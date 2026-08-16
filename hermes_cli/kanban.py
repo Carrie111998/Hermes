@@ -184,7 +184,8 @@ def _check_dispatcher_presence(
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
+        from hermes_cli.kanban_config import enabled
+        dispatch_on = enabled(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
     except Exception:
         dispatch_on = True  # can't tell — assume default
 
@@ -333,7 +334,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
-    p_create.add_argument("--workspace", default="scratch",
+    p_create.add_argument("--workspace", default=None,
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
@@ -1540,6 +1541,7 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    workspace_explicit = args.workspace is not None
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1571,6 +1573,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
+            workspace_explicit=workspace_explicit,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
@@ -1901,7 +1904,8 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
     if not ok:
         print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
+            f"cannot reclaim {args.task_id} (not running, unknown, or a live "
+            "checkpoint predecessor still holds its fence)",
             file=sys.stderr,
         )
         return 1
@@ -2085,7 +2089,39 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        policy = kb.workspace_conflict_policy()
+        if policy == "allow":
+            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        else:
+            # The dispatcher performs this same check under the board's
+            # dispatch flock. Claiming by hand needs that fence too: without
+            # it, two shell users could both observe no conflict and claim
+            # different tasks pointing at the same workspace.
+            with kb._dispatch_tick_lock(kb.kanban_db_path()) as held:
+                if not held:
+                    print(
+                        "cannot claim while another kanban dispatcher or claim "
+                        "operation is checking this board; retry shortly",
+                        file=sys.stderr,
+                    )
+                    return 1
+                candidate = kb.get_task(conn, args.task_id)
+                if candidate is not None:
+                    workspace_path, running_task_ids = kb.workspace_conflicts_with_running(
+                        conn, candidate,
+                    )
+                    if workspace_path is not None and running_task_ids:
+                        message = kb.workspace_conflict_message(
+                            candidate.id, workspace_path, running_task_ids,
+                        )
+                        if policy == "warn":
+                            kb._log.warning(
+                                "kanban workspace conflict: claiming despite %s", message,
+                            )
+                        else:
+                            print(f"cannot claim {args.task_id}: {message}", file=sys.stderr)
+                            return 1
+                task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -2098,7 +2134,14 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
+        try:
+            workspace = kb.resolve_workspace(task)
+        except Exception as exc:
+            kb.release_claim_without_spawn(
+                conn, task, reason=f"manual workspace preflight: {exc}",
+            )
+            print(f"cannot claim {args.task_id}: workspace preflight failed: {exc}", file=sys.stderr)
+            return 1
         kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
@@ -2116,7 +2159,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(conn, args.task_id, author, body, source="cli")
     print(f"Comment added to {args.task_id}")
     return 0
 

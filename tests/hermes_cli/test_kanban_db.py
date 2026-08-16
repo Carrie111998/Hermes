@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -37,6 +38,118 @@ def _init_git_repo(repo: Path) -> None:
     (repo / "README.md").write_text("hello\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
+
+
+# ---------------------------------------------------------------------------
+# Task-creation validation
+# ---------------------------------------------------------------------------
+
+
+def _set_creation_validation(
+    home: Path, policy: str, *, require_explicit_workspace: bool = False,
+) -> None:
+    home.joinpath("config.yaml").write_text(
+        "kanban:\n"
+        f"  validate_on_create: {policy}\n"
+        f"  require_explicit_workspace: {str(require_explicit_workspace).lower()}\n",
+        encoding="utf-8",
+    )
+
+
+def _create_profile(home: Path, name: str) -> Path:
+    profile = home / "profiles" / name
+    (profile / "skills").mkdir(parents=True)
+    return profile
+
+
+def test_create_validation_off_preserves_creation_without_validation_log(
+    kanban_home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _set_creation_validation(
+        kanban_home, "off", require_explicit_workspace=True,
+    )
+
+    with kb.connect() as conn, caplog.at_level("WARNING"):
+        task_id = kb.create_task(
+            conn, title="legacy fixture", assignee="not-a-profile", skills=["missing"],
+        )
+
+    assert task_id
+    assert "kanban task creation validation" not in caplog.text
+
+
+def test_create_validation_warn_logs_but_creates(
+    kanban_home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _set_creation_validation(kanban_home, "warn", require_explicit_workspace=True)
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn, caplog.at_level("WARNING"):
+        task_id = kb.create_task(conn, title="warn", assignee="worker", skills=["missing"])
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    validation_records = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("kanban task creation validation:")
+    ]
+    assert validation_records == [
+        "kanban task creation validation: skill 'missing' is not installed for assignee profile 'worker'",
+        "kanban task creation validation: workspace was an implicit scratch default; choose --workspace scratch explicitly",
+    ]
+
+
+def test_create_validation_strict_rejects_missing_assignee_profile(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict")
+
+    with kb.connect() as conn, pytest.raises(ValueError, match="assignee profile 'not-a-profile' does not exist"):
+        kb.create_task(conn, title="bad profile", assignee="not-a-profile")
+
+
+def test_create_validation_strict_rejects_missing_profile_skill(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict")
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn, pytest.raises(ValueError, match="skill 'missing' is not installed for assignee profile 'worker'"):
+        kb.create_task(conn, title="bad skill", assignee="worker", skills=["missing"])
+
+
+def test_create_validation_uses_assignee_profile_skill_registry(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict")
+    profile = _create_profile(kanban_home, "worker")
+    skill = profile / "skills" / "skill-directory"
+    skill.mkdir()
+    skill.joinpath("SKILL.md").write_text(
+        "---\nname: registered-skill\n---\n", encoding="utf-8",
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="known skill", assignee="worker", skills=["registered-skill"],
+        )
+
+    assert task_id
+
+
+def test_create_validation_strict_rejects_implicit_scratch_workspace(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict", require_explicit_workspace=True)
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn, pytest.raises(ValueError, match="implicit scratch default"):
+        kb.create_task(conn, title="implicit", assignee="worker")
+
+
+def test_create_validation_allows_explicit_scratch_workspace(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict", require_explicit_workspace=True)
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="explicit", assignee="worker", workspace_kind="scratch",
+        )
+
+    assert task_id
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +311,318 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
 
         events = kb.list_events(conn, t)
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+
+
+def test_checkpoint_claim_releases_only_after_old_worker_exits(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="roll over", assignee="coder")
+        host = kb._claimer_id().split(":", 1)[0]
+        task = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert task is not None
+
+        assert kb.checkpoint_task(
+            conn,
+            task_id,
+            summary="first slice complete",
+            expected_run_id=task.current_run_id,
+        )
+        checkpointed = kb.get_task(conn, task_id)
+        assert checkpointed.status == "ready"
+        assert checkpointed.claim_lock == f"{host}:worker"
+        assert checkpointed.worker_pid == os.getpid()
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        assert kb.release_checkpoint_claims(conn) == 0
+        assert kb.claim_task(conn, task_id) is None
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_checkpoint_claims(conn) == 1
+        assert kb.claim_task(conn, task_id) is not None
+
+
+def test_checkpoint_requires_a_claim_run_id(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="roll over", assignee="coder")
+        assert kb.claim_task(conn, task_id) is not None
+
+        with pytest.raises(TypeError):
+            kb.checkpoint_task(conn, task_id, summary="missing")
+        with pytest.raises(ValueError, match="expected_run_id is required"):
+            kb.checkpoint_task(conn, task_id, summary="none", expected_run_id=None)
+
+
+def test_remote_checkpoint_claim_releases_only_after_lease_expiry(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="remote roll over", assignee="coder")
+        task = kb.claim_task(conn, task_id, claimer="other-host:worker")
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn,
+            task_id,
+            summary="first slice complete",
+            expected_run_id=task.current_run_id,
+        )
+        assert kb.release_checkpoint_claims(conn) == 0
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+        conn.commit()
+        assert kb.release_stale_claims(conn) == 1
+
+
+def test_stale_recovery_keeps_expired_live_local_checkpoint_fence(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fenced", assignee="worker")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn, task_id, summary="handoff", expected_run_id=task.current_run_id,
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+        assert kb.release_stale_claims(conn) == 0
+        row = conn.execute(
+            "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] is not None
+
+
+@pytest.mark.parametrize("transition", ["complete", "block", "review", "reclaim"])
+def test_lifecycle_transitions_keep_live_checkpoint_fence(
+    kanban_home, monkeypatch, transition,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fenced", assignee="worker")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn, task_id, summary="handoff", expected_run_id=task.current_run_id,
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        if transition == "complete":
+            assert kb.complete_task(conn, task_id, result="done")
+        elif transition == "block":
+            assert kb.block_task(conn, task_id, reason="wait", kind="needs_input")
+        elif transition == "review":
+            assert kb.request_review(conn, task_id, summary="review")
+        else:
+            assert not kb.reclaim_task(conn, task_id, reason="operator retry")
+        assert kb.release_checkpoint_claims(conn) == 0
+        row = conn.execute(
+            "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] is not None
+
+
+def test_failed_rewind_records_durable_retry_after_cursor_race(kanban_home):
+    with kb.connect() as conn1, kb.connect() as conn2:
+        task_id = kb.create_task(conn1, title="notify", assignee="worker")
+        kb.add_notify_sub(conn1, task_id=task_id, platform="telegram", chat_id="chat")
+        kb.add_comment(conn1, task_id, "human", "decision")
+        old, claimed, events = kb.claim_unseen_events_for_sub(
+            conn1, task_id=task_id, platform="telegram", chat_id="chat",
+        )
+        kb._append_event(conn1, task_id, "blocked", {"kind": "needs_input"})
+        conn1.commit()
+        kb.claim_unseen_events_for_sub(
+            conn2, task_id=task_id, platform="telegram", chat_id="chat",
+        )
+        assert not kb.rewind_notify_cursor(
+            conn1, task_id=task_id, platform="telegram", chat_id="chat",
+            claimed_cursor=claimed, old_cursor=old,
+            claimed_event_ids=[event.id for event in events],
+        )
+        _old, cursor, retry = kb.claim_unseen_events_for_sub(
+            conn2, task_id=task_id, platform="telegram", chat_id="chat",
+        )
+        assert events[0].id in [event.id for event in retry]
+        kb.advance_notify_cursor(
+            conn2, task_id=task_id, platform="telegram", chat_id="chat",
+            new_cursor=cursor,
+        )
+        assert conn2.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+
+def test_retry_row_has_a_single_atomic_notifier_claim(kanban_home):
+    """A retry lease prevents two gateway connections double-delivering it."""
+    with kb.connect() as writer, kb.connect() as first, kb.connect() as second:
+        task_id = kb.create_task(writer, title="notify", assignee="worker")
+        kb.add_notify_sub(writer, task_id=task_id, platform="matrix", chat_id="!room:server")
+        kb.add_comment(writer, task_id, "human", "decision")
+        _old, cursor, events = kb.claim_unseen_events_for_sub(
+            writer, task_id=task_id, platform="matrix", chat_id="!room:server",
+        )
+        kb.advance_notify_cursor(
+            writer, task_id=task_id, platform="matrix", chat_id="!room:server", new_cursor=cursor,
+        )
+        event_id = events[0].id
+        writer.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, ?, ?, '', ?, ?)",
+            (task_id, "matrix", "!room:server", event_id, int(time.time())),
+        )
+        writer.commit()
+
+        _old, _cursor, claimed = kb.claim_unseen_events_for_sub(
+            first, task_id=task_id, platform="matrix", chat_id="!room:server",
+        )
+        _old, _cursor, duplicate = kb.claim_unseen_events_for_sub(
+            second, task_id=task_id, platform="matrix", chat_id="!room:server",
+        )
+
+    assert [event.id for event in claimed] == [event_id]
+    assert duplicate == []
+
+
+def test_retry_rows_follow_subscription_task_and_event_lifecycle(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="notify", assignee="worker")
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        kb.add_comment(conn, task_id, "human", "decision")
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.commit()
+        assert kb.remove_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.commit()
+        assert kb.delete_task(conn, task_id)
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+
+def test_retry_rows_are_removed_by_subscription_and_event_gc(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="old", assignee="worker")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.complete_task(conn, task_id, expected_run_id=task.current_run_id)
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (task_id,))
+        conn.commit()
+
+        assert kb.purge_stale_done_notify_subs(conn, max_age_days=1) == 1
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.commit()
+        assert kb.gc_events(conn, older_than_seconds=1) > 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+
+def test_default_subscription_parses_matrix_ids_and_stamps_creator_profile(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"default_subscriptions": ["matrix:!room:server", "matrix:!room:server:42"]}},
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="matrix", assignee="worker", created_by="creator")
+        rows = conn.execute(
+            "SELECT chat_id, thread_id, notifier_profile FROM kanban_notify_subs WHERE task_id = ? "
+            "ORDER BY thread_id", (task_id,),
+        ).fetchall()
+
+    assert [(row["chat_id"], row["thread_id"], row["notifier_profile"]) for row in rows] == [
+        ("!room:server", "", "creator"),
+        ("!room:server", "42", "creator"),
+    ]
+
+
+@pytest.mark.parametrize("source", ["cli", "tool", "dashboard"])
+def test_comment_events_record_write_surface_provenance(kanban_home, source):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="comment", assignee="worker")
+        kb.add_comment(conn, task_id, "worker", "note", source=source)
+        payload = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()[0]
+
+    assert json.loads(payload)["source"] == source
+
+def test_checkpoint_advertisement_is_config_gated_and_rejects_future_dates(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        kb._dispatch_once_locked(conn, advertise_capabilities=True)
+        assert kb.dispatcher_supports_safe_checkpoint(conn) is False
+
+        monkeypatch.setattr(kb, "safe_checkpoint_enabled", lambda: True)
+        kb._dispatch_once_locked(conn, advertise_capabilities=True)
+        assert kb.dispatcher_supports_safe_checkpoint(conn) is True
+
+        future = int(time.time()) + 60
+        conn.execute(
+            "UPDATE board_meta SET value = ?, updated_at = ? WHERE key = ?",
+            (
+                '{"safe_checkpoint":true,"advertised_at":%d}' % future,
+                future,
+                kb._DISPATCHER_CAPABILITIES_META_KEY,
+            ),
+        )
+        conn.commit()
+        assert kb.dispatcher_supports_safe_checkpoint(conn) is False
+
+
+def test_checkpoint_successor_context_includes_live_git_state_and_handoff(
+    kanban_home, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(kb, "safe_checkpoint_enabled", lambda: True)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="resume from checkpoint",
+            assignee="coder",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn,
+            task_id,
+            summary="implementation slice complete",
+            metadata={"handoff": {"next_worker_start_here": "Run targeted tests."}},
+            expected_run_id=task.current_run_id,
+        )
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "## Live Git state" in context
+    assert "README.md" in context
+    assert "implementation slice complete" in context
+    assert "Run targeted tests." in context
 
 
 
@@ -842,7 +1267,14 @@ class TestSharedBoardPaths:
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            max_runtime_seconds=120,
         )
+        (tmp_path / "ws").mkdir()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"deadline_warning_fraction": 0.75}},
+        )
+        before_spawn = int(time.time())
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -852,6 +1284,8 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_RUNTIME_CAP_SECONDS"] == "120"
+        assert before_spawn + 120 <= int(env["HERMES_KANBAN_RUNTIME_DEADLINE"])
         for key in sc._VAR_MAP:
             if key == "HERMES_SESSION_SOURCE":
                 # Re-set by the dispatcher, so what matters is that it carries
@@ -859,6 +1293,37 @@ class TestSharedBoardPaths:
                 assert env[key] == "kanban"
                 continue
             assert key not in env
+
+
+@pytest.mark.parametrize("workspace_state", ["missing", "relative", "nonexistent"])
+def test_default_spawn_rejects_nonabsolute_or_missing_workspace(
+    tmp_path: Path, workspace_state: str,
+) -> None:
+    task = kb.Task(
+        id="t_workspace_preflight",
+        title="x",
+        body=None,
+        assignee="worker",
+        status="ready",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+    candidate = {
+        "missing": None,
+        "relative": "relative/workspace",
+        "nonexistent": str(tmp_path / "missing"),
+    }[workspace_state]
+
+    with pytest.raises(ValueError, match="workspace preflight failed"):
+        kb._default_spawn(task, candidate)
 
 
 # ---------------------------------------------------------------------------

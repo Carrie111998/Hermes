@@ -256,6 +256,7 @@ class TestWorkerSpawnEnv:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         kb.create_board("spawntest")
+        (fresh_home / "ws").mkdir()
 
         task = kb.Task(
             id="t_abc",
@@ -285,6 +286,36 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+
+    def test_default_spawn_omits_checkpoint_hint_unless_persistent_dispatcher(
+        self, fresh_home, monkeypatch,
+    ):
+        captured = {}
+
+        class FakeProc:
+            pid = 12345
+
+        def fake_popen(_cmd, *args, **kwargs):
+            captured["env"] = kwargs["env"]
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setenv("HERMES_KANBAN_SAFE_CHECKPOINT", "1")
+        (fresh_home / "ws").mkdir()
+        task = kb.Task(
+            id="t_checkpoint", title="worker test", body=None, assignee="teknium",
+            status="ready", priority=0, created_by="user", created_at=0,
+            started_at=None, completed_at=None, workspace_kind="scratch",
+            workspace_path=None, claim_lock=None, claim_expires=None, tenant=None,
+        )
+
+        kb._default_spawn(task, str(fresh_home / "ws"))
+        assert "HERMES_KANBAN_SAFE_CHECKPOINT" not in captured["env"]
+
+        kb._default_spawn(
+            task, str(fresh_home / "ws"), safe_checkpoint_enabled=True,
+        )
+        assert captured["env"]["HERMES_KANBAN_SAFE_CHECKPOINT"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +372,4 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
-
 

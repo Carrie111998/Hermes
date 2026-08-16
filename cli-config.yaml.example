@@ -306,6 +306,19 @@ model:
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true
+  # Workflow policy keys. Every default preserves historical behavior; enable
+  # what your workflow needs. See docs/user-guide/features/kanban.md.
+  # human_comment_wake: true             # wake a needs_input worker when a human comments
+  # human_comment_wake_overrides_mute: false  # wake even muted subscribers on human replies
+  # safe_checkpoint:
+  #   enabled: false                     # fenced fresh-worker checkpoint protocol
+  #   prompt_hint: ""                    # local guidance on when workers should checkpoint
+  # workspace_conflict: "allow"          # allow | warn | serialize concurrent same-workspace dispatch
+  # default_subscriptions: []            # notify targets added on every task creation, e.g. ["telegram:12345"]
+  # default_subscription_notifier_profile: null  # gateway profile that delivers default subscriptions (null = creating profile)
+  # validate_on_create: "warn"           # off | warn | strict creation validation
+  # require_explicit_workspace: false    # treat an implicit scratch workspace as a violation
+  # deadline_warning_fraction: 0.0       # 0 disables; else nudge workers past this fraction of runtime
 
 # =============================================================================
 # Terminal Tool Configuration

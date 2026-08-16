@@ -93,6 +93,63 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # 180s budget (is_reconnect=True preserves the offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+
+
+def _running_git_commit() -> str:
+    """Return the checked-out commit for this gateway process, if available."""
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    if git:
+        try:
+            package_root = Path(__file__).resolve().parent.parent
+            root_result = subprocess.run(
+                [git, "rev-parse", "--show-toplevel"],
+                cwd=str(package_root),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if root_result.returncode == 0 and Path(root_result.stdout.strip()).resolve() == package_root:
+                result = subprocess.run(
+                    [git, "rev-parse", "--short", "HEAD"],
+                    cwd=str(package_root), capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    dirty = subprocess.run(
+                        [git, "status", "--porcelain"], cwd=str(package_root),
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    return result.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("Could not resolve gateway git commit", exc_info=True)
+    try:
+        from hermes_cli.build_info import get_build_sha
+
+        return get_build_sha(short=8) or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _kanban_dispatch_in_gateway_enabled() -> bool:
+    """Resolve the embedded-dispatcher startup gate for status logging."""
+    if os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return False
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        logger.debug("Could not resolve kanban dispatcher config", exc_info=True)
+        return False
+    kanban_config = config.get("kanban", {}) if isinstance(config, dict) else {}
+    from hermes_cli.kanban_config import enabled
+    return enabled(kanban_config.get("dispatch_in_gateway", True))
+
+
 # End reasons that mean the USER deliberately closed this thread of work
 # (/new -> session_reset / new_session, an explicit exit, or a /switch).
 # Shared by _classify_completion_target (pre-flight verdict) and
@@ -11932,6 +11989,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        self._running_git_commit = _running_git_commit()
+        self._kanban_dispatch_in_gateway_enabled = _kanban_dispatch_in_gateway_enabled()
+        logger.info(
+            "Gateway code: commit=%s; kanban dispatch-in-gateway=%s",
+            self._running_git_commit,
+            "configured" if self._kanban_dispatch_in_gateway_enabled else "disabled",
+        )
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -12048,7 +12112,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="starting", exit_reason=None)
+            write_runtime_status(
+                gateway_state="starting",
+                exit_reason=None,
+                git_commit=self._running_git_commit,
+            )
         except Exception:
             pass
         try:

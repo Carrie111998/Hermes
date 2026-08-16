@@ -5277,6 +5277,13 @@ def launchd_status(deep: bool = False):
         if fallback_pid:
             print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
 
+    runtime_lines = _runtime_health_lines()
+    if runtime_lines:
+        print()
+        print("Recent gateway health:")
+        for line in runtime_lines:
+            print(f"  {line}")
+
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
         if log_file.exists():
@@ -6156,6 +6163,18 @@ def _runtime_health_lines() -> list[str]:
     active_agents = state.get("active_agents")
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
+
+    git_commit = state.get("git_commit")
+    if git_commit:
+        raw_dispatch = state.get("kanban_dispatch_in_gateway")
+        dispatch = (
+            raw_dispatch
+            if raw_dispatch in {"enabled", "disabled", "contended"}
+            else ("enabled" if raw_dispatch else "disabled")
+        )
+        lines.append(
+            f"Running code: {git_commit} (kanban dispatch-in-gateway: {dispatch})"
+        )
 
     for platform, pdata in platforms.items():
         if pdata.get("state") == "fatal":
@@ -8004,6 +8023,12 @@ def _gateway_command_inner(args):
             from hermes_cli import gateway_windows
 
             gateway_windows.status(deep=deep)
+            runtime_lines = _runtime_health_lines()
+            if runtime_lines:
+                print()
+                print("Recent gateway health:")
+                for line in runtime_lines:
+                    print(f"  {line}")
             _print_gateway_process_mismatch(snapshot)
         else:
             # Check for manually running processes

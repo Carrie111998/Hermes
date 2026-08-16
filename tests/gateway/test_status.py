@@ -24,6 +24,22 @@ class TestGatewayPidState:
         assert isinstance(payload["argv"], list)
         assert payload["argv"]
 
+    def test_runtime_status_persists_gateway_code_and_dispatch_ownership(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="starting",
+            git_commit="abc1234",
+            kanban_dispatch_in_gateway="enabled",
+        )
+        status.write_runtime_status(active_agents=1)
+
+        payload = status.read_runtime_status()
+        assert payload["git_commit"] == "abc1234"
+        assert payload["kanban_dispatch_in_gateway"] == "enabled"
+
     def test_write_pid_file_is_atomic_against_concurrent_writers(self, tmp_path, monkeypatch):
         """Regression: two concurrent --replace invocations must not both win.
 
@@ -299,7 +315,7 @@ class TestGetProcessStartTime:
     def test_live_process_is_stable_int(self):
         import subprocess
         import time
-        p = subprocess.Popen(["sleep", "20"])
+        p = subprocess.Popen(["sleep", "1"])
         try:
             a = status._get_process_start_time(p.pid)
             time.sleep(0.2)
@@ -307,7 +323,7 @@ class TestGetProcessStartTime:
             assert a is not None and isinstance(a, int)
             assert a == b  # same process → identical fingerprint
         finally:
-            p.kill()
+            p.wait(timeout=2)
             p.wait()
 
 
@@ -1219,4 +1235,3 @@ class TestResolveGatewayLiveness:
         # expected_home is what stops a recycled PID belonging to another
         # profile's live gateway from being reported as this profile's.
         assert seen["expected_home"] == profile_dir
-

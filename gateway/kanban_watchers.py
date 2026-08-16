@@ -57,6 +57,26 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _resolve_human_comment_wake_settings(
+    load_config: Callable[[], Any],
+) -> "tuple[bool, bool]":
+    """Resolve live comment-wake policy from the kanban configuration."""
+    try:
+        cfg = load_config()
+    except Exception:
+        # These are policy defaults, so retain the documented behavior when a
+        # transient config read fails rather than silently leaving a human
+        # decision unread.
+        return True, False
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    from hermes_cli.kanban_config import enabled
+
+    return (
+        enabled(kcfg.get("human_comment_wake", True)),
+        enabled(kcfg.get("human_comment_wake_overrides_mute", False)),
+    )
+
+
 def _kanban_dispatch_allowed() -> bool:
     """Return False while the global emergency stop (`hermes pause`) is engaged.
 
@@ -176,6 +196,14 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    def _report_kanban_dispatch_state(self, state: str) -> None:
+        """Persist actual dispatcher ownership after config/lock resolution."""
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(kanban_dispatch_in_gateway=state)
+        except Exception:
+            logger.debug("kanban dispatcher: could not persist ownership state", exc_info=True)
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -217,7 +245,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "checkpointed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "commented")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -268,6 +296,12 @@ class GatewayKanbanWatchersMixin:
 
         while self._running:
             try:
+                from hermes_cli.config import load_config as _load_cfg
+
+                (
+                    human_comment_wake,
+                    human_comment_wake_overrides_mute,
+                ) = _resolve_human_comment_wake_settings(_load_cfg)
                 _gc_due = time.monotonic() >= _gc_next_at
                 _gc_retention_days = 30
                 if _gc_due:
@@ -443,6 +477,13 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    block_event_id = (
+                                        _kb.latest_needs_input_block_event_id(conn, sub["task_id"])
+                                        if task
+                                        and task.status == "blocked"
+                                        and task.block_kind == "needs_input"
+                                        else None
+                                    )
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -453,6 +494,7 @@ class GatewayKanbanWatchersMixin:
                                         "cursor": cursor,
                                         "events": events,
                                         "task": task,
+                                        "block_event_id": block_event_id,
                                         "board": slug,
                                     })
                                 except Exception as sub_exc:
@@ -503,6 +545,7 @@ class GatewayKanbanWatchersMixin:
                             sub,
                             d["cursor"],
                             d.get("old_cursor", 0),
+                            [event.id for event in d["events"]],
                             board_slug,
                         )
                         continue
@@ -560,6 +603,16 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "checkpointed":
+                            handoff = ""
+                            if ev.payload and ev.payload.get("next_worker_start_here"):
+                                handoff = f"\nNext: {str(ev.payload['next_worker_start_here'])[:200]}"
+                            elif ev.payload and ev.payload.get("summary"):
+                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                            msg = (
+                                f"💾 {board_tag}{tag}Kanban {sub['task_id']} checkpointed"
+                                f" — {title}; a fresh worker will resume{handoff}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -616,7 +669,7 @@ class GatewayKanbanWatchersMixin:
                                 f" — needs a human decision{rc}{reason}"
                             )
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
+                            # archived / unblocked / commented are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
                             # wedge a later completed/blocked event behind an
                             # unclaimed row) but are intentionally SILENT: an
@@ -735,6 +788,7 @@ class GatewayKanbanWatchersMixin:
                                     sub,
                                     d["cursor"],
                                     d.get("old_cursor", 0),
+                                    [event.id for event in d["events"]],
                                     board_slug,
                                 )
                             # Rewind the pre-send claim on transient failure so
@@ -760,17 +814,68 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _event_wake_kinds = {
+                            ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS
+                        }
+                        _comment_wake = None
+                        if (
+                            human_comment_wake
+                            and (wake_agent or human_comment_wake_overrides_mute)
+                            and task
+                            and task.status == "blocked"
+                            and task.block_kind == "needs_input"
+                        ):
+                            _assignee_name = (task.assignee or "").strip()
+                            # Compare against the subscription owner, not this
+                            # gateway's active profile: multiplex gateways can
+                            # deliver another profile's subscription, and that
+                            # profile's own resolution comment must not loop.
+                            _notifier_name = (sub_profile or notifier_profile or "").strip()
+                            # Consider only the newest comment event in this
+                            # claim. A later worker/origin resolution comment
+                            # suppresses any older human decision, preventing
+                            # that decision from waking the agent a second time.
+                            _comment_events = [
+                                event for event in d["events"]
+                                if event.kind == "commented"
+                            ]
+                            if _comment_events and d.get("block_event_id") is not None:
+                                _comment_event = _comment_events[-1]
+                                _comment_author = str(
+                                    (_comment_event.payload or {}).get("author") or ""
+                                ).strip()
+                                _comment_source = str(
+                                    (_comment_event.payload or {}).get("source") or ""
+                                ).strip().lower()
+                                # CLI/dashboard provenance records an operator
+                                # surface even when the displayed author equals
+                                # the assignee profile.  For legacy/tool events,
+                                # retain the conservative identity heuristic.
+                                if (
+                                    _comment_author
+                                    and _comment_event.id > d["block_event_id"]
+                                    and (
+                                        _comment_source in {"cli", "dashboard"}
+                                        or (
+                                            _comment_author != _assignee_name
+                                            and _comment_author != _notifier_name
+                                        )
+                                    )
+                                ):
+                                    _comment_wake = _comment_author
+                        # Terminal events wake only modes that opt in, while a
+                        # policy-enabled comment wake carries coalesced terminal
+                        # state as context.
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
-                            else set()
+                            _event_wake_kinds if wake_agent or _comment_wake else set()
                         )
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
-                        if _wake_kinds:
+                        _wake_now = bool(_wake_kinds or _comment_wake)
+                        if _wake_now:
                             if _is_push_adapter:
                                 _session_key = getattr(task, "session_id", None) or ""
                             else:
@@ -787,7 +892,8 @@ class GatewayKanbanWatchersMixin:
                                     or getattr(task, "session_id", None)
                                     or ""
                                 )
-                        if _wake_kinds:
+                        _can_wake = _wake_now and bool(_is_push_adapter or _session_key)
+                        if _can_wake:
                             _title = (task.title if task else sub["task_id"])[:120]
                             _assignee = task.assignee if task else ""
                             _parts = []
@@ -796,20 +902,53 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                            _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                            _synth = t(
-                                "gateway.kanban.wake.message",
-                                task_id=sub["task_id"],
-                                status=_status,
-                                title=_title,
-                                assignee=_assignee,
-                                board=board_slug,
+                            if _wake_kinds:
+                                _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
+                                _synth = t(
+                                    "gateway.kanban.wake.message",
+                                    task_id=sub["task_id"],
+                                    status=_status,
+                                    title=_title,
+                                    assignee=_assignee,
+                                    board=board_slug,
+                                )
+                            if _comment_wake:
+                                _author = _comment_wake
+                                if "blocked" in _wake_kinds:
+                                    _synth += " This claim also includes a blocked terminal event."
+                                _synth += (
+                                    f" Kanban task {sub['task_id']} on board {board_slug}"
+                                    f" ({_title!r}) has a newest human comment from {_author}."
+                                    " Please read the task's block reason and latest comments, treat the"
+                                    " newest human comment as the decision, record a resolution"
+                                    " comment on the task, THEN unblock the task."
+                                )
+
+                        _source = None
+                        if _is_push_adapter and _can_wake:
+                            from gateway.session import SessionSource
+
+                            _chat_type = str(sub.get("chat_type") or "").strip()
+                            if not _chat_type:
+                                _delivery_meta = sub.get("delivery_metadata")
+                                if isinstance(_delivery_meta, dict):
+                                    _chat_type = str(
+                                        _delivery_meta.get("chat_type") or ""
+                                    ).strip()
+                            _source = SessionSource(
+                                platform=plat,
+                                chat_id=sub["chat_id"],
+                                chat_type=_chat_type or "group",
+                                thread_id=sub.get("thread_id") or None,
+                                user_id=sub.get("user_id"),
+                                user_id_alt=sub.get("user_id_alt"),
+                                profile=sub_profile or None,
+                                scope_id=_wake_scope_id(adapter, sub),
                             )
-                            # Graph-safe wake turn (#70752): carry the worker's
-                            # completion handoff into the synthetic turn and
-                            # label it as an automatic notification so the woken
-                            # creator inspects the board instead of
-                            # re-decomposing work that already exists.
+                        # Graph-safe wake turn (#70752): carry the worker's
+                        # completion handoff into every synthetic wake turn,
+                        # including the API-server self-post path.
+                        if _can_wake:
                             if wake_handoff:
                                 _synth += "\n" + t(
                                     "gateway.kanban.wake.handoff",
@@ -819,9 +958,13 @@ class GatewayKanbanWatchersMixin:
                                 "gateway.kanban.wake.guidance"
                             )
 
-                        if not _is_push_adapter and _wake_kinds and _session_key:
-                            # Wake self-post IS the delivery on this path —
-                            # it must succeed BEFORE the cursor advances.
+                        if (
+                            _can_wake
+                            and (not _is_push_adapter or _comment_wake)
+                        ):
+                            # A comment has no user-facing text delivery, so
+                            # its wake IS the delivery on every adapter. Run it
+                            # before advancing the cursor and rewind on failure.
                             from gateway.wake import deliver_wake
 
                             try:
@@ -829,6 +972,7 @@ class GatewayKanbanWatchersMixin:
                                     adapter,
                                     text=_synth,
                                     session_id=_session_key,
+                                    source=_source,
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
@@ -861,6 +1005,7 @@ class GatewayKanbanWatchersMixin:
                                         sub,
                                         d["cursor"],
                                         d.get("old_cursor", 0),
+                                        [event.id for event in d["events"]],
                                         board_slug,
                                     )
                                 continue
@@ -873,7 +1018,6 @@ class GatewayKanbanWatchersMixin:
                             branches below; raises on failure so the caller
                             decides whether to rewind or merely log.
                             """
-                            from gateway.session import SessionSource
                             from gateway.wake import deliver_wake
                             # Rebuild the creator's real session scope from
                             # the chat_type persisted on the subscription
@@ -889,24 +1033,6 @@ class GatewayKanbanWatchersMixin:
                             # handle_message() get_or_create_session's the
                             # target, so a mismatch only ever degrades to a
                             # fresh session, never an exception.
-                            _chat_type = str(sub.get("chat_type") or "").strip()
-                            if not _chat_type:
-                                _delivery_meta = sub.get("delivery_metadata")
-                                if isinstance(_delivery_meta, dict):
-                                    _chat_type = str(
-                                        _delivery_meta.get("chat_type") or ""
-                                    ).strip()
-                            _chat_type = _chat_type or "group"
-                            _source = SessionSource(
-                                platform=plat,
-                                chat_id=sub["chat_id"],
-                                chat_type=_chat_type,
-                                thread_id=sub.get("thread_id") or None,
-                                user_id=sub.get("user_id"),
-                                user_id_alt=sub.get("user_id_alt"),
-                                profile=sub_profile or None,
-                                scope_id=_wake_scope_id(adapter, sub),
-                            )
                             # deliver_wake preserves the synthetic
                             # MessageEvent/handle_message path for
                             # push-capable adapters (the non-push /
@@ -923,7 +1049,12 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                             )
 
-                        if _is_push_adapter and not send_passive and _wake_kinds:
+                        if (
+                            _is_push_adapter
+                            and not send_passive
+                            and _wake_kinds
+                            and not _comment_wake
+                        ):
                             # Wake-only (delivery_mode='wake') push sub: the
                             # text ping was intentionally skipped above, so
                             # the wake IS the sole delivery. It must succeed
@@ -961,6 +1092,7 @@ class GatewayKanbanWatchersMixin:
                                         sub,
                                         d["cursor"],
                                         d.get("old_cursor", 0),
+                                        [event.id for event in d["events"]],
                                         board_slug,
                                     )
                                 continue
@@ -982,7 +1114,12 @@ class GatewayKanbanWatchersMixin:
                         # work for review corrections and continuation. The
                         # retained cursor prevents replay while preserving the
                         # original delivery and wake ownership for that cycle.
-                        if _is_push_adapter and send_passive and _wake_kinds:
+                        if (
+                            _is_push_adapter
+                            and send_passive
+                            and _wake_kinds
+                            and not _comment_wake
+                        ):
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
                             # injection stays best-effort.
@@ -1052,6 +1189,7 @@ class GatewayKanbanWatchersMixin:
         sub: dict,
         claimed_cursor: int,
         old_cursor: int,
+        claimed_event_ids: list[int],
         board: Optional[str] = None,
     ) -> None:
         """Sync helper: undo a claimed notification cursor after send failure."""
@@ -1066,6 +1204,7 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+                claimed_event_ids=claimed_event_ids,
             )
         finally:
             conn.close()
@@ -1204,24 +1343,35 @@ class GatewayKanbanWatchersMixin:
         try:
             from hermes_cli.config import load_config as _load_config
         except Exception:
+            self._report_kanban_dispatch_state("disabled")
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
         if env_override in {"0", "false", "no", "off"}:
+            self._report_kanban_dispatch_state("disabled")
             logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
             return
 
         try:
             cfg = _load_config()
         except Exception as exc:
+            self._report_kanban_dispatch_state("disabled")
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        from hermes_cli.kanban_config import enabled as _enabled
+        if not _enabled(kanban_cfg.get("dispatch_in_gateway", True)):
+            self._report_kanban_dispatch_state("disabled")
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        checkpoint_cfg = kanban_cfg.get("safe_checkpoint", {})
+        safe_checkpoint_enabled = _enabled(
+            checkpoint_cfg.get("enabled", False)
+            if isinstance(checkpoint_cfg, dict)
+            else False
+        )
 
         try:
             from hermes_cli import kanban_db as _kb
@@ -1240,6 +1390,7 @@ class GatewayKanbanWatchersMixin:
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
+            self._report_kanban_dispatch_state("contended")
             logger.info(
                 "kanban dispatcher: another gateway already holds the dispatcher "
                 "lock (%s); this gateway will NOT dispatch.", _lock_path,
@@ -1247,8 +1398,10 @@ class GatewayKanbanWatchersMixin:
             return
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
+            self._report_kanban_dispatch_state("enabled")
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
         else:
+            self._report_kanban_dispatch_state("enabled")
             logger.warning(
                 "kanban dispatcher: advisory lock unavailable at %s; proceeding "
                 "on config control alone.", _lock_path,
@@ -1467,6 +1620,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    advertise_capabilities=safe_checkpoint_enabled,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

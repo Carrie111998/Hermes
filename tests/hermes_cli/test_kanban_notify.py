@@ -35,6 +35,50 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
+def test_empty_default_subscriptions_leave_task_creation_unchanged(kanban_home):
+    """The empty default must create no rows beyond the historical task event."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="no configured subs", assignee="worker")
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        subs = kb.list_notify_subs(conn, task_id)
+
+    assert task is not None
+    assert [event.kind for event in events] == ["created"]
+    assert subs == []
+
+
+def test_default_subscriptions_dedupe_against_inherited_child_subs(kanban_home):
+    """Defaults add parentless tasks and never overwrite inherited delivery."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  default_subscriptions: [telegram:ops:1]\n",
+        encoding="utf-8",
+    )
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_id,
+            platform="telegram",
+            chat_id="ops",
+            thread_id="1",
+            delivery_mode="wake",
+        )
+        child_id = kb.create_task(
+            conn, title="child", assignee="worker", parents=(parent_id,)
+        )
+        parent_subs = kb.list_notify_subs(conn, parent_id)
+        child_subs = kb.list_notify_subs(conn, child_id)
+
+    assert len(parent_subs) == 1
+    assert parent_subs[0]["delivery_mode"] == "wake"
+    assert len(child_subs) == 1
+    assert child_subs[0]["platform"] == "telegram"
+    assert child_subs[0]["chat_id"] == "ops"
+    assert child_subs[0]["thread_id"] == "1"
+    assert child_subs[0]["delivery_mode"] == "wake"
+
+
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     """delivery_mode persists; an explicit re-subscribe is last-write-wins, a
     ``None`` re-subscribe leaves the existing mode untouched, an unknown value

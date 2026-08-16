@@ -7156,6 +7156,33 @@ def run_conversation(
                                 pass
                     break
 
+                # Tool-heavy workers can otherwise run past the advisory
+                # checkpoint threshold forever: the final-response path below
+                # is never reached. Inject the same once-per-run nudge before
+                # the next model turn.
+                try:
+                    from agent.kanban_stop import build_kanban_deadline_warning
+
+                    _tool_deadline_warning = build_kanban_deadline_warning(
+                        issued=getattr(agent, "_kanban_deadline_warning_issued", False),
+                        messages=messages,
+                    )
+                except Exception:
+                    logger.debug("kanban tool-path deadline-warning check failed", exc_info=True)
+                    _tool_deadline_warning = None
+                if _tool_deadline_warning:
+                    agent._kanban_deadline_warning_issued = True
+                    messages.append({
+                        "role": "user",
+                        "content": _tool_deadline_warning,
+                        "_kanban_deadline_warning_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "kanban deadline-warning nudge issued on tool path task=%s",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                    )
+
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
@@ -7923,6 +7950,48 @@ def run_conversation(
                     agent._session_messages = messages
                     logger.debug("pre_verify nudge issued (attempt %d)",
                                  agent._pre_verify_nudges)
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
+                # ── Kanban worker terminal-tool stop guard ─────────────
+                # A dispatcher-provided runtime deadline can request one
+                # advisory continuation before the ordinary terminal guard.
+                # This remains a nudge only: the dispatcher owns actual
+                # timeout enforcement and process termination.
+                try:
+                    from agent.kanban_stop import build_kanban_deadline_warning
+
+                    _deadline_warning = build_kanban_deadline_warning(
+                        issued=getattr(agent, "_kanban_deadline_warning_issued", False),
+                        messages=messages,
+                    )
+                except Exception:
+                    logger.debug("kanban deadline-warning check failed", exc_info=True)
+                    _deadline_warning = None
+
+                if _deadline_warning:
+                    agent._kanban_deadline_warning_issued = True
+                    final_msg["finish_reason"] = "kanban_deadline_warning"
+                    agent._emit_interim_assistant_message(final_msg)
+                    messages.append(final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("kanban deadline-warning interim flush failed", exc_info=True)
+                    messages.append({
+                        "role": "user",
+                        "content": _deadline_warning,
+                        "_kanban_deadline_warning_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "kanban deadline-warning nudge issued task=%s",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                    )
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")

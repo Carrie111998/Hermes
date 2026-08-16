@@ -427,6 +427,15 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 
 分解器的路由决策依赖于配置文件描述，这是一个每配置文件的标签原语，通过 `hermes profile create --description "..."`、`hermes profile describe <name> --text "..."`、`hermes profile describe <name> --auto`（LLM 从配置文件安装的 skill + 模型自动生成），或仪表盘展开的 **Orchestration settings** 面板中的每配置文件编辑器来设置。没有描述的配置文件仍然出现在名册中 —— 它们可以按名称路由，只是精度较低。分解器**绝不**会将子任务落地为 `assignee=None`：当 LLM 选择未知配置文件时，子任务路由到 `kanban.default_assignee`（如果未设置，则路由到活动默认配置文件）。
 
+### 安全检查点轮换
+
+设置 `kanban.safe_checkpoint.enabled: true` 后，worker 可使用
+`kanban_checkpoint`。它会持久化有界、已脱敏的交接信息，并把任务重新排队；
+旧认领会一直围栏到本地前任进程退出，或远程租约过期，避免两个 worker 同时修改
+同一工作区。Worker 每次检查点前都会验证看板数据库中五分钟内的新鲜持久调度器
+能力公告；一次性和 dry-run 调度不会公告该能力。`safe_checkpoint.prompt_hint`
+可提供何时轮换的本地提示，空值使用通用的上下文压力提示。
+
 配置项（均在 `~/.hermes/config.yaml` 的 `kanban:` 下）：
 
 | 键 | 默认值 | 用途 |
@@ -435,6 +444,16 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 | `auto_decompose_per_tick` | `3` | 每个调度器 tick 的分解上限。超出部分推迟到下一个 tick。 |
 | `orchestrator_profile` | `""` | 拥有分解权的配置文件。空 = 回退到活动默认配置文件。 |
 | `default_assignee` | `""` | LLM 选择未知配置文件时子任务的落地位置。空 = 回退到活动默认配置文件。 |
+| `deadline_warning_fraction` | `0.0` | 在任务运行上限的指定比例时提醒 worker。有效范围为 `0 < f <= 1`；`0` 禁用提醒。安全检查点关闭时，提醒 worker 在连贯边界完成或阻塞，不承诺会话轮换。 |
+| `human_comment_wake` | `true` | 人类在 `needs_input` 阻塞任务上评论时唤醒 worker。 |
+| `human_comment_wake_overrides_mute` | `false` | 即使订阅仅为被动 `notify`，人类评论也可触发唤醒。 |
+| `safe_checkpoint.enabled` | `false` | 启用围栏式安全检查点、worker 工具和持久调度器能力公告。 |
+| `safe_checkpoint.prompt_hint` | `""` | 何时检查点的可选附加提示；空值使用内置上下文压力提示。 |
+| `workspace_conflict` | `"allow"` | 工作区冲突策略：`allow` 保持原行为；`warn` 记录后仍调度；`serialize` 跳过与运行任务共用工作区的候选项。保证仅适用于单看板、每看板一个调度器的模型。 |
+| `default_subscriptions` | `[]` | 每条任务创建路径加入的通知订阅目标，格式为 `platform:chat_id[:thread_id]`。仅第一个冒号分隔平台；最后一段只有是整数时才是线程 ID，因此 Matrix `!room:server` 可用。 |
+| `default_subscription_notifier_profile` | 创建者配置文件 | 默认订阅投递所属的 gateway 配置文件；空值使用创建任务的配置文件。 |
+| `validate_on_create` | `"warn"` | 创建校验策略：`off`、`warn`（记录违规但创建）或 `strict`（拒绝）。 |
+| `require_explicit_workspace` | `false` | 校验开启时，将未显式指定的 `scratch` 工作区视为违规。 |
 | `auto_subscribe_on_create` | `true` | 当 `kanban_create` 在持久 gateway/TUI 会话中运行时，终止事件会通过合成状态回合恢复原始 agent。设为 `false` 可让完成保持被动，或要求显式调用 `kanban_notify-subscribe`。此设置独立于 `auto_decompose`。 |
 
 以及两个辅助 LLM 槽：
@@ -830,6 +849,8 @@ hermes kanban runs t_abcd
 | `promoted` | — | 因所有父任务达到 `done` 而 `todo → ready`。`run_id` 为 `NULL`。 |
 | `claimed` | `{lock, expires, run_id}` | 调度器原子性认领 `ready` 任务以启动。 |
 | `completed` | `{result_len, summary?}` | Worker 写入 `--result` / `--summary` 且任务达到 `done`。`summary` 是第一行交接（400 字符上限）；完整版本存在于运行行上。如果在从未认领的任务上调用 `complete_task` 并带有交接字段，则合成零持续时间运行，以便 `run_id` 仍然指向某处。 |
+| `checkpointed` | `{summary, next_worker_start_here?}` | Worker 已持久化检查点交接并将任务重新排队；旧认领围栏保持到前任退出或租约过期。 |
+| `checkpoint_released` | `{previous_worker_pid, reason}` | 仅当本地前任进程退出（`worker_exited`）或远程租约过期（`claim_expired`）后，才会清除保留的检查点围栏。 |
 | `blocked` | `{reason}` | Worker 或人类将任务翻转为 `blocked`。在带有 `--reason` 的从未认领任务上调用时合成零持续时间运行。 |
 | `unblocked` | — | `blocked → ready`，手动或通过 `/unblock`。`run_id` 为 `NULL`。 |
 | `archived` | — | 从默认看板中隐藏。如果任务仍在运行，携带作为副作用被回收的运行的 `run_id`。 |

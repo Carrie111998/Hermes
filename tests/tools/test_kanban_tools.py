@@ -62,10 +62,12 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     return tid
 
 
@@ -78,6 +80,106 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def test_checkpoint_tool_is_hidden_and_refused_when_disabled(worker_env):
+    """The default must retain the exact pre-checkpoint worker surface."""
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    assert kt._check_safe_checkpoint_mode() is False
+    invalidate_check_fn_cache()
+    names = {
+        schema["function"].get("name")
+        for schema in registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+        if "function" in schema
+    }
+    assert "kanban_checkpoint" not in names
+    assert "disabled" in json.loads(
+        kt._handle_checkpoint({"summary": "safe boundary"})
+    )["error"]
+
+
+def test_checkpoint_tool_is_exposed_when_configuration_is_enabled(
+    worker_env, monkeypatch,
+):
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {"kanban": {"safe_checkpoint": {"enabled": True}}},
+    )
+    assert kt._check_safe_checkpoint_mode() is True
+    invalidate_check_fn_cache()
+    names = {
+        schema["function"].get("name")
+        for schema in registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+        if "function" in schema
+    }
+    assert "kanban_checkpoint" in names
+
+
+@pytest.mark.parametrize("value", ["false", "NO", "0", "off", "", "true"])
+def test_checkpoint_string_config_values_fail_closed(value, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    config = {"kanban": {"safe_checkpoint": {"enabled": value}}}
+    monkeypatch.setattr(kt, "load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    assert kt._safe_checkpoint_enabled() is False
+    assert kb.safe_checkpoint_enabled() is False
+
+
+def test_checkpoint_requires_fresh_database_advertisement_even_with_env_flag(
+    worker_env, monkeypatch,
+):
+    """HERMES_KANBAN_SAFE_CHECKPOINT is a hint, never an authorization bypass."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    monkeypatch.setenv("HERMES_KANBAN_SAFE_CHECKPOINT", "1")
+
+    payload = json.loads(kt._handle_checkpoint({"summary": "safe boundary"}))
+
+    assert "fresh safe-checkpoint support" in payload["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_checkpoint_fails_closed_without_a_worker_run_id(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    payload = json.loads(kt._handle_checkpoint({"summary": "safe boundary"}))
+
+    assert "HERMES_KANBAN_RUN_ID" in payload["error"]
+
+
+def test_canonical_handoff_is_recursively_redacted_and_bounded():
+    from tools import kanban_tools as kt
+
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+    handoff = kt._canonical_handoff(
+        "summary",
+        {
+            "nested": {"token": secret, "large": ["x" * 9000]},
+            "handoff": {"validation": [{"credential": secret}]},
+        },
+    )
+
+    serialized = json.dumps(handoff, ensure_ascii=False).encode("utf-8")
+    assert len(serialized) <= kt._HANDOFF_MAX_SERIALIZED_BYTES
+    assert secret not in serialized.decode("utf-8")
+    assert handoff["handoff_truncated"] is True
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -130,6 +232,50 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
+
+
+def test_checkpoint_requeues_with_canonical_handoff(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    monkeypatch.setattr(kb, "safe_checkpoint_enabled", lambda: True)
+    with kb.connect() as conn:
+        kb.advertise_dispatcher_capabilities(conn)
+
+    payload = json.loads(kt._handle_checkpoint({
+        "summary": "auth path complete; cancellation work remains",
+        "metadata": {
+            "changed_files": ["rest/copilot/v1/stream.py"],
+            "next_worker_start_here": "Add disconnect tests.",
+        },
+    }))
+
+    assert payload["ok"] is True
+    assert payload["status"] == "ready"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        run = kb.latest_run(conn, worker_env)
+        events = kb.list_events(conn, worker_env)
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert run.outcome == "checkpointed"
+    assert run.status == "released"
+    assert run.metadata["handoff"]["changed_files"] == ["rest/copilot/v1/stream.py"]
+    assert events[-1].kind == "checkpointed"
+
+
+def test_enabled_completion_uses_the_same_canonical_handoff(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    assert json.loads(kt._handle_complete({"summary": "finished slice"}))["ok"]
+
+    with kb.connect() as conn:
+        metadata = kb.latest_run(conn, worker_env).metadata
+    assert set(metadata["handoff"]) == set(kt._HANDOFF_FIELDS)
+    assert metadata["handoff"]["completed_scope"] == ["finished slice"]
 
 
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
@@ -568,6 +714,17 @@ def test_kanban_guidance_prompt_size_bounded():
     )
 
 
+def test_checkpoint_guidance_uses_config_hint_or_generic_context_pressure_line():
+    from agent.prompt_builder import kanban_guidance_with_checkpoint
+
+    assert "Checkpoint at a coherent stopping point when context pressure is high." in (
+        kanban_guidance_with_checkpoint()
+    )
+    assert "team-specific rollover cue" in kanban_guidance_with_checkpoint(
+        "team-specific rollover cue"
+    )
+
+
 def test_kanban_guidance_orchestrator_decision_ownership():
     """The orchestrator section must carry the split-brain prevention
     contract: decisions are made by the orchestrator before fan-out and
@@ -919,6 +1076,64 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert d["subscribed"] is False, d
 
     assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_create_applies_default_subscriptions(monkeypatch, worker_env):
+    """Tool-created tasks use the same create_task default-subscription seam."""
+    home = os.environ["HERMES_HOME"]
+    from pathlib import Path
+
+    Path(home, "config.yaml").write_text(
+        "kanban:\n  default_subscriptions: [slack:ops-channel]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    from tools import kanban_tools as kt
+
+    payload = json.loads(kt._handle_create({
+        "title": "tool default subscription",
+        "assignee": "peer",
+    }))
+
+    assert payload["ok"] is True
+    assert payload["subscribed"] is False
+    subs = _list_subs_for_task(payload["task_id"])
+    assert [
+        (sub["platform"], sub["chat_id"], sub["thread_id"])
+        for sub in subs
+    ] == [("slack", "ops-channel", "")]
+
+
+def test_create_dedupes_default_subscription_with_session_auto_subscribe(
+    monkeypatch, worker_env,
+):
+    """The existing auto-subscribe path keeps its delivery mode and one row."""
+    home = os.environ["HERMES_HOME"]
+    from pathlib import Path
+
+    Path(home, "config.yaml").write_text(
+        "kanban:\n  default_subscriptions: [telegram:chat-42:7]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "7")
+
+    from tools import kanban_tools as kt
+
+    payload = json.loads(kt._handle_create({
+        "title": "dedupe default and auto",
+        "assignee": "peer",
+    }))
+
+    assert payload["ok"] is True
+    assert payload["subscribed"] is True
+    subs = _list_subs_for_task(payload["task_id"])
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "notify+wake"
 
 
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):

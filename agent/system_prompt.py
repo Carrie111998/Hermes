@@ -36,6 +36,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
+    kanban_guidance_with_checkpoint,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
@@ -429,7 +430,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(_kanban_guidance)
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
+        tool_guidance.append(
+            kanban_guidance_with_checkpoint()
+            if "kanban_checkpoint" in agent.valid_tool_names
+            else KANBAN_GUIDANCE
+        )
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 

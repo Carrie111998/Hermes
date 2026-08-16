@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+import hermes_cli.gateway as gateway_cli
 from hermes_cli.gateway import _runtime_health_lines
 
 
@@ -64,6 +66,39 @@ def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypa
     assert "⚠ Last startup issue: telegram conflict" in lines
 
 
+def test_launchd_status_renders_running_code_from_runtime_state(
+    tmp_path, monkeypatch, capsys
+):
+    """The launchd-backed ``gateway status`` path must render runtime code details."""
+    plist_path = tmp_path / "ai.hermes.gateway.plist"
+    plist_path.write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+    monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+    monkeypatch.setattr(
+        gateway_cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        "gateway.status.get_running_pid", lambda cleanup_stale=False: None
+    )
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "gateway_state": "running",
+            "git_commit": "abc1234",
+            "kanban_dispatch_in_gateway": True,
+        },
+    )
+
+    gateway_cli.launchd_status()
+
+    assert (
+        "Running code: abc1234 (kanban dispatch-in-gateway: enabled)"
+        in capsys.readouterr().out
+    )
+
+
 def test_runtime_status_running_pid_validates_live_gateway_record(monkeypatch):
     from gateway import status as status_mod
 
@@ -79,5 +114,4 @@ def test_runtime_status_running_pid_validates_live_gateway_record(monkeypatch):
     monkeypatch.setattr(status_mod, "_looks_like_gateway_process", lambda pid: False)
 
     assert status_mod.get_runtime_status_running_pid(runtime) == 12345
-
 

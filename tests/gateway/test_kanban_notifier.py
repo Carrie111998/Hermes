@@ -66,6 +66,34 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
+def test_notifier_delivers_checkpoint_handoff(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "checkpoint.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="resume auth", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn,
+            tid,
+            summary="auth path complete",
+            metadata={"handoff": {"next_worker_start_here": "Add disconnect tests."}},
+            expected_run_id=task.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "checkpointed" in adapter.sent[0]["text"]
+    assert "resume auth" in adapter.sent[0]["text"]
+    assert "Add disconnect tests." in adapter.sent[0]["text"]
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:
