@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V15_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V16_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -195,10 +195,13 @@ or an equivalent write guard must preserve this increment for any prior writer
 that can mutate those columns. The mutation/genesis transaction records the
 counter before/after values in its event and updates the row marker. A row whose marker is older
 than the current generation, or whose materialized counter is greater than the
-latest journaled counter for that entity, is `UNKNOWN`, never `DRIFT`. Every
-event's before-counter must equal the immediately preceding event's
-after-counter, or the baseline's sealed counter; any discontinuity is a
-permanent history gap and returns `UNKNOWN` with `WRITE_COUNTER_GAP`. If the
+latest journaled counter for that entity, is `UNKNOWN`, never `DRIFT`. Every event's before-counter must equal the immediately preceding event's
+after-counter, or the baseline's sealed counter. A marked genesis for an
+entity with no current-epoch history is the other valid starting point: its
+before-counter adopts the observed materialized counter and its after-counter
+becomes the new epoch's starting counter. Any discontinuity after the selected
+start is a permanent history gap and returns `UNKNOWN` with
+`WRITE_COUNTER_GAP`. If the
 counters agree, the history is complete, and the replay tuple differs, the
 result may be `DRIFT` with `DRIFT_DETECTED`. This is the concrete
 discriminator between an unjournaled state advance and genuine drift. A rollback-then-roll-forward cycle therefore keeps affected entities
@@ -274,8 +277,11 @@ pre-rotation history remains `UNKNOWN` and is not bridged by this ticket.
 
 Migration rollback is forward-compatible: prior code must tolerate the journal
 table's presence and continue serving materialized rows; rollback must not
-delete the table or rewrite history. Migration compatibility tests must assert
-this posture.
+delete
+the table, counter column, or counter trigger/write-guard, and must not rewrite
+history. Any prior-version path that drops or bypasses the counter mechanism
+fails the compatibility preflight and leaves affected verification `UNKNOWN`.
+Migration compatibility tests must assert this posture.
 
 ### Gate 2 - atomic emission at the CAS chokepoint
 
@@ -295,9 +301,12 @@ this posture.
   the latest journaled after-counter (or baseline sealed counter). For a
   same-epoch ordinary mutation, a mismatch is a persisted counter gap:
   abort with mutation-side `WRITE_ABORT` before changing replay state or
-  emitting an event. A strictly newer writer-epoch re-originating genesis is
-  the explicit exception; it starts a new selected replay epoch and supersedes
-  the prior gap as defined by Gate 3.
+  emitting an event. A genesis for an entity with no current-epoch history
+  (legacy/pre-journal, post-rotation, or first post-migration entity) is also
+  exempt: it adopts the observed materialized counter as its before-counter
+  and starts a new counter-continuity epoch. A strictly newer writer-epoch
+  re-originating genesis is the other explicit exception; it starts a new
+  selected replay epoch and supersedes the prior gap as defined by Gate 3.
 - Use the caller's existing SQLite WAL connection and transaction for mutation
   and genesis events, update the materialized generation marker, and record the
   current generation in the event.
@@ -343,8 +352,9 @@ Implement a bounded verifier that:
   replay start point. Compute the start candidates as the highest valid baseline
   under the current digest identifier and the latest valid marked genesis under
   the current digest identifier, when present; select the later candidate by
-  `entity_seq`. If neither candidate exists, return `UNKNOWN`. Baseline and
-  genesis rows carry the origin epoch marker and origin-genesis sequence, so
+  `entity_seq`. If neither candidate exists, return `UNKNOWN` with
+  `LEGACY_ORIGIN_MISSING`. Baseline and genesis rows carry the origin epoch
+  marker and origin-genesis sequence, so
   current-origin validity is checked from bounded row metadata without scanning
   an unbounded pre-start prefix. Events preceding the selected start are
   ignored after that O(1) metadata check, and counter continuity is enforced
@@ -647,6 +657,25 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v15
+
+The v15 authenticated Claude Opus review returned `REVISE` with five bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Legacy, post-migration, and post-rotation genesis events explicitly adopt
+   the observed materialized counter as their new continuity starting point.
+2. Rollback compatibility protects the counter column and trigger/write-guard
+   alongside the journal table.
+3. A missing valid baseline/genesis candidate returns
+   `LEGACY_ORIGIN_MISSING`.
+4. Acceptance coverage now includes v14.
+5. The duplicate v14 changelog entry was removed.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -675,7 +704,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v13 items are incorporated into the normative
+- reconciliation v1 and v5-v14 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -712,8 +741,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   mutation-time KEY_UNAVAILABLE semantics, and complete acceptance coverage.
 - v14: replay-tuple-only counter scope, in-transaction gap refusal, explicit
   newer-epoch genesis exception, and merged replay-start validation.
-- v14: replay-tuple-only counter scope, in-transaction gap refusal, explicit
-  newer-epoch genesis exception, and merged replay-start validation.
+- v15: genesis continuity starting counters, rollback-preserved counter
+  mechanism, LEGACY_ORIGIN_MISSING binding, and corrected coverage.
 
 
 ## Non-goals
