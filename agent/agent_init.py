@@ -1871,6 +1871,14 @@ def init_agent(
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+    # Resolve once per AIAgent so config edits cannot mutate the cached prompt
+    # for a conversation that is already in progress.
+    from agent.prompt_builder import normalize_execution_mode
+
+    agent._execution_mode = normalize_execution_mode(
+        _agent_section.get("execution_mode", "rigorous")
+    )
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the

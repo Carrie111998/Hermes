@@ -391,6 +391,16 @@ class TestStringTypedConfigValues:
         saved = yaml.safe_load(_read_config(_isolated_hermes_home))
         assert saved["custom"]["enabled"] is False
 
+    def test_execution_mode_is_validated_and_normalized(self, _isolated_hermes_home):
+        set_config_value("agent.execution_mode", "FAST")
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["agent"]["execution_mode"] == "fast"
+
+        with pytest.raises(SystemExit):
+            set_config_value("agent.execution_mode", "turbo")
+
 
 # ---------------------------------------------------------------------------
 # Secret redaction in display output (issue #50245)

@@ -932,6 +932,12 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
+  # Prompt execution posture: fast | balanced | rigorous (default: rigorous).
+  # "fast" answers simple questions directly and uses tools/skills selectively;
+  # "balanced" uses them when materially useful; "rigorous" preserves the
+  # historical exhaustive execution and verification behavior.
+  # execution_mode: rigorous
+
   # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration

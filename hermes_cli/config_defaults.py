@@ -124,6 +124,10 @@ DEFAULT_CONFIG = {
         # provider hiccups on a single provider.
         "api_max_retries": 3,
         "service_tier": "",
+        # Prompt execution posture. Missing values preserve the historical
+        # exhaustive behavior through the normal defaults deep-merge.
+        # Values: "fast", "balanced", or "rigorous".
+        "execution_mode": "rigorous",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false

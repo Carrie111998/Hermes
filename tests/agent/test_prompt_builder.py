@@ -28,6 +28,9 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    build_model_execution_guidance,
+    build_task_completion_guidance,
+    build_tool_use_enforcement_guidance,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
@@ -54,6 +57,30 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_execution_guidance_is_mode_specific_and_grounded(self):
+        fast = build_model_execution_guidance("fast")
+        balanced = build_model_execution_guidance("balanced")
+        rigorous = build_model_execution_guidance("rigorous")
+
+        assert "zero to three tool calls" in fast
+        assert "arithmetic" in fast and "Git history" in fast
+        assert "reasonable chance" in balanced
+        assert "Keep calling tools until" in rigorous
+        assert rigorous == OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert len({fast, balanced, rigorous}) == 3
+
+    def test_tool_use_guidance_still_requires_stated_actions(self):
+        for mode in ("fast", "balanced", "rigorous"):
+            guidance = build_tool_use_enforcement_guidance(mode)
+            assert "action" in guidance.lower()
+            assert "tool" in guidance.lower()
+
+    def test_fast_completion_guidance_bounds_retry_and_preserves_grounding(self):
+        guidance = build_task_completion_guidance("fast")
+        assert "at most one" in guidance
+        assert "Never fabricate" in guidance
+        assert "verification" in guidance
 
 
 # =========================================================================
@@ -293,6 +320,24 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
+
+    def test_skill_loading_policy_and_cache_are_mode_specific(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "search"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: search\ndescription: Search stuff\n---\n"
+        )
+
+        fast = build_skills_system_prompt(execution_mode="fast")
+        balanced = build_skills_system_prompt(execution_mode="balanced")
+        rigorous = build_skills_system_prompt(execution_mode="rigorous")
+
+        assert "clearly relevant" in fast
+        assert "tangentially or partially relevant" in fast
+        assert "relevant and materially useful" in balanced
+        assert "even partially relevant" in rigorous
+        assert len({fast, balanced, rigorous}) == 3
 
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
@@ -988,5 +1033,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
