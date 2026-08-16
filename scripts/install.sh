@@ -2402,7 +2402,11 @@ install_node_deps() {
                     # at that read-only /nix/store path. Attempting the download there
                     # fails with EROFS instead of a helpful message, so skip it and
                     # point the user at the Nix-native path instead.
-                    if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ ! -w "${PLAYWRIGHT_BROWSERS_PATH}" ]; then
+                    #
+                    # `-e` guards against treating a not-yet-created (but writable
+                    # once mkdir'd) target dir as read-only — only a path that
+                    # *exists* and fails `-w` is the genuine /nix/store case.
+                    if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ -e "${PLAYWRIGHT_BROWSERS_PATH}" ] && [ ! -w "${PLAYWRIGHT_BROWSERS_PATH}" ]; then
                         log_warn "PLAYWRIGHT_BROWSERS_PATH ($PLAYWRIGHT_BROWSERS_PATH) is read-only — skipping npx playwright install."
                         log_info "This is expected if it points at pkgs.playwright-driver.browsers; Chromium is already available there."
                         log_info "If browser tools can't find it, add pkgs.playwright-driver.browsers to your system/home config and re-export PLAYWRIGHT_BROWSERS_PATH."
@@ -2412,7 +2416,9 @@ install_node_deps() {
                         log_info "Add it to your configuration.nix / home-manager config and set:"
                         log_info "  PLAYWRIGHT_BROWSERS_PATH = \"\${pkgs.playwright-driver.browsers}\";"
                         log_info "  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = \"1\";"
-                        log_info "Falling back to a plain download attempt for now:"
+                        log_info "Falling back to a best-effort download for now — this is NOT the supported"
+                        log_info "path on NixOS and will most likely still fail at runtime on missing system"
+                        log_info "libraries (no apt/dnf to install them from). Use pkgs.playwright-driver.browsers above instead."
                         cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install chromium || {
                             log_warn "Playwright browser installation failed — see the nixpkgs guidance above."
                         }
