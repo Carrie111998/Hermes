@@ -142,6 +142,36 @@ class TestHandleVoiceCommand:
         assert adapter._auto_tts_disabled_chats == {"123"}
 
     @pytest.mark.asyncio
+    async def test_multiplex_profile_uses_its_adapter_and_state_key(self, runner):
+        event = _make_event("/voice")
+        event.source.profile = "work"
+        primary = SimpleNamespace(
+            _auto_tts_default=True,
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats=set(),
+            _should_auto_tts_for_chat=lambda _chat_id: True,
+        )
+        secondary = SimpleNamespace(
+            _auto_tts_default=False,
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats=set(),
+            _should_auto_tts_for_chat=lambda _chat_id: False,
+        )
+        runner.adapters[event.source.platform] = primary
+        runner._adapter_for_source = (
+            lambda source: secondary if source.profile == "work" else primary
+        )
+
+        result = await runner._handle_voice_command(event)
+
+        assert result.startswith("Voice mode enabled.")
+        assert runner._voice_mode == {"work:telegram:123": "voice_only"}
+        assert secondary._auto_tts_enabled_chats == {"123"}
+        assert secondary._auto_tts_disabled_chats == set()
+        assert primary._auto_tts_enabled_chats == set()
+        assert primary._auto_tts_disabled_chats == set()
+
+    @pytest.mark.asyncio
     async def test_persistence_saved(self, runner):
         event = _make_event("/voice on")
         await runner._handle_voice_command(event)
@@ -196,6 +226,25 @@ class TestHandleVoiceCommand:
         runner._sync_voice_mode_state_to_adapter(adapter)
 
         assert adapter._auto_tts_default is True
+
+    def test_sync_scopes_voice_modes_to_the_adapter_profile(self, runner):
+        from gateway.config import Platform
+
+        runner._voice_mode = {
+            "telegram:123": "off",
+            "work:telegram:123": "all",
+        }
+        adapter = SimpleNamespace(
+            _auto_tts_default=False,
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats=set(),
+            platform=Platform.TELEGRAM,
+        )
+
+        runner._sync_voice_mode_state_to_adapter(adapter, profile="work")
+
+        assert adapter._auto_tts_disabled_chats == set()
+        assert adapter._auto_tts_enabled_chats == {"123"}
 
 
     @pytest.mark.asyncio
