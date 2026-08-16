@@ -17429,6 +17429,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        from hermes_state import SessionResumeTooLargeError
+
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
@@ -17449,6 +17451,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "⏳ Another turn is still running on this session. To "
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
+                )
+            except SessionResumeTooLargeError as exc:
+                # Same rejection shape as TurnLeaseTimeoutError just above:
+                # the transcript load was never attempted, so nothing here
+                # needs the /goal judge or a resend notice beyond this text.
+                logger.error(
+                    "Rejecting turn for routing key %s: %s", _quick_key, exc
+                )
+                return (
+                    "⚠️ This session's transcript has grown too large to "
+                    "process safely. Use /compact to compress the "
+                    "conversation, or /reset to start fresh."
                 )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -18649,9 +18663,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
-        # Load conversation history from transcript
+        # Load conversation history from transcript. Bound the load first —
+        # this hot path runs on EVERY message for a live session and, unlike
+        # the CLI/TUI resume paths (hermes_cli/cli_agent_setup_mixin.py,
+        # tui_gateway/methods_session.py) and session.history
+        # (tui_gateway/methods_session.py), it never got the
+        # assert_resume_safe() guard added this week to stop a runaway
+        # lineage from exhausting memory. A session that keeps growing while
+        # staying live in _sessions would otherwise re-materialize its full
+        # (unbounded) transcript on every single incoming message, before
+        # the hygiene auto-compress below even gets a chance to shrink it.
+        from hermes_state import SessionResumeTooLargeError
+
+        try:
+            _resume_guard = getattr(self._session_db, "assert_resume_safe", None)
+            if callable(_resume_guard):
+                await _resume_guard(session_entry.session_id)
+        except SessionResumeTooLargeError:
+            # Fail closed, matching the turn-lease-timeout early exit just
+            # above: restore the tokens before propagating, or this early
+            # exit leaks task-local identity (the broad session-context
+            # cleanup finally later in this method never runs).
+            self._clear_session_env(_session_env_tokens)
+            raise
+        except Exception:
+            # Fail OPEN on a transient guard failure (locked DB, schema skew
+            # on an old test/adaptor DB) — same posture as the resume guards
+            # this mirrors.
+            logger.debug(
+                "Resume-size guard failed for session %s; proceeding unguarded",
+                session_entry.session_id,
+                exc_info=True,
+            )
         history = await self.async_session_store.load_transcript(session_entry.session_id)
-        
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #

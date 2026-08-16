@@ -241,6 +241,58 @@ class TestPersistence:
         # Should not be found via ACP SessionManager.
         assert manager.get_session("cli-session-123") is None
 
+    def test_restore_rejects_oversized_transcript(self, manager, monkeypatch):
+        """A transcript over sessions.max_resume_messages must not be
+        materialized on ACP restore — get_session falls back to None (the
+        same "not found" shape a genuine DB error already takes), instead
+        of unconditionally loading the full lineage into memory and
+        replaying it over the connection, mirroring the CLI/TUI resume
+        guards."""
+        from hermes_state import SessionResumeTooLargeError
+
+        state = manager.create_session()
+        state.history.append({"role": "user", "content": "hi"})
+        manager.save_session(state.session_id)
+
+        with manager._lock:
+            del manager._sessions[state.session_id]
+
+        db = manager._get_db()
+        load_calls = []
+        real_get_messages = db.get_messages_as_conversation
+
+        def spy_get_messages(*args, **kwargs):
+            load_calls.append((args, kwargs))
+            return real_get_messages(*args, **kwargs)
+
+        monkeypatch.setattr(db, "get_messages_as_conversation", spy_get_messages)
+        monkeypatch.setattr(
+            db,
+            "assert_resume_safe",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                SessionResumeTooLargeError(20_001, 20_000)
+            ),
+        )
+
+        restored = manager.get_session(state.session_id)
+
+        assert restored is None
+        assert load_calls == []
+
+    def test_restore_proceeds_when_transcript_is_within_the_limit(self, manager):
+        """The new guard must not regress the ordinary restore path."""
+        state = manager.create_session()
+        state.history.append({"role": "user", "content": "hi"})
+        manager.save_session(state.session_id)
+
+        with manager._lock:
+            del manager._sessions[state.session_id]
+
+        restored = manager.get_session(state.session_id)
+
+        assert restored is not None
+        assert restored.history[-1]["content"] == "hi"
+
     def test_sessions_searchable_via_fts(self, manager):
         """ACP sessions stored in SessionDB are searchable via FTS5."""
         state = manager.create_session()

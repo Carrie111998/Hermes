@@ -541,9 +541,34 @@ class SessionManager:
         # otherwise re-fire the pre-request defensive repair on every request
         # for the rest of the session (see hermes_state.get_messages_as_conversation).
         try:
+            from hermes_state import SessionResumeTooLargeError
+
+            safety_check = getattr(db, "assert_resume_safe", None)
+            if callable(safety_check):
+                safety_check(session_id)
             history = db.get_messages_as_conversation(
                 session_id, repair_alternation=True
             )
+        except SessionResumeTooLargeError:
+            # Fail closed like the CLI/TUI resume guards this mirrors
+            # (hermes_cli/cli_agent_setup_mixin.py, tui_gateway/methods_session.py):
+            # a transcript this large would otherwise be fully materialized
+            # into memory here and then replayed message-by-message over the
+            # ACP connection on every reconnect, with no guard at all. None
+            # falls through the same "restore failed" path a genuine DB
+            # error already takes below — every caller (get_session,
+            # update_cwd, resume_session, load_session) treats it as "not
+            # found" and starts a fresh session, so an oversized session
+            # degrades the same way a corrupted one does instead of OOMing
+            # the ACP server.
+            logger.error(
+                "ACP session %s transcript too large to restore safely; "
+                "starting a fresh session instead. Raise "
+                "sessions.max_resume_messages in config.yaml (or set it to "
+                "0 to disable the guard) to restore it.",
+                session_id,
+            )
+            return None
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
