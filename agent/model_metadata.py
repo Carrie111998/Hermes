@@ -3181,6 +3181,21 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
+def _last_assistant_index(messages: "List[Dict[str, Any]]") -> int:
+    """Index of the newest assistant message, or -1.
+
+    The one turn whose thinking fields every transport may still replay —
+    see ``_NEWEST_TURN_ONLY_BUDGET_KEYS``. Shared with ContextCompressor's
+    tail-budget walks so preflight and budget accounting always agree on
+    the same "newest" definition (#73624).
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            return i
+    return -1
+
+
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
@@ -3206,14 +3221,13 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     # the threshold. Mirror _estimate_msg_budget_tokens'
     # charge_stale_thinking semantics so preflight and the tail-budget walk
     # agree on the same transcript.
-    newest_asst_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        _m = messages[i]
-        if isinstance(_m, dict) and _m.get("role") == "assistant":
-            newest_asst_idx = i
-            break
+    newest_asst_idx = _last_assistant_index(messages)
     for idx, msg in enumerate(messages):
-        if idx != newest_asst_idx and isinstance(msg, dict):
+        if (
+            idx != newest_asst_idx
+            and isinstance(msg, dict)
+            and ("reasoning" in msg or "reasoning_content" in msg)
+        ):
             msg = {
                 k: v for k, v in msg.items()
                 if k not in ("reasoning", "reasoning_content")
