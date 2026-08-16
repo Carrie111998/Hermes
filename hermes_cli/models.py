@@ -634,12 +634,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # AmbiguousAliasError rather than guessing, so listing two opus
     # generations here would break the bare `/model opus` shorthand.
     # Gemini entries validated live against a GCP project (global region,
-    # HTTP 200) as of 2026-07-21 (PR #68767).
+    # HTTP 200) as of 2026-07-21 (PR #68767); gemini-3.7-flash added and
+    # re-validated live 2026-08-15 (global only — us-central1/us-east5 404).
     "vertex": [
         "claude-opus-5",
         "claude-fable-5",
         "claude-sonnet-5",
         "google/gemini-3.1-pro-preview",
+        "google/gemini-3.7-flash",
         "google/gemini-3.6-flash",
         "google/gemini-3.5-flash",
         "google/gemini-3.5-flash-lite",
