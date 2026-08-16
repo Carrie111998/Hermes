@@ -2640,7 +2640,11 @@ class SlackAdapter(BasePlatformAdapter):
                     "ts": stream.stream_ts,
                     "chunks": chunks,
                 }
-                if fallback_text:
+                # chat.appendStream rejects payloads containing both chunks
+                # and markdown_text (cannot_provide_both_markdown_text_and_chunks).
+                # The task-card chunks are the primary payload, so only send
+                # markdown_text when there are no chunks to attach.
+                if fallback_text and not chunks:
                     append_payload["markdown_text"] = fallback_text
                 await client.api_call("chat.appendStream", json=append_payload)
                 return SendResult(success=True, message_id=stream.stream_ts)
