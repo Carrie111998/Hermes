@@ -97,12 +97,17 @@ class TestRegistration:
 
     def test_same_name_is_isolated_by_profile(self, tmp_path):
         from hermes_constants import (
+            hermes_home_key,
             reset_hermes_home_override,
             set_hermes_home_override,
         )
 
-        home_a = str((tmp_path / "secrets-a").resolve())
-        home_b = str((tmp_path / "secrets-b").resolve())
+        # Scope keys are the normalized hermes_home_key() form (the plugin
+        # path and apply_all both use it). A raw path string would differ
+        # from the normalized form on Windows (normcase lowercases), making
+        # get_source() miss the scoped registration — see #86830.
+        home_a = hermes_home_key(tmp_path / "secrets-a")
+        home_b = hermes_home_key(tmp_path / "secrets-b")
         source_a = _make_source(name="profile_secret", secrets={"A": "a"})
         source_b = _make_source(name="profile_secret", secrets={"B": "b"})
         assert reg.register_source(source_a, scope=home_a)

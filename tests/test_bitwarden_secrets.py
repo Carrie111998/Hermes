@@ -94,7 +94,9 @@ def test_platform_asset_name(system, machine, libc_text, expected):
 def _make_fake_zip(binary_bytes: bytes) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("bws", binary_bytes)
+        # Member name must match what install_bws looks up on this platform
+        # (_platform_binary_name() is "bws.exe" on Windows) — see #86830.
+        zf.writestr(bw._platform_binary_name(), binary_bytes)
     return buf.getvalue()
 
 
@@ -157,8 +159,10 @@ def test_install_bws_happy_path(hermes_home, monkeypatch):
     path = bw.install_bws()
     assert path.exists()
     assert path.read_bytes() == fake_binary
-    # Executable bit set
-    assert path.stat().st_mode & stat.S_IXUSR
+    # Executable bit set. NTFS does not reflect POSIX modes, so the assertion
+    # only holds on POSIX hosts (CONTRIBUTING: mode assertions skip on win32).
+    if sys.platform != "win32":
+        assert path.stat().st_mode & stat.S_IXUSR
 
 
 
@@ -370,8 +374,11 @@ def test_encrypted_cache_writes_without_plaintext(monkeypatch, tmp_path):
     assert not bw._disk_cache_path(home).exists()
     cache_path = bw._encrypted_disk_cache_path(home)
     assert cache_path.exists()
-    mode = stat.S_IMODE(os.stat(cache_path).st_mode)
-    assert mode == 0o600, f"expected 0o600, got 0o{mode:o}"
+    # NTFS does not enforce POSIX modes (files land at 0o666), so the 0o600
+    # assertion only holds on POSIX hosts (CONTRIBUTING) — see #86830.
+    if sys.platform != "win32":
+        mode = stat.S_IMODE(os.stat(cache_path).st_mode)
+        assert mode == 0o600, f"expected 0o600, got 0o{mode:o}"
     text = cache_path.read_text()
     assert "secret-value" not in text
     assert "0.t" not in text

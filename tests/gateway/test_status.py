@@ -299,7 +299,11 @@ class TestGetProcessStartTime:
     def test_live_process_is_stable_int(self):
         import subprocess
         import time
-        p = subprocess.Popen(["sleep", "20"])
+        # `sleep` does not exist on Windows; use the interpreter itself so
+        # the test stays cross-platform (see #86830).
+        p = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(20)"]
+        )
         try:
             a = status._get_process_start_time(p.pid)
             time.sleep(0.2)
@@ -869,6 +873,10 @@ class TestPlannedStopMarker:
 class TestReadProcessCmdlinePsFallback:
     """Tests for _read_process_cmdline falling back to ps on non-Linux."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="ps fallback is POSIX-only; Windows uses the psutil path",
+    )
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
         monkeypatch.setattr(
