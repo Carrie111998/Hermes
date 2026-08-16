@@ -127,6 +127,14 @@ export const zhHant = defineLocale({
     updateReadyMessage: count => `有 ${count} 項新變更可用。`,
     updateReadyMessageUnknown: '有新更新可用。',
     seeWhatsNew: '查看新增內容',
+    mcp: {
+      needsAuthTitle: 'MCP 伺服器需要重新驗證',
+      needsAuthMessage: name => `${name} MCP 需要重新驗證。`,
+      errorTitle: 'MCP 伺服器無法連線',
+      errorMessage: name => `${name} MCP 健康檢查失敗。`,
+      signIn: '登入',
+      view: '檢視'
+    },
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT 需要 ELEVENLABS_API_KEY。',
       elevenLabsRejectedKey: 'ElevenLabs 拒絕了該 API 金鑰 (401)。',
@@ -865,7 +873,12 @@ export const zhHant = defineLocale({
       deepLinkErrorConfig: '連結中的設定不是有效的 base64 編碼 JSON。',
       deepLinkErrorShape: '設定必須是包含字串 `url` 或 `command` 欄位的 JSON 物件。',
       deepLinkErrorUrl: '僅允許 http:// 和 https:// 伺服器網址。',
-      deepLinkErrorTooLarge: '設定內容超過 32KB 上限。'
+      deepLinkErrorTooLarge: '設定內容超過 32KB 上限。',
+      importButton: '匯入',
+      importPlaceholder: '貼上 mcp.json 片段、npx/docker 指令、claude mcp add 指令、URL 或 Cursor 連結…',
+      importNoMatch: '貼上的文字中未識別到伺服器設定。',
+      importConfirm: '加入 mcp.json',
+      importConfirmMany: count => `將 ${count} 個伺服器加入 mcp.json`
     },
     model: {
       loading: '正在載入模型設定...',

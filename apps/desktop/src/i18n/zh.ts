@@ -127,6 +127,14 @@ export const zh: Translations = {
     updateReadyMessage: count => `有 ${count} 项新更改可用。`,
     updateReadyMessageUnknown: '有新更新可用。',
     seeWhatsNew: '查看更新内容',
+    mcp: {
+      needsAuthTitle: 'MCP 服务器需要重新认证',
+      needsAuthMessage: name => `${name} MCP 需要重新认证。`,
+      errorTitle: 'MCP 服务器无法连接',
+      errorMessage: name => `${name} MCP 健康检查失败。`,
+      signIn: '登录',
+      view: '查看'
+    },
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT 需要 ELEVENLABS_API_KEY。',
       elevenLabsRejectedKey: 'ElevenLabs 拒绝了该 API key (401)。',
@@ -1112,7 +1120,12 @@ export const zh: Translations = {
       deepLinkErrorConfig: '链接中的配置不是有效的 base64 编码 JSON。',
       deepLinkErrorShape: '配置必须是包含字符串 `url` 或 `command` 字段的 JSON 对象。',
       deepLinkErrorUrl: '仅允许 http:// 和 https:// 服务器地址。',
-      deepLinkErrorTooLarge: '配置负载超过 32KB 上限。'
+      deepLinkErrorTooLarge: '配置负载超过 32KB 上限。',
+      importButton: '导入',
+      importPlaceholder: '粘贴 mcp.json 片段、npx/docker 命令、claude mcp add 命令、URL 或 Cursor 链接…',
+      importNoMatch: '粘贴的文本中未识别到服务器配置。',
+      importConfirm: '添加到 mcp.json',
+      importConfirmMany: count => `添加 ${count} 个服务器到 mcp.json`
     },
     model: {
       loading: '正在加载模型配置...',
@@ -1868,6 +1881,7 @@ export const zh: Translations = {
     showAllProfiles: '显示全部配置档案',
     switchToProfile: name => `切换到 ${name}`,
     manageProfiles: '管理配置档案…',
+    connectGateway: '连接另一个 Hermes 网关…',
     actions: '操作',
     color: '颜色…',
     colorFor: '颜色',

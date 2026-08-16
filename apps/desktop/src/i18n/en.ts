@@ -130,6 +130,14 @@ export const en: Translations = {
     updateReadyMessage: count => `${count} new change${count === 1 ? '' : 's'} available.`,
     updateReadyMessageUnknown: 'A new update is available.',
     seeWhatsNew: "See what's new",
+    mcp: {
+      needsAuthTitle: 'MCP server needs re-authentication',
+      needsAuthMessage: name => `${name} MCP needs re-authentication.`,
+      errorTitle: 'MCP server unreachable',
+      errorMessage: name => `${name} MCP failed its health check.`,
+      signIn: 'Sign in',
+      view: 'View'
+    },
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT needs ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'ElevenLabs rejected the API key (401).',
@@ -914,7 +922,12 @@ export const en: Translations = {
       deepLinkErrorConfig: 'The link\u2019s config is not valid base64-encoded JSON.',
       deepLinkErrorShape: 'The config must be a JSON object with a string `url` or `command` field.',
       deepLinkErrorUrl: 'Only http:// and https:// server URLs are allowed.',
-      deepLinkErrorTooLarge: 'The config payload exceeds the 32KB limit.'
+      deepLinkErrorTooLarge: 'The config payload exceeds the 32KB limit.',
+      importButton: 'Import',
+      importPlaceholder: 'Paste an mcp.json snippet, npx/docker command, claude mcp add line, URL, or Cursor link…',
+      importNoMatch: 'No server config recognized in the pasted text.',
+      importConfirm: 'Add to mcp.json',
+      importConfirmMany: count => `Add ${count} servers to mcp.json`
     },
     model: {
       loading: 'Loading model configuration...',
@@ -1680,6 +1693,7 @@ export const en: Translations = {
     showAllProfiles: 'Show all profiles',
     switchToProfile: name => `Switch to ${name}`,
     manageProfiles: 'Manage profiles…',
+    connectGateway: 'Connect another Hermes gateway…',
     actions: 'Actions',
     color: 'Color…',
     colorFor: 'Color',
