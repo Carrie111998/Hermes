@@ -5479,7 +5479,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return response
             reservation_id = prepared.reservation_id
         except Exception:
-            logger.debug("Trader MCP pre-trade hook failed", exc_info=True)
+            logger.exception("Trader MCP pre-trade hook failed")
+            if tool_name in {"execute_swap", "submit_gasless_swap"}:
+                return tool_error(
+                    "Trader pre-trade risk gate unavailable; live write blocked"
+                )
 
         async def _call():
             _mark_server_call_started(server)
