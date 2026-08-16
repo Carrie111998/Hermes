@@ -3831,9 +3831,12 @@ def _write_through_codex_tokens_to_global_root(
     # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
     # (mirrors the guard in _write_through_xai_oauth_to_global_root). Uses
     # the unmodified HOME env, not Path.home() which fixtures may
-    # monkeypatch.
+    # monkeypatch — and falls back to USERPROFILE because HOME is often
+    # unset on Windows, which would otherwise silently disable the guard.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
+        real_home_env = os.environ.get("HOME", "") or os.environ.get(
+            "USERPROFILE", ""
+        )
         if real_home_env:
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
