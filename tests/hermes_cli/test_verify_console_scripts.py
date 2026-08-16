@@ -117,6 +117,24 @@ class TestWarnIfHermesLauncherBroken:
 
         assert capsys.readouterr().out == ""
 
+    def test_warns_with_windows_appropriate_remedy_on_windows(
+        self, temp_pyproject, fake_scripts_dir, capsys
+    ):
+        (fake_scripts_dir / "hermes-agent").write_bytes(b"fake")
+        (fake_scripts_dir / "hermes-acp").write_bytes(b"fake")
+
+        with patch("hermes_cli.main._venv_scripts_dir", return_value=fake_scripts_dir), \
+             patch("hermes_cli.main._is_windows", return_value=True):
+            from hermes_cli.main import _warn_if_hermes_launcher_broken
+
+            _warn_if_hermes_launcher_broken()
+
+        out = capsys.readouterr().out
+        assert "ls -la" not in out
+        assert "chown" not in out
+        assert "icacls" in out
+        assert "takeown" in out
+
 
 class TestInstallPythonDependenciesWithOptionalFallback:
     """The base-install retry used to be unguarded — a failure here skipped
@@ -156,3 +174,42 @@ class TestInstallPythonDependenciesWithOptionalFallback:
         assert warned == [True]
         # First attempt was `.[all]`, second (unguarded) was bare `.`.
         assert len(calls) == 2
+
+    def test_base_install_oserror_warns_before_reraising(
+        self, temp_pyproject, fake_scripts_dir, monkeypatch
+    ):
+        """A permission error on file writes (not just a non-zero exit) must
+        also trigger the launcher-broken warning, not just CalledProcessError."""
+        import subprocess
+
+        import hermes_cli.main as main_mod
+
+        (fake_scripts_dir / "hermes-agent").write_bytes(b"fake")
+        (fake_scripts_dir / "hermes-acp").write_bytes(b"fake")
+
+        calls: list[list[str]] = []
+
+        def fake_run_quarantined_install(cmd, *, env=None, scripts_dir=None):
+            calls.append(cmd)
+            if len(calls) == 1:
+                # First attempt (`.[all]`) fails normally, falling through to
+                # the unguarded bare-`.` retry below.
+                raise subprocess.CalledProcessError(2, cmd)
+            raise PermissionError("[Errno 13] Permission denied")
+
+        warned = []
+        monkeypatch.setattr(main_mod, "_is_windows", lambda: False)
+        monkeypatch.setattr(main_mod, "_venv_scripts_dir", lambda: fake_scripts_dir)
+        monkeypatch.setattr(
+            main_mod, "_run_quarantined_install", fake_run_quarantined_install
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_warn_if_hermes_launcher_broken",
+            lambda: warned.append(True),
+        )
+
+        with pytest.raises(PermissionError):
+            main_mod._install_python_dependencies_with_optional_fallback(["uv", "pip"])
+
+        assert warned == [True]

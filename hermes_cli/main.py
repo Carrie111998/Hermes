@@ -8558,7 +8558,7 @@ def _install_python_dependencies_with_optional_fallback(
 
     try:
         _install(["install", "-e", "."])
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError):
         _warn_if_hermes_launcher_broken()
         raise
 
@@ -8712,10 +8712,17 @@ def _warn_if_hermes_launcher_broken() -> None:
         "    This usually means files under the venv are not writable by the "
         "current user (for example, a previous update or install ran under sudo)."
     )
-    print(f"    Check ownership with: ls -la {scripts_dir}")
-    print(
-        f"    If it's owned by another user, fix it with: sudo chown -R \"$(id -un)\" {scripts_dir.parent}"
-    )
+    if _is_windows():
+        print(f"    Check permissions with: icacls {scripts_dir}")
+        print(
+            "    If it's not writable by the current user, take ownership with: "
+            f"takeown /r /d y /f {scripts_dir.parent}"
+        )
+    else:
+        print(f"    Check ownership with: ls -la {scripts_dir}")
+        print(
+            f"    If it's owned by another user, fix it with: sudo chown -R \"$(id -un)\" {scripts_dir.parent}"
+        )
     print("    Then re-run `hermes update` (or the setup script) to reinstall.")
 
 
