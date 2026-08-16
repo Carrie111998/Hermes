@@ -7181,12 +7181,23 @@ def specify_triage_task(
                     int(time.time()),
                 ),
             )
-        _append_event(
-            conn,
-            task_id,
-            "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
-        )
+        # Capture the pre-overwrite title/body in the event payload. A
+        # specify pass rewrites both in place with no undo anywhere else,
+        # so without this the human's original ask is unrecoverable from
+        # the tasks table. Event JSON is the cheap store — no migration —
+        # and replaying a card's 'specified' events reconstructs every
+        # prior version in order.
+        payload: Optional[dict[str, Any]] = None
+        if changed_fields:
+            payload = {"changed_fields": changed_fields}
+            prior: dict[str, Any] = {}
+            if "title" in changed_fields:
+                prior["title"] = existing["title"]
+            if "body" in changed_fields:
+                prior["body"] = existing["body"]
+            if prior:
+                payload["prior"] = prior
+        _append_event(conn, task_id, "specified", payload)
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task

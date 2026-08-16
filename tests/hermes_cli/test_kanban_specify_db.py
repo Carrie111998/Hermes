@@ -79,3 +79,55 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+
+
+def test_specify_event_captures_prior_title_and_body(kanban_home):
+    """A specify pass overwrites title/body in place; the 'specified'
+    event must carry the exact prior values so the human's original ask
+    stays recoverable."""
+    with kb.connect() as conn:
+        tid = _create_triage(
+            conn, title="human's original ask", body="what I actually wanted"
+        )
+        kb.specify_triage_task(
+            conn,
+            tid,
+            title="Refined: machine title",
+            body="machine body",
+            author="specifier-bot",
+        )
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert set(payload["changed_fields"]) == {"title", "body"}
+    assert payload["prior"] == {
+        "title": "human's original ask",
+        "body": "what I actually wanted",
+    }
+
+
+def test_specify_twice_leaves_both_prior_versions_recoverable(kanban_home):
+    """The re-promotion path can specify the same card repeatedly. Every
+    pass must leave its own prior snapshot, so replaying the event log
+    reconstructs the full chain back to the human's text."""
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="v0 title", body="v0 body")
+        kb.specify_triage_task(conn, tid, title="v1 title", body="v1 body")
+        # Simulate a re-promotion back into triage (what the loop did).
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+        kb.specify_triage_task(conn, tid, title="v2 title", body="v2 body")
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert [e.payload["prior"] for e in events] == [
+        {"title": "v0 title", "body": "v0 body"},
+        {"title": "v1 title", "body": "v1 body"},
+    ]
+
+
+def test_specify_prior_omits_unchanged_fields(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="same title", body="old body")
+        kb.specify_triage_task(conn, tid, title="same title", body="new body")
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert events[0].payload["changed_fields"] == ["body"]
+    assert events[0].payload["prior"] == {"body": "old body"}
