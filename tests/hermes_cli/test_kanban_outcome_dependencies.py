@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 
 
@@ -169,6 +171,32 @@ def test_event_gc_preserves_conditional_approval_provenance(conn):
     assert kb.get_task(conn, child).status == "ready"
 
 
+def test_event_gc_bounds_status_provenance_to_first_invalidating_event(conn):
+    parent = _complete_review(
+        conn, outcome_code="APPROVED", subject_sha=APPROVED_SHA
+    )
+    child = _conditional_child(conn, parent)
+    kb._append_event(conn, parent, "status", {"status": "archived"})
+    kb._append_event(conn, parent, "status", {"status": "todo"})
+    kb._append_event(conn, parent, "status", {"status": "ready"})
+    kb._append_event(conn, parent, "status", {"status": "archived"})
+    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (parent,))
+    conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (parent,))
+
+    kb.gc_events(conn, older_than_seconds=1)
+
+    status_events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'status'",
+        (parent,),
+    ).fetchall()
+    assert [json.loads(event["payload"])["status"] for event in status_events] == [
+        "todo"
+    ]
+    assert kb.dependency_blockers(conn, child)[0]["reason"] == (
+        "stale_evidence_after_reopen"
+    )
+
+
 def test_review_claim_rechecks_conditional_dependencies(conn):
     parent = _complete_review(conn, outcome_code="APPROVED", subject_sha=APPROVED_SHA)
     child = _conditional_child(conn, parent)
@@ -208,6 +236,20 @@ def test_force_promotion_cannot_bypass_conditional_dependency(conn):
     assert ok is False
     assert "conditional" in error
     assert kb.get_task(conn, child).status == "todo"
+
+
+def test_promote_force_help_discloses_conditional_dependency_limit():
+    root = argparse.ArgumentParser()
+    kanban_parser = kanban_cli.build_parser(root.add_subparsers())
+    commands = next(
+        action
+        for action in kanban_parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+
+    help_text = " ".join(commands.choices["promote"].format_help().split())
+
+    assert "cannot override conditional dependencies" in help_text
 
 
 def test_manual_promotion_rechecks_evidence_inside_write_transaction(

@@ -731,7 +731,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_promote.add_argument(
         "--force",
         action="store_true",
-        help="Promote even if parent dependencies are not yet done/archived",
+        help=(
+            "Promote even if unconditional parent dependencies are not yet "
+            "done/archived; cannot override conditional dependencies"
+        ),
     )
     p_promote.add_argument(
         "--dry-run",

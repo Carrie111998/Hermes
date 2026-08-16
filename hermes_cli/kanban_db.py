@@ -5579,6 +5579,12 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    Raises:
+        ValueError: ``outcome_code`` and ``subject_sha`` are not supplied as a
+            pair, the outcome is unknown, or the subject is not a lowercase
+            full 40-hex Git SHA. Programmatic callers must validate or handle
+            this contract; malformed evidence never mutates task state.
     """
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
@@ -11692,9 +11698,11 @@ def gc_events(
 ) -> int:
     """Delete old terminal-task events while preserving approval provenance.
 
-    Structured completion events and later status changes for conditional
-    parents are part of the durable fail-closed evidence chain, not disposable
-    activity history. Running / ready / blocked tasks keep all events.
+    Structured completion events and the first invalidating status change after
+    the latest structured completion are part of the durable fail-closed
+    evidence chain, not disposable activity history. Keeping one invalidation
+    proves stale evidence without retaining unbounded status churn. Running /
+    ready / blocked tasks keep all events.
     """
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
@@ -11704,9 +11712,33 @@ def gc_events(
             "AND NOT (kind = 'completed' AND run_id IN "
             "  (SELECT id FROM task_runs WHERE outcome_code IS NOT NULL "
             "   AND subject_sha IS NOT NULL)) "
-            "AND NOT (kind = 'status' AND task_id IN "
-            "  (SELECT task_id FROM task_runs "
-            "   WHERE outcome_code IS NOT NULL OR subject_sha IS NOT NULL))",
+            "AND NOT (kind = 'status' AND id = ("
+            "  SELECT MIN(status_event.id) FROM task_events AS status_event "
+            "  WHERE status_event.task_id = task_events.task_id "
+            "    AND status_event.kind = 'status' "
+            "    AND status_event.id > ("
+            "      SELECT completion_event.id "
+            "      FROM task_runs AS latest_run "
+            "      JOIN task_events AS completion_event "
+            "        ON completion_event.run_id = latest_run.id "
+            "       AND completion_event.task_id = latest_run.task_id "
+            "       AND completion_event.kind = 'completed' "
+            "      WHERE latest_run.id = ("
+            "        SELECT candidate.id FROM task_runs AS candidate "
+            "        WHERE candidate.task_id = task_events.task_id "
+            "          AND candidate.outcome = 'completed' "
+            "          AND candidate.ended_at IS NOT NULL "
+            "        ORDER BY candidate.ended_at DESC, candidate.id DESC LIMIT 1"
+            "      ) "
+            "        AND latest_run.outcome_code IS NOT NULL "
+            "        AND latest_run.subject_sha IS NOT NULL "
+            "      ORDER BY completion_event.id DESC LIMIT 1"
+            "    ) "
+            "    AND CASE WHEN json_valid(status_event.payload) "
+            "      THEN COALESCE(json_extract(status_event.payload, '$.status'), '') "
+            "           NOT IN ('done', 'archived') "
+            "      ELSE 1 END"
+            "))",
             (cutoff,),
         )
     return int(cur.rowcount or 0)
