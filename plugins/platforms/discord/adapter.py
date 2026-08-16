@@ -1349,7 +1349,7 @@ class DiscordAdapter(BasePlatformAdapter):
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_bot
             proxy_url = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             if proxy_url:
-                logger.info("[%s] Using proxy for Discord: %s", self.name, proxy_url)
+                logger.info("[%s] Using proxy for Discord: %s", self.name, re.sub(r"://[^:@]+:[^@]+@", "://***:***@", proxy_url))
 
             # Create bot — proxy= for HTTP, connector= for SOCKS.
             # allowed_mentions is set with safe defaults (no @everyone/roles)
