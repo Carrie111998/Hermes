@@ -7,10 +7,12 @@ import { getHermesConfigDefaults, getHermesConfigRecord, saveHermesConfig } from
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import {
+  Activity,
   Archive,
   BarChart3,
   Bell,
   Download,
+  GitBranch,
   Globe,
   Info,
   Keyboard,
@@ -40,10 +42,12 @@ import { SECTIONS } from './constants'
 import { GatewaySettings } from './gateway-settings'
 import { KeybindSettings } from './keybind-settings'
 import { KEYS_VIEWS, KeysSettings, type KeysView } from './keys-settings'
+import { LlmWikiSettings } from './llm-wiki-settings'
 import { NotificationsSettings } from './notifications-settings'
 import { PluginsSettings } from './plugins-settings'
 import { PROVIDER_VIEWS, ProvidersSettings, type ProviderView } from './providers-settings'
 import { SessionsSettings } from './sessions-settings'
+import { SkillEvolutionSettings } from './skill-evolution-settings'
 import type { SettingsPageProps, SettingsView as SettingsViewId } from './types'
 
 const SETTINGS_VIEWS: readonly SettingsViewId[] = [
@@ -57,6 +61,8 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'billing',
   'plugins',
   'sessions',
+  'skill-evolution',
+  'llm-wiki',
   'about'
 ]
 
@@ -261,6 +267,20 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         onSelect: () => setActiveView('sessions')
       },
       {
+        active: activeView === 'skill-evolution',
+        icon: Activity,
+        id: 'skill-evolution',
+        label: t.settings.nav.skillEvolution,
+        onSelect: () => setActiveView('skill-evolution')
+      },
+      {
+        active: activeView === 'llm-wiki',
+        icon: GitBranch,
+        id: 'llm-wiki',
+        label: t.settings.nav.llmWiki,
+        onSelect: () => setActiveView('llm-wiki')
+      },
+      {
         active: activeView === 'about',
         gapBefore: true,
         icon: Info,
@@ -342,6 +362,10 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
             <BillingSettings />
           ) : activeView === 'plugins' ? (
             <PluginsSettings />
+          ) : activeView === 'skill-evolution' ? (
+            <SkillEvolutionSettings />
+          ) : activeView === 'llm-wiki' ? (
+            <LlmWikiSettings />
           ) : (
             <SessionsSettings />
           )}

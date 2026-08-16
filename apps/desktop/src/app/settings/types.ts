@@ -11,10 +11,12 @@ export type SettingsView =
   | 'gateway'
   | 'keybinds'
   | 'keys'
+  | 'llm-wiki'
   | 'notifications'
   | 'plugins'
   | 'providers'
   | 'sessions'
+  | 'skill-evolution'
   | `config:${string}`
 export type EnvPatch = Partial<Pick<EnvVarInfo, 'is_set' | 'redacted_value'>>
 

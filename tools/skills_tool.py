@@ -2091,3 +2091,89 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
+
+
+# ── Skill outcome reporting (2026-08) ─────────────────────────────────────
+# The agent reports whether a skill actually WORKED for the task at hand.
+# This is the missing "effectiveness" signal that feeds:
+#   - utility scoring (tools/skill_usage.record_outcome)
+#   - the evolution dashboard (GET /api/skills/evolution)
+#   - the reflection loop (agent/skill_reflection)
+# Called by the agent at the end of a task that used a skill — success,
+# failure (with error type), or unknown. Best-effort: telemetry failure
+# never breaks the tool call.
+
+SKILL_REPORT_OUTCOME_SCHEMA = {
+    "name": "skill_report_outcome",
+    "description": (
+        "Report how well a skill worked for the task that just used it. "
+        "Call this at the end of a task where you loaded a skill: outcome "
+        "'success' when the skill led to a completed task, 'failure' when it "
+        "did not (include the error type, e.g. 'api_403', 'timeout', "
+        "'missing_dependency'), 'unknown' when the result is unclear. This "
+        "feeds the skill-evolution telemetry — over time, skills that "
+        "consistently fail get flagged for improvement."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "The skill name that was used.",
+            },
+            "outcome": {
+                "type": "string",
+                "enum": ["success", "failure", "unknown"],
+                "description": "success | failure | unknown",
+            },
+            "error_type": {
+                "type": "string",
+                "description": "OPTIONAL: for failure, a short error category (e.g. 'api_403', 'timeout', 'missing_dependency').",
+            },
+        },
+        "required": ["name", "outcome"],
+    },
+}
+
+
+def _skill_report_outcome(args, **kw):
+    """Record one skill outcome into the sidecar telemetry. Best-effort."""
+    name = (args.get("name") or "").strip()
+    outcome = (args.get("outcome") or "").strip()
+    error_type = (args.get("error_type") or "").strip() or None
+    if not name or outcome not in {"success", "failure", "unknown"}:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "name and outcome (success|failure|unknown) are required",
+            }
+        )
+    try:
+        from tools.skill_usage import record_outcome
+
+        utility = record_outcome(
+            name,
+            outcome,
+            task_id=kw.get("task_id"),
+            error_type=error_type,
+        )
+        return json.dumps(
+            {
+                "success": True,
+                "skill": name,
+                "outcome": outcome,
+                "utility_score": utility,
+            }
+        )
+    except Exception as e:  # best-effort: telemetry never breaks the call
+        return json.dumps({"success": False, "error": str(e)})
+
+
+registry.register(
+    name="skill_report_outcome",
+    toolset="skills",
+    schema=SKILL_REPORT_OUTCOME_SCHEMA,
+    handler=_skill_report_outcome,
+    check_fn=check_skills_requirements,
+    emoji="📊",
+)
