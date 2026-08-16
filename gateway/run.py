@@ -1257,17 +1257,11 @@ def _ensure_ssl_certs() -> None:
             os.environ["SSL_CERT_FILE"] = candidate
             return
 
-    # 2. certifi (ships its own Mozilla bundle)
-    try:
-        import certifi
-        os.environ["SSL_CERT_FILE"] = certifi.where()
-        return
-    except ImportError:
-        pass
-
-    # 3. Common distro / macOS locations
+    # Prefer distro-managed bundles before certifi. Managed Linux hosts can
+    # add corporate/device roots to the system store; certifi intentionally
+    # contains only Mozilla roots and therefore rejects those HTTPS chains.
     for candidate in (
-        "/etc/ssl/certs/ca-certificates.crt",               # Debian/Ubuntu/Gentoo
+        "/etc/ssl/certs/ca-certificates.crt",                # Debian/Ubuntu/Gentoo
         "/etc/pki/tls/certs/ca-bundle.crt",                 # RHEL/CentOS 7
         "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", # RHEL/CentOS 8+
         "/etc/ssl/ca-bundle.pem",                            # SUSE/OpenSUSE
@@ -1279,6 +1273,14 @@ def _ensure_ssl_certs() -> None:
         if os.path.exists(candidate):
             os.environ["SSL_CERT_FILE"] = candidate
             return
+
+    # 2. certifi (ships its own Mozilla bundle)
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        return
+    except ImportError:
+        pass
 
 def _home_target_env_var(platform_name: str) -> str:
     """Return the configured home-target env var for a platform.
