@@ -115,6 +115,14 @@ describe('standing Goals', () => {
     expect($sessionDotStateById.get()['s1']).toBe('background')
   })
 
+  it('bridges a runtime Goal to its stored sidebar session', () => {
+    publishSessionState('runtime-1', { ...createClientSessionState('stored-1'), busy: false })
+    $sessions.set([storedRow('stored-1')])
+    setSessionGoal('runtime-1', { status: 'active', title: 'ship the feature', updatedAt: 0 })
+
+    expect($sessionDotStateById.get()['stored-1']).toBe('background')
+  })
+
   it('lets a live turn outrank a standing Goal', () => {
     setSessionGoal('s1', { status: 'active', title: 'ship the feature', updatedAt: 0 })
     publishSessionState('runtime-1', { ...createClientSessionState('s1'), busy: true })

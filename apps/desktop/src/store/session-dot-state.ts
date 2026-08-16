@@ -110,10 +110,23 @@ export const $sessionDotStateById = computed(
     $delegatingSessionIds,
     $unreadFinishedSessionIds,
     $draftSessionIds,
+    $sessionStates,
     $sessions,
     $unreadWriteGuard
   ],
-  (attention, goals, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
+  (
+    attention,
+    goals,
+    working,
+    stalled,
+    background,
+    delegating,
+    unread,
+    draft,
+    sessionStates,
+    sessions,
+    unreadWriteGuard
+  ) => {
     const next: Record<string, SessionDotState> = {}
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
@@ -162,12 +175,19 @@ export const $sessionDotStateById = computed(
     // A standing Goal can keep working between model turns. Treat it as
     // background work so the sidebar does not fall back to an idle dot while
     // the Goal remains active; a live turn below still upgrades it to working.
-    claim(
-      Object.entries(goals)
-        .filter(([, goal]) => goal.status === 'active' || goal.status === 'waiting')
-        .map(([id]) => id),
-      'background'
-    )
+    const standingGoalIds = new Set<string>()
+
+    for (const [runtimeId, goal] of Object.entries(goals)) {
+      if (goal.status !== 'active' && goal.status !== 'waiting') {
+        continue
+      }
+
+      for (const alias of lineageAliases(sessionStates[runtimeId]?.storedSessionId ?? runtimeId, sessions)) {
+        standingGoalIds.add(alias)
+      }
+    }
+
+    claim([...standingGoalIds], 'background')
     claim(background, 'background')
     // Async delegation: the parent turn has ended but its subagents are still
     // running, so the session's work continues in child sessions. Same visual
