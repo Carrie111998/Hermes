@@ -2080,6 +2080,26 @@ class _AnthropicCompletionsAdapter:
                 if k not in _ANTHROPIC_UNSUPPORTED_EXTRA_BODY_KEYS
                 and not str(k).startswith("_")
             }
+            # Make the degradation observable. Dropping ``response_format``
+            # silently weakens a caller's contract from schema-enforced to
+            # best-effort prompt compliance; a future caller that cannot
+            # tolerate that should be able to see it in the log rather than
+            # discover it from a malformed reply. Debug level: for the known
+            # callers (title generation, plugin json_mode) this is expected
+            # and would otherwise be per-call warning noise.
+            if logger.isEnabledFor(logging.DEBUG):
+                dropped = sorted(
+                    _ANTHROPIC_UNSUPPORTED_EXTRA_BODY_KEYS
+                    & set(caller_extra_body.keys())
+                )
+                if dropped:
+                    logger.debug(
+                        "Anthropic Messages API: dropped unsupported "
+                        "extra_body keys %s for model %s (no Messages-API "
+                        "equivalent; structured output degrades to prompt "
+                        "compliance)",
+                        dropped, model,
+                    )
             if passthrough:
                 existing = anthropic_kwargs.get("extra_body") or {}
                 if not isinstance(existing, dict):
