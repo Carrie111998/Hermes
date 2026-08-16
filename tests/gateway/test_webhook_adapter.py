@@ -104,6 +104,16 @@ def _generic_signature(body: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
+def _linear_signature(body: bytes, secret: str) -> str:
+    """Compute linear-signature (plain HMAC-SHA256 hex) for *body*.
+
+    Linear signs the raw request body with the webhook signing key and
+    delivers the result in the ``linear-signature`` header — the same
+    algorithm as the generic V1 signature, under a vendor-specific header.
+    """
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
 def _generic_v2_signature(body: bytes, secret: str, timestamp: str) -> str:
     """Compute X-Webhook-Signature-V2 (HMAC-SHA256 of "<timestamp>.<body>")."""
     signed_content = timestamp.encode() + b"." + body
@@ -149,6 +159,7 @@ class TestValidateSignature:
             "X-Hub-Signature-256",
             "X-Gitlab-Token",
             "X-Webhook-Signature",
+            "linear-signature",
         ):
             req = _mock_request(headers={header: hostile})
             # Must return False, never raise.
@@ -277,6 +288,34 @@ class TestValidateSignature:
             }
         )
         assert adapter._validate_signature(req, body, secret) is True
+
+
+    def test_validate_linear_signature_valid(self):
+        """A Linear webhook with a correct linear-signature header validates."""
+        adapter = _make_adapter()
+        body = b'{"action":"create","type":"Issue","data":{"id":"BH-1"}}'
+        secret = "lin-wh-secret"
+        sig = _linear_signature(body, secret)
+        req = _mock_request(headers={"linear-signature": sig})
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_linear_signature_tampered_rejects(self):
+        """A Linear webhook whose body was altered after signing is rejected."""
+        adapter = _make_adapter()
+        body = b'{"action":"create","type":"Issue"}'
+        secret = "lin-wh-secret"
+        sig = _linear_signature(body, secret)
+        tampered = b'{"action":"delete","type":"Issue"}'
+        req = _mock_request(headers={"linear-signature": sig})
+        assert adapter._validate_signature(req, tampered, secret) is False
+
+    def test_validate_linear_signature_wrong_secret_rejects(self):
+        """A signature computed with a different key must not validate."""
+        adapter = _make_adapter()
+        body = b'{"action":"create"}'
+        sig = _linear_signature(body, "attacker-key")
+        req = _mock_request(headers={"linear-signature": sig})
+        assert adapter._validate_signature(req, body, "real-key") is False
 
 
 # ===================================================================
