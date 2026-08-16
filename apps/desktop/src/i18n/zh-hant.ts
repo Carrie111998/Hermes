@@ -2458,7 +2458,15 @@ export const zhHant = defineLocale({
       goForward: '下一頁',
       reload: '重新載入預覽',
       address: '預覽網址',
-      navigate: '瀏覽預覽'
+      navigate: '瀏覽預覽',
+      viewport: '預覽檢視區',
+      viewportFree: '自由尺寸',
+      viewportDesktop: '桌面',
+      viewportLaptop: '筆電',
+      viewportMobile: '手機',
+      viewportWidth: '寬度',
+      viewportHeight: '高度',
+      viewportApply: '套用'
     }
   },
 

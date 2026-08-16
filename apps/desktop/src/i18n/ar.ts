@@ -2260,7 +2260,15 @@ export const ar = defineLocale({
       goForward: 'تقدم',
       reload: 'إعادة تحميل المعاينة',
       address: 'رابط المعاينة',
-      navigate: 'التنقل في المعاينة'
+      navigate: 'التنقل في المعاينة',
+      viewport: 'حجم المعاينة',
+      viewportFree: 'حجم حر',
+      viewportDesktop: 'سطح المكتب',
+      viewportLaptop: 'حاسوب محمول',
+      viewportMobile: 'جوال',
+      viewportWidth: 'العرض',
+      viewportHeight: 'الارتفاع',
+      viewportApply: 'تطبيق'
     }
   },
   zones: {

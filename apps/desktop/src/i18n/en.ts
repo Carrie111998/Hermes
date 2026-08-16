@@ -2827,7 +2827,15 @@ export const en: Translations = {
       goForward: 'Go forward',
       reload: 'Reload preview',
       address: 'Preview URL',
-      navigate: 'Navigate preview'
+      navigate: 'Navigate preview',
+      viewport: 'Preview viewport',
+      viewportFree: 'Free size',
+      viewportDesktop: 'Desktop',
+      viewportLaptop: 'Laptop',
+      viewportMobile: 'Mobile',
+      viewportWidth: 'Viewport width',
+      viewportHeight: 'Viewport height',
+      viewportApply: 'Apply'
     }
   },
 

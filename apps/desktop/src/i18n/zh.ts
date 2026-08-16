@@ -3000,7 +3000,15 @@ export const zh: Translations = {
       goForward: '前进',
       reload: '重新加载预览',
       address: '预览网址',
-      navigate: '浏览预览'
+      navigate: '浏览预览',
+      viewport: '预览视口',
+      viewportFree: '自由尺寸',
+      viewportDesktop: '桌面',
+      viewportLaptop: '笔记本',
+      viewportMobile: '手机',
+      viewportWidth: '宽度',
+      viewportHeight: '高度',
+      viewportApply: '应用'
     }
   },
 

@@ -133,6 +133,7 @@ describe('PreviewPane console state', () => {
 
     expect(rendered.getByRole('textbox', { name: 'Preview URL' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Go back' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Preview viewport' })).toBeTruthy()
     expect(rendered.container.querySelector('webview')).toBeInstanceOf(HTMLElement)
 
     forgetPreviewStripTools(tabId)

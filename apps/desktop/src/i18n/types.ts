@@ -2412,6 +2412,14 @@ export interface Translations {
       reload: string
       address: string
       navigate: string
+      viewport: string
+      viewportFree: string
+      viewportDesktop: string
+      viewportLaptop: string
+      viewportMobile: string
+      viewportWidth: string
+      viewportHeight: string
+      viewportApply: string
     }
   }
 

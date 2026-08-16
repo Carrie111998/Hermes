@@ -23,6 +23,9 @@ import { useI18n } from '@/i18n'
 import { ArrowUpRight, ChevronLeft, ChevronRight, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
+import { type ViewportMode } from './preview-viewport'
+import { PreviewViewportControl } from './preview-viewport-control'
+
 export interface PreviewToolbarProps {
   /** The address to show in the input. */
   address: string
@@ -44,6 +47,8 @@ export interface PreviewToolbarProps {
   onForward: () => void
   onReload: () => void
   onSubmit: (url: string) => void
+  onViewportChange: (next: ViewportMode) => void
+  viewport: ViewportMode
 }
 
 /**
@@ -81,7 +86,9 @@ export function PreviewToolbar({
   onBack,
   onForward,
   onReload,
-  onSubmit
+  onSubmit,
+  onViewportChange,
+  viewport
 }: PreviewToolbarProps) {
   const { t } = useI18n()
   const copy = t.preview.web
@@ -133,6 +140,7 @@ export function PreviewToolbar({
       <TooltipIconButton onClick={onReload} tooltip={copy.reload} type="button">
         <RefreshCw className={cn(loading && 'animate-spin')} />
       </TooltipIconButton>
+      <PreviewViewportControl mode={viewport} onModeChange={onViewportChange} />
     </form>
   )
 }

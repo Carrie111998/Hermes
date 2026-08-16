@@ -25,6 +25,7 @@ import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { registerPreviewPageReader } from './preview-reader'
 import { previewConsoleState, registerPreviewDevTools } from './preview-strip-tools'
 import { isHttpUrl, PreviewToolbar } from './preview-toolbar'
+import { loadViewportMode, modeSize, saveViewportMode, scaleFor, type ViewportMode } from './preview-viewport'
 
 type PreviewWebview = HTMLElement & {
   canGoBack?: () => boolean
@@ -155,7 +156,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [address, setAddress] = useState(target.url)
   const [canGoBack, setCanGoBack] = useState(false)
   const [canGoForward, setCanGoForward] = useState(false)
+  const [viewport, setViewport] = useState<ViewportMode>(() => loadViewportMode())
+  const [hostSize, setHostSize] = useState({ width: 0, height: 0 })
   const addressFocusedRef = useRef(false)
+  const guestSize = modeSize(viewport)
+  const guestScale = guestSize ? scaleFor(hostSize, guestSize) : 1
 
   // Artifacts have no URL to load — they render from the registry, never in a
   // webview.
@@ -317,6 +322,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     }
   }, [currentUrl])
 
+  const handleViewportChange = useCallback((next: ViewportMode) => {
+    setViewport(next)
+    saveViewportMode(next)
+  }, [])
+
   const appendConsoleEntry = useCallback(
     (entry: Omit<ConsoleEntry, 'id'>) => {
       consoleShouldStickRef.current = isNearConsoleBottom(consoleBodyRef.current)
@@ -420,6 +430,24 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       }
     })
   }, [isWebPreview, tabId])
+
+  useEffect(() => {
+    const host = previewContentRef.current
+
+    if (!host || typeof ResizeObserver === 'undefined') {
+      return
+    }
+
+    const apply = () => {
+      setHostSize({ width: host.clientWidth, height: host.clientHeight })
+    }
+
+    apply()
+    const observer = new ResizeObserver(apply)
+    observer.observe(host)
+
+    return () => observer.disconnect()
+  }, [])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -761,7 +789,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             onForward={goForward}
             onReload={reloadPreview}
             onSubmit={submitAddress}
+            onViewportChange={handleViewportChange}
             placeholder={currentUrl || copy.fallbackTitle}
+            viewport={viewport}
           />
         )}
         {!embedded && !isWebPreview && target.kind === 'file' && target.previewKind === 'html' && (
@@ -793,9 +823,20 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           <div
             className={cn(
               'absolute inset-0 flex bg-transparent',
+              guestSize && 'items-start justify-center overflow-hidden',
               (isRemoteHtml || !isWebPreview || loadError) && 'pointer-events-none opacity-0'
             )}
             ref={hostRef}
+            style={
+              guestSize
+                ? {
+                    width: guestSize.width,
+                    height: guestSize.height,
+                    transform: `scale(${guestScale})`,
+                    transformOrigin: 'top center'
+                  }
+                : undefined
+            }
           />
           {isRemoteHtml && (
             <iframe

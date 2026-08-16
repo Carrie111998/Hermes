@@ -16,7 +16,9 @@ const baseProps = {
   onBack: vi.fn(),
   onForward: vi.fn(),
   onReload: vi.fn(),
-  onSubmit: vi.fn()
+  onSubmit: vi.fn(),
+  onViewportChange: vi.fn(),
+  viewport: { kind: 'free' as const }
 }
 
 afterEach(() => {
