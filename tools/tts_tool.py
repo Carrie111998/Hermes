@@ -1543,6 +1543,41 @@ def _tts_instructions_overhead(
     return 0
 
 
+def _tts_text_chunk_limit(
+    provider: Optional[str],
+    instructions: str,
+    tts_config: Optional[Dict[str, Any]],
+    max_length: int,
+) -> int:
+    """Return the largest transcript chunk that fits the provider request."""
+    key = (provider or "").lower().strip()
+    cfg = tts_config if isinstance(tts_config, dict) else {}
+
+    if key == "gemini":
+        gemini_config = _get_provider_section(cfg, "gemini")
+        persona_prompt = _read_gemini_persona_prompt(gemini_config)
+        if persona_prompt or instructions:
+            lower = 0
+            upper = max_length
+            while lower < upper:
+                candidate = (lower + upper + 1) // 2
+                prompt = _compose_gemini_tts_prompt(
+                    "x" * candidate,
+                    gemini_config,
+                    persona_prompt=persona_prompt,
+                    instructions=instructions,
+                )
+                if len(prompt) <= max_length:
+                    lower = candidate
+                else:
+                    upper = candidate - 1
+
+            return max(1, lower)
+
+    overhead = _tts_instructions_overhead(provider, instructions, cfg)
+    return max(1, max_length - overhead)
+
+
 def _tts_instructions_applied(
     provider: Optional[str],
     instructions: str,
@@ -1567,12 +1602,7 @@ def _tts_instructions_applied(
         return True
 
     if key == "xai":
-        xai_cfg = _get_provider_section(cfg, "xai")
-        auto_tags = _xai_bool_config(
-            xai_cfg.get("auto_speech_tags", xai_cfg.get("speech_tags")),
-            DEFAULT_XAI_AUTO_SPEECH_TAGS,
-        )
-        return bool(_xai_instructions_wrap_tag(instructions)) or auto_tags
+        return bool(_xai_instructions_wrap_tag(instructions))
 
     if key == "elevenlabs":
         el_cfg = _get_provider_section(cfg, "elevenlabs")
@@ -1581,15 +1611,6 @@ def _tts_instructions_applied(
 
     if key == "minimax":
         return instructions.lower() in _MINIMAX_TTS_EMOTIONS
-
-    if key and key not in BUILTIN_TTS_PROVIDERS:
-        # Plugin-registered provider: instructions were forwarded via the
-        # ``**extra`` contract. Mirrors _plugin_provider_is_voice_compatible.
-        try:
-            from agent.tts_registry import get_provider
-            return get_provider(key) is not None
-        except Exception:  # noqa: BLE001 — registry lookup is best-effort
-            return False
 
     return False
 
@@ -3887,13 +3908,15 @@ def text_to_speech_tool(
     tts_config = dict(tts_config)
     tts_config["instructions"] = instructions
 
-    # Inline renderings (xAI wrap, ElevenLabs prefix) are applied per chunk
-    # inside the provider functions, so budget their overhead into the split
-    # cap to keep every rendered chunk within the provider request limit.
+    # Budget every provider-side rendering before splitting. Gemini composes
+    # a prompt around the transcript; xAI and ElevenLabs add inline syntax.
     max_len = _resolve_max_text_length(provider, tts_config)
-    overhead = _tts_instructions_overhead(provider, instructions, tts_config)
-    if overhead:
-        max_len = max(1, max_len - overhead)
+    max_len = _tts_text_chunk_limit(
+        provider,
+        instructions,
+        tts_config,
+        max_len,
+    )
     chunks = _split_text_for_tts(text, max_len)
     if not chunks:
         return tool_error("Text is required", success=False)
