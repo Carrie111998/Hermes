@@ -1,6 +1,6 @@
 # Hermes Dispatcher/Worker Isolation — Design & Safety Spec (P0-A)
 
-Status: implemented locally (kanban P0-A), design spec for review
+Status: design spec for review — implementation landed locally (kanban P0-A) and is *not* part of this PR; sections marked "design-pending" describe behavior not yet surfaced in the in-tree implementation
 Author: Nei (Knowledge & Continuity) — drafted for the Hyraxknot Division, deliberately project-agnostic
 Scope: any deployment of the Hermes kanban dispatcher (gateway-hosted or standalone daemon)
 
@@ -90,18 +90,32 @@ process launch:
   run/env dir, and passed via `--property=EnvironmentFile=`. Secrets
   reach the worker through the file, never the command line. Stale env
   files are cleaned by `kanban gc`.
+  *POSIX scope:* the 0600 permission promise applies to POSIX hosts;
+  non-POSIX hosts (e.g. Windows) should not rely on it. The argv guard
+  is a heuristic — an env var whose name does not match the regex and
+  whose value is short-but-sensitive (e.g. a 20-char token) is not
+  caught; the fail-closed abort remains the safety backstop, and
+  operators should treat any env var whose value may be sensitive as
+  load-bearing regardless of the heuristic.
 
 ## 6. Restart, adoption, drain semantics
 
 - **Restart** — restarting a gateway restarts only the gateway unit.
   In-flight workers (own cgroup) keep running and keep their claims. The
-  new dispatcher generation sees them and **adopts** them:
-  `DispatchResult.adopted` surfaces every running task with a live,
-  host-local PID and intact claim. Crash detection runs first, so dead
-  workers are reclaimed, not adopted.
+  new dispatcher generation sees them and **adopts** them: surviving
+  workers are left untouched — crash detection runs first
+  (`detect_crashed_workers`, `release_stale_claims`), so dead workers are
+  reclaimed, not adopted. Broken-claim orphans are requeued by
+  `reconcile_orphaned_running`, which defers requeue while the recorded
+  PID is alive on this host (never spawns a duplicate beside a live
+  worker).
 - **Adoption** — adopted workers are left untouched; their claims stay
-  valid, their units keep running. Telemetry / CLI / dashboard can see
-  the adoption so operators know a generation changed under them.
+  valid, their units keep running. *Design-pending:* the spec proposes
+  `DispatchResult.adopted` (every running task with a live, host-local
+  PID and intact claim) as telemetry so operators can see a generation
+  changed under them; that field is not yet present in the in-tree
+  `DispatchResult` (current observable signals: `reconciled_orphans`,
+  `reclaimed`, `crashed`).
 - **Drain** — SIGINT/SIGTERM (or `drain_on_start`) puts the dispatcher
   into draining mode: `spawn_allowed=False` (no new claims) while
   reclaim/promote continue, so already-queued work still progresses.
@@ -182,5 +196,8 @@ then may real traffic ride the same path.
 - [ ] Backup/rollback procedure is rehearsed on a throwaway tree, not
       just documented (§7).
 - [ ] Pre-restart gate conditions are checkable, not aspirational (§8).
+      *Design-pending:* no automated enforcement ships with this PR —
+      see the tracking item for wiring a check into `kanban gc`/tests.
 - [ ] Terminology matches the implementation (`kanban_isolation.py`,
-      `DispatchResult.adopted`, claim fields, wake file path).
+      `DispatchResult` fields as they exist today, claim fields, wake
+      file path).
