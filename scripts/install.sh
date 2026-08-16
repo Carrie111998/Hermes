@@ -2394,6 +2394,30 @@ install_node_deps() {
                         log_warn "Playwright browser installation failed — install dependencies above and retry."
                     }
                     ;;
+                nixos)
+                    # NixOS has no apt/dnf/pacman for Playwright to shell out to, and
+                    # `npx playwright install chromium` downloads into
+                    # $PLAYWRIGHT_BROWSERS_PATH — which, on a system that already
+                    # provides `pkgs.playwright-driver.browsers`, is typically pointed
+                    # at that read-only /nix/store path. Attempting the download there
+                    # fails with EROFS instead of a helpful message, so skip it and
+                    # point the user at the Nix-native path instead.
+                    if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ ! -w "${PLAYWRIGHT_BROWSERS_PATH}" ]; then
+                        log_warn "PLAYWRIGHT_BROWSERS_PATH ($PLAYWRIGHT_BROWSERS_PATH) is read-only — skipping npx playwright install."
+                        log_info "This is expected if it points at pkgs.playwright-driver.browsers; Chromium is already available there."
+                        log_info "If browser tools can't find it, add pkgs.playwright-driver.browsers to your system/home config and re-export PLAYWRIGHT_BROWSERS_PATH."
+                    else
+                        log_warn "Playwright does not support automatic dependency installation on NixOS."
+                        log_info "Chromium's system libraries are best supplied via pkgs.playwright-driver.browsers (nixpkgs) rather than 'npx playwright install'."
+                        log_info "Add it to your configuration.nix / home-manager config and set:"
+                        log_info "  PLAYWRIGHT_BROWSERS_PATH = \"\${pkgs.playwright-driver.browsers}\";"
+                        log_info "  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = \"1\";"
+                        log_info "Falling back to a plain download attempt for now:"
+                        cd "$INSTALL_DIR" && run_playwright_install 600 npx playwright install chromium || {
+                            log_warn "Playwright browser installation failed — see the nixpkgs guidance above."
+                        }
+                    fi
+                    ;;
                 *)
                     log_warn "Playwright does not support automatic dependency installation on $DISTRO."
                     log_info "Install Chromium/browser system dependencies for your distribution, then run:"
