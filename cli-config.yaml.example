@@ -43,6 +43,7 @@ model:
   #   "nous-api"     - Nous Portal API key (requires: NOUS_API_KEY)
   #   "anthropic"    - Direct Anthropic API (requires: ANTHROPIC_API_KEY)
   #   "openai-codex" - OpenAI Codex (requires: hermes auth)
+  #   "prime-agent"  - Prime Agent local ACP bridge (requires: prime-agent on PATH)
   #   "copilot"      - GitHub Copilot / GitHub Models (requires: GITHUB_TOKEN)
   #   "gemini"      - Use Google AI Studio direct (requires: GOOGLE_API_KEY or GEMINI_API_KEY)
   #   "zai"         - Use z.ai / ZhipuAI GLM models (requires: GLM_API_KEY)
@@ -72,6 +73,10 @@ model:
   # API configuration (falls back to OPENROUTER_API_KEY env var)
   # api_key: "your-key-here"  # Uncomment to set here instead of .env
   base_url: "https://openrouter.ai/api/v1"
+
+  # Prime Agent launch overrides (used only when provider is "prime-agent"):
+  # acp_command: "/absolute/path/to/prime-agent"
+  # acp_args: ["--mode", "acp"]
 
   # Azure Foundry keyless auth example:
   # provider: "azure-foundry"

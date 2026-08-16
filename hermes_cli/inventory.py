@@ -635,6 +635,15 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
             if _raw_config_has_enabled_moa_preset():
                 kept.append(row)
             continue
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY, get_external_process_provider_status
+            pconfig = PROVIDER_REGISTRY.get(slug)
+            if pconfig and pconfig.auth_type == "external_process":
+                if get_external_process_provider_status(slug).get("configured"):
+                    kept.append(row)
+                    continue
+        except Exception:
+            pass
         if is_provider_explicitly_configured(slug):
             kept.append(row)
     return kept

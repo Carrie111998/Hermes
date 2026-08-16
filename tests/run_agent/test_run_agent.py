@@ -5376,7 +5376,7 @@ def test_aiagent_uses_copilot_acp_client():
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI") as mock_openai,
-        patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
+        patch("agent.acp_client.ACPClient") as mock_acp_client,
     ):
         acp_client = MagicMock()
         mock_acp_client.return_value = acp_client
@@ -5399,6 +5399,37 @@ def test_aiagent_uses_copilot_acp_client():
     assert mock_acp_client.call_args.kwargs["api_key"] == "copilot-acp"
     assert mock_acp_client.call_args.kwargs["command"] == "/usr/local/bin/copilot"
     assert mock_acp_client.call_args.kwargs["args"] == ["--acp", "--stdio"]
+
+
+def test_acp_provider_gpt5_model_stays_on_chat_completions():
+    """A gpt-5* model on an ACP provider must not auto-upgrade to Responses.
+
+    Prime Agent advertises gpt-5.6-luna; the generic gpt-5 → codex_responses
+    upgrade would bypass ACPClient (which has no Responses surface) whenever
+    api_mode is re-derived (e.g. delegate_task model overrides).
+    """
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+        patch("agent.acp_client.ACPClient") as mock_acp_client,
+    ):
+        mock_acp_client.return_value = MagicMock()
+
+        agent = AIAgent(
+            api_key="copilot-acp",
+            base_url="acp://prime-agent",
+            provider="prime-agent",
+            model="gpt-5.6-luna",
+            acp_command="/usr/local/bin/prime-agent",
+            acp_args=["--mode", "acp"],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    mock_openai.assert_not_called()
+    assert agent.api_mode == "chat_completions"
 
 
 def test_quiet_spinner_allowed_with_explicit_print_fn(agent):

@@ -149,6 +149,39 @@ class TestSwitchModelReloadsCredentialPool:
         assert agent._credential_pool is new_pool
         assert agent._credential_pool.provider == "groq"
 
+
+class TestSwitchModelPreservesExternalProcessLaunch:
+    def test_switch_to_prime_agent_uses_resolved_command(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        executable = home / ".local" / "bin" / "prime-agent"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
+        hermes_home = home / ".hermes"
+        hermes_home.mkdir()
+
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        agent = _make_agent("openai-codex", "gpt-old", None)
+        agent._create_openai_client = MagicMock(return_value=MagicMock())
+
+        with patch("agent.credential_pool.load_pool", return_value=None):
+            switch_model(
+                agent,
+                new_model="deepseek-v4-pro",
+                new_provider="prime-agent",
+                api_key="copilot-acp",
+                base_url="acp://prime-agent",
+                api_mode="chat_completions",
+            )
+
+        assert agent.acp_command == str(executable)
+        assert agent.acp_args == ["--mode", "acp"]
+        assert agent._client_kwargs["command"] == str(executable)
+        assert agent._client_kwargs["args"] == ["--mode", "acp"]
+
     def test_recover_pool_mismatch_guard_no_longer_trips_after_switch(self):
         """End-to-end: after a provider switch, recover_with_credential_pool
         must not skip rotation due to a provider mismatch.

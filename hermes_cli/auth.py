@@ -244,6 +244,13 @@ class ProviderConfig:
     api_key_env_vars: tuple = ()
     # Optional env var for base URL override
     base_url_env_var: str = ""
+    # Local subprocess launch metadata. Command/args may be overridden in the
+    # matching model: config.yaml entry; env names are retained only for
+    # existing provider compatibility.
+    process_default_command: str = ""
+    process_default_args: tuple = ()
+    process_command_env: str = ""
+    process_args_env: str = ""
 
 
 PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
@@ -304,6 +311,18 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+        process_default_command="copilot",
+        process_default_args=("--acp", "--stdio"),
+        process_command_env="HERMES_COPILOT_ACP_COMMAND",
+        process_args_env="HERMES_COPILOT_ACP_ARGS",
+    ),
+    "prime-agent": ProviderConfig(
+        id="prime-agent",
+        name="Prime Agent",
+        auth_type="external_process",
+        inference_base_url="acp://prime-agent",
+        process_default_command="prime-agent",
+        process_default_args=("--mode", "acp"),
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -7095,24 +7114,89 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_external_process_launch(
+    provider_id: str,
+    pconfig: ProviderConfig,
+) -> tuple[str, list[str]]:
+    """Resolve a subprocess provider's command and args from model config.
+
+    ``model.acp_command`` and ``model.acp_args`` are honored only when the
+    configured provider matches ``provider_id``. Existing Copilot environment
+    overrides remain supported for compatibility; new providers should use
+    config.yaml instead of adding user-facing behavioral environment variables.
+    """
+    model_cfg: Dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config
+
+        loaded = load_config().get("model")
+        if isinstance(loaded, dict):
+            model_cfg = loaded
+    except Exception:
+        pass
+
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    command_value = model_cfg.get("acp_command")
+    args_value = model_cfg.get("acp_args")
+    if configured_provider == provider_id and isinstance(command_value, str) and command_value.strip():
+        command = command_value.strip()
+    elif pconfig.process_command_env:
+        command = os.getenv(pconfig.process_command_env, "").strip()
+    else:
+        command = ""
+    command = command or pconfig.process_default_command
+
+    if configured_provider == provider_id and args_value is not None:
+        if isinstance(args_value, str):
+            args = shlex.split(args_value)
+        elif isinstance(args_value, (list, tuple)):
+            args = [str(value) for value in args_value]
+        else:
+            args = []
+    elif pconfig.process_args_env:
+        raw_args = os.getenv(pconfig.process_args_env, "").strip()
+        args = shlex.split(raw_args) if raw_args else list(pconfig.process_default_args)
+    else:
+        args = list(pconfig.process_default_args)
+    return command, args
+
+
+def _resolve_external_process_command(command: str) -> Optional[str]:
+    """Resolve an ACP executable, including standard user-local bins.
+
+    Desktop applications commonly inherit the graphical session's minimal
+    PATH rather than the user's interactive-shell PATH. Commands installed by
+    pipx, npm, uv, or another user-local package manager therefore live at
+    ``~/.local/bin`` but remain invisible to ``shutil.which``. Probe that
+    standard location without mutating the process environment.
+    """
+    command = os.path.expanduser(str(command or "").strip())
+    if not command:
+        return None
+
+    resolved = shutil.which(command)
+    if resolved or os.path.dirname(command):
+        return resolved
+
+    for directory in (Path.home() / ".local" / "bin", Path.home() / "bin"):
+        candidate = directory / command
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    command, args = _resolve_external_process_launch(provider_id, pconfig)
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    resolved_command = shutil.which(command) if command else None
+    resolved_command = _resolve_external_process_command(command)
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
@@ -7142,7 +7226,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "prime-agent"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7332,20 +7416,14 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
+    command, args = _resolve_external_process_launch(provider_id, pconfig)
+    error_name = pconfig.name
+    resolved_command = _resolve_external_process_command(command)
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the {error_name} command '{command}'.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_external_process",
         )
 
     return {

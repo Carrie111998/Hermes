@@ -2483,12 +2483,15 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
-        from agent.copilot_acp_client import CopilotACPClient
+    base_url = str(client_kwargs.get("base_url", ""))
+    if agent.provider in {"copilot-acp", "prime-agent"} or base_url.startswith(
+        ("acp://copilot", "acp://prime-agent")
+    ):
+        from agent.acp_client import ACPClient
 
-        client = CopilotACPClient(**client_kwargs)
+        client = ACPClient(provider=agent.provider, **client_kwargs)
         _ra().logger.info(
-            "Copilot ACP client created (%s, shared=%s) %s",
+            "ACP client created (%s, shared=%s) %s",
             reason,
             shared,
             agent._client_log_context(),
@@ -2652,6 +2655,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
+            "acp_command",
+            "acp_args",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -2804,6 +2809,20 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "api_key": effective_key,
                 "base_url": effective_base,
             }
+            if new_norm_provider in {"copilot-acp", "prime-agent"}:
+                # Model switches rebuild _client_kwargs from scratch. Preserve
+                # the external-process launch metadata too; otherwise ACPClient
+                # falls back to a bare command name, which desktop PATHs often
+                # cannot resolve even though setup/status found the executable.
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+
+                _process_runtime = resolve_external_process_provider_credentials(
+                    new_norm_provider
+                )
+                agent.acp_command = _process_runtime.get("command") or None
+                agent.acp_args = list(_process_runtime.get("args") or [])
+                agent._client_kwargs["command"] = agent.acp_command
+                agent._client_kwargs["args"] = agent.acp_args
             try:
                 from hermes_cli.config import (
                     apply_custom_provider_tls_to_client_kwargs,
