@@ -32,11 +32,14 @@ NOT emitted here.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from providers import register_provider
 from providers.base import ProviderProfile
+
+logger = logging.getLogger(__name__)
 
 _GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
 
@@ -136,6 +139,18 @@ class ZaiProfile(ProviderProfile):
             enabled = reasoning_config.get("enabled") is not False
             if enabled or not _is_glm_5_3(model):
                 extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+            else:
+                # GLM-5.3 ignores thinking.disabled (no error, thinking
+                # still runs server-side).  The user's "disable reasoning"
+                # preference is a silent no-op on this wire — say so at
+                # debug level so it isn't mistaken for a wiring bug
+                # (review point on PR #86433).  reasoning_effort below is
+                # 5.3's actual effort control.
+                logger.debug(
+                    "zai: reasoning disabled for %s but GLM-5.3 ignores "
+                    "thinking.disabled on the OpenAI-compat wire; leaving "
+                    "server default (thinking on)", model,
+                )
 
         if _supports_reasoning_effort(model):
             effort = _reasoning_effort_for_config(reasoning_config)

@@ -720,25 +720,15 @@ def needs_reasoning_echo(provider: Any, model: Any, base_url: Any) -> bool:
 
 def apply_reasoning_content_policy(
     source_msg: dict, api_msg: dict, needs_thinking_pad: bool,
-    family: str | None = None,
 ) -> None:
     """Copy provider-facing reasoning fields onto an API replay message.
 
     ``needs_thinking_pad`` is the require-side flag (see
     ``needs_reasoning_echo`` / the agent's cached
     ``_needs_thinking_reasoning_pad``). Mutates ``api_msg`` in place.
-
-    ``family`` names the matched echo family when a caller supplies one
-    (``"kimi"``, ``"deepseek"``, ``"mimo"``), else ``None``.  Reserved for
-    soft echo families (zai Preserved Thinking, issue #11483) that must
-    replay real reasoning but never fabricate pads — no such family is
-    wired yet (see the direction-table comment above).  ``family=None``
-    keeps today's exact behavior.
     """
     if source_msg.get("role") != "assistant":
         return
-    # No soft family is active today; strict semantics for everyone.
-    strict = family is None or family != "__soft__"
 
     # 1. Explicit reasoning_content already set.
     #
@@ -782,7 +772,6 @@ def apply_reasoning_content_policy(
     normalized_reasoning = source_msg.get("reasoning")
     if (
         needs_thinking_pad
-        and strict
         and source_msg.get("tool_calls")
         and isinstance(normalized_reasoning, str)
         and normalized_reasoning
@@ -811,7 +800,7 @@ def apply_reasoning_content_policy(
     # Pro tightened validation and rejects empty string with HTTP 400
     # ("The reasoning content in the thinking mode must be passed back
     # to the API"). Refs #17341.
-    if needs_thinking_pad and strict:
+    if needs_thinking_pad:
         api_msg["reasoning_content"] = " "
         return
 
@@ -822,7 +811,7 @@ def apply_reasoning_content_policy(
 
 
 def reapply_reasoning_echo(
-    api_messages: list, needs_thinking_pad: bool, family: str | None = None
+    api_messages: list, needs_thinking_pad: bool,
 ) -> int:
     """Re-pad (or strip) assistant turns' reasoning_content for the active provider.
 
@@ -860,7 +849,7 @@ def reapply_reasoning_echo(
             if api_msg.get("reasoning_content"):
                 continue
             apply_reasoning_content_policy(
-                api_msg, api_msg, needs_thinking_pad, family=family
+                api_msg, api_msg, needs_thinking_pad
             )
             if api_msg.get("reasoning_content"):
                 changed += 1

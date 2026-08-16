@@ -126,6 +126,36 @@ class TestZaiGlm53:
         )
         assert extra_body == {}
 
+    def test_disabled_on_5_3_logs_noop(self, zai_profile, caplog):
+        """The silent no-op is surfaced at debug level so a config that
+        appears to do nothing isn't mistaken for a wiring bug
+        (review point on PR #86433)."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="plugins.model_providers.zai"):
+            zai_profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": False},
+                model="glm-5.3",
+            )
+        assert any(
+            "ignores thinking.disabled" in r.message for r in caplog.records
+        ), caplog.records
+
+    def test_no_spurious_log_when_thinking_emitted(self, zai_profile, caplog):
+        """Control: the debug line fires only on the 5.3 no-op path —
+        normal emits (disabled on a model that honors it) stay quiet."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="plugins.model_providers.zai"):
+            extra_body, _ = zai_profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": False},
+                model="glm-4.5",
+            )
+        assert extra_body == {"thinking": {"type": "disabled"}}
+        assert not any(
+            "ignores thinking.disabled" in r.message for r in caplog.records
+        ), caplog.records
+
     def test_context_length_registered(self):
         from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
 
