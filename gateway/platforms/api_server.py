@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
+- GET  /api/remote/sessions        — list open sessions available for remote attach
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
@@ -52,6 +53,7 @@ from functools import wraps
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -2062,6 +2064,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("GET", "/api/remote/sessions", self._handle_remote_sessions),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3265,6 +3268,73 @@ class APIServerAdapter(BasePlatformAdapter):
             "platform": "api_server",
             "data": data,
         })
+
+    # ------------------------------------------------------------------
+    # /api/remote — remote-attach discovery
+    # ------------------------------------------------------------------
+
+    async def _handle_remote_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/remote/sessions — list sessions available for attachment."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+
+        sessions = await asyncio.to_thread(
+            db.list_sessions_rich,
+            limit=-1,
+            order_by_last_active=True,
+            compact_rows=True,
+        )
+
+        # Both registries hold live agents, but cover different entry paths:
+        # _shutdown_interruptible_agents tracks direct API turns while
+        # _active_run_agents also covers /v1/runs executors.
+        active_agents = list(self._shutdown_interruptible_agents.values())
+        active_agents.extend(self._active_run_agents.values())
+        active_session_ids = set()
+        for agent in active_agents:
+            session_id = getattr(agent, "session_id", None)
+            if isinstance(session_id, str) and session_id:
+                active_session_ids.add(session_id)
+
+        from gateway.status import normalize_updated_at
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = _api_request_profile.get() or get_active_profile_name() or "default"
+        attachable = []
+        for session in sessions:
+            if session.get("ended_at") is not None:
+                continue
+            session_id = session.get("id")
+            attachable.append(
+                {
+                    "id": session_id,
+                    "title": session.get("title"),
+                    "status": (
+                        "active" if session_id in active_session_ids else "idle"
+                    ),
+                    "updated_at": normalize_updated_at(
+                        session.get("last_active") or session.get("started_at")
+                    ),
+                }
+            )
+
+        return web.json_response(
+            {
+                "hostname": socket.gethostname(),
+                "profile": profile,
+                "sessions": attachable,
+            }
+        )
 
     # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
