@@ -2938,8 +2938,14 @@ class PluginContext:
 
         Hermes' Teams adapter dispatches card invokes whose
         ``data.hermes_action`` matches ``hermes_action`` to the callback
-        (after the built-in approval actions). Use this for firm-specific
-        workflows (e.g. claim a referral) without patching the adapter.
+        **before** the built-in approval actions (so custom actions do not
+        need a ``session_key``). Use this for plugin workflows (e.g. claim
+        a referral) without patching the adapter.
+
+        When several plugins register the same ``hermes_action``, handlers
+        run in registration order; the first non-``None`` return wins. A
+        handler that raises soft-fails immediately (error status to Teams)
+        and does not fall through to later handlers.
 
         Callback signature::
 
@@ -2947,11 +2953,16 @@ class PluginContext:
                 # ctx: ActivityContext for the card invoke
                 # data: action.data dict from the Adaptive Card
                 # adapter: TeamsAdapter instance
-                # Return a short status string, an AdaptiveCard / card dict,
-                # an InvokeResponse, or None to decline the match.
+                # Return a short status string, an AdaptiveCard SDK object
+                # (full card replace), a raw AdaptiveCard dict (status text
+                # from the first TextBlock only), an InvokeResponse, or
+                # None to decline the match and try the next handler.
 
         Args:
             hermes_action: Exact ``data.hermes_action`` string to match.
+                Avoid colliding with built-in approval ids
+                (``approve_once``, ``approve_session``, ``approve_always``,
+                ``deny``) — a matching plugin handler shadows them.
             callback: Async callable receiving ``ctx``, ``data``, ``adapter``.
 
         Raises:
@@ -5357,8 +5368,9 @@ class PluginManager:
     def get_teams_card_action_handlers(self) -> List[tuple]:
         """Return plugin-registered Teams Adaptive Card action handlers.
 
-        Each entry is a ``(hermes_action, callback, plugin_name)`` tuple.
-        Consumed by the Teams adapter on ``Action.Execute`` invokes.
+        Each entry is a ``(hermes_action, callback, plugin_name)`` tuple in
+        registration order (first registered first). Consumed by the Teams
+        adapter on ``Action.Execute`` invokes; first non-``None`` result wins.
 
         Plugins register handlers via
         :meth:`PluginContext.register_teams_card_action_handler`.

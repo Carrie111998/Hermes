@@ -185,10 +185,10 @@ class TestRegisterTeamsCardActionHandlerAPI:
         async def cb(*, ctx, data, adapter):  # pragma: no cover
             return "ok"
 
-        ctx.register_teams_card_action_handler("claim_referral", cb)
+        ctx.register_teams_card_action_handler("claim_item", cb)
         handlers = mgr.get_teams_card_action_handlers()
         assert len(handlers) == 1
-        assert handlers[0][0] == "claim_referral"
+        assert handlers[0][0] == "claim_item"
         assert handlers[0][2] == "test_plugin"
 
     def test_empty_action_rejected(self):
@@ -204,14 +204,14 @@ class TestRegisterTeamsCardActionHandlerAPI:
 @pytest.mark.asyncio
 async def test_card_action_dispatches_plugin_handler(monkeypatch):
     monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
-    mgr, pctx = _make_ctx("laborde")
+    mgr, pctx = _make_ctx("demo_plugin")
     seen = {}
 
     async def cb(*, ctx, data, adapter):
-        seen["pnc"] = data.get("pnc_id")
-        return f"claimed {data.get('pnc_id')}"
+        seen["item_id"] = data.get("item_id")
+        return f"claimed {data.get('item_id')}"
 
-    pctx.register_teams_card_action_handler("claim_referral", cb)
+    pctx.register_teams_card_action_handler("claim_item", cb)
 
     adapter = teams_mod.TeamsAdapter(
         PlatformConfig(enabled=True, extra={"client_id": "x", "client_secret": "y", "tenant_id": "z"})
@@ -221,7 +221,7 @@ async def test_card_action_dispatches_plugin_handler(monkeypatch):
     activity = SimpleNamespace(
         value=SimpleNamespace(
             action=SimpleNamespace(
-                data={"hermes_action": "claim_referral", "pnc_id": "PNC-1"}
+                data={"hermes_action": "claim_item", "item_id": "ITEM-1"}
             )
         ),
         conversation=SimpleNamespace(id="19:channel@thread.tacv2"),
@@ -232,8 +232,8 @@ async def test_card_action_dispatches_plugin_handler(monkeypatch):
     with patch("hermes_cli.plugins.get_plugin_manager", return_value=mgr):
         resp = await adapter._on_card_action(ctx)
 
-    assert seen["pnc"] == "PNC-1"
-    assert resp.body.value == "claimed PNC-1"
+    assert seen["item_id"] == "ITEM-1"
+    assert resp.body.value == "claimed ITEM-1"
     assert adapter._conv_refs["19:channel@thread.tacv2"] == "ref-1"
 
 
@@ -245,13 +245,13 @@ async def test_card_action_plugin_exception_is_soft(monkeypatch):
     async def cb(*, ctx, data, adapter):
         raise RuntimeError("nope")
 
-    pctx.register_teams_card_action_handler("claim_referral", cb)
+    pctx.register_teams_card_action_handler("claim_item", cb)
     adapter = teams_mod.TeamsAdapter(
         PlatformConfig(enabled=True, extra={"client_id": "x", "client_secret": "y", "tenant_id": "z"})
     )
     activity = SimpleNamespace(
         value=SimpleNamespace(
-            action=SimpleNamespace(data={"hermes_action": "claim_referral", "pnc_id": "PNC-1"})
+            action=SimpleNamespace(data={"hermes_action": "claim_item", "item_id": "ITEM-1"})
         ),
         conversation=SimpleNamespace(id="c1"),
         from_=SimpleNamespace(aad_object_id="u", id="u"),
@@ -260,3 +260,34 @@ async def test_card_action_plugin_exception_is_soft(monkeypatch):
     with patch("hermes_cli.plugins.get_plugin_manager", return_value=mgr):
         resp = await adapter._on_card_action(ctx)
     assert "Action failed" in resp.body.value
+
+
+@pytest.mark.asyncio
+async def test_card_action_unauthorized_skips_plugin_handler(monkeypatch):
+    """Plugin handlers must not run when the clicker fails the auth gate."""
+    monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("TEAMS_ALLOWED_USERS", "allowed-user")
+    mgr, pctx = _make_ctx("demo_plugin")
+    called = {"n": 0}
+
+    async def cb(*, ctx, data, adapter):
+        called["n"] += 1
+        return "should not run"
+
+    pctx.register_teams_card_action_handler("claim_item", cb)
+    adapter = teams_mod.TeamsAdapter(
+        PlatformConfig(enabled=True, extra={"client_id": "x", "client_secret": "y", "tenant_id": "z"})
+    )
+    activity = SimpleNamespace(
+        value=SimpleNamespace(
+            action=SimpleNamespace(data={"hermes_action": "claim_item", "item_id": "ITEM-1"})
+        ),
+        conversation=SimpleNamespace(id="c1"),
+        from_=SimpleNamespace(aad_object_id="other-user", id="other-user"),
+    )
+    ctx = SimpleNamespace(activity=activity, conversation_ref="r")
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=mgr):
+        resp = await adapter._on_card_action(ctx)
+
+    assert called["n"] == 0
+    assert "Not authorized" in resp.body.value

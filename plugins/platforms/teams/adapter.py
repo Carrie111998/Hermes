@@ -1077,8 +1077,8 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
-        # Cache conversation ref so proactive follow-ups (claim results, etc.)
-        # can land back in the same channel/thread.
+        # Cache conversation ref so proactive follow-ups can land back in the
+        # same channel/thread (same pattern as _on_message).
         conv_id = getattr(getattr(ctx.activity, "conversation", None), "id", None)
         if conv_id:
             self._conv_refs[conv_id] = ctx.conversation_ref
@@ -1113,9 +1113,9 @@ class TeamsAdapter(BasePlatformAdapter):
                     body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
                 )
 
-        # Plugin-registered Action.Execute handlers (firm workflows, etc.).
-        # Checked before built-in approvals so custom actions don't need a
-        # session_key. First matching non-None result wins.
+        # Plugin-registered Action.Execute handlers run before built-in
+        # approvals so custom actions don't need a session_key. Registration
+        # order; first non-None result wins (see register_teams_card_action_handler).
         plugin_response = await self._dispatch_plugin_card_action(
             hermes_action, ctx=ctx, data=data
         )
@@ -1183,7 +1183,12 @@ class TeamsAdapter(BasePlatformAdapter):
         ctx: "ActivityContext[AdaptiveCardInvokeActivity]",
         data: Dict[str, Any],
     ) -> "Optional[InvokeResponse]":
-        """Dispatch a card invoke to plugin-registered Teams handlers."""
+        """Dispatch a card invoke to plugin-registered Teams handlers.
+
+        Walks handlers in registration order. The first non-``None`` return
+        wins. A raised exception soft-fails (error message to Teams) and does
+        not continue to later handlers for the same action.
+        """
         try:
             from hermes_cli.plugins import get_plugin_manager
 
@@ -1218,7 +1223,16 @@ class TeamsAdapter(BasePlatformAdapter):
         return None
 
     def _coerce_card_action_response(self, result: Any) -> "InvokeResponse":
-        """Normalize plugin handler return values into an InvokeResponse."""
+        """Normalize plugin handler return values into an InvokeResponse.
+
+        Supported returns:
+        - ``InvokeResponse`` — passed through
+        - ``str`` — status message
+        - ``AdaptiveCard`` SDK object — full card replace
+        - raw AdaptiveCard ``dict`` — **status message only** (first TextBlock
+          text); return an ``AdaptiveCard`` instance for a full card replace
+        - anything else — ``str(result)`` as a status message
+        """
         if isinstance(result, InvokeResponse):
             return result
         if isinstance(result, str):
@@ -1226,32 +1240,26 @@ class TeamsAdapter(BasePlatformAdapter):
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value=result),
             )
-        # AdaptiveCard SDK object
+        # AdaptiveCard SDK object — full card replace
         if AdaptiveCard is not None and isinstance(result, AdaptiveCard):
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionCardResponse(value=result),
             )
-        # Raw Adaptive Card dict → rebuild via SDK when possible
+        # Raw Adaptive Card dict → status text only (not a full card rebuild)
         if isinstance(result, dict) and result.get("type") == "AdaptiveCard":
+            title = "Done."
             try:
-                card = AdaptiveCard().with_version(str(result.get("version") or "1.4"))
-                # Prefer message response with a short status if body is complex;
-                # plugins that need a full replace should return AdaptiveCard.
-                title = "Done."
                 for block in result.get("body") or []:
                     if isinstance(block, dict) and block.get("type") == "TextBlock":
                         title = str(block.get("text") or title)
                         break
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(value=title),
-                )
             except Exception:
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(value="Done."),
-                )
+                title = "Done."
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value=title),
+            )
         return InvokeResponse(
             status=200,
             body=AdaptiveCardActionMessageResponse(value=str(result)),
