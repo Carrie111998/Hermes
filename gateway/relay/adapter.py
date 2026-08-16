@@ -1816,6 +1816,7 @@ class RelayAdapter(BasePlatformAdapter):
             message_id=result.get("message_id"),
             error=result.get("error"),
             raw_response=result,
+            ambiguous=bool(result.get("ambiguous")),
         )
 
     def _format_hints(
@@ -2024,6 +2025,7 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
+            ambiguous=bool(result.get("ambiguous")),
         )
 
     def auto_thread_info_for_chat(
@@ -2240,6 +2242,10 @@ class RelayAdapter(BasePlatformAdapter):
             success=bool(result.get("success")),
             message_id=result.get("message_id") or message_id,
             error=result.get("error"),
+            retryable=bool(result.get("retryable")),
+            retry_after=result.get("retry_after"),
+            error_kind=result.get("error_kind"),
+            ambiguous=bool(result.get("ambiguous")),
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
