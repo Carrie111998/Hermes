@@ -1134,6 +1134,10 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Optional short-lived, operation-allowlisted approval grant. Stored as
+    # JSON in SQLite and revalidated against the active task/run/claim on every
+    # use; the worker environment carries only its approval_id.
+    approval_grant: Optional[dict] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1154,6 +1158,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        approval_grant_value: Optional[dict] = None
+        if "approval_grant" in keys and row["approval_grant"]:
+            try:
+                parsed_grant = json.loads(row["approval_grant"])
+                if isinstance(parsed_grant, dict):
+                    approval_grant_value = parsed_grant
+            except Exception:
+                approval_grant_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1227,6 +1239,7 @@ class Task:
             session_id=(
                 row["session_id"] if "session_id" in keys else None
             ),
+            approval_grant=approval_grant_value,
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
@@ -1405,11 +1418,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- goals-engine default.
     goal_max_turns       INTEGER,
     -- Originating chat/agent session id when the task was created from
-    -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
-    -- for tasks created from the CLI, dashboard, or any path that doesn't
+    -- inside an agent loop that propagated ``HERMES_SESSION_ID`` (e.g. ACP). NULL
+    -- for tasks created from the CLI, the dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Optional task-scoped approval grant. JSON is validated on grant and on
+    -- every consumption; NULL keeps the historical fail-closed worker mode.
+    approval_grant       TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2661,6 +2677,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # creation path that doesn't set the env var (CLI, dashboard).
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
+        )
+
+    if "approval_grant" not in cols:
+        # Existing tasks remain unapproved. A grant is always an explicit,
+        # short-lived operator action and is never synthesized by migration.
+        _add_column_if_missing(
+            conn, "tasks", "approval_grant", "approval_grant TEXT"
         )
 
     if "block_kind" not in cols:
@@ -4725,6 +4748,15 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        from hermes_cli.kanban_approval import bind_task_approval_to_run
+
+        bind_task_approval_to_run(
+            conn,
+            task_id,
+            run_id=run_id,
+            claim_lock=lock,
+            now=now,
+        )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4823,6 +4855,15 @@ def claim_review_task(
             {"lock": lock, "expires": expires, "run_id": run_id,
              "source_status": "review"},
             run_id=run_id,
+        )
+        from hermes_cli.kanban_approval import bind_task_approval_to_run
+
+        bind_task_approval_to_run(
+            conn,
+            task_id,
+            run_id=run_id,
+            claim_lock=lock,
+            now=now,
         )
         return get_task(conn, task_id)
 
@@ -10366,6 +10407,9 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # Never inherit a parent worker's scoped grant. The dispatcher may install
+    # only the id validated for THIS claimed task below.
+    env.pop("HERMES_KANBAN_APPROVAL_ID", None)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.
@@ -10423,6 +10467,11 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    from hermes_cli.kanban_approval import active_grant_id_for_task
+
+    approval_id = active_grant_id_for_task(task, now=int(time.time()))
+    if approval_id:
+        env["HERMES_KANBAN_APPROVAL_ID"] = approval_id
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
