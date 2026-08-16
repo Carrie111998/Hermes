@@ -362,7 +362,7 @@ Location and venue pins become a text turn containing the coordinates, a Google 
 
 ### Albums and media groups
 
-A rapid burst of photos (an album) is debounced and delivered to the agent as **one** turn instead of one turn per photo. Messages sharing a `media_group_id` are coalesced into a single event; photo-only groups are merged this way. Tune the debounce window with `HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS` (default `0.8`).
+A rapid burst of photos (an album) is debounced and delivered to the agent as **one** turn instead of one turn per photo. Messages sharing a `media_group_id` are coalesced into a single event; photo-only groups are merged this way. Tune the debounce window with `HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS` (default `0.8`). See the *Media routing and batching* section for the full timing table.
 
 ## Voice Messages
 
