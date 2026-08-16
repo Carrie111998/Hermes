@@ -258,3 +258,43 @@ def test_list_spawnable_triage_ids_excludes_parked_assignees(kanban_home):
     # Unfiltered listing (CLI/dashboard) still surfaces every card,
     # including the parked ones, so a user can see what's contained.
     assert set(parked_ids) | {eligible_id, unassigned_id} <= set(all_ids)
+
+
+def test_list_spawnable_triage_ids_uses_one_assignee_snapshot_per_call(kanban_home):
+    with kb.connect() as conn:
+        first_id = kb.create_task(
+            conn, title="first", assignee="engineer", triage=True,
+        )
+        second_id = kb.create_task(
+            conn, title="second", assignee="engineer", triage=True,
+        )
+
+    profile_states = iter([True, False])
+    with patch(
+        "hermes_cli.profiles.profile_exists",
+        side_effect=lambda _name: next(profile_states),
+    ):
+        spawnable_ids = decomp.list_spawnable_triage_ids()
+
+    assert {first_id, second_id} <= set(spawnable_ids)
+
+
+def test_list_spawnable_triage_ids_logs_profile_lookup_failure(
+    kanban_home,
+    caplog,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="retry next tick", assignee="engineer", triage=True,
+        )
+
+    caplog.set_level("WARNING", logger=decomp.__name__)
+    with patch(
+        "hermes_cli.profiles.profile_exists",
+        side_effect=OSError("profile store unavailable"),
+    ):
+        spawnable_ids = decomp.list_spawnable_triage_ids()
+
+    assert task_id not in spawnable_ids
+    assert "failed to resolve assignee 'engineer'" in caplog.text
+    assert "profile store unavailable" in caplog.text

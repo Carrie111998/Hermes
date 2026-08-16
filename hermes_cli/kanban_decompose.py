@@ -279,7 +279,12 @@ def _is_spawnable_assignee(assignee: Optional[str]) -> bool:
         return True
     try:
         return profiles_mod.profile_exists(assignee)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "decompose: failed to resolve assignee %r as a profile: %s",
+            assignee,
+            exc,
+        )
         return False
 
 
@@ -511,4 +516,13 @@ def list_spawnable_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows if _is_spawnable_assignee(row.assignee)]
+    spawnable_by_assignee: dict[Optional[str], bool] = {}
+    spawnable_ids: list[str] = []
+    for row in rows:
+        if row.assignee not in spawnable_by_assignee:
+            spawnable_by_assignee[row.assignee] = _is_spawnable_assignee(
+                row.assignee,
+            )
+        if spawnable_by_assignee[row.assignee]:
+            spawnable_ids.append(row.id)
+    return spawnable_ids
