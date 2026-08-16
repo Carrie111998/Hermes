@@ -1318,7 +1318,12 @@ def _apply_delete_for_wal_reset_bug(
                 "this process does not exclusively own"
             )
         _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
-        return "wal"
+        # Report "delete", not "wal", for the indeterminate probe: claiming
+        # "wal" would set _wal_active=True and enable the lock-free read pool
+        # on a DB that may actually be in rollback-journal mode (raw
+        # SQLITE_BUSY on reads); claiming "delete" only costs queuing on the
+        # write lock — slow but correct.
+        return "delete"
 
     actual = ""
     try:
