@@ -165,6 +165,7 @@ source edit or implementation branch is authorized.
 
 ## Current next action
 
-Review merge authorization and the isolated diff. Do not merge, deploy,
+PR #29 is ready for review. Await separate merge authorization and recheck CI
+for the latest head before merging. Do not merge, deploy,
 mutate DGX, or clean the primary dirty worktree without a separate explicit
 gate.
