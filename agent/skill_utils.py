@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import ast
 import logging
 import os
 import re
@@ -475,8 +476,35 @@ def _normalize_string_set(values) -> Set[str]:
     if values is None:
         return set()
     if isinstance(values, str):
-        values = [values]
+        values = _coerce_list_shaped_string(values)
     return {str(v).strip() for v in values if str(v).strip()}
+
+
+def _coerce_list_shaped_string(value: str):
+    """A single string is normally treated as one name (issue #13026) --
+    but a value that's clearly a serialized list (from `hermes config set`
+    or a JSON-mode editor save, both of which store the value verbatim
+    rather than as a proper YAML list) should be parsed as one, not
+    wrapped whole into a single garbage entry that silently matches
+    nothing (issue #86661).
+
+    Only strings that structurally look like a list (leading '[' after
+    stripping whitespace) are attempted; anything else is left as a
+    single-element list, preserving existing scalar-name behavior
+    unchanged. ast.literal_eval (not json.loads) so both the
+    JSON-double-quote form ('["a","b"]') and the Python-single-quote
+    form ("['a','b']", which json.loads rejects) parse correctly.
+    """
+    stripped = value.strip()
+    if not stripped.startswith("["):
+        return [value]
+    try:
+        parsed = ast.literal_eval(stripped)
+    except (ValueError, SyntaxError):
+        return [value]
+    if not isinstance(parsed, list):
+        return [value]
+    return parsed
 
 
 # ── External skills directories ──────────────────────────────────────────
