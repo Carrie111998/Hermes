@@ -40,13 +40,7 @@ import {
   setActiveProfile,
   setShowAllProfiles
 } from '@/store/profile'
-import {
-  $activeSessionId,
-  $currentCwd,
-  $currentModel,
-  $gatewayState,
-  $selectedStoredSessionId
-} from '@/store/session'
+import { $activeSessionId, $currentCwd, $currentModel, $gatewayState, $selectedStoredSessionId } from '@/store/session'
 import {
   $focusedRuntimeId,
   $focusedSessionState,
@@ -327,7 +321,7 @@ export const host = {
   /** Open a machine-readable file in the shared preview rail. Plugins hand
    *  over a path; the host owns local/remote resolution and presentation. */
   previewFile: async (path: string, label?: string): Promise<boolean> => {
-    const target = await normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined)
+    const target = await normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined, { strict: true })
 
     if (!target) {
       return false
