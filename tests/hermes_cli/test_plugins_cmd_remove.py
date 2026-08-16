@@ -366,7 +366,7 @@ class TestEntryPointPlugins:
 class TestManagedMode:
     """Managed mode keeps main's behaviour: the tree goes, config is not written."""
 
-    def test_managed_install_still_removes_the_tree(self, plugin_env):
+    def test_managed_install_still_removes_the_tree(self, plugin_env, capsys):
         home = plugin_env
         plugin_dir = _install(home, "solo", "solo")
         _write_plugins_config(
@@ -382,7 +382,8 @@ class TestManagedMode:
 
         cmd_remove("solo")
 
-        # save_config prints the canonical managed error and returns without
-        # writing, so the removal proceeds exactly as it does on main today.
+        # Managed installs cannot persist user config. Preserve main's silent
+        # uninstall behavior instead of emitting a managed-write warning.
         assert not plugin_dir.exists()
         assert (home / "config.yaml").read_text(encoding="utf-8") == before
+        assert capsys.readouterr().err == ""

@@ -1151,13 +1151,16 @@ def _plugin_removal_identities(target: Path) -> set:
 def _remove_plugin_config_state(identities: set) -> None:
     """Drop *identities* from ``plugins.enabled`` / ``disabled`` / ``entries``.
 
-    One load/save pair so a removal cannot half-apply. Managed-config
-    refusals are handled by ``save_config``, which reports the canonical
-    managed error and returns without writing.
+    One load/save pair so a removal cannot half-apply. Managed installs
+    cannot persist user config, so they retain the previous silent uninstall
+    behavior instead of attempting a managed write.
     """
     if not identities:
         return
-    from hermes_cli.config import load_config, save_config
+    from hermes_cli.config import is_managed, load_config, save_config
+
+    if is_managed():
+        return
 
     config = load_config()
     plugins_cfg = config.get("plugins")
