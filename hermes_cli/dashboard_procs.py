@@ -363,14 +363,31 @@ def _kill_stale_dashboard_processes(
     # stay a stop, not a restart.
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
+    pid_launchd: dict[int, str | None] = {}
+    pid_launchd_errors: dict[int, str] = {}
     pid_cmdline: dict[int, list[str]] = {}
     pid_home: dict[int, str | None] = {}
     if restart_managed and sys.platform != "win32":
         for pid in pids:
-            cg_path = _m()._get_pid_cgroup_path(pid)
-            pid_cgroup[pid] = cg_path
-            pid_service[pid] = _m()._get_systemd_service_for_pid(pid)
-            if not pid_service[pid]:
+            if sys.platform == "darwin":
+                launchd_target, launchd_error = _m()._get_launchd_job_for_pid(pid)
+                pid_launchd[pid] = launchd_target
+                if launchd_error:
+                    pid_launchd_errors[pid] = launchd_error
+                manually_started = not launchd_target and not launchd_error
+                if not launchd_target and not launchd_error:
+                    # Keep the existing systemd fallback for POSIX
+                    # environments that do not use launchd.
+                    cg_path = _m()._get_pid_cgroup_path(pid)
+                    pid_cgroup[pid] = cg_path
+                    pid_service[pid] = _m()._get_systemd_service_for_pid(pid)
+                    manually_started = not pid_service[pid]
+            else:
+                cg_path = _m()._get_pid_cgroup_path(pid)
+                pid_cgroup[pid] = cg_path
+                pid_service[pid] = _m()._get_systemd_service_for_pid(pid)
+                manually_started = not pid_service[pid]
+            if manually_started:
                 # Manually-started process: preserve its exact argv so we
                 # can respawn it after the update (#40449, #68934).
                 # Snapshot HERMES_HOME before the kill so per-profile caps
@@ -393,11 +410,44 @@ def _kill_stale_dashboard_processes(
             if not pids:
                 return {"matched": [], "killed": [], "failed": []}
 
-    print()
-    print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
-
+    matched_pids = list(pids)
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
+    unrecovered: list[int] = []
+    launchd_restarted: list[tuple[int, str]] = []
+    launchd_lookup_failures: dict[int, str] = {}
+    launchd_kickstart_failures: dict[int, str] = {}
+
+    if restart_managed and sys.platform == "darwin":
+        manual_pids: list[int] = []
+        for pid in pids:
+            launchd_target = pid_launchd.get(pid)
+            launchd_error = pid_launchd_errors.get(pid)
+            if launchd_error:
+                error = f"launchd ownership lookup failed: {launchd_error}"
+                failed.append((pid, error))
+                launchd_lookup_failures[pid] = error
+            elif launchd_target:
+                restarted, error = _m()._kickstart_launchd_job(launchd_target)
+                if restarted:
+                    launchd_restarted.append((pid, launchd_target))
+                else:
+                    detail = error or "launchctl kickstart returned non-zero"
+                    # kickstart may have killed or restarted the job before
+                    # returning failure, so the PID's post-state is unknown.
+                    failure = (
+                        f"launchd kickstart failed for {launchd_target}; "
+                        f"post-state is indeterminate: {detail}"
+                    )
+                    failed.append((pid, failure))
+                    launchd_kickstart_failures[pid] = failure
+            else:
+                manual_pids.append(pid)
+        pids = manual_pids
+
+    if pids:
+        print()
+        print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
 
     if sys.platform == "win32":
         for pid in pids:
@@ -460,7 +510,20 @@ def _kill_stale_dashboard_processes(
     for pid in killed:
         print(f"    ✓ stopped PID {pid}")
     for pid, err_msg in failed:
-        print(f"    ✗ failed to stop PID {pid}: {err_msg}")
+        if pid in launchd_lookup_failures:
+            print(f"    ⚠ left PID {pid} untouched: {err_msg}")
+        elif pid in launchd_kickstart_failures:
+            print(f"    ⚠ state of PID {pid} is indeterminate: {err_msg}")
+        else:
+            print(f"    ✗ failed to stop PID {pid}: {err_msg}")
+    for _pid, target in launchd_restarted:
+        print(f"    ✓ restarted launchd job {target}")
+    if launchd_lookup_failures:
+        print("  Resolve launchd ownership lookup failure before restarting")
+        print("  these dashboard processes; they were left untouched.")
+    if launchd_kickstart_failures:
+        print("  A failed launchd kickstart leaves the dashboard post-state")
+        print("  indeterminate; do not retry with raw kill or detached respawn.")
 
     # Restart what we just killed (update path only).  Two categories:
     #  - systemd-supervised PIDs: restart the owning unit.  Without this, a
@@ -471,7 +534,6 @@ def _kill_stale_dashboard_processes(
     #    Filtered so Desktop ``serve|dashboard --port 0`` backends are not
     #    resurrected and duplicates collapse to one per profile (#78821).
     restarted_services: list[str] = []
-    unrecovered: list[int] = []
     if killed and restart_managed:
         failed_restarts: list[tuple[str, str]] = []
         seen_services: set[str] = set()
@@ -514,7 +576,7 @@ def _kill_stale_dashboard_processes(
         print("    hermes dashboard --port <port>")
 
     return {
-        "matched": list(pids),
+        "matched": matched_pids,
         "killed": list(killed),
         "failed": list(failed),
         "unrecovered": list(unrecovered),
@@ -979,4 +1041,3 @@ def _reap_orphaned_desktop_local_serves(
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
-
