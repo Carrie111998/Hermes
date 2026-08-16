@@ -1,6 +1,6 @@
 ---
 title: "HERMES-TELEGRAM-INBOUND-001: restore and prove Telegram inbound polling readiness"
-status: DESIGN_REVIEW_PASS
+status: MERGED_DEPLOYED_RUNTIME_DEGRADED
 date: 2026-08-16
 type: reliability
 ticket: HERMES-TELEGRAM-INBOUND-001
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-IMPLEMENTATION_REVIEW_BLOCKED_CLAUDE_UNAVAILABLE
+MERGED_DEPLOYED_RUNTIME_DEGRADED
 
 ## Context
 
@@ -24,9 +24,9 @@ from `systemctl is-active`, `start_polling()` returning, or outbound success.
 Current verified boundary:
 
 - DGX host: `55-0940189-03`
-- active release: `v2026.8.16-hermes-ca-29d4663bb9`
-- code merge: `29d4663bb94cf2d9603d2de9d437a431b5101f14`
-- service: `hermes-gateway.service`, active/running, `NRestarts=0`
+- active release: `v2026.8.16-hermes-telegram-inbound-178c9be1`
+- code merge: `178c9be1c5e2cc8052d69a0c140131b417a44ee8`
+- service: `hermes-gateway.service`, active/running, MainPID `202065`, `NRestarts=0`
 - outbound: prior verified `success=true`, `message_id=1967`, `mirrored=true`
 - inbound: `DEGRADED/UNPROVEN`
 
@@ -207,9 +207,31 @@ editing source. Keep inbound, service, and outbound gates separate.
   cannot substitute for the missing Claude verdict, and implementation is
   not authorized.
 
+## Implementation, CI, merge, and deployment evidence
+
+- Implementation files: `plugins/platforms/telegram/adapter.py` and
+  `tests/gateway/test_telegram_polling_progress.py`.
+- Focused polling suite: `23 passed`; polling plus redaction: `27 passed`;
+  Telegram network/reconnect suite: `96 passed`; Ruff and `git diff --check`
+  passed.
+- Independent implementation review: authenticated DGX AGY PASS plus an
+  independent reviewer PASS on the same metadata-only correction set.
+- PR #26 was marked ready and merged with expected head
+  `9115b0393b586ed91f1735887fd3823b520c091b`; merge commit is
+  `178c9be1c5e2cc8052d69a0c140131b417a44ee8`.
+- CI completed with 22 success, 8 skipped, 1 neutral, and no failures.
+- DGX immutable release marker is `178c9be1c5e2cc8052d69a0c140131b417a44ee8`;
+  effective drop-in is `33-hermes-telegram-inbound-178c9be1.conf`, and the
+  prior release/drop-in remains available for rollback.
+- Post-deploy service gate passed: active/running, `ExecMainStatus=0`,
+  `NRestarts=0`. The bounded five-minute metadata window recorded zero
+  `polling_progress`, `getUpdates`, and `polling_degraded` events, so inbound
+  readiness remains `DEGRADED/UNPROVEN`.
+
 ## Current next action
 
-Obtain one authenticated Claude PASS on the exact packet, then reconcile it
-with the recorded AGY PASS before any source edit. Do not modify code,
-credentials, Telegram state, systemd units, or the live DGX runtime while the
-implementation review gate is blocked.
+Run a bounded real inbound test and metadata-only progress check. If the
+qualifying `getUpdates` or accepted-update evidence is still absent, open a
+narrow follow-up correction and repeat independent review, focused tests, CI,
+merge, immutable deployment, and inbound evidence gates. Do not change
+credentials, allowlists, webhook state, or TLS verification.

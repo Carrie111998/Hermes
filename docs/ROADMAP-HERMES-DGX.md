@@ -17,12 +17,12 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| `main` | `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b` | Canonical mainline after PR #22, HERMES-UPDATE-001 Lane 2/3 correction set. |
+| `main` | `178c9be1c5e2cc8052d69a0c140131b417a44ee8` | Canonical mainline after PR #26, HERMES-TELEGRAM-INBOUND-001 implementation. |
 | DGX live source checkout | `/home/cwliao/.hermes/hermes-agent`, clean HEAD `1c14d2b9df29da845fb2a56b2fbe12cf8ee507cb` | Deployment input only; do not reset or edit as the active runtime source. |
-| DGX active release | `/home/cwliao/.hermes/releases/v2026.8.16-hermes-update-001-0fe3773ccf` | Immutable runtime snapshot selected by drop-in `31-hermes-update-001-0fe3773ccf.conf`. |
-| Gateway service | `active/running`, MainPID `3992364`, `ExecMainStatus=0`, `NRestarts=0` | Process/service health PASS at verification time. |
-| Calendar guard | timer `active/waiting`; service and wrapper point to the active release | Recovery path is installed and enabled; prior release remains available. |
-| Rollback | drop-in `30-hermes-telegram-transport-77bcb5d0717e.conf` and its release retained | Rollback metadata remains available; no prior release was deleted. |
+| DGX active release | `/home/cwliao/.hermes/releases/v2026.8.16-hermes-telegram-inbound-178c9be1` | Immutable runtime snapshot selected by drop-in `33-hermes-telegram-inbound-178c9be1.conf`. |
+| Gateway service | `active/running`, MainPID `202065`, `ExecMainStatus=0`, `NRestarts=0` | Process/service health PASS at verification time; release hash matches merged main. |
+| Health guard | `hermes-mcp-health-guard.timer` `active/waiting`, result `success` | Actual guard unit is healthy; the older calendar-guard unit name is absent. |
+| Rollback | prior release/drop-in `32-hermes-ca-29d4663bb9` retained | Rollback metadata remains available; no prior release was deleted. |
 
 ## Core engineering order
 
@@ -48,9 +48,10 @@
 |---|---|---|
 | HERMES-UPDATE-001 | MERGED_DEPLOYED | PR #22, SHA `0fe3773c...`; Lane 2/3 review PASS, 33 targeted tests passed, immutable DGX release active. |
 | HERMES-TELEGRAM-TRANSPORT-001 | MERGED_DEPLOYED_RUNTIME_DEGRADED | Outbound E2E passed with `success=true`, `message_id=1967`, `mirrored=true`; inbound has no qualifying `getUpdates` progress after the bounded post-restart window. Diagnose network/polling ownership next. |
+| HERMES-TELEGRAM-INBOUND-001 | MERGED_DEPLOYED_RUNTIME_DEGRADED | PR #26 merged as `178c9be1...`; CI had no failures, immutable DGX deployment and service health passed; inbound remains unproven because the bounded post-deploy metadata window recorded zero `polling_progress`, `getUpdates`, and `polling_degraded` events. |
 | HERMES-AUTH-001 | MERGED_DEPLOYED | Separate auth ticket; merged and deployed evidence remains historical. |
-| HERMES-AUTH-002 | READY_FOR_MERGE | Separate target-config ticket; do not conflate it with the update/deploy lane. |
-| HERMES-CALENDAR-GUARD-001 | MERGED_DEPLOYED | Recovery timer and oneshot remain active; release selection is rollback-ready. |
+| HERMES-AUTH-002 | MERGED_DEPLOYED | Separate target-config ticket; do not conflate it with the Telegram lane. |
+| HERMES-CALENDAR-GUARD-001 | MERGED_DEPLOYED | Actual `hermes-mcp-health-guard.timer` remains active/waiting; the historical calendar-guard unit name is not installed. |
 | HERMES-MONITORING-001 | BLOCKED | No merge or deployment inference from current gateway evidence. |
 | ARCH-002 | PROPOSED | Select after the current Telegram transport gate is resolved or explicitly re-sequenced. |
 
@@ -60,4 +61,4 @@
 
 ## Runtime and deployment boundary
 
-The active release is selected through the new drop-in while the previous transport release remains intact for rollback. The service restarted successfully and stayed active with zero restarts. Telegram outbound delivery is separately proven through Hermes `send`; inbound polling remains `DEGRADED/UNPROVEN` because the logs show connection/menu registration but no qualifying `getUpdates` progress. The CLI warning about an outdated installed service definition is recorded as deployment hygiene; effective systemd state is verified independently.
+The active release is selected through the new drop-in while the previous CA release remains intact for rollback. The service restarted successfully and stayed active with zero restarts. Telegram outbound delivery is separately proven through Hermes `send`; inbound polling remains `DEGRADED/UNPROVEN` because the bounded post-deploy metadata window recorded no qualifying `getUpdates` progress. The health-guard unit naming discrepancy is recorded as documentation hygiene; effective systemd state is verified independently.
