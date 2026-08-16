@@ -1565,6 +1565,19 @@ def get_context_length_from_provider_error(
     return None
 
 
+def _parse_sglang_token_split(error_lower: str) -> Optional[Tuple[int, int]]:
+    """Extract (context_window, input_tokens) from SGLang's error wording, or None.
+
+    Shared by parse_available_output_tokens_from_error() and is_output_cap_error()
+    so the two numeric extractions can't drift apart if SGLang changes its wording.
+    """
+    m_ctx = re.search(r'maximum context length of (\d+)\s*token', error_lower)
+    m_input = re.search(r'(\d+)\s*tokens from the input messages', error_lower)
+    if m_ctx and m_input:
+        return int(m_ctx.group(1)), int(m_input.group(1))
+    return None
+
+
 def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     """Detect an "output cap too large" error and return how many output tokens are available.
 
@@ -1701,10 +1714,10 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     # Available output = window - input. When the input alone already meets
     # or exceeds the window this stays None, so the caller falls through to
     # compression instead of futilely shrinking the output cap.
-    _m_sglang_ctx = re.search(r'maximum context length of (\d+)\s*token', error_lower)
-    _m_sglang_input = re.search(r'(\d+)\s*tokens from the input messages', error_lower)
-    if _m_sglang_ctx and _m_sglang_input:
-        _available = int(_m_sglang_ctx.group(1)) - int(_m_sglang_input.group(1))
+    _sglang_split = _parse_sglang_token_split(error_lower)
+    if _sglang_split:
+        _ctx, _input = _sglang_split
+        _available = _ctx - _input
         if _available >= 1:
             return _available
 
@@ -1781,9 +1794,8 @@ def is_output_cap_error(error_msg: str) -> bool:
     # SGLang reports both figures explicitly; when the input alone already
     # meets or exceeds the context window this is a genuine overflow, not an
     # output-cap error, even though the wording also names a completion cap.
-    _m_ctx = re.search(r'maximum context length of (\d+)\s*token', error_lower)
-    _m_input = re.search(r'(\d+)\s*tokens from the input messages', error_lower)
-    if _m_ctx and _m_input and int(_m_input.group(1)) >= int(_m_ctx.group(1)):
+    _sglang_split = _parse_sglang_token_split(error_lower)
+    if _sglang_split and _sglang_split[1] >= _sglang_split[0]:
         return False
 
     return True
