@@ -58,6 +58,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
     exit_non_dispatcher_owned_context,
+    non_dispatcher_owned_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -4320,9 +4321,14 @@ def run_job(
             _job_workdir = None
 
         try:
-            ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
-            )
+            # This subprocess is spawned before the non-dispatcher marker
+            # further down in run_job() is entered — wrap it explicitly so the
+            # kanban env scrub (tools/environments/local.py) fires here too,
+            # not just for the agent path's tool loop (#87725).
+            with non_dispatcher_owned_context():
+                ok, output = _run_job_script_with_claim_heartbeat(
+                    job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
+                )
         except Exception as exc:
             logger.exception(
                 "Job '%s': script execution raised unexpectedly", job_id,
@@ -4532,9 +4538,12 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(
-            job, script_path, cancel_event=cancel_event,
-        )
+        # Same as the no_agent path above: this runs before the non-dispatcher
+        # marker is entered later in run_job(), so wrap it explicitly (#87725).
+        with non_dispatcher_owned_context():
+            prerun_script = _run_job_script_with_claim_heartbeat(
+                job, script_path, cancel_event=cancel_event,
+            )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
