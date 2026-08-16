@@ -7570,7 +7570,33 @@ def _worktree_base_ref(repo_root: Path) -> str:
         _log.debug("kanban worktree has no fetchable origin: %s", fetch_error)
         return "HEAD"
 
-    candidates = []
+    def _fetch_remote_branch(branch: str) -> Optional[str]:
+        remote_ref = f"refs/remotes/origin/{branch}"
+        try:
+            targeted_fetch = subprocess.run(
+                [
+                    "git", "-C", str(repo_root), "fetch", "origin",
+                    f"+refs/heads/{branch}:{remote_ref}",
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=60,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+        except Exception as exc:
+            _log.debug("kanban remote branch fetch failed: %s", exc)
+            return None
+        if targeted_fetch.returncode == 0 and _is_commit(remote_ref):
+            return remote_ref
+        if targeted_fetch.returncode != 0:
+            _log.debug(
+                "kanban remote branch fetch failed: %s",
+                (targeted_fetch.stderr or targeted_fetch.stdout or "").strip(),
+            )
+        return None
+
     try:
         remote_head = subprocess.run(
             [
@@ -7588,52 +7614,38 @@ def _worktree_base_ref(repo_root: Path) -> str:
             for line in remote_head.stdout.splitlines():
                 if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
                     branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
-                    remote_default = f"refs/remotes/origin/{branch}"
-                    targeted_fetch = subprocess.run(
-                        [
-                            "git", "-C", str(repo_root), "fetch", "origin",
-                            f"+refs/heads/{branch}:{remote_default}",
-                        ],
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                        timeout=60,
-                        check=False,
-                        stdin=subprocess.DEVNULL,
-                        env=env,
-                    )
-                    if targeted_fetch.returncode == 0 and _is_commit(remote_default):
-                        candidates.append(remote_default)
-                    elif targeted_fetch.returncode != 0:
-                        _log.debug(
-                            "kanban remote default fetch failed: %s",
-                            (targeted_fetch.stderr or targeted_fetch.stdout or "").strip(),
+                    remote_default = _fetch_remote_branch(branch)
+                    if remote_default is None:
+                        raise RuntimeError(
+                            "could not fetch the live remote default branch "
+                            "for new Kanban worktree"
                         )
-                    break
-        if not candidates:
-            symbolic = subprocess.run(
-                [
-                    "git", "-C", str(repo_root), "symbolic-ref", "--quiet",
-                    "refs/remotes/origin/HEAD",
-                ],
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                timeout=30,
-                check=False,
-            )
-            symbolic_target = symbolic.stdout.strip()
-            if (
-                symbolic.returncode == 0
-                and symbolic_target.startswith("refs/remotes/origin/")
-                and _is_commit(symbolic_target)
-            ):
-                candidates.append(symbolic_target)
+                    return remote_default
+
+        symbolic = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "symbolic-ref", "--quiet",
+                "refs/remotes/origin/HEAD",
+            ],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+        symbolic_target = symbolic.stdout.strip()
+        if symbolic.returncode == 0 and symbolic_target.startswith("refs/remotes/origin/"):
+            branch = symbolic_target.removeprefix("refs/remotes/origin/")
+            remote_default = _fetch_remote_branch(branch)
+            if remote_default is not None:
+                return remote_default
+    except RuntimeError:
+        raise
     except Exception as exc:
         _log.debug("kanban remote default resolution failed: %s", exc)
 
-    candidates.append("refs/remotes/origin/main")
-    for candidate in candidates:
-        if _is_commit(candidate):
-            return candidate
+    remote_main = _fetch_remote_branch("main")
+    if remote_main is not None:
+        return remote_main
     raise RuntimeError(
         "could not resolve a fetched default branch for new Kanban worktree"
     )

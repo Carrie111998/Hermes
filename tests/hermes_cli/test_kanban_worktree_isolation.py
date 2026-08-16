@@ -277,6 +277,24 @@ def test_new_worktree_branch_rejects_unresolved_remote_default(tmp_path):
     assert not target.exists()
 
 
+def test_new_worktree_branch_rejects_failed_live_default_fetch(tmp_path, monkeypatch):
+    repo, _seed = _make_remote_backed_repo(tmp_path)
+    target = repo / ".worktrees" / "new-task"
+    real_run = subprocess.run
+
+    def fail_targeted_fetch(args, *run_args, **run_kwargs):
+        if args[-1] == "+refs/heads/main:refs/remotes/origin/main":
+            return subprocess.CompletedProcess(args, 1, "", "targeted fetch failed")
+        return real_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(kb.subprocess, "run", fail_targeted_fetch)
+
+    with pytest.raises(RuntimeError, match="could not fetch the live remote default branch"):
+        kb._ensure_git_worktree(repo, target, "project/new-task")
+
+    assert not target.exists()
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
