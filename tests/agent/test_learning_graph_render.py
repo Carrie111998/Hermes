@@ -117,6 +117,27 @@ def test_wiki_nodes_keep_third_kind_in_terminal_payload():
     assert out["buckets"][0]["nodes"][0]["style"] == render.STYLE_WIKI
 
 
+def test_terminal_bar_allocation_conserves_width_without_inventing_memory():
+    bucket = render._ChartBucket("now", 1_700_000_000)
+    bucket.skills = 1
+    bucket.wiki = 1
+
+    skill_len, wiki_len, memory_len = render._allocate_bucket_bar(bucket, 5)
+
+    assert skill_len + wiki_len + memory_len == 5
+    assert skill_len > 0 and wiki_len > 0
+    assert memory_len == 0
+
+
+def test_wiki_cluster_is_not_repeated_as_a_skill_category():
+    payload = _payload(skills=1, memories=0)
+    payload["clusters"].append({"category": "wiki", "count": 3})
+
+    labels = [item["label"] for item in render.category_legend(payload)]
+
+    assert all(not label.startswith("wiki ") for label in labels)
+
+
 
 
 

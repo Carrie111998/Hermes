@@ -459,7 +459,7 @@ export function Journey({ gw, onClose, t }: JourneyProps) {
           <Text bold color={t.color.primary}>
             ✦ Journey
           </Text>
-          <Text color={t.color.muted}> learned skills &amp; memories over time</Text>
+          <Text color={t.color.muted}> learned skills, memories &amp; wiki pages over time</Text>
         </Text>
         <Text wrap="wrap">
           {data.legend.map((item, i) => (

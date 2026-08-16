@@ -406,7 +406,7 @@ def _category_counts(payload: dict[str, Any]) -> list[tuple[str, int]]:
     clusters = [
         (str(c.get("category")), int(c.get("count", 0)))
         for c in payload.get("clusters", []) or []
-        if c.get("category") and c.get("category") != "memory"
+        if c.get("category") and c.get("category") not in {"memory", "wiki"}
     ]
     if clusters:
         return clusters
@@ -470,6 +470,24 @@ def _trajectory_row(buckets: list[_ChartBucket], width: int, reveal: float) -> R
     return [["trajectory ", STYLE_LABEL, 0.55], ["".join(cells), STYLE_SKILL, 0.48]]
 
 
+def _allocate_bucket_bar(bucket: _ChartBucket, length: int) -> tuple[int, int, int]:
+    """Allocate a fixed bar length proportionally without inventing node kinds."""
+    counts = (bucket.skills, bucket.wiki, bucket.memories)
+    if bucket.total <= 0 or length <= 0:
+        return (0, 0, 0)
+    exact = [(count / bucket.total) * length for count in counts]
+    allocated = [math.floor(value) for value in exact]
+    remaining = length - sum(allocated)
+    order = sorted(range(len(counts)), key=lambda i: (-(exact[i] % 1), i))
+    for index in order:
+        if remaining == 0:
+            break
+        if counts[index] > 0:
+            allocated[index] += 1
+            remaining -= 1
+    return allocated[0], allocated[1], allocated[2]
+
+
 def render_graph(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, reveal: float = 1.0) -> dict[str, Any]:
     """Render one timeline frame at ``reveal`` (0→1).
 
@@ -504,19 +522,7 @@ def render_graph(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, rev
         visible += bucket.total
         ink = recency_ink(bucket.rec)
         bar_len = max(1, round((bucket.total / max_total) * bar_w)) if bucket.total else 0
-        skill_len = round((bucket.skills / bucket.total) * bar_len) if bucket.total else 0
-        wiki_len = round((bucket.wiki / bucket.total) * bar_len) if bucket.total else 0
-        if bucket.skills and skill_len == 0:
-            skill_len = 1
-        if bucket.wiki and wiki_len == 0 and bar_len > skill_len:
-            wiki_len = 1
-        memory_len = max(0, bar_len - skill_len - wiki_len)
-        if bucket.memories and memory_len == 0 and bar_len > 1:
-            memory_len = 1
-            if wiki_len > skill_len and wiki_len > 0:
-                wiki_len -= 1
-            elif skill_len > 0:
-                skill_len -= 1
+        skill_len, wiki_len, memory_len = _allocate_bucket_bar(bucket, bar_len)
 
         node = _bucket_label_node(bucket)
         marker = ""
