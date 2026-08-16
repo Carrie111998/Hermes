@@ -3,5 +3,7 @@ import { atom } from 'nanostores'
 export const $composerEnterSends = atom<boolean>(true)
 
 export function applyComposerPrefsFromConfig(config: { desktop?: { composer?: { enter_sends?: unknown } } }): void {
-  $composerEnterSends.set(config.desktop?.composer?.enter_sends !== false)
+  const value = config.desktop?.composer?.enter_sends
+
+  $composerEnterSends.set(typeof value === 'boolean' ? value : true)
 }

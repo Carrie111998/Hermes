@@ -237,7 +237,7 @@ export interface KeybindReadonly {
 }
 
 export const DEFAULT_COMPOSER_READONLY: readonly KeybindReadonly[] = [
-  { id: 'composer.send', category: 'composer', keys: ['enter'] },
+  { id: 'composer.send', category: 'composer', keys: ['enter', 'mod+enter'] },
   { id: 'composer.newline', category: 'composer', keys: ['shift+enter'] },
   { id: 'composer.steer', category: 'composer', keys: ['enter'] },
   { id: 'composer.queue', category: 'composer', keys: ['mod+enter'] },
@@ -262,12 +262,7 @@ export const MULTILINE_COMPOSER_READONLY: readonly KeybindReadonly[] = [
   { id: 'composer.cancel', category: 'composer', keys: ['escape'] }
 ]
 
-export function composerReadonlyKeybinds(enterSends: boolean): readonly KeybindReadonly[] {
-  return enterSends ? DEFAULT_COMPOSER_READONLY : MULTILINE_COMPOSER_READONLY
-}
-
-export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
-  ...DEFAULT_COMPOSER_READONLY,
+const NON_COMPOSER_READONLY: readonly KeybindReadonly[] = [
   // Fixed, context-local shortcuts surfaced for discoverability.
   { id: 'view.terminalSelection', category: 'view', keys: ['mod+l'] },
   // Terminal clipboard. ⌘C/⌘V on macOS, Ctrl+Shift+C/V elsewhere — matching VS
@@ -278,3 +273,18 @@ export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
   // Global OS chord registered in main while HUD mode is up.
   { id: 'hud.snapToPointer', category: 'view', keys: ['mod+shift+g'] }
 ]
+
+export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
+  ...DEFAULT_COMPOSER_READONLY,
+  ...NON_COMPOSER_READONLY
+]
+
+const MULTILINE_KEYBIND_READONLY: readonly KeybindReadonly[] = [
+  ...MULTILINE_COMPOSER_READONLY,
+  ...NON_COMPOSER_READONLY
+]
+
+/** The complete readonly shortcut map for the active composer Enter mode. */
+export function readonlyKeybindsFor(enterSends: boolean): readonly KeybindReadonly[] {
+  return enterSends ? KEYBIND_READONLY : MULTILINE_KEYBIND_READONLY
+}

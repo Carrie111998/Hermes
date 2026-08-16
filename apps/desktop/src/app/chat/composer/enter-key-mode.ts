@@ -1,4 +1,4 @@
-export type ComposerEnterKeyIntent = 'native' | 'newline' | 'noop' | 'queue' | 'steer' | 'submit'
+export type ComposerEnterKeyIntent = 'native' | 'newline' | 'queue' | 'steer' | 'submit'
 
 export interface ComposerEnterKeyIntentInput {
   busy?: boolean
@@ -28,7 +28,7 @@ export function resolveComposerEnterKeyIntent({
 
   if (enterSends) {
     if (modKey && !shiftKey) {
-      return busy ? 'queue' : 'noop'
+      return busy ? 'queue' : 'submit'
     }
 
     return shiftKey ? 'native' : 'submit'

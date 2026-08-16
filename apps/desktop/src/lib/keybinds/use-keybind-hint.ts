@@ -4,7 +4,7 @@ import { $registryVersion } from '@/contrib/registry'
 import { $composerEnterSends } from '@/store/composer-prefs'
 import { $bindings, bindingsFor } from '@/store/keybinds'
 
-import { composerReadonlyKeybinds, KEYBIND_READONLY } from './actions'
+import { readonlyKeybindsFor } from './actions'
 import { formatCombo } from './combo'
 
 // The formatted first combo for `actionId`, or null when unbound. Rebindable
@@ -28,9 +28,7 @@ export function useKeybindHint(actionId: string): string | null {
     return formatCombo(rebindable)
   }
 
-  const readonly = (actionId.startsWith('composer.') ? composerReadonlyKeybinds(enterSends) : KEYBIND_READONLY).find(
-    entry => entry.id === actionId
-  )
+  const readonly = readonlyKeybindsFor(enterSends).find(entry => entry.id === actionId)
 
   if (readonly) {
     return formatCombo(readonly.keys[0])

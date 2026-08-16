@@ -854,6 +854,7 @@ export function ChatBar({
     const liveCanSteer =
       busy &&
       !compacting &&
+      !blockingPrompt &&
       !queueEdit &&
       !!onSteer &&
       attachments.length === 0 &&
@@ -868,12 +869,6 @@ export function ChatBar({
       modKey: event.metaKey || event.ctrlKey,
       shiftKey: event.shiftKey
     })
-
-    if (enterIntent === 'noop') {
-      event.preventDefault()
-
-      return
-    }
 
     if (enterIntent === 'newline') {
       event.preventDefault()

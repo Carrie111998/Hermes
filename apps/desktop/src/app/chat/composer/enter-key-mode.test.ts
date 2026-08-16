@@ -7,7 +7,7 @@ describe('Desktop composer Enter key mode', () => {
     expect(resolveComposerEnterKeyIntent({ enterSends: true, key: 'Enter' })).toBe('submit')
     expect(resolveComposerEnterKeyIntent({ enterSends: true, key: 'Enter', shiftKey: true })).toBe('native')
     expect(resolveComposerEnterKeyIntent({ enterSends: true, busy: true, key: 'Enter', modKey: true })).toBe('queue')
-    expect(resolveComposerEnterKeyIntent({ enterSends: true, busy: false, key: 'Enter', modKey: true })).toBe('noop')
+    expect(resolveComposerEnterKeyIntent({ enterSends: true, busy: false, key: 'Enter', modKey: true })).toBe('submit')
   })
 
   it('supports multiline-first mode: Enter inserts newline and Ctrl/Cmd+Enter sends', () => {

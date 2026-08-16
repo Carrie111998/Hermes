@@ -5,10 +5,14 @@ import { $composerEnterSends, applyComposerPrefsFromConfig } from './composer-pr
 afterEach(() => $composerEnterSends.set(true))
 
 describe('composer prefs from Hermes config', () => {
-  it('enables multiline-first mode only for an explicit false value', () => {
+  it('applies explicit boolean values exactly', () => {
     applyComposerPrefsFromConfig({ desktop: { composer: { enter_sends: false } } })
 
     expect($composerEnterSends.get()).toBe(false)
+
+    applyComposerPrefsFromConfig({ desktop: { composer: { enter_sends: true } } })
+
+    expect($composerEnterSends.get()).toBe(true)
   })
 
   it('preserves the backward-compatible Enter-to-send default for missing or invalid values', () => {

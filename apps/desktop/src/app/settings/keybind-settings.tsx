@@ -10,13 +10,12 @@ import { useContributions } from '@/contrib/react/use-contributions'
 import { useI18n } from '@/i18n'
 import {
   allKeybindActions,
-  composerReadonlyKeybinds,
   KEYBIND_CATEGORIES,
   KEYBIND_PANEL_ACTION,
-  KEYBIND_READONLY,
   type KeybindActionMeta,
   type KeybindReadonly,
-  KEYBINDS_AREA
+  KEYBINDS_AREA,
+  readonlyKeybindsFor
 } from '@/lib/keybinds/actions'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { arraysEqual } from '@/lib/storage'
@@ -44,13 +43,7 @@ export function KeybindSettings() {
   useContributions(KEYBINDS_AREA)
   const actionList = allKeybindActions()
 
-  const readonlyList = useMemo(
-    () => [
-      ...composerReadonlyKeybinds(enterSends),
-      ...KEYBIND_READONLY.filter(shortcut => shortcut.category !== 'composer')
-    ],
-    [enterSends]
-  )
+  const readonlyList = useMemo(() => readonlyKeybindsFor(enterSends), [enterSends])
 
   const [query, setQuery] = useState('')
 
