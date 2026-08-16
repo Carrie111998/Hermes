@@ -16,6 +16,7 @@ Environment variables:
 """
 
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import email as email_lib
 import imaplib
 import logging
@@ -116,6 +117,14 @@ SMTP_CONNECT_TIMEOUT = 30
 # independent inactivity bound around the executor job so one stuck operation
 # cannot pin the poll loop while a healthy large batch may run for longer.
 IMAP_FETCH_WATCHDOG_TIMEOUT = 120.0
+
+
+class _EmailDispatchError(Exception):
+    """A fetched message could not be dispatched on the owning event loop."""
+
+
+class _EmailDispatchTimeout(_EmailDispatchError):
+    """A message dispatch exceeded the email inactivity window."""
 
 
 def _close_imap(imap: "imaplib.IMAP4") -> None:
@@ -608,7 +617,6 @@ class EmailAdapter(BasePlatformAdapter):
         self._active_imap_lock = threading.Lock()
         self._fetch_progress_lock = threading.Lock()
         self._fetch_last_progress = 0.0
-        self._fetch_dispatch_callback = None
 
         # Track the last IMAP fetch attempt so the poll loop can distinguish
         # "checked, nothing new" from "the check itself failed" (#80016).
@@ -856,25 +864,43 @@ class EmailAdapter(BasePlatformAdapter):
             self._active_fetches[self._address] = fetch_token
 
         self._record_fetch_progress()
+        dispatch_active = threading.Event()
 
         def dispatch_from_worker(uid: bytes, msg_data: Dict[str, Any]) -> None:
+            self._record_fetch_progress()
+            dispatch_active.set()
             dispatch_future = asyncio.run_coroutine_threadsafe(
                 self._dispatch_message(msg_data), loop
             )
-            dispatch_future.result()
+            try:
+                dispatch_future.result(timeout=IMAP_FETCH_WATCHDOG_TIMEOUT)
+            except FutureTimeoutError as exc:
+                if dispatch_future.done():
+                    raise _EmailDispatchError(
+                        f"Message dispatch for IMAP UID {uid!r} failed: {exc}"
+                    ) from exc
+                dispatch_future.cancel()
+                raise _EmailDispatchTimeout(
+                    f"Message dispatch for IMAP UID {uid!r} made no progress for "
+                    f"{IMAP_FETCH_WATCHDOG_TIMEOUT:g}s"
+                ) from exc
+            except Exception as exc:
+                raise _EmailDispatchError(
+                    f"Message dispatch for IMAP UID {uid!r} failed: {exc}"
+                ) from exc
+            finally:
+                dispatch_active.clear()
 
-        self._fetch_dispatch_callback = dispatch_from_worker
         try:
-            fetch_future = loop.run_in_executor(None, self._fetch_new_messages)
+            fetch_future = loop.run_in_executor(
+                None, self._fetch_new_messages, dispatch_from_worker
+            )
         except Exception:
-            self._fetch_dispatch_callback = None
             self._release_active_fetch(fetch_token)
             raise
 
         def finish_fetch(done_future: "asyncio.Future[List[Dict[str, Any]]]") -> None:
             self._release_active_fetch(fetch_token)
-            if self._fetch_dispatch_callback is dispatch_from_worker:
-                self._fetch_dispatch_callback = None
             if not done_future.cancelled():
                 # Retrieve background exceptions after a timed-out/cancelled
                 # waiter so asyncio does not warn that they were never retrieved.
@@ -889,19 +915,40 @@ class EmailAdapter(BasePlatformAdapter):
                 remaining = IMAP_FETCH_WATCHDOG_TIMEOUT - inactive_for
                 if remaining <= 0:
                     self._abort_active_imap()
-                    message = (
-                        "IMAP fetch made no progress for "
-                        f"{IMAP_FETCH_WATCHDOG_TIMEOUT:g}s"
-                    )
+                    if dispatch_active.is_set():
+                        code = "email_message_dispatch_timeout"
+                        message = (
+                            "Message dispatch made no progress for "
+                            f"{IMAP_FETCH_WATCHDOG_TIMEOUT:g}s"
+                        )
+                    else:
+                        code = "email_imap_fetch_timeout"
+                        message = (
+                            "IMAP fetch made no progress for "
+                            f"{IMAP_FETCH_WATCHDOG_TIMEOUT:g}s"
+                        )
                     logger.error("[Email] %s", message)
-                    self._set_fatal_error(
-                        "email_imap_fetch_timeout", message, retryable=True
-                    )
+                    self._set_fatal_error(code, message, retryable=True)
                     await self._notify_fatal_error()
                     return
                 done, _ = await asyncio.wait({fetch_future}, timeout=remaining)
                 if done:
-                    messages = fetch_future.result()
+                    try:
+                        messages = fetch_future.result()
+                    except _EmailDispatchTimeout as exc:
+                        logger.error("[Email] %s", exc)
+                        self._set_fatal_error(
+                            "email_message_dispatch_timeout", str(exc), retryable=True
+                        )
+                        await self._notify_fatal_error()
+                        return
+                    except _EmailDispatchError as exc:
+                        logger.error("[Email] %s", exc)
+                        self._set_fatal_error(
+                            "email_message_dispatch_failed", str(exc), retryable=True
+                        )
+                        await self._notify_fatal_error()
+                        return
                     break
         except asyncio.CancelledError:
             self._abort_active_imap()
@@ -961,7 +1008,7 @@ class EmailAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
 
-    def _fetch_new_messages(self) -> List[Dict[str, Any]]:
+    def _fetch_new_messages(self, dispatch_callback=None) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
         results = []
         imap: Optional[imaplib.IMAP4] = None
@@ -1024,7 +1071,6 @@ class EmailAdapter(BasePlatformAdapter):
                         self._seen_uids.add(uid)
                         continue
                     if parsed is not None:
-                        dispatch_callback = self._fetch_dispatch_callback
                         if dispatch_callback is None:
                             parsed["_imap_uid"] = uid
                             results.append(parsed)
@@ -1051,6 +1097,8 @@ class EmailAdapter(BasePlatformAdapter):
                 with self._active_imap_lock:
                     if self._active_imap is imap:
                         self._active_imap = None
+        except _EmailDispatchError:
+            raise
         except Exception as e:
             logger.error("[Email] IMAP fetch error: %s", e)
             self._last_fetch_failed = True

@@ -621,7 +621,7 @@ class TestPollLoop(unittest.TestCase):
         notified = []
         aborted = []
 
-        def stalled_fetch():
+        def stalled_fetch(dispatch_callback=None):
             fetch_started.set()
             release_fetch.wait(timeout=5.0)
             return []
@@ -663,7 +663,7 @@ class TestPollLoop(unittest.TestCase):
         adapter = self._make_adapter()
         notified = []
 
-        def progressing_fetch():
+        def progressing_fetch(dispatch_callback=None):
             for _ in range(5):
                 time.sleep(0.03)
                 adapter._record_fetch_progress()
@@ -679,6 +679,98 @@ class TestPollLoop(unittest.TestCase):
             asyncio.run(adapter._check_inbox())
 
         self.assertEqual(notified, [])
+
+    def test_stalled_dispatch_releases_fetch_gate(self):
+        """A wedged dispatch must not leave reconnect blocked indefinitely."""
+        import asyncio
+        import time
+
+        from plugins.platforms.email import adapter as email_adapter
+
+        adapter = self._make_adapter()
+        dispatch_cancelled = asyncio.Event()
+        notified = []
+        raw_email = MIMEText("Body", "plain", "utf-8")
+        raw_email["From"] = "sender@test.com"
+        raw_email["Subject"] = "Stalled dispatch"
+        mock_imap = MagicMock()
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                return ("OK", [(b"1", raw_email.as_bytes())])
+            return ("NO", [])
+
+        async def stalled_dispatch(msg_data):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                dispatch_cancelled.set()
+                raise
+
+        async def mock_fatal_handler(failed_adapter):
+            notified.append(failed_adapter)
+
+        async def exercise():
+            await adapter._check_inbox()
+            deadline = time.monotonic() + 2.0
+            while adapter._address in adapter._active_fetches:
+                if time.monotonic() >= deadline:
+                    self.fail("dispatch timeout did not release the fetch gate")
+                await asyncio.sleep(0.01)
+
+        mock_imap.uid.side_effect = uid_handler
+        adapter._dispatch_message = stalled_dispatch
+        adapter.set_fatal_error_handler(mock_fatal_handler)
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap), patch.object(
+            email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.05
+        ):
+            asyncio.run(exercise())
+
+        self.assertTrue(dispatch_cancelled.is_set())
+        self.assertEqual(notified, [adapter])
+        self.assertEqual(adapter.fatal_error_code, "email_message_dispatch_timeout")
+        self.assertTrue(adapter.fatal_error_retryable)
+        self.assertNotIn(b"1", adapter._seen_uids)
+
+    def test_dispatch_failure_is_not_reported_as_imap_failure(self):
+        """A downstream dispatch exception must retain its own failure classification."""
+        import asyncio
+
+        adapter = self._make_adapter()
+        notified = []
+        raw_email = MIMEText("Body", "plain", "utf-8")
+        raw_email["From"] = "sender@test.com"
+        raw_email["Subject"] = "Dispatch failure"
+        mock_imap = MagicMock()
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                return ("OK", [(b"1", raw_email.as_bytes())])
+            return ("NO", [])
+
+        async def failed_dispatch(msg_data):
+            raise RuntimeError("downstream unavailable")
+
+        async def mock_fatal_handler(failed_adapter):
+            notified.append(failed_adapter)
+
+        mock_imap.uid.side_effect = uid_handler
+        adapter._dispatch_message = failed_dispatch
+        adapter.set_fatal_error_handler(mock_fatal_handler)
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            asyncio.run(adapter._check_inbox())
+
+        self.assertEqual(notified, [adapter])
+        self.assertEqual(adapter.fatal_error_code, "email_message_dispatch_failed")
+        self.assertIn("downstream unavailable", adapter.fatal_error_message)
+        self.assertFalse(adapter._last_fetch_failed)
+        self.assertNotIn(b"1", adapter._seen_uids)
 
     def test_timeout_keeps_completed_message_eligible_for_reconnect(self):
         """A later stalled UID must not consume an earlier undispatched UID."""
