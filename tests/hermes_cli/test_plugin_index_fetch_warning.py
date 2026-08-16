@@ -19,4 +19,4 @@ def test_remote_fetch_failure_warns_before_fallback(monkeypatch, caplog):
 
     assert entries is None
     assert "remote fetch failed" in caplog.text
-    assert "using cached or bundled fallback" in caplog.text
+    assert "will fall back to cached or bundled index" in caplog.text
