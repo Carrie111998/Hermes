@@ -1395,6 +1395,7 @@ export interface Translations {
     showAllProfiles: string
     switchToProfile: (name: string) => string
     manageProfiles: string
+    connectGateway: string
     actions: string
     color: string
     colorFor: string
