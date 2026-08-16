@@ -40,6 +40,23 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery():
+    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+
+    Tests in this file that reach the full success path (e.g. the #87694
+    orphan-history rescue-ref tests) would otherwise hit real gateway
+    discovery: an unmocked ``find_gateway_pids`` on a box with a live gateway
+    reaches the conftest live-system guard and turns into a spurious
+    ``sys.exit(1)`` (#78574). Discovery returning nothing makes the phase a
+    clean no-op — none of the tests here assert on gateway restarts.
+    """
+    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+        yield
+
+
 
 
 
@@ -119,6 +136,8 @@ def _make_update_side_effect(
     fetch_fails=False,
     fetch_stderr="",
     merge_base_exists=True,
+    update_ref_fails=False,
+    pre_pull_sha_unavailable=False,
 ):
     """Build a subprocess.run side_effect for cmd_update tests.
 
@@ -127,8 +146,17 @@ def _make_update_side_effect(
     (default) simulates ordinary divergence (a common ancestor exists, e.g.
     upstream force-push), False simulates orphan/unrelated-history divergence
     (no common ancestor at all).
+
+    ``update_ref_fails`` simulates ``git update-ref`` itself failing (disk
+    full, permissions) when writing the orphan rescue ref.
+
+    ``pre_pull_sha_unavailable`` simulates ``_capture_head_sha`` being unable
+    to resolve HEAD before the pull (empty rev-parse output) — the rescue-ref
+    guard requires a truthy ``pre_pull_sha`` and must degrade gracefully
+    without one.
     """
     recorded = []
+    head_sha_calls = []
 
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
@@ -140,7 +168,19 @@ def _make_update_side_effect(
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "rev-parse" in joined and "HEAD" in joined:
-            return SimpleNamespace(stdout="deadbeefcafe1234567890abcdef1234567890\n", stderr="", returncode=0)
+            # First call = pre-pull HEAD, every later call = post-pull HEAD
+            # (issue #79678's "did HEAD actually move" guard depends on these
+            # differing after a successful reset/merge).
+            head_sha_calls.append(1)
+            if len(head_sha_calls) == 1:
+                if pre_pull_sha_unavailable:
+                    return SimpleNamespace(stdout="", stderr="", returncode=0)
+                return SimpleNamespace(
+                    stdout="1111111111111111111111111111111111111beef\n", stderr="", returncode=0
+                )
+            return SimpleNamespace(
+                stdout="2222222222222222222222222222222222222cafe\n", stderr="", returncode=0
+            )
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
@@ -151,6 +191,12 @@ def _make_update_side_effect(
             return SimpleNamespace(
                 stdout="", stderr="fatal: Not a valid commit name origin/main\n", returncode=1
             )
+        if "update-ref" in joined:
+            if update_ref_fails:
+                return SimpleNamespace(
+                    stdout="", stderr="fatal: unable to write ref\n", returncode=128
+                )
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "--ff-only" in joined:
             if ff_only_fails:
                 return SimpleNamespace(
@@ -218,6 +264,10 @@ def test_cmd_update_orphan_history_backs_up_before_reset(monkeypatch, tmp_path, 
     """No common ancestor with origin/<branch> → HEAD is parked behind a
     ``refs/hermes-update-backups/orphan-*`` ref before the reset proceeds."""
     _setup_update_mocks(monkeypatch, tmp_path)
+    # Orphan-history detection is platform-agnostic; skip the unrelated
+    # Windows gateway-fleet stop/restart machinery so this test only
+    # exercises the merge-base guard.
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
 
     side_effect, recorded = _make_update_side_effect(
         ff_only_fails=True, merge_base_exists=False,
@@ -231,7 +281,7 @@ def test_cmd_update_orphan_history_backs_up_before_reset(monkeypatch, tmp_path, 
     ref_name = update_ref_calls[0][update_ref_calls[0].index("update-ref") + 1]
     assert ref_name.startswith("refs/hermes-update-backups/orphan-main-")
     assert update_ref_calls[0][update_ref_calls[0].index("update-ref") + 2] == (
-        "deadbeefcafe1234567890abcdef1234567890"
+        "1111111111111111111111111111111111111beef"
     )
 
     out = capsys.readouterr().out
@@ -243,6 +293,7 @@ def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, 
     """Common ancestor still exists (e.g. upstream force-push) → no rescue
     ref, no orphan messaging, behavior identical to before #87694."""
     _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
 
     side_effect, recorded = _make_update_side_effect(
         ff_only_fails=True, merge_base_exists=True,
@@ -257,6 +308,82 @@ def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, 
     out = capsys.readouterr().out
     assert "orphan divergence" not in out
     assert "Fast-forward not possible (history diverged), resetting to match remote" in out
+
+
+def test_cmd_update_orphan_rescue_ref_write_failure_is_non_fatal(monkeypatch, tmp_path, capsys):
+    """#87694 stress test: ``git update-ref`` itself fails (disk full,
+    permissions) while parking the orphan rescue ref. The backup attempt is
+    best-effort — its return code is intentionally not checked — so the
+    reset must still proceed and the update must still succeed."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=False, update_ref_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    assert len(update_ref_calls) == 1
+
+    reset_calls = [
+        c for c in recorded if "reset" in " ".join(str(x) for x in c) and "--hard" in c
+    ]
+    assert len(reset_calls) == 1
+
+    out = capsys.readouterr().out
+    assert "orphan divergence" in out
+
+
+def test_cmd_update_orphan_guard_skips_rescue_ref_when_pre_pull_sha_missing(
+    monkeypatch, tmp_path, capsys
+):
+    """#87694 stress test: if capturing the pre-pull HEAD SHA itself fails
+    (empty ``rev-parse HEAD`` output), the rescue-ref guard requires a
+    truthy ``pre_pull_sha`` and must skip the backup rather than writing a
+    ref pointing at nothing — the reset must still proceed without crashing.
+    """
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=False, pre_pull_sha_unavailable=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    assert update_ref_calls == []
+
+    out = capsys.readouterr().out
+    assert "orphan divergence" not in out
+
+
+def test_cmd_update_orphan_rescue_ref_persists_when_reset_fails(monkeypatch, tmp_path, capsys):
+    """#87694 stress test: even when the subsequent ``reset --hard`` itself
+    fails, the rescue ref must already have been written — the backup is
+    not lost just because the overall update aborts."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=False, reset_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(SimpleNamespace())
+    assert exc_info.value.code == 1
+
+    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    assert len(update_ref_calls) == 1
+
+    out = capsys.readouterr().out
+    assert "orphan divergence" in out
+    assert "Failed to reset to origin/main" in out
 
 
 # ---------------------------------------------------------------------------
