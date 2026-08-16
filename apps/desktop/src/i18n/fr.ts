@@ -4,6 +4,10 @@ import { defineLocale } from './define-locale'
 
 export const fr = defineLocale({
   common: {
+    right: 'Droite',
+    bottom: 'Bas',
+    left: 'Gauche',
+    top: 'Haut',
     apply: 'Appliquer',
     back: 'Retour',
     save: 'Enregistrer',

@@ -4,6 +4,10 @@ import type { Translations } from './types'
 
 export const en: Translations = {
   common: {
+    right: 'Right',
+    bottom: 'Down',
+    left: 'Left',
+    top: 'Up',
     apply: 'Apply',
     back: 'Back',
     save: 'Save',

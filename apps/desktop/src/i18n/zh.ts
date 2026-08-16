@@ -4,6 +4,10 @@ import type { Translations } from './types'
 
 export const zh: Translations = {
   common: {
+    right: '右侧',
+    bottom: '底部',
+    left: '左侧',
+    top: '顶部',
     apply: '应用',
     back: '返回',
     save: '保存',

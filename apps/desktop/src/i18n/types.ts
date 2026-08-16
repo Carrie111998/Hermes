@@ -50,6 +50,10 @@ interface AuxTaskCopy {
 
 export interface Translations {
   common: {
+    right: string
+    bottom: string
+    left: string
+    top: string
     apply: string
     back: string
     save: string
