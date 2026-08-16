@@ -34,22 +34,20 @@ def _bulky_session(n_dumps: int = 20, dump_chars: int = 150_000):
     ]
     big = "y" * dump_chars
     for i in range(n_dumps):
-        msgs.append(
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": f"c{i}",
-                        "type": "function",
-                        "function": {
-                            "name": "terminal",
-                            "arguments": '{"command":"ls -la"}',
-                        },
-                    }
-                ],
-            }
-        )
+        msgs.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"c{i}",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"ls -la"}',
+                    },
+                }
+            ],
+        })
         msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": big})
     msgs += [
         {"role": "assistant", "content": "All green"},
@@ -92,14 +90,20 @@ def test_select_context_prunes_request_only(engine):
     assert selected is not None
     assert selected is not msgs  # replacement list, never in-place mutation
     # Chat turns (user/assistant text) survive verbatim.
-    chat = [(m["role"], m.get("content", "")) for m in selected if m["role"] in ("user", "assistant")]
+    chat = [
+        (m["role"], m.get("content", ""))
+        for m in selected
+        if m["role"] in ("user", "assistant")
+    ]
     assert chat[0] == ("user", "Set up the proxy stack")
     assert chat[-1] == ("assistant", "Done, released v2")
     # Bulk tool results are replaced with one-line summaries. The dedup
     # pass is intentionally lossless: the NEWEST full copy survives while
     # older duplicates become short back-references, so at most one tool
     # result keeps its full payload and the rest collapse.
-    tool_lens = sorted(len(m.get("content", "")) for m in selected if m.get("role") == "tool")
+    tool_lens = sorted(
+        len(m.get("content", "")) for m in selected if m.get("role") == "tool"
+    )
     assert tool_lens
     assert sum(1 for l in tool_lens if l <= 200) >= len(tool_lens) - 1
     assert tool_lens[0] <= 200
@@ -108,8 +112,28 @@ def test_select_context_prunes_request_only(engine):
 
 
 def test_select_context_small_request_noop(engine):
-    small = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    small = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
     assert engine.select_context(copy.deepcopy(small), budget_tokens=1_048_576) is None
+
+
+def test_select_context_falls_back_when_budget_missing(engine):
+    # Safety valve: a call site that supplies neither a model context
+    # length nor budget_tokens must not silently disable request
+    # compaction — the engine falls back to a conservative default window.
+    engine.context_length = 0
+    msgs = _bulky_session()
+    selected = engine.select_context(copy.deepcopy(msgs), budget_tokens=0)
+    assert selected is not None
+    # Fallback window is far below the ~1M-token session bulk, so the
+    # hard-ceiling trim must also have engaged and bounded the request.
+    est = sum(
+        len(str(m.get("content", ""))) // 4 + len(str(m.get("tool_calls", ""))) // 4
+        for m in selected
+    )
+    assert est < 128_000
 
 
 def test_select_context_rearm_gate(engine):
@@ -135,6 +159,8 @@ def test_compress_preserves_all_chat_turns(engine):
     assert "CONTEXT COMPACTION" not in joined
     assert "Earlier turns were compacted" not in joined
     # Tool bulk is still deterministically pruned (dedup back-references).
-    tool_lens = sorted(len(m.get("content", "")) for m in out if m.get("role") == "tool")
+    tool_lens = sorted(
+        len(m.get("content", "")) for m in out if m.get("role") == "tool"
+    )
     assert tool_lens
     assert tool_lens[0] <= 200

@@ -25,7 +25,10 @@ Behavior
   request. Returns the pruned list; persisted history is untouched. A
   rearm watermark (like the built-in proactive prune) keeps cache-breaking
   prunes episodic, and a hard-ceiling trim guarantees the request still
-  fits the window even in pathological sessions.
+  fits the window even in pathological sessions — note that this trim CAN
+  drop mid-conversation messages from the request the model sees
+  (request-level drop only; the persisted transcript — and therefore the
+  visible chat history — still keeps every turn).
 - ``compress()`` (manual ``/compress`` / gateway hygiene): deterministic
   prune-only compaction — every user/assistant message is preserved
   verbatim; only old tool-result bodies are shortened. Never produces a
@@ -37,7 +40,7 @@ Behavior
 
 from __future__ import annotations
 
-import os
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.context_compressor import (
@@ -46,32 +49,39 @@ from agent.context_compressor import (
     resolve_model_threshold,
 )
 
+logger = logging.getLogger(__name__)
+
+# Request-prune trigger as a fraction of the context window when
+# ``proactive_prune_tokens`` is not configured.
+_REQUEST_PRUNE_TRIGGER_RATIO = 0.55
+
+# Safety-valve window when neither the model's context length nor the
+# request's ``budget_tokens`` is known (call sites that skip the budget):
+# request compaction must never silently disable itself and let requests
+# grow past the provider window unbounded.
+_FALLBACK_CONTEXT_TOKENS = 128_000
+
 
 def _load_compression_config() -> Dict[str, Any]:
-    """Read the ``compression`` block from the active profile's config.yaml.
+    """Read the ``compression`` block via the standard config loader.
 
     Plugin engines are constructed with no arguments (the loader calls
     ``Engine()``), so config values that the built-in engine receives via
-    its constructor must be resolved here. Falls back to built-in-safe
-    defaults when the file is missing/unreadable.
+    its constructor must be resolved here. Going through
+    ``hermes_cli.config.load_config`` (instead of a direct YAML read)
+    keeps env overrides, managed scope and profile switches consistent
+    with the rest of the app. Falls back to built-in-safe defaults when
+    the config subsystem is unavailable.
     """
-    cfg: Dict[str, Any] = {}
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_cli.config import load_config
 
-        home = get_hermes_home()
-        path = os.path.join(home, "config.yaml")
-        if os.path.isfile(path):
-            import yaml
-
-            with open(path, encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            block = data.get("compression", {})
-            if isinstance(block, dict):
-                cfg = block
-    except Exception:
-        pass
-    return cfg
+        cfg = load_config()
+        block = cfg.get("compression") if isinstance(cfg, dict) else None
+        return block if isinstance(block, dict) else {}
+    except Exception as exc:
+        logger.debug("Could not load compression config: %s", exc)
+        return {}
 
 
 class KeepHistoryContextEngine(ContextCompressor):
@@ -97,14 +107,10 @@ class KeepHistoryContextEngine(ContextCompressor):
                 return default
 
         kwargs.setdefault("model", "keep_history")
-        kwargs.setdefault(
-            "threshold_percent", float(_f("threshold", 0.85))
-        )
+        kwargs.setdefault("threshold_percent", float(_f("threshold", 0.85)))
         kwargs.setdefault("protect_first_n", int(_f("protect_first_n", 3)))
         kwargs.setdefault("protect_last_n", int(_f("protect_last_n", 60)))
-        kwargs.setdefault(
-            "summary_target_ratio", float(_f("target_ratio", 0.20))
-        )
+        kwargs.setdefault("summary_target_ratio", float(_f("target_ratio", 0.20)))
         kwargs.setdefault("quiet_mode", True)
         kwargs.setdefault(
             "proactive_prune_tokens", int(_f("proactive_prune_tokens", 0))
@@ -176,12 +182,14 @@ class KeepHistoryContextEngine(ContextCompressor):
             return None
         ctx = int(self.context_length or budget_tokens or 0)
         if ctx <= 0:
-            return None
+            # Safety valve: compaction must never silently disable itself
+            # just because the call site didn't pass a budget.
+            ctx = _FALLBACK_CONTEXT_TOKENS
 
         trigger = (
             int(self.proactive_prune_tokens)
             if self.proactive_prune_tokens and self.proactive_prune_tokens > 0
-            else int(ctx * 0.55)
+            else int(ctx * _REQUEST_PRUNE_TRIGGER_RATIO)
         )
         est = sum(_estimate_msg_budget_tokens(m) for m in request_messages)
         if est < trigger:

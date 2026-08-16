@@ -66,8 +66,10 @@ Behavior:
   one-line summaries for large outputs, tool_call-arg truncation) when the
   request crosses the token trigger, with a rearm watermark so
   prompt-cache breaks stay episodic. A hard-ceiling trim guarantees the
-  request still fits the window in pathological sessions (request-only —
-  the stored transcript is untouched).
+  request still fits the window in pathological sessions; in those cases
+  the trim may drop mid-chat turns **from the request the model sees**
+  (request-level drop only — the stored transcript still keeps every
+  turn, so the visible history is unaffected).
 - `compress()` (manual `/compress`, gateway hygiene) performs the same
   deterministic prune — every user/assistant message survives verbatim and
   no summary card is produced.
@@ -75,10 +77,11 @@ Behavior:
 The engine honors the same `compression.*` config block
 (`threshold`, `protect_last_n`, `min_tail_user_messages`,
 `proactive_prune_tokens`, `proactive_prune_min_result_chars`,
-`proactive_prune_min_reclaim_tokens`). Note that the destructive
-full-compression trigger (`threshold`) is effectively advisory for this
-engine since auto-compression never fires; it is still used for the
-request-prune trigger calculations.
+`proactive_prune_min_reclaim_tokens`). The request-prune trigger is driven
+by `proactive_prune_tokens` (fallback: ~55% of the context window);
+`threshold` is accepted for compatibility but is not consulted, since the
+destructive full-compression path it configures never fires for this
+engine.
 
 ## Dual Compression System
 
