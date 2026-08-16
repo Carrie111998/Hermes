@@ -3422,7 +3422,13 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
         for anc in psutil.Process().parents():
             anc_pid = int(anc.pid)
             try:
-                anc_cmdline = " ".join(anc.cmdline() or [])
+                # Keep quotes when re-serializing: the matcher tokenizes via
+                # shlex, so a path containing spaces (e.g. "C:\Program Files\...")
+                # must stay quoted or it would be split and fail to match.
+                raw = anc.cmdline() or []
+                anc_cmdline = (
+                    subprocess.list2cmdline(raw) if os.name == "nt" else " ".join(raw)
+                )
             except Exception:
                 anc_cmdline = ""
             if anc_cmdline and looks_like_gateway_runtime_command_line(anc_cmdline):
