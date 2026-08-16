@@ -2006,7 +2006,6 @@ _XAI_WRAPPING_SPEECH_TAGS = (
     "fast",
     "sing-song",
     "singing",
-    "laugh-speak",
     "emphasis",
 )
 _XAI_SPEECH_TAG_RE = re.compile(
