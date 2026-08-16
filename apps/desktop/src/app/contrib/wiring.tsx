@@ -139,6 +139,7 @@ const CommandCenterView = lazy(async () => ({ default: (await import('../command
 const CronView = lazy(async () => ({ default: (await import('../cron')).CronView }))
 const WebhooksView = lazy(async () => ({ default: (await import('../webhooks')).WebhooksView }))
 const ProfilesView = lazy(async () => ({ default: (await import('../profiles')).ProfilesView }))
+const RemoteView = lazy(async () => ({ default: (await import('../remote')).RemoteView }))
 const SettingsView = lazy(async () => ({ default: (await import('../settings')).SettingsView }))
 const StarmapView = lazy(async () => ({ default: (await import('../starmap')).StarmapView }))
 
@@ -240,6 +241,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     openCommandCenterSection,
     openStarmap,
     profilesOpen,
+    remoteOpen,
     resetOverlayReturnRoute,
     settingsOpen,
     starmapOpen,
@@ -1125,6 +1127,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       {profilesOpen && (
         <Suspense fallback={null}>
           <ProfilesView onClose={closeOverlayToPreviousRoute} />
+        </Suspense>
+      )}
+
+      {remoteOpen && (
+        <Suspense fallback={null}>
+          <RemoteView onClose={closeOverlayToPreviousRoute} />
         </Suspense>
       )}
 

@@ -236,6 +236,56 @@ describe('remote session store', () => {
     expect($remoteAttach.get().status).toBe('connected')
   })
 
+  it('disconnects by dropping persisted credentials and aborting the active stream', async () => {
+    saveConnection()
+    const stream = openEventStream()
+    let signal: AbortSignal | undefined
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        signal = init?.signal ?? undefined
+        return Promise.resolve(stream.response)
+      })
+    )
+    const { $remoteAttach, attachToSession, disconnect } = await import('./remote-session')
+
+    await attachToSession('s1')
+    disconnect()
+
+    expect(signal?.aborted).toBe(true)
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect($remoteAttach.get()).toEqual({
+      host: '',
+      port: 8642,
+      token: '',
+      expiresAt: '',
+      sessions: [],
+      status: 'idle'
+    })
+  })
+
+  it('ignores a chat response that completes after disconnecting', async () => {
+    saveConnection()
+    const pending = deferred<Response>()
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(pending.promise))
+    const { $remoteAttach, disconnect, sendRemoteChat } = await import('./remote-session')
+    $remoteAttach.set({ ...$remoteAttach.get(), attachedSessionId: 's1' })
+
+    const request = sendRemoteChat('Still there?')
+    disconnect()
+    pending.resolve(jsonResponse({ ok: true }))
+    await request
+
+    expect($remoteAttach.get()).toEqual({
+      host: '',
+      port: 8642,
+      token: '',
+      expiresAt: '',
+      sessions: [],
+      status: 'idle'
+    })
+  })
+
   it('posts chat content to the attached session with bearer auth', async () => {
     saveConnection()
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }))

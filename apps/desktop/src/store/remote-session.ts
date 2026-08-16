@@ -190,6 +190,21 @@ function closeStream(): void {
   streamAbort = null
 }
 
+export function disconnect(): void {
+  connectionGeneration += 1
+  refreshGeneration += 1
+  closeStream()
+  persistString(STORAGE_KEY, null)
+  $remoteAttach.set({
+    host: '',
+    port: DEFAULT_REMOTE_PORT,
+    token: '',
+    expiresAt: '',
+    sessions: [],
+    status: 'idle'
+  })
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error && error.message ? error.message : 'Remote connection failed'
 }
@@ -577,6 +592,7 @@ export async function sendRemoteChat(text: string): Promise<void> {
     return
   }
 
+  const connectionVersion = connectionGeneration
   const sessionId = $remoteAttach.get().attachedSessionId
 
   if (!sessionId) {
@@ -594,8 +610,13 @@ export async function sendRemoteChat(text: string): Promise<void> {
         body: JSON.stringify({ content: text })
       }
     )
-    $remoteAttach.set({ ...$remoteAttach.get(), status: 'connected', error: undefined })
+
+    if (connectionVersion === connectionGeneration) {
+      $remoteAttach.set({ ...$remoteAttach.get(), status: 'connected', error: undefined })
+    }
   } catch (error) {
-    publishError(error)
+    if (connectionVersion === connectionGeneration) {
+      publishError(error)
+    }
   }
 }

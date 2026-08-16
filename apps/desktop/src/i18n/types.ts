@@ -1543,6 +1543,42 @@ export interface Translations {
     open: string
   }
 
+  remoteAttach: {
+    title: string
+    subtitle: string
+    close: string
+    connectTitle: string
+    connectDescription: string
+    hostLabel: string
+    hostPlaceholder: string
+    portLabel: string
+    codeLabel: string
+    codePlaceholder: string
+    codeHint: string
+    pairedUntil: (date: string) => string
+    disconnect: string
+    refreshing: string
+    sessions: string
+    noSessions: string
+    untitled: string
+    active: string
+    idle: string
+    attach: string
+    detach: string
+    attachTo: (title: string) => string
+    detachFrom: (title: string) => string
+    eventLogLabel: string
+    noEvents: string
+    message: string
+    emptyMessage: string
+    statusChanged: (status: string) => string
+    unknown: string
+    unknownTool: string
+    messageAria: string
+    messagePlaceholder: string
+    sending: string
+  }
+
   artifactPreview: {
     versionOf: (current: number, total: number) => string
     olderVersion: string

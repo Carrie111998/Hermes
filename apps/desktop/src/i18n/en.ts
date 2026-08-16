@@ -1847,6 +1847,42 @@ export const en: Translations = {
     open: 'Open'
   },
 
+  remoteAttach: {
+    title: 'Remote sessions',
+    subtitle: 'Attach to sessions running on another Hermes instance.',
+    close: 'Close remote sessions',
+    connectTitle: 'Connect to a remote Hermes',
+    connectDescription: 'Enter the host and the six-character pairing code shown by the remote instance.',
+    hostLabel: 'Host',
+    hostPlaceholder: 'remote-host.local',
+    portLabel: 'Port',
+    codeLabel: 'Pairing code',
+    codePlaceholder: 'ABC123',
+    codeHint: 'Pairing codes contain six letters or numbers and can only be used once.',
+    pairedUntil: date => `Paired until ${date}`,
+    disconnect: 'Disconnect',
+    refreshing: 'Refreshing sessions',
+    sessions: 'Sessions',
+    noSessions: 'No remote sessions are available.',
+    untitled: '(untitled)',
+    active: 'active',
+    idle: 'idle',
+    attach: 'Attach',
+    detach: 'Detach',
+    attachTo: title => `Attach to ${title}`,
+    detachFrom: title => `Detach from ${title}`,
+    eventLogLabel: 'Remote session event log',
+    noEvents: 'Waiting for remote session events…',
+    message: 'message',
+    emptyMessage: '(empty message)',
+    statusChanged: status => `Status changed to ${status}`,
+    unknown: 'unknown',
+    unknownTool: 'unknown tool',
+    messageAria: 'Message remote session',
+    messagePlaceholder: 'Send a message to this session…',
+    sending: 'Sending'
+  },
+
   artifactPreview: {
     versionOf: (current, total) => `v${current} of ${total}`,
     olderVersion: 'Older version',
@@ -1866,7 +1902,8 @@ export const en: Translations = {
       skills: 'Capabilities',
       messaging: 'Messaging',
       artifacts: 'Artifacts',
-      cron: 'Scheduled jobs'
+      cron: 'Scheduled jobs',
+      remote: 'Remote sessions'
     },
     searchAria: 'Search sessions',
     searchPlaceholder: 'Search sessions…',
