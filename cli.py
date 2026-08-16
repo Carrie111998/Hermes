@@ -5240,6 +5240,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._status_usage_checked_at = 0.0
         self._status_usage_refreshing = False
         self._status_usage_completed_before_app = False
+        self._status_usage_generation = 0
         self._status_usage_lock = threading.Lock()
         # When True, the input separator rules and the dynamic status bar are
         # hidden until the next user input. Set by _recover_after_resize() so a
@@ -5973,8 +5974,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         continue
                     labels.append(f"{short} {remaining}%")
                 snapshot["plan_usage_label"] = "plan " + " · ".join(labels) if labels else ""
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("status-bar plan usage render failed: %s", exc, exc_info=True)
 
         try:
             from hermes_cli.focus_view import focus_statusbar_segment
@@ -6094,6 +6095,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return
             self._status_usage_checked_at = now
             self._status_usage_refreshing = True
+            generation = getattr(self, "_status_usage_generation", 0)
 
         def refresh() -> None:
             try:
@@ -6115,27 +6117,51 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         api_key=getattr(agent, "api_key", None) or getattr(self, "api_key", None),
                     )
                 with lock:
+                    if generation != getattr(self, "_status_usage_generation", 0):
+                        return
                     self._status_usage_snapshot = usage
-                app = getattr(self, "_app", None)
+                    # Publish the snapshot and repaint handoff atomically.
+                    app = getattr(self, "_app", None)
+                    if app is None:
+                        self._status_usage_completed_before_app = True
                 if app is not None:
                     app.invalidate()
-                else:
-                    self._status_usage_completed_before_app = True
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("status-bar plan usage refresh failed: %s", exc, exc_info=True)
             finally:
                 with lock:
-                    self._status_usage_refreshing = False
+                    if generation == getattr(self, "_status_usage_generation", 0):
+                        self._status_usage_refreshing = False
 
         threading.Thread(target=refresh, name="hermes-status-usage", daemon=True).start()
 
+    def _reset_status_usage_cache(self) -> None:
+        """Discard quota data after a model/provider change."""
+        lock = getattr(self, "_status_usage_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._status_usage_generation = getattr(self, "_status_usage_generation", 0) + 1
+            self._status_usage_snapshot = None
+            self._status_usage_checked_at = 0.0
+            self._status_usage_refreshing = False
+            self._status_usage_completed_before_app = False
+        app = getattr(self, "_app", None)
+        if app is not None:
+            app.invalidate()
+
     def _replay_status_usage_invalidation(self) -> None:
         """Repaint once if usage arrived before prompt_toolkit had an app."""
-        if getattr(self, "_status_usage_completed_before_app", False):
+        lock = getattr(self, "_status_usage_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if not getattr(self, "_status_usage_completed_before_app", False):
+                return
             self._status_usage_completed_before_app = False
             app = getattr(self, "_app", None)
-            if app is not None:
-                app.invalidate()
+        if app is not None:
+            app.invalidate()
 
     def _get_status_bar_session_title(self) -> str:
         """Return the current title without polling state.db on every repaint."""
@@ -10496,6 +10522,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"staying on {old_model}."
                 )
                 return
+
+        self._reset_status_usage_cache()
 
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)

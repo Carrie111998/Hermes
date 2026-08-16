@@ -19,6 +19,7 @@ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
     cli_obj._status_usage_checked_at = 0.0
     cli_obj._status_usage_refreshing = False
     cli_obj._status_usage_completed_before_app = False
+    cli_obj._status_usage_generation = 0
     cli_obj._status_usage_lock = threading.Lock()
     return cli_obj
 
@@ -114,6 +115,18 @@ class TestCLIStatusBar:
         cli_obj._app = app
         cli_obj._replay_status_usage_invalidation()
         app.invalidate.assert_called_once_with()
+
+    def test_status_usage_cache_reset_forces_fresh_snapshot(self):
+        cli_obj = _make_cli()
+        cli_obj._status_usage_snapshot = SimpleNamespace(windows=())
+        cli_obj._status_usage_checked_at = 123.0
+        generation = cli_obj._status_usage_generation
+
+        cli_obj._reset_status_usage_cache()
+
+        assert cli_obj._status_usage_snapshot is None
+        assert cli_obj._status_usage_checked_at == 0.0
+        assert cli_obj._status_usage_generation == generation + 1
 
     def test_session_title_is_right_aligned_after_it_is_queued(self):
         cli_obj = _make_cli()
