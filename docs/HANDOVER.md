@@ -47,9 +47,9 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 ### Current lane: HERMES-TELEGRAM-INBOUND-001
 
 - **Plan:** `docs/plans/2026-08-16-hermes-telegram-inbound-001.md`.
-- **Status:** `DIAGNOSIS_EVIDENCE_RECORDED / IMPLEMENTATION_SCOPE_PENDING`; design consensus and bounded DGX diagnosis are recorded in the plan.
+- **Status:** `IMPLEMENTATION_REVIEW_BLOCKED_CLAUDE_UNAVAILABLE`; design consensus, bounded DGX diagnosis, and the failed Claude/AGY correction-set review are recorded in the plan.
 - **Parent lane:** HERMES-TELEGRAM-TRANSPORT-001 is `MERGED_DEPLOYED_RUNTIME_DEGRADED`; its service and outbound gates passed, but inbound readiness remains unproven.
-- **Next action:** prepare a narrowly scoped implementation correction set for the missing qualifying inbound evidence, then obtain the required Claude+AGY implementation review. Claude and AGY ticket-design review consensus is already recorded; implementation remains a separate authorized gate.
+- **Next action:** obtain one authenticated Claude PASS on the exact correction packet and reconcile it with the recorded AGY PASS. Implementation remains blocked until both reviewer-family gates pass.
 - **Do not:** implement, restart, deploy, change credentials/allowlists/webhook state, or claim inbound readiness before the ticket review and direct polling evidence gates pass.
 
 ### Other ticket state

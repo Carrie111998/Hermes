@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-DIAGNOSIS_EVIDENCE_RECORDED / IMPLEMENTATION_SCOPE_PENDING
+IMPLEMENTATION_REVIEW_BLOCKED_CLAUDE_UNAVAILABLE
 
 ## Context
 
@@ -184,9 +184,32 @@ correction set (including safe, metadata-only observability and hermetic
 coverage), then obtain the required Claude+AGY implementation review before
 editing source. Keep inbound, service, and outbound gates separate.
 
+## Implementation correction-set review evidence
+
+- Packet boundary: identical metadata-only packet for both reviewer families;
+  no source, credentials, secrets, absolute paths, or evidence text.
+- Packet SHA-256: `ed8767916ce27d6a35045e5cf9f59f1c018c0d00be2ba01a9f4290f60325265c`.
+- Proposed correction set: add rate-limited metadata-only records at the
+  existing dedicated `getUpdates` promotion point; preserve independent
+  inbound/service/outbound states; record bounded degraded transitions; and
+  add hermetic promotion, timeout, fencing, and redaction tests. No network,
+  credential, TLS, webhook, timeout-policy, or DGX-runtime changes.
+- DGX Claude: host `55-0940189-03`, Claude Code `2.1.223`; authenticated SSH
+  session reached the reviewer, but the bounded 90-second review timed out
+  without a verdict.
+- DGX AGY: host `55-0940189-03`; `agy` was not installed/available, so no
+  verdict was obtained there.
+- WSL Claude fallback: host `55-0940189-91`, Claude Code `2.1.233`; the
+  bounded invocation returned `Execution error` without a verdict.
+- WSL AGY fallback: host `55-0940189-91`, AGY `1.1.13`; returned
+  `AUTHENTICATED_REVIEWER: yes` and `VERDICT: PASS` for the exact packet.
+- Consensus: `BLOCKED`; the required Claude PASS is absent. The AGY PASS
+  cannot substitute for the missing Claude verdict, and implementation is
+  not authorized.
+
 ## Current next action
 
-Prepare the implementation correction set from the confirmed evidence
-boundary. Do not modify code, credentials, Telegram state, systemd units, or
-the live DGX runtime until implementation review, tests, CI, and deployment
-gates are separately authorized and complete.
+Obtain one authenticated Claude PASS on the exact packet, then reconcile it
+with the recorded AGY PASS before any source edit. Do not modify code,
+credentials, Telegram state, systemd units, or the live DGX runtime while the
+implementation review gate is blocked.
