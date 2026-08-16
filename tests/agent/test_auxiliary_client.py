@@ -26,6 +26,7 @@ from agent.auxiliary_client import (
     _is_rate_limit_error,
     _is_model_not_found_error,
     _is_model_incompatible_error,
+    _is_zai_vision_param_error,
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
     _try_payment_fallback,
@@ -1384,6 +1385,32 @@ class TestIsModelNotFoundError:
         assert _is_model_not_found_error(exc) is False
 
 
+class TestIsZaiVisionParamError:
+    """_is_zai_vision_param_error must host-anchor the client base_url, not
+    substring-match "bigmodel" — regression for the sibling gap left behind
+    by the #74312 host-anchoring sweep, which fixed _to_openai_base_url()'s
+    ZAI/Kimi rewrite but missed this identical classifier."""
+
+    def test_real_bigmodel_host_matches(self):
+        assert _is_zai_vision_param_error("Error 1210: API 调用参数有误", "https://open.bigmodel.cn/api/paas/v4") is True
+
+    def test_real_zai_host_matches(self):
+        assert _is_zai_vision_param_error("Error 1210: API 调用参数有误", "https://api.z.ai/api/paas/v4") is True
+
+    def test_proxied_path_containing_bigmodel_does_not_match(self):
+        """A proxy whose path merely contains "bigmodel" is not ZAI — the
+        exact false-positive class the substring check had."""
+        assert _is_zai_vision_param_error("Error 1210: something else entirely", "https://proxy.corp/bigmodel-fallback/v1") is False
+
+    def test_lookalike_subdomain_does_not_match(self):
+        assert _is_zai_vision_param_error("Error 1210", "https://open.bigmodel.cn.evil.net/v1") is False
+
+    def test_non_1210_error_does_not_match_even_on_real_host(self):
+        assert _is_zai_vision_param_error("Error 400: bad request", "https://open.bigmodel.cn/api/paas/v4") is False
+
+    def test_missing_base_url_does_not_crash(self):
+        assert _is_zai_vision_param_error("Error 1210", None) is False
+        assert _is_zai_vision_param_error("Error 1210", "") is False
 
 
 class TestIsModelIncompatibleError:
