@@ -254,6 +254,23 @@ async def test_non_free_response_rejects_human_reply_to_other_bot(adapter, monke
 
 
 @pytest.mark.asyncio
+async def test_free_response_rejects_human_direct_mention_of_other_bot(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    adapter._ready_event.set()
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    channel = FakeTextChannel(channel_id=789)
+    message = make_message(
+        channel=channel,
+        content="<@55> can you handle this?",
+        mentions=[SimpleNamespace(id=55, bot=True)],
+    )
+    message.guild = channel.guild
+
+    assert await adapter._dispatch_discord_message(message) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_free_response_rejects_bot_reply_to_other_bot(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")

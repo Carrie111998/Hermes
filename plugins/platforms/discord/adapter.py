@@ -1615,7 +1615,11 @@ class DiscordAdapter(BasePlatformAdapter):
             if (
                 other_bots_mentioned
                 and not raw_self_mention
-                and (author_is_bot or not is_free_response)
+                and (
+                    author_is_bot
+                    or not is_free_response
+                    or message.type != discord.MessageType.reply
+                )
             ):
                 return False, False
             ignore_no_mention = os.getenv(
@@ -2196,12 +2200,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._post_connect_task
             except asyncio.CancelledError:
                 pass
-        if self._missed_message_backfill_task and not self._missed_message_backfill_task.done():
-            self._missed_message_backfill_task.cancel()
-            try:
-                await self._missed_message_backfill_task
-            except asyncio.CancelledError:
-                pass
         if (
             self._missed_message_backfill_periodic_task
             and not self._missed_message_backfill_periodic_task.done()
@@ -2209,6 +2207,12 @@ class DiscordAdapter(BasePlatformAdapter):
             self._missed_message_backfill_periodic_task.cancel()
             try:
                 await self._missed_message_backfill_periodic_task
+            except asyncio.CancelledError:
+                pass
+        if self._missed_message_backfill_task and not self._missed_message_backfill_task.done():
+            self._missed_message_backfill_task.cancel()
+            try:
+                await self._missed_message_backfill_task
             except asyncio.CancelledError:
                 pass
 
@@ -2574,8 +2578,24 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             value = float(raw)
         except (TypeError, ValueError):
+            logger.warning(
+                "[%s] Invalid Discord missed-message backfill interval_seconds %r; "
+                "periodic recovery disabled",
+                self.name,
+                raw,
+            )
             return 0.0
-        return value if math.isfinite(value) and value > 0 else 0.0
+        if value == 0:
+            return 0.0
+        if not math.isfinite(value) or value < 0:
+            logger.warning(
+                "[%s] Invalid Discord missed-message backfill interval_seconds %r; "
+                "periodic recovery disabled",
+                self.name,
+                raw,
+            )
+            return 0.0
+        return value
 
     def _ensure_missed_message_backfill_task(self) -> asyncio.Task:
         """Return the active recovery task, or start one when none is running."""
@@ -2755,7 +2775,7 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
+            message, claim=True,
         )
         if not admitted:
             return False
