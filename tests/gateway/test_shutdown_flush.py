@@ -204,6 +204,44 @@ def test_recover_survives_unparseable_payload(tmp_path, monkeypatch):
     assert corrupt.exists()
 
 
+def test_recover_closes_owned_db_when_interrupt_follows_tolerated_error(
+    tmp_path, monkeypatch
+):
+    """Tolerating ordinary errors must not weaken the interrupt contract.
+
+    #83226's guarantee is that an interrupt closes an owned SessionDB and
+    propagates.  That must still hold on a pass where an earlier file
+    already failed with an ordinary exception and was skipped.
+    """
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    failed = _write_flush_file(flush_dir, "pending-a.json", "sid-bad", "first")
+    _write_flush_file(flush_dir, "pending-b.json", "sid-interrupt", "second")
+
+    class InterruptAfterErrorDB:
+        closed = False
+
+        def append_message(self, **kwargs):
+            if kwargs["session_id"] == "sid-bad":
+                raise RuntimeError("session is closed")
+            raise KeyboardInterrupt
+
+        def close(self):
+            self.closed = True
+
+    db = InterruptAfterErrorDB()
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
+
+    with pytest.raises(KeyboardInterrupt):
+        recover_pending_to_db()
+
+    assert db.closed is True
+    # The tolerated failure is still on disk for the next startup.
+    assert failed.exists()
+
+
 def test_serialise_object_with_text():
     obj = MagicMock()
     obj.text = "msg"
