@@ -3,10 +3,12 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
-  instanceWindowBounds
+  instanceWindowBounds,
+  normalizeInstanceWindowProfile
 } from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
@@ -86,6 +88,46 @@ test('buildSessionWindowUrl adds the watch flag for spectator windows, before th
   const url = buildSessionWindowUrl('abc', { devServer: 'http://localhost:5173', watch: true })
 
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1#/abc')
+})
+
+test('buildInstanceWindowUrl pins a full peer window to a profile before the hash route', () => {
+  const url = buildInstanceWindowUrl({ devServer: 'http://localhost:5173', profile: 'work' })
+
+  assert.equal(url, 'http://localhost:5173/?profile=work#/')
+})
+
+test('buildInstanceWindowUrl preserves the legacy plain URL without a profile', () => {
+  const url = buildInstanceWindowUrl({ devServer: 'http://localhost:5173' })
+
+  assert.equal(url, 'http://localhost:5173')
+})
+
+test('buildInstanceWindowUrl builds a packaged profile URL before the hash route', () => {
+  const url = buildInstanceWindowUrl({ profile: 'work', rendererIndexPath: '/opt/app/index.html' })
+
+  assert.match(url, /^file:\/\/.*index\.html\?profile=work#\/$/)
+})
+
+test('buildInstanceWindowUrl URL-encodes the profile value', () => {
+  const url = buildInstanceWindowUrl({ devServer: 'http://localhost:5173/', profile: 'work/a b' })
+
+  assert.equal(url, 'http://localhost:5173/?profile=work%2Fa%20b#/')
+})
+
+test('normalizeInstanceWindowProfile rejects invalid IPC profile values', () => {
+  const result = normalizeInstanceWindowProfile('Not Valid!', value => /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value))
+
+  assert.deepEqual(result, { ok: false, profile: null })
+})
+
+test('normalizeInstanceWindowProfile preserves generic and valid profile opens', () => {
+  const isValid = value => /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value)
+
+  assert.deepEqual(normalizeInstanceWindowProfile(undefined, isValid), { ok: true, profile: null })
+  assert.deepEqual(normalizeInstanceWindowProfile('   ', isValid), { ok: true, profile: null })
+  assert.deepEqual(normalizeInstanceWindowProfile(' default ', isValid), { ok: true, profile: 'default' })
+  assert.deepEqual(normalizeInstanceWindowProfile(' work ', isValid), { ok: true, profile: 'work' })
+  assert.deepEqual(normalizeInstanceWindowProfile({ profile: 'work' }, isValid), { ok: false, profile: null })
 })
 
 test('instanceWindowBounds cascades a new window off its source bounds', () => {

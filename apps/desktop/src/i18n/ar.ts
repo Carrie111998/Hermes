@@ -1322,6 +1322,7 @@ export const ar = defineLocale({
     count: count => `${count} ملف شخصي`,
     loading: 'جار التحميل...',
     newProfile: 'ملف شخصي جديد',
+    newWindow: 'نافذة جديدة',
     importProfile: 'استيراد ملف شخصي…',
     exportProfile: 'تصدير ملف شخصي…',
     imported: 'تم استيراد الملف الشخصي',
