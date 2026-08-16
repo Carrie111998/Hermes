@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V2_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -77,91 +77,148 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
 
 ## Implementation sequence
 
-### Gate 0 — source and mutation-path preflight
+### Gate 0 - source and mutation-path preflight
 
 - Verify repository identity, design commit, branch, worktree, and merged
   runtime-state implementation.
+- Enumerate every process, thread, connection, scheduler path, maintenance
+  path, and privileged baseline/compaction path that can write runtime state.
+  Record the writer matrix before source edits.
+- Choose and record one writer model:
+  - single-writer: retain one mutation connection, remove unnecessary
+    contention retry behavior, and test the single-writer invariant; or
+  - multi-writer: specify SQLite WAL mode, busy timeout, bounded retry policy,
+    and all writer ownership boundaries before implementation.
+  The chosen model must align Gate 2 and Gate 4; an unresolved model blocks
+  implementation.
 - Map every runtime-state lifecycle mutation and prove the chosen CAS
   chokepoint covers them.
 - Locate the existing local secret/key-storage mechanism without printing or
-  copying secrets.
-- Define the journal migration version and event field names before edits.
-- Stop if a direct mutation path bypasses the chokepoint or durable key custody
-  is unavailable.
+  copying secrets. If durable custody is unavailable, stop.
+- Define the journal migration version, event kinds, replay tuple, baseline
+  fields, and rollback posture before edits.
+- Confirm that the prior release can start with the new journal table present
+  and that rollback does not require deleting the table or losing materialized
+  state.
+- Stop if a direct mutation path bypasses the chokepoint, key custody is
+  unavailable, writer semantics are unresolved, or prior-version tolerance is
+  unproven.
 
-### Gate 1 — journal schema and migration
+### Gate 1 - journal schema and migration
 
 Add a versioned runtime-state-owned journal table with:
 
-- event identity;
+- event identity and event kind: `mutation`, `genesis`, or `baseline`;
 - profile/entity category;
 - profile-scoped keyed entity digest;
 - non-secret digest-parameter identifier;
+- origin marker for migration-origin or post-migration genesis;
 - per-profile/entity monotonic sequence with uniqueness;
 - operation category;
 - lifecycle state before/after;
 - owner-version before/after;
 - state schema version and journal event version;
 - bounded closed reason code;
-- diagnostic timestamp.
+- diagnostic timestamp;
+- baseline sealed lifecycle state, owner-version, state schema version, and
+  sealed sequence position when event kind is `baseline`.
+
+The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
+`state_schema_version`; terminality is derived from lifecycle state. Columns
+outside this tuple are outside the verifier's `CONSISTENT` claim.
 
 The migration must not record raw business keys, owner tokens, prompts,
 messages, tool arguments, credentials, filesystem paths, provider payloads, or
 arbitrary user data.
 
-Legacy entities must follow the explicit `UNKNOWN` policy above.
+Legacy entities use the explicit no-backfill policy: pre-journal rows remain
+`UNKNOWN` until a successful post-migration mutation emits a marked
+post-migration genesis event. A truncated head without the required origin
+marker also returns `UNKNOWN`.
 
-### Gate 2 — atomic emission at the CAS chokepoint
+Digest parameter identifiers are persisted metadata; key material is never
+journaled. A digest-parameter rotation makes pre-rotation history
+non-comparable and `UNKNOWN` unless a valid sealed baseline explicitly
+bridges the regimes. Verify-time key unavailability is `UNKNOWN`.
 
-- Emit exactly one event for every committed mutation that changes a replayed
-  column, including owner-version changes with unchanged lifecycle state.
+Migration rollback is forward-compatible: prior code must tolerate the
+journal table's presence and continue serving materialized rows; rollback must
+not delete the table or rewrite history. Migration compatibility tests must
+assert this posture.
+
+### Gate 2 - atomic emission at the CAS chokepoint
+
+- Emit exactly one event for every committed mutation that changes any member
+  of the replay tuple, including owner-version-only changes with unchanged
+  lifecycle state.
 - Emit no event for a true no-op that changes no replayed column.
 - Use the caller's existing SQLite connection and transaction.
 - Any journal constraint/write failure aborts the complete enclosing mutation;
   errors must not be swallowed.
-- Resolve sequence contention by retrying with a fresh in-transaction sequence
-  or aborting; neither path may create a committed event without its state
+- Align sequence allocation with the Gate 0 writer model. In the multi-writer
+  branch, use a code-level `SEQUENCE_RETRY_LIMIT = 3`; retry with a fresh
+  in-transaction sequence and abort the enclosing mutation when the cap is
+  exhausted. In the single-writer branch, prove contention cannot occur and
+  retain an explicit defensive abort path.
+- Neither retry nor abort may create a committed event without its state
   mutation or a replay-visible sequence gap.
 - Add a negative test proving lifecycle writes cannot bypass the emission
   chokepoint.
 
-### Gate 3 — read-only verifier
+### Gate 3 - read-only verifier
 
 Implement a bounded verifier that:
 
-- reads the event stream and materialized row in one read-only snapshot;
+- opens one SQLite read-only transaction on one connection and reads both the
+  bounded event stream and materialized row within that same snapshot; under
+  WAL this is one deferred read transaction held across both reads;
 - returns per-entity `CONSISTENT`, `DRIFT`, or `UNKNOWN`;
 - treats `UNKNOWN` as absorbing;
 - requires complete verified history for `DRIFT`;
-- validates sequence continuity, duplicate/missing predecessors, baseline
-  contents, digest-parameter identity, schema versions, reason codes, and
-  terminal state;
+- validates event kind, origin/genesis markers, sequence continuity, duplicate
+  or missing predecessors, baseline contents, digest-parameter identity,
+  schema versions, reason codes, and terminal state;
+- uses a code-level `REPLAY_EVENT_LIMIT = 10000` per entity; exceeding it or
+  failing to establish the read snapshot returns `UNKNOWN`;
 - returns `UNKNOWN` on snapshot failure, unsupported/newer versions, malformed
-  history, unknown digest regime, exceeded bound, or missing legacy origin;
+  history, unknown digest regime, verify-time key unavailability, exceeded
+  bound, or missing legacy origin;
+- may read digest key material through the approved local key store, but never
+  logs, persists, echoes, or includes key material in diagnostics or results;
 - performs no writes, ownership claims, external calls, gateway replay, or
   prompt construction.
 
-The verifier must never run inside the gateway conversation loop.
+The verifier must never run inside the gateway conversation loop. A verifier
+result covers only the replay tuple; non-replayed materialized columns are
+outside the `CONSISTENT` claim.
 
-### Gate 4 — focused hermetic tests
+### Gate 4 - focused hermetic tests
 
 Add deterministic tests for:
 
 - empty database and journal migration;
 - legacy populated rows returning `UNKNOWN`;
-- one event per committed mutation;
+- marked post-migration genesis and truncated-head history;
+- prior-version startup with the journal table present and rollback posture;
+- one event per committed replay-tuple mutation;
 - true no-op without an event;
 - owner-version-only mutation;
 - journal failure rolling back materialized state;
-- sequence uniqueness and concurrent contention;
+- writer-model, SQLite WAL/busy-timeout policy, sequence retry cap, and
+  concurrent contention;
 - bypass-path rejection;
-- keyed digest/profile isolation and digest-parameter rotation;
+- keyed digest/profile isolation, digest-parameter rotation, and verify-time
+  key unavailability;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
 - sealed baseline contents and post-baseline continuity;
-- snapshot race returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
+- snapshot race using the selected read-transaction mechanism, returning
+  `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
 - replay bound and closed reason-code enforcement;
+- verifier-performs-no-writes using a direct database-change assertion;
+- prompt-cache/gateway no-change check: runtime-state modules must not import
+  or invoke gateway conversation or prompt-construction modules;
 - `DRIFT` only for complete verified history;
-- no gateway/prompt-cache surface changes.
+- non-replayed columns remain outside the verifier claim.
 
 Run focused tests first, then the repository's relevant full test suite.
 
@@ -223,17 +280,47 @@ must be incorporated before implementation authorization:
 These are plan-only corrections. They do not authorize source edits, migration,
 tests, DGX changes, deployment, repair, or event-sourcing.
 
+## Implementation-plan review reconciliation v2
+
+The authenticated Claude re-review of reconciliation v1 found that the earlier
+corrections were appended rather than incorporated into the normative gates.
+The v2 update folds them into Gates 0–4 and adds:
+
+- an explicit replay tuple;
+- concrete SQLite read-snapshot behavior;
+- baseline and genesis schema fields;
+- a bounded sequence retry cap;
+- verify-time key handling;
+- direct no-write and gateway/prompt isolation tests;
+- migration rollback compatibility;
+- mutation overhead and journal growth acceptance bounds;
+- a requirement that the merged Gate 0–4 text itself be re-reviewed.
+
+The optional encoding cleanup was handled by using ASCII gate headings. This
+section is a changelog only; the normative behavior is in Gates 0–4 above.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
 
-- every committed replayed mutation emits exactly one metadata-only event;
+- every committed replay-tuple mutation emits exactly one metadata-only event;
 - journal failure cannot commit a materialized mutation;
+- the writer model, snapshot mechanism, sequence retry cap, baseline/genesis
+  schema, digest rotation behavior, rollback posture, and key handling are
+  explicit in the Gate 0–4 bodies;
 - profile/entity sequences are contiguous and race-safe;
 - legacy rows have explicit `UNKNOWN` behavior;
 - baselines and digest regimes are verifiable;
 - verifier reads are snapshot-consistent and read-only;
 - `DRIFT` is never produced from incomplete or ambiguous history;
+- verifier mutation and prompt-cache/gateway isolation tests pass;
+- incremental mutation-path overhead target is at most 5 ms p95 in the focused
+  benchmark; exceeding it blocks delivery and requires plan revision;
+- journal growth is one bounded metadata row per committed replay-tuple
+  mutation, with no automatic retention job; operational review is required at
+  100,000 events or 100 MiB per profile, whichever occurs first;
+- reconciliation v1 items are incorporated into the normative Gate 0–4 text and
+  this merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
 - authenticated Claude + AGY implementation review reaches consensus;
 - no unrelated dirty worktree or DGX runtime state was changed.
