@@ -2308,11 +2308,20 @@ install_node_deps() {
         # A failed npm install used to still print "✓ Node.js dependencies
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
-            log_error "npm install failed or timed out; Node.js dependencies were not installed"
+        # Capture npm's output so the failure that aborts the install is
+        # diagnosable — --silent alone leaves nothing to tell EBADENGINE from
+        # ETARGET from a network timeout from a registry 5xx (#87340). Same
+        # capture-and-replay pattern as the camofox install below.
+        local log_file
+        log_file="$(mktemp)"
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent >"$log_file" 2>&1; then
+            log_error "npm install failed or timed out; Node.js dependencies were not installed:"
+            cat "$log_file" >&2
+            rm -f "$log_file"
             restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
+        rm -f "$log_file"
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
@@ -2413,12 +2422,18 @@ install_node_deps() {
         cd "$INSTALL_DIR/ui-tui"
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
         # Report success only on actual success, same as node-deps above
-        # (#77003) — and fail the install outright (#85297).
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
-            log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
+        # (#77003) — and fail the install outright (#85297). Capture and
+        # replay npm's output on failure for the same reason (#87340).
+        local tui_log_file
+        tui_log_file="$(mktemp)"
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent >"$tui_log_file" 2>&1; then
+            log_error "TUI npm install failed or timed out; TUI dependencies were not installed:"
+            cat "$tui_log_file" >&2
+            rm -f "$tui_log_file"
             restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
+        rm -f "$tui_log_file"
         log_success "TUI dependencies installed"
     fi
 
