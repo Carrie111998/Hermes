@@ -264,3 +264,50 @@ class TestCursorACPClientShape:
         )
         with pytest.raises(RuntimeError, match="cursor-agent login"):
             client._run_prompt("hello", timeout_seconds=1)
+
+    def test_authenticate_failure_is_actionable(self, tmp_path) -> None:
+        """A live ACP process that rejects cursor_login must not fall back to prose."""
+        server = tmp_path / "fake_unauth_acp.py"
+        server.write_text(
+            "import json, sys\n"
+            "\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line)\n"
+            "    method = msg.get('method')\n"
+            "    mid = msg.get('id')\n"
+            "    if method == 'initialize':\n"
+            "        send({\n"
+            "            'jsonrpc': '2.0',\n"
+            "            'id': mid,\n"
+            "            'result': {\n"
+            "                'protocolVersion': 1,\n"
+            "                'authMethods': [{'id': 'cursor_login'}],\n"
+            "            },\n"
+            "        })\n"
+            "    elif method == 'authenticate':\n"
+            "        send({\n"
+            "            'jsonrpc': '2.0',\n"
+            "            'id': mid,\n"
+            "            'error': {'code': -32000, 'message': 'Not logged in'},\n"
+            "        })\n"
+            "    else:\n"
+            "        send({\n"
+            "            'jsonrpc': '2.0',\n"
+            "            'id': mid,\n"
+            "            'error': {'code': -32601, 'message': method},\n"
+            "        })\n",
+            encoding="utf-8",
+        )
+        import sys
+
+        client = CursorACPClient(
+            acp_command=sys.executable,
+            acp_args=[str(server)],
+            acp_cwd=str(tmp_path),
+        )
+        with pytest.raises(RuntimeError, match="authentication failed"):
+            client._run_prompt("hello", timeout_seconds=5)
