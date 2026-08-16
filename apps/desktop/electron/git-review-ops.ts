@@ -32,13 +32,19 @@ function ghEnv(ghBin) {
 
 // Run the `gh` CLI in a repo. Resolves { ok, stdout } so callers branch on
 // availability/auth without a throw. gh missing/unauthed → ok:false.
-function runGh(args, cwd, ghBin): Promise<{ ok: boolean; stdout: string }> {
+function runGh(args, cwd, ghBin): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> {
   return new Promise(resolve => {
     execFile(
       ghBin || 'gh',
       args,
       { cwd, env: ghEnv(ghBin), windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
-      (err, stdout) => resolve({ ok: !err, stdout: String(stdout || '') })
+      (err, stdout, stderr) =>
+        resolve({
+          ok: !err,
+          stdout: String(stdout || ''),
+          stderr: String(stderr || ''),
+          code: err && typeof (err as any).code === 'number' ? (err as any).code : null,
+        })
     )
   })
 }
