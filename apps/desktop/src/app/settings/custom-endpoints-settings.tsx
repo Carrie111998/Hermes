@@ -11,6 +11,7 @@ import {
   validateCustomEndpoint
 } from '@/hermes'
 import { triggerHaptic } from '@/lib/haptics'
+import { useI18n } from '@/i18n'
 import { Check, Globe, Loader2, Plus, Save, Trash2, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
@@ -75,6 +76,7 @@ function toPayload(form: EndpointForm, models?: string[]): CustomEndpointUpdate 
 }
 
 export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: CustomEndpointsSettingsProps) {
+  const { t } = useI18n()
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -229,7 +231,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     <SettingsContent>
       <div className="space-y-6">
         <section>
-          <SectionHeading icon={Globe} meta={`${endpoints.length}`} title="Custom Endpoints" />
+          <SectionHeading icon={Globe} meta={`${endpoints.length}`} title={t.common.customEndpoints} />
           <div className="divide-y divide-border/40 rounded-md border border-border/50">
             {endpoints.length ? (
               endpoints.map(endpoint => (
@@ -276,7 +278,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                         disabled={deleting === endpoint.id}
                         onClick={() => void handleDelete(endpoint)}
                         size="icon-sm"
-                        title="Delete endpoint"
+                        title={t.common.deleteEndpoint}
                         variant="ghost"
                       >
                         {deleting === endpoint.id ? <Loader2 className="animate-spin" /> : <Trash2 />}
@@ -286,7 +288,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 </div>
               ))
             ) : (
-              <EmptyState description="Add an OpenAI-compatible endpoint below." title="No custom endpoints" />
+              <EmptyState description={t.common.addEndpointDesc} title={t.common.noCustomEndpoints} />
             )}
           </div>
         </section>
@@ -340,7 +342,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 <Input
                   inputMode="numeric"
                   onChange={event => setForm(current => ({ ...current, contextLength: event.target.value }))}
-                  placeholder="Auto"
+                  placeholder={t.common.auto}
                   value={form.contextLength}
                 />
               </label>

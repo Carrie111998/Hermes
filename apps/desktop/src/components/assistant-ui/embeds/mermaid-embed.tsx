@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react'
 import { Zoomable } from '@/components/ui/zoomable'
 import { copySvgAsPng } from '@/lib/svg-image'
 import { cn } from '@/lib/utils'
+import { useI18n } from '@/i18n'
 
 import type { RichFenceProps } from './types'
 import { useIsDark } from './use-is-dark'
@@ -43,6 +44,7 @@ function SourcePreview({ code, muted }: { code: string; muted?: boolean }) {
 // the source while the message streams (partial syntax throws) and falls back
 // to source on parse failure.
 export default function MermaidRenderer({ code, streaming }: RichFenceProps) {
+  const { t } = useI18n()
   const isDark = useIsDark()
   const [svg, setSvg] = useState('')
   const [failed, setFailed] = useState(false)
@@ -95,7 +97,7 @@ export default function MermaidRenderer({ code, streaming }: RichFenceProps) {
   // renders before any zoom; the inline version stays capped at 33dvh.
   return (
     <Zoomable
-      label="Open diagram"
+      label={t.common.openDiagram}
       onCopy={() => copySvgAsPng(svg)}
       overlay={
         <div

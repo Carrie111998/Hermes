@@ -107,7 +107,7 @@ export function CreateProfileDialog({
               autoFocus
               id="new-profile-name"
               onValueChange={setName}
-              placeholder="my-profile"
+              placeholder={t.common.myProfile}
               sanitize={slug}
               value={name}
             />

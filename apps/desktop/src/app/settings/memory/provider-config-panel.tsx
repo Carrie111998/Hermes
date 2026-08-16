@@ -12,6 +12,7 @@ import { ListRow, Pill } from '../primitives'
 
 import { FieldControl, FieldTitle } from './field-control'
 import { ProviderConfigModal } from './provider-config-modal'
+import { useI18n } from '@/i18n'
 
 // Inline fields only: the compact panel must never re-write modal-owned keys.
 function seedValues(config: MemoryProviderConfig): Record<string, string> {
@@ -27,6 +28,7 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
   const [saved, setSaved] = useState<Record<string, string>>({})
   const [expanded, setExpanded] = useState(true)
   const [showModal, setShowModal] = useState(false)
+  const { t } = useI18n()
 
   const refresh = useCallback(async () => {
     try {
@@ -38,9 +40,9 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
       setLoadError(null)
     } catch (err) {
       setConfig(null)
-      setLoadError(err instanceof Error ? err.message : 'Memory provider settings failed to load')
+      setLoadError(err instanceof Error ? err.message : t.common.memoryProviderSettingsFailed)
     }
-  }, [provider])
+  }, [provider, t])
 
   useEffect(() => {
     setConfig(null)
@@ -87,16 +89,16 @@ export function ProviderConfigPanel({ provider }: { provider: string }) {
       return (
         <div className="flex items-center justify-between gap-3 py-2">
           <span className="text-[length:var(--conversation-caption-font-size)] text-muted-foreground">
-            Memory provider settings failed to load: {loadError}
+            {t.common.memoryProviderSettingsFailed}: {loadError}
           </span>
           <Button onClick={() => void refresh()} size="sm" type="button" variant="secondary">
-            Retry
+            {t.common.retry}
           </Button>
         </div>
       )
     }
 
-    return <PageLoader className="min-h-24" label="Loading memory provider settings..." />
+    return <PageLoader className="min-h-24" label={t.common.loadingMemoryProviderSettings} />
   }
 
   const inlineFields = config.fields.filter(field => field.inline)

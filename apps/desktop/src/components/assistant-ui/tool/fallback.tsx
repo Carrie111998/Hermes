@@ -620,7 +620,7 @@ function ToolEntry({ part }: ToolEntryProps) {
             <div className="max-w-full text-xs leading-relaxed text-(--ui-text-secondary)">
               {view.searchQuery && (
                 <p className="mb-1 flex min-w-0 gap-1.5 wrap-anywhere">
-                  <span className="shrink-0 font-medium text-(--ui-text-tertiary)">Search</span>
+                  <span className="shrink-0 font-medium text-(--ui-text-tertiary)">{t.common.search}</span>
                   <span>{view.searchQuery}</span>
                 </p>
               )}

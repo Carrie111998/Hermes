@@ -460,7 +460,7 @@ export const ChatView = memo(function ChatView({
       },
       tools: {
         enabled: true,
-        label: 'Add context',
+        label: t.common.addContext,
         suggestions: contextSuggestions
       },
       voice: {
