@@ -54,10 +54,12 @@ export function SessionsHeaderAction({
     return (
       <div className="group/workspace flex shrink-0 items-center gap-0.5">
         {enteredProject.path && <StartWorkButton repoPath={enteredProject.path} />}
-        {/* Home has no folder and no record to rename, theme, or delete. */}
+        {/* Home has no folder and no record to rename, theme, or delete. It's
+            also the only way to start a session from Home, so keep it
+            visible rather than hover-revealed like the flat view's "+". */}
         {enteredProject.isNoProject ? (
           <NewSessionHeaderButton
-            className={HEADER_ACTION_BTN}
+            className={HEADER_NAV_BTN}
             label={labels.newSession}
             onClick={() => onNewSessionInWorkspace(null)}
           />
