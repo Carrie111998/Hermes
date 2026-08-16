@@ -1730,18 +1730,26 @@ class LocalEnvironment(BaseEnvironment):
             # Debian's /etc/profile unconditionally resets PATH for
             # non-root shells *before* sourcing /etc/profile.d/*.sh,
             # discarding venv entries the Dockerfile's ENV PATH sets up.
-            # Save and restore the PATH around the login shell so that
-            # the snapshot (export -p) captures the correct venv entries.
-            # See issue #56634.
+            # Restore it immediately, before anything else in this login
+            # shell runs — including the init-file sourcing just prepended
+            # above, and (for init_session's bootstrap specifically)
+            # cmd_string's own ``export -p`` snapshot dump (see base.py's
+            # ``_export_dump_excluding_session_vars``), which persists
+            # whatever PATH is current at that moment into the snapshot
+            # file every later terminal call sources. This restore must be
+            # the FIRST thing that runs, prepended in front of the
+            # init-file prelude too — not appended after cmd_string (the
+            # original placement here), which fixed the live shell's PATH
+            # too late: the dump had already captured and persisted the
+            # profile-reset value by then, so every subsequent command in
+            # the session still lost the venv. Init files still run after
+            # this and may freely extend PATH further (nvm/pyenv/asdf), so
+            # their own additions are unaffected and still land in the
+            # snapshot. See issue #56634.
             path_key = _path_env_key(run_env)
             if path_key is not None:
                 saved = shlex.quote(run_env.get(path_key, ""))
-                cmd_string = (
-                    f"__hermes_prelogin_path={saved}\n"
-                    f"{cmd_string}"
-                    f"export {path_key}=$__hermes_prelogin_path\n"
-                    f"unset __hermes_prelogin_path\n"
-                )
+                cmd_string = f"export {path_key}={saved}\n" + cmd_string
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
 
         # Recover when the cwd has been deleted out from under us — usually by
