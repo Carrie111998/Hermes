@@ -71,6 +71,39 @@ def test_omitted_workspace_inherits_project_worktree_without_warning(kanban_conn
     assert supersession_warning(None, task) is None
 
 
+def test_explicit_directory_preserved_without_warning(kanban_conn, tmp_path):
+    proj = _make_project()
+    assert proj is not None
+    requested_path = tmp_path / "explicit-workspace"
+    tid = kb.create_task(
+        kanban_conn,
+        title="Use existing directory",
+        project_id=proj.slug,
+        workspace_kind="dir",
+        workspace_path=str(requested_path),
+    )
+
+    task = kb.get_task(kanban_conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(requested_path)
+    assert supersession_warning(f"dir:{requested_path}", task) is None
+
+
+def test_explicit_scratch_on_unlinked_task_does_not_warn(kanban_conn):
+    tid = kb.create_task(
+        kanban_conn,
+        title="Unlinked scratch",
+        workspace_kind="scratch",
+    )
+
+    task = kb.get_task(kanban_conn, tid)
+    assert task is not None
+    assert task.project_id is None
+    assert task.workspace_kind == "scratch"
+    assert supersession_warning("scratch", task) is None
+
+
 def test_explicit_branch_overrides_project_default(kanban_conn):
     proj = _make_project()
     tid = kb.create_task(
