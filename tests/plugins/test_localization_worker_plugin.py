@@ -54,6 +54,22 @@ def claimed_job(plugin, tmp_path, text="Hello {name}"):
     return job_id, lease
 
 
+def test_relative_source_path_is_anchored_to_configured_root(worker, tmp_path, monkeypatch):
+    plugin, _ = worker
+    source = tmp_path / "source.txt"
+    source.write_text("Hello", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    created = call(plugin.create_job, source_path="source.txt", target_locale="ko")
+    repeated = call(plugin.create_job, source_path="source.txt", target_locale="ko")
+
+    assert created["ok"] is True
+    assert repeated["job_id"] == created["job_id"]
+    assert call(plugin.inspect_job, job_id=created["job_id"])["state"] == "INSPECTED"
+
+
 def test_create_job_rejects_source_swapped_to_external_symlink(worker, tmp_path, monkeypatch):
     plugin, _ = worker
     source = tmp_path / "source.txt"
@@ -277,6 +293,31 @@ def test_translation_unicode_separator_is_preserved_as_content(worker, tmp_path)
 
     assert verified["state"] == "COMPLETED"
     assert Path(assembled["output_path"]).read_text(encoding="utf-8") == translated
+
+
+def test_final_chunk_submit_retry_is_idempotent_after_validation(worker, tmp_path):
+    plugin, _ = worker
+    job_id, lease = claimed_job(plugin, tmp_path, text="Hello")
+    translations = [{"segment_id": lease["segments"][0]["segment_id"], "text": "안녕"}]
+    accepted = call(
+        plugin.submit_chunk,
+        job_id=job_id,
+        chunk_id=lease["chunk_id"],
+        fencing_token=lease["fencing_token"],
+        translations=translations,
+    )
+    assert accepted["idempotent"] is False
+    assert call(plugin.validate_chunk, job_id=job_id, chunk_id=lease["chunk_id"])["state"] == "VALIDATING"
+
+    retried = call(
+        plugin.submit_chunk,
+        job_id=job_id,
+        chunk_id=lease["chunk_id"],
+        fencing_token=lease["fencing_token"],
+        translations=translations,
+    )
+
+    assert retried == {"ok": True, "accepted": True, "idempotent": True, "state": "VALIDATING"}
 
 
 def test_invalid_transition_fails_closed(worker, tmp_path):
@@ -604,6 +645,22 @@ def test_empty_translation_is_rejected(worker, tmp_path):
     )
 
     assert rejected["error"]["code"] == "EMPTY_TRANSLATION"
+
+
+@pytest.mark.parametrize("translated", ["안녕\n세계", "안녕\r세계", "안녕\r\n세계"])
+def test_embedded_translation_newline_is_rejected_at_submission(worker, tmp_path, translated):
+    plugin, _ = worker
+    job_id, lease = claimed_job(plugin, tmp_path, text="Hello")
+
+    rejected = call(
+        plugin.submit_chunk,
+        job_id=job_id,
+        chunk_id=lease["chunk_id"],
+        fencing_token=lease["fencing_token"],
+        translations=[{"segment_id": lease["segments"][0]["segment_id"], "text": translated}],
+    )
+
+    assert rejected["error"]["code"] == "TRANSLATION_CONTAINS_NEWLINE"
 
 
 def test_number_change_is_rejected(worker, tmp_path):

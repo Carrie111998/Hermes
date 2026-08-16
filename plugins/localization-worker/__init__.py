@@ -135,10 +135,11 @@ def _require(row: sqlite3.Row, expected: str) -> None:
 
 def _source_location(path: str) -> tuple[Path, tuple[str, ...]]:
     candidate = Path(path).expanduser()
+    roots = _source_roots()
     if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
+        candidate = roots[0] / candidate
     normalized = Path(os.path.abspath(candidate))
-    for root in _source_roots():
+    for root in roots:
         root_abs = Path(os.path.abspath(root))
         try:
             relative = normalized.relative_to(root_abs)
@@ -524,15 +525,17 @@ def submit_chunk(a: dict[str, Any]) -> dict[str, Any]:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = _job(conn, a["job_id"])
-        if row["state"] != "PROCESSING":
+        if row["state"] not in {"PROCESSING", "VALIDATING"}:
             raise ValueError("INVALID_TRANSITION")
         chunk = conn.execute("SELECT * FROM chunks WHERE job_id=? AND id=?", (row["id"], a["chunk_id"])).fetchone()
         if not chunk: raise ValueError("CHUNK_NOT_FOUND")
         if chunk["fencing_token"] != a.get("fencing_token"):
             raise ValueError("STALE_LEASE")
-        if chunk["state"] == "SUBMITTED" and chunk["submission_hash"] == submission_hash:
+        if chunk["state"] in {"SUBMITTED", "VALIDATED"} and chunk["submission_hash"] == submission_hash:
             conn.commit()
             return {"ok": True, "accepted": True, "idempotent": True, "state": row["state"]}
+        if row["state"] != "PROCESSING":
+            raise ValueError("INVALID_TRANSITION")
         if chunk["state"] != "LEASED" or chunk["lease_expires_at"] <= _epoch():
             raise ValueError("STALE_LEASE")
         expected = {x[0] for x in conn.execute("SELECT segment_id FROM chunk_segments WHERE job_id=? AND chunk_id=?", (row["id"], chunk["id"]))}
@@ -542,6 +545,7 @@ def submit_chunk(a: dict[str, Any]) -> dict[str, Any]:
             source = conn.execute("SELECT source_text FROM segments WHERE job_id=? AND segment_id=?", (row["id"], item["segment_id"])).fetchone()[0]
             target = item["text"]
             if not isinstance(target, str): raise ValueError("INVALID_TRANSLATION")
+            if "\n" in target or "\r" in target: raise ValueError("TRANSLATION_CONTAINS_NEWLINE")
             if source == "":
                 if target != "": raise ValueError("BLANK_LINE_CHANGED")
             elif not target.strip():
