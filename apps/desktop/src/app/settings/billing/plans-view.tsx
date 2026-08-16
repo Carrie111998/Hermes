@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { openExternalLink } from '@/lib/external-link'
 import { ChevronLeft, ExternalLink } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { useI18n } from '@/i18n'
 
 import { Pill } from '../primitives'
 
@@ -111,6 +112,7 @@ function DowngradeConfirm({ flow, tier }: { flow: DowngradeFlow; tier: BillingPl
 }
 
 function PlanCard({ flow, tier }: { flow: DowngradeFlow; tier: BillingPlanTierView }) {
+  const { t } = useI18n()
   const isCurrent = tier.state === 'current'
   const confirming = flow.active?.target.tierId === tier.tierId
   const cardRef = useRef<HTMLDivElement>(null)
@@ -155,9 +157,9 @@ function PlanCard({ flow, tier }: { flow: DowngradeFlow; tier: BillingPlanTierVi
       )}
 
       <div className="mt-auto min-w-0 pt-1">
-        {isCurrent && <Pill tone="primary">Current plan</Pill>}
+        {isCurrent && <Pill tone="primary">{t.common.currentPlan}</Pill>}
 
-        {tier.state === 'scheduled' && <Pill>Scheduled</Pill>}
+        {tier.state === 'scheduled' && <Pill>{t.common.scheduled}</Pill>}
 
         {tier.state === 'upgrade' && (
           <Button
@@ -192,6 +194,7 @@ function PlanCard({ flow, tier }: { flow: DowngradeFlow; tier: BillingPlanTierVi
 }
 
 export function BillingPlansView({ onBack, tiers }: { onBack: () => void; tiers: BillingPlanTierView[] }) {
+  const { t } = useI18n()
   // A scheduled downgrade lands the user back on the overview, where the plan card
   // now shows the pending state with its undo.
   const flow = useDowngradeFlow({ onScheduled: onBack })
@@ -200,7 +203,7 @@ export function BillingPlansView({ onBack, tiers }: { onBack: () => void; tiers:
     <div className="@container">
       <div className="mb-2.5 flex items-center gap-2 pt-2 text-[length:var(--conversation-text-font-size)] font-medium">
         <Button
-          aria-label="Back to billing"
+          aria-label={t.common.backToBilling}
           className="size-7 p-0 text-(--ui-text-tertiary)"
           disabled={flow.mutating}
           onClick={onBack}
@@ -210,7 +213,7 @@ export function BillingPlansView({ onBack, tiers }: { onBack: () => void; tiers:
         >
           <ChevronLeft className="size-4" />
         </Button>
-        <span>Plans</span>
+        <span>{t.common.plans}</span>
       </div>
 
       {tiers.length > 0 ? (

@@ -1,4 +1,5 @@
 import { summarizeShellCommand } from '@/lib/summarize-command'
+import type { Translations } from '@/i18n'
 
 import { fileEditBasename, firstStringField, isFileEditTool, parseMaybeObject } from './fallback-model'
 
@@ -23,14 +24,6 @@ type RunCategory = 'delegate' | 'edit' | 'explore' | 'other' | 'run'
 // Clause order is fixed so the same run always reads the same way, whichever
 // category happens to be live.
 const CATEGORY_ORDER: readonly RunCategory[] = ['edit', 'explore', 'run', 'delegate', 'other']
-
-const CATEGORY_COPY: Record<RunCategory, { noun: [string, string]; past: string; present: string }> = {
-  delegate: { noun: ['task', 'tasks'], past: 'Delegated', present: 'Delegating' },
-  edit: { noun: ['file', 'files'], past: 'Edited', present: 'Editing' },
-  explore: { noun: ['file', 'files'], past: 'Explored', present: 'Exploring' },
-  other: { noun: ['tool', 'tools'], past: 'Used', present: 'Using' },
-  run: { noun: ['command', 'commands'], past: 'Ran', present: 'Running' }
-}
 
 const EXPLORE_TOOLS = new Set([
   'list_files',
@@ -71,8 +64,8 @@ function isPending(tool: ToolCallLike): boolean {
  * the status line that covers the gap before a tool starts, so the same run is
  * described in the same words from the moment the model drafts it.
  */
-export function toolPresentVerb(toolName: string): string {
-  return CATEGORY_COPY[toolCategory(toolName)].present
+export function toolPresentVerb(toolName: string, t: Translations): string {
+  return t.toolRun[toolCategory(toolName)].present
 }
 
 /** The thing a tool acted on, as the header should name it. */
@@ -94,16 +87,15 @@ function toolTarget(tool: ToolCallLike): string {
  * command is the exception — "ran 5 commands" is the useful reading, and a
  * command line only earns its space while it's the thing you're waiting on.
  */
-function clause(category: RunCategory, tools: ToolCallLike[], live: boolean): string {
-  const copy = CATEGORY_COPY[category]
-  const verb = live ? copy.present : copy.past
+function clause(category: RunCategory, tools: ToolCallLike[], live: boolean, t: Translations): string {
+  const copy = t.toolRun[category]
   const target = tools.length === 1 ? toolTarget(tools[0]) : ''
 
   if (target && (live || category !== 'run')) {
-    return `${verb} ${target}`
+    return live ? copy.presentTarget(target) : copy.pastTarget(target)
   }
 
-  return `${verb} ${tools.length} ${copy.noun[tools.length === 1 ? 0 : 1]}`
+  return live ? copy.presentCount(tools.length) : copy.pastCount(tools.length)
 }
 
 function lowerFirst(text: string): string {
@@ -125,7 +117,7 @@ function lowerFirst(text: string): string {
  * split out before this sees them (`splitRunItems`), so there is no aggregate
  * diff to report here; each edit carries its own +N/−M on its card.
  */
-export function summarizeToolRun(tools: readonly ToolCallLike[], live: boolean): string {
+export function summarizeToolRun(tools: readonly ToolCallLike[], live: boolean, t: Translations): string {
   // Which clause narrates in the present tense: normally the outstanding call,
   // but sequential calls leave gaps where the run is still going and nothing is
   // pending. The most recent call covers those, and it's the one the ticker is
@@ -149,7 +141,7 @@ export function summarizeToolRun(tools: readonly ToolCallLike[], live: boolean):
   const clauses = CATEGORY_ORDER.flatMap(category => {
     const group = byCategory.get(category)
 
-    return group ? [clause(category, group, category === liveCategory)] : []
+    return group ? [clause(category, group, category === liveCategory, t)] : []
   })
 
   return clauses.map((text, index) => (index === 0 ? text : lowerFirst(text))).join(', ')

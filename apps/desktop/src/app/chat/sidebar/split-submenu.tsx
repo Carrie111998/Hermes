@@ -12,6 +12,7 @@ import {
   DropdownMenuSubTrigger
 } from '@/components/ui/dropdown-menu'
 import { triggerHaptic } from '@/lib/haptics'
+import { useI18n } from '@/i18n'
 import type { SplitDir } from '@/store/session-states'
 
 /** The leaf + submenu components for one menu flavour, so the split submenu
@@ -38,11 +39,12 @@ export const CONTEXT_SPLIT_KIT: SplitMenuKit = {
 }
 
 // Ordered so the default (right) sits first, one hop away.
-const SPLIT_DIRS: { dir: SplitDir; icon: string; label: string }[] = [
-  { dir: 'right', icon: 'arrow-right', label: 'Right' },
-  { dir: 'bottom', icon: 'arrow-down', label: 'Down' },
-  { dir: 'left', icon: 'arrow-left', label: 'Left' },
-  { dir: 'top', icon: 'arrow-up', label: 'Up' }
+// `labelKey` resolves through `t.common` inside the component (see render below).
+const SPLIT_DIRS: { dir: SplitDir; icon: string; labelKey: 'splitRight' | 'splitDown' | 'splitLeft' | 'splitUp' }[] = [
+  { dir: 'right', icon: 'arrow-right', labelKey: 'splitRight' },
+  { dir: 'bottom', icon: 'arrow-down', labelKey: 'splitDown' },
+  { dir: 'left', icon: 'arrow-left', labelKey: 'splitLeft' },
+  { dir: 'top', icon: 'arrow-up', labelKey: 'splitUp' }
 ]
 
 interface SplitSubmenuProps {
@@ -60,6 +62,7 @@ interface SplitSubmenuProps {
  * submenu picks any edge. Shared by session rows and page nav rows.
  */
 export function SplitSubmenu({ close, disabled, kit, label, onSplit }: SplitSubmenuProps) {
+  const { t } = useI18n()
   const { Item, Sub, SubContent, SubTrigger } = kit
 
   const split = (dir: SplitDir) => {
@@ -80,10 +83,10 @@ export function SplitSubmenu({ close, disabled, kit, label, onSplit }: SplitSubm
         <span>{label}</span>
       </SubTrigger>
       <SubContent>
-        {SPLIT_DIRS.map(({ dir, icon, label: dirLabel }) => (
+        {SPLIT_DIRS.map(({ dir, icon, labelKey }) => (
           <Item key={dir} onSelect={() => split(dir)}>
             <Codicon name={icon} size="0.875rem" />
-            <span>{dirLabel}</span>
+            <span>{t.common[labelKey]}</span>
           </Item>
         ))}
       </SubContent>

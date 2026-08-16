@@ -474,7 +474,7 @@ export function ModelCatalogMenu({
       {shownMoaPresets.length > 0 ? (
         <div className={cn(quietRows)}>
           <DropdownMenuSeparator className="mx-0" />
-          <DropdownMenuLabel className={dropdownMenuSectionLabel}>MoA presets</DropdownMenuLabel>
+          <DropdownMenuLabel className={dropdownMenuSectionLabel}>{t.common.moaPresets}</DropdownMenuLabel>
           {shownMoaPresets.map(preset => {
             const isCurrentMoa = current.provider === 'moa' && current.model === preset
 

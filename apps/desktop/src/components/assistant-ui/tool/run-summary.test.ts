@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { summarizeToolRun, type ToolCallLike } from './run-summary'
+import { en } from '@/i18n/en'
 
 function tool(toolName: string, args: Record<string, unknown> = {}, result?: unknown): ToolCallLike {
   return { args, result, toolCallId: `${toolName}-${Math.random()}`, toolName }
@@ -10,8 +11,8 @@ const read = (path: string) => tool('read_file', { path }, { content: '' })
 const searched = (query: string) => tool('search_files', { query }, { hits: [] })
 const ran = (command: string) => tool('terminal', { command }, { exit_code: 0 })
 
-const settled = (tools: ToolCallLike[]) => summarizeToolRun(tools, false)
-const running = (tools: ToolCallLike[]) => summarizeToolRun(tools, true)
+const settled = (tools: ToolCallLike[]) => summarizeToolRun(tools, false, en)
+const running = (tools: ToolCallLike[]) => summarizeToolRun(tools, true, en)
 
 // A run only ever holds ephemeral activity: reads, searches, commands. File
 // edits and other cards are split out before a run is summarized, so there is

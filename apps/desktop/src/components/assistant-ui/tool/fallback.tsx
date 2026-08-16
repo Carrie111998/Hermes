@@ -620,7 +620,7 @@ function ToolEntry({ part }: ToolEntryProps) {
             <div className="max-w-full text-xs leading-relaxed text-(--ui-text-secondary)">
               {view.searchQuery && (
                 <p className="mb-1 flex min-w-0 gap-1.5 wrap-anywhere">
-                  <span className="shrink-0 font-medium text-(--ui-text-tertiary)">Search</span>
+                  <span className="shrink-0 font-medium text-(--ui-text-tertiary)">{t.common.search}</span>
                   <span>{view.searchQuery}</span>
                 </p>
               )}
@@ -842,6 +842,7 @@ interface ToolRunState {
 // re-render the group on every text delta in the turn. The run only changes
 // when a call arrives or one finishes; cache on exactly that.
 function useToolRun(startIndex: number, endIndex: number): ToolRunState {
+  const { t } = useI18n()
   const cache = useRef<null | { signature: string; value: ToolRunState }>(null)
 
   return useAuiState(state => {
@@ -894,7 +895,7 @@ function useToolRun(startIndex: number, endIndex: number): ToolRunState {
             undefined
           ),
           pendingApprovalTool: tools.some(tool => tool.result === undefined && APPROVAL_TOOLS.has(tool.toolName)),
-          summary: summarizeToolRun(tools, live)
+          summary: summarizeToolRun(tools, live, t)
         }
       }
     }

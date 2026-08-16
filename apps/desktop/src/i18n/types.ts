@@ -5,7 +5,7 @@
 // partial locales should use `defineLocale()` so missing desktop-only strings
 // fall back to English while new keys remain type-checked.
 
-export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
+export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar' | 'tr'
 
 export type ToolTitleKey =
   | 'browser_click'
@@ -89,6 +89,116 @@ export interface Translations {
     tryHint: (term: string) => string
     on: string
     off: string
+    reset: string
+    search: string
+    moreActions: string
+    moreEmoji: string
+    zoomIn: string
+    zoomOut: string
+    apiKey: string
+    showOptions: string
+    addContext: string
+    currentChat: string
+    newSession: string
+    targetSession: string
+    openInHermes: string
+    quickEntry: string
+    profiles: string
+    removeReference: string
+    hatchingProgress: string
+    reactedByHermes: string
+    openDiagram: string
+    moaPresets: string
+    driverHealth: string
+    screenRecording: string
+    accessibility: string
+    conversationTimeline: string
+    timelineScrubber: string
+    grabKeyFrom: string
+    currentPlan: string
+    backToBilling: string
+    plan: string
+    paymentAndCredits: string
+    usage: string
+    invoices: string
+    autoRefillThreshold: string
+    autoRefillAmount: string
+    customCreditAmount: string
+    customEndpoints: string
+    deleteEndpoint: string
+    noCustomEndpoints: string
+    addEndpointDesc: string
+    dangerZone: string
+    confirmUninstall: string
+    uninstallHermes: string
+    mixtureOfAgents: string
+    preset: string
+    newPreset: string
+    aggregator: string
+    searchThemes: string
+    auto: string
+    myProfile: string
+    splitRight: string
+    splitDown: string
+    splitLeft: string
+    splitUp: string
+    alertCaution: string
+    alertImportant: string
+    alertNote: string
+    alertTip: string
+    alertWarning: string
+    youtubeEmbed: string
+    spotifyEmbed: string
+    messageInput: string
+    loadingMemoryProviderSettings: string
+    askHermes: string
+    notConnectedReconnect: string
+    sendTo: string
+    loadingEmoji: string
+    noEmojiFound: string
+    removeReaction: (emoji: string) => string
+    billing: string
+    plans: string
+    scheduled: string
+    memoryProviderSettingsFailed: string
+  }
+
+  toolRun: {
+    edit: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    explore: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    run: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    delegate: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    other: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
   }
 
   fileMenu: {
@@ -1620,6 +1730,37 @@ export interface Translations {
 
   sidebar: {
     nav: Record<string, string>
+    filterMenu: {
+      filters: string
+      grouping: string
+      ordering: string
+      show: string
+      status: string
+      pullRequest: string
+      profile: string
+      project: string
+      inboxStyle: string
+      archived: string
+      resetToDefaults: string
+      expandAll: string
+      collapseAll: string
+      updated: string
+      created: string
+      tokens: string
+      cost: string
+      manual: string
+      preview: string
+      pr: string
+      open: string
+      draft: string
+      merged: string
+      closed: string
+      noPr: string
+      needsInput: string
+      working: string
+      unread: string
+      idle: string
+    }
     searchAria: string
     searchPlaceholder: string
     clearSearch: string
@@ -2459,6 +2600,8 @@ export interface Translations {
       loadingResponse: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string
+      hermesThinking: string
+      summarizingThread: string
       thought: string
       thoughtBriefly: string
       thoughtFor: (duration: string) => string

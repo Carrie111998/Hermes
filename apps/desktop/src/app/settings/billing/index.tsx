@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { useI18n } from '@/i18n'
 import { Progress } from '@/components/ui/progress'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -155,6 +156,7 @@ function AccountRow({ billing, row }: { billing?: BillingStateResponse; row: Bil
 }
 
 function BuyCreditsRow({ billing, row }: { billing: BillingStateResponse; row: BillingAccountRowView }) {
+  const { t } = useI18n()
   const presets = useMemo(
     () =>
       billing.charge_presets.map((amount, index) => ({
@@ -192,7 +194,7 @@ function BuyCreditsRow({ billing, row }: { billing: BillingStateResponse; row: B
             value={amount}
           />
           <Input
-            aria-label="Custom credit amount"
+            aria-label={t.common.customCreditAmount}
             containerClassName="w-16"
             disabled={controlsDisabled}
             inputMode="decimal"
@@ -407,11 +409,12 @@ function BillingHeader({
   fixtureName?: BillingFixtureSelection
   onFixtureChange?: (value: BillingFixtureSelection) => void
 }) {
+  const { t } = useI18n()
   return (
     <div className="mb-2.5 flex items-center justify-between gap-3 pt-2 text-[length:var(--conversation-text-font-size)] font-medium">
       <div className="flex min-w-0 items-center gap-2">
         <BarChart3 className="size-4 shrink-0 text-muted-foreground" />
-        <span>Billing</span>
+        <span>{t.common.billing}</span>
       </div>
       {import.meta.env.DEV && fixtureName && onFixtureChange ? (
         <BillingFixtureSelect onValueChange={onFixtureChange} value={fixtureName} />
@@ -455,6 +458,7 @@ function BillingSettingsContent({
   fixtureName?: BillingFixtureSelection
   onFixtureChange?: (value: BillingFixtureSelection) => void
 }) {
+  const { t } = useI18n()
   const [subView, setSubView] = useRouteEnumParam<BillingSubView>('bview', BILLING_VIEWS, 'overview')
 
   // Fixture mode flows through the SAME query path — the simulated api (supplied by
@@ -515,7 +519,7 @@ function BillingSettingsContent({
       </div>
 
       {view.plan && (
-        <SettingsSection icon={Package} title="Plan">
+        <SettingsSection icon={Package} title={t.common.plan}>
           <CurrentPlanCard onViewPlans={() => setSubView('plans')} plan={view.plan} />
         </SettingsSection>
       )}
@@ -524,7 +528,7 @@ function BillingSettingsContent({
         <SettingsSection
           aside={paymentRow ? <PaymentMethodAside row={paymentRow} /> : undefined}
           icon={CreditCard}
-          title="Payment & credits"
+          title={t.common.paymentAndCredits}
         >
           {accountRows.map(row => (
             <AccountRow billing={billing} key={row.id} row={row} />
@@ -533,7 +537,7 @@ function BillingSettingsContent({
       )}
 
       {view.usageRows.length > 0 && (
-        <SettingsSection icon={BarChart3} title="Usage">
+        <SettingsSection icon={BarChart3} title={t.common.usage}>
           <div className="@container">
             {view.usageRows.map(row => (
               <UsageRow key={row.id} row={row} />
@@ -544,7 +548,7 @@ function BillingSettingsContent({
 
       {
         // no endpoint yet — NAS capability-board gap
-        FEATURE_BILLING_INVOICES ? <SectionHeading icon={BarChart3} title="Invoices" /> : null
+        FEATURE_BILLING_INVOICES ? <SectionHeading icon={BarChart3} title={t.common.invoices} /> : null
       }
     </SettingsContent>
   )

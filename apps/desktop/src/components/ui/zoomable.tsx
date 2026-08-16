@@ -6,6 +6,7 @@ import { Dialog, DialogContent } from '@/components/ui/dialog'
 import { Tip } from '@/components/ui/tooltip'
 import { Check, Copy, Maximize, RefreshCw, X, ZoomIn, ZoomOut } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { useI18n } from '@/i18n'
 
 import { useZoomPan } from './use-zoom-pan'
 
@@ -117,6 +118,7 @@ function Toolbar({
   zoomOut: () => void
 }) {
   const [copied, setCopied] = useState(false)
+  const { t } = useI18n()
 
   const copy = async () => {
     if (!onCopy) {
@@ -130,13 +132,13 @@ function Toolbar({
 
   return (
     <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border/70 bg-background/85 p-1 shadow-sm backdrop-blur">
-      <ToolbarButton label="Zoom out" onClick={zoomOut}>
+      <ToolbarButton label={t.common.zoomOut} onClick={zoomOut}>
         <ZoomOut className="size-4" />
       </ToolbarButton>
-      <ToolbarButton label="Reset" onClick={reset}>
+      <ToolbarButton label={t.common.reset} onClick={reset}>
         <RefreshCw className="size-4" />
       </ToolbarButton>
-      <ToolbarButton label="Zoom in" onClick={zoomIn}>
+      <ToolbarButton label={t.common.zoomIn} onClick={zoomIn}>
         <ZoomIn className="size-4" />
       </ToolbarButton>
       {onCopy && (
@@ -148,7 +150,7 @@ function Toolbar({
         </>
       )}
       <Divider />
-      <ToolbarButton label="Close" onClick={onClose}>
+      <ToolbarButton label={t.common.close} onClick={onClose}>
         <X className="size-4" />
       </ToolbarButton>
     </div>

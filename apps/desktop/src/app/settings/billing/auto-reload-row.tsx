@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
+import { useI18n } from '@/i18n'
 
 import { ListRow, Pill } from '../primitives'
 
@@ -24,6 +25,7 @@ export function AutoReloadRow({
   bounds: Pick<BillingStateResponse, 'max_usd' | 'min_usd'>
   row: BillingAccountRowView
 }) {
+  const { t } = useI18n()
   const api = useBillingApi()
   const queryClient = useQueryClient()
   const [confirmDisable, setConfirmDisable] = useState(false)
@@ -180,7 +182,7 @@ export function AutoReloadRow({
                 <label className="min-w-0 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
                   Threshold
                   <Input
-                    aria-label="Auto-refill threshold"
+                    aria-label={t.common.autoRefillThreshold}
                     className="mt-1 py-[3px]"
                     disabled={busy || !editing}
                     inputMode="decimal"
@@ -197,7 +199,7 @@ export function AutoReloadRow({
                 <label className="min-w-0 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
                   Reload to
                   <Input
-                    aria-label="Auto-refill reload-to amount"
+                    aria-label={t.common.autoRefillAmount}
                     className="mt-1 py-[3px]"
                     disabled={busy || !editing}
                     inputMode="decimal"

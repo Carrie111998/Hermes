@@ -1001,7 +1001,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       </section>
       {moa && currentMoaPreset && (
         <section>
-          <SectionHeading icon={Cpu} title="Mixture of Agents" />
+          <SectionHeading icon={Cpu} title={t.common.mixtureOfAgents} />
           <p className="mb-2 text-xs text-muted-foreground">
             Configure named presets that appear as models under the Mixture of Agents provider. The aggregator is the
             acting model.
@@ -1009,7 +1009,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <Select onValueChange={setSelectedMoaPreset} value={selectedMoaPreset || moa.default_preset}>
               <SelectTrigger className={cn('min-w-40', CONTROL_TEXT)}>
-                <SelectValue placeholder="Preset" />
+                <SelectValue placeholder={t.common.preset} />
               </SelectTrigger>
               <SelectContent>
                 {Object.keys(moa.presets).map(name => (
@@ -1072,7 +1072,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             <Input
               className={cn('w-40', CONTROL_TEXT)}
               onChange={event => setNewMoaPresetName(event.target.value)}
-              placeholder="new preset"
+              placeholder={t.common.newPreset}
               value={newMoaPresetName}
             />
             <Button
@@ -1270,7 +1270,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                   {currentMoaPreset.aggregator.provider} · {currentMoaPreset.aggregator.model}
                 </span>
               }
-              title="Aggregator"
+              title={t.common.aggregator}
             />
           </div>
         </section>
