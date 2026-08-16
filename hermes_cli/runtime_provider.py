@@ -41,6 +41,7 @@ from hermes_cli.auth import (
     normalize_actual_base_url,
 )
 from hermes_cli.config import (
+    get_custom_provider_endpoint,
     get_compatible_custom_providers,
     load_config,
     normalize_extra_headers,
@@ -769,7 +770,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 str(ep_name),
             ):
                 # Found match by provider key
-                base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                base_url = get_custom_provider_endpoint(entry)
                 if base_url:
                     result = {
                         "name": entry.get("name", ep_name),
@@ -894,9 +895,7 @@ def find_custom_provider_identity(base_url: str) -> Optional[str]:
         for ep_name, entry in providers.items():
             if not isinstance(entry, dict):
                 continue
-            entry_url = (
-                entry.get("api") or entry.get("url") or entry.get("base_url") or ""
-            )
+            entry_url = get_custom_provider_endpoint(entry)
             if _normalize_base_url_for_match(entry_url) == target:
                 return custom_provider_slug(str(ep_name), str(ep_name))
 

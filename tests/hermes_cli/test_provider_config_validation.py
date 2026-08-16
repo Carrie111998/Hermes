@@ -11,6 +11,7 @@ import pytest
 from hermes_cli.config import (
     _PROVIDER_NORMALIZE_WARNED,
     _normalize_custom_provider_entry,
+    get_custom_provider_endpoint,
 )
 
 
@@ -25,6 +26,24 @@ class TestNormalizeCustomProviderEntry:
         _PROVIDER_NORMALIZE_WARNED.clear()
         yield
         _PROVIDER_NORMALIZE_WARNED.clear()
+
+    @pytest.mark.parametrize(
+        ("entry", "expected"),
+        [
+            ({"api": "http://127.0.0.1:11434"}, "http://127.0.0.1:11434"),
+            ({"url": "http://127.0.0.1:11434/v1"}, "http://127.0.0.1:11434/v1"),
+            (
+                {
+                    "api": "http://127.0.0.1:11434",
+                    "url": "http://127.0.0.1:11434/legacy",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                },
+                "http://127.0.0.1:11434/v1",
+            ),
+        ],
+    )
+    def test_get_custom_provider_endpoint_uses_canonical_precedence(self, entry, expected):
+        assert get_custom_provider_endpoint(entry) == expected
 
 
 
@@ -66,5 +85,3 @@ class TestNormalizeCustomProviderEntry:
         result = _normalize_custom_provider_entry(entry, provider_key="PROVIDER_A")
         assert result is not None
         assert result["base_url"] == "${PROVIDER_A_BASE_URL}"
-
-

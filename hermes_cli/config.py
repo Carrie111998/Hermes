@@ -1327,6 +1327,23 @@ def _canonical_api_mode(api_mode: str) -> str:
     return _API_MODE_ALIASES.get(cleaned.lower(), cleaned)
 
 
+def get_custom_provider_endpoint(entry: Any) -> str:
+    """Return a custom provider's canonical endpoint field.
+
+    ``base_url`` is the current schema; ``url`` and ``api`` are compatibility
+    aliases retained in existing configs.  Keeping the precedence here makes
+    runtime, picker, and dashboard consumers agree when an older entry has
+    both a legacy field and a later canonical override.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    for key in ("base_url", "url", "api"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _normalize_custom_provider_entry(
     entry: Any,
     *,

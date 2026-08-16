@@ -37,6 +37,29 @@ def test_matches_providers_dict_by_key(monkeypatch):
         rp.find_custom_provider_identity("http://127.0.0.1:8000/v1")
         == "custom:local"
     )
+    assert rp.find_custom_provider_identity("http://127.0.0.1:8000") is None
+
+
+def test_matches_canonical_base_url_when_legacy_api_is_retained(monkeypatch):
+    """Session identity must follow the endpoint the runtime will use."""
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "local": {
+                    "api": "http://127.0.0.1:8000",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                }
+            }
+        },
+    )
+
+    assert (
+        rp.find_custom_provider_identity("http://127.0.0.1:8000/v1")
+        == "custom:local"
+    )
+    assert rp.find_custom_provider_identity("http://127.0.0.1:8000") is None
 
 
 def test_matches_providers_dict_by_stable_key_not_display_name(monkeypatch):

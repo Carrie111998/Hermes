@@ -8,6 +8,7 @@ are exposed in the model picker.
 import pytest
 from hermes_cli.model_switch import list_authenticated_providers, switch_model
 from hermes_cli import runtime_provider as rp
+from hermes_cli.providers import resolve_user_provider
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +68,22 @@ def test_list_authenticated_providers_includes_full_models_list_from_user_provid
     assert "kimi-k2.5:cloud" in user_prov["models"]
     assert "glm-5.1:cloud" in user_prov["models"]
     assert "qwen3.5:cloud" in user_prov["models"]
+
+
+def test_resolve_user_provider_prefers_canonical_base_url_over_legacy_api():
+    """The picker must advertise the same endpoint as runtime resolution."""
+    provider = resolve_user_provider(
+        "local-ollama",
+        {
+            "local-ollama": {
+                "api": "http://127.0.0.1:11434",
+                "base_url": "http://127.0.0.1:11434/v1",
+            }
+        },
+    )
+
+    assert provider is not None
+    assert provider.base_url == "http://127.0.0.1:11434/v1"
 
 
 def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch):

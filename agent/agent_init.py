@@ -2376,7 +2376,10 @@ def init_agent(
             _user_providers = _agent_cfg.get("providers")
             _disabled_custom_provider_ids: set[str] = set()
             if isinstance(_user_providers, dict):
-                from hermes_cli.config import is_provider_enabled
+                from hermes_cli.config import (
+                    get_custom_provider_endpoint,
+                    is_provider_enabled,
+                )
 
                 for _provider_key, _provider_entry in _user_providers.items():
                     if not isinstance(_provider_entry, dict):
@@ -2397,9 +2400,7 @@ def init_agent(
                     if _configured_custom_provider not in _entry_provider_ids:
                         continue
                     _configured_base_url = _normalize_route_base_url(
-                        _provider_entry.get("api")
-                        or _provider_entry.get("url")
-                        or _provider_entry.get("base_url")
+                        get_custom_provider_endpoint(_provider_entry)
                     )
                     if _configured_base_url:
                         break

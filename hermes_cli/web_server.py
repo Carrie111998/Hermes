@@ -7912,6 +7912,8 @@ def _config_api_key_is_env_ref(endpoint_id: str) -> bool:
 
 
 def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    from hermes_cli.config import get_custom_provider_endpoint
+
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     current_provider = str(model_cfg.get("provider", "") or "")
     current_model = str(model_cfg.get("default", model_cfg.get("name", "")) or "")
@@ -7923,7 +7925,7 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
         for provider_id, raw_entry in providers.items():
             if not isinstance(raw_entry, dict):
                 continue
-            base_url = str(raw_entry.get("base_url") or raw_entry.get("url") or raw_entry.get("api") or "").strip()
+            base_url = get_custom_provider_endpoint(raw_entry)
             if not base_url:
                 continue
             endpoint_id = str(provider_id)

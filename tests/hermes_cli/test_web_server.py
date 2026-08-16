@@ -1841,6 +1841,24 @@ class TestWebServerEndpoints:
         assert endpoint["has_api_key"] is True
         assert "sk-in-env" not in (endpoint["api_key_preview"] or "")
 
+    def test_custom_endpoint_response_prefers_canonical_base_url_over_legacy_api(self):
+        """The dashboard must not report a stale compatibility endpoint."""
+        from hermes_cli.web_server import _custom_endpoint_response
+
+        result = _custom_endpoint_response(
+            {
+                "providers": {
+                    "local-ollama": {
+                        "api": "http://127.0.0.1:11434",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                    }
+                }
+            }
+        )
+
+        endpoint = next(e for e in result["endpoints"] if e["id"] == "local-ollama")
+        assert endpoint["base_url"] == "http://127.0.0.1:11434/v1"
+
     def test_activating_an_endpoint_carries_its_credential_either_way(self):
         """Activate must work for both key_env and pre-#69449 plaintext entries."""
         from hermes_cli.config import load_config, save_config

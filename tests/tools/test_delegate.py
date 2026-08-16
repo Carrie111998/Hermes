@@ -931,6 +931,86 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             requested="crof.ai", target_model="deepseek-v4-pro-CEER"
         )
 
+
+def test_named_ollama_delegation_uses_configured_local_endpoint_without_cloud_key(
+    tmp_path, monkeypatch
+):
+    """Canonical base_url must win over a retained legacy api field.
+
+    Updating an existing provider entry with ``providers.ollama.base_url``
+    leaves the older ``api`` field in place.  The delegation resolver must
+    consume the canonical endpoint and keep cloud credential sentinels out of
+    the local child.
+    """
+    (tmp_path / "config.yaml").write_text(
+        """\
+providers:
+  ollama:
+    api: http://127.0.0.1:11434
+delegation:
+  provider: ollama
+  model: nemotron-3.5-lightning:30b-mlx
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "parent-openai-sentinel")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "parent-openrouter-sentinel")
+    parent = _make_mock_parent(depth=0)
+    parent.api_key = "parent-cloud-sentinel"
+
+    from hermes_cli.config import load_config, set_config_value
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    set_config_value("providers.ollama.base_url", "http://127.0.0.1:11434/v1")
+    delegation = load_config()["delegation"]
+    runtime = resolve_runtime_provider(
+        requested=delegation["provider"], target_model=delegation["model"]
+    )
+    creds = _resolve_delegation_credentials(delegation, parent)
+
+    assert runtime["provider"] == "custom"
+    assert runtime["base_url"] == "http://127.0.0.1:11434/v1"
+    assert runtime["source"] == "custom_provider:ollama"
+    assert runtime["api_key"] == "no-key-required"
+    assert creds["provider"] == "ollama"
+    assert creds["model"] == "nemotron-3.5-lightning:30b-mlx"
+    assert creds["api_mode"] == "chat_completions"
+    assert creds["base_url"] == "http://127.0.0.1:11434/v1"
+    assert creds["api_key"] == "no-key-required"
+    assert "sentinel" not in creds["api_key"]
+
+
+def test_named_ollama_delegation_preserves_legacy_api_only_endpoint(tmp_path, monkeypatch):
+    """An api-only named provider keeps its established local route."""
+    (tmp_path / "config.yaml").write_text(
+        """\
+providers:
+  ollama:
+    api: http://127.0.0.1:11434
+delegation:
+  provider: ollama
+  model: nemotron-3.5-lightning:30b-mlx
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "parent-openai-sentinel")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "parent-openrouter-sentinel")
+    parent = _make_mock_parent(depth=0)
+    parent.api_key = "parent-cloud-sentinel"
+
+    from hermes_cli.config import load_config
+
+    creds = _resolve_delegation_credentials(load_config()["delegation"], parent)
+
+    assert creds["provider"] == "ollama"
+    assert creds["model"] == "nemotron-3.5-lightning:30b-mlx"
+    assert creds["api_mode"] == "chat_completions"
+    assert creds["base_url"] == "http://127.0.0.1:11434"
+    assert creds["api_key"] == "no-key-required"
+    assert "sentinel" not in creds["api_key"]
+
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
