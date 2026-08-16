@@ -13,7 +13,14 @@ import { AlertTriangle, Save } from '@/lib/icons'
 import { resolveProfileColor } from '@/lib/profile-color'
 import { normalize } from '@/lib/text'
 import { notify, notifyError } from '@/store/notifications'
-import { $profileColors, refreshProfiles } from '@/store/profile'
+import {
+  $primaryDesktopProfileState,
+  $profileColors,
+  normalizeProfileKey,
+  refreshPrimaryProfile,
+  refreshProfiles,
+  switchProfile
+} from '@/store/profile'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import {
@@ -48,10 +55,11 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
   const [createOpen, setCreateOpen] = useState(false)
   const [pendingRename, setPendingRename] = useState<null | ProfileInfo>(null)
   const [pendingDelete, setPendingDelete] = useState<null | ProfileInfo>(null)
+  const primaryProfileState = useStore($primaryDesktopProfileState)
 
   const refresh = useCallback(async () => {
     try {
-      const list = await refreshProfiles()
+      const [list] = await Promise.all([refreshProfiles(), refreshPrimaryProfile()])
       setProfiles(list)
       setSelectedName(current => {
         if (current && list.some(p => p.name === current)) {
@@ -102,6 +110,17 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
     [refresh]
   )
 
+  const makePrimary = useCallback(
+    async (profile: ProfileInfo) => {
+      try {
+        await switchProfile(profile.name)
+      } catch (err) {
+        notifyError(err, p.failedSetPrimaryDesktop)
+      }
+    },
+    [p]
+  )
+
   return (
     <Panel closeLabel={p.close} onClose={onClose}>
       {!profiles ? (
@@ -131,19 +150,27 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
                 <ProfileRow
                   active={selected?.name === profile.name}
                   key={profile.name}
-                  menuItems={
-                    profile.is_default
-                      ? []
-                      : [
+                  menuItems={[
+                    {
+                      disabled:
+                        primaryProfileState.current === normalizeProfileKey(profile.name) &&
+                        primaryProfileState.persisted === normalizeProfileKey(profile.name),
+                      icon: 'server-process',
+                      label: p.makePrimaryDesktop,
+                      onSelect: () => void makePrimary(profile)
+                    },
+                    ...(!profile.is_default
+                      ? [
                           { icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(profile) },
                           {
                             icon: 'trash',
                             label: t.common.delete,
                             onSelect: () => setPendingDelete(profile),
-                            tone: 'danger'
+                            tone: 'danger' as const
                           }
                         ]
-                  }
+                      : [])
+                  ]}
                   onSelect={() => setSelectedName(profile.name)}
                   profile={profile}
                 />
@@ -152,7 +179,11 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
             </PanelList>
 
             {selected ? (
-              <ProfileDetail key={selected.name} profile={selected} />
+              <ProfileDetail
+                isPrimary={primaryProfileState.current === normalizeProfileKey(selected.name)}
+                key={selected.name}
+                profile={selected}
+              />
             ) : (
               <PanelEmpty description={p.selectPrompt} icon="account" />
             )}
@@ -220,7 +251,7 @@ function ProfileRow({
   )
 }
 
-function ProfileDetail({ profile }: { profile: ProfileInfo }) {
+function ProfileDetail({ isPrimary, profile }: { isPrimary: boolean; profile: ProfileInfo }) {
   const { t } = useI18n()
   const p = t.profiles
 
@@ -231,6 +262,7 @@ function ProfileDetail({ profile }: { profile: ProfileInfo }) {
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-[0.95rem] font-semibold tracking-tight text-foreground">{profile.name}</h3>
             {profile.is_default && <PanelPill tone="good">{p.defaultBadge}</PanelPill>}
+            {isPrimary && <PanelPill tone="muted">{p.primaryDesktopBadge}</PanelPill>}
             {profile.has_env && <PanelPill tone="muted">.env</PanelPill>}
           </div>
           <p
