@@ -245,6 +245,9 @@ class GatewayStreamConsumer:
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
+        # A failed finalize may leave an older preview visible.  Do not retain
+        # that preview as proof of final delivery across the next segment reset.
+        self._last_finalize_failed = False
         # True when the most recent _send_or_edit split-and-delivered across
         # continuation messages (the adapter adopted a new message id).
         self._last_edit_overflowed = False
@@ -575,8 +578,10 @@ class GatewayStreamConsumer:
             return
         # Retain the finalized visible text of the current segment before
         # clearing ``_last_sent_text``, so ``has_delivered_text`` can still
-        # match it after a segment break. (#65919 review)
-        if self._last_sent_text:
+        # match it after a segment break. A failed finalize may leave an older
+        # preview visible; it is not proof that the completed segment landed.
+        # (#65919 review)
+        if self._last_sent_text and not self._last_finalize_failed:
             finalized = self._clean_for_display(self._last_sent_text).strip()
             if finalized:
                 self._delivered_segment_texts.append(finalized)
@@ -585,6 +590,7 @@ class GatewayStreamConsumer:
         self._accumulated = ""
         self._stream_ledger = ""
         self._last_sent_text = ""
+        self._last_finalize_failed = False
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -2117,6 +2123,11 @@ class GatewayStreamConsumer:
             return True  # cursor-only / whitespace-only update
         if not text.strip():
             return True  # nothing to send is "success"
+        if finalize:
+            # A segment reset must not treat a stale preview as delivered when
+            # this finalize attempt fails.  Successful send/edit paths below
+            # leave this cleared; failure paths set it before returning.
+            self._last_finalize_failed = False
         # Guard: do not create a brand-new standalone message when the only
         # visible content is a handful of characters alongside the streaming
         # cursor.  During rapid tool-calling the model often emits 1-2 tokens
@@ -2271,6 +2282,8 @@ class GatewayStreamConsumer:
                         self._flood_strikes = 0
                         return True
                     else:
+                        if finalize:
+                            self._last_finalize_failed = True
                         immediate_final_fallback = False
                         if (
                             finalize
@@ -2388,6 +2401,8 @@ class GatewayStreamConsumer:
                 else:
                     # Editing not supported — skip intermediate updates.
                     # The final response will be sent by the fallback path.
+                    if finalize:
+                        self._last_finalize_failed = True
                     return False
             else:
                 # First message — send new, threaded to the original user message
@@ -2431,7 +2446,11 @@ class GatewayStreamConsumer:
                 else:
                     # Initial send failed — disable streaming for this session
                     self._edit_supported = False
+                    if finalize:
+                        self._last_finalize_failed = True
                     return False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
+            if finalize:
+                self._last_finalize_failed = True
             return False

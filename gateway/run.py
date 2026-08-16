@@ -115,6 +115,65 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+def _stream_confirmed_final_delivery(
+    consumer,
+    final_text: str,
+    *,
+    previewed: bool = False,
+) -> bool:
+    """Return True only when the exact final reply reached the user."""
+    if consumer is None:
+        return False
+    if getattr(consumer, "final_response_sent", False):
+        # A successful finalize call is not proof the *content* was final: the
+        # edit may have carried only the last preview snapshot while the tail
+        # generated between that snapshot and stream completion never reached
+        # any API call (#71643).
+        matcher = getattr(consumer, "delivered_final_matches", None)
+        if callable(matcher):
+            try:
+                if matcher(final_text) is False:
+                    return False
+            except Exception:
+                pass
+        return True
+
+    # Codex app-server can deliver its completed answer through the live
+    # commentary callback without setting response_previewed.  The consumer's
+    # exact-text ledger is stronger evidence than that provenance flag: an
+    # exact match means the user already received this final text, while normal
+    # progress commentary does not match and still permits the final send.
+    has_delivered_text = getattr(consumer, "has_delivered_text", None)
+    if callable(has_delivered_text):
+        try:
+            return bool(has_delivered_text(final_text))
+        except Exception:
+            return False
+    return False
+
+
+def _resolve_assistant_delivery_modes(
+    user_config: dict[str, Any] | None,
+    platform_key: str | None,
+    *,
+    streaming_enabled: bool,
+    interim_enabled: bool,
+) -> tuple[bool, bool]:
+    """Resolve text delivery modes while preserving a one-reply footer."""
+    from gateway.runtime_footer import resolve_footer_config
+
+    footer_enabled = bool(
+        resolve_footer_config(user_config, platform_key).get("enabled")
+    )
+    if footer_enabled:
+        # Footer fields include completed-turn data such as final context usage
+        # and latency. They cannot be correct during token or commentary
+        # streaming. Buffer assistant text so the gateway can publish one
+        # complete body-plus-footer reply after the turn finishes.
+        return False, False
+    return bool(streaming_enabled), bool(interim_enabled)
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -5172,8 +5231,14 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_stream_deltas, _want_interim_messages = (
+            _resolve_assistant_delivery_modes(
+                ctx.user_config,
+                platform_key,
+                streaming_enabled=_streaming_enabled,
+                interim_enabled=ctx.interim_assistant_messages_enabled,
+            )
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -19870,9 +19935,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
+            # Off by default (display.runtime_footer.enabled=false). Footer-
+            # enabled turns buffer assistant text, so this body-plus-footer is
+            # delivered once through the normal final-send path.
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
@@ -20263,21 +20328,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
-                    try:
-                        _foot_adapter = self._adapter_for_source(source)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
-                                source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
-                    except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
                 return None
 
             return response
@@ -28245,43 +28295,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Long-running notification error: %s", _ne)
 
         _notify_task = asyncio.create_task(_notify_long_running())
-
-        def _stream_confirmed_final_delivery(
-            consumer,
-            final_text: str,
-            *,
-            previewed: bool = False,
-        ) -> bool:
-            """Return True only when the actual final reply reached the user."""
-            if consumer is None:
-                return False
-            if getattr(consumer, "final_response_sent", False):
-                # A successful finalize call is not proof the *content* was
-                # final: the edit may have carried only the last preview
-                # snapshot while the tail generated between that snapshot and
-                # stream completion never reached any API call (#71643).
-                # Reconcile the recorded turn-final payload against the
-                # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — including payload-less multi-message
-                # split delivery (#78541). None (no record on a non-split
-                # legacy path) keeps the legacy trust so ambiguous-timeout
-                # dedup is not regressed.
-                matcher = getattr(consumer, "delivered_final_matches", None)
-                if callable(matcher):
-                    try:
-                        if matcher(final_text) is False:
-                            return False
-                    except Exception:
-                        pass
-                return True
-            if previewed:
-                has_delivered_text = getattr(consumer, "has_delivered_text", None)
-                if callable(has_delivered_text):
-                    try:
-                        return bool(has_delivered_text(final_text))
-                    except Exception:
-                        return False
-            return False
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based

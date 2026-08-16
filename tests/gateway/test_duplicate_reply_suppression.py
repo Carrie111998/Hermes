@@ -23,6 +23,7 @@ from gateway.platforms.base import (
     MessageEvent,
     SendResult,
 )
+from gateway.run import _stream_confirmed_final_delivery
 from gateway.session import SessionSource, build_session_key
 
 
@@ -158,6 +159,34 @@ class TestOnlyFinalStreamDeliverySuppressesFinalSend:
                 response["already_sent"] = True
 
         assert "already_sent" not in response
+
+    def test_exact_codex_commentary_suppresses_duplicate_final_send(self):
+        """An exact commentary delivery is proof even when the agent does not
+        label it as a final-response preview."""
+        final_text = "The requested change is complete."
+        sc = SimpleNamespace(
+            final_response_sent=False,
+            has_delivered_text=lambda text: text == final_text,
+        )
+
+        assert _stream_confirmed_final_delivery(
+            sc,
+            final_text,
+            previewed=False,
+        ) is True
+
+    def test_different_codex_commentary_does_not_suppress_final_send(self):
+        """Ordinary progress commentary must not hide a different answer."""
+        sc = SimpleNamespace(
+            final_response_sent=False,
+            has_delivered_text=lambda text: text == "I am checking that now.",
+        )
+
+        assert _stream_confirmed_final_delivery(
+            sc,
+            "The check completed successfully.",
+            previewed=False,
+        ) is False
 
 
 # ===================================================================
@@ -319,4 +348,3 @@ class TestFinalContentDeliveredSuppression:
             response["already_sent"] = True
 
         assert response.get("already_sent") is True
-

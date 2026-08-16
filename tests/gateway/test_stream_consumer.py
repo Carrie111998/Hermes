@@ -1391,6 +1391,31 @@ class TestHasDeliveredTextAfterSegmentBreak:
         # After the reset, has_delivered_text must still find it
         assert c.has_delivered_text("Here is the first segment") is True
 
+    @pytest.mark.asyncio
+    async def test_failed_segment_finalize_does_not_claim_preview_delivered(self):
+        """A failed final edit must leave the gateway free to resend the answer."""
+        adapter = MagicMock()
+        adapter.REQUIRES_EDIT_FINALIZE = True
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=False, error="temporary failure")
+        )
+        c = GatewayStreamConsumer(adapter, "chat_test")
+        c._message_id = "preview-1"
+        c._last_sent_text = "The complete answer"
+
+        assert (
+            await c._send_or_edit(
+                "The complete answer",
+                finalize=True,
+                is_turn_final=False,
+            )
+            is False
+        )
+
+        c._reset_segment_state()
+
+        assert c.has_delivered_text("The complete answer") is False
+
 
 # ── Flush barrier (clarify-ordering) tests ───────────────────────────────
 
@@ -1487,4 +1512,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-
