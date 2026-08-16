@@ -5333,6 +5333,15 @@ def interactive_setup() -> None:
         password = prompt("Password", password=True)
         if password:
             save_env_value("MATRIX_PASSWORD", password)
+            # Password login without a pinned device ID makes the homeserver
+            # mint a fresh device on every restart, accumulating toward its
+            # hard device limit. Generate + persist a stable ID at setup so
+            # new installs are pinned from the start; a user-configured
+            # MATRIX_DEVICE_ID always wins over the generated one.
+            if not get_env_value("MATRIX_DEVICE_ID"):
+                device_id = _generate_stable_device_id()
+                save_env_value("MATRIX_DEVICE_ID", device_id)
+                print_success(f"Generated a stable device ID ({device_id})")
             print_success("Matrix credentials saved")
 
     if token or get_env_value("MATRIX_PASSWORD"):
