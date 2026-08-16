@@ -9,6 +9,7 @@ import { CodeEditor } from '@/components/chat/code-editor'
 import { PageLoader } from '@/components/page-loader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { MatchFieldChip } from '@/components/ui/search-highlight'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { CountSkeleton } from '@/components/ui/skeleton'
 import {
@@ -23,17 +24,16 @@ import {
   setToolsetEnabled
 } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { MatchFieldChip } from '@/components/ui/search-highlight'
 import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
 import { compactNumber } from '@/lib/format'
 import { queryClient } from '@/lib/query-client'
 import {
   bestMatch,
-  rankItems,
-  SEARCH_FIELD_LABEL_EN,
-  SEARCH_FIELD_LABEL_ZH,
   type FieldMatch,
-  type SearchField
+  rankItems,
+  type SearchField,
+  SEARCH_FIELD_LABEL_EN,
+  SEARCH_FIELD_LABEL_ZH
 } from '@/lib/search-match'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
@@ -62,7 +62,7 @@ import { PanelEmpty, PanelPill } from '../overlays/panel'
 import { PageSearchShell } from '../page-search-shell'
 import { SETTINGS_ROUTE } from '../routes'
 import { ComputerUsePanel } from '../settings/computer-use-panel'
-import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
+import { asText, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
 import { TerminalBackendPanel } from '../settings/terminal-backend-panel'
 import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'

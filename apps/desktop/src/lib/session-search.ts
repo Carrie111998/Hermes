@@ -4,11 +4,11 @@ import type { SessionInfo } from '@/types/hermes'
 import { sessionTitle } from './chat-runtime'
 import {
   bestMatch,
-  rankFields,
   type FieldMatch,
   type FieldSpec,
   type RankedHit,
-  type RankOptions
+  type RankOptions,
+  rankFields
 } from './search-match'
 import { sessionSourceSearchTerms } from './session-source'
 

@@ -28,10 +28,10 @@ import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
 import {
+  type SearchField as SearchMatchField,
   SEARCH_FIELD_LABEL_EN,
   SEARCH_FIELD_LABEL_ZH,
-  stripHighlightMarkers,
-  type SearchField as SearchMatchField
+  stripHighlightMarkers
 } from '@/lib/search-match'
 import { rankSession } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
@@ -148,10 +148,6 @@ import {
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
 
-import {
-  SessionSearchMetaContext,
-  type SessionSearchMeta
-} from './search-meta-context'
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
@@ -178,6 +174,10 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { WorktreeDialog } from './projects/worktree-dialog'
+import {
+  type SessionSearchMeta,
+  SessionSearchMetaContext
+} from './search-meta-context'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
