@@ -98,3 +98,34 @@ def test_vertex_extra_body_empty_without_reasoning():
 
     p = get_provider_profile("vertex")
     assert p.build_extra_body(model="google/gemini-3-flash-preview") == {}
+
+
+def test_vertex_provider_model_ids_fallback():
+    """Verify provider_model_ids('vertex') falls back to the curated _PROVIDER_MODELS
+    since Vertex has no discovery endpoint, without snapshotting the exact model names."""
+    from hermes_cli.models import provider_model_ids
+    
+    models = provider_model_ids("vertex")
+    assert models is not None
+    assert isinstance(models, list)
+    assert len(models) > 0
+    assert all(isinstance(m, str) for m in models)
+
+def test_vertex_cached_provider_model_ids(tmp_path, monkeypatch):
+    """Verify the disk-cache wrapper handles the Vertex fallback correctly."""
+    from hermes_cli.models import cached_provider_model_ids, clear_provider_models_cache
+    import hermes_constants
+    
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    clear_provider_models_cache("vertex")
+    
+    models1 = cached_provider_model_ids("vertex")
+    assert models1 is not None
+    assert isinstance(models1, list)
+    assert len(models1) > 0
+    
+    cache_file = tmp_path / "provider_models_cache.json"
+    assert cache_file.exists()
+    
+    models2 = cached_provider_model_ids("vertex")
+    assert models1 == models2
