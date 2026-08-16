@@ -145,6 +145,93 @@ def _queued_event(source: SessionSource) -> MessageEvent:
     )
 
 
+@pytest.mark.parametrize("profile", [None, "coder"], ids=["default", "named-profile"])
+def test_terminal_steer_enqueue_respects_durable_overflow_after_goal_clear(
+    monkeypatch,
+    tmp_path,
+    profile,
+):
+    """An empty physical slot does not make a non-empty logical FIFO empty."""
+    _gateway_run, runner, adapter = _make_runner(monkeypatch, tmp_path)
+    runner.config.multiplex_profiles = profile is not None
+    if profile is not None:
+        runner._profile_adapters = {profile: {Platform.TELEGRAM: adapter}}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-goal-clear-terminal-steer",
+        chat_type="dm",
+        user_id="user-goal-clear",
+        profile=profile,
+    )
+    state_key = runner._session_key_for_source(source)
+    adapter_key = adapter.session_key_for_source(source)
+    stale_goal = MessageEvent(
+        text="[Continuing toward your standing goal]\nGoal: stale goal",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    older_user = _queued_event(source)
+    terminal_steer = MessageEvent(
+        text="terminal steer",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+    )
+    setattr(terminal_steer, "_gateway_terminal_steer", True)
+
+    runner._enqueue_fifo(
+        state_key,
+        stale_goal,
+        adapter,
+        adapter_key=adapter_key,
+    )
+    runner._enqueue_fifo(
+        state_key,
+        older_user,
+        adapter,
+        adapter_key=adapter_key,
+    )
+    assert runner._clear_goal_pending_continuations(
+        state_key,
+        adapter,
+        source=source,
+    ) == 1
+    assert adapter_key not in adapter._pending_messages
+    assert runner._queued_events[state_key] == [older_user]
+
+    # This is the terminal-result caller's enqueue at gateway/run.py. The old
+    # implementation saw the empty physical slot and inserted the steer there,
+    # jumping it ahead of the older durable overflow item.
+    runner._enqueue_fifo(
+        state_key,
+        terminal_steer,
+        adapter,
+        adapter_key=adapter_key,
+    )
+
+    drained = []
+    while True:
+        pending = adapter.get_pending_message(adapter_key)
+        pending = runner._promote_queued_event(
+            state_key,
+            adapter,
+            pending,
+            adapter_key=adapter_key,
+        )
+        if pending is None:
+            break
+        drained.append(pending)
+
+    assert [event.text for event in drained] == [
+        "older queued work",
+        "terminal steer",
+    ]
+    assert drained[1] is terminal_steer
+    assert getattr(drained[1], "_gateway_terminal_steer", False) is True
+    assert adapter_key not in adapter._pending_messages
+    assert runner._queued_events.get(state_key, []) == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "queue_before_run",

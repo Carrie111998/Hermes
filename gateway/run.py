@@ -9010,10 +9010,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if pending_slot is None:
             return
         slot_key = adapter_key or state_key
-        if slot_key in pending_slot:
-            self._session_state(state_key).conversation.queued_events.append(
-                queued_event
-            )
+        overflow = self._session_state(state_key).conversation.queued_events
+        if slot_key in pending_slot or overflow:
+            overflow.append(queued_event)
         else:
             pending_slot[slot_key] = queued_event
 
