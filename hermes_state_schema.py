@@ -355,7 +355,7 @@ class SessionSchemaMixin:
             try:
                 cursor.execute(f"DELETE FROM {table}")
             except sqlite3.DatabaseError as exc:
-                if not SessionSchemaMixin._is_malformed_fts_index_error(exc):
+                if SessionSchemaMixin._is_transient_sqlite_error(exc):
                     raise
                 logger.warning(
                     "Cannot clear legacy FTS index %s with DELETE (%s); "
@@ -409,28 +409,21 @@ class SessionSchemaMixin:
             cursor.execute(backfill_sql.format(table=table))
 
     @staticmethod
-    def _is_malformed_fts_index_error(exc: BaseException) -> bool:
-        """True when *exc* is the corrupt-index class that justifies a
-        drop-and-recreate rebuild, rather than a transient lock/busy/IO
-        error that the open-retry path should handle instead.
+    def _is_transient_sqlite_error(exc: BaseException) -> bool:
+        """True for lock/busy/IO/readonly errors the open-retry path handles.
 
-        Message-based classification adopted from the #86062 review round
-        (credit @StanleyStetson / @Christopher-Schulze): treating every
-        ``DatabaseError`` as corruption makes a ``database is locked``
-        trigger a redundant rebuild (and, pre-atomicity, an autocommitted
-        DROP TABLE).
+        Class-based split (replaces the message-string classifier from the
+        #86062 review round, which the #86183 review flagged as fragile):
+        corruption — ``SQLITE_CORRUPT`` and the FTS5 corrupt-structure
+        class — surfaces as plain ``sqlite3.DatabaseError``, never
+        ``OperationalError``, while ``database is locked`` / disk-IO /
+        readonly are ``OperationalError``. An isinstance check therefore
+        classifies both directions with no dependence on SQLite's error
+        wording; verified against a really-corrupt index (which also
+        showed a ``fts5: corrupt structure record`` DELETE failure the
+        string list missed) and a real ``database is locked``.
         """
-        if not isinstance(exc, sqlite3.DatabaseError):
-            return False
-        message = str(exc).lower()
-        return any(
-            marker in message
-            for marker in (
-                "malformed inverted index",
-                "database disk image is malformed",
-                "malformed database schema",
-            )
-        )
+        return isinstance(exc, sqlite3.OperationalError)
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
@@ -461,49 +454,64 @@ class SessionSchemaMixin:
         derived index across the upgrade.
 
         Gated by the state_meta key ``fts_integrity_engine``: when it holds
-        the running ``sqlite3.sqlite_version`` the sweep already passed on
-        this engine and costs a single meta read. Otherwise every EXISTING
-        FTS table gets one 'integrity-check'; a failure is repaired in place
-        with the 'rebuild' command (full re-tokenization from the stored
-        content) and re-verified. A repair that cannot be verified logs the
-        manual escape hatch and leaves the marker unstamped so the next open
+        the running ``sqlite3.sqlite_version`` plus this host's capability
+        signature the sweep already passed here and costs a few cheap
+        metadata reads. Otherwise every EXISTING FTS table gets one
+        'integrity-check'; a failure is repaired in place with the
+        'rebuild' command (full re-tokenization from the stored content)
+        and re-verified. A repair that cannot be verified logs the manual
+        escape hatch and leaves the marker unstamped so the next open
         retries. Never raises: this hardens derived indexes only and must
         not fail opening the canonical store.
+
+        The capability signature (``|missing=<tables>`` appended when a
+        probe returns None, e.g. a host without the cjk tokenizer
+        extension) lets an incapable host also sweep at most once per
+        engine+capability pair instead of on every open, while a capable
+        host reading an incapable host's stamp sees a signature mismatch
+        and re-verifies — an incapable host still never vouches, on behalf
+        of a capable one, for indexes it could not check.
         """
         if self.read_only:
             return
         try:
+            probes = {
+                table: self._fts_table_probe(cursor, table)
+                for table in (
+                    "messages_fts",
+                    "messages_fts_trigram",
+                    "messages_fts_cjk",
+                )
+            }
+            missing = sorted(
+                table for table, status in probes.items() if status is None
+            )
+            stamp = sqlite3.sqlite_version
+            if missing:
+                stamp = f"{stamp}|missing={','.join(missing)}"
+
             row = cursor.execute(
                 "SELECT value FROM state_meta WHERE key = ? LIMIT 1",
                 (FTS_INTEGRITY_ENGINE_KEY,),
             ).fetchone()
             if row is not None:
                 stamped = row["value"] if isinstance(row, sqlite3.Row) else row[0]
-                if stamped == sqlite3.sqlite_version:
+                if stamped == stamp:
                     return
 
-            capability_missing = False
             verified = True
-            for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
-                status = self._fts_table_probe(cursor, table)
+            for table, status in probes.items():
                 if status is not True:
-                    if status is None:
-                        # An incapable host (e.g. no trigram tokenizer) must
-                        # not stamp the engine marker on behalf of the
-                        # capable host that may have written these indexes.
-                        capability_missing = True
                     continue
                 try:
                     cursor.execute(
                         f"INSERT INTO {table}({table}) VALUES('integrity-check')"
                     )
                 except sqlite3.DatabaseError as exc:
-                    if not SessionSchemaMixin._is_malformed_fts_index_error(exc):
-                        # Transient (lock/busy/IO) — not the corruption
-                        # class. Leave the marker unstamped so the next
-                        # open re-runs the sweep instead of freezing an
-                        # unverified state (classification adopted from
-                        # the #86062 review round).
+                    if self._is_transient_sqlite_error(exc):
+                        # Lock/busy/IO — not corruption. Leave the marker
+                        # unstamped so the next open re-runs the sweep
+                        # instead of freezing an unverified state.
                         verified = False
                         logger.warning(
                             "FTS integrity check for %s in %s hit a transient "
@@ -543,11 +551,11 @@ class SessionSchemaMixin:
                         sqlite3.sqlite_version,
                         exc,
                     )
-            if capability_missing or not verified:
+            if not verified:
                 return
             self.set_meta(
                 FTS_INTEGRITY_ENGINE_KEY,
-                sqlite3.sqlite_version,
+                stamp,
                 cursor=cursor,
             )
         except sqlite3.Error as exc:

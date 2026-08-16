@@ -233,6 +233,39 @@ class TestFtsEngineIntegrityGate:
         finally:
             ro.close()
 
+    def test_capability_signature_stamped_and_skips_resweep(self, tmp_path, monkeypatch):
+        """T10: a host whose probe cannot see a table (e.g. no cjk
+        tokenizer) sweeps at most once per engine+capability pair — the
+        stamp encodes the missing-capability signature, so a same-shape
+        reopen skips, while the bare-version stamp semantics are unchanged
+        on fully capable hosts."""
+        db_path = tmp_path / "legacy-state.db"
+        _make_legacy_db(db_path)
+
+        real_probe = SessionDB._fts_table_probe
+
+        def incapable_probe(self, cursor, table_name):
+            if table_name == "messages_fts_cjk":
+                return None  # capability missing, table unverifiable here
+            return real_probe(self, cursor, table_name)
+
+        monkeypatch.setattr(SessionDB, "_fts_table_probe", incapable_probe)
+        db = SessionDB(db_path=db_path)
+        db.close()
+        expected_stamp = f"{sqlite3.sqlite_version}|missing=messages_fts_cjk"
+        assert _meta_value(db_path, FTS_INTEGRITY_ENGINE_KEY) == expected_stamp
+
+        # A same-capability reopen skips the sweep entirely: corruption
+        # introduced after the stamp survives untouched (matching-marker
+        # semantics, now signature-scoped).
+        _corrupt_fts_index(db_path, "messages_fts_trigram")
+        db = SessionDB(db_path=db_path)
+        db.close()
+        assert not _integrity_check_ok(db_path, "messages_fts_trigram")
+        assert (
+            _meta_value(db_path, FTS_INTEGRITY_ENGINE_KEY) == expected_stamp
+        )
+
     def test_v23_external_content_layout_repaired(self, tmp_path):
         """T6: the same gate covers the v23 external-content layout (the
         'rebuild' command re-reads the canonical messages table). The DB is
