@@ -4202,9 +4202,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
         Single source of truth for handler registration. Both initial connect
         and the transient-initialization rebuild path call this method, keeping
-        the ``gateway_platform_event`` observer (group 99) in lockstep with the
-        core handlers.
+        plugin factories, the ``gateway_platform_event`` observer (group 99),
+        and the core handlers in lockstep. Plugin factories run first so their
+        scoped handlers take PTB's first-match precedence over the core set.
         """
+        self._wire_plugin_handlers(app)
         app.add_handler(TelegramMessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._handle_text_message
@@ -4227,17 +4229,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
-    def _wire_plugin_handlers(self) -> None:
-        """Invoke plugin-registered Telegram handler factories at connect.
+    def _wire_plugin_handlers(self, app) -> None:
+        """Invoke plugin-registered Telegram handler factories.
 
         Plugins call ``ctx.register_telegram_handler(factory)`` at register()
         time; the manager queues the factories and this method invokes each
-        with ``(application, adapter)`` right after the PTB Application is
-        built and BEFORE the core handlers are added. PTB dispatches only the
-        first matching handler per group, so plugin handlers registered first
-        take precedence for the updates they scope to (e.g. a
-        ``CallbackQueryHandler`` with a ``pattern=`` prefix) while everything
-        else falls through to the core handlers.
+        with ``(application, adapter)``. Called as the first step of
+        :meth:`_register_handlers`, so plugin handlers are registered BEFORE
+        the core handlers. PTB dispatches only the first matching handler per
+        group, so plugin handlers registered first take precedence for the
+        updates they scope to (e.g. a ``CallbackQueryHandler`` with a
+        ``pattern=`` prefix) while everything else falls through to the core
+        handlers.
 
         Each factory is isolated so a misbehaving plugin can't prevent
         Telegram from connecting.
@@ -4253,7 +4256,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         for factory, plugin_name in factories:
             try:
-                factory(self._app, self)
+                factory(app, self)
                 logger.info(
                     "[%s] Wired Telegram handlers from plugin '%s'",
                     self.name, plugin_name,
@@ -4505,11 +4508,9 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
 
-            # Wire plugin-provided PTB handlers BEFORE the core handlers are
-            # added — see _wire_plugin_handlers for precedence + isolation.
-            self._wire_plugin_handlers()
-
             # Register handlers via the single registration site (#64176).
+            # Plugin factories, core handlers, and the observer are wired
+            # there in precedence order.
             self._register_handlers(self._app)
             
             # Start polling — retry initialize() for transient TLS resets.
@@ -4625,11 +4626,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._app = builder.build()
                         self._bot = self._app.bot
                         # Keep plugin, core, and observer handlers in lockstep
-                        # after a transient-init rebuild (#64176): the rebuilt
-                        # Application needs the plugin factories re-invoked too,
-                        # or plugin handlers silently vanish while the core
-                        # handlers survive.
-                        self._wire_plugin_handlers()
+                        # after a transient-init rebuild (#64176).
                         self._register_handlers(self._app)
                         # Best-effort discard the old app's resources
                         try:

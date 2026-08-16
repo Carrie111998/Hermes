@@ -62,14 +62,23 @@ class TestRegisterTelegramHandlerAPI:
         assert fn is factory
         assert plugin_name == "test_plugin"
 
+    def test_registration_handle_releases_factory(self):
+        """The returned PluginRegistration removes the factory on release,
+        so a reloaded plugin's old factory is not re-wired forever."""
+        mgr, ctx = _make_ctx()
+
+        def factory(application, adapter):  # pragma: no cover
+            ...
+
+        handle = ctx.register_telegram_handler(factory)
+        handle.dispose()
+        assert mgr.get_telegram_handler_factories() == []
+
     def test_non_callable_factory_raises(self):
         """A non-callable factory must be rejected, not silently stored."""
         _mgr, ctx = _make_ctx()
         with pytest.raises(ValueError, match="non-callable"):
             ctx.register_telegram_handler("not a factory")  # type: ignore[arg-type]
-
-    def test_none_factory_raises(self):
-        _mgr, ctx = _make_ctx()
         with pytest.raises(ValueError, match="non-callable"):
             ctx.register_telegram_handler(None)  # type: ignore[arg-type]
 
@@ -107,7 +116,7 @@ class TestRegisterTelegramHandlerAPI:
         ctx_b.register_telegram_handler(fb)
 
         factories = mgr.get_telegram_handler_factories()
-        assert [(fn, name) for fn, name in factories] == [(fa, "plug_a"), (fb, "plug_b")]
+        assert factories == [(fa, "plug_a"), (fb, "plug_b")]
 
 
 # ---------------------------------------------------------------------------
@@ -115,25 +124,9 @@ class TestRegisterTelegramHandlerAPI:
 # ---------------------------------------------------------------------------
 # Exercises TelegramAdapter._wire_plugin_handlers() — the connect-time code
 # path that consumes get_telegram_handler_factories() and invokes each factory
-# with (application, adapter). python-telegram-bot is an optional dep, so mock
-# the telegram package the same way tests/gateway/test_telegram_network_reconnect
-# .py does.
-
-def _ensure_telegram_mock() -> None:
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
-    telegram_mod = MagicMock()
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    telegram_mod.constants.ChatType.GROUP = "group"
-    telegram_mod.constants.ChatType.SUPERGROUP = "supergroup"
-    telegram_mod.constants.ChatType.CHANNEL = "channel"
-    telegram_mod.constants.ChatType.PRIVATE = "private"
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, telegram_mod)
-
-
-_ensure_telegram_mock()
+# with (application, adapter). The telegram package is mocked by
+# tests/gateway/conftest.py at collection time (python-telegram-bot is an
+# optional dep).
 
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
@@ -150,14 +143,13 @@ def _recording_factory(log, key):
 class TestTelegramAdapterPluginHandlerWiring:
     """_wire_plugin_handlers() (the connect path) invokes factories with (app, adapter)."""
 
-    def _adapter(self, app) -> TelegramAdapter:
+    def _adapter(self) -> TelegramAdapter:
         # object.__new__ skips the heavy __init__. _wire_plugin_handlers only
-        # needs self._app and self.name; `name` is a read-only property over
-        # self.platform (Platform.TELEGRAM.value.title() -> "Telegram"), so set
-        # a stand-in platform rather than the property itself.
+        # needs self.name; `name` is a read-only property over self.platform
+        # (Platform.TELEGRAM.value.title() -> "Telegram"), so set a stand-in
+        # platform rather than the property itself.
         a = object.__new__(TelegramAdapter)
         a.platform = SimpleNamespace(value="telegram")
-        a._app = app
         return a
 
     def _mgr(self, factories):
@@ -168,7 +160,7 @@ class TestTelegramAdapterPluginHandlerWiring:
     def test_factories_invoked_with_app_and_adapter(self):
         """Each factory is called exactly once with (application=app, adapter=self)."""
         app = MagicMock(name="app")
-        adapter = self._adapter(app)
+        adapter = self._adapter()
         log: list = []
         fa, fb = _recording_factory(log, "a"), _recording_factory(log, "b")
 
@@ -176,38 +168,38 @@ class TestTelegramAdapterPluginHandlerWiring:
             "hermes_cli.plugins.get_plugin_manager",
             return_value=self._mgr([(fa, "plug_a"), (fb, "plug_b")]),
         ):
-            adapter._wire_plugin_handlers()
+            adapter._wire_plugin_handlers(app)
 
         assert log == [("a", app, adapter), ("b", app, adapter)]
 
     def test_no_factories_is_a_noop(self):
         """Empty factory list (the common case) wires nothing onto the app."""
         app = MagicMock(name="app")
-        adapter = self._adapter(app)
+        adapter = self._adapter()
 
         with patch(
             "hermes_cli.plugins.get_plugin_manager",
             return_value=self._mgr([]),
         ):
-            adapter._wire_plugin_handlers()
+            adapter._wire_plugin_handlers(app)
 
         app.add_handler.assert_not_called()
 
     def test_plugin_manager_load_failure_is_isolated(self):
         """If get_plugin_manager() raises, wiring is skipped — connect stays safe."""
         app = MagicMock(name="app")
-        adapter = self._adapter(app)
+        adapter = self._adapter()
 
         with patch(
             "hermes_cli.plugins.get_plugin_manager",
             side_effect=RuntimeError("plugin layer down"),
         ):
-            adapter._wire_plugin_handlers()  # must not raise
+            adapter._wire_plugin_handlers(app)  # must not raise
 
     def test_one_factory_raising_does_not_block_others(self):
         """A factory that raises must not stop later factories from running."""
         app = MagicMock(name="app")
-        adapter = self._adapter(app)
+        adapter = self._adapter()
         log: list = []
 
         def boom(application, adapter):
@@ -220,6 +212,6 @@ class TestTelegramAdapterPluginHandlerWiring:
             "hermes_cli.plugins.get_plugin_manager",
             return_value=self._mgr([(boom, "buggy"), (good, "g"), (other, "o")]),
         ):
-            adapter._wire_plugin_handlers()  # must not raise
+            adapter._wire_plugin_handlers(app)  # must not raise
 
         assert [key for (key, _app, _adapter) in log] == ["good", "other"]

@@ -2931,7 +2931,9 @@ class PluginContext:
 
     # -- auxiliary task registration ---------------------------------------
 
-    def register_telegram_handler(self, factory: Callable) -> None:
+    # -- telegram handler registration -------------------------------------
+
+    def register_telegram_handler(self, factory: Callable) -> PluginRegistration:
         """Register a python-telegram-bot handler factory from a plugin.
 
         Hermes' Telegram adapter invokes registered factories at ``connect()``
@@ -2977,14 +2979,21 @@ class PluginContext:
                 f"Plugin '{self.manifest.name}' tried to register a Telegram "
                 f"handler factory with a non-callable factory."
             )
-        self._manager._telegram_handler_factories.append(
-            (factory, self.manifest.name)
+        entry = (factory, self.manifest.name)
+        self._manager._telegram_handler_factories.append(entry)
+        handle = self._track(
+            "telegram_handler",
+            getattr(factory, "__name__", repr(factory)),
+            lambda: self._manager._remove_identity(
+                self._manager._telegram_handler_factories, entry
+            ),
         )
         logger.debug(
             "Plugin %s registered Telegram handler factory: %s",
             self.manifest.name,
             getattr(factory, "__name__", repr(factory)),
         )
+        return handle
 
     @_serialized_replacement
     def register_auxiliary_task(
@@ -3493,10 +3502,8 @@ class PluginManager:
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
         # Telegram handler factories registered by plugins. Each entry is
-        # (factory, plugin_name); the Telegram adapter invokes factories at
-        # connect() time with (application, adapter) so plugins can wire
-        # their own PTB handlers (pattern-scoped CallbackQueryHandler, etc.)
-        # before the core handlers are added.
+        # (factory, plugin_name); the Telegram adapter invokes the factories
+        # at connect() time.
         self._telegram_handler_factories: List[tuple] = []
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
@@ -5517,9 +5524,7 @@ class PluginManager:
         """Return the list of plugin-registered Telegram handler factories.
 
         Each entry is a ``(factory, plugin_name)`` tuple. Consumed by the
-        Telegram adapter at connect time; each factory is invoked with
-        ``(application, adapter)`` so plugins can wire their own PTB handlers
-        before the core handlers are added.
+        Telegram adapter at connect time.
 
         Plugins register factories via
         :meth:`PluginContext.register_telegram_handler`.
