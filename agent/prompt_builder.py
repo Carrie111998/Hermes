@@ -2079,13 +2079,12 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}")
 
         result = (
-            "## Skills (mandatory)\n"
+            "## Skills\n"
             "Before replying, scan the skills below. Use skill_view(name) to load only skills that "
             "clearly and materially govern the task, a distinct required subtask, or a dependency, "
-            "and follow their instructions. Prefer the smallest sufficient set. The explicit mandatory "
-            "triggers below still apply. "
+            "and follow their instructions. Prefer the smallest sufficient set. "
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
+            "and proven workflows that outperform general-purpose approaches. Load a qualifying skill "
             f"even if you think you could handle the task with basic tools like {_basic_tools}. "
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
