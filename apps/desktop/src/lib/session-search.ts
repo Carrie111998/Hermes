@@ -7,8 +7,8 @@ import {
   type FieldMatch,
   type FieldSpec,
   type RankedHit,
-  type RankOptions,
-  rankFields
+  rankFields,
+  type RankOptions
 } from './search-match'
 import { sessionSourceSearchTerms } from './session-source'
 

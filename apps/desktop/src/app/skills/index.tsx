@@ -31,9 +31,9 @@ import {
   bestMatch,
   type FieldMatch,
   rankItems,
-  type SearchField,
   SEARCH_FIELD_LABEL_EN,
-  SEARCH_FIELD_LABEL_ZH
+  SEARCH_FIELD_LABEL_ZH,
+  type SearchField
 } from '@/lib/search-match'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'

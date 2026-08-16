@@ -28,9 +28,9 @@ import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
 import {
-  type SearchField as SearchMatchField,
   SEARCH_FIELD_LABEL_EN,
   SEARCH_FIELD_LABEL_ZH,
+  type SearchField as SearchMatchField,
   stripHighlightMarkers
 } from '@/lib/search-match'
 import { rankSession } from '@/lib/session-search'
