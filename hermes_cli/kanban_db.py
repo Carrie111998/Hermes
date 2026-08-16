@@ -4462,10 +4462,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       automatically once the underlying conditions change (e.g. parents
       finish, transient infra error clears).
 
-    The cheapest signal that distinguishes these is the most recent
-    ``"created"`` / ``"blocked"`` / ``"unblocked"`` event for the task.
-    A blocked creation or explicit block is sticky until a newer explicit
-    ``"unblocked"`` event fires, and ``recompute_ready`` must not
+    The cheapest signal that distinguishes these is the most recent audited
+    gate transition: ``"created"``, ``"blocked"``, ``"unblocked"``,
+    ``"promoted_manual"``, or dashboard ``"status"``. A blocked creation,
+    explicit block, or status move to blocked is sticky until a newer
+    operator transition clears it, and ``recompute_ready`` must not
     auto-promote it.
 
     Returns ``False`` when there is no sticky event (e.g. the task was set
@@ -4475,11 +4476,13 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind, payload FROM task_events "
-        "WHERE task_id = ? AND kind IN ('created', 'blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ("
+        "'created', 'blocked', 'unblocked', 'promoted_manual', 'status'"
+        ") "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if not row or row["kind"] == "unblocked":
+    if not row:
         return False
     if row["kind"] == "blocked":
         return True
@@ -4487,7 +4490,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         payload = json.loads(row["payload"]) if row["payload"] else {}
     except (json.JSONDecodeError, TypeError):
         payload = {}
-    return isinstance(payload, dict) and payload.get("status") == "blocked"
+    return (
+        row["kind"] in {"created", "status"}
+        and isinstance(payload, dict)
+        and payload.get("status") == "blocked"
+    )
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:

@@ -128,6 +128,55 @@ def test_initially_blocked_child_requires_explicit_unblock_after_parent_completi
         assert kb.claim_task(conn, blocked_child_id, claimer="after-unblock") is not None
 
 
+@pytest.mark.parametrize("transition", ["promote", "status"])
+def test_operator_transition_clears_initial_block_stickiness(
+    kanban_home: Path,
+    transition: str,
+) -> None:
+    """Audited operator overrides must not poison later breaker recovery."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="human gate",
+            initial_status="blocked",
+        )
+
+        if transition == "promote":
+            ok, error = kb.promote_task(conn, task_id, actor="operator")
+            assert ok and error is None
+        else:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ?",
+                    (task_id,),
+                )
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "status",
+                    {"status": "todo", "requested_status": "todo"},
+                )
+            assert kb.recompute_ready(conn) == 1
+
+        claimed = kb.claim_task(conn, task_id, claimer="test-worker")
+        assert claimed is not None
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "spawn failed",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        blocked = kb.get_task(conn, task_id)
+        assert blocked is not None and blocked.status == "blocked"
+
+        assert kb.recompute_ready(conn) == 1
+        recovered = kb.get_task(conn, task_id)
+        assert recovered is not None and recovered.status == "ready"
+
+
 
 
 # ---------------------------------------------------------------------------
