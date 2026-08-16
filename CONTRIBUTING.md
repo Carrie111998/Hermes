@@ -75,7 +75,7 @@ Hermes cron jobs support a `no_agent: true` mode that runs a script directly wit
 |--------|:----------:|:-----------:|:---------|
 | **Tool** (`plugin/tools/`) | Low per-call | ★★★★★ | Binary data, streaming, real-time events, auth flows |
 | **Skill** (`skills/` or `optional-skills/`) | Variable (LLM-driven) | ★★★☆☆ | Tasks needing reasoning, judgment, or in-context adaptation |
-| **Script** (`no_agent` cron) | **Zero per-run** | ★★★★★ | Deterministic, repeatable, scheduled operations |
+| **Script** (`no_agent` cron) | **Zero per-run** | ★★★★☆ | Deterministic, repeatable, scheduled operations |
 
 **Make it a Script when:**
 
@@ -90,6 +90,8 @@ Hermes cron jobs support a `no_agent: true` mode that runs a script directly wit
 - Example: "summarize new GitHub issues" needs judgment → skill; "alert if disk > 90%" is purely deterministic → script
 
 The most common mistake is defaulting to a Skill when a Script would do. Every LLM call burns tokens; scripts cost nothing to run and, with no LLM in the loop, cannot hallucinate.
+
+For the full decision boundary and runtime constraints, see the [Script-Only Cron Jobs guide](https://hermes-agent.nousresearch.com/docs/guides/cron-script-only#when-to-use-it) (when to use it) and the [No-agent mode section in the cron docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron#no-agent-mode-script-only-jobs) (timeouts, failure alerts, delivery semantics).
 
 ---
 
