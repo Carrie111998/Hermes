@@ -717,7 +717,12 @@ def _title_match_result(
         return None
 
     try:
-        session_id = db.resolve_session_by_title(title_query)
+        if caller_session_key:
+            session_id = db.resolve_session_by_title(
+                title_query, session_key=caller_session_key
+            )
+        else:
+            session_id = db.resolve_session_by_title(title_query)
     except Exception:
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
@@ -798,7 +803,7 @@ def _discover(
     )
 
     try:
-        raw_results = db.search_messages(
+        search_kwargs = dict(
             query=query,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
@@ -809,6 +814,9 @@ def _discover(
             sort=sort,
             fields=_DISCOVER_SEARCH_FIELDS,
         )
+        if caller_session_key:
+            search_kwargs["session_key"] = caller_session_key
+        raw_results = db.search_messages(**search_kwargs)
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
@@ -817,13 +825,7 @@ def _discover(
     # high-volume cron corpus can't starve the user's own sessions out of the
     # top `limit` results (#19434). Stable — preserves BM25/recency order
     # within each class.
-    raw_results = _order_for_recall(
-        [
-            row
-            for row in raw_results
-            if _session_in_scope(db, row.get("session_id"), caller_session_key)
-        ]
-    )
+    raw_results = _order_for_recall(raw_results)
 
     if not raw_results and not title_result:
         _empty_payload = {

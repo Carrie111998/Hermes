@@ -226,6 +226,66 @@ class TestGatewayOwnershipScope:
         }
         assert "other" not in json.dumps(result)
 
+    def test_discovery_scopes_before_ranking_limit(self, db, monkeypatch):
+        monkeypatch.setattr(
+            "tools.session_search_tool._DISCOVER_SCAN_LIMIT", 3
+        )
+        db.create_session(
+            "owned-low-rank", source="telegram", session_key="telegram:dm:owner"
+        )
+        db.append_message(
+            "owned-low-rank",
+            role="user",
+            content="scope starvation needle " + ("unrelated filler " * 200),
+        )
+        for index in range(4):
+            sid = f"foreign-high-rank-{index}"
+            db.create_session(
+                sid, source="telegram", session_key="telegram:dm:other"
+            )
+            db.append_message(
+                sid,
+                role="user",
+                content="scope starvation needle scope starvation needle",
+            )
+
+        result = json.loads(
+            session_search(
+                query="scope starvation needle",
+                detail="full",
+                limit=10,
+                db=db,
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "owned-low-rank"
+        ]
+
+    def test_title_match_resolves_within_the_callers_gateway_scope(self, db):
+        db.create_session(
+            "owned-title", source="telegram", session_key="telegram:dm:owner"
+        )
+        db.set_session_title("owned-title", "Shared Plan")
+        db.create_session(
+            "foreign-title", source="telegram", session_key="telegram:dm:other"
+        )
+        db.set_session_title("foreign-title", "Shared Plan #2")
+
+        result = json.loads(
+            session_search(
+                query="Shared Plan",
+                detail="full",
+                db=db,
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "owned-title"
+        ]
+
     @pytest.mark.parametrize("shape", ["read", "scroll"])
     def test_direct_lookup_rejects_another_gateway_scope(self, db, shape):
         _, other_mid = self._seed(db)
