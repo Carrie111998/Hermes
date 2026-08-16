@@ -885,6 +885,9 @@ export const en: Translations = {
       catalogEnvRequired: 'Fill in the required values before installing.',
       capabilitySummary: (tools, prompts, resources) =>
         `${[`${tools} tools`, ...(prompts ? [`${prompts} prompts`] : []), ...(resources ? [`${resources} resources`] : [])].join(', ')} enabled`,
+      costTokens: tokens => `~${tokens} tok/call`,
+      usage30d: uses => `${uses} uses/30d`,
+      unusedPill: 'unused',
       statusConnecting: 'Connecting…',
       statusNeedsAuth: 'Needs authentication',
       statusError: 'Error',
@@ -897,7 +900,21 @@ export const en: Translations = {
       unsavedConnect: 'Unsaved — save mcp.json to connect.',
       enableTool: tool => `Enable ${tool}`,
       disableTool: tool => `Disable ${tool}`,
-      noOutput: 'No output yet.'
+      noOutput: 'No output yet.',
+      deepLinkTitle: 'Add MCP server?',
+      deepLinkDescription:
+        'A link asked to add this MCP server to Hermes. Review the exact configuration below — it comes from the link, not from Hermes.',
+      deepLinkStdioWarning:
+        'This server runs a local process on your machine with the command shown below. Only continue if you trust its source.',
+      deepLinkConfirm: 'Add server',
+      deepLinkNameInvalid: 'Names use 1-64 letters, digits, dots, dashes, or underscores.',
+      deepLinkNameConflict: name => `A server named ${name} already exists — choose a different name or cancel.`,
+      deepLinkErrorTitle: 'MCP install link rejected',
+      deepLinkErrorName: 'The link\u2019s server name is missing or invalid.',
+      deepLinkErrorConfig: 'The link\u2019s config is not valid base64-encoded JSON.',
+      deepLinkErrorShape: 'The config must be a JSON object with a string `url` or `command` field.',
+      deepLinkErrorUrl: 'Only http:// and https:// server URLs are allowed.',
+      deepLinkErrorTooLarge: 'The config payload exceeds the 32KB limit.'
     },
     model: {
       loading: 'Loading model configuration...',
@@ -2376,6 +2393,20 @@ export const en: Translations = {
     applyingClose: 'This window will close while the update runs, then Hermes reopens on its own.',
     errorTitle: 'Update didn’t finish',
     errorBody: 'No worries — nothing was lost. You can try again now.',
+    blockerTitle: 'Close local previews to update Hermes?',
+    blockerBody:
+      'Hermes needs to stop these local previews before updating. This will not modify or delete your files.',
+    foreignBlockerTitle: 'Close other processes to update Hermes',
+    foreignBlockerBody:
+      'Hermes can’t safely close these processes automatically. Close the app, terminal, or service that owns each one, then try the update again.',
+    mixedBlockerBody:
+      'Hermes can close the local previews listed below. Other processes must be closed manually before the update can continue.',
+    closePreviewsAndUpdate: 'Close previews and update',
+    closePreviewsAndCheckAgain: 'Close previews and check again',
+    localPreview: 'Local preview',
+    portLabel: port => `Port ${port}`,
+    pidLabel: pid => `PID ${pid}`,
+    technicalDetails: 'Technical details',
     notNow: 'Not now',
     applyStatus: {
       preparing: 'Updating backend…',
@@ -3089,6 +3120,7 @@ export const en: Translations = {
     stopFailed: 'Stop failed',
     regenerateFailed: 'Regenerate failed',
     editFailed: 'Edit failed',
+    editTurnUnavailable: 'This turn is no longer in server history (it may have been compressed away).',
     resumeFailed: 'Resume failed',
     resumeStrandedTitle: "Couldn't load this session",
     resumeStrandedBody:
