@@ -92,9 +92,9 @@ def _bound_session_key(key):
 
 
 def _dispatch_diag(res) -> str:
-    """TEMP CI diagnostic (08-16): wiring tests fail on CI-only conditions
-    with KeyError 'dispatched' — render the actual result + scheduler running
-    set so the failure message identifies the taken return path."""
+    """Failure renderer for the wiring tests' dispatch asserts: the result
+    dict plus the scheduler running set, so a broken assert names the return
+    path that was actually taken instead of a bare KeyError."""
     try:
         from cron.scheduler import get_running_job_ids
 
@@ -188,9 +188,13 @@ class TestRunnerSummaryWiring:
     def test_delivery_failure_surfaces_in_completion_summary(self):
         from tools.cronjob_tools import _try_dispatch_background_run
 
+        job = _job("job-dn-01", "telegram")
         with _bound_session_key("agent:main:telegram:dm:83993"):
             with (
-                patch("tools.cronjob_tools.claim_job_for_fire", return_value=True),
+                patch(
+                    "tools.cronjob_tools.claim_job_for_fire",
+                    return_value=job,  # claimed snapshot (return_job=True API)
+                ),
                 patch("cron.scheduler.run_one_job", return_value=True),
                 patch(
                     "tools.cronjob_tools.get_job",
@@ -201,7 +205,7 @@ class TestRunnerSummaryWiring:
                     },
                 ),
             ):
-                res = _try_dispatch_background_run(_job("job-dn-01", "telegram"))
+                res = _try_dispatch_background_run(job)
                 assert res.get("dispatched") is True, _dispatch_diag(res)
                 evt = _drain_completion_event(res["delegation_id"])
         assert evt is not None, "completion event never reached the queue"
@@ -217,16 +221,20 @@ class TestRunnerSummaryWiring:
         by a delivered-there claim."""
         from tools.cronjob_tools import _try_dispatch_background_run
 
+        job = _job("job-dn-03", "")
         with _bound_session_key("agent:main:telegram:dm:86622"):
             with (
-                patch("tools.cronjob_tools.claim_job_for_fire", return_value=True),
+                patch(
+                    "tools.cronjob_tools.claim_job_for_fire",
+                    return_value=job,  # claimed snapshot (return_job=True API)
+                ),
                 patch("cron.scheduler.run_one_job", return_value=True),
                 patch(
                     "tools.cronjob_tools.get_job",
                     return_value={"last_status": "ok", "last_error": None},
                 ),
             ):
-                res = _try_dispatch_background_run(_job("job-dn-03", ""))
+                res = _try_dispatch_background_run(job)
                 assert res.get("dispatched") is True, _dispatch_diag(res)
                 evt = _drain_completion_event(res["delegation_id"])
         assert evt is not None, "completion event never reached the queue"
@@ -237,16 +245,20 @@ class TestRunnerSummaryWiring:
     def test_delivery_success_wording_unchanged_in_completion_summary(self):
         from tools.cronjob_tools import _try_dispatch_background_run
 
+        job = _job("job-dn-02", "telegram")
         with _bound_session_key("agent:main:telegram:dm:83994"):
             with (
-                patch("tools.cronjob_tools.claim_job_for_fire", return_value=True),
+                patch(
+                    "tools.cronjob_tools.claim_job_for_fire",
+                    return_value=job,  # claimed snapshot (return_job=True API)
+                ),
                 patch("cron.scheduler.run_one_job", return_value=True),
                 patch(
                     "tools.cronjob_tools.get_job",
                     return_value={"last_status": "ok", "last_error": None},
                 ),
             ):
-                res = _try_dispatch_background_run(_job("job-dn-02", "telegram"))
+                res = _try_dispatch_background_run(job)
                 assert res.get("dispatched") is True, _dispatch_diag(res)
                 evt = _drain_completion_event(res["delegation_id"])
         assert evt is not None, "completion event never reached the queue"
