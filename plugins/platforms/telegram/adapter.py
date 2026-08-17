@@ -5116,6 +5116,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return content, "HTML"
         return self.format_message(content), "MARKDOWN_V2"
 
+    def _format_parse_fallback_text(self, content: str) -> str:
+        """Strip HTML tags for the plain-text parse-failure fallback.
+
+        TKT-0033 never-drop guarantee: when Telegram rejects the declared
+        parse mode with a parse ``BadRequest``, delivery supersedes
+        formatting — the message is resent as plain text rather than
+        dropped. HTML tags are removed so the user sees legible text
+        instead of raw markup; MarkdownV2 escape cleanup stays with
+        ``_strip_mdv2`` at the call site.
+        """
+        return re.sub(r"<[^>]+>", "", content)
+
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
         """Determine if this message chunk should thread to the original message.
 
@@ -5278,10 +5290,24 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **self._notification_kwargs(metadata),
                             )
                         except Exception as md_error:
-                            # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
+                            # Declared-format parse failed. TKT-0033
+                            # never-drop guarantee: delivery supersedes
+                            # formatting — resend as plain text (tags and
+                            # MarkdownV2 escapes stripped) rather than drop
+                            # the message. Driven by the attempted
+                            # send_parse_mode, so both the HTML and the
+                            # MarkdownV2 paths are covered.
+                            err_text = str(md_error).lower()
+                            if "parse" in err_text or "markdown" in err_text or "entities" in err_text:
+                                logger.error(
+                                    "[%s] %s parse rejected by Telegram for chat %s; "
+                                    "falling back to plain text (never-drop): %s",
+                                    self.name, send_parse_mode_name, chat_id, md_error,
+                                )
+                                if send_parse_mode_name == "HTML":
+                                    plain_chunk = self._format_parse_fallback_text(chunk)
+                                else:
+                                    plain_chunk = _strip_mdv2(chunk)
                                 msg = await self._bot.send_message(
                                     chat_id=normalize_telegram_chat_id(chat_id),
                                     text=plain_chunk,
@@ -10717,6 +10743,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    payload_type: str = "text/markdown",
 ):
     """Out-of-process Telegram delivery. Delegates to the standalone
     ``_send_telegram`` REST sender in tools/send_message_tool.py (which already
@@ -10743,6 +10770,7 @@ async def _standalone_send(
         thread_id=thread_id,
         disable_link_previews=disable_link_previews,
         force_document=force_document,
+        payload_type=payload_type,
     )
 
 
