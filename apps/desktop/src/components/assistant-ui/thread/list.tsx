@@ -253,21 +253,31 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   // Track where the user is in the current session (sticky-bottom vs exact
   // offset) so the restore effect below can put them back there (#70101).
-  useEffect(() => {
-    const el = scrollRef.current
+useEffect(() => {
+  const el = scrollRef.current
 
-    if (!el) {
-      return
-    }
+  if (!el) {
+    return
+  }
 
-    const track = () => {
-      liveScrollStateRef.current = stateFromMetrics(el)
-    }
+  const track = () => {
+    liveScrollStateRef.current = stateFromMetrics(el)
+  }
 
-    el.addEventListener('scroll', track, { passive: true })
+  // Initialize immediately so we don't rely on a first scroll event.
+  track()
 
-    return () => el.removeEventListener('scroll', track)
-  }, [scrollRef])
+  el.addEventListener('scroll', track, { passive: true })
+
+  const content = contentRef.current
+  const ro = typeof ResizeObserver === 'undefined' || !content ? null : new ResizeObserver(track)
+  ro?.observe(content)
+
+  return () => {
+    el.removeEventListener('scroll', track)
+    ro?.disconnect()
+  }
+}, [contentRef, scrollRef])
 
   // Floating jump button (outside this subtree) → return to the bottom.
   useEffect(() => onScrollToBottomRequest(() => void scrollToBottom()), [scrollToBottom])
