@@ -62,6 +62,20 @@ def test_bright_data_is_unavailable_without_secret(settings):
     assert health.reason == "credential_required"
 
 
+def test_bright_data_is_unavailable_with_whitespace_only_secret(settings):
+    registry = build_registry(settings=Settings(
+        database_path=settings.database_path,
+        brightdata_enabled=True,
+        brightdata_api_key="  \t  ",
+        brightdata_unlocker_zone="test-zone",
+    ))
+
+    health = registry.get("brightdata-web").health()
+
+    assert health.status == "unavailable"
+    assert health.reason == "credential_required"
+
+
 def test_bright_data_is_unavailable_when_disabled(settings):
     registry = build_registry(
         settings=Settings(
@@ -172,3 +186,76 @@ def test_source_hash_is_derived_from_retrieved_content(candidate, query):
         f"[Acme company record](https://directory.example/acme) {markdown}".encode()
     ).hexdigest()
     assert bundle.sources[0].raw_hash == expected
+
+
+def test_generic_buyer_product_result_without_candidate_identity_is_rejected(candidate, query):
+    no_domain_candidate = CandidateRecord(**{**candidate.__dict__, "domain": None})
+    markdown = (
+        "[German industrial machinery importers]"
+        "(https://generic.example/importers) DE Germany distributor importer heat pumps"
+    )
+    verifier = BrightDataVerifier(
+        "test-key",
+        "test-zone",
+        httpx.Client(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, text=markdown)
+        )),
+    )
+
+    bundle = verifier.verify(query, no_domain_candidate)
+
+    assert bundle.sources == []
+    assert bundle.independent_source_count == 0
+
+
+def test_identity_from_one_result_does_not_validate_a_different_result(candidate, query):
+    no_domain_candidate = CandidateRecord(**{**candidate.__dict__, "domain": None})
+    markdown = (
+        "[Acme Handel GmbH](https://identity.example/acme) company profile "
+        "[German machinery importer](https://generic.example/importers) "
+        "distributor importer heat pumps"
+    )
+    verifier = BrightDataVerifier(
+        "test-key",
+        "test-zone",
+        httpx.Client(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, text=markdown)
+        )),
+    )
+
+    bundle = verifier.verify(query, no_domain_candidate)
+
+    assert [source.provenance_url for source in bundle.sources] == [
+        "https://identity.example/acme"
+    ]
+    assert bundle.sources[0].facts == {"company_name": ["Acme Handel GmbH"]}
+    assert bundle.independent_source_count == 1
+
+
+def test_explicit_candidate_alias_establishes_result_identity(candidate, query):
+    alias_candidate = CandidateRecord(**{
+        **candidate.__dict__,
+        "domain": None,
+        "data": {**candidate.data, "aliases": ["Acme Waerme"]},
+    })
+    markdown = (
+        "[Acme Waerme](https://alias.example/acme) "
+        "distributor of heat pumps"
+    )
+    verifier = BrightDataVerifier(
+        "test-key",
+        "test-zone",
+        httpx.Client(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, text=markdown)
+        )),
+    )
+
+    bundle = verifier.verify(query, alias_candidate)
+
+    assert [source.provenance_url for source in bundle.sources] == [
+        "https://alias.example/acme"
+    ]
+    assert bundle.sources[0].facts["company_name"] == ["Acme Handel GmbH"]
+    assert bundle.sources[0].facts["buyer_role"] == ["distributor"]
+    assert bundle.sources[0].facts["product_term"] == ["heat pumps"]
+    assert bundle.independent_source_count == 1

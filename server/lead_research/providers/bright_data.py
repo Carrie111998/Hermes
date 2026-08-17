@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
+from ...quality import normalize_name
 from ..candidates import CandidateRecord
 from ..models import (
     DatasetDefinition,
@@ -88,9 +89,19 @@ def _fact_matches(
     product_terms: list[str],
     classification: str,
 ) -> dict[str, list[str]]:
-    normalized = " ".join(text.casefold().replace("-", " ").split())
+    normalized = normalize_name(text)
+    aliases = candidate.data.get("aliases", [])
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    identity_terms = [
+        candidate.normalized_name,
+        *[normalize_name(str(alias)) for alias in aliases],
+    ]
+    identity_matched = any(term and term in normalized for term in identity_terms)
+    if classification == "independent" and not identity_matched:
+        return {}
     facts: dict[str, list[str]] = {}
-    if candidate.normalized_name in normalized:
+    if identity_matched:
         facts["company_name"] = [candidate.company_name]
     country = candidate.country.strip().upper()
     if re.search(rf"(?<![a-z]){re.escape(country.casefold())}(?![a-z])", normalized):
@@ -219,14 +230,17 @@ class BrightDataVerifier(CatalogProvider):
         for search_url in self._search_urls(query, candidate, buyer_terms, product_terms):
             markdown = self._fetch_markdown(search_url)
             digest = hashlib.sha256(markdown.encode()).hexdigest()
-            matches = list(MARKDOWN_LINK.finditer(markdown))[:MAX_RESULTS_PER_PAGE]
-            for match in matches:
+            matches = list(MARKDOWN_LINK.finditer(markdown))
+            for index, match in enumerate(matches[:MAX_RESULTS_PER_PAGE]):
                 provenance_url = _result_url(match.group(2))
                 if not provenance_url or provenance_url in seen_urls:
                     continue
-                line_start = markdown.rfind("\n", 0, match.start()) + 1
-                line_end = markdown.find("\n", match.end())
-                evidence_text = markdown[line_start:line_end if line_end >= 0 else None]
+                entry_end = (
+                    matches[index + 1].start()
+                    if index + 1 < len(matches)
+                    else len(markdown)
+                )
+                evidence_text = markdown[match.start():entry_end]
                 classification = (
                     "official" if _is_official(provenance_url, candidate_domain) else "independent"
                 )

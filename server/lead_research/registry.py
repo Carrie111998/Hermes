@@ -63,19 +63,20 @@ def build_registry(
     )
     if bright_data is not None and bright_data.source_id not in supplied:
         settings = settings or Settings.load()
+        api_key = settings.brightdata_api_key.strip()
         if not settings.brightdata_enabled:
             supplied[bright_data.source_id] = UnavailableCandidateVerifier(
                 bright_data,
                 "disabled",
             )
-        elif not settings.brightdata_api_key:
+        elif not api_key:
             supplied[bright_data.source_id] = UnavailableCandidateVerifier(
                 bright_data,
                 "credential_required",
             )
         else:
             verifier = BrightDataVerifier(
-                settings.brightdata_api_key,
+                api_key,
                 settings.brightdata_unlocker_zone,
             )
             verifier.definition = bright_data
