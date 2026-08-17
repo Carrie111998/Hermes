@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import collections
+import ctypes
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
@@ -279,6 +281,93 @@ def watch_polling(root: Path, on_hit, stop: threading.Event, interval_s: float) 
         stop.wait(interval_s)
 
 
+# --- Win32 directory-change watching -------------------------------------
+#
+# Non-recursive on purpose: we want ONE specific child of the root, and a
+# subtree watch over a repo checkout would deliver enormous volume during a
+# test run.
+FILE_LIST_DIRECTORY = 0x0001
+FILE_SHARE_READ = 0x0001
+FILE_SHARE_WRITE = 0x0002
+FILE_SHARE_DELETE = 0x0004
+OPEN_EXISTING = 3
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000  # required to open a DIRECTORY handle
+FILE_NOTIFY_CHANGE_DIR_NAME = 0x00000002
+FILE_ACTION_ADDED = 1
+FILE_ACTION_RENAMED_NEW_NAME = 5
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def parse_notifications(buf: bytes, nbytes: int):
+    """Walk a FILE_NOTIFY_INFORMATION chain.
+
+    Layout: NextEntryOffset (DWORD), Action (DWORD), FileNameLength (DWORD,
+    in BYTES not characters), FileName (WCHAR[]). Treating FileNameLength as
+    a character count is the classic way to get this wrong.
+    """
+    offset = 0
+    while offset + 12 <= nbytes:
+        next_off, action, name_len = struct.unpack_from("<III", buf, offset)
+        start = offset + 12
+        name = buf[start:start + name_len].decode("utf-16-le", "replace")
+        yield action, name
+        if next_off == 0:
+            break
+        offset += next_off
+
+
+def _open_directory_handle(root: Path):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        ctypes.c_wchar_p(str(root)),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    if not handle or handle == _INVALID_HANDLE_VALUE:
+        raise OSError(ctypes.get_last_error(), f"CreateFileW failed for {root}")
+    return kernel32, handle
+
+
+def watch_readdirchanges(root: Path, on_hit, stop: threading.Event, handles: list) -> None:
+    """Block on ReadDirectoryChangesW until %SystemDrive% is created.
+
+    Detection latency drops from the poll interval (up to 1.5s in the
+    2026-08-16 prototype) to roughly the kernel's notification latency.
+
+    ``handles`` collects the open handle so the owner can CancelIoEx it at
+    shutdown. The thread is a daemon, so a still-blocked call can never hold
+    up interpreter exit either way.
+    """
+    kernel32, handle = _open_directory_handle(root)
+    handles.append((kernel32, handle))
+    buf = ctypes.create_string_buffer(64 * 1024)
+    returned = ctypes.c_ulong(0)
+    try:
+        while not stop.is_set():
+            ok = kernel32.ReadDirectoryChangesW(
+                ctypes.c_void_p(handle), buf, ctypes.sizeof(buf), False,
+                FILE_NOTIFY_CHANGE_DIR_NAME, ctypes.byref(returned), None, None,
+            )
+            if not ok:
+                return  # cancelled or handle closed
+            for action, name in parse_notifications(buf.raw, returned.value):
+                if name == JUNK_NAME and action in (
+                    FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME
+                ):
+                    on_hit(root, "readdirectorychanges")
+                    return
+    finally:
+        try:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+        except Exception:
+            pass
+
+
 class Watcher:
     """Watches N roots for a literal %SystemDrive% child."""
 
@@ -315,6 +404,9 @@ class Watcher:
         self._lock = threading.Lock()
         self._hit_roots: set = set()
         self.sightings = 0
+        # Open ReadDirectoryChangesW handles, so run() can CancelIoEx them at
+        # shutdown instead of leaving a watch thread blocked in the kernel.
+        self._handles: list = []
 
     def record_preexisting(self) -> None:
         """A tree already present at arm time blames nobody.
@@ -477,14 +569,42 @@ class Watcher:
             self._stop.wait(max(0.0, self._sample_s - elapsed))
 
     def _start_backends(self) -> dict:
-        """Start one detection thread per root; return backend by root."""
+        """Start one detection thread per root; return the backend actually used.
+
+        A root that cannot be opened for a directory watch is DOWNGRADED to
+        polling and the downgrade is recorded -- a run must never be able to
+        claim a fast watch it did not get.
+        """
         chosen = {}
         for root in self.roots:
-            target = watch_polling
-            name = "polling"
-            args = (root, self.on_hit, self._stop, self._poll_s)
-            chosen[str(root)] = name
-            threading.Thread(target=target, args=args, daemon=True).start()
+            use_fast = sys.platform == "win32" and not self.force_polling
+            if use_fast:
+                try:
+                    # Probe openability, then close immediately -- the watch
+                    # thread opens its own handle.
+                    probe_k32, probe_handle = _open_directory_handle(root)
+                    probe_k32.CloseHandle(ctypes.c_void_p(probe_handle))
+                except OSError as exc:
+                    write_record(
+                        self.log, "backend_downgrade", root=str(root),
+                        reason=repr(exc),
+                        note="could not open a directory handle; falling back to polling",
+                    )
+                    use_fast = False
+            if use_fast:
+                chosen[str(root)] = "readdirectorychanges"
+                threading.Thread(
+                    target=watch_readdirchanges,
+                    args=(root, self.on_hit, self._stop, self._handles),
+                    daemon=True,
+                ).start()
+            else:
+                chosen[str(root)] = "polling"
+                threading.Thread(
+                    target=watch_polling,
+                    args=(root, self.on_hit, self._stop, self._poll_s),
+                    daemon=True,
+                ).start()
         return chosen
 
     def run(self) -> int:
@@ -507,6 +627,11 @@ class Watcher:
         while not self._stop.is_set() and time.monotonic() < deadline:
             self._stop.wait(0.2)
         self._stop.set()
+        for kernel32, handle in self._handles:
+            try:
+                kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
+            except Exception:
+                pass
         watched = round(time.monotonic() - started, 1)
         write_record(
             self.log, "done",
@@ -520,3 +645,27 @@ class Watcher:
             ),
         )
         return 0
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    args = build_parser().parse_args(argv)
+    roots = [Path(r) for r in args.roots] or [Path.cwd()]
+    watcher = Watcher(
+        roots,
+        log=args.log,
+        ring_capacity=args.ring,
+        sample_ms=args.sample_ms,
+        poll_ms=args.poll_ms,
+        secs=args.secs,
+        stop_file=args.stop_file,
+        force_polling=args.force_polling,
+    )
+    try:
+        return watcher.run()
+    except KeyboardInterrupt:
+        watcher.stop()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

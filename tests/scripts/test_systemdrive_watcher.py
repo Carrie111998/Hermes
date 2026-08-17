@@ -363,3 +363,99 @@ def test_run_stops_early_when_the_stop_file_appears(tmp_path: Path):
     watcher.run()
     assert time.monotonic() - started < 10, "stop-file did not shut the watcher down"
     assert [r for r in _rows(log) if r["event"] == "done"]
+
+
+import struct
+
+import pytest
+
+from scripts.systemdrive_watcher import (
+    FILE_ACTION_ADDED,
+    parse_notifications,
+    watch_readdirchanges,
+)
+
+
+def _notification(action: int, name: str, next_offset: int = 0) -> bytes:
+    encoded = name.encode("utf-16-le")
+    return struct.pack("<III", next_offset, action, len(encoded)) + encoded
+
+
+def test_parse_notifications_reads_a_single_entry():
+    buf = _notification(FILE_ACTION_ADDED, JUNK_NAME)
+    assert list(parse_notifications(buf, len(buf))) == [(FILE_ACTION_ADDED, JUNK_NAME)]
+
+
+def test_parse_notifications_walks_the_chain():
+    """FileNameLength is in BYTES, not characters - the classic mistake."""
+    alpha_len = len(_notification(FILE_ACTION_ADDED, "alpha"))
+    first = _notification(FILE_ACTION_ADDED, "alpha", next_offset=alpha_len)
+    second = _notification(FILE_ACTION_ADDED, JUNK_NAME)
+    buf = first + second
+    assert list(parse_notifications(buf, len(buf))) == [
+        (FILE_ACTION_ADDED, "alpha"),
+        (FILE_ACTION_ADDED, JUNK_NAME),
+    ]
+
+
+def test_parse_notifications_stops_at_the_declared_length():
+    buf = _notification(FILE_ACTION_ADDED, JUNK_NAME) + b"\x00" * 64
+    entries = list(parse_notifications(buf, len(_notification(FILE_ACTION_ADDED, JUNK_NAME))))
+    assert entries == [(FILE_ACTION_ADDED, JUNK_NAME)]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ReadDirectoryChangesW is Win32-only")
+def test_readdirchanges_detects_a_created_directory(tmp_path: Path):
+    """End-to-end proof the fast backend actually fires."""
+    hits = []
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=watch_readdirchanges,
+        args=(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, []),
+        daemon=True,
+    )
+    thread.start()
+    time.sleep(0.3)  # let the watch arm
+    (tmp_path / JUNK_NAME).mkdir()
+    thread.join(timeout=10)
+    assert hits, "ReadDirectoryChangesW backend never fired"
+    assert hits[0][1] == "readdirectorychanges"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32-only")
+def test_readdirchanges_ignores_unrelated_directories(tmp_path: Path):
+    hits = []
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=watch_readdirchanges,
+        args=(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, []),
+        daemon=True,
+    )
+    thread.start()
+    time.sleep(0.3)
+    (tmp_path / "unrelated").mkdir()
+    time.sleep(0.5)
+    stop.set()
+    assert not hits
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32-only")
+def test_watcher_records_the_backend_it_actually_got(tmp_path: Path):
+    """A run must never claim a fast watch it did not get."""
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    watcher = Watcher([root], log=log, secs=0.3, sample_ms=50)
+    watcher.run()
+    armed = [r for r in _rows(log) if r["event"] == "armed"][0]
+    assert armed["backend_by_root"][str(root.resolve())] == "readdirectorychanges"
+
+
+def test_force_polling_is_reflected_in_the_armed_record(tmp_path: Path):
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    watcher = Watcher([root], log=log, secs=0.3, sample_ms=50, force_polling=True)
+    watcher.run()
+    armed = [r for r in _rows(log) if r["event"] == "armed"][0]
+    assert armed["backend_by_root"][str(root.resolve())] == "polling"
