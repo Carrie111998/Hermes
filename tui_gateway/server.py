@@ -3246,6 +3246,19 @@ def _coerce_int_config_value(value: Any, default: int, *, min_value: int) -> int
     return coerced if coerced >= min_value else default
 
 
+def _coerce_int(value: Any, default: int) -> int:
+    """Best-effort ``int()`` that never raises. A bad type returns ``default``.
+
+    Client params reach these handlers on the stdin reader thread, where an
+    uncaught exception kills the whole gateway. A wrong type for an
+    int-shaped param must fall back, not blow up.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[str, Any]:
     """Return dashboard process-isolation config with read-site defaults.
 

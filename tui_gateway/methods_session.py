@@ -15,7 +15,7 @@ _profile_scoped = _registry.profile_scoped
 def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
-    cols = int(params.get("cols", 80))
+    cols = _coerce_int(params.get("cols", 80), 80)
     history = _coerce_seed_history(params.get("messages"))
     title = str(params.get("title") or "").strip()
     # When set, this is a branch: the new chat copies an existing conversation's
@@ -177,7 +177,7 @@ def _(rid, params: dict) -> dict:
             # their own source.
             deny = frozenset({"kanban", "tool"})
 
-            limit = int(params.get("limit", 200) or 200)
+            limit = _coerce_int(params.get("limit", 200) or 200, 200)
             # Over-fetch modestly so per-source filtering doesn't leave us
             # short; the compression-tip projection in ``list_sessions_rich``
             # can also merge rows.
@@ -1281,10 +1281,7 @@ def _(rid, params: dict) -> dict:
     variables = params.get("variables") if isinstance(params.get("variables"), dict) else {}
     task = (params.get("task") or "title_generation").strip() or "title_generation"
 
-    try:
-        max_tokens = int(params.get("max_tokens") or 1024)
-    except (TypeError, ValueError):
-        max_tokens = 1024
+    max_tokens = _coerce_int(params.get("max_tokens") or 1024, 1024)
     temperature = params.get("temperature")
     if temperature is not None:
         try:
@@ -1609,7 +1606,7 @@ def _(rid, params: dict) -> dict:
 
         state = str(params.get("state") or constants.PetState.IDLE.value)
         scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
-        cols = int(params.get("cols") or 0) or constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
+        cols = _coerce_int(params.get("cols") or 0, 0) or constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
 
         # Graphics path: when the TUI is attached to a real TTY (``graphics``)
         # and the terminal speaks the kitty protocol, return a Unicode-
@@ -2014,10 +2011,7 @@ def _(rid, params: dict) -> dict:
     ref_raw = str(params.get("referenceImage") or "").strip()
     if not prompt and not ref_raw:
         return _err(rid, 4004, "missing prompt")
-    try:
-        count = max(1, min(4, int(params.get("count") or 4)))
-    except (TypeError, ValueError):
-        count = 4
+    count = max(1, min(4, _coerce_int(params.get("count") or 4, 4)))
     style = str(params.get("style") or "auto").strip() or "auto"
 
     try:
@@ -3304,7 +3298,7 @@ def _(rid, params: dict) -> dict:
 @method("spawn_tree.list")
 def _(rid, params: dict) -> dict:
     session_id = str(params.get("session_id") or "").strip()
-    limit = int(params.get("limit") or 50)
+    limit = _coerce_int(params.get("limit") or 50, 50)
     cross_session = bool(params.get("cross_session"))
 
     if cross_session:
@@ -3460,7 +3454,10 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    session["cols"] = int(params.get("cols", 80))
+    try:
+        session["cols"] = int(params.get("cols", 80))
+    except (TypeError, ValueError):
+        return _err(rid, 4000, "cols must be an integer")
     return _ok(rid, {"cols": session["cols"]})
 
 
