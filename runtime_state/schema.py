@@ -21,6 +21,8 @@ STATE_TABLES = (
 
 JOURNAL_SCHEMA_VERSION = 1
 JOURNAL_EVENT_VERSION = 1
+# ARCH-004 is a strictly newer writer than ARCH-003's epoch 0 baseline.
+RUNTIME_STATE_WRITER_EPOCH = 1
 DIGEST_PARAMETER_ID = "hmac-sha256:v1:128"
 JOURNAL_EVENT_KINDS = ("mutation", "genesis", "baseline")
 ORIGIN_MARKERS = (

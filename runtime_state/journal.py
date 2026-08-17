@@ -8,12 +8,18 @@ import hmac
 import json
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from runtime_state.key_custody import AuthJsonKeyCustody, KeyUnavailable
 from runtime_state.locking import LockTimeout, MaintenanceLock
 from runtime_state.migrations import utc_timestamp
+from runtime_state.retry_config import (
+    DEFAULT_RETRY_CONFIG,
+    RetryConfig,
+    is_transient_sqlite_error,
+)
 from runtime_state.schema import (
     DIGEST_PARAMETER_ID,
     JOURNAL_DDL,
@@ -29,12 +35,31 @@ WRITE_ABORT = "WRITE_ABORT"
 KEY_UNAVAILABLE = "KEY_UNAVAILABLE"
 GENERATION_MISMATCH = "GENERATION_MISMATCH"
 WRITE_COUNTER_GAP = "WRITE_COUNTER_GAP"
+RETRY_EXHAUSTED = "RETRY_EXHAUSTED"
+
+_SAFE_ERROR_MESSAGES = {
+    LOCK_TIMEOUT: "runtime-state maintenance lock timed out",
+    RETRY_EXHAUSTED: "runtime-state write retry budget exhausted",
+    WRITE_ABORT: "runtime-state transaction aborted",
+    KEY_UNAVAILABLE: "runtime-state digest key is unavailable",
+}
+
+_OPERATION_CATEGORIES = frozenset({
+    "create_session",
+    "create_task",
+    "create_approval",
+    "create_compression",
+    "claim_owner",
+    "update_columns",
+    "release_owner",
+})
 
 
 class JournalWriteError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, metadata: Optional[dict[str, Any]] = None):
         super().__init__(message)
         self.code = code
+        self.metadata = dict(metadata or {})
 
 
 @dataclass(frozen=True)
@@ -42,6 +67,7 @@ class JournalConnectionState:
     db_path: Path
     key_custody: AuthJsonKeyCustody
     writer_epoch: int
+    retry_config: RetryConfig = DEFAULT_RETRY_CONFIG
     startup_locked: bool = False
     current_generation: int = 1
 
@@ -101,12 +127,14 @@ def register_connection(
     *,
     writer_epoch: int = 0,
     key_custody: Optional[AuthJsonKeyCustody] = None,
+    retry_config: RetryConfig = DEFAULT_RETRY_CONFIG,
 ) -> None:
     custody = key_custody or AuthJsonKeyCustody(db_path.with_name("auth.json"))
     _CONNECTIONS[id(conn)] = JournalConnectionState(
         db_path=db_path,
         key_custody=custody,
         writer_epoch=max(0, int(writer_epoch)),
+        retry_config=retry_config,
     )
 
 
@@ -118,13 +146,60 @@ def connection_state(conn: sqlite3.Connection) -> JournalConnectionState:
     try:
         return _CONNECTIONS[id(conn)]
     except KeyError as exc:
-        raise JournalWriteError(WRITE_ABORT, "unregistered runtime-state connection") from exc
+        raise JournalWriteError(WRITE_ABORT, "unregistered runtime-state connection") from None
 
 
 def journal_lock_path(conn: sqlite3.Connection) -> Path:
     return connection_state(conn).db_path.with_name(
         connection_state(conn).db_path.name + ".maintenance.lock"
     )
+
+
+def _operation_category(operation: object) -> str:
+    value = operation if isinstance(operation, str) else ""
+    return value if value in _OPERATION_CATEGORIES else "unclassified"
+
+
+def _failure_metadata(
+    state: JournalConnectionState,
+    operation: object,
+    reason_code: str,
+    *,
+    attempt: int = 1,
+    started: Optional[float] = None,
+    digest: Optional[str] = None,
+    before: Optional[dict[str, Any]] = None,
+    after: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "operation_category": _operation_category(operation),
+        "attempt": int(attempt),
+        "max_attempts": state.retry_config.max_attempts,
+        "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)) if started else 0,
+        "diagnostic_timestamp": utc_timestamp(),
+        "journal_schema_version": JOURNAL_SCHEMA_VERSION,
+        "writer_generation": state.current_generation,
+        "writer_epoch": state.writer_epoch,
+        "reason_code": reason_code,
+    }
+    if digest is not None:
+        metadata["entity_digest"] = digest
+    if before is not None:
+        metadata["materialized_counter_before"] = int(before.get("materialized_write_counter", 0))
+    if after is not None:
+        metadata["materialized_counter_after"] = int(after.get("materialized_write_counter", 0))
+    return metadata
+
+
+def _safe_error_message(code: str) -> str:
+    return _SAFE_ERROR_MESSAGES.get(code, "runtime-state transaction aborted")
+
+
+def _rollback_safely(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    except sqlite3.Error:
+        pass
 
 
 def ensure_journal_schema(conn: sqlite3.Connection) -> None:
@@ -201,7 +276,14 @@ def startup_transition(conn: sqlite3.Connection, *, writer_epoch: int = 0) -> Jo
     try:
         lock.acquire()
     except LockTimeout:
-        updated = JournalConnectionState(state.db_path, state.key_custody, writer_epoch, True, 1)
+        updated = JournalConnectionState(
+            state.db_path,
+            state.key_custody,
+            writer_epoch,
+            state.retry_config,
+            True,
+            1,
+        )
         _CONNECTIONS[id(conn)] = updated
         return updated
     try:
@@ -223,7 +305,14 @@ def startup_transition(conn: sqlite3.Connection, *, writer_epoch: int = 0) -> Jo
                      "downgrade_unsafe=?, transition_epoch=?, transition_at=? WHERE id=1",
                      (generation, durable_epoch, unsafe, writer_epoch, utc_timestamp()))
         conn.commit()
-        updated = JournalConnectionState(state.db_path, state.key_custody, writer_epoch, False, generation)
+        updated = JournalConnectionState(
+            state.db_path,
+            state.key_custody,
+            writer_epoch,
+            state.retry_config,
+            False,
+            generation,
+        )
         _CONNECTIONS[id(conn)] = updated
         return updated
     except Exception:
@@ -270,7 +359,8 @@ def _append_event(conn: sqlite3.Connection, table: str, profile: str, business_k
                  "materialized_write_counter_before,materialized_write_counter_after,diagnostic_timestamp) "
                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (uuid4().hex, kind, profile, table, digest, DIGEST_PARAMETER_ID, key_check, marker,
-                  origin_epoch, origin_seq, seq, operation, before.get(lifecycle) if before else None,
+                  origin_epoch, origin_seq, seq, _operation_category(operation),
+                  before.get(lifecycle) if before else None,
                   after.get(lifecycle), before.get("owner_version") if before else None,
                   after.get("owner_version"), after.get("schema_version"), JOURNAL_EVENT_VERSION,
                   after.get("materialized_writer_generation", state.current_generation), state.writer_epoch,
@@ -282,54 +372,160 @@ def run_journaled_mutation(conn: sqlite3.Connection, table: str, profile: str,
                            business_key: str, operation: str,
                            callback: Callable[[], Any], *, key_required: bool = True) -> Any:
     state = connection_state(conn)
+    operation_category = _operation_category(operation)
     if state.startup_locked:
-        raise JournalWriteError(WRITE_ABORT, "runtime-state startup is lock-bound")
-    unsafe = conn.execute(
-        "SELECT downgrade_unsafe FROM runtime_state_journal_meta WHERE id=1"
-    ).fetchone()
-    if unsafe is None or int(unsafe[0]):
-        raise JournalWriteError(WRITE_ABORT, "runtime-state generation is downgrade-unsafe")
-    if not state.key_custody.auth_path.exists():
-        history = conn.execute("SELECT 1 FROM runtime_state_journal LIMIT 1").fetchone()
-        if history is not None:
-            raise JournalWriteError(KEY_UNAVAILABLE, "runtime-state digest key is unavailable")
-    try:
-        key = state.key_custody.ensure() if key_required else b""
-    except KeyUnavailable as exc:
-        raise JournalWriteError(KEY_UNAVAILABLE, str(exc)) from exc
+        raise JournalWriteError(
+            WRITE_ABORT,
+            _safe_error_message(WRITE_ABORT),
+            metadata=_failure_metadata(state, operation_category, WRITE_ABORT),
+        )
     try:
         with MaintenanceLock(journal_lock_path(conn), exclusive=False):
-            conn.execute("BEGIN IMMEDIATE")
-            before = _row(conn, table, profile, business_key)
-            result = callback()
-            if not getattr(result, "success", False):
-                conn.rollback()
-                return result
-            after = _row(conn, table, profile, business_key)
-            if after is None:
-                raise JournalWriteError(WRITE_ABORT, "successful mutation removed a row")
-            if not _same_replay(before, after, table):
-                _append_event(conn, table, profile, business_key, operation, before, after, key)
-            conn.commit()
-            return result
+            # The named lock is intentionally acquired before the epoch check
+            # and before BEGIN IMMEDIATE. An old writer therefore fails closed
+            # without opening a SQLite write transaction.
+            try:
+                unsafe = conn.execute(
+                    "SELECT downgrade_unsafe FROM runtime_state_journal_meta WHERE id=1"
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                raise JournalWriteError(
+                    WRITE_ABORT,
+                    _safe_error_message(WRITE_ABORT),
+                    metadata=_failure_metadata(state, operation_category, WRITE_ABORT),
+                ) from None
+            if unsafe is None or int(unsafe[0]):
+                raise JournalWriteError(
+                    WRITE_ABORT,
+                    _safe_error_message(WRITE_ABORT),
+                    metadata=_failure_metadata(state, operation_category, WRITE_ABORT),
+                )
+
+            if not state.key_custody.auth_path.exists():
+                try:
+                    history = conn.execute(
+                        "SELECT 1 FROM runtime_state_journal LIMIT 1"
+                    ).fetchone()
+                except sqlite3.DatabaseError as exc:
+                    raise JournalWriteError(
+                        WRITE_ABORT,
+                        _safe_error_message(WRITE_ABORT),
+                        metadata=_failure_metadata(state, operation_category, WRITE_ABORT),
+                    ) from None
+                if history is not None:
+                    raise JournalWriteError(
+                        KEY_UNAVAILABLE,
+                        _safe_error_message(KEY_UNAVAILABLE),
+                        metadata=_failure_metadata(state, operation_category, KEY_UNAVAILABLE),
+                    )
+            try:
+                key = state.key_custody.ensure() if key_required else b""
+            except KeyUnavailable as exc:
+                raise JournalWriteError(
+                    KEY_UNAVAILABLE,
+                    _safe_error_message(KEY_UNAVAILABLE),
+                    metadata=_failure_metadata(state, operation_category, KEY_UNAVAILABLE),
+                ) from None
+
+            digest = _digest(key, profile, table, business_key)
+            for attempt in range(1, state.retry_config.max_attempts + 1):
+                started = time.monotonic()
+                before: Optional[dict[str, Any]] = None
+                after: Optional[dict[str, Any]] = None
+                commit_started = False
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    before = _row(conn, table, profile, business_key)
+                    result = callback()
+                    if not getattr(result, "success", False):
+                        conn.rollback()
+                        return result
+                    after = _row(conn, table, profile, business_key)
+                    if after is None:
+                        raise JournalWriteError(
+                            WRITE_ABORT,
+                            _safe_error_message(WRITE_ABORT),
+                        )
+                    if not _same_replay(before, after, table):
+                        _append_event(conn, table, profile, business_key, operation_category, before, after, key)
+                    # A commit error is ambiguous: never replay the callback.
+                    commit_started = True
+                    conn.commit()
+                    return result
+                except JournalWriteError as exc:
+                    _rollback_safely(conn)
+                    code = exc.code if exc.code in _SAFE_ERROR_MESSAGES else WRITE_ABORT
+                    raise JournalWriteError(
+                        code,
+                        _safe_error_message(code),
+                        metadata=_failure_metadata(
+                            state,
+                            operation_category,
+                            code,
+                            attempt=attempt,
+                            started=started,
+                            digest=digest,
+                            before=before,
+                            after=after,
+                        ),
+                    ) from None
+                except sqlite3.DatabaseError as exc:
+                    _rollback_safely(conn)
+                    transient = not commit_started and is_transient_sqlite_error(exc)
+                    if transient and attempt < state.retry_config.max_attempts:
+                        time.sleep(state.retry_config.delay_ms(attempt) / 1000.0)
+                        continue
+                    code = RETRY_EXHAUSTED if transient else WRITE_ABORT
+                    raise JournalWriteError(
+                        code,
+                        _safe_error_message(code),
+                        metadata=_failure_metadata(
+                            state,
+                            operation_category,
+                            code,
+                            attempt=attempt,
+                            started=started,
+                            digest=digest,
+                            before=before,
+                            after=after,
+                        ),
+                    ) from None
+                except Exception as exc:
+                    _rollback_safely(conn)
+                    raise JournalWriteError(
+                        WRITE_ABORT,
+                        _safe_error_message(WRITE_ABORT),
+                        metadata=_failure_metadata(
+                            state,
+                            operation_category,
+                            WRITE_ABORT,
+                            attempt=attempt,
+                            started=started,
+                            digest=digest,
+                            before=before,
+                            after=after,
+                        ),
+                    ) from None
     except LockTimeout as exc:
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
-        raise JournalWriteError(LOCK_TIMEOUT, str(exc)) from exc
+        _rollback_safely(conn)
+        raise JournalWriteError(
+            LOCK_TIMEOUT,
+            _safe_error_message(LOCK_TIMEOUT),
+            metadata=_failure_metadata(state, operation_category, LOCK_TIMEOUT),
+        ) from None
     except JournalWriteError:
-        conn.rollback()
         raise
     except sqlite3.OperationalError as exc:
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
-        raise JournalWriteError(WRITE_ABORT, "runtime-state transaction aborted") from exc
-    except Exception:
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
-        raise
+        _rollback_safely(conn)
+        raise JournalWriteError(
+            WRITE_ABORT,
+            _safe_error_message(WRITE_ABORT),
+            metadata=_failure_metadata(state, operation_category, WRITE_ABORT),
+        ) from None
+    except Exception as exc:
+        _rollback_safely(conn)
+        raise JournalWriteError(
+            WRITE_ABORT,
+            _safe_error_message(WRITE_ABORT),
+            metadata=_failure_metadata(state, operation_category, WRITE_ABORT),
+        ) from None

@@ -36,15 +36,18 @@ from runtime_state.migrations import (
 from runtime_state.retry_config import (
     DEFAULT_RETRY_CONFIG,
     MAX_BUSY_TIMEOUT_MS,
+    MAX_APPLICATION_RETRIES,
     MIN_BUSY_TIMEOUT_MS,
     RetryConfig,
     apply_busy_timeout,
+    is_transient_sqlite_error,
     no_retry_hook,
 )
 from runtime_state.schema import (
     DIGEST_PARAMETER_ID,
     JOURNAL_EVENT_VERSION,
     JOURNAL_SCHEMA_VERSION,
+    RUNTIME_STATE_WRITER_EPOCH,
     MIGRATION_1_BODY,
     MIGRATION_1_CHECKSUM,
     MIGRATION_1_SEED_SQL,
@@ -57,7 +60,7 @@ from runtime_state.schema import (
     normalize_migration_body,
 )
 from runtime_state.key_custody import AuthJsonKeyCustody, KeyUnavailable
-from runtime_state.journal import KEY_UNAVAILABLE, LOCK_TIMEOUT, WRITE_ABORT
+from runtime_state.journal import KEY_UNAVAILABLE, LOCK_TIMEOUT, RETRY_EXHAUSTED, WRITE_ABORT
 from runtime_state.verifier import DRIFT, OK, UNKNOWN, VerificationResult, verify_all, verify_entity
 
 __all__ = [
@@ -74,6 +77,7 @@ __all__ = [
     "DIGEST_PARAMETER_ID",
     "JOURNAL_EVENT_VERSION",
     "JOURNAL_SCHEMA_VERSION",
+    "RUNTIME_STATE_WRITER_EPOCH",
     "RuntimeStateDB",
     "RuntimeStateSchemaError",
     "RuntimeStatePreflightError",
@@ -82,7 +86,9 @@ __all__ = [
     "DEFAULT_RETRY_CONFIG",
     "MIN_BUSY_TIMEOUT_MS",
     "MAX_BUSY_TIMEOUT_MS",
+    "MAX_APPLICATION_RETRIES",
     "apply_busy_timeout",
+    "is_transient_sqlite_error",
     "no_retry_hook",
     "utc_timestamp",
     "OWNED_TABLES",
@@ -114,5 +120,6 @@ __all__ = [
     "verify_all",
     "KEY_UNAVAILABLE",
     "LOCK_TIMEOUT",
+    "RETRY_EXHAUSTED",
     "WRITE_ABORT",
 ]

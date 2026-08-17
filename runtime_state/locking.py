@@ -47,7 +47,7 @@ class MaintenanceLock:
                     return
                 except (BlockingIOError, OSError):
                     if time.monotonic() >= deadline:
-                        raise LockTimeout(f"maintenance lock timeout: {self.path}")
+                        raise LockTimeout("runtime-state maintenance lock timed out")
                     time.sleep(0.05)
         except Exception:
             handle.close()
