@@ -118,7 +118,10 @@ export type GatewayEventPayload = {
   row_id?: number
   reactions?: MessageReaction[]
   role?: string
-  // session.title (live auto-title push) — stored session id + generated title
+  // session.title (live auto-title push) — stored session id + generated title.
+  // Also tool.start: the model-provided short label for a command run
+  // (terminal/execute_code `title` arg), so pending/approval rows can show it
+  // before the persisted args load.
   session_id?: string
   title?: string
   // session.info — the stored (durable) session id for this runtime session.
@@ -716,6 +719,7 @@ function toolArgs(payload: GatewayEventPayload | undefined, prevArgs?: unknown):
     ...eventArgs,
     ...(payload?.context ? { context: payload.context } : {}),
     ...(payload?.preview ? { preview: payload.preview } : {}),
+    ...(payload?.title ? { title: payload.title } : {}),
     ...carryTodos(payload, prevArgs)
   }
 }

@@ -864,6 +864,25 @@ describe('upsertToolPart', () => {
     })
   })
 
+  it('carries the model-provided title from tool.start into live args', () => {
+    const started = upsertToolPart(
+      [],
+      {
+        context: 'rm -rf "C:\\Users\\owner\\approval-test-dir2"',
+        name: 'terminal',
+        title: 'Delete approval test directory',
+        tool_id: 'term-title-1'
+      },
+      'running'
+    )
+
+    const [part] = started
+
+    expect((part as Extract<ChatMessagePart, { type: 'tool-call' }>).args).toMatchObject({
+      title: 'Delete approval test directory'
+    })
+  })
+
   it('preserves query args when completion payload omits context', () => {
     const started = upsertToolPart(
       [],

@@ -13,6 +13,7 @@ from agent.display import (
     prepare_tool_preview,
     redact_tool_args_for_display,
     set_tool_preview_max_len,
+    summarize_shell_command,
     _render_inline_unified_diff,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
@@ -34,6 +35,19 @@ def test_cute_tool_message_falls_back_when_renderer_raises(monkeypatch):
 
     assert get_cute_tool_message("web_extract", {"urls": []}, 0.25) == (
         "┊ ⚡ web_extra completed  0.2s"
+    )
+
+
+def test_summarize_shell_command_env_only_segment():
+    """An env-assignment-only member (`FOO=1`) must still render its own text."""
+    assert summarize_shell_command("FOO=1 && npm test") == "FOO=1 · npm test"
+
+
+def test_summarize_shell_command_compound_names_every_segment():
+    assert summarize_shell_command("node -v; npm -v; echo x") == "node -v · npm -v · echo x"
+    assert (
+        summarize_shell_command("which node; node -v; corepack --version; exit 0")
+        == "which node · node -v · corepack --version + 1 more"
     )
 
 

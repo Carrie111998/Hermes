@@ -2,6 +2,12 @@ import { summarizeShellCommand } from '@/lib/summarize-command'
 
 import { fileEditBasename, firstStringField, isFileEditTool, parseMaybeObject } from './fallback-model'
 
+// A `title` is trusted display text, but the model still controls its length —
+// cap it so a rambling one can't flood the collapsed group line.
+function shortTitle(title: string): string {
+  return title.length > 80 ? `${title.slice(0, 79)}…` : title
+}
+
 /**
  * The little a summary needs from a tool call, stated structurally so both
  * shapes of tool part satisfy it — the stored `ChatMessagePart` and the live
@@ -80,7 +86,11 @@ function toolTarget(tool: ToolCallLike): string {
   const args = parseMaybeObject(tool.args)
 
   if (toolCategory(tool.toolName) === 'run') {
-    return summarizeShellCommand(firstStringField(args, ['command', 'code']))
+    // The model can name its own run (`title` arg) — prefer that over the
+    // deterministic command summary when it bothered.
+    const title = firstStringField(args, ['title'])
+
+    return title ? shortTitle(title) : summarizeShellCommand(firstStringField(args, ['command', 'code']))
   }
 
   const path = firstStringField(args, ['path', 'file', 'filepath'])
@@ -90,16 +100,23 @@ function toolTarget(tool: ToolCallLike): string {
 
 /**
  * One clause per category. A category holding a single thing says what it was
- * ("Edited wiring.tsx"); anything else counts ("explored 3 files"). A settled
- * command is the exception — "ran 5 commands" is the useful reading, and a
- * command line only earns its space while it's the thing you're waiting on.
+ * ("Edited wiring.tsx"); anything else counts ("explored 3 files"). Settled
+ * commands are the exception — "ran 5 commands" is the useful reading, and a
+ * raw command line only earns its space while it's the thing you're waiting
+ * on, or when the model gave it a short `title` worth keeping.
  */
 function clause(category: RunCategory, tools: ToolCallLike[], live: boolean): string {
   const copy = CATEGORY_COPY[category]
   const verb = live ? copy.present : copy.past
   const target = tools.length === 1 ? toolTarget(tools[0]) : ''
 
-  if (target && (live || category !== 'run')) {
+  // A settled command stays a count ("ran 3 commands") because raw command
+  // lines are long — unless the model named it with a short `title`, which
+  // reads fine in the collapsed line ("Ran List Hermes processes").
+  const runTitled =
+    category === 'run' && tools.length === 1 && Boolean(firstStringField(parseMaybeObject(tools[0]!.args), ['title']))
+
+  if (target && (live || category !== 'run' || runTitled)) {
     return `${verb} ${target}`
   }
 

@@ -1426,6 +1426,33 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     assert "result_text" not in events[1][2]
 
 
+def test_tool_start_forwards_model_title_for_pending_labels(monkeypatch):
+    # The desktop's pending/approval rows render before persisted args load,
+    # so the model-provided command title must ride the tool.start payload.
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "title-test",
+        {"tool_progress_mode": "all"},
+    )
+
+    server._on_tool_start(
+        "title-test",
+        "tool-1",
+        "terminal",
+        {"command": "powershell -NoProfile ...", "title": "List Hermes processes"},
+    )
+    assert events[0][0] == "tool.start"
+    assert events[0][2]["title"] == "List Hermes processes"
+
+    events.clear()
+    server._on_tool_start("title-test", "tool-2", "terminal", {"command": "pwd"})
+    assert "title" not in events[0][2]
+
+
 def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -2645,10 +2672,10 @@ def test_tool_start_ships_full_args(monkeypatch):
 def test_tool_ctx_sends_an_arg_preview_not_a_phrased_label():
     # Clients phrase their own verb around this string: the TUI renders
     # `Terminal("<ctx>")` and the desktop prepends "Running"/"Ran". Sending a
-    # pre-phrased label made both stutter ("Ran Running sleep 70 + 2 commands")
+    # pre-phrased label made both stutter ("Ran Running sleep 70 · echo a ...")
     # and stood in for the real command in the desktop's `$` transcript.
     assert server._tool_ctx("terminal", {"command": 'sleep 70; echo "a"; echo "b"'}) == (
-        "sleep 70 + 2 commands"
+        'sleep 70 · echo "a" · echo "b"'
     )
     assert server._tool_ctx("read_file", {"path": "/tmp/demo/package.json"}) == "package.json"
     assert server._tool_ctx("web_search", {"query": "weather in NYC"}) == "weather in NYC"

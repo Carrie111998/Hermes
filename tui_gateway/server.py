@@ -5831,6 +5831,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         # tool runs, at the cost of one duplicate transient payload per call.
         if args:
             payload["args"] = args
+        # The model can name its own command run (terminal/execute_code
+        # `title` arg). Forward it so pending and approval rows can show the
+        # short label instead of the raw command — the only window where the
+        # full persisted args aren't available to the UI yet.
+        title = args.get("title") if isinstance(args, dict) else None
+        if isinstance(title, str) and title.strip():
+            payload["title"] = title.strip()
         if _session_verbose(sid):
             args_text = _tool_args_text(args)
             if args_text:

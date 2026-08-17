@@ -1384,13 +1384,14 @@ function dynamicTitle(
           ? verb(translateNow('assistant.tool.actions.runningCode'), translateNow('assistant.tool.actions.ranCode'))
           : verb(translateNow('assistant.tool.actions.running'), translateNow('assistant.tool.actions.ran'))
 
+      // A model-provided `title` names the run in the model's own words
+      // ("List Hermes processes"); the deterministic command summary stays
+      // the fallback. The raw command remains in the row's detail/payload.
+      const label = firstStringField(args, ['title']) || summarizeShellCommand(command)
+
       return titledAction(
         action,
-        translateNow(
-          'assistant.tool.titleTemplates.actionCommand',
-          action,
-          compactPreview(summarizeShellCommand(command), 160)
-        )
+        translateNow('assistant.tool.titleTemplates.actionCommand', action, compactPreview(label, 160))
       )
     }
   }

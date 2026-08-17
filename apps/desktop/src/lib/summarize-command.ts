@@ -168,6 +168,31 @@ function isBoundaryEcho(segment: string): boolean {
   return /-{2,}|_exit=|(?:^|\s|=)\$[?{]|PIPESTATUS/.test(rest)
 }
 
+// A segment in a few characters: program plus its first argument (usually the
+// subcommand), so a compound reads `git add · git commit · git push` instead
+// of flooding the row with full command lines.
+function segmentLabel(segment: string): string {
+  const words = splitWords(segment)
+  let index = 0
+
+  while (index < words.length && /^[A-Za-z_]\w*=/.test(words[index]!)) {
+    index += 1
+  }
+
+  // Every word was an env assignment (`FOO=1`): label from the assignment
+  // itself so the slot never renders empty.
+  if (index >= words.length) {
+    const env = words[0]!
+    return env.length > 24 ? `${env.slice(0, 21)}...` : env
+  }
+
+  const head = basename(words[index]!)
+  const arg = words[index + 1] ?? ''
+  const argShort = arg.length > 24 ? `${arg.slice(0, 21)}...` : arg
+
+  return argShort ? `${head} ${argShort}` : head
+}
+
 /**
  * Reduce a verbose shell command to the "main" command, for display only.
  *
@@ -181,9 +206,11 @@ function isBoundaryEcho(segment: string): boolean {
  *   3. clean env var prefixes / redirects
  *   4. drop setup/banner/status segments
  *
- * If one real command survives, show it. If multiple real commands survive,
- * show a short `first command + N commands` label instead of flooding the row
- * with every probe. The full command is always still available via Copy/detail.
+ * If one real command survives, show it in full. If multiple survive, name
+ * each briefly — `head sub` per segment, joined with ` · ` for up to three,
+ * `+ N more` beyond — so every command in a compound is identifiable from the
+ * row alone without flooding it. The full command is always still available
+ * via Copy/detail.
  */
 export function summarizeShellCommand(raw: string): string {
   const original = (raw ?? '').trim()
@@ -212,5 +239,11 @@ export function summarizeShellCommand(raw: string): string {
     return core[0]!
   }
 
-  return `${core[0]} + ${core.length - 1} ${core.length === 2 ? 'command' : 'commands'}`
+  const labels = core.map(segmentLabel)
+
+  if (labels.length <= 3) {
+    return labels.join(' · ')
+  }
+
+  return `${labels.slice(0, 3).join(' · ')} + ${labels.length - 3} more`
 }

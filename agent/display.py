@@ -322,6 +322,24 @@ def _is_shell_boundary_echo(segment: str) -> bool:
     return bool(re.search(r"-{2,}|_exit=|(?:^|\s|=)\$[?{]|PIPESTATUS", rest))
 
 
+def _shell_segment_label(segment: str) -> str:
+    """Program plus its first argument (usually the subcommand), so a compound
+    reads `git add · git commit · git push` instead of flooding the row."""
+    words = _split_shell_words(segment)
+    index = 0
+    while index < len(words) and re.match(r"^[A-Za-z_]\w*=", words[index]):
+        index += 1
+    if index >= len(words):
+        # Every word was an env assignment (`FOO=1`): label from the
+        # assignment itself so the slot never renders empty.
+        env = words[0]
+        return f"{env[:21]}..." if len(env) > 24 else env
+    head = _shell_basename(words[index])
+    arg = words[index + 1] if index + 1 < len(words) else ""
+    arg_short = f"{arg[:21]}..." if len(arg) > 24 else arg
+    return f"{head} {arg_short}" if arg_short else head
+
+
 def summarize_shell_command(command: str) -> str:
     """Compact shell wrapper/plumbing for display while preserving raw command elsewhere."""
     original = _oneline(command)
@@ -344,8 +362,10 @@ def summarize_shell_command(command: str) -> str:
     if len(core) == 1:
         return core[0]
 
-    count = len(core) - 1
-    return f"{core[0]} + {count} {'command' if count == 1 else 'commands'}"
+    labels = [_shell_segment_label(segment) for segment in core]
+    if len(labels) <= 3:
+        return " · ".join(labels)
+    return f"{' · '.join(labels[:3])} + {len(labels) - 3} more"
 
 
 def _read_file_line_label(args: dict) -> str:
