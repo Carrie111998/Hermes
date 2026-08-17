@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import sys
@@ -87,6 +88,30 @@ def test_local_wav_conversion_without_ffmpeg_preserves_audio(monkeypatch, tmp_pa
 
     assert not wav_path.exists()
     assert output_path.read_bytes() == b"RIFF-audio"
+
+
+def test_local_wav_cleanup_failure_is_reported(monkeypatch, tmp_path, caplog):
+    wav_path = tmp_path / "voice.wav"
+    output_path = tmp_path / "voice.ogg"
+    wav_path.write_bytes(b"wav")
+
+    def _run(command, **kwargs):
+        output_path.write_bytes(b"ogg")
+        return subprocess.CompletedProcess(command, 0)
+
+    def _remove(_path):
+        raise OSError("file is busy")
+
+    monkeypatch.setattr(tts_tool.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(tts_tool.subprocess, "run", _run)
+    monkeypatch.setattr(tts_tool.os, "remove", _remove)
+
+    with caplog.at_level(logging.WARNING):
+        tts_tool._convert_local_wav_output(str(wav_path), str(output_path))
+
+    assert output_path.exists()
+    assert "Failed to remove temporary local TTS WAV" in caplog.text
+    assert str(wav_path) in caplog.text
 
 
 def test_neutts_uses_shared_local_conversion(monkeypatch, tmp_path):

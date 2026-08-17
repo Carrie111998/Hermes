@@ -2804,8 +2804,13 @@ def _convert_local_wav_output(wav_path: str, output_path: str) -> None:
     )
     try:
         os.remove(wav_path)
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning(
+            "Failed to remove temporary local TTS WAV %s after writing %s: %s",
+            wav_path,
+            output_path,
+            exc,
+        )
 
 
 # ===========================================================================
