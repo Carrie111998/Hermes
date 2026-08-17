@@ -41,6 +41,14 @@
 #   # bundled `hermes` CLI (server/agent_service.py: HermesProcessExecutor).
 #   OPENROUTER_API_KEY=
 #
+#   # optional — the Bright Data candidate verifier. The key is read ONLY from
+#   # this variable (server/config.py:130); a brightdata_api_key in config.yaml
+#   # is deliberately ignored. Without it the source stays unavailable with
+#   # reason `credential_required` and research produces no results. Enabling it
+#   # also needs `brightdata_enabled: true` in $HERMES_HOME/config.yaml and an
+#   # admin POST to /api/v1/data-sources/brightdata-web/enable per tenant.
+#   BRIGHTDATA_API_KEY=
+#
 # Non-secret behaviour (cors_origins, auth_mode, chat_model, upload_dir,
 # max_upload_bytes, ...) is read from $HERMES_HOME/config.yaml under the
 # `interfaze_server` key — i.e. /data/config.yaml inside the volume.
