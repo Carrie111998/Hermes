@@ -36,6 +36,15 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         action="store_true",
         help="Enable verbose logging on stderr",
     )
+    mcp_serve_p.add_argument(
+        "--tools",
+        action="store_true",
+        help=(
+            "Also expose Hermes' tool surface (web search/extract, browser "
+            "automation, vision, image generation, skills, TTS) so external "
+            "MCP clients can use Hermes' connectors directly"
+        ),
+    )
     add_accept_hooks_flag(mcp_serve_p)
 
     mcp_add_p = mcp_sub.add_parser(

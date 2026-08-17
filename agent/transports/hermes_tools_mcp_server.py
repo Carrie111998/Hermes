@@ -151,32 +151,23 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
-def _build_server() -> Any:
-    """Create the FastMCP server with Hermes tools attached. Lazy imports
-    so the module can be imported without the mcp package installed
-    (we degrade to a clear error only when actually run)."""
-    try:
-        from mcp.server.fastmcp import FastMCP
-    except ImportError as exc:  # pragma: no cover - install hint
-        raise ImportError(
-            f"hermes-tools MCP server requires the 'mcp' package: {exc}"
-        ) from exc
+def register_hermes_tools(mcp: Any) -> int:
+    """Register the curated Hermes tool surface onto an existing FastMCP server.
 
+    Shared by two entry points: the codex_app_server runtime's dedicated
+    ``hermes-tools`` stdio server (``_build_server`` below) and
+    ``hermes mcp serve --tools`` (``mcp_serve.py``), which folds these tools
+    into the conversation-bridge server so any MCP client gets Hermes'
+    web/browser/vision/image/skills/TTS capabilities alongside messaging.
+
+    Returns the number of tools actually registered (tools missing from the
+    current process's registry — unconfigured backends, disabled toolsets —
+    are skipped, matching the model-facing availability rules).
+    """
     # Discover Hermes tools so dispatch works.
     from model_tools import (
         get_tool_definitions,
         handle_function_call,
-    )
-
-    mcp = FastMCP(
-        "hermes-tools",
-        instructions=(
-            "Hermes Agent's tool surface, exposed for use inside a Codex "
-            "session. Use these for capabilities Codex's built-in toolset "
-            "doesn't cover: web search/extract, browser automation, "
-            "subagent delegation, vision, image generation, persistent "
-            "memory, skills, and cross-session search."
-        ),
     )
 
     # Pull authoritative Hermes tool schemas for the ones we expose, so
@@ -244,6 +235,31 @@ def _build_server() -> Any:
         exposed_count,
         len(EXPOSED_TOOLS),
     )
+    return exposed_count
+
+
+def _build_server() -> Any:
+    """Create the FastMCP server with Hermes tools attached. Lazy imports
+    so the module can be imported without the mcp package installed
+    (we degrade to a clear error only when actually run)."""
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError as exc:  # pragma: no cover - install hint
+        raise ImportError(
+            f"hermes-tools MCP server requires the 'mcp' package: {exc}"
+        ) from exc
+
+    mcp = FastMCP(
+        "hermes-tools",
+        instructions=(
+            "Hermes Agent's tool surface, exposed for use inside a Codex "
+            "session. Use these for capabilities Codex's built-in toolset "
+            "doesn't cover: web search/extract, browser automation, "
+            "subagent delegation, vision, image generation, persistent "
+            "memory, skills, and cross-session search."
+        ),
+    )
+    register_hermes_tools(mcp)
     return mcp
 
 

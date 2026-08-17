@@ -888,9 +888,37 @@ The event queue is in-memory and starts when the bridge connects. Older messages
 ### Options
 
 ```bash
-hermes mcp serve              # Normal mode
+hermes mcp serve              # Normal mode (messaging bridge only)
+hermes mcp serve --tools      # Also expose Hermes' tool surface (see below)
 hermes mcp serve --verbose    # Debug logging on stderr
 ```
+
+### Exposing Hermes' tools to other agents (`--tools`)
+
+With `--tools`, the server additionally registers Hermes' curated tool
+surface alongside the messaging bridge: `web_search`, `web_extract`, the
+`browser_*` automation suite, `vision_analyze`, `image_generate`,
+`skill_view`/`skills_list`, and `text_to_speech`. Any MCP client — Claude
+Code, Codex, Cursor, a custom harness — can then use Hermes' configured
+connectors and capabilities directly, under the credentials configured in
+your Hermes install:
+
+```json
+{
+  "mcpServers": {
+    "hermes": {
+      "command": "hermes",
+      "args": ["mcp", "serve", "--tools"]
+    }
+  }
+}
+```
+
+Tools whose backend isn't configured in your Hermes install (e.g. no web
+provider) are skipped automatically, matching what Hermes' own model would
+see. Switching models or clients no longer means leaving your tools behind:
+the same web/browser/vision/skills stack follows you into any MCP-speaking
+agent.
 
 ### How it works
 

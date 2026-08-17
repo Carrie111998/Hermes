@@ -617,8 +617,18 @@ class EventBridge:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
-    """Create and return the Hermes MCP server with all tools registered."""
+def create_mcp_server(
+    event_bridge: Optional[EventBridge] = None,
+    include_tools: bool = False,
+) -> "FastMCP":
+    """Create and return the Hermes MCP server with all tools registered.
+
+    When ``include_tools`` is True, the curated Hermes tool surface
+    (web search/extract, browser automation, vision, image generation,
+    skills, TTS, kanban) is registered alongside the messaging bridge, so
+    external MCP clients (Claude Code, Codex, Cursor, ...) can use Hermes'
+    connectors and capabilities directly.
+    """
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server requires the 'mcp' package. "
@@ -631,8 +641,24 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             "Hermes Agent messaging bridge. Use these tools to interact with "
             "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
             "Matrix, and other connected platforms."
+            + (
+                " Also exposes Hermes' own capabilities — web search/extract, "
+                "browser automation, vision analysis, image generation, "
+                "skills, and text-to-speech — as directly callable tools."
+                if include_tools
+                else ""
+            )
         ),
     )
+
+    if include_tools:
+        # Fold in Hermes' curated tool surface. Registered first so the
+        # count reflects what this process can actually dispatch
+        # (unconfigured backends are skipped by availability checks).
+        from agent.transports.hermes_tools_mcp_server import register_hermes_tools
+
+        registered = register_hermes_tools(mcp)
+        logger.info("exposed %d Hermes tools over MCP", registered)
 
     bridge = event_bridge or EventBridge()
 
@@ -1023,7 +1049,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
+def run_mcp_server(verbose: bool = False, include_tools: bool = False) -> None:
     """Start the Hermes MCP server on stdio."""
     if not _MCP_SERVER_AVAILABLE:
         print(
@@ -1038,10 +1064,15 @@ def run_mcp_server(verbose: bool = False) -> None:
     else:
         logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
+    if include_tools:
+        # Keep Hermes' own banners/prints off stdout — it is the MCP wire.
+        os.environ.setdefault("HERMES_QUIET", "1")
+        os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
+
     bridge = EventBridge()
     bridge.start()
 
-    server = create_mcp_server(event_bridge=bridge)
+    server = create_mcp_server(event_bridge=bridge, include_tools=include_tools)
 
     import asyncio
 

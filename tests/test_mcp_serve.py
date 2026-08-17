@@ -1025,7 +1025,18 @@ class TestCliIntegration:
         args = argparse.Namespace(mcp_action="serve", verbose=True)
         from hermes_cli.mcp_config import mcp_command
         mcp_command(args)
-        mock_run.assert_called_once_with(verbose=True)
+        mock_run.assert_called_once_with(verbose=True, include_tools=False)
+
+    def test_dispatcher_routes_serve_with_tools(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mock_run = MagicMock()
+        monkeypatch.setattr("mcp_serve.run_mcp_server", mock_run)
+
+        import argparse
+        args = argparse.Namespace(mcp_action="serve", verbose=False, tools=True)
+        from hermes_cli.mcp_config import mcp_command
+        mcp_command(args)
+        mock_run.assert_called_once_with(verbose=False, include_tools=True)
 
 
 # ---------------------------------------------------------------------------
