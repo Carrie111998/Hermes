@@ -18,6 +18,7 @@ Environment variables:
 import asyncio
 import email as email_lib
 import imaplib
+import inspect
 import json
 import logging
 import os
@@ -1237,17 +1238,35 @@ class EmailAdapter(BasePlatformAdapter):
         profile_name = (profile_name or "").strip() or None
         resolver = getattr(runner, "_authorization_adapter", None)
         if callable(resolver):
+            supports_profile = True
             try:
-                adapter = resolver(Platform.DISCORD, profile_name)
-            except TypeError:
+                sig = inspect.signature(resolver)
+                params = list(sig.parameters.values())
+                positional = {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+                supports_profile = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params) or sum(
+                    1 for p in params if p.kind in positional and p.default is inspect.Parameter.empty
+                ) >= 2 or any(p.name == "profile" for p in params)
+            except (TypeError, ValueError):
+                supports_profile = True
+
+            if supports_profile:
+                try:
+                    adapter = resolver(Platform.DISCORD, profile_name)
+                except Exception:
+                    logger.debug("[Email] Failed to resolve Discord adapter from gateway runner", exc_info=True)
+            else:
                 if profile_name is not None:
                     # A legacy resolver cannot honor explicit profile
                     # provenance. Fail closed instead of falling back to the
                     # active profile's Discord transport.
                     return None
-                adapter = resolver(Platform.DISCORD)
-            except Exception:
-                logger.debug("[Email] Failed to resolve Discord adapter from gateway runner", exc_info=True)
+                try:
+                    adapter = resolver(Platform.DISCORD)
+                except Exception:
+                    logger.debug("[Email] Failed to resolve Discord adapter from gateway runner", exc_info=True)
 
         if adapter is None:
             if profile_name is not None:

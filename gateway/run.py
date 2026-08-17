@@ -1906,6 +1906,31 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+_SUPPRESS_HOME_NOTICE_CONFIG_CACHE: dict[str, bool] = {}
+
+
+def _suppress_home_channel_notice_from_config(platform_name: str) -> bool:
+    cached = _SUPPRESS_HOME_NOTICE_CONFIG_CACHE.get(platform_name)
+    if cached is not None:
+        return cached
+    suppressed = False
+    try:
+        cfg = _load_gateway_config()
+        platforms = cfg.get("platforms") or {}
+        platform_cfg = platforms.get(platform_name) or {}
+        if isinstance(platform_cfg, dict):
+            response_delivery = str(platform_cfg.get("response_delivery") or "").strip().lower()
+            suppressed = bool(
+                platform_cfg.get("suppress_home_notice")
+                or platform_cfg.get("suppress_home_channel_notice")
+                or (platform_name == "email" and response_delivery in {"discord", "discord_home", "approval_discord"})
+            )
+    except Exception:
+        suppressed = False
+    _SUPPRESS_HOME_NOTICE_CONFIG_CACHE[platform_name] = suppressed
+    return suppressed
+
+
 def _suppress_home_channel_notice(platform_name: str) -> bool:
     """Return True when a platform opts out of the first-run /sethome notice.
 
@@ -1921,20 +1946,7 @@ def _suppress_home_channel_notice(platform_name: str) -> bool:
         return True
     if platform_name == "email" and os.getenv("EMAIL_RESPONSE_DELIVERY", "").strip().lower() in {"discord", "discord_home", "approval_discord"}:
         return True
-    try:
-        cfg = _load_gateway_config()
-        platforms = cfg.get("platforms") or {}
-        platform_cfg = platforms.get(platform_name) or {}
-        if not isinstance(platform_cfg, dict):
-            return False
-        response_delivery = str(platform_cfg.get("response_delivery") or "").strip().lower()
-        return bool(
-            platform_cfg.get("suppress_home_notice")
-            or platform_cfg.get("suppress_home_channel_notice")
-            or (platform_name == "email" and response_delivery in {"discord", "discord_home", "approval_discord"})
-        )
-    except Exception:
-        return False
+    return _suppress_home_channel_notice_from_config(platform_name)
 
 
 def _restart_notification_pending() -> bool:
