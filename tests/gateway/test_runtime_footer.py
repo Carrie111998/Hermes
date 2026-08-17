@@ -146,7 +146,7 @@ def test_format_footer_session_id_field():
         session_id="20260817_113500_a1b2c3d4",
         fields=("session_id",),
     )
-    assert out == "Session ID: 20260817_113500_a1b2c3d4"
+    assert out == "Session: 20260817_113500_a1b2c3d4"
 
 
 def test_format_footer_missing_session_id_skips_field():
@@ -159,6 +159,19 @@ def test_format_footer_missing_session_id_skips_field():
         fields=("session_id",),
     )
     assert out == ""
+
+
+def test_format_footer_dual_telegram_context_uses_exact_two_line_format():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        session_id="sid-42",
+        telegram_topic="227617",
+        fields=("session_id", "telegram_topic"),
+    )
+    assert out == "Session: sid-42\nTelegram topic: 227617"
 
 
 def test_format_footer_unknown_field_silently_ignored():
@@ -269,7 +282,28 @@ def test_build_footer_returns_session_id_when_configured():
         cwd="",
         session_id="sid-42",
     )
-    assert out == "Session ID: sid-42"
+    assert out == "Session: sid-42"
+
+
+def test_build_footer_returns_dual_telegram_context_when_configured():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["session_id", "telegram_topic"],
+                },
+            },
+        },
+        platform_key="telegram",
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        session_id="sid-42",
+        telegram_topic="227617",
+    )
+    assert out == "Session: sid-42\nTelegram topic: 227617"
 
 
 def test_build_footer_per_platform_off_suppresses():

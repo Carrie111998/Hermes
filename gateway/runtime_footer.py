@@ -1,8 +1,8 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, cwd, session ID) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+Renders a compact footer showing runtime state (model, context %, cwd, session ID,
+and Telegram topic) and appends it to the FINAL message of an agent turn when
+enabled.  Off by default to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
 
@@ -30,6 +30,7 @@ from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+_LABEL_FIELDS = {"session_id", "telegram_topic"}
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -95,15 +96,19 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     session_id: Optional[str] = None,
+    telegram_topic: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
-    """Render the footer line, or return "" if no fields have data.
+    """Render the footer, or return "" if no fields have data.
 
     Fields are skipped silently when their underlying data is missing — a
-    partially-populated footer is better than a line with ``?%`` or empty slots.
+    partially-populated footer is better than a line with ``?%`` or empty
+    slots.  Session/topic identity fields use their own labeled lines; the
+    legacy model/context/cwd fields retain the compact separator format.
     """
+    field_list = tuple(fields)
     parts: list[str] = []
-    for field in fields:
+    for field in field_list:
         if field == "model":
             m = _model_short(model)
             if m:
@@ -118,11 +123,16 @@ def format_runtime_footer(
                 parts.append(rel)
         elif field == "session_id":
             if session_id:
-                parts.append(f"Session ID: {session_id}")
+                parts.append(f"Session: {session_id}")
+        elif field == "telegram_topic":
+            if telegram_topic:
+                parts.append(f"Telegram topic: {telegram_topic}")
         # Unknown field names are silently ignored.
 
     if not parts:
         return ""
+    if any(field in _LABEL_FIELDS for field in field_list):
+        return "\n".join(parts)
     return _SEP.join(parts)
 
 
@@ -135,6 +145,7 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     session_id: Optional[str] = None,
+    telegram_topic: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -151,5 +162,6 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         session_id=session_id,
+        telegram_topic=telegram_topic,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

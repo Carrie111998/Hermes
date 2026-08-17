@@ -12330,6 +12330,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     session_id=session_entry.session_id if session_entry else None,
+                    telegram_topic=(
+                        str(source.thread_id)
+                        if _platform_config_key(source.platform) == "telegram"
+                        and getattr(source, "thread_id", None) is not None
+                        else None
+                    ),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
