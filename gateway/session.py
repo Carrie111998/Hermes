@@ -65,6 +65,7 @@ from .whatsapp_identity import (
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
 from utils import atomic_replace
+from agent.redact import redact_object
 
 
 @dataclass
@@ -1275,10 +1276,48 @@ class SessionStore:
                 logger.debug("Session DB operation failed: %s", e)
         
         # Also write legacy JSONL (keeps existing tooling working during transition)
+        #
+        # SECURITY (Phase 9 / B4): the JSONL copy is redacted; the SQLite write
+        # above deliberately is NOT. The asymmetry is load-bearing, not an
+        # oversight -- see _redacted_for_transcript.
         transcript_path = self.get_transcript_path(session_id)
         with self._lock:
             with open(transcript_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(message, ensure_ascii=False) + "\n")
+                f.write(json.dumps(self._redacted_for_transcript(message), ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _redacted_for_transcript(message: Dict[str, Any]) -> Dict[str, Any]:
+        """Redact a message for the on-disk JSONL transcript.
+
+        SECURITY (Phase 9 / B4). An agent that reads a credential into context
+        carries it as conversation text, so every transcript write is a
+        potential credential write.
+
+        **Why SQLite is left unredacted and this is not an inconsistency.**
+        ``messages`` in state.db is the resume source of truth -- a resumed or
+        compressed session rebuilds its working context from it. Redacting it
+        would strip values out of a running agent's own context and break
+        in-flight tasks. The JSONL is a redundant mirror: ``load_transcript``
+        prefers whichever source has MORE messages, using a strict ``>``, so
+        SQLite wins on ties and the JSONL is only authoritative for legacy
+        sessions that pre-date the DB layer.
+
+        Verified against live state 2026-08-17: across all 15 JSONL
+        transcripts in all three profiles, ``db_count >= jsonl_count`` in every
+        case -- zero JSONL-authoritative sessions. So redacting here cannot
+        degrade resume for any session that exists today.
+
+        That is a statement about the current corpus, not a guarantee. The
+        legacy code path still exists. If a future migration produces a session
+        whose JSONL is longer than its DB rows, that session would resume from
+        redacted text. The durable fix is to retire the JSONL mirror, not to
+        un-redact it.
+
+        The historical plaintext already in state.db is Phase E's problem
+        (targeted delete, FTS rebuild, secure_delete, VACUUM) -- not something
+        a write-path redaction can reach.
+        """
+        return redact_object(message)
     
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Replace the entire transcript for a session with new messages.
@@ -1295,10 +1334,15 @@ class SessionStore:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
         
         # JSONL: overwrite the file
+        #
+        # SECURITY (Phase 9 / B4): redacted on the same terms as
+        # append_to_transcript. Without this, /retry, /undo and /compress would
+        # rewrite the whole file from unredacted in-memory history and silently
+        # undo the containment on every prior line.
         transcript_path = self.get_transcript_path(session_id)
         with open(transcript_path, "w", encoding="utf-8") as f:
             for msg in messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                f.write(json.dumps(self._redacted_for_transcript(msg), ensure_ascii=False) + "\n")
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
