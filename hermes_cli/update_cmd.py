@@ -1200,13 +1200,20 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         )
 
     print()
-    if node_failures:
-        print(
-            "⚠ Update partially complete — Node.js dependencies for "
-            f"{', '.join(node_failures)} did not refresh."
-        )
-        print("  Code and Python deps are updated, but the dashboard/TUI may")
-        print("  be in a mixed state until the Node deps are rebuilt.")
+    if node_failures or not desktop_build_ok:
+        parts = []
+        if node_failures:
+            parts.append(
+                f"Node.js dependencies for {', '.join(node_failures)} did not refresh"
+            )
+        if not desktop_build_ok:
+            parts.append("the desktop app was not rebuilt and is still on the previous build")
+        print("⚠ Update partially complete — " + "; ".join(parts) + ".")
+        if node_failures:
+            print("  Code and Python deps are updated, but the dashboard/TUI may")
+            print("  be in a mixed state until the Node deps are rebuilt.")
+        if not desktop_build_ok:
+            print("  Run `hermes desktop` to retry the desktop rebuild.")
     else:
         _print_update_completion("✓ Update complete!")
     try:
@@ -5594,13 +5601,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
         print()
-        if node_failures:
-            print(
-                "⚠ Update partially complete — Node.js dependencies for "
-                f"{', '.join(node_failures)} did not refresh."
-            )
-            print("  Code and Python deps are updated, but the dashboard/TUI may")
-            print("  be in a mixed state until the Node deps are rebuilt.")
+        if node_failures or not desktop_build_ok:
+            parts = []
+            if node_failures:
+                parts.append(
+                    f"Node.js dependencies for {', '.join(node_failures)} did not refresh"
+                )
+            if not desktop_build_ok:
+                parts.append("the desktop app was not rebuilt and is still on the previous build")
+            print("⚠ Update partially complete — " + "; ".join(parts) + ".")
+            if node_failures:
+                print("  Code and Python deps are updated, but the dashboard/TUI may")
+                print("  be in a mixed state until the Node deps are rebuilt.")
+            if not desktop_build_ok:
+                print("  Run `hermes desktop` to retry the desktop rebuild.")
         else:
             _print_update_completion("✓ Update complete!")
 
