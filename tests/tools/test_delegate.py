@@ -68,6 +68,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertEqual(props["judge"]["type"], "string")
+        self.assertEqual(props["judge"]["maxLength"], 500)
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -295,6 +296,10 @@ class TestBestOfNJudge(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(custom, "Prefer simpler code")
 
+        too_long, error = _normalize_best_of_n_judge("x" * 501)
+        self.assertIsNone(too_long)
+        self.assertIn("at most 500 characters", error)
+
     def test_success_calls_judge_once_with_blind_stable_candidates(self):
         results = [
             self._result(2, "third answer", model="secret-model-c", provider="secret-c"),
@@ -339,7 +344,7 @@ class TestBestOfNJudge(unittest.TestCase):
         self.assertNotIn("secret-b", prompt)
         self.assertNotIn("secret-c", prompt)
 
-    def test_malformed_empty_and_out_of_range_verdicts_fail_safely(self):
+    def test_malformed_empty_and_out_of_range_verdicts_use_stable_fallback(self):
         results = [self._result(0, "A"), self._result(1, "B")]
         tasks = [{"goal": self._GOAL}, {"goal": self._GOAL}]
         responses = (
@@ -365,7 +370,9 @@ class TestBestOfNJudge(unittest.TestCase):
                         results, tasks, "Select the best answer"
                     )
                 self.assertEqual(evaluation["status"], "failed")
-                self.assertIsNone(winner)
+                self.assertEqual(evaluation["fallback"], "first_completed_candidate")
+                self.assertEqual(evaluation["winner_index"], 0)
+                self.assertEqual(winner, {"task_index": 0, "candidate": "A"})
                 self.assertEqual(results, original)
 
     def test_provider_error_preserves_results(self):
@@ -380,7 +387,8 @@ class TestBestOfNJudge(unittest.TestCase):
             )
         self.assertEqual(evaluation["status"], "failed")
         self.assertIn("TimeoutError", evaluation["error"])
-        self.assertIsNone(winner)
+        self.assertEqual(evaluation["fallback"], "first_completed_candidate")
+        self.assertEqual(winner, {"task_index": 0, "candidate": "A"})
         self.assertEqual([entry["summary"] for entry in results], ["A", "B"])
 
     def test_failed_candidate_is_excluded_without_renumbering(self):

@@ -3308,6 +3308,7 @@ def _recover_tasks_from_json_string(
 _DEFAULT_BEST_OF_N_CRITERIA = (
     "Evaluate correctness, completeness, robustness, and maintainability."
 )
+_MAX_BEST_OF_N_CRITERIA_LENGTH = 500
 _BEST_OF_N_JUDGE_SYSTEM_PROMPT = """You are an independent evaluator comparing
 anonymous candidate answers to the same task. Judge only the answer content.
 Return exactly one JSON object with this shape:
@@ -3344,6 +3345,11 @@ def _normalize_best_of_n_judge(
         return None, None
     if criteria.lower() in {"default", "true"}:
         return _DEFAULT_BEST_OF_N_CRITERIA, None
+    if len(criteria) > _MAX_BEST_OF_N_CRITERIA_LENGTH:
+        return None, (
+            "judge criteria must be at most "
+            f"{_MAX_BEST_OF_N_CRITERIA_LENGTH} characters."
+        )
     return criteria, None
 
 
@@ -3481,6 +3487,12 @@ def _judge_best_of_n(
             winner,
         )
 
+    fallback_candidate = candidates[0]
+    fallback_winner = {
+        "task_index": fallback_candidate["task_index"],
+        "candidate": fallback_candidate["candidate"],
+    }
+
     original_task = str(task_list[0].get("goal", "")).strip()
     candidate_blocks = []
     for candidate in candidates:
@@ -3509,25 +3521,42 @@ def _judge_best_of_n(
         )
         raw = response.choices[0].message.content or ""
     except Exception as exc:
-        logger.info("delegate_task Best-of-N judge call failed: %s", exc)
+        logger.warning(
+            "delegate_task Best-of-N judge call failed; selecting the first "
+            "completed candidate (%s) as fallback: %s",
+            fallback_candidate["candidate"],
+            exc,
+        )
         return (
             {
                 **evaluation_base,
                 "status": "failed",
                 "error": f"Judge call failed: {type(exc).__name__}",
+                "fallback": "first_completed_candidate",
+                "winner_index": fallback_candidate["task_index"],
+                "winner_candidate": fallback_candidate["candidate"],
             },
-            None,
+            fallback_winner,
         )
 
     verdict, parse_error = _parse_best_of_n_judge_response(raw, candidates)
     if verdict is None:
+        logger.warning(
+            "delegate_task Best-of-N judge response was invalid; selecting "
+            "the first completed candidate (%s) as fallback: %s",
+            fallback_candidate["candidate"],
+            parse_error or "unknown parse error",
+        )
         return (
             {
                 **evaluation_base,
                 "status": "failed",
                 "error": parse_error or "Judge returned an invalid response.",
+                "fallback": "first_completed_candidate",
+                "winner_index": fallback_candidate["task_index"],
+                "winner_candidate": fallback_candidate["candidate"],
             },
-            None,
+            fallback_winner,
         )
 
     winner = {
@@ -4821,6 +4850,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "judge": {
                 "type": "string",
+                "maxLength": _MAX_BEST_OF_N_CRITERIA_LENGTH,
                 "description": (
                     "Optional Best-of-N evaluation criteria for batch tasks "
                     "that share the same goal. Use 'default' for correctness, "
