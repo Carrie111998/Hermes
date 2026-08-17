@@ -1242,7 +1242,11 @@ def _start_junk_watcher(repo_root: Path) -> None:
         return
     _watcher_stop_file = stop_file
     atexit.register(_stop_junk_watcher)
-    print(f"  [junk-probe] watcher armed on {repo_root} (pid {_watcher_proc.pid})")
+    # This confirms only that Popen() returned a PID -- i.e. a process was
+    # spawned -- NOT that the watch is actually established. If the watcher
+    # crashed on startup this line would still print. The real confirmation
+    # is the watcher's own "armed" record.
+    print(f"  [junk-probe] watcher process spawned for {repo_root} (pid {_watcher_proc.pid}); see the watcher's own 'armed' record for confirmation the watch is live")
 
 
 def _stop_junk_watcher() -> None:
@@ -1259,7 +1263,24 @@ def _stop_junk_watcher() -> None:
         if stop_file is not None:
             stop_file.touch()
         proc.wait(timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError as exc:
+        print(
+            f"  [junk-probe] could not signal the watcher via its stop-file "
+            f"({exc}); force-terminating it. Its 'done' record (the "
+            f"NEGATIVE) will therefore be missing from this run.",
+            file=sys.stderr,
+        )
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    except subprocess.TimeoutExpired:
+        print(
+            "  [junk-probe] watcher did not exit within 15s of the stop "
+            "signal; force-terminating it. Its 'done' record (the "
+            "NEGATIVE) will therefore be missing from this run.",
+            file=sys.stderr,
+        )
         try:
             proc.terminate()
         except OSError:

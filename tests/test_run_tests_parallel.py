@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -849,12 +850,111 @@ def test_help_exits_without_starting_a_suite_run():
 from scripts import run_tests_parallel as rtp
 
 
-def test_watcher_not_started_when_the_knob_is_unset(monkeypatch, tmp_path):
-    """Opt-in, default off."""
-    monkeypatch.delenv("HERMES_TEST_JUNK_PROBE", raising=False)
+class _FakeWatcherProc:
+    """Stand-in for subprocess.Popen's return value -- no real process spawns."""
+
+    def __init__(self, pid: int = 999999) -> None:
+        self.pid = pid
+
+    def poll(self):
+        # Report "already exited" so a leaked atexit callback (registration
+        # is separately faked below, but belt-and-suspenders) is a no-op.
+        return 0
+
+
+def _patch_watcher_popen(monkeypatch) -> list:
+    """Replace subprocess.Popen with a recorder and swallow atexit.register.
+
+    Returns the list of recorded calls (dicts with cmd/cwd/env keys) so the
+    caller can assert on argv/cwd/env without ever spawning a real process
+    or leaving an atexit handler registered that could fire later in the
+    test session.
+    """
+    calls: list = []
+
+    def _fake_popen(cmd, cwd=None, env=None, **kwargs):
+        calls.append({"cmd": cmd, "cwd": cwd, "env": env})
+        return _FakeWatcherProc()
+
+    monkeypatch.setattr(rtp.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(rtp.atexit, "register", lambda fn: None)
     monkeypatch.setattr(rtp, "_watcher_proc", None)
-    rtp._start_junk_watcher(tmp_path)
+    monkeypatch.setattr(rtp, "_watcher_stop_file", None)
+    return calls
+
+
+def test_watcher_not_started_when_the_knob_is_unset(monkeypatch):
+    """Gate OFF must not spawn -- proven against the REAL repo root so the
+    gate is the ONLY variable in play.
+
+    A prior version of this test passed ``tmp_path`` as ``repo_root``. A
+    reviewer proved that with the gate forcibly ON, ``_watcher_proc`` was
+    STILL None under ``tmp_path`` -- because a second guard
+    (``script.exists()``) also blocked it, since ``tmp_path`` never contains
+    ``scripts/systemdrive_watcher.py``. That made the test unable to tell
+    "gate correctly off" from "gate check deleted". Using the real repo
+    root (where the script does exist) and faking ``subprocess.Popen``
+    means only the gate itself can explain a non-call.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    calls = _patch_watcher_popen(monkeypatch)
+    monkeypatch.delenv("HERMES_TEST_JUNK_PROBE", raising=False)
+
+    rtp._start_junk_watcher(repo_root)
+
+    assert calls == [], f"Popen was called with the gate unset: {calls}"
     assert rtp._watcher_proc is None
+
+
+def test_watcher_started_and_configured_when_the_knob_is_set(monkeypatch):
+    """Positive control for the test above.
+
+    Without this half, "Popen not called with the gate off" cannot prove
+    the GATE is what decided that -- it could just as well be a broken
+    watcher path that never calls Popen at all. This proves gate ON does
+    spawn, and that the spawn is configured correctly: the watcher script
+    path, --stop-file, and --secs are on argv; cwd is the user's home (NOT
+    the repo root, so the watcher doesn't watch its own cwd); and env is
+    inherited (still carries SYSTEMDRIVE) rather than scrubbed.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    calls = _patch_watcher_popen(monkeypatch)
+    monkeypatch.setenv("HERMES_TEST_JUNK_PROBE", "1")
+    # Guarantee SYSTEMDRIVE is present regardless of host/platform, so the
+    # "inherited, not scrubbed" assertion below doesn't depend on the
+    # ambient environment of whatever box runs this test.
+    monkeypatch.setenv("SYSTEMDRIVE", "C:")
+
+    rtp._start_junk_watcher(repo_root)
+
+    assert len(calls) == 1, calls
+    call = calls[0]
+    cmd = call["cmd"]
+    script = repo_root / "scripts" / "systemdrive_watcher.py"
+    assert str(script) in cmd, cmd
+    assert "--stop-file" in cmd, cmd
+    assert "--secs" in cmd, cmd
+    assert call["cwd"] == str(Path.home()), call["cwd"]
+    assert call["cwd"] != str(repo_root), "watcher must not watch its own cwd"
+    assert call["env"] is not None and "SYSTEMDRIVE" in call["env"], (
+        "env must be inherited (not scrubbed) so the watcher sees our own "
+        "SYSTEMDRIVE condition"
+    )
+
+
+def _find_forwarding_loop_vars(body: str) -> "list[str] | None":
+    """Extract the variable list of run_tests.sh's `for _var in ...; do` loop.
+
+    Returns None if the loop cannot be located at all, so a refactor that
+    renames or restructures it fails loudly rather than silently passing.
+    """
+    match = re.search(r"for _var in (.*?); do", body, re.DOTALL)
+    if match is None:
+        return None
+    # Collapse backslash-newline continuations before splitting on
+    # whitespace, so a multi-line variable list yields clean tokens.
+    joined = re.sub(r"\\\s*\n", " ", match.group(1))
+    return joined.split()
 
 
 def test_run_tests_sh_forwards_the_junk_probe_gate():
@@ -863,7 +963,57 @@ def test_run_tests_sh_forwards_the_junk_probe_gate():
     run_tests.sh execs the runner under `env -i` with an explicit allowlist,
     so an unforwarded variable simply never arrives -- and the run then looks
     exactly like a clean negative.
+
+    This must check the FORWARDING LOOP specifically, not the whole file
+    text: the file also carries a required warning comment (near the
+    CLEAN_ENV array) that itself contains the literal string
+    "HERMES_TEST_JUNK_PROBE=1". A whole-file substring check passes even
+    if the loop entry is deleted while the comment survives -- which is
+    exactly the regression this test exists to catch.
     """
     repo_root = Path(__file__).resolve().parent.parent
     body = (repo_root / "scripts" / "run_tests.sh").read_text(encoding="utf-8")
-    assert "HERMES_TEST_JUNK_PROBE" in body
+
+    loop_vars = _find_forwarding_loop_vars(body)
+    assert loop_vars is not None, (
+        "could not locate the `for _var in ...; do` forwarding loop in "
+        "run_tests.sh -- this test cannot verify the gate is forwarded "
+        "without it. If the loop was refactored/renamed, update the "
+        "regex in _find_forwarding_loop_vars to match the new form."
+    )
+    assert "HERMES_TEST_JUNK_PROBE" in loop_vars, (
+        f"HERMES_TEST_JUNK_PROBE is missing from the forwarding loop's "
+        f"variable list {loop_vars} -- the knob would be silently inert "
+        f"through scripts/run_tests.sh"
+    )
+
+
+def test_run_tests_sh_never_forwards_systemdrive():
+    """SYSTEMDRIVE must never enter the clean env, in the loop or the array.
+
+    Adding it would erase the only reproducer this whole tool exists to
+    catch (see the warning comment in run_tests.sh above CLEAN_ENV). There
+    was previously no test guarding against this regression at all.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    body = (repo_root / "scripts" / "run_tests.sh").read_text(encoding="utf-8")
+
+    loop_vars = _find_forwarding_loop_vars(body)
+    assert loop_vars is not None, (
+        "could not locate the `for _var in ...; do` forwarding loop in "
+        "run_tests.sh -- cannot verify SYSTEMDRIVE is absent from it."
+    )
+    assert "SYSTEMDRIVE" not in loop_vars, (
+        "SYSTEMDRIVE must not be forwarded -- it would erase the only "
+        "reproducer the junk-probe watcher exists to catch"
+    )
+
+    array_match = re.search(r"CLEAN_ENV=\((.*?)\)", body, re.DOTALL)
+    assert array_match is not None, (
+        "could not locate the `CLEAN_ENV=(...)` array in run_tests.sh -- "
+        "cannot verify SYSTEMDRIVE is absent from it."
+    )
+    assert "SYSTEMDRIVE" not in array_match.group(1), (
+        "SYSTEMDRIVE must not be in the base CLEAN_ENV array -- it would "
+        "erase the only reproducer the junk-probe watcher exists to catch"
+    )
