@@ -946,7 +946,8 @@ def init_agent(
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
     else:
-        if api_key and base_url:
+        has_explicit_creds = bool(api_key and base_url)
+        if has_explicit_creds:
             # Explicit credentials from CLI/gateway — construct directly.
             # The runtime provider resolver already handled auth for us.
             # Extract query params (e.g. Azure api-version) from base_url

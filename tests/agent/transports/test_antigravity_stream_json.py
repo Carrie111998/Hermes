@@ -58,6 +58,7 @@ def test_tool_lifecycle_projects_into_hermes_messages() -> None:
                         "conversation_id": "conv-1",
                         "status": "SUCCESS",
                         "response": "AGY_TOOL_PROBE",
+                        "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19},
                     },
                 }
             ),
@@ -66,6 +67,7 @@ def test_tool_lifecycle_projects_into_hermes_messages() -> None:
 
     assert result.completed is True
     assert result.conversation_id == "conv-1"
+    assert result.usage == {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19}
     assert result.tool_iterations == 1
     assert len(result.projected_messages) == 2
     assert result.projected_messages[0]["role"] == "assistant"
