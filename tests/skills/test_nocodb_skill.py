@@ -1,19 +1,13 @@
 """
 Smoke tests for the nocodb optional skill.
 
-Validates:
-  - Both platform scripts ship and expose an identical command surface
-    (which is what makes the three-platform `platforms:` claim honest)
-  - Every command named in SKILL.md prose is one the scripts implement
-    (catches doc drift when the vendored scripts are refreshed upstream)
-  - The scripts only ever talk to the configured NocoDB origin
-  - The MIT provenance of the vendored scripts survives
+Generic frontmatter conformance is not repeated here — test_authoring_
+standards.py already sweeps every skill in the repo for it. These are the
+nocodb-specific checks: the two platform scripts staying in lockstep, the
+SKILL.md command reference staying true to them, and the vendored scripts
+keeping their origin and their attribution.
 
-Generic frontmatter conformance (required fields, the 60-char description
-hardline, tags, related_skills) is not repeated here — tests/skills/
-test_authoring_standards.py already sweeps every skill in the repo for it.
-
-No network. Everything here is static analysis of the shipped files.
+No network. Static analysis of the shipped files only.
 """
 from __future__ import annotations
 
@@ -34,22 +28,16 @@ SKILL_DIR = (
 SH = SKILL_DIR / "scripts" / "nocodb.sh"
 PS1 = SKILL_DIR / "scripts" / "nocodb.ps1"
 
-# `case` labels in the Bash dispatcher, at column 0. Some labels alternate:
-#   record:update-many)
-#   where:help|filter:help)
+# Bash `case` labels, which may alternate: `where:help|filter:help)`.
 _SH_COMMAND = re.compile(r"^([a-z][a-z:|-]*)\)", re.MULTILINE)
-# `switch` labels in the PowerShell dispatcher, either a plain literal
-#   "record:update-many" {
-# or a script-block condition covering several aliases
-#   { $_ -eq "where:help" -or $_ -eq "filter:help" } {
+# PowerShell `switch` labels: a plain literal, or a script-block condition
+# (`{ $_ -eq "where:help" -or $_ -eq "filter:help" }`) covering aliases.
 _PS1_COMMAND = re.compile(r'^\s+"([a-z][a-z:-]*)"\s*\{', re.MULTILINE)
 _PS1_ALIAS = re.compile(r'\$_ -eq "([a-z][a-z:-]*)"')
-# Commands as written in SKILL.md prose/tables: `record:update-many`.
 _DOC_COMMAND = re.compile(r"`(?:scripts/nocodb\.sh )?([a-z][a-z-]+:[a-z:-]+)`")
 
 
 def _sh_commands_from(src: str) -> set[str]:
-    """Flatten `a|b)` alternation labels into individual command names."""
     return {c for label in _SH_COMMAND.findall(src) for c in label.split("|")}
 
 
@@ -81,15 +69,12 @@ def test_skill_dir_and_scripts_exist() -> None:
 
 
 def test_bash_script_is_executable() -> None:
-    # The skill documents `scripts/nocodb.sh <command>` as the entry point,
-    # so the mode bit has to survive the commit.
     assert SH.stat().st_mode & 0o111, "scripts/nocodb.sh is not executable"
 
 
 def test_mit_provenance_recorded(frontmatter: dict) -> None:
-    # The scripts are vendored from an MIT upstream that ships no LICENSE
-    # file, so the attribution lives in the frontmatter and in a header on
-    # each script. Losing either silently drops the only notice we carry.
+    # Upstream ships no LICENSE file, so the header on each script and this
+    # frontmatter field are the only MIT notice travelling with the code.
     assert frontmatter["license"] == "MIT"
     for script in (SH, PS1):
         head = script.read_text(encoding="utf-8")[:600]
@@ -105,8 +90,7 @@ def test_declares_token_env_var(frontmatter: dict) -> None:
 
 
 def test_platforms_match_shipped_scripts(frontmatter: dict) -> None:
-    # Windows is only claimable because the PowerShell port ships alongside
-    # the Bash one. If nocodb.ps1 is ever dropped, this fails loudly.
+    # Windows is only claimable while the PowerShell port ships alongside.
     assert set(frontmatter["platforms"]) == {"macos", "linux", "windows"}
     assert PS1.is_file()
 
@@ -140,10 +124,7 @@ def test_documented_command_count_matches(skill_src: str, sh_commands: set[str])
 
 @pytest.mark.parametrize("script", [SH, PS1], ids=["sh", "ps1"])
 def test_scripts_contact_only_nocodb_default_origin(script: Path) -> None:
-    # Every request is built off $NOCODB_URL, whose only default is the NocoDB
-    # cloud origin. A second literal host on an executable line would mean
-    # exfiltration or an unreviewed upstream change. Comment lines are skipped
-    # so the provenance header can cite the upstream repo.
+    # Comment lines are skipped so the provenance header can cite upstream.
     code = "\n".join(
         line
         for line in script.read_text(encoding="utf-8").splitlines()
