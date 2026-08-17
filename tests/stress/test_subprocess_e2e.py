@@ -113,12 +113,20 @@ def main():
     # Wait for all workers to complete. Incidental safety net, not the
     # assertion (tests/timeout_budget.py rule 2): each worker makes five
     # real CLI invocations and every one pays full interpreter + hermes
-    # import startup (~2.5s on Windows), so three concurrent workers need
-    # far more than the 10s this used to allow. Under-budgeting here does
-    # not report "too slow" — it reports status=running, a dangling
-    # current_run_id and missing heartbeats, i.e. it looks exactly like a
-    # kernel bug.
-    deadline = time.monotonic() + scaled(180)
+    # import startup, so three concurrent workers need far more than the
+    # 10s this used to allow.
+    #
+    # The base is deliberately large because under-budgeting here does not
+    # report "too slow" — it reports status=running, a dangling
+    # current_run_id and a missing outcome, which looks exactly like a
+    # kernel bug and costs an investigation every time. Measured on this
+    # host: ~81s for the whole script on an idle box, 169s with a couple of
+    # sibling pytest sessions running, and a failure at 180s when the full
+    # stress lane ran alongside three of them. A bound that a healthy run
+    # comes within 6% of is not a safety net, so give it real headroom;
+    # rule 2 asks for a generous base precisely so contention cannot
+    # masquerade as a regression.
+    deadline = time.monotonic() + scaled(600)
     while time.monotonic() < deadline:
         statuses = [kb.get_task(conn, tid).status for tid in tids]
         if all(s == "done" for s in statuses):

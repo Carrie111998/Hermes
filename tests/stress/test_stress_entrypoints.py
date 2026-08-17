@@ -43,9 +43,13 @@ SCRIPTS = sorted(p.name for p in _HERE.glob("test_*.py") if p.name != _SELF)
 
 # Incidental safety net, not the assertion (tests/timeout_budget.py rule 2).
 # The slowest scripts measured ~530s (property_fuzzing) and ~500s
-# (benchmarks) on Windows, so this leaves substantial headroom for a loaded
-# host before it trips.
-SCRIPT_TIMEOUT = scaled(900)
+# (benchmarks) on an idle box, and this host routinely runs several agent
+# sessions at once: the same lane took 26m unloaded and 35m alongside three
+# sibling pytest runs. A bound only ~25% above the idle measurement would
+# convert that contention into a red that looks like a regression, so the
+# base is set well clear of it. It still bounds a genuinely hung script,
+# which is all this is for.
+SCRIPT_TIMEOUT = scaled(1800)
 
 
 def test_stress_scripts_are_discovered():
