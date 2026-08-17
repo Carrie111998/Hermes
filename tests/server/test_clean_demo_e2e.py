@@ -4,10 +4,12 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
+from scripts.ci import interfaze_clean_demo_smoke as smoke
 from server.agent_service import StubRunExecutor
 from server.app import create_app
 from server.config import Settings
@@ -107,6 +109,7 @@ def test_clean_demo_first_research_run(
     # The shared backend corpus is not customer data until research verifies it.
     assert client.get("/api/v1/leads", headers=headers).json() == []
     assert client.get("/api/v1/contacts", headers=headers).json() == []
+    assert client.get("/api/v1/lead-map/selected-countries", headers=headers).json() == []
     assert client.get("/api/v1/research", headers=headers).json() == []
     assert client.get("/api/v1/research-campaigns", headers=headers).json() == []
     assert client.get("/api/v1/outreach/campaigns", headers=headers).json() == []
@@ -165,3 +168,138 @@ def test_operational_smoke_cli_exposes_secret_file_contract():
     assert "--base-url" in completed.stdout
     assert "--email" in completed.stdout
     assert "--password-file" in completed.stdout
+    assert "--mode" in completed.stdout
+    assert "--confirm-disposable-tenant" in completed.stdout
+    parsed = smoke.parser().parse_args([
+        "--base-url", "https://example.test",
+        "--email", TEST_EMAIL,
+        "--password-file", "password-file",
+    ])
+    assert parsed.mode == "read-only"
+    assert parsed.confirm_disposable_tenant is None
+
+
+class InProcessApiClient:
+    """Use the real FastAPI app while replacing only HTTP socket transport."""
+
+    def __init__(self, client: TestClient, token: str | None = None):
+        self.client = client
+        self.token = token
+
+    def request(self, method, path, *, payload=None, body=None, content_type="application/json"):
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if body is not None:
+            headers["Content-Type"] = content_type
+        response = self.client.request(
+            method,
+            path,
+            headers=headers,
+            json=payload,
+            content=body,
+        )
+        return response.status_code, response.json() if response.content else None
+
+
+def _smoke_args(tmp_path: Path, *, mode: str, confirmation: str | None = None):
+    password_file = tmp_path / "smoke-password"
+    password_file.write_text(TEST_PASSWORD + "\n", encoding="utf-8")
+    password_file.chmod(0o600)
+    return SimpleNamespace(
+        base_url="http://in-process.test",
+        email=TEST_EMAIL,
+        password_file=password_file,
+        source_id="fixture-directory",
+        country="DE",
+        mode=mode,
+        confirm_disposable_tenant=confirmation,
+    )
+
+
+def _prepare_smoke(
+    tmp_path: Path,
+    fake_verifier: ProviderRegistry,
+    candidate_csv: bytes,
+) -> tuple[TestClient, dict[str, str]]:
+    db, client, headers, _ = make_clean_demo(tmp_path, fake_verifier)
+    CandidateRepository(db).import_file(
+        "kitchen-appliances", "smoke-v1", "candidates.csv", candidate_csv,
+    )
+    return client, headers
+
+
+def test_operational_smoke_defaults_to_read_only(
+    tmp_path: Path,
+    monkeypatch,
+    fake_verifier: ProviderRegistry,
+    candidate_csv: bytes,
+):
+    client, headers = _prepare_smoke(tmp_path, fake_verifier, candidate_csv)
+    monkeypatch.setattr(smoke, "ApiClient", lambda _base_url, token=None: InProcessApiClient(client, token))
+
+    smoke.run(_smoke_args(tmp_path, mode="read-only"))
+
+    assert client.get("/api/v1/products", headers=headers).json() == []
+    assert client.get("/api/v1/research-campaigns", headers=headers).json() == []
+
+
+def test_operational_smoke_rejects_mutation_without_matching_disposable_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+    fake_verifier: ProviderRegistry,
+    candidate_csv: bytes,
+):
+    client, headers = _prepare_smoke(tmp_path, fake_verifier, candidate_csv)
+    monkeypatch.setattr(smoke, "ApiClient", lambda _base_url, token=None: InProcessApiClient(client, token))
+
+    with pytest.raises(smoke.SmokeFailure, match="disposable tenant"):
+        smoke.run(_smoke_args(tmp_path, mode="full", confirmation="another-smoke@example.test"))
+    assert client.get("/api/v1/products", headers=headers).json() == []
+    assert client.get("/api/v1/research-campaigns", headers=headers).json() == []
+
+
+def test_operational_smoke_never_mutates_the_real_silverline_demo(
+    tmp_path: Path,
+    monkeypatch,
+    fake_verifier: ProviderRegistry,
+    candidate_csv: bytes,
+):
+    client, headers = _prepare_smoke(tmp_path, fake_verifier, candidate_csv)
+    monkeypatch.setattr(smoke, "ApiClient", lambda _base_url, token=None: InProcessApiClient(client, token))
+    args = _smoke_args(
+        tmp_path,
+        mode="full",
+        confirmation="efe@anexa-arelvia.com",
+    )
+    args.email = "efe@anexa-arelvia.com"
+
+    with pytest.raises(smoke.SmokeFailure, match="protected demo"):
+        smoke.run(args)
+    assert client.get("/api/v1/products", headers=headers).json() == []
+    assert client.get("/api/v1/research-campaigns", headers=headers).json() == []
+
+
+def test_operational_smoke_full_mode_runs_real_api_and_evidence_path(
+    tmp_path: Path,
+    monkeypatch,
+    fake_verifier: ProviderRegistry,
+    candidate_csv: bytes,
+    capsys,
+):
+    client, headers = _prepare_smoke(tmp_path, fake_verifier, candidate_csv)
+    monkeypatch.setattr(smoke, "ApiClient", lambda _base_url, token=None: InProcessApiClient(client, token))
+
+    smoke.run(_smoke_args(tmp_path, mode="full", confirmation=TEST_EMAIL))
+
+    assert "clean demo smoke passed" in capsys.readouterr().out
+    campaigns = client.get("/api/v1/research-campaigns", headers=headers).json()
+    assert len(campaigns) == 1
+    active = client.get(
+        f"/api/v1/research-campaigns/{campaigns[0]['id']}/results", headers=headers,
+    ).json()
+    rejected = client.get(
+        f"/api/v1/research-campaigns/{campaigns[0]['id']}/results?view=rejected",
+        headers=headers,
+    ).json()
+    assert active and rejected

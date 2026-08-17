@@ -158,9 +158,9 @@ the wheel or container.
 
 ## Clean-demo release smoke
 
-After provisioning the account and loading the backend candidate corpus, run
-the post-deploy gate. The password value stays out of arguments and process
-listings:
+Before any WebUI product import or research action, the default post-deploy gate
+can verify that the real demo account is still clean. This mode is read-only.
+The password value stays out of arguments and process listings:
 
 ```bash
 python scripts/ci/interfaze_clean_demo_smoke.py \
@@ -169,11 +169,37 @@ python scripts/ci/interfaze_clean_demo_smoke.py \
   --password-file .interfaze-credentials/demo-password
 ```
 
-The gate requires an initially empty tenant, imports one test-only product,
-starts research with an available verifier, and verifies active/rejected
-separation plus HTTPS evidence. Use `--empty-only` only for the credential-free
-CI boot check; CI runs the complete research path with its injected test
-verifier in `tests/server/test_clean_demo_e2e.py`.
+The default gate requires empty products, countries, leads, contacts, research,
+campaigns, messages, and outreach, and makes no product or operational tenant
+changes.
+
+Full rehearsal intentionally imports one synthetic product and starts a
+campaign. Started campaigns cannot be cleaned up, so **never run full mode
+against Silverline, a customer demo account, or any reusable tenant**. Provision
+a new disposable smoke tenant for every rehearsal, load the backend candidate
+corpus, then repeat that disposable email as the explicit confirmation:
+
+```bash
+smoke_email='release-smoke-20260817@example.test'
+python -m server provision-demo \
+  --email "${smoke_email}" \
+  --password-file .interfaze-credentials/disposable-smoke-password \
+  --profile /secure/path/disposable-smoke-profile.json
+
+python scripts/ci/interfaze_clean_demo_smoke.py \
+  --base-url https://interfaze.example.com \
+  --email "${smoke_email}" \
+  --password-file .interfaze-credentials/disposable-smoke-password \
+  --mode full \
+  --confirm-disposable-tenant "${smoke_email}"
+```
+
+Full mode verifies product import, candidate isolation, research completion,
+active/rejected separation, and HTTPS evidence metadata. The command refuses
+full mode when the confirmation does not exactly match the login email, and it
+unconditionally protects the Silverline demo email. CI executes the same full
+script branch against the real FastAPI routes with a test-only verifier in
+`tests/server/test_clean_demo_e2e.py`; no fake provider is wired into production.
 
 ## Production / Supabase
 

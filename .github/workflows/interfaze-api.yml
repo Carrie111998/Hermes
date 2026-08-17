@@ -117,7 +117,9 @@ jobs:
           test ! -e server/webui/js/mocks/handlers.js
           test ! -e server/lead_research/providers/fixture.py
 
-      - name: Run the clean-demo release gate
+      # This file includes the actual full smoke-script path against the real
+      # FastAPI app with only the external verifier injected from tests.
+      - name: Run clean-demo and full operational smoke gates
         run: |
           set -euo pipefail
           source .venv/bin/activate
@@ -189,8 +191,7 @@ jobs:
           python scripts/ci/interfaze_clean_demo_smoke.py \
             --base-url http://127.0.0.1:8000 \
             --email ci-demo@example.test \
-            --password-file "${password_file}" \
-            --empty-only
+            --password-file "${password_file}"
 
           kill "${api_pid}" 2>/dev/null || true
           wait "${api_pid}" 2>/dev/null || true

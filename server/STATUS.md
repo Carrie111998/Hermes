@@ -63,8 +63,12 @@ Status as of 2026-08-17.
   the customer, imports one product and a backend corpus, proves candidate
   isolation, runs an injected verifier, and asserts sourced active/rejected
   result separation.
-- `scripts/ci/interfaze_clean_demo_smoke.py` repeats the public-HTTP boundary
-  against a deployed service using an owner-restricted password file.
+- `scripts/ci/interfaze_clean_demo_smoke.py` defaults to a read-only clean-state
+  check against a deployed service using an owner-restricted password file.
+  Its mutating full rehearsal requires an email-matched disposable-tenant
+  confirmation and refuses the reusable Silverline demo account.
+- The clean-demo E2E executes the full operational smoke branch against the
+  real FastAPI routes with only the external verifier injected from test code.
 - The Interfaze workflow runs the complete server suite and five focused WebUI
   suites, checks `uv.lock`, installs wheel and sdist in clean environments, and
   builds/boots the Docker image.

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Exercise a provisioned, empty Interfaze tenant over its public HTTP API.
 
-The script never accepts a password value on the command line. Candidate data
-is loaded separately with ``python -m server import-candidates`` because it is
-a private backend corpus, not tenant or WebUI data. CI exercises that import
-and the injected deterministic verifier in ``test_clean_demo_e2e.py``; this
-command is the equivalent post-deploy gate using the configured live verifier.
+The default mode is read-only and never changes the target tenant. The script
+never accepts a password value on the command line. Candidate data is loaded
+separately with ``python -m server import-candidates`` because it is a private
+backend corpus, not tenant or WebUI data. Full mode is destructive release
+rehearsal for an explicitly confirmed disposable tenant only.
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ OPERATIONAL_COLLECTIONS = (
     "/api/v1/outreach/campaigns",
 )
 INITIAL_EMPTY_COLLECTIONS = ("/api/v1/products", *OPERATIONAL_COLLECTIONS)
+PROTECTED_DEMO_EMAILS = frozenset({"efe@anexa-arelvia.com"})
 
 
 class SmokeFailure(RuntimeError):
@@ -134,7 +135,28 @@ def _choose_source(client: ApiClient, requested: str | None) -> str:
     return available[0]
 
 
+def _mutation_mode(args: argparse.Namespace) -> bool:
+    mode = getattr(args, "mode", "read-only")
+    if mode not in {"read-only", "full"}:
+        raise SmokeFailure(f"unsupported smoke mode: {mode!r}")
+    if mode == "read-only":
+        return False
+    email = args.email.strip().casefold()
+    confirmation = str(getattr(args, "confirm_disposable_tenant", "") or "").strip().casefold()
+    if email in PROTECTED_DEMO_EMAILS:
+        raise SmokeFailure(
+            "full smoke cannot mutate the protected demo tenant; provision a disposable smoke tenant"
+        )
+    if not confirmation or confirmation != email:
+        raise SmokeFailure(
+            "full smoke requires the disposable tenant confirmation "
+            "(--confirm-disposable-tenant) to exactly match --email"
+        )
+    return True
+
+
 def run(args: argparse.Namespace) -> None:
+    mutating = _mutation_mode(args)
     anonymous = ApiClient(args.base_url)
     status, session = anonymous.request("POST", "/api/v1/auth/login", payload={
         "email": args.email,
@@ -143,7 +165,11 @@ def run(args: argparse.Namespace) -> None:
     _expect(status, 200, "login")
     client = ApiClient(args.base_url, session["access_token"])
 
-    _assert_empty(client, INITIAL_EMPTY_COLLECTIONS, phase="before catalog import")
+    _assert_empty(client, INITIAL_EMPTY_COLLECTIONS, phase="clean tenant check")
+    if not mutating:
+        print("clean demo smoke passed (read-only empty-tenant check)")
+        return
+
     catalog = (
         b"product_name,category,aliases\n"
         b"Release gate built-in oven,Ovens,oven;electric oven\n"
@@ -165,10 +191,6 @@ def run(args: argparse.Namespace) -> None:
         OPERATIONAL_COLLECTIONS,
         phase="after catalog and backend candidate import",
     )
-    if args.empty_only:
-        print("clean demo smoke passed (empty tenant + product import)")
-        return
-
     source_id = _choose_source(client, args.source_id)
     status, campaign = client.request("POST", "/api/v1/research-campaigns", payload={
         "name": "Release gate appliance buyers",
@@ -225,15 +247,21 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--email", required=True)
     result.add_argument("--password-file", required=True, type=Path)
     result.add_argument(
+        "--mode",
+        choices=("read-only", "full"),
+        default="read-only",
+        help="read-only by default; full irreversibly mutates a disposable tenant",
+    )
+    result.add_argument(
+        "--confirm-disposable-tenant",
+        metavar="EMAIL",
+        help="required in full mode and must exactly match --email",
+    )
+    result.add_argument(
         "--source-id",
         help="configured verifier source; defaults to the first available",
     )
     result.add_argument("--country", default="DE", help="ISO alpha-2 target country (default: DE)")
-    result.add_argument(
-        "--empty-only",
-        action="store_true",
-        help="stop after empty-state and product-import checks (CI research runs in pytest)",
-    )
     return result
 
 
