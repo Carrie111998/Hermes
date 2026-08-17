@@ -31,6 +31,13 @@ def test_production_webui_has_no_mock_runtime():
     assert client.get("/js/mocks/seed.js").status_code == 404
 
 
+def test_served_index_does_not_advertise_mock_mode():
+    _, client, _, _ = make_client()
+    index = client.get("/")
+    assert index.status_code == 200
+    assert "mock mode" not in index.text.casefold()
+
+
 def test_source_picker_is_catalog_driven_and_admin_copy_is_distinct():
     _, client, _, _ = make_client()
     picker = client.get("/js/pages/research-source-picker.js").text

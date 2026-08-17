@@ -1,10 +1,9 @@
 /* ============================================================
    interfaze-agent — real-backend adapters.
 
-   Per-route shims between the UI's mock-era contract and the real
-   interfaze-api backend (server/WEBUI_CONNECTION_PRD.md §3.3).
-   Consulted only on the real path in api.js; mock handlers keep the
-   original shapes. Keyed by logical route name.
+   Per-route shims between the UI's original contract and the real
+   interfaze-api backend (server/WEBUI_CONNECTION_PRD.md §3.3), keyed by
+   logical route name.
 
    Cross-cutting rules handled here:
      - DataPatch envelope: company/onboarding/brain PATCH routes take

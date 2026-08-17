@@ -218,7 +218,7 @@ function reviewActions(message, handlers) {
 /**
  * Full-width, one-message review surface.
  * `handlers` carries view context and actions so the component remains usable
- * with both the real API adapter and the deterministic mock store.
+ * with the real API adapter and deterministic test fixtures.
  */
 export function reviewCard(message, handlers = {}) {
   const position = Math.max(1, Number(handlers.position) || 1);

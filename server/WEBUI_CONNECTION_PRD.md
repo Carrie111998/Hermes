@@ -23,10 +23,10 @@ behavior, and cross-tenant denial.
 
 Phase 4 added real multipart document upload with the configured server-side size limit,
 authenticated CSV blob downloads, WebUI-shaped pipeline/market/dashboard analytics, the promoted
-onboarding/admin/WhatsApp convenience routes, and tenant-scoped list filtering. `MOCK_ROUTES` now
-contains only the dormant agent-bridge probes. Qualification covers real file persistence and 413s,
-analytics contracts, filters, promoted-route tenant isolation, cross-tenant export denial, and a
-headless Edge hybrid browser pass across the Phase 4 user flows.
+onboarding/admin/WhatsApp convenience routes, and tenant-scoped list filtering. The WebUI now uses
+only real API routes. Qualification covers real file persistence and 413s, analytics contracts,
+filters, promoted-route tenant isolation, cross-tenant export denial, and a headless Edge browser
+pass across the Phase 4 user flows.
 
 ---
 
@@ -39,12 +39,11 @@ The SPA in `server/webui/` is the customer dashboard that [ROADMAP.md](../ROADMA
   the frontend feature modules that `webui/js/pages/` implements.
 - The backend (`server/`, FastAPI, console script `interfaze-api`, default `127.0.0.1:8000`)
   implements **216/216** spec routes, OpenAPI-verified ([STATUS.md](STATUS.md), 2026-07-12).
-- The UI now runs in **hybrid mode** against the real backend. Built-in mocks remain only for the
-  dormant `agent.capabilities` and `agent.status` probes.
+- The UI uses the real backend exclusively; the deleted fixture runtime is not part of the served
+  bundle.
 
-**Goal:** serve the UI from the `interfaze-api` process and connect it to the real API in
-**hybrid mode** — real backend where the spec is implemented, mocks for UI-extra routes — plus a
-new **SSE chat bridge** for the dashboard's "Ask Hermes" widget.
+**Goal:** serve the UI from the `interfaze-api` process and connect it to the real API, plus a new
+**SSE chat bridge** for the dashboard's "Ask Hermes" widget.
 
 ### Target architecture (one process, one origin)
 
@@ -124,11 +123,11 @@ Response/request shape reconciliation remains centralized in `api.js` and `adapt
 ### 3.2 Per-group route status
 
 Legend: **EXISTS** = paths match · **ADAPTED** = real route with client normalization ·
-**UI-STUB** = intentionally mocked dormant route.
+**NOT SERVED** = no current dashboard capability.
 
 | UI group (api.js) | Routes | Backend | Status | Group-specific notes |
 |---|---|---|---|---|
-| auth | 6 | [routes/auth.py](routes/auth.py) | PARTIAL | Login returns `{access_token, refresh_token, token_type, expires_in}`; UI expects `{token, user, company}` → composite adapter (§3.3.4). `/auth/me` returns flat principal vs mock's `{user, company}`. |
+| auth | 6 | [routes/auth.py](routes/auth.py) | PARTIAL | Login returns `{access_token, refresh_token, token_type, expires_in}`; UI expects `{token, user, company}` → composite adapter (§3.3.4). `/auth/me` returns a flat principal rather than the UI's `{user, company}` composite. |
 | admin companies | 8 | [routes/admin.py](routes/admin.py) | ADAPTED | Bare-array lists (§3.3.1). `CompanyCreate`/`CompanyPatch` are `extra="forbid"`: `website`, `plan` and every other profile attribute are packed into `data` by `adaptRequest` and flattened back by `adminCompany`. `CompanyPatch` has no `status` — lifecycle uses activate/disable/suspend. |
 | admin users | 8 | routes/admin.py | ADAPTED | `UserCreate`/`UserPatch` are `extra="forbid"` and store no display name: `name` rides in `data`. Roles are `admin`\|`customer` only. Create requires a ≥10-char password (no password ⇒ no usable credential; Supabase mode 422s). reset-password requires `{password}` and returns 204 → `null` through api.js, so the page owns the confirmation text. |
 | admin errors/logs | 2 | [routes/admin.py](routes/admin.py) | EXISTS | Admin-only, secret-safe operational summaries promoted in Phase 4. |
@@ -152,7 +151,7 @@ Legend: **EXISTS** = paths match · **ADAPTED** = real route with client normali
 | whatsapp messages | 7 | routes/outreach.py | EXISTS | |
 | linkedin | 7 | routes/outreach.py | EXISTS | |
 | agent-runs | 8 | [routes/agent_runs.py](routes/agent_runs.py) | EXISTS | Poll-based (`/events`, `/logs`) — matches UI polling. |
-| agent capabilities/status | 2 | — | **UI-STUB** | Only consumed by dormant `agent-bridge.js` (`config.agentAdapter.enabled = false`); intentionally mocked. |
+| agent capabilities/status | 2 | — | **NOT SERVED** | No current dashboard caller; these routes are not part of the served bundle. |
 | exports | 7 | routes/operations.py | ADAPTED | Authenticated CSV `FileResponse` downloads use fetch → blob → object URL. |
 | data-sources | 8 | routes/operations.py | EXISTS | |
 | activity | 5 | routes/operations.py | EXISTS | |
@@ -160,7 +159,8 @@ Legend: **EXISTS** = paths match · **ADAPTED** = real route with client normali
 
 **Promotion decision (Phase 4):** nine convenience routes are now PRODUCT.md contracts:
 three onboarding steps, two admin operational views, three WhatsApp profile operations, and the
-dashboard analytics composite. `GET /agent/capabilities` and `GET /agent/status` remain UI stubs.
+dashboard analytics composite. `GET /agent/capabilities` and `GET /agent/status` are not dashboard
+routes.
 
 ### 3.3 Cross-cutting contract gaps (affect every group — fix once, centrally)
 
@@ -185,26 +185,11 @@ dashboard analytics composite. `GET /agent/capabilities` and `GET /agent/status`
 
 ---
 
-## 4. Hybrid Mock/Real Mechanism (UI-side)
+## 4. Real API Mechanism (UI-side)
 
-Dispatch is keyed by **logical route name**, keeping the hybrid boundary explicit and auditable:
-
-1. **Mode + explicit mock set** in `api.js`:
-   ```js
-   config.mode = 'hybrid';            // 'mock' | 'hybrid' | 'real'
-   export const MOCK_ROUTES = new Set([
-     'agent.capabilities', 'agent.status',
-   ]);
-   ```
-   Gate: `const useMock = config.mode === 'mock' || (config.mode === 'hybrid' && MOCK_ROUTES.has(name));`
-   (~6-line change; exact logical names to be finalized against the route table during implementation.)
-2. **Never** try-real-then-fallback-to-mock: a legitimate 404 ("lead not found") would silently
-   flip to demo data and mask real bugs.
-3. **New `js/adapters.js`** consulted only on the real path, keyed by name/prefix, each entry
-   `{request(body), response(payload)}`. Contents = the four adapters from §3.3.1–4.
-4. **Boot changes** (`main.js` / `session.js`): set `config.authHeader`; keep the mock reseed
-   (`reset()`) only when `config.mode === 'mock'`. `login.js`'s demo-credentials note checks
-   `config.useMocks` today → update to `config.mode === 'mock'`.
+`api.js` dispatches every logical route to the real backend and applies the adapters from §3.3
+where request or response shapes differ. There is no client mode switch or fixture fallback: a
+real 404 (for example, "lead not found") remains an error rather than becoming demo data.
 
 ---
 
@@ -293,11 +278,11 @@ Plus SSE comment keepalives (`: ping`) every ~15 s; headers `Cache-Control: no-c
 
 | # | Change | File |
 |---|---|---|
-| 1 | ✅ `config.mode` + agent-stub-only `MOCK_ROUTES`; list-wrap; errors; multipart/blob transports | js/api.js |
+| 1 | ✅ Real-route dispatch; list-wrap; errors; multipart/blob transports | js/api.js |
 | 2 | ✅ Adapter layer (envelopes, auth composite, lead-map body, analytics/integration shapes) | js/adapters.js |
 | 3 | ✅ `Authorization: Bearer` in `hermesApi()` | js/hermes-client.js |
-| 4 | ✅ Set `config.authHeader` at boot; preserve the shared hybrid view-model seed | js/main.js, js/session.js |
-| 5 | ✅ Demo-note check `useMocks` → `mode === 'mock'` | js/pages/login.js |
+| 4 | ✅ Set `config.authHeader` at boot; preserve the shared real view-model state | js/main.js, js/session.js |
+| 5 | ✅ Remove the obsolete demo-credentials mode check | js/pages/login.js |
 | 6 | ✅ Gate Ask Hermes on the server-injected `chat_enabled` value | js/pages/dashboard.js |
 
 ## 8. Security
@@ -311,16 +296,16 @@ Plus SSE comment keepalives (`: ping`) every ~15 s; headers `Cache-Control: no-c
   header limitation).
 - **Upload limit** enforced server-side (`max_upload_bytes`), not just injected into the page.
 - **CORS** list stays dev-only; production is same-origin.
-- Mock data ships in the bundle (harmless demo content) — acceptable; it never touches the backend.
+- The served bundle contains no fixture data or alternate client runtime.
 
 ## 9. Phased Rollout
 
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| **1 — Serve + Auth** | Static mount, placeholders, hybrid gate, adapters, real login/me/company | Login against real API; dashboard renders; company profile round-trips (PATCH 200, not 422) |
+| **1 — Serve + Auth** | Static mount, placeholders, adapters, real login/me/company | Login against real API; dashboard renders; company profile round-trips (PATCH 200, not 422) |
 | **2 — Core data** ✅ | Leads, scans, research, contacts, onboarding (5 spec steps), outreach, agent-runs polling | Silverline demo flow (PRODUCT.md §11) runs against the real API with `StubRunExecutor` |
 | **3 — Chat bridge** ✅ | §5 endpoints + `chat_enabled=true` + widget activation | Ask Hermes streams tokens end-to-end; 409 on concurrent stream; cross-tenant test fails closed |
-| **4 — Long tail** ✅ | Uploads (FormData), exports (blob download), analytics shape reconciliation, promoted UI-extras, server-side filters | `MOCK_ROUTES` contains only agent-bridge stubs; full server suite passes |
+| **4 — Long tail** ✅ | Uploads (FormData), exports (blob download), analytics shape reconciliation, promoted UI-extras, server-side filters | Real API-only WebUI; full server suite passes |
 
 ## 10. Testing
 
@@ -329,15 +314,15 @@ Plus SSE comment keepalives (`: ping`) every ~15 s; headers `Cache-Control: no-c
   substituted, no literal `__CSRF_TOKEN_JSON__`; GET `/js/main.js` → 200; GET `/api/v1/...` still
   wins over the mount), chat-bridge tests with a fake agent (token order, `done` shape, 404/409,
   stream-id single-use, tenant isolation).
-- **UI:** with `config.mode='hybrid'`, a scripted browser pass over Phase-appropriate pages;
-  explicit check that a real 404 surfaces as an error (no silent mock fallback).
+- **UI:** a scripted browser pass over Phase-appropriate pages against the real backend; explicit
+  check that a real 404 surfaces as an error.
 - **Contract:** regenerate OpenAPI and re-run the PRODUCT.md 216-route comparison after any
   backend additions.
 
 ## 11. Risks
 
-1. **`DataPatch extra="forbid"` 422s are invisible under mocks** — the most likely "worked in demo,
-   broke on real" failure. Covered by adapter + Phase-1 exit criterion.
+1. **`DataPatch extra="forbid"` 422s require client adaptation** — covered by the adapter and
+   Phase-1 exit criterion.
 2. **`/health` already returns 200**, so availability must include the injected `chat_enabled`
    flag and the health response's `chat_enabled` field. Phase 3 implements both checks.
 3. **EventSource cannot authenticate** — the stream_id-capability design is mandatory; without the
@@ -363,7 +348,6 @@ assets/   profile.jpeg  world.svg
 css/      tokens.css  app.css
 js/       main.js  router.js  shell.js  ui.js  api.js  adapters.js  real-state.js  session.js  icons.js
           hermes-client.js  agent-bridge.js
-js/mocks/ handlers.js  seed.js  db.js          (kept — required by hybrid mode)
 js/pages/ _page-utils.js  access-pending.js  admin.js  agent-runs.js  analytics.js
           company-brain.js  contacts.js  custom-outreach.js  dashboard.js  integrations.js
           lead-map.js  leads.js  login.js  onboarding.js  outreach.js  settings.js
@@ -378,7 +362,7 @@ Not copied from the source repo (superseded by this backend): `server.py`, `api/
 |---|---|
 | UI route table + client config hooks | `webui/js/api.js` |
 | Chat client (SSE contract to preserve) | `webui/js/hermes-client.js` |
-| Mock response shapes to mirror | `webui/js/mocks/handlers.js` |
+| Historical response-shape reference | source UI repository history (not shipped) |
 | Legacy SSE server (bridge reference) | source repo `api/streaming.py` |
 | Placeholder substitution reference | source repo `scripts/static_webui_preview.py` |
 | API spec (authoritative) | [PRODUCT.md §7](../PRODUCT.md) |

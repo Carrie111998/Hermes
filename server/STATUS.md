@@ -23,8 +23,8 @@ Status as of 2026-07-16.
 - Analytics, CSV exports, data sources, activity logs, run logs/events.
 - SQLite local backend and Supabase Postgres/RLS/Storage deployment path.
 - Installable `interfaze-api` entry point and packaged server/company packs.
-- Packaged same-origin WebUI that uses the real API by default, with mock mode
-  available only when explicitly selected for frontend development.
+- Packaged same-origin WebUI that uses the real API only; frontend development
+  exercises the same backend contract as production.
 - Tenant-scoped Ask Hermes SSE bridge with restricted agent turns, durable
   chat history, single-use stream capabilities, and concurrent-turn control.
 - Real WebUI multipart uploads, authenticated CSV downloads, dashboard-shaped
