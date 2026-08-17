@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
+import { createSpokenReplyDedupe } from '@/lib/spoken-reply'
+import type { SpokenReplyDedupe } from '@/lib/spoken-reply'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -62,7 +64,15 @@ export function useComposerVoice({
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
-  const lastSpokenIdRef = useRef<string | null>(null)
+  // "Already spoken" bookkeeping for reply TTS: same-reply detection survives
+  // the end-of-turn id rewrite (renderer stream id → durable backend id).
+  const lastSpokenRef = useRef<SpokenReplyDedupe | null>(null)
+
+  if (lastSpokenRef.current === null) {
+    lastSpokenRef.current = createSpokenReplyDedupe()
+  }
+
+  const dedupe = lastSpokenRef.current
   const ownsWakeIndicatorRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
 
@@ -78,13 +88,22 @@ export function useComposerVoice({
     const messages = $messages.get()
     const last = messages.findLast(m => m.role === 'assistant' && !m.hidden)
 
-    if (!last || last.id === lastSpokenIdRef.current) {
+    if (!last) {
       return null
     }
 
     const text = chatMessageText(last).trim()
 
     if (!text) {
+      return null
+    }
+
+    // Same text, new id → the committed rewrite of an already-spoken reply
+    // (renderer stream id → durable backend id). `isSpoken` absorbs the new
+    // id; without it the row would fail the id check at the playback-idle
+    // edge and the reply would be spoken a second time (auto-speak "plays
+    // twice"). A genuinely new reply has different text and falls through.
+    if (dedupe.isSpoken(last.id, text)) {
       return null
     }
 
@@ -100,14 +119,14 @@ export function useComposerVoice({
    * in order — narration interims AND the final answer, not just whichever
    * bubble happens to be last. See `collectUnspokenTurnSpeech`.
    */
-  const pendingTurnResponse = () => collectUnspokenTurnSpeech($messages.get(), lastSpokenIdRef.current)
+  const pendingTurnResponse = () => collectUnspokenTurnSpeech($messages.get(), dedupe.lastId())
 
   const consumePendingResponse = () => {
     const messages = $messages.get()
     const last = messages.findLast(m => m.role === 'assistant' && !m.hidden)
 
     if (last) {
-      lastSpokenIdRef.current = last.id
+      dedupe.markSpoken(last.id, chatMessageText(last))
     }
   }
 
