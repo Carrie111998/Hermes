@@ -1585,6 +1585,11 @@ def _normalize_loaded_kimi_entry(provider_id: str, entry: Dict[str, Any]) -> Dic
 
     Read-only repair, applied on load only (never written back):
 
+    * Because ``KIMI_BASE_URL`` always wins (matching ``_resolve_kimi_base_url``
+      semantics), a read result is a function of the current environment: the
+      same persisted entry can report different URLs across processes when the
+      env differs. Nothing is written back, so a session-scoped env override is
+      never baked into ``auth.json``.
     * ``base_url`` missing, or equal to the provider's registry default, or
       equal to the legacy ``KIMI_CODE_BASE_URL + "/v1"`` variant → re-resolve
       from the key prefix (``KIMI_BASE_URL`` env always wins).
@@ -1609,6 +1614,9 @@ def _normalize_loaded_kimi_entry(provider_id: str, entry: Dict[str, Any]) -> Dic
         or entry.get("api_key")
         or ""
     ).strip()
+    if not api_key:
+        # No credential to infer an endpoint from — leave the entry untouched.
+        return entry
     if stored and not env_url:
         stale = {(pconfig.inference_base_url or "").rstrip("/")}
         if api_key.startswith("sk-kimi-"):

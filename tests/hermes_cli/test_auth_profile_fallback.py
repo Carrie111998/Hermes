@@ -474,6 +474,24 @@ def test_runtime_api_key_field_drives_normalization(profile_env):
     assert entries[0]["base_url"] == KIMI_CODE_URL
 
 
+def test_fully_empty_credential_entry_left_untouched(profile_env):
+    """An entry with no credential at all has nothing to infer a URL from;
+    the load-time repair must not even fill a missing base_url for it."""
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "kimi-coding": [_kimi_entry(
+            access_token="",
+            runtime_api_key=None,
+            api_key=None,
+            base_url=None,
+        )],
+    }))
+
+    from hermes_cli.auth import read_credential_pool
+
+    entries = read_credential_pool("kimi-coding")
+    assert entries[0].get("base_url") is None
+
+
 def test_non_kimi_provider_entries_untouched(profile_env):
     _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
         "zai": [{
