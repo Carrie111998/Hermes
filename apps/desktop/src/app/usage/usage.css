@@ -1,0 +1,194 @@
+.usage-deck {
+  isolation: isolate;
+}
+
+.usage-rail {
+  position: relative;
+}
+
+.usage-rail::before,
+.usage-rail::after {
+  border-color: var(--ui-green);
+  content: '';
+  height: 0.625rem;
+  opacity: 0.7;
+  pointer-events: none;
+  position: absolute;
+  width: 0.625rem;
+  z-index: 1;
+}
+
+.usage-rail::before {
+  border-block-start-style: solid;
+  border-inline-start-style: solid;
+  border-width: 1px;
+  inset-block-start: -1px;
+  inset-inline-start: -1px;
+}
+
+.usage-rail::after {
+  border-block-end-style: solid;
+  border-inline-end-style: solid;
+  border-width: 1px;
+  inset-block-end: -1px;
+  inset-inline-end: -1px;
+}
+
+.usage-led {
+  animation: usage-led-pulse 1.8s steps(2, end) infinite;
+}
+
+.usage-chart-bar,
+.usage-share-bar,
+.usage-token-segment {
+  transition-duration: 150ms;
+  transition-property: height, opacity, transform, width;
+  transition-timing-function: ease-out;
+}
+
+.usage-chart-bar:hover,
+.usage-chart-bar:focus {
+  opacity: 0.75;
+  transform: translateY(-1px);
+}
+
+.usage-chart-bar:focus-visible {
+  outline: 1px solid var(--ui-text-primary);
+  outline-offset: 2px;
+}
+
+.usage-disclosure {
+  transition:
+    background-color 100ms ease-out,
+    border-color 100ms ease-out,
+    transform 100ms ease-out;
+}
+
+.usage-disclosure:hover,
+.usage-disclosure:focus-visible {
+  background-color: var(--ui-row-hover-background);
+  border-color: var(--ui-green);
+  outline: none;
+}
+
+.usage-disclosure:active {
+  transform: translateY(1px);
+}
+
+.usage-heat-cell {
+  background-color: transparent;
+  border: 1px solid var(--ui-stroke-secondary);
+  transition:
+    background-color 120ms ease-out,
+    border-color 120ms ease-out,
+    transform 120ms ease-out;
+}
+
+.usage-heat-cell[data-level='1'] {
+  background-color: color-mix(in srgb, var(--ui-green) 22%, transparent);
+}
+
+.usage-heat-cell[data-level='2'] {
+  background-color: color-mix(in srgb, var(--ui-green) 42%, transparent);
+}
+
+.usage-heat-cell[data-level='3'] {
+  background-color: color-mix(in srgb, var(--ui-green) 64%, transparent);
+}
+
+.usage-heat-cell[data-level='4'] {
+  background-color: color-mix(in srgb, var(--ui-green) 86%, transparent);
+}
+
+.usage-heat-cell:hover,
+.usage-heat-cell:focus-visible {
+  border-color: var(--ui-green);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.usage-token-segment[data-tone='input'] {
+  background-color: var(--ui-green);
+}
+
+.usage-token-segment[data-tone='cache-read'] {
+  background-color: var(--ui-cyan);
+}
+
+.usage-token-segment[data-tone='cache-write'] {
+  background-color: var(--ui-blue);
+}
+
+.usage-token-segment[data-tone='output'] {
+  background-color: var(--ui-purple);
+}
+
+.usage-token-segment[data-tone='reasoning'] {
+  background-color: var(--ui-yellow);
+}
+
+.usage-token-segment:focus-visible {
+  outline: 1px solid var(--ui-text-primary);
+  outline-offset: -2px;
+}
+
+.usage-status[data-tone='actual'] {
+  color: var(--ui-green);
+}
+
+.usage-status[data-tone='estimated'] {
+  color: var(--ui-yellow);
+}
+
+.usage-status[data-tone='included'] {
+  color: var(--ui-cyan);
+}
+
+.usage-status[data-tone='mixed'] {
+  color: var(--ui-purple);
+}
+
+.usage-status[data-tone='unavailable'],
+.usage-status[data-tone='error'] {
+  color: var(--ui-red);
+}
+
+.usage-status[data-tone='neutral'] {
+  color: var(--ui-text-tertiary);
+}
+
+.usage-table-scroll {
+  scrollbar-color: var(--ui-stroke-secondary) transparent;
+  scrollbar-width: thin;
+}
+
+@media (width <= 40rem) {
+  .usage-deck button:not(.usage-chart-bar, .usage-disclosure),
+  .usage-deck input,
+  .usage-deck [role='combobox'] {
+    min-height: 1.75rem;
+  }
+}
+
+@keyframes usage-led-pulse {
+  0%,
+  62% {
+    opacity: 1;
+  }
+  63%,
+  100% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .usage-led,
+  .usage-chart-bar,
+  .usage-share-bar,
+  .usage-token-segment,
+  .usage-disclosure,
+  .usage-heat-cell {
+    animation: none;
+    transition: none;
+  }
+}

@@ -138,13 +138,15 @@ import {
   MESSAGING_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
-  SKILLS_ROUTE
+  SKILLS_ROUTE,
+  USAGE_ROUTE
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
+import { resolveSidebarNavLabel } from './nav-label'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
@@ -219,6 +221,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="watch" {...props} />,
     route: CRON_ROUTE,
     keybindActionId: 'nav.cron'
+  },
+  {
+    id: 'usage',
+    label: '',
+    icon: props => <Codicon name="graph-line" {...props} />,
+    route: USAGE_ROUTE
   }
 ]
 
@@ -1454,6 +1462,13 @@ export function ChatSidebar({
               {[...SIDEBAR_NAV, ...contributedNav].map(item => {
                 const isInteractive = Boolean(item.action) || Boolean(item.route)
 
+                const navLabel = resolveSidebarNavLabel({
+                  fallback: item.label,
+                  id: item.id,
+                  sidebarNav: s.nav,
+                  usageLabel: t.commandCenter.sections.usage
+                })
+
                 const active =
                   (item.id === 'skills' && currentView === 'skills') ||
                   (item.id === 'messaging' && currentView === 'messaging') ||
@@ -1496,15 +1511,15 @@ export function ChatSidebar({
                       item.keybindActionId
                         ? {
                             children: (
-                              <TipKeybindLabel actionId={item.keybindActionId} text={s.nav[item.id] ?? item.label} />
+                              <TipKeybindLabel actionId={item.keybindActionId} text={navLabel} />
                             )
                           }
-                        : (s.nav[item.id] ?? item.label)
+                        : navLabel
                     }
                     type="button"
                   >
                     <item.icon className="size-4 shrink-0 text-[color-mix(in_srgb,currentColor_72%,transparent)]" />
-                    <span className="min-w-0 flex-1 truncate">{s.nav[item.id] ?? item.label}</span>
+                    <span className="min-w-0 flex-1 truncate">{navLabel}</span>
                     {isNewSession && (
                       <KbdGroup
                         className={cn('ml-auto opacity-55', newSessionKbdFlash && 'opacity-100!')}
@@ -1522,7 +1537,7 @@ export function ChatSidebar({
                     {isNewSession || item.route ? (
                       <ContextMenu>
                         <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
-                        <ContextMenuContent aria-label={s.nav[item.id] ?? item.label}>
+                        <ContextMenuContent aria-label={navLabel}>
                           <SplitSubmenu
                             kit={CONTEXT_SPLIT_KIT}
                             label={s.row.openInSplit}

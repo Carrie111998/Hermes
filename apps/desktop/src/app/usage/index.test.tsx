@@ -1,0 +1,518 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  usageMeterDetailsFixture,
+  usageMeterRecentFixture,
+  usageMeterSummaryFixture,
+  usageOverviewFixture
+} from './fixtures.test-util'
+
+import { UsageView } from './index'
+
+const gatewayMock = vi.hoisted(() => vi.fn())
+
+function responseFor(method: string, params: Record<string, unknown>) {
+  if (method === 'usage.overview') {
+    return { ...usageOverviewFixture, days: Number(params.days) }
+  }
+
+  if (method === 'usage.meter.summary') {
+    return usageMeterSummaryFixture
+  }
+
+  if (method === 'usage.meter.details') {
+    return {
+      ...usageMeterDetailsFixture,
+      end_ts: params.scope === 'month' ? usageMeterSummaryFixture.month_end_ts : null,
+      scope: params.scope,
+      start_ts: params.scope === 'month' ? usageMeterSummaryFixture.month_start_ts : null
+    }
+  }
+
+  if (method === 'usage.meter.recent') {
+    return usageMeterRecentFixture
+  }
+
+  throw new Error(`Unexpected RPC: ${method}`)
+}
+
+function renderUsage() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } }
+  })
+
+  render(
+    <QueryClientProvider client={client}>
+      <UsageView requestGateway={gatewayMock} />
+    </QueryClientProvider>
+  )
+
+  return client
+}
+
+beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+    configurable: true,
+    value: vi.fn()
+  })
+  gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) =>
+    Promise.resolve(responseFor(method, params))
+  )
+})
+
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+})
+
+describe('UsageView', () => {
+  it('uses accessible labels and themed tips instead of native title attributes across every deck', async () => {
+    renderUsage()
+
+    const usageDeck = await screen.findByRole('heading', { name: 'Usage deck' })
+    const renderedSurface = usageDeck.ownerDocument.body
+
+    expect(renderedSurface.querySelector('[title]')).toBeNull()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+    await screen.findByRole('heading', { name: 'Route matrix' })
+    expect(renderedSurface.querySelector('[title]')).toBeNull()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Call ledger' }))
+    await screen.findByRole('heading', { name: 'Captured call ledger' })
+    expect(renderedSurface.querySelector('[title]')).toBeNull()
+  })
+
+  it('delegates vertical scrolling to the surrounding pane owner', async () => {
+    renderUsage()
+
+    const heading = await screen.findByRole('heading', { name: 'Usage deck' })
+    const usageSurface = heading.closest('main')
+
+    expect(usageSurface).toBeTruthy()
+    expect(usageSurface?.classList.contains('overflow-y-auto')).toBe(false)
+    expect(usageSurface?.classList.contains('overflow-auto')).toBe(false)
+  })
+
+  it('loads all telemetry surfaces and renders macro plus cost-truth data', async () => {
+    renderUsage()
+
+    expect(await screen.findByRole('heading', { name: 'Usage deck' })).toBeTruthy()
+    expect(await screen.findByText('1.7M')).toBeTruthy()
+    expect(screen.getAllByText('$32.11').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('$34.87').length).toBeGreaterThan(0)
+    expect(screen.getByText('estimate $11.37')).toBeTruthy()
+    expect(screen.getByText('Session provider actual')).toBeTruthy()
+    expect(screen.getByText('Price unavailable')).toBeTruthy()
+    expect(screen.getByText('18% of output')).toBeTruthy()
+    expect(screen.queryByLabelText(/Reasoning:/)).toBeNull()
+
+    await waitFor(() => {
+      expect(gatewayMock).toHaveBeenCalledWith('usage.overview', { days: 30 })
+      expect(gatewayMock).toHaveBeenCalledWith('usage.meter.summary', {})
+    })
+    expect(gatewayMock).not.toHaveBeenCalledWith('usage.meter.details', expect.anything())
+    expect(gatewayMock).not.toHaveBeenCalledWith('usage.meter.recent', expect.anything())
+  })
+
+  it('changes the session insight period without conflating the meter scope', async () => {
+    renderUsage()
+    await screen.findByText('Usage deck')
+
+    fireEvent.click(screen.getByRole('button', { name: '90d' }))
+
+    await waitFor(() => expect(gatewayMock).toHaveBeenCalledWith('usage.overview', { days: 90 }))
+    expect(gatewayMock).toHaveBeenCalledWith('usage.meter.summary', {})
+  })
+
+  it('sorts and filters the route matrix, then drills into matching captured calls', async () => {
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+    expect(await screen.findByRole('heading', { name: 'Route matrix' })).toBeTruthy()
+    expect(await screen.findByText('Hermes-4-405B')).toBeTruthy()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search usage routes' }), {
+      target: { value: 'openai' }
+    })
+    expect(screen.queryByText('Hermes-4-405B')).toBeNull()
+    expect(screen.getByText('gpt-5.6-sol')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /Inspect recent calls for openai-codex\/gpt-5.6-sol/ }))
+
+    expect(await screen.findByRole('heading', { name: 'Captured call ledger' })).toBeTruthy()
+    await waitFor(() => expect(gatewayMock).toHaveBeenCalledWith('usage.meter.recent', { limit: 500 }))
+    expect(screen.getAllByText('gpt-5.6-sol').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Hermes-4-405B')).toBeNull()
+  })
+
+  it('micromanages the call ledger with profile filters and full disclosure details', async () => {
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Call ledger' }))
+
+    expect(await screen.findByText('gpt-5.6-sol')).toBeTruthy()
+    fireEvent.click(screen.getByRole('combobox', { name: 'Profile filter' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'research' }))
+
+    expect(screen.queryByText('gpt-5.6-sol')).toBeNull()
+    expect(screen.getByText('Hermes-4-405B')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /Hermes-4-405B/ }))
+    expect(screen.getByText('Session ID')).toBeTruthy()
+    expect(screen.getByText('20260811_161955_bb22cc')).toBeTruthy()
+    expect(screen.getByText('pricing_catalog')).toBeTruthy()
+    expect(screen.getByText('41,000')).toBeTruthy()
+  })
+
+  it('renders a production-shaped empty overview without fabricating activity', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          activity: { by_hour: [] },
+          daily_series: [],
+          empty: true,
+          models: [],
+          overview: {},
+          platforms: [],
+          skills: {
+            summary: {
+              distinct_skills_used: 0,
+              total_skill_actions: 0,
+              total_skill_edits: 0,
+              total_skill_loads: 0
+            },
+            top_skills: []
+          },
+          tools: [],
+          top_sessions: []
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    expect(await screen.findByText('No daily activity in this range.')).toBeTruthy()
+    expect(screen.getByText('No model traffic in this range.')).toBeTruthy()
+    expect(screen.getByText('No platform traffic in this range.')).toBeTruthy()
+    expect(within(screen.getByText('Market equiv.').closest('div')!).getByText('—')).toBeTruthy()
+  })
+
+  it('renders absent non-empty overview metrics as unavailable rather than zero', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({ ...usageOverviewFixture, empty: false, overview: {} })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+
+    expect(within(marketCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+    expect(within(screen.getByText('Token volume').closest('div')!).getByText('—')).toBeTruthy()
+  })
+
+  it('adds included-session at-market value to the session market equivalent', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            included_cost_sessions: 1,
+            unknown_cost_sessions: 0,
+            cost_buckets: {
+              estimated: { sessions: 1, cost_usd: 2.17, input_tokens: 18_000, output_tokens: 7_000 },
+              included: {
+                sessions: 1,
+                cost_usd: 0,
+                input_tokens: 84_000,
+                output_tokens: 51_000,
+                at_market_cost_usd: 4.83
+              },
+              unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('$7.00')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: \$7\.00/)).toBeTruthy()
+  })
+
+  it('uses the backend-reconciled market value for a mixed estimated and included session', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            included_cost_sessions: 0,
+            unknown_cost_sessions: 0,
+            cost_buckets: {
+              estimated: {
+                sessions: 1,
+                cost_usd: 2.17,
+                input_tokens: 102_000,
+                output_tokens: 58_000,
+                at_market_cost_usd: 7
+              },
+              included: {
+                sessions: 0,
+                cost_usd: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                at_market_cost_usd: 0
+              },
+              unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('$7.00')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: \$7\.00/)).toBeTruthy()
+  })
+
+  it('renders mixed-session market value as unavailable when backend evidence is explicitly incomplete', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            cost_buckets: {
+              estimated: {
+                sessions: 1,
+                cost_usd: 2.17,
+                input_tokens: 102_000,
+                output_tokens: 58_000,
+                at_market_cost_usd: null
+              },
+              included: {
+                sessions: 0,
+                cost_usd: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                at_market_cost_usd: 0
+              },
+              unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: —/)).toBeTruthy()
+  })
+
+  it('renders the session market equivalent as unavailable when any cost is unknown', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            included_cost_sessions: 1,
+            unknown_cost_sessions: 0,
+            cost_buckets: {
+              estimated: { sessions: 1, cost_usd: 2.17, input_tokens: 18_000, output_tokens: 7_000 },
+              included: {
+                sessions: 1,
+                cost_usd: 0,
+                input_tokens: 84_000,
+                output_tokens: 51_000,
+                at_market_cost_usd: 4.83
+              },
+              unknown: { sessions: 1, cost_usd: 0, input_tokens: 3_000, output_tokens: 900 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: —/)).toBeTruthy()
+  })
+
+  it('does not fabricate a captured zero when every metered call is unpriced', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.meter.summary') {
+        return Promise.resolve({
+          ...usageMeterSummaryFixture,
+          all_time: {
+            ...usageMeterSummaryFixture.all_time,
+            summary: {
+              ...usageMeterSummaryFixture.all_time.summary,
+              calls: 9,
+              estimated_cost_usd: 0,
+              has_unpriced: true,
+              included_calls: 0,
+              priced_calls: 0,
+              unpriced_calls: 9
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const capturedCostLabel = await screen.findByText('Captured estimate')
+
+    expect(within(capturedCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+  })
+
+  it('renders an all-unpriced route cost as unavailable', async () => {
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+
+    const row = (await screen.findByText('unpriced-lab-model')).closest('tr')
+    expect(row).toBeTruthy()
+    expect(within(row!).getByText('—')).toBeTruthy()
+    expect(within(row!).getByText('unavailable')).toBeTruthy()
+  })
+
+  it('renders an included plus unpriced route cost as unavailable', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.meter.details') {
+        return Promise.resolve({
+          ...usageMeterDetailsFixture,
+          routes: [
+            {
+              ...usageMeterDetailsFixture.routes[0],
+              calls: 4,
+              estimated_cost_usd: 0,
+              included_calls: 2,
+              model: 'mixed-route',
+              priced_calls: 0,
+              unpriced_calls: 2
+            }
+          ]
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+
+    const row = (await screen.findByText('mixed-route')).closest('tr')
+    expect(row).toBeTruthy()
+    expect(within(row!).getByText('—')).toBeTruthy()
+    expect(within(row!).getByText('mixed')).toBeTruthy()
+  })
+
+  it('renders a priced plus unpriced route cost as unavailable', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.meter.details') {
+        return Promise.resolve({
+          ...usageMeterDetailsFixture,
+          routes: [
+            {
+              ...usageMeterDetailsFixture.routes[0],
+              calls: 4,
+              estimated_cost_usd: 1.25,
+              included_calls: 0,
+              model: 'partial-priced-route',
+              priced_calls: 2,
+              unpriced_calls: 2
+            }
+          ]
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+
+    const row = (await screen.findByText('partial-priced-route')).closest('tr')
+    expect(row).toBeTruthy()
+    expect(within(row!).getByText('—')).toBeTruthy()
+    expect(within(row!).getByText('mixed')).toBeTruthy()
+  })
+
+  it('labels month route drilldown as a bounded recent-event window', async () => {
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'This month' }))
+    await waitFor(() => expect(gatewayMock).toHaveBeenCalledWith('usage.meter.details', { scope: 'month' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Inspect recent calls for openai-codex\/gpt-5.6-sol/ }))
+
+    expect(await screen.findByText(/Month scope is applied to the newest captured window/)).toBeTruthy()
+  })
+
+  it('searches numeric event identifiers from the live ledger contract', async () => {
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Call ledger' }))
+    const search = await screen.findByRole('textbox', { name: 'Search captured calls' })
+    fireEvent.change(search, { target: { value: '302' } })
+
+    expect(await screen.findByText('Hermes-4-405B')).toBeTruthy()
+    expect(screen.queryByText('gpt-5.6-sol')).toBeNull()
+  })
+
+  it('keeps session analytics usable when the optional installation meter fails', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.meter.summary') {
+        return Promise.reject(new Error('meter disabled'))
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    expect(await screen.findByText('ledger degraded')).toBeTruthy()
+    expect(screen.getByText('install meter unavailable')).toBeTruthy()
+    expect(screen.getByText('Model pressure stack')).toBeTruthy()
+  })
+
+  it('synchronizes all four data surfaces on demand', async () => {
+    renderUsage()
+    await screen.findByText('Usage deck')
+    await waitFor(() => expect(gatewayMock).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+
+    await waitFor(() => expect(gatewayMock.mock.calls.length).toBeGreaterThanOrEqual(6))
+  })
+})

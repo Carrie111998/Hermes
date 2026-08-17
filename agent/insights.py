@@ -20,12 +20,13 @@ import json
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from agent.usage_pricing import (
     CanonicalUsage,
+    estimate_market_equivalent_cost,
     estimate_usage_cost,
     format_cost_label,
     format_duration_compact,
@@ -82,6 +83,29 @@ def _estimate_cost(
         base_url=base_url,
     )
     return float(result.amount_usd or 0.0), result.status
+
+
+def _estimate_at_market_cost(session: Dict[str, Any]) -> Optional[float]:
+    """Published list-price comparison for an included session's token load.
+
+    The original route remains authoritative for billed cost. This comparison
+    deliberately resolves a separate public-price route; an included OAuth
+    route's zero-price entry proves inclusion, not market value. Unknown public
+    pricing remains unavailable rather than becoming a fabricated ``0.0``.
+    """
+    usage = CanonicalUsage(
+        input_tokens=session.get("input_tokens") or 0,
+        output_tokens=session.get("output_tokens") or 0,
+        cache_read_tokens=session.get("cache_read_tokens") or 0,
+        cache_write_tokens=session.get("cache_write_tokens") or 0,
+    )
+    result = estimate_market_equivalent_cost(
+        session.get("model") or "",
+        usage,
+        provider=session.get("billing_provider"),
+        base_url=session.get("billing_base_url"),
+    )
+    return None if result.amount_usd is None else float(result.amount_usd)
 
 
 
@@ -148,7 +172,8 @@ class InsightsEngine:
         Returns:
             Dict with all computed insights
         """
-        cutoff = time.time() - (days * 86400)
+        window_end = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = (window_end - timedelta(days=days - 1)).timestamp()
 
         # Token/cost totals may still sit on the SessionDB's async
         # accounting queue; drain so the report reflects exact counters.
@@ -183,16 +208,19 @@ class InsightsEngine:
                 },
                 "activity": {},
                 "top_sessions": [],
+                "daily_series": self._compute_daily_series(sessions, [], days, window_end),
             }
 
         # Compute insights
-        models = self._compute_model_breakdown(sessions, cutoff, source)
-        overview = self._compute_overview(sessions, message_stats, models)
-        platforms = self._compute_platform_breakdown(sessions)
+        usage = self._reconcile_usage(sessions, cutoff, source)
+        models = self._compute_model_breakdown(sessions, usage)
+        overview = self._compute_overview(sessions, message_stats, usage)
+        platforms = self._compute_platform_breakdown(sessions, usage)
         tools = self._compute_tool_breakdown(tool_usage)
         skills = self._compute_skill_breakdown(skill_usage)
         activity = self._compute_activity_patterns(sessions)
-        top_sessions = self._compute_top_sessions(sessions)
+        top_sessions = self._compute_top_sessions(sessions, usage)
+        daily_series = self._compute_daily_series(sessions, usage, days, window_end)
 
         return {
             "days": days,
@@ -206,6 +234,7 @@ class InsightsEngine:
             "skills": skills,
             "activity": activity,
             "top_sessions": top_sessions,
+            "daily_series": daily_series,
         }
 
     def get_usage_breakdown(self, days: int = 30, source: str = None) -> Dict[str, Any]:
@@ -486,13 +515,13 @@ class InsightsEngine:
         self,
         sessions: List[Dict],
         message_stats: Dict,
-        models: Optional[List[Dict]] = None,
+        usage: List[Dict],
     ) -> Dict:
         """Compute high-level overview statistics."""
-        total_input = sum(s.get("input_tokens") or 0 for s in sessions)
-        total_output = sum(s.get("output_tokens") or 0 for s in sessions)
-        total_cache_read = sum(s.get("cache_read_tokens") or 0 for s in sessions)
-        total_cache_write = sum(s.get("cache_write_tokens") or 0 for s in sessions)
+        total_input = sum(row["input_tokens"] for row in usage)
+        total_output = sum(row["output_tokens"] for row in usage)
+        total_cache_read = sum(row["cache_read_tokens"] for row in usage)
+        total_cache_write = sum(row["cache_write_tokens"] for row in usage)
         total_tokens = total_input + total_output + total_cache_read + total_cache_write
         total_tool_calls = sum(s.get("tool_call_count") or 0 for s in sessions)
         total_messages = sum(s.get("message_count") or 0 for s in sessions)
@@ -504,35 +533,62 @@ class InsightsEngine:
         models_without_pricing = set()
         unknown_cost_sessions = 0
         included_cost_sessions = 0
-        for s in sessions:
-            model = s.get("model") or ""
-            estimated, status = _estimate_cost(s)
-            total_cost += estimated
-            actual_cost += s.get("actual_cost_usd") or 0.0
+        cost_buckets = {
+            "estimated": {"sessions": 0, "cost_usd": 0.0,
+                          "input_tokens": 0, "output_tokens": 0,
+                          "at_market_cost_usd": 0.0},
+            "included": {"sessions": 0, "cost_usd": 0.0,
+                         "input_tokens": 0, "output_tokens": 0,
+                         "at_market_cost_usd": 0.0},
+            "unknown": {"sessions": 0, "cost_usd": 0.0,
+                        "input_tokens": 0, "output_tokens": 0},
+        }
+        usage_by_session = defaultdict(list)
+        for row in usage:
+            usage_by_session[row["session_id"]].append(row)
+            model = row["model"]
             display = model.split("/")[-1] if "/" in model else (model or "unknown")
+            if row["has_pricing"]:
+                models_with_pricing.add(display)
+            else:
+                models_without_pricing.add(display)
+            total_cost += row["estimated_cost_usd"]
+            actual_cost += row["actual_cost_usd"]
+
+        for session in sessions:
+            rows = usage_by_session[session["id"]]
+            statuses = {row["cost_bucket"] for row in rows}
+            status = (
+                "unknown" if "unknown" in statuses
+                else "estimated" if "estimated" in statuses
+                else "included" if "included" in statuses
+                else "unknown"
+            )
+            bucket = cost_buckets[status]
+            bucket["sessions"] += 1
+            bucket["cost_usd"] += sum(row["estimated_cost_usd"] for row in rows)
+            bucket["input_tokens"] += sum(row["input_tokens"] for row in rows)
+            bucket["output_tokens"] += sum(row["output_tokens"] for row in rows)
+            if status != "unknown":
+                market_values = [
+                    _estimate_at_market_cost(row)
+                    if row["cost_bucket"] == "included"
+                    else row["estimated_cost_usd"]
+                    if row["cost_bucket"] == "estimated"
+                    else None
+                    for row in rows
+                ]
+                if (
+                    bucket["at_market_cost_usd"] is None
+                    or any(value is None for value in market_values)
+                ):
+                    bucket["at_market_cost_usd"] = None
+                else:
+                    bucket["at_market_cost_usd"] += sum(market_values)
             if status == "included":
                 included_cost_sessions += 1
             elif status == "unknown":
                 unknown_cost_sessions += 1
-            if has_known_pricing(model, s.get("billing_provider"), s.get("billing_base_url")):
-                models_with_pricing.add(display)
-            else:
-                models_without_pricing.add(display)
-
-        if models:
-            total_cost = sum(float(m.get("cost") or 0.0) for m in models)
-            # Token totals likewise: the per-model breakdown includes
-            # auxiliary usage rows (vision/compression/titles — task
-            # dimension in session_model_usage, #23270) plus reconciled
-            # residuals, while the sessions counters carry main-loop usage
-            # only. Summing the breakdown keeps overview totals consistent
-            # with the per-model table and stops `hermes insights`
-            # undercounting aux spend (#58592, #9979).
-            total_input = sum(int(m.get("input_tokens") or 0) for m in models)
-            total_output = sum(int(m.get("output_tokens") or 0) for m in models)
-            total_cache_read = sum(int(m.get("cache_read_tokens") or 0) for m in models)
-            total_cache_write = sum(int(m.get("cache_write_tokens") or 0) for m in models)
-            total_tokens = total_input + total_output + total_cache_read + total_cache_write
 
         # Session duration stats (guard against negative durations from clock drift)
         durations = []
@@ -561,6 +617,9 @@ class InsightsEngine:
             "total_tokens": total_tokens,
             "estimated_cost": total_cost,
             "actual_cost": actual_cost,
+            "actual_cost_available": any(
+                session.get("actual_cost_usd") is not None for session in sessions
+            ),
             "total_hours": total_hours,
             "avg_session_duration": avg_duration,
             "avg_messages_per_session": total_messages / len(sessions) if sessions else 0,
@@ -574,6 +633,7 @@ class InsightsEngine:
             "models_without_pricing": sorted(models_without_pricing),
             "unknown_cost_sessions": unknown_cost_sessions,
             "included_cost_sessions": included_cost_sessions,
+            "cost_buckets": cost_buckets,
         }
 
     _GET_MODEL_USAGE_WITH_SOURCE = (
@@ -581,7 +641,7 @@ class InsightsEngine:
         " u.api_call_count, u.input_tokens, u.output_tokens,"
         " u.cache_read_tokens, u.cache_write_tokens, u.reasoning_tokens,"
         " u.estimated_cost_usd, u.actual_cost_usd, u.cost_status,"
-        " u.cost_source, u.billing_mode"
+        " u.cost_source, u.billing_mode, u.task"
         " FROM session_model_usage u"
         " JOIN sessions s ON s.id = u.session_id"
         " WHERE s.started_at >= ? AND s.source = ?"
@@ -591,7 +651,7 @@ class InsightsEngine:
         " u.api_call_count, u.input_tokens, u.output_tokens,"
         " u.cache_read_tokens, u.cache_write_tokens, u.reasoning_tokens,"
         " u.estimated_cost_usd, u.actual_cost_usd, u.cost_status,"
-        " u.cost_source, u.billing_mode"
+        " u.cost_source, u.billing_mode, u.task"
         " FROM session_model_usage u"
         " JOIN sessions s ON s.id = u.session_id"
         " WHERE s.started_at >= ?"
@@ -615,155 +675,198 @@ class InsightsEngine:
         except sqlite3.OperationalError:
             return []
 
-    def _compute_model_breakdown(
+    def _reconcile_usage(
         self, sessions: List[Dict], cutoff: float, source: str = None
     ) -> List[Dict]:
-        """Break down token usage and cost by model.
-
-        Tokens and cost are attributed per model from session_model_usage, so a
-        session that switched models mid-flight (via ``/model``) splits across
-        every model it used instead of dumping everything on the initial model
-        (issue #51607). Sessions without per-model rows — e.g. data written
-        before this table existed and not yet backfilled — fall back to their
-        single recorded (model, billing_provider) aggregate so nothing is lost.
-
-        Tool calls aren't tied to a specific API invocation, so they stay
-        attributed to the session's recorded model.
-        """
-        model_data = defaultdict(lambda: {
-            "sessions": set(), "input_tokens": 0, "output_tokens": 0,
-            "cache_read_tokens": 0, "cache_write_tokens": 0,
-            "reasoning_tokens": 0, "total_tokens": 0, "api_calls": 0,
-            "tool_calls": 0, "cost": 0.0, "actual_cost": 0.0,
-        })
-
-        def _accumulate(model, provider, base_url, session_id, inp, out,
-                        cache_read, cache_write, reasoning, *,
-                        stored_cost=None, actual_cost=None, cost_status=None):
-            model = model or "unknown"
-            # Normalize: strip provider prefix for display
-            display_model = model.split("/")[-1] if "/" in model else model
-            d: Dict[str, Any] = model_data[display_model]
-            d["sessions"].add(session_id)
-            d["input_tokens"] += inp
-            d["output_tokens"] += out
-            d["cache_read_tokens"] += cache_read
-            d["cache_write_tokens"] += cache_write
-            d["reasoning_tokens"] += reasoning
-            d["total_tokens"] += inp + out + cache_read + cache_write
-            if stored_cost is None:
-                estimate, status = _estimate_cost(
-                    model, inp, out,
-                    cache_read_tokens=cache_read, cache_write_tokens=cache_write,
-                    provider=provider or None, base_url=base_url,
-                )
-            else:
-                estimate = float(stored_cost or 0.0)
-                status = cost_status or "unknown"
-            d["cost"] += estimate
-            d["actual_cost"] += float(actual_cost or 0.0)
-            d["cost_status"] = status
-            if has_known_pricing(model, provider or None, base_url):
-                d["has_pricing"] = True
-            else:
-                d.setdefault("has_pricing", False)
-            return display_model
-
+        """Build one accounting population shared by every usage aggregate."""
+        session_by_id = {session["id"]: session for session in sessions}
         usage_rows = self._get_model_usage(cutoff, source)
-        usage_totals = defaultdict(lambda: {
+        totals = defaultdict(lambda: {
             "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
             "cache_write_tokens": 0, "reasoning_tokens": 0,
             "api_call_count": 0, "estimated_cost_usd": 0.0,
             "actual_cost_usd": 0.0,
         })
-        for r in usage_rows:
-            totals: Dict[str, Any] = usage_totals[r["session_id"]]
+        reconciled = []
+
+        def append_row(raw: Dict[str, Any], *, residual: bool = False) -> Dict[str, Any]:
+            session = session_by_id[raw["session_id"]]
+            auxiliary = bool(raw.get("task"))
+            model = raw.get("model") or (
+                "unknown" if auxiliary else session.get("model") or "unknown"
+            )
+            provider = raw.get("billing_provider") or (
+                None if auxiliary else session.get("billing_provider") or None
+            )
+            base_url = raw.get("billing_base_url") or (
+                None if auxiliary else session.get("billing_base_url") or None
+            )
+            stored = raw.get("estimated_cost_usd")
+            status = raw.get("cost_status")
+            if status == "unknown":
+                # Unknown is an explicit absence-of-complete-evidence state.
+                # A legacy/stale numeric column must neither leak as a partial
+                # estimate nor trigger repricing from the same incomplete row.
+                estimated = 0.0
+            elif stored is not None and (
+                raw.get("_estimated_cost_reconciled")
+                or status or raw.get("cost_source") or float(stored) > 0
+            ):
+                estimated = float(stored)
+                status = status or "estimated"
+            else:
+                estimated, status = _estimate_cost(
+                    model,
+                    raw.get("input_tokens") or 0,
+                    raw.get("output_tokens") or 0,
+                    cache_read_tokens=raw.get("cache_read_tokens") or 0,
+                    cache_write_tokens=raw.get("cache_write_tokens") or 0,
+                    provider=provider,
+                    base_url=base_url,
+                )
+            session = session_by_id[raw["session_id"]]
+            normalized = {
+                "session_id": raw["session_id"],
+                "source": session.get("source") or "unknown",
+                "started_at": session.get("started_at"),
+                "model": model,
+                "billing_provider": provider,
+                "billing_base_url": base_url,
+                "billing_mode": raw.get("billing_mode") or (
+                    None if auxiliary else session.get("billing_mode")
+                ),
+                "input_tokens": int(raw.get("input_tokens") or 0),
+                "output_tokens": int(raw.get("output_tokens") or 0),
+                "cache_read_tokens": int(raw.get("cache_read_tokens") or 0),
+                "cache_write_tokens": int(raw.get("cache_write_tokens") or 0),
+                "reasoning_tokens": int(raw.get("reasoning_tokens") or 0),
+                "api_call_count": int(raw.get("api_call_count") or 0),
+                "estimated_cost_usd": estimated,
+                "actual_cost_usd": float(raw.get("actual_cost_usd") or 0.0),
+                # Per-model storage defaults actual cost to zero. Only row-local
+                # evidence may authorize that zero as provider actual; the
+                # nullable session aggregate proves availability only for the
+                # report-wide total.
+                "actual_cost_available": bool(
+                    raw.get("actual_cost_available") is True
+                    or float(raw.get("actual_cost_usd") or 0.0) > 0
+                    or status == "actual"
+                ),
+                "cost_status": status,
+                "cost_source": raw.get("cost_source"),
+                # Provider-actual is a presentation/availability state, while
+                # the comparison reducer still consumes the separately stored
+                # local estimate. Keep those contracts orthogonal.
+                "cost_bucket": (
+                    "estimated" if status == "actual"
+                    else status if status in {"estimated", "included"}
+                    else "unknown"
+                ),
+                "has_pricing": has_known_pricing(model, provider, base_url),
+                "residual": residual,
+            }
+            reconciled.append(normalized)
+            return normalized
+
+        for row in usage_rows:
+            normalized = append_row(row)
+            aggregate = totals[row["session_id"]]
             for key in (
                 "input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_write_tokens", "reasoning_tokens", "api_call_count",
             ):
-                totals[key] += r[key] or 0
-            totals["estimated_cost_usd"] += r["estimated_cost_usd"] or 0.0
-            totals["actual_cost_usd"] += r["actual_cost_usd"] or 0.0
-            d = _accumulate(
-                r["model"], r["billing_provider"], r.get("billing_base_url"),
-                r["session_id"], r["input_tokens"] or 0, r["output_tokens"] or 0,
-                r["cache_read_tokens"] or 0, r["cache_write_tokens"] or 0,
-                r["reasoning_tokens"] or 0,
-                stored_cost=(
-                    r["estimated_cost_usd"]
-                    if r.get("cost_status") or r.get("cost_source")
-                    else None
+                aggregate[key] += row.get(key) or 0
+            aggregate["estimated_cost_usd"] += normalized["estimated_cost_usd"]
+            aggregate["actual_cost_usd"] += normalized["actual_cost_usd"]
+
+        for session in sessions:
+            aggregate = totals[session["id"]]
+            session_estimated_cost = float(session.get("estimated_cost_usd") or 0.0)
+            residual = {
+                **session,
+                "session_id": session["id"],
+                "input_tokens": max(0, (session.get("input_tokens") or 0) - aggregate["input_tokens"]),
+                "output_tokens": max(0, (session.get("output_tokens") or 0) - aggregate["output_tokens"]),
+                "cache_read_tokens": max(0, (session.get("cache_read_tokens") or 0) - aggregate["cache_read_tokens"]),
+                "cache_write_tokens": max(0, (session.get("cache_write_tokens") or 0) - aggregate["cache_write_tokens"]),
+                "reasoning_tokens": 0,
+                "api_call_count": max(0, (session.get("api_call_count") or 0) - aggregate["api_call_count"]),
+                "estimated_cost_usd": max(
+                    0.0, session_estimated_cost - aggregate["estimated_cost_usd"]
                 ),
-                actual_cost=r["actual_cost_usd"],
-                cost_status=r.get("cost_status"),
-            )
-            model_data[d]["api_calls"] += r["api_call_count"] or 0
-
-        # Reconcile against the aggregate row. This covers legacy sessions,
-        # interrupted migrations, and absolute cumulative updates without
-        # double-counting already-attributed route deltas.
-        for s in sessions:
-            totals = usage_totals[s["id"]]
-            inp = max(0, (s.get("input_tokens") or 0) - totals["input_tokens"])
-            out = max(0, (s.get("output_tokens") or 0) - totals["output_tokens"])
-            cache_read = max(
-                0, (s.get("cache_read_tokens") or 0) - totals["cache_read_tokens"]
-            )
-            cache_write = max(
-                0, (s.get("cache_write_tokens") or 0) - totals["cache_write_tokens"]
-            )
-            residual_cost = max(
-                0.0, float(s.get("estimated_cost_usd") or 0.0)
-                - totals["estimated_cost_usd"],
-            )
-            residual_actual = max(
-                0.0, float(s.get("actual_cost_usd") or 0.0)
-                - totals["actual_cost_usd"],
-            )
-            residual_calls = max(
-                0, (s.get("api_call_count") or 0) - totals["api_call_count"]
-            )
-            if not (
-                inp or out or cache_read or cache_write or residual_cost
-                or residual_actual or residual_calls
+                # A positive session aggregate is authoritative reconciliation
+                # evidence even when the more-specific model rows exceed it and
+                # clamp the residual to zero. Do not re-price leftover tokens.
+                "_estimated_cost_reconciled": session_estimated_cost > 0,
+                "actual_cost_usd": max(0.0, float(session.get("actual_cost_usd") or 0.0) - aggregate["actual_cost_usd"]),
+            }
+            if not usage_rows or any(
+                residual[key] for key in (
+                    "input_tokens", "output_tokens", "cache_read_tokens",
+                    "cache_write_tokens", "api_call_count",
+                    "estimated_cost_usd", "actual_cost_usd",
+                )
             ):
-                continue
-            d = _accumulate(
-                s.get("model"), s.get("billing_provider"),
-                s.get("billing_base_url"), s["id"],
-                inp, out, cache_read, cache_write, 0,
-                stored_cost=residual_cost,
-                actual_cost=residual_actual,
-                cost_status=s.get("cost_status"),
-            )
-            residual_bucket: Dict[str, Any] = model_data[d]
-            residual_bucket["api_calls"] += residual_calls
+                append_row(residual, residual=True)
+        return reconciled
 
-        # Tool calls are attributed by the session's recorded model.
-        for s in sessions:
-            tool_calls = s.get("tool_call_count") or 0
-            if not tool_calls:
-                continue
-            model = s.get("model") or "unknown"
-            display_model = model.split("/")[-1] if "/" in model else model
-            model_data[display_model]["tool_calls"] += tool_calls
+    def _compute_model_breakdown(
+        self, sessions: List[Dict], usage: List[Dict]
+    ) -> List[Dict]:
+        """Reduce the shared reconciled accounting population by model."""
+        model_data = defaultdict(lambda: {
+            "sessions": set(), "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "reasoning_tokens": 0, "total_tokens": 0, "api_calls": 0,
+            "tool_calls": 0, "cost": 0.0, "actual_cost": 0.0,
+            "actual_cost_available": False, "statuses": set(),
+            "has_pricing": False,
+        })
+        for row in usage:
+            model = row["model"]
+            display = model.split("/")[-1] if "/" in model else model
+            data: Dict[str, Any] = model_data[display]
+            data["sessions"].add(row["session_id"])
+            for key in (
+                "input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_write_tokens", "reasoning_tokens",
+            ):
+                data[key] += row[key]
+            data["total_tokens"] += (
+                row["input_tokens"] + row["output_tokens"]
+                + row["cache_read_tokens"] + row["cache_write_tokens"]
+            )
+            data["api_calls"] += row["api_call_count"]
+            data["cost"] += row["estimated_cost_usd"]
+            data["actual_cost"] += row["actual_cost_usd"]
+            data["actual_cost_available"] |= row["actual_cost_available"]
+            data["statuses"].add(row["cost_status"])
+            data["has_pricing"] |= row["has_pricing"]
+
+        for session in sessions:
+            model = session.get("model") or "unknown"
+            display = model.split("/")[-1] if "/" in model else model
+            model_data[display]["tool_calls"] += session.get("tool_call_count") or 0
 
         result = []
         for model, data in model_data.items():
+            statuses = data.pop("statuses")
             entry = {"model": model, **data}
             entry["sessions"] = len(data["sessions"])
-            # Models that surfaced only via tool-call attribution (no token
-            # rows) won't have these set by _accumulate — default them so the
-            # output shape is uniform for downstream/JSON consumers.
-            entry.setdefault("has_pricing", False)
-            entry.setdefault("cost_status", "unknown")
+            entry["cost_status"] = (
+                "unknown" if "unknown" in statuses
+                else "actual" if "actual" in statuses
+                else "estimated" if "estimated" in statuses
+                else "included" if "included" in statuses
+                else "unknown"
+            )
             result.append(entry)
-        # Sort by tokens first, fall back to session count when tokens are 0
-        result.sort(key=lambda x: (x["total_tokens"], x["sessions"]), reverse=True)
+        result.sort(key=lambda row: (row["total_tokens"], row["sessions"]), reverse=True)
         return result
 
-    def _compute_platform_breakdown(self, sessions: List[Dict]) -> List[Dict]:
+    def _compute_platform_breakdown(
+        self, sessions: List[Dict], usage: List[Dict]
+    ) -> List[Dict]:
         """Break down usage by platform/source."""
         platform_data = defaultdict(lambda: {
             "sessions": 0, "messages": 0, "input_tokens": 0,
@@ -776,16 +879,18 @@ class InsightsEngine:
             d = platform_data[source]
             d["sessions"] += 1
             d["messages"] += s.get("message_count") or 0
-            inp = s.get("input_tokens") or 0
-            out = s.get("output_tokens") or 0
-            cache_read = s.get("cache_read_tokens") or 0
-            cache_write = s.get("cache_write_tokens") or 0
-            d["input_tokens"] += inp
-            d["output_tokens"] += out
-            d["cache_read_tokens"] += cache_read
-            d["cache_write_tokens"] += cache_write
-            d["total_tokens"] += inp + out + cache_read + cache_write
             d["tool_calls"] += s.get("tool_call_count") or 0
+
+        for row in usage:
+            d = platform_data[row["source"]]
+            d["input_tokens"] += row["input_tokens"]
+            d["output_tokens"] += row["output_tokens"]
+            d["cache_read_tokens"] += row["cache_read_tokens"]
+            d["cache_write_tokens"] += row["cache_write_tokens"]
+            d["total_tokens"] += (
+                row["input_tokens"] + row["output_tokens"]
+                + row["cache_read_tokens"] + row["cache_write_tokens"]
+            )
 
         result = [
             {"platform": platform, **data}
@@ -905,7 +1010,67 @@ class InsightsEngine:
             "max_streak": max_streak,
         }
 
-    def _compute_top_sessions(self, sessions: List[Dict]) -> List[Dict]:
+    def _compute_daily_series(
+        self,
+        sessions: List[Dict],
+        usage: List[Dict],
+        days: int,
+        window_end: Optional[datetime] = None,
+    ) -> List[Dict]:
+        """Aggregate sessions into per-calendar-day token/cost buckets.
+
+        Returns exactly ``days`` entries — one per calendar day ending today,
+        oldest first — with zero-filled inactive days so the series forms a
+        continuous axis for charting (heatmap columns, cumulative spend
+        lines) instead of a sparse point list. Token/cost fields reconcile
+        exactly with the overview totals: each session is bucketed into the
+        calendar day of its ``started_at``.
+        """
+        # Seed the full window with zero buckets (oldest → today).
+        today = window_end or datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        series = []
+        for offset in range(days - 1, -1, -1):
+            day = today - timedelta(days=offset)
+            series.append({
+                "date": day.strftime("%Y-%m-%d"),
+                "sessions": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "estimated_cost_usd": 0.0,
+            })
+        by_date = {row["date"]: row for row in series}
+
+        for session in sessions:
+            ts = session.get("started_at")
+            if not ts:
+                continue
+            date_key = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            row = by_date.get(date_key)
+            if row is None:
+                # Outside the window (clock skew / boundary); skip.
+                continue
+            row["sessions"] += 1
+
+        for item in usage:
+            ts = item["started_at"]
+            if not ts:
+                continue
+            row = by_date.get(datetime.fromtimestamp(ts).strftime("%Y-%m-%d"))
+            if row is None:
+                continue
+            row["input_tokens"] += item["input_tokens"]
+            row["output_tokens"] += item["output_tokens"]
+            row["cache_read_tokens"] += item["cache_read_tokens"]
+            row["cache_write_tokens"] += item["cache_write_tokens"]
+            row["estimated_cost_usd"] += item["estimated_cost_usd"]
+
+        return series
+
+    def _compute_top_sessions(
+        self, sessions: List[Dict], usage: List[Dict]
+    ) -> List[Dict]:
         """Find notable sessions (longest, most messages, most tokens)."""
         top = []
 
@@ -938,11 +1103,14 @@ class InsightsEngine:
             })
 
         # Most tokens
-        most_tokens = max(
-            sessions,
-            key=lambda s: (s.get("input_tokens") or 0) + (s.get("output_tokens") or 0),
-        )
-        token_total = (most_tokens.get("input_tokens") or 0) + (most_tokens.get("output_tokens") or 0)
+        tokens_by_session = Counter()
+        for row in usage:
+            tokens_by_session[row["session_id"]] += (
+                row["input_tokens"] + row["output_tokens"]
+                + row["cache_read_tokens"] + row["cache_write_tokens"]
+            )
+        most_tokens = max(sessions, key=lambda s: tokens_by_session[s["id"]])
+        token_total = tokens_by_session[most_tokens["id"]]
         if token_total > 0:
             top.append({
                 "label": "Most tokens",

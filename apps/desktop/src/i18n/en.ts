@@ -1,6 +1,7 @@
 import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
 
 import type { Translations } from './types'
+import { usageDashboardEn } from './usage-dashboard-en'
 
 export const en: Translations = {
   common: {
@@ -1466,6 +1467,8 @@ export const en: Translations = {
       viewLog: 'Action log'
     }
   },
+
+  usageDashboard: usageDashboardEn,
 
   messaging: {
     search: 'Search messaging...',

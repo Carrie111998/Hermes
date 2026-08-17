@@ -1,17 +1,42 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ProfileInfo } from '@/types/hermes'
+import { GatewaySettings } from './gateway-settings'
 
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
-const profiles = atom<ProfileInfo[]>([])
 
-vi.mock('@/store/profile', () => ({
-  $profiles: profiles,
-  refreshActiveProfile: vi.fn()
-}))
+// Keep the component import static so the suite's import phase, not a timed hook,
+// owns module loading under full-suite contention. Vitest hoists this isolated
+// profile-store mock before evaluating the component import, keeping import
+// scheduling outside the behavioral assertion timeout.
+vi.mock('@/store/profile', async () => {
+  const { atom } = await import('nanostores')
+
+  return {
+    $profiles: atom([
+      {
+        has_env: false,
+        is_default: true,
+        model: null,
+        name: 'default',
+        path: '/tmp/hermes',
+        provider: null,
+        skill_count: 0
+      },
+      {
+        has_env: false,
+        is_default: false,
+        model: null,
+        name: 'work',
+        path: '/tmp/hermes/profiles/work',
+        provider: null,
+        skill_count: 0
+      }
+    ]),
+    refreshActiveProfile: vi.fn()
+  }
+})
 
 const localConnection = {
   cloudOrg: '',
@@ -25,26 +50,6 @@ const localConnection = {
 }
 
 beforeEach(() => {
-  profiles.set([
-    {
-      has_env: false,
-      is_default: true,
-      model: null,
-      name: 'default',
-      path: '/tmp/hermes',
-      provider: null,
-      skill_count: 0
-    },
-    {
-      has_env: false,
-      is_default: false,
-      model: null,
-      name: 'work',
-      path: '/tmp/hermes/profiles/work',
-      provider: null,
-      skill_count: 0
-    }
-  ])
   getConnectionConfig.mockResolvedValue(localConnection)
   saveConnectionConfig.mockResolvedValue(localConnection)
   Object.defineProperty(window, 'hermesDesktop', {
@@ -60,8 +65,6 @@ afterEach(() => {
 
 describe('GatewaySettings', () => {
   it('labels local mode as default inheritance for a named profile', async () => {
-    const { GatewaySettings } = await import('./gateway-settings')
-
     render(<GatewaySettings />)
     expect(await screen.findByText('Local gateway')).toBeTruthy()
     expect(
@@ -95,8 +98,6 @@ describe('GatewaySettings', () => {
         : localConnection
     )
     saveConnectionConfig.mockReturnValue(new Promise(() => {}))
-    const { GatewaySettings } = await import('./gateway-settings')
-
     render(<GatewaySettings />)
     fireEvent.click(await screen.findByRole('button', { name: 'work' }))
 

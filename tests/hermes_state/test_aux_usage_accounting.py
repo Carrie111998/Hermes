@@ -296,3 +296,309 @@ class TestInsightsAuxTotals:
         models = {m["model"] for m in report["models"]}
         assert {"main-model", "glm-5"} <= models
 
+    def test_aux_usage_reconciles_overview_models_daily_and_cost_buckets(self, db):
+        """Every Usage view derives from one main-plus-aux accounting population."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("s1", source="cli")
+        db.update_token_counts(
+            "s1",
+            model="main-model",
+            billing_provider="custom",
+            input_tokens=100,
+            output_tokens=10,
+            estimated_cost_usd=1.25,
+            actual_cost_usd=0.0,
+            cost_status="estimated",
+            cost_source="provider",
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "s1",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+            estimated_cost_usd=2.5,
+        )
+        db.flush_token_counts()
+        with db._lock:
+            db._conn.execute(
+                "UPDATE session_model_usage SET cost_status='estimated', "
+                "cost_source='provider' WHERE session_id='s1' AND task='compression'"
+            )
+            db._conn.commit()
+
+        report = InsightsEngine(db).generate(days=30)
+        overview = report["overview"]
+        models = report["models"]
+        daily = report["daily_series"]
+        buckets = overview["cost_buckets"]
+
+        assert overview["total_input_tokens"] == sum(m["input_tokens"] for m in models) == 150
+        assert overview["total_output_tokens"] == sum(m["output_tokens"] for m in models) == 15
+        assert overview["total_input_tokens"] == sum(day["input_tokens"] for day in daily)
+        assert overview["total_output_tokens"] == sum(day["output_tokens"] for day in daily)
+        assert overview["estimated_cost"] == pytest.approx(sum(m["cost"] for m in models))
+        assert overview["estimated_cost"] == pytest.approx(
+            sum(day["estimated_cost_usd"] for day in daily)
+        )
+        assert overview["estimated_cost"] == pytest.approx(
+            sum(bucket["cost_usd"] for bucket in buckets.values())
+        )
+        assert overview["actual_cost"] == pytest.approx(sum(m["actual_cost"] for m in models))
+        assert sum(bucket["sessions"] for bucket in buckets.values()) == overview["total_sessions"] == 1
+        assert sum(m["api_calls"] for m in models) == 2
+
+    def test_derived_model_cost_does_not_duplicate_authoritative_session_total(self, db):
+        """A derived model estimate consumes its share of the stored session total."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("partial-cost", source="cli")
+        db.update_token_counts(
+            "partial-cost",
+            model="gpt-4o",
+            billing_provider="openai",
+            input_tokens=1_000_000,
+            api_call_count=1,
+        )
+        db.update_token_counts(
+            "partial-cost",
+            model="gpt-4o",
+            billing_provider="openai",
+            input_tokens=1_000_000,
+            estimated_cost_usd=10.0,
+            api_call_count=1,
+            absolute=True,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+
+        assert report["overview"]["estimated_cost"] == pytest.approx(10.0)
+        assert sum(model["cost"] for model in report["models"]) == pytest.approx(10.0)
+        assert sum(day["estimated_cost_usd"] for day in report["daily_series"]) == pytest.approx(10.0)
+
+    def test_model_cost_above_stale_session_total_does_not_reprice_zero_residual(self, db):
+        """A clamped zero residual is reconciliation evidence, not missing cost."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("stale-total", source="cli")
+        db.update_token_counts(
+            "stale-total",
+            model="gpt-4o",
+            billing_provider="openai",
+            input_tokens=250_000,
+            estimated_cost_usd=12.5,
+            api_call_count=1,
+        )
+        db.update_token_counts(
+            "stale-total",
+            model="gpt-4o",
+            billing_provider="openai",
+            input_tokens=1_000_000,
+            estimated_cost_usd=10.0,
+            api_call_count=2,
+            absolute=True,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+
+        assert report["overview"]["estimated_cost"] == pytest.approx(12.5)
+        assert sum(model["cost"] for model in report["models"]) == pytest.approx(12.5)
+        assert sum(day["estimated_cost_usd"] for day in report["daily_series"]) == pytest.approx(12.5)
+
+    def test_unknown_cost_row_does_not_surface_stored_partial_estimate(self, db):
+        """An explicitly unknown route cannot expose a numeric estimate."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("unknown-cost", source="cli")
+        db.update_token_counts(
+            "unknown-cost",
+            model="model",
+            billing_provider="custom",
+            input_tokens=100,
+            estimated_cost_usd=1.0,
+            cost_status="unknown",
+            api_call_count=1,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        model = next(row for row in report["models"] if row["model"] == "model")
+        unknown = report["overview"]["cost_buckets"]["unknown"]
+
+        assert model["cost_status"] == "unknown"
+        assert model["cost"] == 0.0
+        assert unknown["cost_usd"] == 0.0
+        assert report["overview"]["estimated_cost"] == 0.0
+
+    def test_mixed_included_and_estimated_session_keeps_complete_market_value(self, db):
+        """A priced aux row must not hide the included main route's list value."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("mixed", source="cli", model="gpt-5.6-sol")
+        db.update_token_counts(
+            "mixed",
+            model="gpt-5.6-sol",
+            billing_provider="openai-codex",
+            billing_mode="subscription_included",
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            estimated_cost_usd=0.0,
+            cost_status="included",
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "mixed",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+            estimated_cost_usd=2.5,
+        )
+        db.flush_token_counts()
+        with db._lock:
+            db._conn.execute(
+                "UPDATE session_model_usage SET cost_status='estimated', "
+                "cost_source='provider' WHERE session_id='mixed' AND task='compression'"
+            )
+            db._conn.commit()
+
+        overview = InsightsEngine(db).generate(days=30)["overview"]
+        estimated = overview["cost_buckets"]["estimated"]
+
+        assert estimated["sessions"] == 1
+        assert estimated["cost_usd"] == pytest.approx(2.5)
+        assert estimated["at_market_cost_usd"] == pytest.approx(22.5)
+
+    def test_mixed_session_market_value_is_unknown_when_included_sku_has_no_public_price(self, db):
+        """Known aux spend cannot make an unresolved included comparison partial."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("mixed-unknown", source="cli", model="codex-plan-only-model")
+        db.update_token_counts(
+            "mixed-unknown",
+            model="codex-plan-only-model",
+            billing_provider="openai-codex",
+            billing_mode="subscription_included",
+            input_tokens=1_000,
+            output_tokens=500,
+            estimated_cost_usd=0.0,
+            cost_status="included",
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "mixed-unknown",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+            estimated_cost_usd=2.5,
+        )
+        db.flush_token_counts()
+        with db._lock:
+            db._conn.execute(
+                "UPDATE session_model_usage SET cost_status='estimated', "
+                "cost_source='provider' WHERE session_id='mixed-unknown' AND task='compression'"
+            )
+            db._conn.commit()
+
+        estimated = InsightsEngine(db).generate(days=30)["overview"]["cost_buckets"]["estimated"]
+
+        assert estimated["sessions"] == 1
+        assert estimated["cost_usd"] == pytest.approx(2.5)
+        assert estimated["at_market_cost_usd"] is None
+
+    def test_aux_usage_does_not_inherit_main_loop_billing_route(self, db):
+        """An underspecified auxiliary row remains unknown, not plan-included."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("s1", source="cli", model="gpt-5.5")
+        db.update_token_counts(
+            "s1",
+            model="gpt-5.5",
+            billing_provider="openai-codex",
+            billing_mode="subscription_included",
+            input_tokens=100,
+            output_tokens=10,
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "s1",
+            "compression",
+            model="aux-model",
+            input_tokens=50,
+            output_tokens=5,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        models = {model["model"]: model for model in report["models"]}
+
+        assert models["gpt-5.5"]["cost_status"] == "included"
+        assert models["aux-model"]["cost_status"] == "unknown"
+        assert report["overview"]["cost_buckets"]["unknown"]["sessions"] == 1
+
+    def test_actual_cost_availability_is_not_borrowed_by_auxiliary_models(self, db):
+        """A provider actual on the main route does not authorize an aux zero."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("s1", source="cli")
+        db.update_token_counts(
+            "s1",
+            model="main-model",
+            billing_provider="custom",
+            input_tokens=100,
+            output_tokens=10,
+            actual_cost_usd=1.25,
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "s1",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        models = {model["model"]: model for model in report["models"]}
+
+        assert models["main-model"]["actual_cost_available"] is True
+        assert models["aux-model"]["actual_cost_available"] is False
+
+    def test_actual_status_reconciles_as_known_market_cost(self, db):
+        """Provider-actual rows remain actual but do not become unknown coverage."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("actual", source="cli")
+        db.update_token_counts(
+            "actual",
+            model="actual-model",
+            billing_provider="custom",
+            input_tokens=100,
+            output_tokens=10,
+            estimated_cost_usd=1.5,
+            actual_cost_usd=1.25,
+            cost_status="actual",
+            cost_source="provider",
+            api_call_count=1,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        overview = report["overview"]
+        models = {model["model"]: model for model in report["models"]}
+
+        assert models["actual-model"]["cost_status"] == "actual"
+        assert overview["unknown_cost_sessions"] == 0
+        assert overview["cost_buckets"]["estimated"]["sessions"] == 1
+        assert overview["cost_buckets"]["estimated"]["cost_usd"] == pytest.approx(1.5)
+

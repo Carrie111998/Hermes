@@ -1,0 +1,7 @@
+name: usage-meter
+version: 1.0.0
+description: "Provider-agnostic privacy-safe per-call usage ledger with month/all-time aggregates for Desktop and TUI."
+author: "Hermes contributors; completion scope from @muhammadshess-10xe on #77221"
+hooks:
+  - post_api_request
+kind: standalone

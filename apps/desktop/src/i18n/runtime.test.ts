@@ -52,6 +52,21 @@ describe('desktop i18n runtime translator', () => {
     )
   })
 
+  it('keeps the existing Usage navigation contract localized in every supported locale', () => {
+    const expected = [
+      ['ar', 'الاستخدام'],
+      ['en', 'Usage'],
+      ['ja', '使用状況'],
+      ['zh', '用量'],
+      ['zh-hant', '使用量']
+    ] as const
+
+    for (const [locale, label] of expected) {
+      setRuntimeI18nLocale(locale)
+      expect(translateNow('commandCenter.sections.usage')).toBe(label)
+    }
+  })
+
   it('keeps translated settings field copy addressable from schema keys', () => {
     const field = ['display', 'show_reasoning'].join('.')
 

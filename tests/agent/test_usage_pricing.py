@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from agent.usage_pricing import (
     CanonicalUsage,
+    estimate_market_equivalent_cost,
     format_cost_label,
     estimate_usage_cost,
     get_pricing_entry,
@@ -15,6 +16,34 @@ from decimal import Decimal
 
 
 
+
+
+def test_codex_included_cost_and_public_market_equivalent_stay_distinct():
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=500_000)
+
+    billed = estimate_usage_cost(
+        "gpt-5.6-sol", usage, provider="openai-codex",
+    )
+    market = estimate_market_equivalent_cost(
+        "gpt-5.6-sol", usage, provider="openai-codex",
+    )
+
+    assert billed.status == "included"
+    assert billed.amount_usd == 0
+    assert market.status == "estimated"
+    assert market.amount_usd == 20
+    assert market.source == "official_docs_snapshot"
+
+
+def test_codex_plan_only_model_has_no_market_equivalent():
+    market = estimate_market_equivalent_cost(
+        "codex-plan-only-model",
+        CanonicalUsage(input_tokens=1_000, output_tokens=500),
+        provider="openai-codex",
+    )
+
+    assert market.status == "unknown"
+    assert market.amount_usd is None
 
 
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():

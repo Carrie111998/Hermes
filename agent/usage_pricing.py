@@ -1504,6 +1504,51 @@ def estimate_usage_cost(
     )
 
 
+def estimate_market_equivalent_cost(
+    model_name: str,
+    usage: CanonicalUsage,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> CostResult:
+    """Estimate public list-price value without changing billed-route truth.
+
+    Subscription routes remain zero-cost in :func:`estimate_usage_cost`. For a
+    market comparison, only routes with an explicit public-provider identity
+    are remapped. A plan-only model absent from that provider's published
+    pricing stays ``unknown`` instead of being represented as a genuine zero.
+    """
+    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    if route.billing_mode != "subscription_included":
+        return estimate_usage_cost(
+            model_name,
+            usage,
+            provider=provider,
+            base_url=base_url,
+            api_key=api_key,
+        )
+
+    public_provider = {
+        "openai-codex": "openai",
+    }.get(route.provider)
+    if public_provider is None:
+        return CostResult(
+            amount_usd=None,
+            status="unknown",
+            source="none",
+            label="n/a",
+            notes=("public list-price route unavailable for included provider",),
+        )
+
+    return estimate_usage_cost(
+        route.model,
+        usage,
+        provider=public_provider,
+        api_key=api_key,
+    )
+
+
 def has_known_pricing(
     model_name: str,
     provider: Optional[str] = None,
