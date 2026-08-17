@@ -29,7 +29,7 @@ _MAX_SQLITE_IN_PARAMS = 500
 
 @dataclass(frozen=True)
 class StoredLineage:
-    """Identity and exact local revision emitted by :func:`store_archived_lineage`."""
+    """Identity and immutable local snapshot emitted by :func:`store_archived_lineage`."""
 
     terminal_id: str
     physical_ids: tuple[str, ...]
@@ -227,10 +227,10 @@ def _open_or_create_directory(parent_fd: int, name: str, path: Path) -> int:
         raise _unsafe_archive_parent(path, exc)
 
 
-def _open_revision_parent(
+def _open_snapshot_parent(
     archive_root: Path, relative_parts: tuple[str, ...]
 ) -> tuple[list[int], list[tuple[int, str, int, Path]]]:
-    """Open/create a no-follow chain from ``/`` through the revision parent."""
+    """Open/create a no-follow chain from ``/`` through the snapshot parent."""
     absolute_root = Path(os.path.abspath(os.fspath(archive_root)))
     names = (*absolute_root.parts[1:], *relative_parts)
     descriptors = [os.open(os.sep, _directory_open_flags())]
@@ -292,28 +292,32 @@ def _read_regular_text_at(directory_fd: int, name: str) -> str | None:
         return source.read()
 
 
-def _valid_existing_revision_at(
-    revisions_fd: int,
-    revision_name: str,
+def _valid_existing_snapshot_at(
+    snapshot_parent_fd: int,
+    snapshot_name: str,
     terminal_id: str,
     lineage: tuple[str, ...],
     fingerprint: str,
 ) -> bool | None:
     try:
-        revision_fd = os.open(revision_name, _directory_open_flags(), dir_fd=revisions_fd)
+        snapshot_fd = os.open(
+            snapshot_name,
+            _directory_open_flags(),
+            dir_fd=snapshot_parent_fd,
+        )
     except FileNotFoundError:
         return None
     except OSError:
         return False
     try:
         try:
-            metadata_text = _read_regular_text_at(revision_fd, "metadata.json")
-            payload_text = _read_regular_text_at(revision_fd, "session.jsonl")
+            metadata_text = _read_regular_text_at(snapshot_fd, "metadata.json")
+            payload_text = _read_regular_text_at(snapshot_fd, "session.jsonl")
             if metadata_text is None or payload_text is None:
                 return False
             metadata = json.loads(metadata_text)
             records = [json.loads(line) for line in payload_text.splitlines()]
-            artifacts_fd = os.open("artifacts", _directory_open_flags(), dir_fd=revision_fd)
+            artifacts_fd = os.open("artifacts", _directory_open_flags(), dir_fd=snapshot_fd)
             os.close(artifacts_fd)
         except (OSError, json.JSONDecodeError):
             return False
@@ -324,35 +328,35 @@ def _valid_existing_revision_at(
             and metadata.get("source_fingerprint") == fingerprint
             and metadata.get("record_count") == len(records)
             and _fingerprint(records) == fingerprint
-            and _directory_entry_matches(revisions_fd, revision_name, revision_fd)
+            and _directory_entry_matches(snapshot_parent_fd, snapshot_name, snapshot_fd)
         )
     finally:
-        os.close(revision_fd)
+        os.close(snapshot_fd)
 
 
-def _create_staging_directory(revisions_fd: int) -> tuple[str, int]:
+def _create_staging_directory(snapshot_parent_fd: int) -> tuple[str, int]:
     for _ in range(100):
         name = f".staging-{secrets.token_hex(8)}"
         try:
-            os.mkdir(name, 0o700, dir_fd=revisions_fd)
+            os.mkdir(name, 0o700, dir_fd=snapshot_parent_fd)
         except FileExistsError:
             continue
         try:
-            descriptor = os.open(name, _directory_open_flags(), dir_fd=revisions_fd)
+            descriptor = os.open(name, _directory_open_flags(), dir_fd=snapshot_parent_fd)
         except BaseException:
             try:
-                os.rmdir(name, dir_fd=revisions_fd)
+                os.rmdir(name, dir_fd=snapshot_parent_fd)
             except OSError:
                 pass
             raise
-        if not _directory_entry_matches(revisions_fd, name, descriptor):
+        if not _directory_entry_matches(snapshot_parent_fd, name, descriptor):
             os.close(descriptor)
             raise ValueError("unsafe cold-store staging directory")
         return name, descriptor
     raise FileExistsError("could not allocate cold-store staging directory")
 
 
-def _remove_staging_at(revisions_fd: int, name: str, staging_fd: int) -> None:
+def _remove_staging_at(snapshot_parent_fd: int, name: str, staging_fd: int) -> None:
     for member in ("metadata.json", "session.jsonl"):
         try:
             os.unlink(member, dir_fd=staging_fd)
@@ -362,9 +366,9 @@ def _remove_staging_at(revisions_fd: int, name: str, staging_fd: int) -> None:
         os.rmdir("artifacts", dir_fd=staging_fd)
     except OSError:
         pass
-    if _directory_entry_matches(revisions_fd, name, staging_fd):
+    if _directory_entry_matches(snapshot_parent_fd, name, staging_fd):
         try:
-            os.rmdir(name, dir_fd=revisions_fd)
+            os.rmdir(name, dir_fd=snapshot_parent_fd)
         except OSError:
             pass
 
@@ -372,9 +376,9 @@ def _remove_staging_at(revisions_fd: int, name: str, staging_fd: int) -> None:
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:
     """Store one marked completed compression lineage without deleting DB rows.
 
-    The terminal ID determines the logical session directory. A content-addressed
-    fingerprint directory makes repeated stores idempotent and lets a later
-    changed source produce a separate local revision.
+    The safe terminal ID names a single immutable snapshot. Repeated stores of
+    the exact source are idempotent; a changed source fails at the archival
+    boundary instead of creating a revision or overwriting the snapshot.
     """
     if os.name == "nt":
         raise OSError("cold store is not yet supported on Windows")
@@ -406,45 +410,45 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
             conn.execute("RELEASE SAVEPOINT cold_store_snapshot")
 
     terminal_date = datetime.fromtimestamp(float(ended_at), UTC)
-    revision_dir = (
+    snapshot_name = _safe_component(terminal_id)
+    snapshot_dir = (
         archive_root
         / "sessions"
         / "ended"
         / f"{terminal_date:%Y}"
         / f"{terminal_date:%m}"
         / f"{terminal_date:%d}"
-        / _safe_component(terminal_id)
-        / "revisions"
-        / fingerprint
+        / snapshot_name
     )
-    revision_parent_parts = (
+    snapshot_parent_parts = (
         "sessions",
         "ended",
         f"{terminal_date:%Y}",
         f"{terminal_date:%m}",
         f"{terminal_date:%d}",
-        _safe_component(terminal_id),
-        "revisions",
     )
-    descriptors, edges = _open_revision_parent(archive_root, revision_parent_parts)
-    revisions_fd = descriptors[-1]
+    descriptors, edges = _open_snapshot_parent(archive_root, snapshot_parent_parts)
+    snapshot_parent_fd = descriptors[-1]
     staging_name: str | None = None
     staging_fd = -1
     published = False
     try:
-        existing = _valid_existing_revision_at(
-            revisions_fd,
-            fingerprint,
+        existing = _valid_existing_snapshot_at(
+            snapshot_parent_fd,
+            snapshot_name,
             terminal_id,
             lineage,
             fingerprint,
         )
         if existing is True:
-            return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
+            return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
         if existing is False:
-            raise ValueError("existing cold-store revision is invalid or mismatched")
+            raise ValueError(
+                "cold-store archival boundary violation: existing snapshot is invalid "
+                "or the marked source changed after Store"
+            )
 
-        staging_name, staging_fd = _create_staging_directory(revisions_fd)
+        staging_name, staging_fd = _create_staging_directory(snapshot_parent_fd)
         _validate_directory_chain(edges)
         metadata = {
             "format": _ARCHIVE_FORMAT,
@@ -469,34 +473,37 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         os.mkdir("artifacts", dir_fd=staging_fd)
         os.fsync(staging_fd)
         _validate_directory_chain(edges)
-        if not _directory_entry_matches(revisions_fd, staging_name, staging_fd):
+        if not _directory_entry_matches(snapshot_parent_fd, staging_name, staging_fd):
             raise ValueError("unsafe cold-store staging directory")
         try:
             os.rename(
                 staging_name,
-                fingerprint,
-                src_dir_fd=revisions_fd,
-                dst_dir_fd=revisions_fd,
+                snapshot_name,
+                src_dir_fd=snapshot_parent_fd,
+                dst_dir_fd=snapshot_parent_fd,
             )
         except OSError as exc:
             if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                 raise
-            if _valid_existing_revision_at(
-                revisions_fd,
-                fingerprint,
+            if _valid_existing_snapshot_at(
+                snapshot_parent_fd,
+                snapshot_name,
                 terminal_id,
                 lineage,
                 fingerprint,
             ):
-                return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
-            raise
+                return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
+            raise ValueError(
+                "cold-store archival boundary violation: existing snapshot is invalid "
+                "or the marked source changed after Store"
+            ) from exc
         published = True
-        os.fsync(revisions_fd)
+        os.fsync(snapshot_parent_fd)
     finally:
         if staging_fd >= 0:
             if not published and staging_name is not None:
-                _remove_staging_at(revisions_fd, staging_name, staging_fd)
+                _remove_staging_at(snapshot_parent_fd, staging_name, staging_fd)
             os.close(staging_fd)
         for descriptor in reversed(descriptors):
             os.close(descriptor)
-    return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
+    return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
