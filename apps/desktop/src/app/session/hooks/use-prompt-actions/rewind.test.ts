@@ -472,7 +472,7 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
     expect(submit?.params?.confirm_truncate).toBeUndefined()
   })
 
-  it('leaves a bound durable rowId untouched (no extra history call)', async () => {
+  it('uses a bound durable rowId without the redundant client ordinal', async () => {
     const calls: Call[] = []
 
     await runRewindSubmit(makeGateway(calls), 'sid', 'fixed prompt', 1, undefined, false, undefined, 13, 'typo prompt')
@@ -482,6 +482,9 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
     const submit = calls.find(call => call.method === 'prompt.submit')
 
     expect(submit?.params?.truncate_before_row_id).toBe(13)
-    expect(submit?.params?.truncate_before_user_ordinal).toBe(1)
+    // A row id is authoritative. The visible ordinal can be stale after an
+    // interrupted/optimistic turn, so sending both can only trigger a safe
+    // backend refusal — never improve the cut address.
+    expect(submit?.params?.truncate_before_user_ordinal).toBeUndefined()
   })
 })

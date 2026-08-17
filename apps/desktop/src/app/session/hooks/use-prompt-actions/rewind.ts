@@ -262,6 +262,15 @@ export async function runRewindSubmit(
     resolvedMessageId = undefined
   }
 
+  // A durable row id is the authoritative truncation address. The client
+  // ordinal is only a redundant cross-check and can become stale when the
+  // renderer retains an interrupted/optimistic user bubble that never reached
+  // the durable transcript. Sending both then produces a safe but recurring
+  // 4030 refusal, while the row id alone still aims the exact same turn.
+  if (typeof resolvedRowId === 'number') {
+    resolvedOrdinal = undefined
+  }
+
   const interrupt = async () => {
     try {
       await requestGateway('session.interrupt', { session_id: liveSessionId })
