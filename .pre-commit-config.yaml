@@ -29,15 +29,25 @@ repos:
   # commit hides the change from the diff the author is reviewing, and the
   # F841 autofix in particular can delete side-effecting statements.
   #
-  # The RULES stay in sync via ruff.toml. The ruff BINARIES are aligned by
-  # hand, and as of 2026-08-17 all THREE sit on 0.15.12:
+  # The RULES stay in sync via ruff.toml. The ruff BINARY version is declared
+  # in FOUR files, all on 0.15.12 as of 2026-08-17:
   #   1. this hook's `rev:` below (pre-commit's own isolated env)
-  #   2. both lint.yml jobs -- `uv tool install ruff==0.15.12` (:53, :147)
-  #   3. the local CLI -- `python -m pip install "ruff==0.15.12"`, which is
-  #      also what events/producers/ruff_gate_probe.py shells out to every
-  #      15 minutes, so drift there desyncs the alarm from this gate
-  # Nothing ENFORCES the equality -- no test asserts it -- so a bump is a
-  # three-file commit or it is a drift. Change all three together.
+  #   2. both lint.yml jobs -- `uv tool install ruff==0.15.12`
+  #   3. ruff.toml `required-version`
+  #   4. pyproject.toml's dev extra, which is what the repo .venv installs
+  # tests/test_lint_config.py::TestRuffVersionPins asserts all four agree, so
+  # bumping any one alone fails the suite -- and an UNPINNED `uv tool install
+  # ruff` fails it too rather than passing unnoticed.
+  #
+  # (3) is the one that reaches the binaries no test can see: ruff refuses to
+  # load this config under a version it does not match and exits 2 (verified
+  # 2026-08-17 -- 0.15.10 and 0.16.3 both fail with "Required version
+  # `==0.15.12` does not match"). That covers whatever ruff is on PATH, which
+  # is what events/producers/ruff_gate_probe.py shells out to every 15 minutes;
+  # before it, the alarm's version depended on whether a session happened to
+  # have the .venv activated. The probe reads exit >= 2 as UNMEASURABLE rather
+  # than clean, so a mismatch there surfaces as a broken alarm instead of a
+  # silent pass. A bump is a four-file change or it is a drift.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.12 # the ruff pre-commit runs -- see the version note above
     hooks:
