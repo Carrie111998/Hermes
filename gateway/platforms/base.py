@@ -6105,13 +6105,14 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd and event.allow_gateway_control:
+            if event.allow_gateway_control and not should_bypass_active_session(cmd):
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
                         _clarify_mod.get_pending_for_session(
                             session_key,
                             include_choice_prompts=True,
+                            source_identity=_clarify_mod.source_identity(event.source),
                         ) is not None
                     )
                 except Exception:

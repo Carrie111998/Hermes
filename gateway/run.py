@@ -5683,6 +5683,7 @@ class TurnRunner:
         # rather than hang forever).
         # ------------------------------------------------------------------
         def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
+            from gateway.session import is_shared_multi_user_session
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
@@ -5696,6 +5697,20 @@ class TurnRunner:
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                source_identity=_clarify_mod.source_identity(ctx.source),
+                shared_multi_user_session=is_shared_multi_user_session(
+                    ctx.source,
+                    group_sessions_per_user=getattr(
+                        ctx._status_adapter.config,
+                        "extra",
+                        {},
+                    ).get("group_sessions_per_user", True),
+                    thread_sessions_per_user=getattr(
+                        ctx._status_adapter.config,
+                        "extra",
+                        {},
+                    ).get("thread_sessions_per_user", False),
+                ),
             )
 
             # Pause typing — like approval, we don't want a "thinking..."
@@ -5751,10 +5766,12 @@ class TurnRunner:
                     send_ok = False
 
             if not send_ok:
-                # Couldn't deliver the prompt — clean up and return
-                # sentinel so the agent can fall back to a sensible
-                # default rather than hanging.
-                _clarify_mod.clear_session(ctx.session_key or "")
+                # Delivery failure loses to an answer that already won while
+                # transport was in flight. Otherwise cancel and clean the
+                # registered entry because no waiter will own that cleanup.
+                winning_response = _clarify_mod.finish_failed_delivery(clarify_id)
+                if winning_response is not None:
+                    return winning_response
                 return "[clarify prompt could not be delivered]"
 
             timeout = _clarify_mod.get_clarify_timeout()
@@ -16351,14 +16368,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # direct replies to multi-choice prompts are accepted too ("2" maps
         # to the second option). Slash
         # commands still bypass this path so /stop and friends keep working.
-        _clarify_mod = None
         try:
             from tools import clarify_gateway as _clarify_mod
+            _clarify_identity = _clarify_mod.source_identity(source)
             _pending_clarify = _clarify_mod.get_pending_for_session(
-                _quick_key, include_choice_prompts=True,
+                _quick_key,
+                include_choice_prompts=True,
+                source_identity=_clarify_identity,
             )
         except Exception:
+            _clarify_mod = None
             _pending_clarify = None
+        if (
+            allow_gateway_control
+            and _clarify_mod is not None
+            and _clarify_mod.is_clarify_message_consumed(event.message_id or "")
+        ):
+            logger.info(
+                "Gateway suppressed duplicate clarify message delivery (message_id=%s)",
+                event.message_id,
+            )
+            return ""
         if (
             allow_gateway_control
             and _pending_clarify is not None
@@ -16374,15 +16404,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pending_clarify.clarify_id,
                 )
                 return ""
-            # Skip slash commands — the user clearly wanted to issue a
-            # command, not answer the clarify.  Leave the clarify pending
-            # so the user can retry; if it times out, the agent unblocks
-            # with an empty response.
-            if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _text_outcome = _clarify_mod.attempt_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
+            # Only recognized slash commands bypass clarify. Unknown slash
+            # text is an ordinary answer candidate, matching the adapter's
+            # active-session bypass decision.
+            import hermes_cli.commands as _clarify_commands
+            _clarify_cmd = event.get_command()
+            _clarify_command_known = _clarify_commands.is_gateway_known_command(
+                _clarify_cmd
+            )
+            if _raw_clarify_reply and not _clarify_command_known:
+                _resolved = _clarify_mod.resolve_message_text_for_session(
+                    _quick_key,
+                    _raw_clarify_reply,
+                    event.message_id or "",
+                    source_identity=_clarify_identity,
                 )
-                if _text_outcome == _clarify_mod.TEXT_RESOLVED:
+                if _resolved in {"consumed", "duplicate"}:
                     logger.info(
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
@@ -16406,27 +16443,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
                     return ""
-                if _text_outcome == _clarify_mod.TEXT_REJECTED_SELECTION:
-                    # Selection-shaped but invalid (out-of-range number,
-                    # unrecognised comma-list). Keep the clarify armed so
-                    # the user can retry — do not cancel and do not treat
-                    # this as an unrelated follow-up turn.
-                    logger.info(
-                        "Gateway retained pending clarify after invalid "
-                        "selection attempt (session=%s, id=%s)",
-                        _quick_key, _pending_clarify.clarify_id,
-                    )
-                    return ""
-                if _text_outcome == _clarify_mod.TEXT_REJECTED_PROSE:
-                    # Native-choice prompts deliberately reject unmatched
-                    # prose so it can continue through normal busy-message
-                    # routing. Release this clarify first: redirect()
-                    # degrades to steer() while tools are executing, and
-                    # that steer cannot drain until the clarify tool returns.
-                    _clarify_mod.resolve_gateway_clarify(
-                        _pending_clarify.clarify_id,
-                        "",
-                    )
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
@@ -16545,10 +16561,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # hermes_cli/commands.py) and dispatched through the single
             # resolver _dispatch_busy_slash_command below — no per-command
             # if-chain here.
-            from hermes_cli.commands import resolve_command as _resolve_cmd_inner
+            from hermes_cli.commands import (
+                is_gateway_known_command as _is_known_cmd_inner,
+                resolve_command as _resolve_cmd_inner,
+            )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
-
+            _plugin_cmd_inner = bool(
+                _evt_cmd
+                and _cmd_def_inner is None
+                and _is_known_cmd_inner(_evt_cmd)
+            )
             # /status and /context are intentionally pre-gate so users
             # always see session state.
             if _cmd_def_inner and _cmd_def_inner.name == "status":
@@ -16562,8 +16585,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /status above is intentionally pre-gate so users always see
             # session state. /help and /whoami fall under the always-allowed
             # floor inside _check_slash_access.
-            if _evt_cmd and _cmd_def_inner is not None:
-                _denied = self._check_slash_access(source, _cmd_def_inner.name)
+            if _evt_cmd and (_cmd_def_inner is not None or _plugin_cmd_inner):
+                _canonical_inner = (
+                    _cmd_def_inner.name if _cmd_def_inner is not None else _evt_cmd
+                )
+                _denied = self._check_slash_access(source, _canonical_inner)
                 if _denied is not None:
                     return _denied
 
@@ -16575,6 +16601,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await self._dispatch_busy_slash_command(
                     event, _cmd_def_inner, _quick_key, source,
                 )
+            if _plugin_cmd_inner:
+                # Plugin commands have no CommandDef/busy policy. Execute the
+                # same hook and handler contract without interrupting the
+                # clarify worker.
+                from hermes_cli.plugins import get_plugin_command_handler
+
+                _plugin_handler = get_plugin_command_handler(
+                    _evt_cmd.replace("_", "-")
+                )
+                if _plugin_handler is not None:
+                    _plugin_args = event.get_command_args().strip()
+                    try:
+                        _plugin_hook_results = await self.hooks.emit_collect(
+                            f"command:{_evt_cmd}",
+                            {
+                                "platform": (
+                                    source.platform.value if source.platform else ""
+                                ),
+                                "user_id": source.user_id,
+                                "command": _evt_cmd,
+                                "raw_command": _evt_cmd,
+                                "args": _plugin_args,
+                                "raw_args": _plugin_args,
+                            },
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "command:%s hook dispatch failed (non-fatal): %s",
+                            _evt_cmd,
+                            exc,
+                        )
+                        _plugin_hook_results = []
+                    for _plugin_hook_result in _plugin_hook_results:
+                        if not isinstance(_plugin_hook_result, dict):
+                            continue
+                        _plugin_decision = str(
+                            _plugin_hook_result.get("decision", "")
+                        ).strip().lower()
+                        if _plugin_decision == "deny":
+                            _plugin_message = _plugin_hook_result.get("message")
+                            return (
+                                _plugin_message
+                                if isinstance(_plugin_message, str)
+                                and _plugin_message
+                                else f"Command `/{_evt_cmd}` was blocked by a hook."
+                            )
+                        if _plugin_decision == "handled":
+                            _plugin_message = _plugin_hook_result.get("message")
+                            return (
+                                _plugin_message
+                                if isinstance(_plugin_message, str)
+                                and _plugin_message
+                                else None
+                            )
+                    _plugin_result = _plugin_handler(_plugin_args)
+                    if asyncio.iscoroutine(_plugin_result):
+                        _plugin_result = await _plugin_result
+                    return str(_plugin_result) if _plugin_result else None
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -16744,6 +16828,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The actual interrupt message is delivered via adapter._pending_messages
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
+
 
         # Check for commands
         command = event.get_command()

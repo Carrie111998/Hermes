@@ -1,25 +1,13 @@
-"""Regression tests for #62034 — pending multi-choice clarify prompts must not
-swallow unrelated thread follow-up messages.
+"""Pending clarify prompts consume the requester's next message as the answer.
 
-When a NATIVE interactive multi-choice clarify (buttons rendered,
-``awaiting_text=False``) is pending, the gateway text-intercept used to
-consume ANY non-command message in the session as the clarify answer —
-arbitrary prose vanished into clarify resolution and the agent appeared to
-ignore the user's thread messages.
-
-After the fix (``tools/clarify_gateway._coerce_text_response`` rejects
-arbitrary prose for native multi-choice prompts):
-
-  * numeric selections ("2") and exact choice labels still resolve, and
-  * arbitrary prose falls through the intercept and continues as a normal
-    message-handling turn.
-
-Open-ended clarifies, explicit "Other" text-capture mode, and the base
-adapter's numbered-text fallback (which flips ``awaiting_text`` at send time)
-keep accepting free text.
+Native controls are optional input conveniences. Arbitrary prose from the
+bound requester resolves the active clarify instead of falling into busy-run
+handling, where an interrupt cannot wake the worker blocked on Event.wait.
 """
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from dataclasses import replace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -53,8 +41,6 @@ class _StubAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "im"}
 
 
-class _FellThroughIntercept(Exception):
-    """Sentinel: _handle_message got PAST the clarify text-intercept."""
 
 
 def _event(text):
@@ -78,6 +64,7 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
+        getattr(cm, "_consumed_message_ids").clear()
         cm._notify_cbs.clear()
 
 
@@ -95,152 +82,34 @@ def _make_runner(adapter):
 
 
 async def _dispatch(runner, event):
-    """Run _handle_message with a tripwire installed AFTER the clarify
-    intercept (the slash-confirm pending lookup is the next statement), so a
-    raised ``_FellThroughIntercept`` proves the message was NOT swallowed."""
-    import tools.slash_confirm as slash_confirm_mod
-
-    def _tripwire(_key):
-        raise _FellThroughIntercept()
-
-    with patch("hermes_cli.plugins.invoke_hook", return_value=[]), \
-            patch.object(slash_confirm_mod, "get_pending", _tripwire):
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
         return await runner._handle_message(event)
 
 
 @pytest.mark.asyncio
-async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
-    """Arbitrary prose during a pending button-clarify continues as a normal turn."""
+async def test_thread_prose_resolves_native_multi_choice_clarify():
     _clear_clarify_state()
     from tools import clarify_gateway as cm
 
     adapter = _StubAdapter()
     runner = _make_runner(adapter)
-    # Native interactive multi-choice prompt: awaiting_text stays False.
-    entry = cm.register("cl-native", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
-    assert entry.awaiting_text is False
+    event = _event("just checking the visual UI, no need to pass any data")
+    cm.register(
+        "cl-native",
+        SESSION_KEY,
+        "Pick a UI variant",
+        ["buttons", "dropdown"],
+        source_identity=cm.source_identity(event.source),
+    )
 
-    with pytest.raises(_FellThroughIntercept):
-        await _dispatch(runner, _event("just checking the visual UI, no need to pass any data"))
+    result = await _dispatch(runner, event)
 
-    # The prose is not accepted as the answer, but the clarify must be
-    # released before normal busy routing so redirect-to-steer can drain.
+    assert result == ""
     with cm._lock:
         entry = cm._entries.get("cl-native")
     assert entry is not None
     assert entry.event.is_set()
-    assert entry.response == ""
-    _clear_clarify_state()
-
-
-@pytest.mark.asyncio
-async def test_thread_prose_does_not_overwrite_concurrent_button_choice():
-    """A button result that wins the race remains the clarify response."""
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
-
-    adapter = _StubAdapter()
-    runner = _make_runner(adapter)
-    entry = cm.register(
-        "cl-button-race",
-        SESSION_KEY,
-        "Pick a UI variant",
-        ["buttons", "dropdown"],
-    )
-    assert cm.resolve_gateway_clarify("cl-button-race", "buttons") is True
-
-    with pytest.raises(_FellThroughIntercept):
-        await _dispatch(runner, _event("one more unrelated thought"))
-
-    assert entry.event.is_set()
-    assert entry.response == "buttons"
-    _clear_clarify_state()
-
-
-@pytest.mark.asyncio
-async def test_native_multi_select_out_of_range_keeps_clarify_pending():
-    """Out-of-range multi-select numbers must not cancel the pending prompt."""
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
-
-    adapter = _StubAdapter()
-    runner = _make_runner(adapter)
-    entry = cm.register(
-        "cl-ms-oor",
-        SESSION_KEY,
-        "Pick some targets",
-        ["staging", "prod", "canary"],
-        multi_select=True,
-    )
-    assert entry.awaiting_text is False
-
-    result = await _dispatch(runner, _event("99"))
-
-    assert result == ""
-    with cm._lock:
-        still = cm._entries.get("cl-ms-oor")
-    assert still is not None
-    assert not still.event.is_set()
-    assert still.response is None
-    _clear_clarify_state()
-
-
-@pytest.mark.asyncio
-async def test_native_multi_select_bad_comma_list_keeps_clarify_pending():
-    """Unrecognised comma-lists are retryable selection attempts, not prose."""
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
-
-    adapter = _StubAdapter()
-    runner = _make_runner(adapter)
-    entry = cm.register(
-        "cl-ms-bad",
-        SESSION_KEY,
-        "Pick some targets",
-        ["staging", "prod", "canary"],
-        multi_select=True,
-    )
-    assert entry.awaiting_text is False
-
-    result = await _dispatch(runner, _event("1,99"))
-
-    assert result == ""
-    with cm._lock:
-        still = cm._entries.get("cl-ms-bad")
-    assert still is not None
-    assert not still.event.is_set()
-    assert still.response is None
-    _clear_clarify_state()
-
-
-@pytest.mark.asyncio
-async def test_native_multi_select_prose_releases_clarify_before_routing():
-    """Free prose on multi-select still breaks the redirect/steer deadlock."""
-    _clear_clarify_state()
-    from tools import clarify_gateway as cm
-
-    adapter = _StubAdapter()
-    runner = _make_runner(adapter)
-    cm.register(
-        "cl-ms-prose",
-        SESSION_KEY,
-        "Pick some targets",
-        ["staging", "prod"],
-        multi_select=True,
-    )
-
-    with pytest.raises(_FellThroughIntercept):
-        await _dispatch(
-            runner,
-            _event("just checking the visual UI, no need to pass any data"),
-        )
-
-    with cm._lock:
-        entry = cm._entries.get("cl-ms-prose")
-    assert entry is not None
-    assert entry.event.is_set()
-    assert entry.response == ""
-    _clear_clarify_state()
+    assert entry.response == "just checking the visual UI, no need to pass any data"
 
 
 @pytest.mark.asyncio
@@ -251,10 +120,17 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
 
     adapter = _StubAdapter()
     runner = _make_runner(adapter)
-    cm.register("cl-other", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+    event = _event("a carousel actually")
+    cm.register(
+        "cl-other",
+        SESSION_KEY,
+        "Pick a UI variant",
+        ["buttons", "dropdown"],
+        source_identity=cm.source_identity(event.source),
+    )
     assert cm.mark_awaiting_text("cl-other") is True
 
-    result = await _dispatch(runner, _event("a carousel actually"))
+    result = await _dispatch(runner, event)
 
     assert result == ""
     with cm._lock:
@@ -262,5 +138,55 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
     assert entry is not None
     assert entry.event.is_set()
     assert entry.response == "a carousel actually"
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_dispatches_while_clarify_run_is_active():
     _clear_clarify_state()
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    is_running = patch.object(runner, "_is_session_running", return_value=True)
+    runner.config = SimpleNamespace(quick_commands={})  # type: ignore[assignment]
+    emit_collect = AsyncMock(return_value=[])
+    runner.hooks = SimpleNamespace(emit_collect=emit_collect)  # type: ignore[assignment]
+    runner._check_slash_access = lambda source, canonical_cmd: None
+    handler = AsyncMock(return_value="refreshed")
+    event = _event("/octo-refresh")
+
+    with (
+        is_running,
+        patch(
+            "hermes_cli.commands._iter_plugin_command_entries",
+            return_value=[("octo-refresh", "Refresh", "")],
+        ),
+        patch(
+            "hermes_cli.plugins.get_plugin_command_handler",
+            return_value=handler,
+        ),
+    ):
+        result = await runner._handle_message(event)
+
+    assert result == "refreshed"
+    handler.assert_awaited_once_with("")
+    emit_collect.assert_awaited_once()
+
+
+def test_prospective_thread_is_shared_when_thread_policy_is_shared():
+    from gateway.session import is_shared_multi_user_session
+
+    source = replace(
+        SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="channel",
+            user_id="owner",
+        ),
+        prospective_thread_id="thread-1",
+    )
+
+    assert is_shared_multi_user_session(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    ) is True
 

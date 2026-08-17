@@ -19,6 +19,7 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
+        cm._consumed_message_ids.clear()
         cm._notify_cbs.clear()
 
 
@@ -381,82 +382,222 @@ class TestMultiSelectTextFallback:
         assert cm._coerce_text_response(entry, "b") == "B"
 
 
-class TestNativeRejectClassification:
-    """Rejected typed replies must distinguish free prose from bad selections.
-
-    Free prose cancels/falls through (deadlock break). Selection-shaped but
-    invalid replies (out-of-range number, unrecognised comma-list) keep the
-    pending clarify armed so the user can retry.
-    """
+class TestClarifyTerminalRaces:
+    """A clarify entry has exactly one terminal outcome."""
 
     def setup_method(self):
         _clear_clarify_state()
 
-    def test_multi_select_out_of_range_is_invalid_selection(self):
+    def test_first_answer_wins_and_entry_stops_being_pending(self):
         from tools import clarify_gateway as cm
 
-        entry = cm.register(
-            "ms-oor", "sk-ms", "Pick some", ["A", "B", "C"], multi_select=True,
-        )
-        assert entry.awaiting_text is False
-        value, reason = cm._coerce_text_response_detailed(entry, "99")
-        assert value is None
-        assert reason == "invalid_selection"
-        assert cm.attempt_text_response_for_session("sk-ms", "99") == (
-            cm.TEXT_REJECTED_SELECTION
-        )
-        pending = cm.get_pending_for_session("sk-ms", include_choice_prompts=True)
-        assert pending is not None
-        assert not pending.event.is_set()
+        cm.register("race-answer", "sk", "Pick", ["A", "B"])
 
-    def test_multi_select_bad_comma_list_is_invalid_selection(self):
+        assert cm.resolve_gateway_clarify("race-answer", "A") is True
+        assert cm.resolve_gateway_clarify("race-answer", "B") is False
+        assert cm.get_pending_for_session("sk", include_choice_prompts=True) is None
+        assert cm.wait_for_response("race-answer", timeout=1) == "A"
+
+    def test_answer_wins_over_later_session_clear(self):
         from tools import clarify_gateway as cm
 
-        entry = cm.register(
-            "ms-bad", "sk-ms2", "Pick some", ["A", "B", "C"], multi_select=True,
-        )
-        value, reason = cm._coerce_text_response_detailed(entry, "1,99")
-        assert value is None
-        assert reason == "invalid_selection"
-        assert cm.attempt_text_response_for_session("sk-ms2", "nope,nope") == (
-            cm.TEXT_REJECTED_SELECTION
-        )
-        pending = cm.get_pending_for_session("sk-ms2", include_choice_prompts=True)
-        assert pending is not None
-        assert not pending.event.is_set()
+        cm.register("race-clear", "sk", "Pick", ["A", "B"])
 
-    def test_multi_select_free_prose_is_rejected_prose(self):
+        assert cm.resolve_gateway_clarify("race-clear", "A") is True
+        assert cm.clear_session("sk") == 0
+        assert cm.wait_for_response("race-clear", timeout=1) == "A"
+
+    def test_timeout_wins_over_later_answer(self):
         from tools import clarify_gateway as cm
 
-        entry = cm.register(
-            "ms-prose", "sk-ms3", "Pick some", ["A", "B"], multi_select=True,
-        )
-        value, reason = cm._coerce_text_response_detailed(
-            entry, "just checking the visual UI, no need to pass any data",
-        )
-        assert value is None
-        assert reason == "prose"
-        assert cm.attempt_text_response_for_session(
-            "sk-ms3", "just checking the visual UI, no need to pass any data",
-        ) == cm.TEXT_REJECTED_PROSE
+        cm.register("race-timeout", "sk", "Pick", ["A", "B"])
 
-    def test_single_select_out_of_range_is_invalid_selection(self):
+        assert cm.wait_for_response("race-timeout", timeout=0.01) is None
+        assert cm.resolve_gateway_clarify("race-timeout", "A") is False
+
+    def test_delivery_failure_returns_winning_answer_and_cleans_entry(self):
         from tools import clarify_gateway as cm
 
-        entry = cm.register("ss-oor", "sk-ss", "Pick one", ["A", "B"])
-        value, reason = cm._coerce_text_response_detailed(entry, "9")
-        assert value is None
-        assert reason == "invalid_selection"
-        assert cm.attempt_text_response_for_session("sk-ss", "9") == (
-            cm.TEXT_REJECTED_SELECTION
-        )
+        cm.register("race-delivery-answer", "sk", "Pick", ["A", "B"])
+        assert cm.resolve_gateway_clarify("race-delivery-answer", "custom") is True
 
-    def test_single_select_prose_is_rejected_prose(self):
+        assert cm.finish_failed_delivery("race-delivery-answer") == "custom"
+        assert "race-delivery-answer" not in cm._entries
+        assert "sk" not in cm._session_index
+
+    def test_delivery_failure_cancels_pending_entry_and_cleans_indices(self):
         from tools import clarify_gateway as cm
 
-        entry = cm.register("ss-prose", "sk-ss2", "Pick one", ["A", "B"])
-        value, reason = cm._coerce_text_response_detailed(
-            entry, "one more unrelated thought",
+        cm.register("race-delivery-cancel", "sk", "Pick", ["A", "B"])
+
+        assert cm.finish_failed_delivery("race-delivery-cancel") is None
+        assert "race-delivery-cancel" not in cm._entries
+        assert "sk" not in cm._session_index
+
+    def test_shared_thread_accepts_other_participant_on_same_route(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from tools import clarify_gateway as cm
+
+        owner = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="channel",
+            thread_id=None,
+            prospective_thread_id="thread-1",
+            user_id="owner",
         )
-        assert value is None
-        assert reason == "prose"
+        member = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="thread",
+            thread_id="thread-1",
+            user_id="member",
+        )
+        cm.register(
+            "shared-thread",
+            "sk",
+            "Pick",
+            ["A", "B"],
+            source_identity=cm.source_identity(owner),
+            shared_multi_user_session=True,
+        )
+
+        assert cm.resolve_text_response_for_session(
+            "sk",
+            "member answer",
+            source_identity=cm.source_identity(member),
+        ) is True
+
+    def test_isolated_thread_rejects_other_participant(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from tools import clarify_gateway as cm
+
+        owner = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="thread",
+            thread_id="thread-1",
+            user_id="owner",
+        )
+        member = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="thread",
+            thread_id="thread-1",
+            user_id="member",
+        )
+        cm.register(
+            "isolated-thread",
+            "sk",
+            "Pick",
+            ["A", "B"],
+            source_identity=cm.source_identity(owner),
+            shared_multi_user_session=False,
+        )
+
+        assert cm.resolve_text_response_for_session(
+            "sk",
+            "member answer",
+            source_identity=cm.source_identity(member),
+        ) is False
+
+
+    def test_source_identity_canonicalizes_whatsapp_alias_flip(self, monkeypatch):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setattr(
+            "gateway.whatsapp_identity.expand_whatsapp_aliases",
+            lambda _value: {"12345", "6012345"},
+        )
+        phone = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="6012345@s.whatsapp.net",
+            user_id="6012345@s.whatsapp.net",
+        )
+        lid = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="12345@lid",
+            user_id_alt="12345@lid",
+        )
+
+        assert cm.source_identity(phone) == cm.source_identity(lid)
+
+class TestNativeChoiceFreeText:
+    """Typed prose always answers an active native clarify."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_single_select_accepts_custom_text_without_other(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("custom-single", "sk", "Pick", ["A", "B"])
+
+        assert cm.resolve_text_response_for_session("sk", "something else") is True
+        assert cm.wait_for_response("custom-single", timeout=1) == "something else"
+
+    def test_multi_select_keeps_unmatched_comma_text_as_one_custom_answer(self):
+        import json
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "custom-multi",
+            "sk",
+            "Pick several",
+            ["A", "B"],
+            multi_select=True,
+        )
+
+        assert cm.resolve_text_response_for_session("sk", "later, after lunch") is True
+        assert json.loads(cm.wait_for_response("custom-multi", timeout=1)) == [
+            "later, after lunch"
+        ]
+
+
+class TestClarifyMessageConsumption:
+    """Realtime and Bot-event delivery share one message-id decision."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_message_id_is_consumed_once_across_delivery_paths(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("dedup", "sk", "Pick", ["A", "B"])
+
+        assert cm.resolve_message_text_for_session("sk", "custom", "message-1") == "consumed"
+        assert cm.resolve_message_text_for_session("sk", "custom", "message-1") == "duplicate"
+        assert cm.is_clarify_message_consumed("message-1") is True
+        assert cm.wait_for_response("dedup", timeout=1) == "custom"
+
+    def test_failed_message_resolution_does_not_consume_message_id(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.resolve_message_text_for_session("missing", "custom", "message-2") == "not_resolved"
+        assert cm.is_clarify_message_consumed("message-2") is False
+
+    def test_message_claim_and_answer_are_atomic_against_competing_answer(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("race-message", "sk", "Pick", ["A", "B"])
+        outcomes = []
+        barrier = threading.Barrier(3)
+
+        def resolve(message_id, answer):
+            barrier.wait()
+            outcomes.append(cm.resolve_message_text_for_session("sk", answer, message_id))
+
+        first = threading.Thread(target=resolve, args=("message-a", "A"))
+        second = threading.Thread(target=resolve, args=("message-b", "B"))
+        first.start()
+        second.start()
+        barrier.wait()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert sorted(outcomes) == ["consumed", "not_resolved"]
+        assert sum(cm.is_clarify_message_consumed(mid) for mid in ("message-a", "message-b")) == 1
