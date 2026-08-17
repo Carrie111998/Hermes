@@ -18,10 +18,18 @@ const ensureGatewayForAgent = vi.fn(async (_connectionId: null | string, _profil
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
+
+const $activeGatewayIdentity = atom<{ connectionId: null | string; profile: string }>({
+  connectionId: null,
+  profile: 'default'
+})
+
 const resetStarmapGraph = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
+  $activeGatewayIdentity,
   $gateway,
+  activeGatewayIdentity: () => $activeGatewayIdentity.get(),
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForProfile
@@ -63,6 +71,7 @@ beforeEach(() => {
   ensureGatewayForAgent.mockClear()
   ensureGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
+  $activeGatewayIdentity.set({ connectionId: null, profile: 'default' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
   vi.stubGlobal('window', { hermesDesktop: { getConnection, getConnectionFor } })
@@ -74,6 +83,16 @@ afterEach(() => {
 })
 
 describe('ensureGatewayAgent → $connection / $activeGatewayProfile sync', () => {
+  it('switches back to the legacy primary when the profile matches but the source differs', async () => {
+    $activeGatewayIdentity.set({ connectionId: 'homelab', profile: 'default' })
+    getConnection.mockResolvedValue(localConn())
+
+    await ensureGatewayProfile('default')
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default')
+    expect(getConnection).toHaveBeenCalledWith('default')
+  })
+
   it('resyncs $connection and $activeGatewayProfile even when the agent socket is already open', async () => {
     // The store-level activation resolves instantly (socket already open) —
     // exactly the case that used to skip the sync entirely.

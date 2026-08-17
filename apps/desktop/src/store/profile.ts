@@ -12,7 +12,13 @@ import {
   storedStringRecord
 } from '@/lib/storage'
 import { invalidateCronModelImpactScopeState } from '@/store/cron-model-impact-scope'
-import { $gateway, ensureGatewayForAgent, ensureGatewayForProfile, openGatewayForProfile } from '@/store/gateway'
+import {
+  $gateway,
+  activeGatewayIdentity,
+  ensureGatewayForAgent,
+  ensureGatewayForProfile,
+  openGatewayForProfile
+} from '@/store/gateway'
 import { setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
@@ -304,7 +310,18 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
 
   const target = normalizeProfileKey(profile)
 
-  if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+  const alreadyActive = () => {
+    const identity = activeGatewayIdentity()
+
+    return (
+      identity.connectionId === null &&
+      normalizeProfileKey(identity.profile) === target &&
+      normalizeProfileKey($activeGatewayProfile.get()) === target &&
+      Boolean($gateway.get())
+    )
+  }
+
+  if (alreadyActive()) {
     return
   }
 
@@ -313,7 +330,7 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   if (gatewaySwitch) {
     await gatewaySwitch.catch(() => undefined)
 
-    if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+    if (alreadyActive()) {
       return
     }
   }

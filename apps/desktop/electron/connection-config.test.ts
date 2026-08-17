@@ -42,6 +42,7 @@ import {
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveProfileSshScope,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
@@ -199,6 +200,30 @@ test('profileRemoteOverride tolerates a missing/!object profiles map', () => {
   assert.equal(profileRemoteOverride({}, 'coder'), null)
   assert.equal(profileRemoteOverride({ profiles: null }, 'coder'), null)
   assert.equal(profileRemoteOverride(null, 'coder'), null)
+})
+
+test('resolveProfileSshScope uses profile SSH while the primary connection is local', () => {
+  const config = {
+    mode: 'local',
+    profiles: { venture: { mode: 'ssh', host: 'mini.example', user: 'del' } }
+  }
+
+  assert.equal(resolveProfileSshScope(config, 'venture'), 'venture')
+})
+
+test('resolveProfileSshScope keeps URL and env remotes off global SSH', () => {
+  const config = {
+    mode: 'ssh',
+    host: 'global.example',
+    profiles: { cloud: { mode: 'remote', url: 'https://gateway.example' } }
+  }
+
+  assert.equal(resolveProfileSshScope(config, 'cloud'), null)
+  assert.equal(resolveProfileSshScope(config, 'venture', 'https://env.example'), null)
+})
+
+test('resolveProfileSshScope inherits app-global SSH without a profile override', () => {
+  assert.equal(resolveProfileSshScope({ mode: 'ssh', host: 'global.example' }, 'venture'), '')
 })
 
 test('SSH remains separate from URL-shaped remote modes and preserves an explicit remote profile', () => {

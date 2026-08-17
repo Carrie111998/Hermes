@@ -21,7 +21,10 @@ const gatewayMocks = vi.hoisted(() => {
   }
 })
 
+const onActiveConnectionInvalidated = vi.fn()
+
 vi.mock('@/hermes', () => ({
+  getApiRequestProfile: vi.fn(() => 'default'),
   setApiRequestConnection: vi.fn(),
   HermesGateway: class {
     connectionState = 'closed'
@@ -46,11 +49,15 @@ vi.mock('@/store/session', () => ({
 vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() }))
 
 const {
+  $activeGatewayIdentity,
+  $gateway,
   closeSecondaryGateways,
   configureGatewayRegistry,
   disposeSecondariesForConnection,
   ensureActiveGatewayOpen,
   ensureGatewayForAgent,
+  ensureGatewayForProfile,
+  isActivePrimary,
   setPrimaryGateway
 } = await import('./gateway')
 
@@ -70,7 +77,8 @@ function descriptorFor(connectionId: string, profile: string) {
 }
 
 beforeEach(() => {
-  configureGatewayRegistry({ onEvent: vi.fn() } as never)
+  onActiveConnectionInvalidated.mockClear()
+  configureGatewayRegistry({ onActiveConnectionInvalidated, onEvent: vi.fn() } as never)
   setPrimaryGateway({ connectionState: 'open' } as never, 'default')
 })
 
@@ -90,21 +98,24 @@ describe('disposeSecondariesForConnection', () => {
 
     installDesktop({ getConnectionFor })
 
+    await ensureGatewayForAgent('office', 'default')
     await ensureGatewayForAgent('homelab', 'default')
     await ensureGatewayForAgent('homelab', 'work')
-    await ensureGatewayForAgent('office', 'default')
 
     expect(gatewayMocks.instances).toHaveLength(3)
 
     disposeSecondariesForConnection('homelab')
 
     // Both homelab sockets closed; the office socket untouched.
-    expect(gatewayMocks.instances[0].close).toHaveBeenCalledOnce()
+    expect(gatewayMocks.instances[0].close).not.toHaveBeenCalled()
     expect(gatewayMocks.instances[1].close).toHaveBeenCalledOnce()
-    expect(gatewayMocks.instances[2].close).not.toHaveBeenCalled()
+    expect(gatewayMocks.instances[2].close).toHaveBeenCalledOnce()
 
     // No redial for a removal.
     expect(getConnectionFor).toHaveBeenCalledTimes(3)
+    expect(isActivePrimary()).toBe(true)
+    expect($gateway.get()).not.toBeNull()
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: null, profile: 'default' })
   })
 
   it('re-dials disposed secondaries when redial is requested (material edit)', async () => {
@@ -124,9 +135,38 @@ describe('disposeSecondariesForConnection', () => {
       expect(gatewayMocks.connect).toHaveBeenCalledTimes(2)
     })
 
-    // Old socket closed, fresh descriptor fetched (would carry the new URL).
+    // Old socket closed, fresh descriptor fetched and the active route
+    // atomically republishes the replacement socket.
     expect(gatewayMocks.instances[0].close).toHaveBeenCalledOnce()
     expect(getConnectionFor).toHaveBeenCalledTimes(2)
+    expect($gateway.get()).toBe(gatewayMocks.instances[1])
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: 'homelab', profile: 'default' })
+  })
+
+  it('keeps outbound gateway work unavailable when an active material-edit redial cannot resolve', async () => {
+    vi.useFakeTimers()
+
+    const getConnectionFor = vi
+      .fn()
+      .mockResolvedValueOnce(descriptorFor('homelab', 'default'))
+      .mockRejectedValueOnce(new Error('edited descriptor is invalid'))
+      .mockResolvedValue(descriptorFor('homelab', 'default'))
+
+    installDesktop({ getConnectionFor })
+
+    await ensureGatewayForAgent('homelab', 'default')
+
+    disposeSecondariesForConnection('homelab', { redial: true })
+
+    expect(isActivePrimary()).toBe(false)
+    expect($gateway.get()).toBeNull()
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: 'homelab', profile: 'default' })
+
+    await vi.runAllTimersAsync()
+
+    expect(getConnectionFor).toHaveBeenCalledTimes(3)
+    expect($gateway.get()).toBe(gatewayMocks.instances[1])
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: 'homelab', profile: 'default' })
   })
 
   it('is a no-op for blank or unknown connection ids', async () => {
@@ -170,6 +210,10 @@ describe('reconnect fail-stop on a removed connection', () => {
     const callsAfterFailStop = getConnectionFor.mock.calls.length
     await ensureActiveGatewayOpen()
     expect(getConnectionFor.mock.calls.length).toBe(callsAfterFailStop)
+    expect(isActivePrimary()).toBe(true)
+    expect($gateway.get()).not.toBeNull()
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: null, profile: 'default' })
+    expect(onActiveConnectionInvalidated).toHaveBeenCalledWith('default', expect.any(Number))
   })
 
   it('keeps retrying on ordinary transport failures', async () => {
@@ -192,5 +236,54 @@ describe('reconnect fail-stop on a removed connection', () => {
     const reopened = await ensureActiveGatewayOpen()
 
     expect(reopened).not.toBeNull()
+  })
+})
+
+describe('reconnect activation races', () => {
+  it('does not supersede a newer foreground profile activation when the old source reconnects first', async () => {
+    let releaseReconnect: () => void = () => undefined
+
+    const reconnectGate = new Promise<void>(resolve => {
+      releaseReconnect = resolve
+    })
+
+    let releaseWorkerDescriptor: () => void = () => undefined
+
+    const workerDescriptorGate = new Promise<void>(resolve => {
+      releaseWorkerDescriptor = resolve
+    })
+
+    const getConnectionFor = vi.fn(async ({ connectionId, profile }: { connectionId: string; profile: string }) =>
+      descriptorFor(connectionId, profile)
+    )
+
+    const getConnection = vi.fn(async (profile: null | string) => {
+      if (profile === 'worker') {
+        await workerDescriptorGate
+      }
+
+      return { port: 5151, profile, token: 'profile-token' }
+    })
+
+    installDesktop({ getConnection, getConnectionFor })
+    await ensureGatewayForAgent('homelab', 'default')
+
+    const sourceGateway = gatewayMocks.instances[0] as unknown as { connectionState: string }
+    sourceGateway.connectionState = 'closed'
+    gatewayMocks.connect.mockImplementationOnce(async () => reconnectGate)
+
+    const reconnect = ensureActiveGatewayOpen()
+    await vi.waitFor(() => expect(gatewayMocks.connect).toHaveBeenCalledTimes(2))
+
+    const activateWorker = ensureGatewayForProfile('worker')
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledWith('worker'))
+
+    releaseReconnect()
+    await reconnect
+    releaseWorkerDescriptor()
+    await activateWorker
+
+    expect($gateway.get()).toBe(gatewayMocks.instances[1])
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: null, profile: 'worker' })
   })
 })

@@ -6,11 +6,12 @@ import { isElementInHiddenPane, PANE_HIDDEN_ATTR } from '@/components/pane-shell
 import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { markRightPanePerf } from '@/debug/right-pane-events'
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
+import { $activeGatewayIdentity } from '@/store/gateway'
 import { $paneStates } from '@/store/panes'
 
 import { $terminalTakeover } from '../store'
 
-import { ensureTerminal } from './terminals'
+import { bindLegacyTerminalIdentities, ensureTerminal } from './terminals'
 import { TerminalWorkspace } from './workspace'
 
 /**
@@ -64,6 +65,7 @@ const sameRect = (a: Rect | null, b: Rect) =>
 export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalProps) {
   const slot = useStore($slot)
   const terminalTakeover = useStore($terminalTakeover)
+  const activeIdentity = useStore($activeGatewayIdentity)
   const [rect, setRect] = useState<Rect | null>(null)
   const [ready, setReady] = useState(false)
 
@@ -76,10 +78,11 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
 
   useEffect(() => {
     if (terminalTakeover && ready) {
+      bindLegacyTerminalIdentities(activeIdentity)
+      ensureTerminal(activeIdentity)
       setMounted(true)
-      ensureTerminal()
     }
-  }, [terminalTakeover, ready])
+  }, [activeIdentity, terminalTakeover, ready])
 
   useLayoutEffect(() => {
     if (!slot) {

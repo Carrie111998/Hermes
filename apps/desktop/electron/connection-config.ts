@@ -413,6 +413,21 @@ function profileHasRemoteConnection(config, profile) {
   return Boolean(profileRemoteOverride(config, profile) || profileSshOverride(config, profile))
 }
 
+/** Resolve which SSH connection scope owns a profile's interactive terminal.
+ * A per-profile SSH override wins. URL/cloud/env routes expose no SSH shell.
+ * Otherwise profiles inherit app-global SSH when configured. */
+function resolveProfileSshScope(config, profile, envRemoteUrl = '') {
+  if (profileSshOverride(config, profile)) {
+    return connectionScopeKey(profile) || ''
+  }
+
+  if (profileRemoteOverride(config, profile) || String(envRemoteUrl || '').trim()) {
+    return null
+  }
+
+  return config?.mode === 'ssh' ? '' : null
+}
+
 function localProfileEntry(existing) {
   const ssh = normalizeSshConfig(existing) || normalizeSshConfig(existing?.savedSsh)
 
@@ -802,6 +817,7 @@ export {
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveProfileSshScope,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,

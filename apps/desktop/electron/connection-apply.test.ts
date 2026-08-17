@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  commitConnectionFailure,
+  resolveTerminalConnection,
+  terminalConnectionId,
+  terminalRegistrySourceKind
+} from './connection-apply'
 
 function deferred() {
   let resolve!: () => void
@@ -67,22 +73,61 @@ describe('applyConnectionChange', () => {
 })
 
 describe('resolveTerminalConnection', () => {
-  it('joins an in-flight backend before resolving the SSH terminal target', async () => {
-    const target = { ssh: {}, scope: '' }
+  it('joins the exact registry backend before resolving its SSH terminal target', async () => {
+    const identity = { connectionId: 'homelab', profile: 'venture' }
+    const target = { ssh: {}, scope: 'conn:homelab::venture' }
     const getTarget = vi.fn().mockReturnValueOnce('pending').mockReturnValueOnce(target)
     const ensureBackend = vi.fn(async () => undefined)
 
-    await expect(resolveTerminalConnection(getTarget, ensureBackend)).resolves.toBe(target)
+    await expect(resolveTerminalConnection(identity, getTarget, ensureBackend)).resolves.toBe(target)
+    expect(getTarget).toHaveBeenNthCalledWith(1, identity)
+    expect(getTarget).toHaveBeenNthCalledWith(2, identity)
     expect(ensureBackend).toHaveBeenCalledOnce()
+    expect(ensureBackend).toHaveBeenCalledWith(identity)
+  })
+
+  it('keeps registry remote and cloud terminals on the local shell path', async () => {
+    const identity = { connectionId: 'cloud-prod', profile: 'venture' }
+    const getTarget = vi.fn(() => null)
+    const ensureBackend = vi.fn(async () => undefined)
+
+    await expect(resolveTerminalConnection(identity, getTarget, ensureBackend)).resolves.toBeNull()
+    expect(getTarget).toHaveBeenCalledOnce()
+    expect(getTarget).toHaveBeenCalledWith(identity)
+    expect(ensureBackend).not.toHaveBeenCalled()
   })
 
   it('does not start a local terminal while configured SSH remains unavailable', async () => {
     await expect(
       resolveTerminalConnection(
+        { connectionId: null, profile: 'venture' },
         () => 'pending',
         async () => undefined
       )
     ).rejects.toThrow('not ready')
+  })
+})
+
+describe('terminalConnectionId', () => {
+  it('preserves explicit local as a registry route instead of legacy routing', () => {
+    expect(terminalConnectionId('local')).toBe('local')
+    expect(terminalConnectionId('')).toBeNull()
+  })
+})
+
+describe('terminalRegistrySourceKind', () => {
+  const sources = [
+    { id: 'homelab', kind: 'ssh' },
+    { id: 'cloud-prod', kind: 'cloud' }
+  ]
+
+  it('keeps known SSH sources on the remote terminal path', () => {
+    expect(terminalRegistrySourceKind('homelab', sources)).toBe('ssh')
+  })
+
+  it('distinguishes removed sources so they cannot silently spawn locally', () => {
+    expect(terminalRegistrySourceKind('cloud-prod', sources)).toBe('local')
+    expect(terminalRegistrySourceKind('removed-source', sources)).toBe('missing')
   })
 })
 

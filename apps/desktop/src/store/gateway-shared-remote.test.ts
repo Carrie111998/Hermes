@@ -19,6 +19,7 @@ const gatewayMocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/hermes', () => ({
+  getApiRequestProfile: vi.fn(() => 'default'),
   setApiRequestConnection: vi.fn(),
   HermesGateway: class {
     connectionState = 'closed'
@@ -39,14 +40,21 @@ vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() })
 
 const {
   $gateway,
+  activeGatewayIdentity,
   closeSecondaryGateways,
   configureGatewayRegistry,
+  deriveActiveGatewayIdentity,
   ensureActiveGatewayOpen,
+  ensureGatewayForAgent,
   ensureGatewayForProfile,
   setPrimaryGateway
 } = await import('./gateway')
 
-type DesktopStub = { getConnection: ReturnType<typeof vi.fn> }
+type DesktopStub = {
+  getConnection: ReturnType<typeof vi.fn>
+  getConnectionFor?: ReturnType<typeof vi.fn>
+  getGatewayWsUrlFor?: ReturnType<typeof vi.fn>
+}
 
 function installDesktop(stub: DesktopStub): void {
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = stub
@@ -70,7 +78,61 @@ afterEach(() => {
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
 })
 
+describe('HMR active gateway identity migration', () => {
+  it('reconstructs registry-secondary and shared-primary route identities', () => {
+    const secondaryState = {
+      activeKey: 'conn:local::work',
+      activeRouteProfile: undefined,
+      primaryProfile: 'default',
+      secondaries: new Map([['conn:local::work', { connectionId: 'local', profile: 'work' }]])
+    }
+
+    expect(deriveActiveGatewayIdentity(secondaryState as never, 'stale')).toEqual({
+      connectionId: 'local',
+      profile: 'work'
+    })
+    expect(
+      deriveActiveGatewayIdentity(
+        { activeKey: 'default', activeRouteProfile: undefined, primaryProfile: 'default', secondaries: new Map() } as never,
+        'venture'
+      )
+    ).toEqual({ connectionId: null, profile: 'venture' })
+  })
+})
+
 describe('ensureGatewayForProfile under a shared global remote', () => {
+  it('reports primary and explicit registry-source identities from the active gateway', async () => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+
+    expect(activeGatewayIdentity()).toEqual({ connectionId: null, profile: 'default' })
+
+    const registryConnection = {
+      authMode: 'token',
+      baseUrl: 'https://homelab.invalid',
+      connectionId: 'homelab',
+      mode: 'remote',
+      profile: 'default',
+      token: 'fake-test-token',
+      wsUrl: 'wss://homelab.invalid/api/ws?token=fake-test-token'
+    }
+
+    installDesktop({
+      getConnection: vi.fn(),
+      getConnectionFor: vi.fn(async () => registryConnection),
+      getGatewayWsUrlFor: vi.fn(async () => ({ ok: true, wsUrl: registryConnection.wsUrl }))
+    })
+    gatewayMocks.connect.mockResolvedValueOnce(undefined)
+
+    await ensureGatewayForAgent('homelab', 'default')
+
+    expect(activeGatewayIdentity()).toEqual({ connectionId: 'homelab', profile: 'default' })
+
+    await ensureGatewayForAgent('local', 'default')
+
+    expect(activeGatewayIdentity()).toEqual({ connectionId: 'local', profile: 'default' })
+  })
+
   it('activates the primary socket for an explicitly shared-primary descriptor', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
@@ -84,6 +146,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
 
     expect(gatewayMocks.connect).not.toHaveBeenCalled()
     expect($gateway.get()).toBe(primary)
+    expect(activeGatewayIdentity()).toEqual({ connectionId: null, profile: 'venture' })
   })
 
   it('dials the exact WebSocket URL for a pooled profile descriptor that carries profile', async () => {

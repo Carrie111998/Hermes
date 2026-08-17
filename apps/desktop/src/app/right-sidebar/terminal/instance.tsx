@@ -25,6 +25,8 @@ interface TerminalInstanceProps {
   cwd: string
   active: boolean
   onAddSelectionToChat: (text: string, label?: string) => void
+  connectionId?: null | string
+  profile?: string
   restoreCwd?: string
   reviveBuffer?: string
 }
@@ -36,6 +38,8 @@ export function TerminalInstance({
   active,
   cwd,
   onAddSelectionToChat,
+  connectionId,
+  profile,
   restoreCwd,
   reviveBuffer
 }: TerminalInstanceProps) {
@@ -46,6 +50,8 @@ export function TerminalInstance({
     cwd,
     active,
     onAddSelectionToChat,
+    connectionId,
+    profile,
     restoreCwd,
     reviveBuffer,
     onShell: shell => reportTerminalShell(id, shell)

@@ -32,6 +32,7 @@ function deferred<T>() {
 }
 
 vi.mock('@/hermes', () => ({
+  getApiRequestProfile: () => 'default',
   getGlobalModelInfo: vi.fn(),
   setApiRequestProfile: vi.fn(),
   setGlobalModel: (...args: Parameters<typeof setGlobalModel>) => setGlobalModel(...args)

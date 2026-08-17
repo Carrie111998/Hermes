@@ -58,7 +58,12 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
-import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  resolveTerminalConnection,
+  terminalConnectionId,
+  terminalRegistrySourceKind
+} from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
@@ -86,6 +91,7 @@ import {
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveProfileSshScope,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview,
@@ -8733,34 +8739,43 @@ async function teardownSshConnection(profile) {
 
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
-// SSH connection — so if the active profile resolves to a NON-SSH backend, the
+// SSH connection — so if the requested profile resolves to a NON-SSH backend, the
 // terminal must NOT fall through to a global SSH host.
-function activeSshTerminalTarget() {
-  const profile = primaryProfileKey()
-  const config = readDesktopConnectionConfig()
+function activeSshTerminalTarget({ connectionId, profile }) {
+  if (connectionId) {
+    const sources = readDesktopConnectionsRegistry().connections
+    const sourceKind = terminalRegistrySourceKind(connectionId, sources)
 
-  if (profileSshOverride(config, profile)) {
-    const scope = sshScopeKey(profile)
+    if (sourceKind === 'missing') {
+      throw new Error('This terminal connection no longer exists. Select an available connection or close the stale tab.')
+    }
+
+    // Registry remote/cloud/local sources have no SSH transport. As with v1
+    // URL and cloud connections, their terminal remains a local shell.
+    if (sourceKind !== 'ssh') {
+      return null
+    }
+
+    const scope = backendScopeKey(connectionId, profile)
     const state = sshConnections.get(scope)
 
-    return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
+    return state?.ssh ? { ssh: state.ssh, scope } : 'pending'
   }
 
-  if (profileRemoteOverride(config, profile)) {
+  const config = readDesktopConnectionConfig()
+  const scope = resolveProfileSshScope(config, profile, process.env.HERMES_DESKTOP_REMOTE_URL)
+
+  if (scope === null) {
     return null
   }
 
-  if (process.env.HERMES_DESKTOP_REMOTE_URL) {
-    return null
-  }
+  const state = sshConnections.get(scope)
 
-  if (config.mode === 'ssh') {
-    const state = sshConnections.get('')
+  return state?.ssh ? { ssh: state.ssh, scope } : 'pending'
+}
 
-    return state && state.ssh ? { ssh: state.ssh, scope: '' } : 'pending'
-  }
-
-  return null
+function ensureTerminalBackend({ connectionId, profile }) {
+  return connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
 }
 
 function effectiveSshConfigFingerprint(sshConfig) {
@@ -14249,8 +14264,12 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   const cwd = safeTerminalCwd(payload?.cwd)
   const cols = Math.max(2, Number.parseInt(String(payload?.cols || 80), 10) || 80)
   const rows = Math.max(2, Number.parseInt(String(payload?.rows || 24), 10) || 24)
+  const requestedProfile = String(payload?.profile || '').trim()
+  const profile = PROFILE_NAME_RE.test(requestedProfile) ? requestedProfile : primaryProfileKey()
+  const connectionId = terminalConnectionId(payload?.connectionId)
+  const identity = { connectionId, profile }
 
-  const sshTarget = await resolveTerminalConnection(activeSshTerminalTarget, () => ensureBackend(primaryProfileKey()))
+  const sshTarget = await resolveTerminalConnection(identity, activeSshTerminalTarget, ensureTerminalBackend)
   const remote = Boolean(sshTarget)
   const remoteState = remote ? sshConnections.get(sshTarget.scope) : null
 
