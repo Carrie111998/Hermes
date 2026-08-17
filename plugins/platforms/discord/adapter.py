@@ -93,6 +93,8 @@ _DISCORD_MODEL_SELECT_CAPACITY = (
 ) * _DISCORD_SELECT_MAX_OPTIONS
 _DISCORD_BUTTON_LABEL_LIMIT = 80
 _DISCORD_ELLIPSIS = "\u2026"
+_DISCORD_THREAD_ACTIVITY_PREFIX = "⏳ "
+_DISCORD_THREAD_FAILURE_PREFIX = "⛔ "
 _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
     "non_conversational_history",
@@ -1117,6 +1119,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        self._thread_activity_states: Dict[str, Dict[str, Any]] = {}
+        self._thread_activity_lock = asyncio.Lock()
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -3353,8 +3357,145 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    def _thread_activity_indicator_enabled(self) -> bool:
+        """Return whether opt-in thread-title activity is enabled."""
+        return os.getenv("DISCORD_THREAD_ACTIVITY_INDICATOR", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _thread_activity_title(prefix: str, base_title: str) -> str:
+        """Fit a prefixed title within Discord's 80 UTF-16-unit budget."""
+        budget = 80 - utf16_len(prefix)
+        return prefix + _prefix_within_utf16_limit(base_title, budget).rstrip()
+
+    @staticmethod
+    def _clean_discord_thread_title(name: str) -> str:
+        """Normalize and truncate a Discord thread title safely."""
+        cleaned = re.sub(r"\s+", " ", str(name or "")).strip()
+        if utf16_len(cleaned) > 80:
+            cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
+        return cleaned
+
+    @staticmethod
+    def _thread_activity_base_title(title: str) -> str:
+        """Remove activity markers left by a previous interrupted turn."""
+        base_title = title.strip()
+        while base_title.startswith(
+            (_DISCORD_THREAD_ACTIVITY_PREFIX, _DISCORD_THREAD_FAILURE_PREFIX)
+        ):
+            base_title = base_title[2:].lstrip()
+        return base_title
+
+    async def _thread_for_activity_event(self, event: MessageEvent) -> Optional[Any]:
+        thread_id = str(getattr(event.source, "thread_id", "") or "")
+        if not thread_id or not self._client:
+            return None
+        channel = getattr(getattr(event, "raw_message", None), "channel", None)
+        thread_type = getattr(discord, "Thread", ())
+        if isinstance(channel, thread_type) and str(getattr(channel, "id", "")) == thread_id:
+            return channel
+        try:
+            thread = self._client.get_channel(int(thread_id))
+            if thread is None:
+                thread = await self._client.fetch_channel(int(thread_id))
+            return thread if isinstance(thread, thread_type) else None
+        except Exception:
+            logger.debug(
+                "[%s] Failed to resolve Discord thread %s for activity indicator",
+                self.name,
+                thread_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _start_thread_activity(self, event: MessageEvent) -> None:
+        if not self._thread_activity_indicator_enabled():
+            return
+        thread = await self._thread_for_activity_event(event)
+        if thread is None:
+            return
+        thread_id = str(thread.id)
+        async with self._thread_activity_lock:
+            state = self._thread_activity_states.get(thread_id)
+            if state is not None:
+                state["active_count"] += 1
+                return
+            base_title = self._thread_activity_base_title(
+                str(getattr(thread, "name", "") or "")
+            )
+            if not base_title:
+                return
+            active_title = self._thread_activity_title(
+                _DISCORD_THREAD_ACTIVITY_PREFIX,
+                base_title,
+            )
+            try:
+                await thread.edit(name=active_title, reason="Hermes processing activity")
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to mark Discord thread %s active",
+                    self.name,
+                    thread_id,
+                    exc_info=True,
+                )
+                return
+            self._thread_activity_states[thread_id] = {
+                "active_count": 1,
+                "base_title": base_title,
+                "display_title": active_title,
+                "failed": False,
+            }
+
+    async def _complete_thread_activity(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        thread_id = str(getattr(event.source, "thread_id", "") or "")
+        if not thread_id:
+            return
+        thread = await self._thread_for_activity_event(event)
+        async with self._thread_activity_lock:
+            state = self._thread_activity_states.get(thread_id)
+            if state is None:
+                return
+            if outcome == ProcessingOutcome.FAILURE:
+                state["failed"] = True
+            state["active_count"] -= 1
+            if state["active_count"] > 0:
+                return
+            if thread is None:
+                self._thread_activity_states.pop(thread_id, None)
+                return
+            current_title = str(getattr(thread, "name", "") or "").strip()
+            target_title = (
+                self._thread_activity_title(
+                    _DISCORD_THREAD_FAILURE_PREFIX,
+                    state["base_title"],
+                )
+                if state["failed"]
+                else state["base_title"]
+            )
+            try:
+                if current_title == state["display_title"] and current_title != target_title:
+                    await thread.edit(name=target_title, reason="Hermes processing activity")
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to finalize Discord thread %s activity indicator",
+                    self.name,
+                    thread_id,
+                    exc_info=True,
+                )
+            finally:
+                self._thread_activity_states.pop(thread_id, None)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
+        await self._start_thread_activity(event)
         message = event.raw_message
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
@@ -3367,6 +3508,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
+        await self._complete_thread_activity(event, outcome)
         await asyncio.to_thread(
             self._record_discord_processing_complete,
             event,
@@ -7297,6 +7439,47 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         only_if_current_name: Optional[str] = None,
     ) -> bool:
+        """Rename a thread while preserving an active activity marker."""
+        normalized_id = str(thread_id)
+        async with self._thread_activity_lock:
+            state = self._thread_activity_states.get(normalized_id)
+            if state is None:
+                return await self._rename_thread_unlocked(
+                    thread_id,
+                    name,
+                    only_if_current_name=only_if_current_name,
+                )
+            if (
+                only_if_current_name is not None
+                and state["base_title"] != only_if_current_name
+            ):
+                return False
+            base_title = self._clean_discord_thread_title(
+                self._thread_activity_base_title(str(name or ""))
+            )
+            if not base_title:
+                return False
+            active_title = self._thread_activity_title(
+                _DISCORD_THREAD_ACTIVITY_PREFIX,
+                base_title,
+            )
+            renamed = await self._rename_thread_unlocked(
+                thread_id,
+                active_title,
+                only_if_current_name=state["display_title"],
+            )
+            if renamed:
+                state["base_title"] = base_title
+                state["display_title"] = active_title
+            return renamed
+
+    async def _rename_thread_unlocked(
+        self,
+        thread_id: str,
+        name: str,
+        *,
+        only_if_current_name: Optional[str] = None,
+    ) -> bool:
         """Best-effort Discord thread rename.
 
         ``only_if_current_name`` prevents overwriting human-renamed or
@@ -7310,14 +7493,9 @@ class DiscordAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return False
 
-        cleaned = re.sub(r"\s+", " ", str(name or "")).strip()
+        cleaned = self._clean_discord_thread_title(name)
         if not cleaned:
             return False
-        # Discord thread names are budgeted in UTF-16 code units (emoji count
-        # double) — truncate with the UTF-16 helpers, not code-point slices.
-        from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
-        if utf16_len(cleaned) > 80:
-            cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
 
         try:
             thread = self._client.get_channel(thread_id_int)
@@ -10374,6 +10552,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     throughout the connect / handle code paths (``DISCORD_ALLOWED_USERS``,
     ``DISCORD_REQUIRE_MENTION``, ``DISCORD_FREE_RESPONSE_CHANNELS``,
     ``DISCORD_AUTO_THREAD``, ``DISCORD_REACTIONS``,
+    ``DISCORD_THREAD_ACTIVITY_INDICATOR``,
     ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
@@ -10456,6 +10635,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+    if (
+        "thread_activity_indicator" in discord_cfg
+        and not os.getenv("DISCORD_THREAD_ACTIVITY_INDICATOR")
+    ):
+        os.environ["DISCORD_THREAD_ACTIVITY_INDICATOR"] = str(
+            discord_cfg["thread_activity_indicator"]
+        ).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
