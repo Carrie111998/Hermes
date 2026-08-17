@@ -555,6 +555,9 @@ def auth_status_command(args) -> None:
         raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
     status = auth_mod.get_auth_status(provider)
     if not status.get("logged_in"):
+        if status.get("needs_refresh"):
+            print(f"{provider}: access token expired (refresh needed)")
+            return
         reason = status.get("error")
         if reason:
             print(f"{provider}: logged out ({reason})")

@@ -1337,17 +1337,14 @@ class CredentialPool:
         # resolve_codex_runtime_credentials()).  When a waiter finally acquires
         # the lock, the in-lock re-sync below picks up the rotated token the
         # winner persisted and skips the POST.
-        try:
-            from providers import get_provider_profile
+        from providers import get_provider_profile
 
-            profile = get_provider_profile(self.provider)
-            is_plugin_oauth = bool(
-                profile
-                and profile.auth_type == "oauth_pkce"
-                and profile.oauth is not None
-            )
-        except Exception:
-            is_plugin_oauth = False
+        profile = get_provider_profile(self.provider)
+        is_plugin_oauth = bool(
+            profile
+            and profile.auth_type == "oauth_pkce"
+            and profile.oauth is not None
+        )
         if self.provider in ("openai-codex", "xai-oauth") or is_plugin_oauth:
             sync_entry = (
                 self._sync_codex_entry_from_auth_store
@@ -1833,12 +1830,9 @@ class CredentialPool:
             # runtime credentials are actually resolved, not merely when the pool
             # is enumerated for listing, migration, or selection.
             return False
-        try:
-            from providers import get_provider_profile
+        from providers import get_provider_profile
 
-            profile = get_provider_profile(self.provider)
-        except Exception:
-            profile = None
+        profile = get_provider_profile(self.provider)
         if profile is not None and profile.auth_type == "oauth_pkce":
             if entry.expires_at_ms is None:
                 return False

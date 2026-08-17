@@ -3049,11 +3049,12 @@ def login_provider_oauth_pkce(
         "client_id": oauth.client_id,
         "response_type": "code",
         "redirect_uri": redirect_uri,
-        "scope": oauth.scope,
         "state": expected_state,
         "code_challenge": _oauth_pkce_code_challenge(verifier),
         "code_challenge_method": "S256",
     })
+    if oauth.scope:
+        authorize_params["scope"] = oauth.scope
     authorize_url = f"{oauth.authorization_url}?{urlencode(authorize_params)}"
     thread = threading.Thread(
         target=server.serve_forever,
@@ -7378,8 +7379,19 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
             entry = load_pool(target).peek()
         except Exception:
             entry = None
+        access_token = str(getattr(entry, "access_token", "") or "")
+        expires_at_ms = getattr(entry, "expires_at_ms", None)
+        expired = False
+        if access_token and expires_at_ms is not None:
+            try:
+                expired = int(expires_at_ms) <= int(time.time() * 1000)
+            except (TypeError, ValueError):
+                expired = False
         return {
-            "logged_in": bool(entry and getattr(entry, "access_token", "")),
+            "logged_in": bool(access_token) and not expired,
+            "needs_refresh": expired and bool(getattr(entry, "refresh_token", "")),
+            "expired": expired,
+            "expires_at_ms": expires_at_ms,
             "provider": target,
         }
     # AWS SDK providers (Bedrock) — check via boto3 credential chain
