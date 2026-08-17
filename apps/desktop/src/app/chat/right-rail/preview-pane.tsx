@@ -22,6 +22,7 @@ import {
 } from './preview-console'
 import { type ConsoleEntry } from './preview-console-state'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
+import { AnnotationLayer } from './annotation/annotation-layer'
 import { registerPreviewPageReader } from './preview-reader'
 import { previewConsoleState, registerPreviewDevTools } from './preview-strip-tools'
 
@@ -146,12 +147,15 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
+  const [annotating, setAnnotating] = useState(false)
 
   // Artifacts have no URL to load — they render from the registry, never in a
   // webview.
   const isWebPreview =
     target.kind !== 'artifact' &&
     (target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source'))
+
+  const isImagePreview = target.kind === 'file' && target.previewKind === 'image'
 
   const isRemoteHtmlTarget =
     target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
@@ -682,6 +686,16 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           className="pointer-events-auto relative min-h-0 flex-1 overflow-hidden bg-transparent"
           ref={previewContentRef}
         >
+          {(isWebPreview || isImagePreview) && !annotating && (
+            <button
+              className="pointer-events-auto absolute bottom-4 right-4 z-20 flex items-center gap-1.5 rounded-full bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-400 shadow-lg backdrop-blur-md transition-all hover:bg-red-500/20 hover:text-red-300"
+              onClick={() => setAnnotating(true)}
+              type="button"
+            >
+              <span className="text-base leading-none">🔍</span>
+              {copy.annotation.start}
+            </button>
+          )}
           <div
             className={cn(
               'absolute inset-0 flex bg-transparent',
@@ -702,7 +716,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             (target.kind === 'artifact' ? (
               <ArtifactPreview target={target} />
             ) : (
-              <LocalFilePreview reloadKey={localReloadKey} target={target} />
+              <LocalFilePreview
+                annotating={annotating && isImagePreview}
+                onExitAnnotation={() => setAnnotating(false)}
+                reloadKey={localReloadKey}
+                target={target}
+              />
             ))}
           {loadError && (
             <PreviewLoadError
@@ -720,6 +739,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
               consoleShouldStickRef={consoleShouldStickRef}
               consoleState={consoleState}
               startConsoleResize={startConsoleResize}
+            />
+          )}
+          {annotating && isWebPreview && (
+            <AnnotationLayer
+              onExit={() => setAnnotating(false)}
+              webview={webviewRef.current}
             />
           )}
         </div>

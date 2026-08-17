@@ -2456,6 +2456,39 @@ export interface Translations {
       unreachableDescription: string
       openTarget: (url: string) => string
       fallbackTitle: string
+      annotation: {
+        start: string
+        stop: string
+        banner: string
+        elementTitle: string
+        regionTitle: string
+        placeholder: string
+        hint: string
+        cancel: string
+        submit: string
+        screenshotAlt: string
+        iframeBlocked: string
+        pickerFailed: string
+        sentToComposer: string
+        sessionTitle: (count: number) => string
+        finishSession: string
+        cancelSession: string
+        add: string
+        discard: string
+        navigatedAway: string
+        navigatedAwaySubmitted: string
+        brushTitle: (count: number) => string
+        brushCommentTitle: string
+        undo: string
+        clear: string
+        back: string
+        noComment: string
+        composeFailed: string
+        imageSaveFailed: string
+        screenshotsAttached: (count: number) => string
+        locate: string
+        remove: string
+      }
     }
   }
 
