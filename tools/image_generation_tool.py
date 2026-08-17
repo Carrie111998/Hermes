@@ -776,12 +776,18 @@ def _resolve_fal_model(override: Optional[str] = None) -> tuple:
     ``image_gen.model`` value. Callers that don't accept per-call model
     overrides can simply pass None.
 
-    Returns (model_id, metadata_dict). Falls back to DEFAULT_MODEL if the
+    Returns ``(model_id, metadata_dict)``. Falls back to DEFAULT_MODEL if the
     resolved model id is unknown (logged as a warning).
+
+    When an ``override`` was supplied but fell back to DEFAULT_MODEL (because
+    the override id was not in ``FAL_MODELS``), the returned metadata dict
+    includes ``"override_dropped": True`` so callers can signal the fallback
+    in their response payload.
     """
-    model_id = ""
+    requested_override = ""
     if isinstance(override, str):
-        model_id = override.strip()
+        requested_override = override.strip()
+    model_id = requested_override
     if not model_id:
         try:
             from hermes_cli.config import load_config
@@ -799,14 +805,20 @@ def _resolve_fal_model(override: Optional[str] = None) -> tuple:
         model_id = os.getenv("FAL_IMAGE_MODEL", "").strip()
 
     if not model_id:
-        return DEFAULT_MODEL, FAL_MODELS[DEFAULT_MODEL]
+        meta = dict(FAL_MODELS[DEFAULT_MODEL])
+        if requested_override:
+            meta["override_dropped"] = True
+        return DEFAULT_MODEL, meta
 
     if model_id not in FAL_MODELS:
         logger.warning(
             "Unknown FAL model '%s' in config; falling back to %s",
             model_id, DEFAULT_MODEL,
         )
-        return DEFAULT_MODEL, FAL_MODELS[DEFAULT_MODEL]
+        meta = dict(FAL_MODELS[DEFAULT_MODEL])
+        if requested_override:
+            meta["override_dropped"] = True
+        return DEFAULT_MODEL, meta
 
     return model_id, FAL_MODELS[model_id]
 
@@ -1116,7 +1128,10 @@ def image_generate_tool(
     back to the configured default.
 
     Returns a JSON string with ``{"success": bool, "image": url | None,
-    "modality": "text" | "image", "error": str, "error_type": str}``.
+    "modality": "text" | "image", "model": str, "error": str,
+    "error_type": str}``. When a per-call ``model`` override was requested
+    but the id was unrecognized, ``"model_override_dropped": True`` is
+    included and ``"model"`` shows the fallback that was actually used.
     """
     model_id, meta = _resolve_fal_model(model)
 
@@ -1271,7 +1286,10 @@ def image_generate_tool(
             "image": formatted_images[0]["url"] if formatted_images else None,
             "modality": modality,
             "upscaled": bool(formatted_images and formatted_images[0].get("upscaled")),
+            "model": model_id,
         }
+        if meta.get("override_dropped"):
+            response_data["model_override_dropped"] = True
 
         debug_call_data["success"] = True
         debug_call_data["images_generated"] = len(formatted_images)
@@ -1492,14 +1510,11 @@ IMAGE_GENERATE_SCHEMA = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional backend-specific model identifier that "
-                    "overrides the configured default for this call only "
-                    "(e.g. a FAL model id, an OpenAI or xAI image model, or "
-                    "when the active backend exposes a bot-name catalog, a "
-                    "specific bot name). The set of valid values depends on "
-                    "the active backend; leave unset to use the configured "
-                    "default. Ignored by backends that don't accept a "
-                    "per-call model override."
+                    "Optional backend-specific model id that overrides "
+                    "the configured default for this call only. Valid "
+                    "values depend on the active backend; leave unset to "
+                    "use the configured default. Ignored by backends "
+                    "that don't accept a per-call model override."
                 ),
             },
         },
@@ -1575,7 +1590,9 @@ def _dispatch_to_plugin_provider(
     ``model`` (when explicitly set) is the per-call backend-specific model
     override surfaced in the ``image_generate`` schema. It wins over
     ``image_gen.model`` from config for this call only. Backends without a
-    per-call model concept receive the value harmlessly and ignore it.
+    per-call model concept receive the value via ``**kwargs`` and ignore it
+    — the provider ABC contract (``agent.image_gen_provider.ImageGenProvider``)
+    requires implementations to accept and silently ignore unknown kwargs.
     """
     configured = _read_configured_image_provider()
     if not configured or configured == "fal":
