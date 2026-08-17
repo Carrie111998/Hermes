@@ -3078,6 +3078,54 @@ class TestRunConversation:
             == "non_retryable_client_error(billing)"
         )
 
+    @pytest.mark.parametrize(
+        "turn_exit_reason",
+        [
+            "api_error_compaction_disabled(context_overflow)",
+            "non_retryable_client_error(billing)",
+            "max_retries_exhausted(rate_limit)",
+        ],
+    )
+    def test_terminal_turn_end_hook_payload(self, turn_exit_reason):
+        from agent.conversation_loop import _emit_terminal_turn_end_hook
+
+        agent = SimpleNamespace(
+            session_id="sess-1",
+            model="model-1",
+            platform="cli",
+        )
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+
+        with patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook):
+            _emit_terminal_turn_end_hook(
+                agent,
+                effective_task_id="task-1",
+                turn_id="turn-1",
+                api_request_id="api-1",
+                turn_exit_reason=turn_exit_reason,
+            )
+
+        assert hook_calls == [
+            (
+                "on_session_end",
+                {
+                    "session_id": "sess-1",
+                    "task_id": "task-1",
+                    "turn_id": "turn-1",
+                    "api_request_id": "api-1",
+                    "completed": False,
+                    "failed": True,
+                    "interrupted": False,
+                    "turn_exit_reason": turn_exit_reason,
+                    "model": "model-1",
+                    "platform": "cli",
+                },
+            )
+        ]
+
     def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime
 

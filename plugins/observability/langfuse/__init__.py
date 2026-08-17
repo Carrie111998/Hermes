@@ -464,7 +464,10 @@ def _redact_api_error_text(value: Any, *, limit: int = _API_ERROR_SUMMARY_MAX_CH
         )
     except Exception:
         text = repr(value)
-    return str(_truncate_text(text, limit))
+    text = _redact_secrets(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
 
 
 def _maybe_parse_json_string(value: str) -> Any:
@@ -1675,7 +1678,7 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", provider: s
         "error_message": _capture_content(error_message),
         "error_summary": status_message,
     }
-    if status_code is not None:
+    if status_code:
         error_metadata["status_code"] = status_code
     if retry_count is not None:
         error_metadata["retry_count"] = retry_count
