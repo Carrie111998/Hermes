@@ -905,6 +905,14 @@ def cmd_sessions(args, sessions_parser=None):
 
         archive_root = args.root.expanduser()
         if args.dry_run:
+            from hermes_cli.session_cold_store import plan_archived_lineage
+
+            try:
+                plan_archived_lineage(db, resolved_session_id)
+            except (OSError, ValueError) as exc:
+                print(f"Error: could not cold-store session lineage: {exc}")
+                db.close()
+                return 1
             print(
                 f"Would store archived session lineage '{resolved_session_id}' "
                 f"under {archive_root}; nothing was written."

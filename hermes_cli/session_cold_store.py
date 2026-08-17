@@ -38,6 +38,15 @@ class StoredLineage:
     snapshot_dir: Path
 
 
+@dataclass(frozen=True)
+class _StorePlan:
+    terminal_id: str
+    physical_ids: tuple[str, ...]
+    started_at: float
+    records: list[dict[str, Any]]
+    source_fingerprint: str
+
+
 def _connection(db: SessionDB) -> sqlite3.Connection:
     if db._conn is None:
         raise RuntimeError("SessionDB connection is closed")
@@ -291,7 +300,10 @@ def _read_regular_text_at(directory_fd: int, name: str) -> str | None:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             return None
         with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as source:
-            return source.read()
+            try:
+                return source.read()
+            except UnicodeDecodeError:
+                return None
     finally:
         os.close(descriptor)
 
@@ -410,6 +422,52 @@ def _move_current_snapshot_aside(snapshot_parent_fd: int, snapshot_name: str) ->
     raise FileExistsError("could not allocate displaced cold-store snapshot name")
 
 
+def _require_supported_platform() -> None:
+    if os.name == "nt":
+        raise OSError("cold store is not yet supported on Windows")
+
+
+def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
+    lineage = _raw_compression_lineage(conn, terminal_id)
+    if lineage[-1] != terminal_id:
+        raise ValueError("store requires the terminal compression session ID")
+
+    rows = [_session(conn, session_id) for session_id in lineage]
+    if any(session is None for session in rows):
+        raise ValueError("compression lineage changed while resolving store candidate")
+    rows = [session for session in rows if session is not None]
+    if any(not row.get("archived") for row in rows):
+        raise ValueError("all compression lineage rows must be marked archived")
+    if any(row.get("pinned") for row in rows):
+        raise ValueError("pinned sessions are not cold-store candidates")
+    started_at = rows[-1].get("started_at")
+    ended_at = rows[-1].get("ended_at")
+    if ended_at is None or rows[-1].get("end_reason") == "compression":
+        raise ValueError(
+            "terminal session must be ended and non-compression before cold storage"
+        )
+    if started_at is None:
+        raise ValueError("terminal session must have a start time before cold storage")
+
+    _enforce_message_limit(conn, lineage)
+    records = _records(conn, lineage)
+    return _StorePlan(
+        terminal_id=terminal_id,
+        physical_ids=lineage,
+        started_at=float(started_at),
+        records=records,
+        source_fingerprint=_fingerprint(records),
+    )
+
+
+def plan_archived_lineage(db: SessionDB, terminal_id: str) -> None:
+    """Run Store eligibility and source planning without writing any state."""
+    _require_supported_platform()
+    conn = _connection(db)
+    with db._lock:
+        _build_store_plan(conn, terminal_id)
+
+
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:
     """Store one marked completed compression lineage without deleting DB rows.
 
@@ -417,40 +475,21 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     source are idempotent; a changed or damaged snapshot is staged, verified, and
     replaced. The source database is never modified by this operation.
     """
-    if os.name == "nt":
-        raise OSError("cold store is not yet supported on Windows")
+    _require_supported_platform()
 
     archive_root = Path(os.path.abspath(os.fspath(archive_root)))
     conn = _connection(db)
     with db._lock:
         conn.execute("SAVEPOINT cold_store_snapshot")
         try:
-            lineage = _raw_compression_lineage(conn, terminal_id)
-            if lineage[-1] != terminal_id:
-                raise ValueError("store requires the terminal compression session ID")
-
-            rows = [_session(conn, session_id) for session_id in lineage]
-            if any(session is None for session in rows):
-                raise ValueError("compression lineage changed while resolving store candidate")
-            rows = [session for session in rows if session is not None]
-            if any(not row.get("archived") for row in rows):
-                raise ValueError("all compression lineage rows must be marked archived")
-            if any(row.get("pinned") for row in rows):
-                raise ValueError("pinned sessions are not cold-store candidates")
-            started_at = rows[-1].get("started_at")
-            ended_at = rows[-1].get("ended_at")
-            if ended_at is None or rows[-1].get("end_reason") == "compression":
-                raise ValueError("terminal session must be ended and non-compression before cold storage")
-            if started_at is None:
-                raise ValueError("terminal session must have a start time before cold storage")
-
-            _enforce_message_limit(conn, lineage)
-            records = _records(conn, lineage)
-            fingerprint = _fingerprint(records)
+            plan = _build_store_plan(conn, terminal_id)
         finally:
             conn.execute("RELEASE SAVEPOINT cold_store_snapshot")
 
-    terminal_date = datetime.fromtimestamp(float(started_at), UTC)
+    lineage = plan.physical_ids
+    records = plan.records
+    fingerprint = plan.source_fingerprint
+    terminal_date = datetime.fromtimestamp(plan.started_at, UTC)
     snapshot_name = _safe_component(terminal_id)
     snapshot_dir = (
         archive_root

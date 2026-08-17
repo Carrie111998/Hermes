@@ -242,10 +242,12 @@ def test_cold_store_rejects_missing_or_ambiguous_ids_before_writing(
     assert not archive_root.exists()
 
 
+@pytest.mark.parametrize("execution_flag", ["--yes", "--dry-run"])
 def test_cold_store_surfaces_store_eligibility_rejection_without_db_changes(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    execution_flag: str,
 ) -> None:
     db = SessionDB()
     try:
@@ -264,7 +266,7 @@ def test_cold_store_surfaces_store_eligibility_rejection_without_db_changes(
         str(archive_root),
         "--session-id",
         "not-archived",
-        "--yes",
+        execution_flag,
     )
 
     assert code == 1
@@ -273,10 +275,12 @@ def test_cold_store_surfaces_store_eligibility_rejection_without_db_changes(
     assert _lineage_rows() == before == [("not-archived", 0)]
 
 
+@pytest.mark.parametrize("execution_flag", ["--yes", "--dry-run"])
 def test_cold_store_surfaces_non_terminal_rejection_without_db_changes(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    execution_flag: str,
 ) -> None:
     db = SessionDB()
     try:
@@ -295,7 +299,7 @@ def test_cold_store_surfaces_non_terminal_rejection_without_db_changes(
         str(archive_root),
         "--session-id",
         "still-open",
-        "--yes",
+        execution_flag,
     )
 
     assert code == 1

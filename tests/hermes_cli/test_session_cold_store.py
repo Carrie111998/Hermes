@@ -304,6 +304,28 @@ def test_store_replaces_non_object_snapshot_metadata(tmp_path: Path) -> None:
         db.close()
 
 
+@pytest.mark.parametrize("payload_name", ["metadata.json", "session.jsonl"])
+def test_store_replaces_snapshot_with_invalid_utf8(
+    tmp_path: Path,
+    payload_name: str,
+) -> None:
+    """Invalid UTF-8 is damaged snapshot state, just like malformed JSON."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        result = store_archived_lineage(db, "terminal", tmp_path / "archive")
+        (result.snapshot_dir / payload_name).write_bytes(b"\xff")
+
+        replacement = store_archived_lineage(db, "terminal", tmp_path / "archive")
+
+        assert replacement == result
+        (replacement.snapshot_dir / payload_name).read_text(encoding="utf-8")
+    finally:
+        db.close()
+
+
 def test_store_rejects_snapshot_parent_symlink_swap_before_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
