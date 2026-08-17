@@ -435,6 +435,34 @@ export function killToLineEnd(value: string, cursor: number): { value: string; c
 }
 
 /**
+ * True when a keystroke is the paste hotkey.
+ *
+ * Two families must match:
+ *   - raw sequences: `\x16` (Ctrl+V in legacy encoding) and `ESC v`/`ESC V`
+ *     (Alt+V compatibility), read off the terminal's raw keypress bytes;
+ *   - semantic action-modifier + `v` — Cmd+V on macOS, Ctrl+V elsewhere.
+ *     Terminals running kitty CSI-u / xterm modifyOtherKeys (Ghostty,
+ *     Kitty, WezTerm) send Ctrl+V as `CSI 27;5;118~` / `CSI 118;5u` instead
+ *     of `\x16`, and Ctrl+Shift+V as the `6` modifier variant — Ink parses
+ *     both into `key.ctrl === true` with `inp === 'v'`, so the semantic
+ *     branch covers them while the raw `\x16` branch cannot (#88192).
+ */
+export function isPasteHotkey(
+  eventRaw: string | undefined,
+  key: { ctrl: boolean; meta: boolean; super?: boolean },
+  inp: string,
+  mac: boolean = isMac
+): boolean {
+  const actionMod = mac ? key.meta || key.super === true : key.ctrl
+  return (
+    eventRaw === '\x1bv' ||
+    eventRaw === '\x1bV' ||
+    eventRaw === '\x16' ||
+    (actionMod && inp.toLowerCase() === 'v')
+  )
+}
+
+/**
  * True when a Backspace / ForwardDelete keystroke should kill to the line
  * boundary rather than delete a single word.
  *
@@ -1257,25 +1285,18 @@ export function TextInput({
         return
       }
 
-      if (
-        eventRaw === '\x1bv' ||
-        eventRaw === '\x1bV' ||
-        eventRaw === '\x16' ||
-        (isMac && isActionMod(k) && inp.toLowerCase() === 'v')
-      ) {
+      if (isPasteHotkey(eventRaw, k, inp)) {
         flushKeyBurst()
 
         if (cbPaste.current) {
           return void emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
         }
 
-        if (isMac) {
-          void readClipboardText().then(text => {
-            if (text) {
-              pastePlainText(text)
-            }
-          })
-        }
+        void readClipboardText().then(text => {
+          if (text) {
+            pastePlainText(text)
+          }
+        })
 
         return
       }
