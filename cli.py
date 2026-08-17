@@ -3011,8 +3011,30 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
             parsed = urlparse(token)
             if parsed.scheme == "file":
                 expanded = unquote(parsed.path or "")
-                if parsed.netloc and os.name == "nt":
-                    expanded = f"//{parsed.netloc}{expanded}"
+                netloc = parsed.netloc or ""
+                # RFC 8089: an authority of "localhost" denotes the local
+                # machine and is equivalent to an empty authority. Splicing it
+                # in as a UNC host below would send Windows off to the network.
+                if netloc.lower() == "localhost":
+                    netloc = ""
+                # ``"file://" + windows_path`` (two slashes, not three) is a
+                # common malformed spelling that parses the DRIVE as the
+                # authority: file://C:/x -> netloc "C:", path "/x". Fold it
+                # back onto the path. A real UNC authority is a hostname and
+                # never matches, so file://server/share/x is untouched.
+                if len(netloc) == 2 and netloc[0].isalpha() and netloc[1] == ":":
+                    expanded = f"{netloc}{expanded}"
+                    netloc = ""
+                # A drive-letter URI (``file:///C:/x``, what Path.as_uri()
+                # and Explorer both produce) parses to ``/C:/x`` — a leading
+                # slash ahead of the drive. Path("/C:/x") has an EMPTY drive
+                # on Windows, so is_absolute() is False and the path below
+                # gets joined onto the cwd, silently losing the drive; on
+                # POSIX the same slash blocks the /mnt/<drive> mapping.
+                elif len(expanded) >= 3 and expanded[0] == "/" and expanded[1].isalpha() and expanded[2] == ":":
+                    expanded = expanded[1:]
+                if netloc and os.name == "nt":
+                    expanded = f"//{netloc}{expanded}"
         except Exception:
             expanded = token
     expanded = os.path.expandvars(os.path.expanduser(expanded))
