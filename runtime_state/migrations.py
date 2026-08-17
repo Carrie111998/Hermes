@@ -20,6 +20,7 @@ from runtime_state.schema import (
     SCHEMA_DDL,
     SCHEMA_VERSION,
     STATE_TABLES,
+    RUNTIME_STATE_WRITER_EPOCH,
 )
 from runtime_state.locking import MaintenanceLock
 
@@ -77,7 +78,7 @@ class RuntimeStateDB:
         self.db_path = Path(db_path)
         self.retry_config = retry_config
         self.writer_epoch = int(
-            os.environ.get("HERMES_RUNTIME_WRITER_EPOCH", "0")
+            os.environ.get("HERMES_RUNTIME_WRITER_EPOCH", str(RUNTIME_STATE_WRITER_EPOCH))
             if writer_epoch is None else writer_epoch
         )
         self.key_custody = key_custody
@@ -109,6 +110,7 @@ class RuntimeStateDB:
                 self.db_path,
                 writer_epoch=self.writer_epoch,
                 key_custody=self.key_custody,
+                retry_config=self.retry_config,
             )
             startup_transition(self._conn, writer_epoch=self.writer_epoch)
         except Exception:
