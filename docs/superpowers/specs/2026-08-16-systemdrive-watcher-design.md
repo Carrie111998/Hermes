@@ -21,8 +21,26 @@ One writer was identified and fixed on 2026-08-16: `agent/secret_sources/base.py
 `run_secret_cli`, whose env allowlist omitted `SYSTEMDRIVE`, spawning the
 MSIX/WindowsApps-packaged Python. Landed on `main` as `ba920d1b5e` / `c3b8083116`.
 
-A later same-day sighting under a `tests/cron` run does not touch that path, so a
-**second writer is likely still open**. This design is the instrument for finding it.
+A later same-day sighting (18:29:34) appeared during a `tests/cron` run, in a path the
+fix does not touch.
+
+**Updated later on 2026-08-16: `tests/cron` has been CLEARED as that writer.** A
+sentinel-cwd experiment — the full suite run from a directory no other session uses —
+came back `1043 passed, 17 skipped`, exit 0, with no `%SystemDrive%` in the sentinel,
+none under the basetemp, and the repo-root tree frozen at its original mtimes. A
+targeted run of the only five files that spawn `sys.executable` was equally clean, and
+statically no cron path meets the precondition: every cron `env=` builder copies
+`os.environ`, so `SYSTEMDRIVE` always survives.
+
+So the sighting is best explained by **another tenant of the multi-tenant shared
+checkout** — some process that merely shares the checkout as its cwd. Attribution to a
+specific session was not attempted and remains unproven.
+
+**This sharpens the case for this design rather than weakening it.** The remaining
+suspect is by definition not the test suite and not any one runner; it is whatever else
+holds that cwd. A probe embedded in the parallel runner cannot see such a writer even in
+principle. A runner-agnostic watcher that records process creations with their cmdline
+and cwd is precisely the instrument that can.
 
 ## Why the existing probe needs rework, not landing
 
