@@ -789,6 +789,17 @@ describe('createGatewayEventHandler', () => {
     )
   })
 
+  it('does not surface the notice when a non-intro item already exists', () => {
+    // A single pre-existing system item (e.g. a setup panel) makes the
+    // transcript non-fresh even though the history length is still small.
+    const appended: Msg[] = [{ kind: 'panel', role: 'system', text: '' }]
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { names: ['browser_navigate'] }, type: 'tools.unavailable' } as any)
+
+    expect(appended.some(msg => msg.text.includes('tools unavailable'))).toBe(false)
+  })
+
   it('does not surface unavailable tools into an in-progress session', () => {
     const appended: Msg[] = [{ kind: 'intro', role: 'system', text: '' }]
     const onEvent = createGatewayEventHandler(buildCtx(appended))
@@ -797,7 +808,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { text: 'existing reply' }, type: 'message.complete' } as any)
     onEvent({ payload: { names: ['browser_navigate'] }, type: 'tools.unavailable' } as any)
 
-    expect(appended.some(msg => msg.text.includes('tools unavailable'))).toBe(false)
+    expect(appended.some(msg => /\d+ tools? unavailable/.test(msg.text ?? ''))).toBe(false)
   })
 
   it('shows setup panel for missing provider startup error', () => {

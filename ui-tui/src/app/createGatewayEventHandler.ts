@@ -813,7 +813,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         setHistoryItems(prev => {
-          if (prev.length > 1) {
+          // Fresh transcript only: the notice belongs right after the intro,
+          // before any real content (message, event, panel, ...).
+          if (prev.some(m => m.kind !== 'intro')) {
             return prev
           }
 
