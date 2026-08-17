@@ -45,7 +45,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, NamedTuple, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -149,6 +149,70 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+# Tag shape staged by cron jobs that need a human decision (see
+# tools/write_approval.stage_write() callers and the cron-approval-reply
+# skill): "[ref:<subsystem>:<id>]", e.g. "[ref:upstream_fix:28e9858f]".
+# subsystem/id are always generated internally (subsystem is a short fixed
+# identifier like "upstream_fix"; id is uuid4().hex[:8]) so the character
+# class only needs to cover word chars and hyphens — no need to be
+# permissive of arbitrary punctuation.
+_REF_TAG_RE = re.compile(r"\[ref:([A-Za-z0-9_\-]+):([A-Za-z0-9_\-]+)\]")
+
+
+class ReplyRefCheck(NamedTuple):
+    """Result of scanning a quote-reply's quoted text for a pending-decision
+    ref tag. Distinguishes three cases the caller must branch on:
+
+      * no tag found                    -> tag_found=False
+      * tag found, pending record exists -> tag_found=True,  pending_exists=True
+      * tag found, no pending record     -> tag_found=True,  pending_exists=False
+    """
+    tag_found: bool
+    pending_exists: bool
+    subsystem: Optional[str] = None
+    pending_id: Optional[str] = None
+
+
+def check_reply_for_pending_ref(reply_to_text: Optional[str]) -> ReplyRefCheck:
+    """Deterministically resolve whether a quoted message carries a
+    ``[ref:<subsystem>:<id>]`` tag and, if so, whether a pending record for
+    it still exists.
+
+    This is step 2+3 of the cron-approval-reply skill's "one deterministic
+    check" (step 1 — is this a genuine quote-reply at all — is the caller's
+    responsibility, since it depends on ``event.reply_to_text`` /
+    ``event.reply_to_message_id`` being present in the first place). Doing
+    steps 2-3 here in code, rather than leaving them to the serving model's
+    own judgment, closes the gap where a session running on a weaker/
+    fallback model can fail to notice the tag and answer as ordinary chat.
+    """
+    if not reply_to_text:
+        return ReplyRefCheck(tag_found=False, pending_exists=False)
+
+    match = _REF_TAG_RE.search(reply_to_text)
+    if not match:
+        return ReplyRefCheck(tag_found=False, pending_exists=False)
+
+    subsystem, pending_id = match.group(1), match.group(2)
+
+    try:
+        from tools import write_approval as wa
+        record = wa.get_pending(subsystem, pending_id)
+    except Exception:
+        logger.exception(
+            "check_reply_for_pending_ref: get_pending(%s, %s) failed",
+            subsystem, pending_id,
+        )
+        record = None
+
+    return ReplyRefCheck(
+        tag_found=True,
+        pending_exists=record is not None,
+        subsystem=subsystem,
+        pending_id=pending_id,
+    )
 
 
 _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
@@ -17918,8 +17982,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
+            #
+            # Deterministic ref-tag check (see check_reply_for_pending_ref()):
+            # a quote-reply to a message carrying a `[ref:<subsystem>:<id>]`
+            # tag is JID answering a pending cron-staged decision
+            # (cron-approval-reply skill). Relying purely on the model
+            # noticing the tag in a soft "[Replying to: ...]" hint is not
+            # safe — an ambient session running on a weaker/fallback model
+            # can miss it entirely and answer as ordinary chat (see incident
+            # notes on fix/gateway-ref-tag-routing). So resolve the tag here,
+            # deterministically, and hand the model an unmissable directive
+            # instead of leaving recognition to its own judgment.
             reply_snippet = event.reply_to_text[:500]
-            if getattr(event, "reply_to_is_own_message", False):
+            ref_check = check_reply_for_pending_ref(event.reply_to_text)
+            if ref_check.tag_found and ref_check.pending_exists:
+                message_text = (
+                    "[SYSTEM: This message is a confirmed quote-reply to a "
+                    "pending decision.\n"
+                    f"subsystem={ref_check.subsystem} id={ref_check.pending_id}\n"
+                    "A cron job staged this decision and is waiting on your "
+                    "answer. You MUST follow the `cron-approval-reply` "
+                    "skill's interpretation procedure now — this is not "
+                    "ordinary conversation. Do not guess, do not improvise, "
+                    "and do not take any action outside that skill's "
+                    "documented procedure.\n"
+                    f'Quoted message: "{reply_snippet}"]\n\n'
+                    f"{message_text}"
+                )
+            elif ref_check.tag_found and not ref_check.pending_exists:
+                message_text = (
+                    "[SYSTEM: This message quote-replies to a message "
+                    f"tagged subsystem={ref_check.subsystem} "
+                    f"id={ref_check.pending_id}, but no pending record "
+                    "exists for it anymore (already handled, discarded, or "
+                    "expired). Tell the user plainly that this has already "
+                    "been resolved and take no further action — do not "
+                    "re-execute, re-stage, or guess at what it might have "
+                    "meant.\n"
+                    f'Quoted message: "{reply_snippet}"]\n\n'
+                    f"{message_text}"
+                )
+            elif getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
                     f"{message_text}"
