@@ -24,12 +24,17 @@ Runs with ``cwd`` left to the caller; the parallel runner starts it with
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import sys
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Deque, List
+
+import psutil
 
 JUNK_NAME = "%SystemDrive%"
 
@@ -115,3 +120,95 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip ReadDirectoryChangesW; use the polling backend everywhere",
     )
     return parser
+
+
+def describe_pid(pid: int) -> dict:
+    """One process, captured as completely as permissions allow.
+
+    Fields are read INDIVIDUALLY on purpose. ``cwd`` raises AccessDenied for
+    many Windows processes, and a single try/except around the whole block
+    would then also lose ``cmdline`` -- which is the field that actually names
+    a writer.
+    """
+    entry: dict = {"pid": pid, "seen_at": datetime.now().isoformat(timespec="milliseconds")}
+    try:
+        proc = psutil.Process(pid)
+    except Exception as exc:
+        # Vanished between pids() and here. Keep it: a PID we saw appear and
+        # could not read is still evidence that SOMETHING started.
+        entry["error"] = type(exc).__name__
+        return entry
+    for field, getter in (
+        ("name", proc.name),
+        ("ppid", proc.ppid),
+        ("create_time", proc.create_time),
+        ("cmdline", proc.cmdline),
+        ("cwd", proc.cwd),
+    ):
+        try:
+            entry[field] = getter()
+        except Exception as exc:
+            entry.setdefault("errors", {})[field] = type(exc).__name__
+    return entry
+
+
+def cwd_matches(entry: dict, root: Path) -> bool:
+    """Does this process hold the watched root as its working directory?
+
+    The established mechanism REQUIRES this: the junk lands under the writer's
+    CWD. This is what narrows a ~1000-process table to a shortlist.
+
+    Best-effort by nature -- an entry whose cwd could not be read (already
+    exited, or AccessDenied) simply does not match.
+    """
+    cwd = entry.get("cwd")
+    if not cwd:
+        return False
+    try:
+        return Path(cwd).resolve() == root
+    except OSError:
+        return False
+
+
+class ProcessRing:
+    """Bounded history of process CREATIONS.
+
+    Sampling ``psutil.pids()`` is one cheap syscall; only the NEW pids get
+    enriched. Cost therefore scales with process CHURN, not with the ~1000
+    live processes, which is what makes a short cadence affordable.
+
+    This is the piece that attacks the prototype's documented failure: on
+    2026-08-16 the watcher fired correctly but the writer had already exited,
+    so a full snapshot named nobody. A creation history makes attribution
+    independent of whether the writer is still alive at sighting time.
+    """
+
+    def __init__(self, capacity: int = DEFAULT_RING) -> None:
+        self._entries: Deque[dict] = collections.deque(maxlen=capacity)
+        self._known: set = set()
+        self._primed = False
+        self._lock = threading.Lock()
+
+    def sample(self) -> int:
+        """One diff pass. Returns how many creations were recorded."""
+        live = set(psutil.pids())
+        new = live - self._known
+        self._known = live
+        if not self._primed:
+            # The first pass is a baseline. Everything looks new, but nothing
+            # actually started inside our window; recording ~1000 entries here
+            # would bury the handful that matter.
+            self._primed = True
+            return 0
+        entries = [describe_pid(pid) for pid in sorted(new)]
+        with self._lock:
+            self._entries.extend(entries)
+        return len(entries)
+
+    def dump(self) -> List[dict]:
+        with self._lock:
+            return list(self._entries)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)

@@ -8,9 +8,12 @@ writer it was built for reproduced from a plain SEQUENTIAL pytest run.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-from scripts.systemdrive_watcher import JUNK_NAME, build_parser, write_record
+from scripts.systemdrive_watcher import JUNK_NAME, build_parser, write_record, ProcessRing, cwd_matches, describe_pid
 
 
 def test_junk_name_is_the_literal_template():
@@ -61,3 +64,82 @@ def test_parser_defaults_are_conservative():
     assert args.sample_ms > 0
     assert args.secs > 0
     assert args.stop_file is None
+
+
+def test_describe_pid_captures_ancestry_fields():
+    entry = describe_pid(os.getpid())
+    assert entry["pid"] == os.getpid()
+    assert entry["name"]
+    assert isinstance(entry["ppid"], int)
+    assert isinstance(entry["cmdline"], list)
+
+
+def test_describe_pid_of_a_dead_process_is_kept_with_an_error():
+    """A PID we saw appear and could not read is still evidence.
+
+    Dropping it would hide the very short-lived processes this ring buffer
+    exists to catch.
+    """
+    entry = describe_pid(999999)
+    assert entry["pid"] == 999999
+    assert "error" in entry
+
+
+def test_describe_pid_partial_failure_keeps_the_other_fields(monkeypatch):
+    """cwd is AccessDenied for many Windows processes.
+
+    Fields are captured individually so losing cwd does not also lose the
+    cmdline, which is the actual identifying field. A single try/except
+    around the whole block would drop both -- so this test INDUCES the cwd
+    failure rather than hoping for one.
+    """
+    import psutil
+
+    def boom(self):
+        raise psutil.AccessDenied(self.pid)
+
+    monkeypatch.setattr(psutil.Process, "cwd", boom)
+    entry = describe_pid(os.getpid())
+    assert entry["cmdline"], "cmdline must survive a cwd failure"
+    assert entry["errors"]["cwd"] == "AccessDenied"
+
+
+def test_first_sample_is_a_baseline_not_a_flood():
+    """Priming must not record the whole process table as 'creations'.
+
+    ~1000 processes are live on this box; recording them all would bury the
+    handful that actually started inside the watch window.
+    """
+    ring = ProcessRing(capacity=10000)
+    assert ring.sample() == 0
+    assert len(ring) == 0
+
+
+def test_sample_records_a_newly_spawned_process():
+    ring = ProcessRing(capacity=10000)
+    ring.sample()  # prime
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    try:
+        ring.sample()
+        pids = [e["pid"] for e in ring.dump()]
+        assert child.pid in pids
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_ring_is_bounded(tmp_path):
+    ring = ProcessRing(capacity=3)
+    ring._primed = True
+    ring._entries.extend({"pid": n} for n in range(100))
+    assert len(ring) == 3
+    assert [e["pid"] for e in ring.dump()] == [97, 98, 99]
+
+
+def test_cwd_matches_is_true_for_the_watched_root(tmp_path: Path):
+    assert cwd_matches({"cwd": str(tmp_path)}, tmp_path.resolve())
+
+
+def test_cwd_matches_is_false_without_a_cwd(tmp_path: Path):
+    """Best-effort: a process that exited before enrichment has no cwd."""
+    assert not cwd_matches({"pid": 1, "error": "NoSuchProcess"}, tmp_path.resolve())
