@@ -467,7 +467,7 @@ command_descriptions:
   clear:         "Clear screen and start a new session"
   redraw:        "Force a full UI repaint (recovers from terminal drift)"
   history:       "Show conversation history"
-  save:          "Save the current conversation"
+  save:          "Export the current conversation (bare /save shows usage)"
   retry:         "Retry the last message (resend to agent)"
   prompt:        "Compose your next prompt in $EDITOR (markdown), then send it"
   undo:          "Back up N user turns and re-prompt (default 1)"
