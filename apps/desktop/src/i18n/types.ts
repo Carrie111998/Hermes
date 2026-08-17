@@ -50,8 +50,10 @@ interface AuxTaskCopy {
 
 export interface Translations {
   common: {
+    addAsContext: string
     apply: string
     back: string
+    pasteAsText: string
     save: string
     saving: string
     cancel: string

@@ -4,6 +4,7 @@ import type { Translations } from './types'
 
 export const en: Translations = {
   common: {
+    addAsContext: 'Add as context',
     apply: 'Apply',
     back: 'Back',
     save: 'Save',
@@ -43,7 +44,8 @@ export const en: Translations = {
     update: 'Update',
     tryHint: term => `Try “${term}”`,
     on: 'On',
-    off: 'Off'
+    off: 'Off',
+    pasteAsText: 'Paste as text'
   },
 
   fileMenu: {

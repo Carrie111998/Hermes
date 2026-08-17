@@ -23,7 +23,9 @@ vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
       common: {
+        addAsContext: 'Add as context',
         copy: 'Copy',
+        pasteAsText: 'Paste as text',
         selectAll: 'Select All',
       },
     },

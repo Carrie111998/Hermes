@@ -104,7 +104,7 @@ export function FileEntryContextMenu({ children, isDirectory, name, path, relati
         )}
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => attachFileAsContext(path, isDirectory, relativeTo)}>
-          Add as context
+          {t.common.addAsContext}
         </ContextMenuItem>
         {localFs && (
           <>

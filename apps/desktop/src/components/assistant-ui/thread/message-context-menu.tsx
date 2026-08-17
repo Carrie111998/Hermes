@@ -138,8 +138,8 @@ export function MessageContextMenu({ children, messageId }: MessageContextMenuPr
         <ContextMenuItem onSelect={handleCopy}>{t.common.copy}</ContextMenuItem>
         <ContextMenuItem onSelect={handleSelectAll}>{t.common.selectAll}</ContextMenuItem>
         <ContextMenuSeparator />
-        <ContextMenuItem onSelect={handleAddAsContext}>Add as context</ContextMenuItem>
-        <ContextMenuItem onSelect={handlePasteAsText}>Paste as text</ContextMenuItem>
+        <ContextMenuItem onSelect={handleAddAsContext}>{t.common.addAsContext}</ContextMenuItem>
+        <ContextMenuItem onSelect={handlePasteAsText}>{t.common.pasteAsText}</ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
   )

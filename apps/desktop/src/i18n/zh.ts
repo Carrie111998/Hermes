@@ -4,6 +4,7 @@ import type { Translations } from './types'
 
 export const zh: Translations = {
   common: {
+    addAsContext: '添加为上下文',
     apply: '应用',
     back: '返回',
     save: '保存',
@@ -43,7 +44,8 @@ export const zh: Translations = {
     update: '更新',
     tryHint: term => `试试“${term}”`,
     on: '开',
-    off: '关'
+    off: '关',
+    pasteAsText: '粘贴为文本'
   },
 
   fileMenu: {
