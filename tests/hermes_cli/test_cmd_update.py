@@ -42,13 +42,41 @@ def _stub_update_side_effects(monkeypatch):
     network and sitting in ``proc.wait`` until pytest-timeout killed the whole
     session — on Windows a hang takes the entire run down, not one test.
 
-    Only ``_venv_pip_install`` is stubbed, not ``refresh_active_features``, so
-    the refresh still runs and stays observable for the test that asserts on
-    it; what disappears is solely the ability to install for real.
+    ``_venv_pip_install`` is stubbed here so no install can run for real. The
+    refresh *call* is separately no-oped by ``_stub_lazy_feature_refresh`` in
+    ``tests/hermes_cli/conftest.py`` — it was left live here on the grounds that
+    it "stays observable for the test that asserts on it", but no such test
+    exists (nothing in this file references the refresh), and leaving it live
+    cost a full ``importlib.metadata`` sweep of every ``LAZY_DEPS`` spec plus
+    stray install commands appended to the ``subprocess.run`` mock below, which
+    desynchronized call-counting assertions non-deterministically.
+
+    Three MORE seams of the same class, found 2026-08-17 while making this file
+    survive the 30s ``--timeout-method=thread`` cap (which kills the whole
+    pytest process, not one test, so any of these took the entire run down):
+
+    * ``_validate_critical_files_syntax`` ``compile()``s critical files under
+      the REAL ``PROJECT_ROOT`` — 3.5s of the runtime, and it reads whatever
+      other sessions happen to have written in this shared checkout.
+    * ``_detect_venv_python_processes`` sweeps the HOST process table via
+      psutil (~1,800 ``proc_cwd``/``proc_cmdline`` probes, 2.6s).
+    * The post-restart survivor sweep sits on a hard ``_time.sleep(3.0)``
+      before re-scanning for gateway PIDs to SIGKILL.
+
+    ``_time`` is swapped for a shim that no-ops only ``sleep`` and forwards
+    ``monotonic``/``time`` to the real module — deliberately NOT a patch of
+    ``time.sleep`` itself, which would be process-wide.
+
+    Both stubbed helpers keep their real coverage in the files that test them
+    directly: ``test_update_post_pull_syntax_guard.py`` and
+    ``test_update_venv_health.py``.
 
     No test in this file asserts on any of these seams, so stubbing them costs
     no coverage and confines the flow to the git mock the tests already install.
     """
+    import time as _real_time
+    from types import SimpleNamespace
+
     import hermes_cli.main as _m
     import tools.lazy_deps as _lazy
 
@@ -66,6 +94,19 @@ def _stub_update_side_effects(monkeypatch):
     monkeypatch.setattr(
         _lazy, "_venv_pip_install",
         lambda *a, **k: _lazy._InstallResult(True, "", ""),
+    )
+    monkeypatch.setattr(
+        _m, "_validate_critical_files_syntax", lambda *a, **k: (True, None, None)
+    )
+    monkeypatch.setattr(_m, "_detect_venv_python_processes", lambda *a, **k: [])
+    monkeypatch.setattr(
+        _m,
+        "_time",
+        SimpleNamespace(
+            sleep=lambda *_a, **_k: None,
+            monotonic=_real_time.monotonic,
+            time=_real_time.time,
+        ),
     )
 
 
