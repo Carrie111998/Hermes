@@ -563,7 +563,74 @@ class TestWebhookSignatureEnforcement:
         assert resp.status == 413
 
 
-# ── Standalone (out-of-process) markdown stripping ──────────────────
+# ── Out-of-process cron delivery (_standalone_send) ──────────────────
+
+class TestSmsStandaloneSendMarkdown:
+    """Guards the markdown strip on the out-of-process SMS send path.
+
+    ``tools/send_message_tool.py`` reaches this path via the platform
+    registry (``_registry_standalone_send("sms", ...)``) for cron and
+    other out-of-process delivery.  It had NO test coverage, which is why
+    a missing ``import re`` sat here undetected: the strip helper raised
+    ``NameError`` on its first substitution, unconditionally, for every
+    outbound message — not just markdown-bearing ones.
+
+    The adapter class path already used the shared
+    ``gateway.platforms.helpers.strip_markdown``; only this module-level
+    duplicate had drifted.
+    """
+
+    def _strip(self, text: str) -> str:
+        from plugins.platforms.sms import adapter
+
+        return adapter.strip_markdown(text)
+
+    def test_strip_is_callable_and_does_not_raise(self):
+        """Regression: this raised NameError: name 're' is not defined."""
+        assert self._strip("**bold** and *italic*") == "bold and italic"
+
+    def test_strip_removes_common_markdown(self):
+        assert self._strip("# Heading\ntext") == "Heading\ntext"
+        assert self._strip("`code`") == "code"
+        assert self._strip("[label](https://example.com)") == "label"
+
+    def test_snake_case_identifiers_survive(self):
+        """The shared helper's word-boundary guards keep identifiers intact.
+
+        The module-level duplicate this replaced used bare ``_(.+?)_`` with
+        no boundary guards, so it collapsed ``snake_case_names`` to
+        ``snakecasenames`` — real corruption for any SMS discussing code.
+        Measured, both ways, before this test was written.
+
+        Pinned so a future "simplification" back to the naive pattern fails
+        here rather than silently in outbound messages.
+        """
+        assert self._strip("use snake_case_names") == "use snake_case_names"
+        assert self._strip("my_var and other_var") == "my_var and other_var"
+
+    def test_fenced_code_language_is_stripped(self):
+        """The duplicate's ``[a-z]*`` fence charset left residue behind.
+
+        ```` ```Python ```` kept the word "Python" in the message body and
+        ```` ```c++ ```` left "++"; the shared helper's
+        ``[a-zA-Z0-9_+-]*`` handles both.
+        """
+        assert self._strip("```Python\ncode\n```") == "code"
+        assert self._strip("```c++\nx\n```") == "x"
+
+    def test_dunder_is_still_flattened_known_limitation(self):
+        """``__init__`` → ``init`` in BOTH implementations.
+
+        Not a regression introduced here and not fixed here: it is
+        pre-existing ``strip_markdown`` behaviour shared with every other
+        plain-text platform (iMessage, Feishu).  Pinned so the limitation
+        is visible and any future fix is a deliberate, cross-platform
+        change rather than an accident.
+        """
+        assert self._strip("call __init__ first") == "call init first"
+
+
+# ── Out-of-process delivery, end to end ──────────────────────────────
 
 class _RecordingFormData:
     """Stand-in for aiohttp.FormData that records the fields Twilio would get."""
@@ -605,51 +672,30 @@ class _FakeSession:
         return _FakeResponse()
 
 
-class TestSmsStandaloneMarkdownStripping:
-    """Regression for the F821 NameError in _strip_markdown_for_sms.
+class TestSmsStandaloneSendDelivery:
+    """Drives ``_standalone_send`` itself rather than the strip helper alone.
 
-    The plugin-migration copy of this helper called ``re.sub()`` 13 times in a
-    module that never imports ``re``. The call site sits *outside* the
-    ``try/except`` in ``_standalone_send``, so every out-of-process SMS send
-    raised ``NameError: name 're' is not defined`` before reaching Twilio.
-
-    These tests drive the real stripping path rather than asserting on imports.
+    ``TestSmsStandaloneSendMarkdown`` above pins what the shared helper does
+    to a string.  These two pin that the send path actually *calls* it and
+    that the result reaches Twilio, which is the part that was broken: the
+    strip call sits outside ``_standalone_send``'s ``try/except``, so the
+    ``NameError`` aborted the send before any HTTP request was issued.
     """
 
-    def test_strip_markdown_for_sms_returns_plain_text(self):
-        from plugins.platforms.sms.adapter import _strip_markdown_for_sms
+    def test_standalone_strip_matches_in_process_format_message(self):
+        """Standalone and in-process SMS paths must render identically.
 
-        out = _strip_markdown_for_sms("**bold** and *ital* and `code`")
-        assert out == "bold and ital and code"
-
-    def test_strip_markdown_for_sms_handles_headings_and_links(self):
-        from plugins.platforms.sms.adapter import _strip_markdown_for_sms
-
-        out = _strip_markdown_for_sms("# Title\nsee [docs](https://example.com)")
-        assert out == "Title\nsee docs"
-
-    def test_strip_markdown_for_sms_preserves_snake_case_identifiers(self):
-        """Underscore stripping must not mangle identifiers.
-
-        The shared helper guards ``__``/``_`` with word boundaries; the stale
-        inline copy did not and turned ``send_message_tool`` into
-        ``sendmessagetool``.
+        The out-of-process duplicate drifting away from the adapter class's
+        shared helper is the original defect; this is the invariant that
+        would have caught it without knowing the helper was missing ``re``.
         """
-        from plugins.platforms.sms.adapter import _strip_markdown_for_sms
-
-        assert _strip_markdown_for_sms("call send_message_tool now") == (
-            "call send_message_tool now"
-        )
-
-    def test_strip_markdown_for_sms_matches_in_process_format_message(self):
-        """Standalone and in-process SMS paths must render identically."""
-        from plugins.platforms.sms.adapter import SmsAdapter, _strip_markdown_for_sms
+        from plugins.platforms.sms.adapter import SmsAdapter, strip_markdown
 
         adapter = object.__new__(SmsAdapter)
         adapter.config = PlatformConfig(enabled=True, api_key="tok")
         adapter._platform = Platform.SMS
         sample = "**b** _i_ `c`\n# H\n[l](https://e.com)\nkeep_this_name"
-        assert _strip_markdown_for_sms(sample) == adapter.format_message(sample)
+        assert strip_markdown(sample) == adapter.format_message(sample)
 
     @pytest.mark.asyncio
     async def test_standalone_send_strips_markdown_in_twilio_body(self):
