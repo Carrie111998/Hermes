@@ -37,7 +37,23 @@ def test_store_archived_compression_lineage_writes_terminal_id_revision(tmp_path
         db.close()
 
 
-def test_store_reads_raw_rows_without_flushing_and_preserves_system_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_store_rejects_a_compression_ancestor_when_a_tip_exists(tmp_path: Path) -> None:
+    """An archive revision must be keyed to the complete chain terminal, never a prefix."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("root", source="cli")
+        db.end_session("root", "compression")
+        db.create_session("terminal", source="cli", parent_session_id="root")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        with pytest.raises(ValueError, match="terminal"):
+            store_archived_lineage(db, "root", tmp_path / "archive")
+    finally:
+        db.close()
+def test_store_reads_raw_rows_without_flushing_and_preserves_system_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Store neither flushes pending accounting nor drops normalized prompt rows."""
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
