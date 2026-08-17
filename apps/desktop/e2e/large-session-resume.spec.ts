@@ -42,6 +42,7 @@ interface SeededFixture {
 
 interface PaintState {
   bursts: number
+  pending: boolean
   timeline: Array<{ mutations: number; time: number }>
 }
 
@@ -121,7 +122,7 @@ async function submitPrompt(page: Page, prompt: string): Promise<void> {
 async function startPaintObserver(page: Page): Promise<void> {
   await page.evaluate(() => {
     const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
-    const state = { bursts: 0, timeline: [] as Array<{ mutations: number; time: number }> }
+    const state = { bursts: 0, pending: false, timeline: [] as Array<{ mutations: number; time: number }> }
     ;(window as Window & { __largeSessionPaints?: typeof state }).__largeSessionPaints = state
     if (!viewport) return
 
@@ -164,6 +165,7 @@ async function startPaintObserver(page: Page): Promise<void> {
 
       additions = 0
       addedUserRows = 0
+      state.pending = false
     }
 
     new MutationObserver(records => {
@@ -180,10 +182,24 @@ async function startPaintObserver(page: Page): Promise<void> {
       }
 
       if (additions === 0) return
+      state.pending = true
       if (flushTimer) clearTimeout(flushTimer)
       flushTimer = setTimeout(flush, 30)
     }).observe(viewport, { childList: true, subtree: true })
   })
+}
+
+async function waitForSettledTranscriptPaint(page: Page): Promise<void> {
+  await page.waitForFunction(
+    expected => {
+      const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
+      const state = (window as Window & { __largeSessionPaints?: PaintState }).__largeSessionPaints
+
+      return Boolean((viewport?.textContent ?? '').includes(expected) && state && state.bursts >= 1 && !state.pending)
+    },
+    OLDEST_SEEDED_TEXT,
+    { timeout: 30_000 },
+  )
 }
 
 async function paintState(page: Page): Promise<PaintState> {
@@ -216,7 +232,7 @@ async function reloadIntoColdRenderer(fixture: SeededFixture): Promise<void> {
 
 async function assertUnchangedResume(page: Page, testInfo: TestInfo, budget: PaintBudget): Promise<void> {
   await openSeededSession(page)
-  await page.waitForTimeout(1_000)
+  await waitForSettledTranscriptPaint(page)
   await page.screenshot({ path: testInfo.outputPath('unchanged-session-resume.png'), fullPage: false })
 
   const paints = await paintState(page)

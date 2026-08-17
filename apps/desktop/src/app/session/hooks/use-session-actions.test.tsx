@@ -892,6 +892,7 @@ describe('resumeSession failure recovery', () => {
   })
 
   it('falls back to REST when resume omits messages and the initial prefetch fails', async () => {
+    setSessions([storedSession({ profile: 'work' })])
     vi.mocked(getLatestSessionMessages)
       .mockReset()
       .mockRejectedValueOnce(new Error('initial prefetch failed'))
@@ -918,8 +919,14 @@ describe('resumeSession failure recovery', () => {
 
     await runResume(requestGateway)
 
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
     expect(getLatestSessionMessages).toHaveBeenCalledTimes(2)
-    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(2, 'stored-1', undefined)
+    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(1, 'stored-1', 'work')
+    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(2, 'stored-1', 'work')
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ profile: 'work', session_id: 'stored-1' })
+    )
     expect(JSON.stringify($messages.get())).toContain('history recovered by bound key')
     expect($activeSessionId.get()).toBe('runtime-1')
   })
