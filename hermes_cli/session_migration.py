@@ -89,6 +89,64 @@ def _first_message_content(db, session_id: str) -> Optional[str]:
     return row[0] if row else None
 
 
+def _first_message_contents(db, session_ids: list[str]) -> dict[str, Optional[str]]:
+    """Batch variant of :func:`_first_message_content` (avoids N+1 queries).
+
+    Returns ``{session_id: first_nonempty_content}`` for every requested
+    session; sessions with no non-empty message map to ``None``. Semantics
+    are identical to calling :func:`_first_message_content` per session.
+    """
+    if not session_ids:
+        return {}
+    placeholders = ",".join("?" * len(session_ids))
+    rows = db._conn.execute(
+        f"""
+        SELECT m.session_id, m.content
+        FROM messages m
+        JOIN (
+            SELECT session_id, MIN(id) AS first_id
+            FROM messages
+            WHERE content IS NOT NULL AND content != ''
+            GROUP BY session_id
+        ) f ON m.id = f.first_id
+        WHERE m.session_id IN ({placeholders})
+        """,
+        tuple(session_ids),
+    ).fetchall()
+    out: dict[str, Optional[str]] = {sid: None for sid in session_ids}
+    for row in rows:
+        out[row["session_id"]] = row["content"]
+    return out
+
+
+def _content_is_compaction_summary(text: str) -> bool:
+    """True if *text* (a session's first message) is a compaction handoff."""
+    stripped = text.lstrip()
+    try:
+        # Reuse the official matcher (keeps the historical-prefix frozen set
+        # in sync automatically instead of duplicating it here).
+        from agent.context_compressor import ContextCompressor
+
+        return ContextCompressor._starts_with_summary_prefix(stripped)
+    except Exception:  # noqa: BLE001 — optional import; fall back to prefixes
+        try:
+            from agent.context_compressor import (
+                LEGACY_SUMMARY_PREFIX,
+                SUMMARY_PREFIX,
+                _HISTORICAL_SUMMARY_PREFIXES,
+            )
+        except Exception:  # noqa: BLE001
+            LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+            _HISTORICAL_SUMMARY_PREFIXES = ()
+            SUMMARY_PREFIX = (
+                "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns "
+                "were compacted into the summary below."
+            )
+        if stripped.startswith(SUMMARY_PREFIX) or stripped.startswith(LEGACY_SUMMARY_PREFIX):
+            return True
+        return any(stripped.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
+
+
 def _starts_with_compaction_summary(db, session_id: str) -> bool:
     """True if the session's first message is a context-compaction handoff.
 
@@ -108,30 +166,7 @@ def _starts_with_compaction_summary(db, session_id: str) -> bool:
     content = _first_message_content(db, session_id)
     if not content:
         return False
-    text = content.lstrip()
-    try:
-        # Reuse the official matcher (keeps the historical-prefix frozen set
-        # in sync automatically instead of duplicating it here).
-        from agent.context_compressor import ContextCompressor
-
-        return ContextCompressor._starts_with_summary_prefix(text)
-    except Exception:  # noqa: BLE001 — optional import; fall back to prefixes
-        try:
-            from agent.context_compressor import (
-                LEGACY_SUMMARY_PREFIX,
-                SUMMARY_PREFIX,
-                _HISTORICAL_SUMMARY_PREFIXES,
-            )
-        except Exception:  # noqa: BLE001
-            LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
-            _HISTORICAL_SUMMARY_PREFIXES = ()
-            SUMMARY_PREFIX = (
-                "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns "
-                "were compacted into the summary below."
-            )
-        if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
-            return True
-        return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
+    return _content_is_compaction_summary(content)
 
 
 def find_orphaned_chain_candidates(db, *, min_group: int = 2) -> list[dict]:
@@ -173,6 +208,7 @@ def find_orphaned_chain_candidates(db, *, min_group: int = 2) -> list[dict]:
 
     by_key: dict[str, list[dict]] = {}
     handoff_ids: set[str] = set()
+    first_contents = _first_message_contents(db, [r["id"] for r in roots])
     for r in roots:
         key = _title_key(r["title"])
         sess = {
@@ -183,7 +219,8 @@ def find_orphaned_chain_candidates(db, *, min_group: int = 2) -> list[dict]:
         }
         if key is not None:
             by_key.setdefault(key, []).append(sess)
-        if _starts_with_compaction_summary(db, r["id"]):
+        content = first_contents.get(r["id"])
+        if content and _content_is_compaction_summary(content):
             handoff_ids.add(r["id"])
 
     # Build candidates: handoff-signal roots always; same-title groups
