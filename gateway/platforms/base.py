@@ -85,6 +85,25 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     return metadata
 
 
+def _thread_metadata_for_event(event, reply_to_message_id: str | None = None) -> dict | None:
+    """Build outbound metadata while preserving per-event observability data."""
+    metadata = _thread_metadata_for_source(
+        event.source,
+        reply_to_message_id,
+    )
+    event_metadata = getattr(event, "metadata", None)
+    correlation_id = event_metadata.get("telegram_delivery_correlation_id") if isinstance(event_metadata, dict) else None
+    if correlation_id:
+        metadata = dict(metadata) if metadata else {}
+        metadata["telegram_delivery_correlation_id"] = str(correlation_id)
+        correlation_ids = event_metadata.get("telegram_delivery_correlation_ids")
+        if isinstance(correlation_ids, (list, tuple)):
+            metadata["telegram_delivery_correlation_ids"] = [
+                str(value) for value in correlation_ids if value
+            ]
+    return metadata
+
+
 def _mark_notify_metadata(metadata: dict | None) -> dict:
     """Clone metadata and mark a user-visible reply as notify-worthy."""
     notify_metadata = dict(metadata) if metadata else {}
@@ -4589,7 +4608,7 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
-        thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        thread_meta = _thread_metadata_for_event(event, _reply_anchor_for_event(event))
 
         try:
             response = await self._message_handler(event)
@@ -4710,7 +4729,7 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    _thread_meta = _thread_metadata_for_event(event, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
@@ -4761,8 +4780,8 @@ class BasePlatformAdapter(ABC):
                         self.name, session_key,
                     )
                     try:
-                        _thread_meta = _thread_metadata_for_source(
-                            event.source, _reply_anchor_for_event(event)
+                        _thread_meta = _thread_metadata_for_event(
+                            event, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
@@ -4885,7 +4904,7 @@ class BasePlatformAdapter(ABC):
         # Gated per-platform: when typing_indicator=False the refresh loop is
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
-        _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        _thread_metadata = _thread_metadata_for_event(event, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
         if getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
@@ -5271,7 +5290,7 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                _thread_metadata = _thread_metadata_for_event(event, _reply_anchor_for_event(event))
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
