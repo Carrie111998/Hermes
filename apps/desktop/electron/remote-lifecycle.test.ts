@@ -409,9 +409,9 @@ function spawnThroughExecWrapper(
   return { launcher, entrypoint, pid: child.pid as number, cleanup }
 }
 
-function spawnDirectHermes(extraServeArgs: string[]) {
+function spawnDirectHermes(extraServeArgs: string[], executableName = 'hermes') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-direct-'))
-  const hermesPath = path.join(dir, 'hermes')
+  const hermesPath = path.join(dir, executableName)
   fs.writeFileSync(hermesPath, '#!/usr/bin/env python3\nimport time\ntime.sleep(120)\n', { mode: 0o755 })
 
   const child = spawn(hermesPath, ['serve', '--isolated', '--host', '127.0.0.1', '--port', '0', ...extraServeArgs], {
@@ -563,6 +563,21 @@ test('pidIsOurDashboard keeps direct launcher matching when the token argument i
   }
 
   const direct = spawnDirectHermes(['--ssh-owner-nonce', SPAWN_NONCE])
+
+  try {
+    await waitForServeArgv(direct.pid, direct.hermesPath)
+    assert.equal(await pidIsOurDashboard(shellSsh(), direct.pid, SPAWN_NONCE, direct.hermesPath, OWNERSHIP_ID), true)
+  } finally {
+    direct.cleanup()
+  }
+})
+
+test('pidIsOurDashboard preserves backslashes in direct launcher paths', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const direct = spawnDirectHermes(['--ssh-owner-nonce', SPAWN_NONCE], String.raw`hermes\new`)
 
   try {
     await waitForServeArgv(direct.pid, direct.hermesPath)

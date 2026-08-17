@@ -422,9 +422,9 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
     const script =
       'import os,shlex,subprocess,sys\n' +
       `pid=${numericPid}\n` +
-      `expected=os.path.expanduser(${shq(hermesPath)})\n` +
-      `nonce=${shq(spawnNonce)}\n` +
-      `tokenfile=os.path.expanduser(${shq(tokenFilePath)})\n` +
+      `expected=os.path.expanduser(${JSON.stringify(String(hermesPath))})\n` +
+      `nonce=${JSON.stringify(String(spawnNonce))}\n` +
+      `tokenfile=os.path.expanduser(${JSON.stringify(tokenFilePath)})\n` +
       'try:\n' +
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
