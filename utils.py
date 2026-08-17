@@ -58,6 +58,47 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
+def _atomic_write(
+    path: Union[str, Path],
+    write_fn: "Callable[[Any], None]",
+) -> None:
+    """Write to a file atomically via a caller-supplied write function.
+
+    Handles the temp-file/fsync/replace dance so callers only need to
+    supply a ``write_fn(file_handle)`` that does the actual serialization.
+
+    Args:
+        path: Target file path (will be created or overwritten).
+        write_fn: Callable that receives an open file handle and writes
+            the desired content.  Must NOT close the handle.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_mode = _preserve_file_mode(path)
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            write_fn(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        _restore_file_mode(path, original_mode)
+    except BaseException:
+        # Intentionally catch BaseException so temp-file cleanup still runs for
+        # KeyboardInterrupt/SystemExit before re-raising the original signal.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,
@@ -78,37 +119,10 @@ def atomic_json_write(
         **dump_kwargs: Additional keyword args forwarded to json.dump(), such
             as default=str for non-native types.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    def _write(f):
+        json.dump(data, f, indent=indent, ensure_ascii=False, **dump_kwargs)
 
-    original_mode = _preserve_file_mode(path)
-
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.stem}_",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
-                data,
-                f,
-                indent=indent,
-                ensure_ascii=False,
-                **dump_kwargs,
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-        _restore_file_mode(path, original_mode)
-    except BaseException:
-        # Intentionally catch BaseException so temp-file cleanup still runs for
-        # KeyboardInterrupt/SystemExit before re-raising the original signal.
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    _atomic_write(path, _write)
 
 
 def atomic_yaml_write(
@@ -133,33 +147,12 @@ def atomic_yaml_write(
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    def _write(f):
+        yaml.dump(data, f, default_flow_style=default_flow_style, sort_keys=sort_keys)
+        if extra_content:
+            f.write(extra_content)
 
-    original_mode = _preserve_file_mode(path)
-
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.stem}_",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=default_flow_style, sort_keys=sort_keys)
-            if extra_content:
-                f.write(extra_content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-        _restore_file_mode(path, original_mode)
-    except BaseException:
-        # Match atomic_json_write: cleanup must also happen for process-level
-        # interruptions before we re-raise them.
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    _atomic_write(path, _write)
 
 
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────
