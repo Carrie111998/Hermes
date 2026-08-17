@@ -110,6 +110,27 @@ elif [ -n "${HOMEDRIVE:-}" ] && [ -n "${HOMEPATH:-}" ]; then
   CLEAN_ENV+=("HOMEDRIVE=$HOMEDRIVE" "HOMEPATH=$HOMEPATH")
 fi
 
+# Windows OS path/identity vars. `env -i` drops SYSTEMDRIVE, and without it a
+# Windows child cannot expand the REG_EXPAND_SZ known-folder template
+# `%SystemDrive%\ProgramData` held in HKLM\...\ProfileList. The literal string
+# is then used as a RELATIVE path and the known-folder cache is built under the
+# process CWD — which the `cd "$REPO_ROOT"` above pinned to the checkout root,
+# leaving a stray `%SystemDrive%/ProgramData/Microsoft/Windows/Caches/` tree in
+# the repo. It propagates: run_tests_parallel.py hands workers `env=os.environ`
+# with `cwd=repo_root`, so every worker inherits the same gap.
+#
+# Observed 2026-08-16 18:29:34 in the shared checkout and reproduced directly —
+# this allowlist plus the MSIX/WindowsApps python writes the tree; adding
+# SYSTEMDRIVE and nothing else makes it stop. Mirrors WINDOWS_OS_PATH_ENV_VARS
+# in agent/secret_sources/base.py, which fixes the same failure mode in the
+# secret-helper allowlists. No-ops on POSIX, where none of these are set.
+for _var in SYSTEMDRIVE PROGRAMDATA ALLUSERSPROFILE WINDIR COMSPEC PATHEXT; do
+  eval "_val=\${$_var:-}"
+  if [ -n "$_val" ]; then
+    CLEAN_ENV+=("$_var=$_val")
+  fi
+done
+
 if [ -n "${HERMES_RUN_SLOW_PET_TESTS:-}" ]; then
   CLEAN_ENV+=("HERMES_RUN_SLOW_PET_TESTS=$HERMES_RUN_SLOW_PET_TESTS")
 fi
