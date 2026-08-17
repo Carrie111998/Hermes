@@ -2,11 +2,16 @@
 Smoke tests for the nocodb optional skill.
 
 Validates:
-  - SKILL.md frontmatter conforms to the authoring standards
   - Both platform scripts ship and expose an identical command surface
+    (which is what makes the three-platform `platforms:` claim honest)
   - Every command named in SKILL.md prose is one the scripts implement
     (catches doc drift when the vendored scripts are refreshed upstream)
   - The scripts only ever talk to the configured NocoDB origin
+  - The MIT provenance of the vendored scripts survives
+
+Generic frontmatter conformance (required fields, the 60-char description
+hardline, tags, related_skills) is not repeated here — tests/skills/
+test_authoring_standards.py already sweeps every skill in the repo for it.
 
 No network. Everything here is static analysis of the shipped files.
 """
@@ -81,17 +86,16 @@ def test_bash_script_is_executable() -> None:
     assert SH.stat().st_mode & 0o111, "scripts/nocodb.sh is not executable"
 
 
-def test_required_frontmatter_fields(frontmatter: dict) -> None:
-    for field in ("name", "description", "version", "author", "license", "platforms"):
-        assert field in frontmatter, f"missing frontmatter field: {field}"
-    assert frontmatter["name"] == "nocodb"
+def test_mit_provenance_recorded(frontmatter: dict) -> None:
+    # The scripts are vendored from an MIT upstream that ships no LICENSE
+    # file, so the attribution lives in the frontmatter and in a header on
+    # each script. Losing either silently drops the only notice we carry.
     assert frontmatter["license"] == "MIT"
-
-
-def test_description_hardline(frontmatter: dict) -> None:
-    desc = frontmatter["description"]
-    assert len(desc) <= 60, f"description is {len(desc)} chars (hardline 60)"
-    assert desc.endswith("."), "description must end with a period"
+    for script in (SH, PS1):
+        head = script.read_text(encoding="utf-8")[:600]
+        assert "github.com/nocodb/agent-skills" in head, (
+            f"{script.name} lost its upstream provenance header"
+        )
 
 
 def test_declares_token_env_var(frontmatter: dict) -> None:
@@ -105,10 +109,6 @@ def test_platforms_match_shipped_scripts(frontmatter: dict) -> None:
     # the Bash one. If nocodb.ps1 is ever dropped, this fails loudly.
     assert set(frontmatter["platforms"]) == {"macos", "linux", "windows"}
     assert PS1.is_file()
-
-
-def test_tags_present(frontmatter: dict) -> None:
-    assert frontmatter["metadata"]["hermes"]["tags"], "no metadata.hermes.tags"
 
 
 def test_both_scripts_expose_the_same_commands(sh_commands: set[str]) -> None:
