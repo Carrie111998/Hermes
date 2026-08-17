@@ -262,6 +262,73 @@ def _exited_status(code: int) -> int:
     return code << 8
 
 
+def _crash_worker_with_output(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    current_output: bytes,
+) -> dict:
+    """Spawn one attempt behind an existing task log, then crash it."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
+
+    workspace = kanban_home / "workspace"
+    workspace.mkdir()
+    host = kb._claimer_id().split(":", 1)[0]
+    board = "crash-log-ownership"
+    kb.create_board(board)
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="run log ownership", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:test")
+        assert claimed is not None and claimed.current_run_id is not None
+
+        log_path = kb.worker_log_path(task_id, board=board)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_bytes(b"previous-run output\n")
+
+        class FakeProc:
+            pid = 76543
+
+        def fake_popen(_cmd, *args, **kwargs):
+            output = kwargs["stdout"]
+            output.write(current_output)
+            output.flush()
+            return FakeProc()
+
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        pid = kb._default_spawn(claimed, str(workspace), board=board)
+        assert pid == FakeProc.pid
+        kb._set_worker_pid(conn, task_id, pid)
+
+        assert kb.detect_crashed_workers(conn, board=board) == [task_id]
+        crash = next(ev for ev in reversed(kb.list_events(conn, task_id)) if ev.kind == "crashed")
+        assert crash.run_id == claimed.current_run_id
+        assert crash.payload is not None
+        assert "worker_log_tail" in crash.payload
+        return crash.payload
+
+
+def test_crash_log_tail_is_null_when_current_run_wrote_nothing(
+    kanban_home, monkeypatch,
+):
+    payload = _crash_worker_with_output(
+        kanban_home, monkeypatch, current_output=b"",
+    )
+
+    assert payload["worker_log_tail"] is None
+
+
+def test_crash_log_tail_excludes_previous_run_output(
+    kanban_home, monkeypatch,
+):
+    payload = _crash_worker_with_output(
+        kanban_home, monkeypatch, current_output=b"current-run failure\n",
+    )
+
+    assert payload["worker_log_tail"] == "current-run failure\n"
+
+
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(
