@@ -25,6 +25,7 @@ import {
   _resetLegacyDiscardForTests,
   applyConfiguredDefaultProjectDir,
   commitWorkspaceCwdForSelectedSession,
+  ensureDefaultWorkspaceCwd,
   getRememberedRoute,
   getRememberedSessionId,
   getRememberedWorkspaceCwd,
@@ -501,6 +502,35 @@ describe('workspaceCwdForNewSession', () => {
     applyConfiguredDefaultProjectDir('/home/user/configured')
 
     expect(workspaceCwdForNewSession()).toBe('/home/user/configured')
+  })
+
+  it('seeds the remote remembered cwd for resume while bare new chats stay detached (#57911)', async () => {
+    const desktopWindow = window as { hermesDesktop?: unknown }
+    const previousDesktop = desktopWindow.hermesDesktop
+    const sanitizeWorkspaceCwd = vi.fn(async (cwd: string) => ({ cwd }))
+    desktopWindow.hermesDesktop = { sanitizeWorkspaceCwd }
+
+    try {
+      window.localStorage.setItem(
+        'hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-a.default',
+        '/tradingview'
+      )
+      $connection.set({ baseUrl: 'http://backend-a', mode: 'remote' } as never)
+      $currentCwd.set('')
+      $activeSessionId.set(null)
+
+      // Boot/resume must still restore the remote-keyed remembered workspace.
+      await ensureDefaultWorkspaceCwd()
+
+      expect($currentCwd.get()).toBe('/tradingview')
+      expect(sanitizeWorkspaceCwd).not.toHaveBeenCalled()
+
+      // Cmd+N is a different contract: without an explicit default, it must not
+      // inherit the restored workspace.
+      expect(workspaceCwdForNewSession()).toBe('')
+    } finally {
+      desktopWindow.hermesDesktop = previousDesktop
+    }
   })
 
   it('remembers only the workspace the user picked, not the one they looked at', () => {
