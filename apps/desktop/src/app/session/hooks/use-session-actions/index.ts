@@ -35,7 +35,9 @@ import {
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  getCurrentEffortSource,
   type NewChatWorkspaceTarget,
+  reconcileComposerReasoningAfterCreate,
   resolveComposerSessionKey,
   sessionPinId,
   setActiveSessionId,
@@ -200,7 +202,9 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     ...(selection.model
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
-    ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
+    ...(selection.effort && getCurrentEffortSource() === 'manual'
+      ? { reasoning_effort: selection.effort }
+      : {}),
     fast: selection.fast
   }
 }
@@ -449,6 +453,10 @@ export function useSessionActions({
 
         const params = await desktopSessionCreateParams(cwd)
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
+        reconcileComposerReasoningAfterCreate(
+          typeof params.reasoning_effort === 'string',
+          created.info
+        )
         const stored = created.stored_session_id ?? null
 
         // Only a genuine move to a DIFFERENT chat mid-create should orphan the
@@ -565,6 +573,10 @@ export function useSessionActions({
         // (project scope → configured default).
         const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
+        reconcileComposerReasoningAfterCreate(
+          typeof params.reasoning_effort === 'string',
+          created.info
+        )
         const stored = created.stored_session_id
 
         if (!stored) {

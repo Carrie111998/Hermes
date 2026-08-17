@@ -15,8 +15,11 @@ import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from 
 import { $visibleModels } from '@/store/model-visibility'
 import { notifyError } from '@/store/notifications'
 import {
+  $currentEffortSource,
   $defaultReasoningEffort,
+  markComposerEffortManual,
   markComposerSelectionManual,
+  resetComposerReasoningToDefault,
   setCurrentFastMode,
   setCurrentReasoningEffort
 } from '@/store/session'
@@ -63,8 +66,10 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const currentReasoningEffort = useStore(view.$reasoningEffort)
   const modelPresets = useStore($modelPresets)
   const defaultEffort = useStore($defaultReasoningEffort) || DEFAULT_REASONING_EFFORT
+  const effortSource = useStore($currentEffortSource)
   const visibleModels = useStore($visibleModels)
   const touchesPrimary = view.kind === 'primary'
+  const effortOverrideActive = touchesPrimary && effortSource === 'manual'
 
   // Subscribe to the SAME query the menu runs (identical key ⇒ React Query
   // dedupes, no second fetch). It must be a live subscription, not a cache
@@ -110,7 +115,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // Push a reasoning change onto the session that owns it, with rollback.
   const patchReasoning = async (next: string, previous: string, provider: string, model: string) => {
     if (touchesPrimary) {
-      markComposerSelectionManual()
+      markComposerEffortManual()
       setCurrentReasoningEffort(next)
     } else if (activeSessionId) {
       sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: next }))
@@ -223,17 +228,39 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     <ModelCatalogMenu
       controller={controller}
       footer={
-        <DropdownMenuItem
-          className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
-          disabled={refreshing}
-          onSelect={event => {
-            event.preventDefault()
-            void refreshModels()
-          }}
-        >
-          <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
-          {copy.refreshModels}
-        </DropdownMenuItem>
+        <>
+          {effortOverrideActive ? (
+            <DropdownMenuItem
+              className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+              data-testid="reset-reasoning-default"
+              onSelect={event => {
+                event.preventDefault()
+
+                resetComposerReasoningToDefault()
+                if (activeSessionId) {
+                  void requestGateway('config.set', {
+                    key: 'reasoning',
+                    session_id: activeSessionId,
+                    value: 'default'
+                  }).catch(err => notifyError(err, t.shell.modelOptions.updateFailed))
+                }
+              }}
+            >
+              {copy.resetReasoningDefault}
+            </DropdownMenuItem>
+          ) : null}
+          <DropdownMenuItem
+            className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+            disabled={refreshing}
+            onSelect={event => {
+              event.preventDefault()
+              void refreshModels()
+            }}
+          >
+            <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
+            {copy.refreshModels}
+          </DropdownMenuItem>
+        </>
       }
       gateway={gateway}
       includeMoa

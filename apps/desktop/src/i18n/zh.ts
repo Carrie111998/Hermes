@@ -2786,6 +2786,7 @@ export const zh: Translations = {
       noModels: '未找到模型',
       editModels: '编辑模型…',
       refreshModels: '刷新模型',
+      resetReasoningDefault: '使用设置中的推理默认值',
       fast: '快速'
     },
     modelOptions: {
@@ -2910,6 +2911,7 @@ export const zh: Translations = {
       switchModel: '切换模型',
       openModelPicker: '打开模型选择器',
       modelPinned: '已由你固定；新对话将使用此模型而非“设置”中的默认模型',
+      effortPinned: '推理覆盖；新对话将使用此值而非“设置”中的默认值',
       modelTitle: (provider, model) => `模型 · ${provider}: ${model}`,
       providerModelTitle: (provider, model) => `${provider} · ${model}`
     }

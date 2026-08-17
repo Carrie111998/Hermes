@@ -4394,6 +4394,33 @@ def _load_reasoning_config(model: str = "") -> dict | None:
     return resolve_reasoning_config(_load_cfg(), model)
 
 
+def _resolve_agent_reasoning_config(
+    override: dict | None,
+    *,
+    provider: str | None,
+    model: str,
+    sid: str | None = None,
+) -> dict | None:
+    """Use a session override only when the runtime can honor it.
+
+    Unsupported composer leftovers (``ultra`` on Codex, …) fall back to
+    config.yaml instead of shipping a request the provider will 400.
+    """
+    if override is not None:
+        from tui_gateway.reasoning_override import supported_session_reasoning_override
+
+        kept = supported_session_reasoning_override(
+            override, provider=provider, model=model
+        )
+        if kept is not None:
+            return kept
+        if sid:
+            session = _sessions.get(sid)
+            if isinstance(session, dict):
+                session.pop("create_reasoning_override", None)
+    return _load_reasoning_config(str(model or ""))
+
+
 def _load_service_tier() -> str | None:
     raw = (
         str((_load_cfg().get("agent") or {}).get("service_tier", "") or "")
@@ -5571,6 +5598,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "provider": pending_provider
         or mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,
+        "reasoning_override": isinstance(
+            (session or {}).get("create_reasoning_override"), dict
+        ),
         "service_tier": service_tier,
         "fast": service_tier == "priority",
         "yolo": yolo,
@@ -6984,10 +7014,11 @@ def _make_agent(
         # display detail).  See cli.py PR (decoupling fix) for the matching
         # change on the classic CLI side.
         verbose_logging=False,
-        reasoning_config=(
-            reasoning_config_override
-            if reasoning_config_override is not None
-            else _load_reasoning_config(str(model or ""))
+        reasoning_config=_resolve_agent_reasoning_config(
+            reasoning_config_override,
+            provider=runtime.get("provider"),
+            model=str(model or ""),
+            sid=sid,
         ),
         service_tier=(
             service_tier_override
@@ -12107,6 +12138,33 @@ def _(rid, params: dict) -> dict:
             arg = str(value or "").strip().lower()
             scope = str(params.get("scope") or "").strip().lower()
             global_scope = scope == "global"
+            if arg in {"default", "reset", "inherit"}:
+                # Drop the per-session composer override so the next turn
+                # (and new chats after a Settings write) use config.yaml.
+                if session is None:
+                    return _err(rid, 4002, "default reasoning needs a session_id")
+                session.pop("create_reasoning_override", None)
+                model = ""
+                agent = session.get("agent")
+                if agent is not None:
+                    model = str(getattr(agent, "model", "") or "")
+                elif isinstance(session.get("model_override"), dict):
+                    model = str(session["model_override"].get("model") or "")
+                parsed = _load_reasoning_config(model)
+                if agent is not None:
+                    agent.reasoning_config = parsed
+                    _persist_live_session_runtime(session)
+                    _emit(
+                        "session.info",
+                        params.get("session_id", ""),
+                        _session_info(agent, session),
+                    )
+                from tui_gateway.reasoning_override import reasoning_effort_label
+
+                return _ok(
+                    rid,
+                    {"key": key, "value": reasoning_effort_label(parsed) or "default"},
+                )
             if arg in {"show", "on"}:
                 cfg = _load_cfg_raw()  # write-back round-trip
                 display = (
@@ -12186,6 +12244,28 @@ def _(rid, params: dict) -> dict:
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
+            if session is not None and not global_scope:
+                from tui_gateway.reasoning_override import (
+                    supported_session_reasoning_override,
+                )
+
+                agent = session.get("agent")
+                provider = getattr(agent, "provider", None)
+                model = str(getattr(agent, "model", "") or "")
+                override = session.get("model_override")
+                if isinstance(override, dict):
+                    provider = provider or override.get("provider")
+                    model = model or str(override.get("model") or "")
+                kept = supported_session_reasoning_override(
+                    parsed, provider=provider, model=model
+                )
+                if kept is None:
+                    return _err(
+                        rid,
+                        4002,
+                        f"reasoning value {arg} is not supported by this provider",
+                    )
+                parsed = kept
             if global_scope or session is None:
                 _write_config_key("agent.reasoning_effort", arg)
                 if session is not None:

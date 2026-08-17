@@ -2096,6 +2096,7 @@ export const ar = defineLocale({
       noModels: 'لا توجد نماذج',
       editModels: 'تحرير النماذج',
       refreshModels: 'تحديث النماذج',
+      resetReasoningDefault: 'استخدام استدلال الإعدادات الافتراضي',
       fast: 'سريع'
     },
     modelOptions: {
@@ -2169,6 +2170,7 @@ export const ar = defineLocale({
       switchModel: 'تبديل النموذج',
       openModelPicker: 'فتح اختيار النموذج',
       modelPinned: 'النموذج مثبت',
+      effortPinned: 'تجاوز الاستدلال؛ المحادثات الجديدة تستخدم هذه القيمة بدل الافتراضي',
       modelTitle: (provider, model) => `${provider}: ${model}`,
       providerModelTitle: (provider, model) => `${provider}: ${model}`
     }

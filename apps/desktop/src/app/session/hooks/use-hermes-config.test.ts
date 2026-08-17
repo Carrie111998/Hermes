@@ -10,8 +10,10 @@ import {
   $currentFastMode,
   $currentReasoningEffort,
   $defaultReasoningEffort,
+  markComposerEffortManual,
   markComposerSelectionManual,
   setCurrentCwd,
+  setCurrentEffortSource,
   setCurrentFastMode,
   setCurrentModelSource,
   setCurrentReasoningEffort,
@@ -46,6 +48,7 @@ describe('useHermesConfig refreshHermesConfig', () => {
     setCurrentCwd('')
     setCurrentFastMode(false)
     setCurrentModelSource('')
+    setCurrentEffortSource('')
     setCurrentReasoningEffort('')
     setDefaultReasoningEffort('')
     setTerminalFontFamilyFromConfig('')
@@ -59,6 +62,7 @@ describe('useHermesConfig refreshHermesConfig', () => {
   // `agent.reasoning_effort: high` to Hermes' built-in medium.
   it('publishes the profile default effort even when a manual pick blocks the composer reseed', async () => {
     setCurrentModelSource('manual')
+    setCurrentEffortSource('manual')
     setCurrentReasoningEffort('low')
 
     mockConfig({ agent: { reasoning_effort: 'high' } })
@@ -114,6 +118,7 @@ describe('useHermesConfig refreshHermesConfig', () => {
     // The user turns Fast off and chooses a different effort while the profile
     // defaults are still loading. That newer picker intent owns the composer.
     markComposerSelectionManual()
+    markComposerEffortManual()
     setCurrentReasoningEffort('high')
     setCurrentFastMode(false)
     profileConfig.resolve({

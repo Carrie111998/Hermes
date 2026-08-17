@@ -1,13 +1,23 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { $modelPresets, applyModelPreset, getModelPreset, modelPresetKey, setModelPreset } from './model-presets'
-import { $currentFastMode, $currentReasoningEffort, setCurrentFastMode, setCurrentReasoningEffort } from './session'
+import {
+  $currentEffortSource,
+  $currentFastMode,
+  $currentReasoningEffort,
+  setCurrentEffortSource,
+  setCurrentFastMode,
+  setCurrentReasoningEffort,
+  setDefaultReasoningEffort
+} from './session'
 
 describe('model presets', () => {
   beforeEach(() => {
     $modelPresets.set({})
     setCurrentFastMode(false)
     setCurrentReasoningEffort('')
+    setCurrentEffortSource('')
+    setDefaultReasoningEffort('medium')
   })
 
   it('round-trips a preset and merges patches without dropping prior fields', () => {
@@ -52,7 +62,18 @@ describe('model presets', () => {
     await applyModelPreset({ effort: 'high', fast: true }, { failMessage: 'x', request, sessionId: null })
 
     expect($currentReasoningEffort.get()).toBe('high')
+    expect($currentEffortSource.get()).toBe('manual')
     expect($currentFastMode.get()).toBe(true)
     expect(calls).toEqual([])
+  })
+
+  it('clears a leftover sticky effort when the model preset has none', async () => {
+    setCurrentReasoningEffort('ultra')
+    setCurrentEffortSource('manual')
+
+    await applyModelPreset({}, { failMessage: 'x', request: async () => ({}) as never, sessionId: null })
+
+    expect($currentReasoningEffort.get()).toBe('medium')
+    expect($currentEffortSource.get()).toBe('default')
   })
 })

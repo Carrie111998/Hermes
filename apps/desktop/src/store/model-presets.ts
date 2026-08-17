@@ -3,7 +3,12 @@ import { atom } from 'nanostores'
 import { persistString, storedString } from '@/lib/storage'
 
 import { notifyError } from './notifications'
-import { setCurrentFastMode, setCurrentReasoningEffort } from './session'
+import {
+  markComposerEffortManual,
+  resetComposerReasoningToDefault,
+  setCurrentFastMode,
+  setCurrentReasoningEffort
+} from './session'
 import { sessionTileDelegate } from './session-states'
 
 const STORAGE_KEY = 'hermes.desktop.model-presets'
@@ -67,6 +72,9 @@ export async function applyModelPreset(
   if (ctx.primary ?? true) {
     if (effort !== undefined) {
       setCurrentReasoningEffort(effort)
+      markComposerEffortManual()
+    } else {
+      resetComposerReasoningToDefault()
     }
 
     if (fast !== undefined) {

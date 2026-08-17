@@ -12,7 +12,12 @@ import { useI18n } from '@/i18n'
 import { ChevronDown } from '@/lib/icons'
 import { formatModelStatusLabel } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
-import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
+import {
+  $currentEffortSource,
+  $currentModelSource,
+  $defaultReasoningEffort,
+  setModelPickerOpen
+} from '@/store/session'
 
 import { onComposerModelMenuRequest } from './focus'
 import { useComposerScope } from './scope'
@@ -51,6 +56,7 @@ export function ModelPill({
   const fastMode = useStore(view.$fast)
   const reasoningEffort = useStore(view.$reasoningEffort)
   const modelSource = useStore($currentModelSource)
+  const effortSource = useStore($currentEffortSource)
   const defaultEffort = useStore($defaultReasoningEffort)
   const runtimeId = useStore(view.$runtimeId)
   const [open, setOpen] = useState(false)
@@ -84,7 +90,9 @@ export function ModelPill({
   // live session's footer reflects that session's model, so no badge there.
   // Tiles always have a runtime — pin badge is primary-draft only.
   const pinnedOverride =
-    view.kind === 'primary' && !runtimeId && modelSource === 'manual' && Boolean(currentModel.trim())
+    view.kind === 'primary' &&
+    !runtimeId &&
+    ((modelSource === 'manual' && Boolean(currentModel.trim())) || effortSource === 'manual')
 
   // The model resolves a beat after the gateway/session comes up. Rather than
   // flash a literal "No model", show a quiet loader (inherits the pill text
@@ -102,9 +110,9 @@ export function ModelPill({
       )}
       {pinnedOverride && (
         <span
-          aria-label={copy.modelPinned}
+          aria-label={effortSource === 'manual' && modelSource !== 'manual' ? copy.effortPinned : copy.modelPinned}
           className="size-1 shrink-0 rounded-full bg-(--ui-accent)"
-          data-testid="model-pinned-dot"
+          data-testid={effortSource === 'manual' && modelSource !== 'manual' ? 'effort-override-dot' : 'model-pinned-dot'}
           role="img"
         />
       )}

@@ -2257,6 +2257,7 @@ export const zhHant = defineLocale({
       noModels: '找不到模型',
       editModels: '編輯模型…',
       refreshModels: '重新整理模型',
+      resetReasoningDefault: '使用設定中的推理預設值',
       fast: '快速'
     },
     modelOptions: {
@@ -2367,6 +2368,7 @@ export const zhHant = defineLocale({
       switchModel: '切換模型',
       openModelPicker: '開啟模型選擇器',
       modelPinned: '已由你固定；新對話將使用此模型而非「設定」中的預設模型',
+      effortPinned: '推理覆寫；新對話將使用此值而非「設定」中的預設值',
       modelTitle: (provider, model) => `模型 · ${provider}：${model}`,
       providerModelTitle: (provider, model) => `${provider} · ${model}`
     }

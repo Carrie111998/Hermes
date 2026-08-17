@@ -7,8 +7,10 @@ import { normalize } from '@/lib/text'
 import { setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
 import {
   getComposerSelectionGeneration,
+  getCurrentEffortSource,
   getCurrentModelSource,
   setAvailablePersonalities,
+  setCurrentEffortSource,
   setCurrentFastMode,
   setCurrentPersonality,
   setCurrentReasoningEffort,
@@ -101,8 +103,17 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
           getComposerSelectionGeneration() === selectionGeneration &&
           (force || getCurrentModelSource() !== 'manual')
 
-        if (shouldSeedComposer) {
+        const shouldSeedEffort =
+          !activeSessionIdRef.current &&
+          getComposerSelectionGeneration() === selectionGeneration &&
+          (force || getCurrentEffortSource() !== 'manual')
+
+        if (shouldSeedEffort) {
           setCurrentReasoningEffort(reasoning)
+          setCurrentEffortSource('default')
+        }
+
+        if (shouldSeedComposer) {
           setCurrentFastMode(FAST_TIERS.has(tier.toLowerCase()))
         }
 

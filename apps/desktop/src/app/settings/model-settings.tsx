@@ -30,6 +30,7 @@ import { cn } from '@/lib/utils'
 import { setMainModelAssignment } from '@/store/cron-model-impact'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
+import { resetComposerReasoningToDefault, setDefaultReasoningEffort } from '@/store/session'
 
 import { invalidateHermesConfig, setHermesConfigCache, useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
@@ -528,6 +529,10 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       try {
         await saveHermesConfig(next)
+        if (key === 'agent.reasoning_effort') {
+          setDefaultReasoningEffort(value)
+          resetComposerReasoningToDefault()
+        }
       } catch (err) {
         setConfig(prev)
         notifyError(err, m.defaultsFailed)

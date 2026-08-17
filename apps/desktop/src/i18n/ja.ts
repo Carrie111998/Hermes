@@ -2340,6 +2340,7 @@ export const ja = defineLocale({
       noModels: 'モデルが見つかりません',
       editModels: 'モデルを編集…',
       refreshModels: 'モデルを更新',
+      resetReasoningDefault: '設定の推論デフォルトを使う',
       fast: '高速'
     },
     modelOptions: {
@@ -2450,6 +2451,7 @@ export const ja = defineLocale({
       switchModel: 'モデルを切り替え',
       openModelPicker: 'モデルピッカーを開く',
       modelPinned: '手動で固定中 — 新しいチャットは設定のデフォルトではなくこのモデルを使用します',
+      effortPinned: '推論の上書き — 新しいチャットは設定のデフォルトではなくこの値を使います',
       modelTitle: (provider, model) => `モデル · ${provider}: ${model}`,
       providerModelTitle: (provider, model) => `${provider} · ${model}`
     }

@@ -4,7 +4,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import type { ChatBarState } from '@/app/chat/composer/types'
 import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
-import { $activeSessionId, $currentModel, setCurrentModel, setCurrentModelSource } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentModel,
+  setCurrentEffortSource,
+  setCurrentModel,
+  setCurrentModelSource
+} from '@/store/session'
 
 import { ModelPill } from './model-pill'
 
@@ -20,6 +26,7 @@ afterEach(() => {
   $activeSessionId.set(null)
   setCurrentModel('')
   setCurrentModelSource('')
+  setCurrentEffortSource('')
 })
 
 // #62055: a manual composer pick is sticky and silently overrides the
@@ -77,6 +84,18 @@ describe('ModelPill pinned-override badge', () => {
     )
     expect(screen.getByTestId('model-pinned-dot')).toBeTruthy()
     expect($currentModel.get()).toBe('deepseek/deepseek-v4-flash')
+  })
+
+  it('shows the effort override dot when only reasoning is pinned', () => {
+    setCurrentModel('google/gemma-4-26b-a4b-it:free')
+    setCurrentModelSource('default')
+    setCurrentEffortSource('manual')
+    $activeSessionId.set(null)
+
+    render(<ModelPill disabled={false} model={modelState()} />)
+
+    expect(screen.getByTestId('effort-override-dot')).toBeTruthy()
+    expect(screen.queryByTestId('model-pinned-dot')).toBeNull()
   })
 })
 

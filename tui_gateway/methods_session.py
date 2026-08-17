@@ -42,11 +42,11 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
 
-    # The desktop composer owns its model/effort/fast as plain UI state and ships
-    # it on every session.create. Honor each as a PER-SESSION override (built into
-    # the agent below) — never a global config write, so picking a model/effort
-    # for a new chat can't mutate the profile default. provider is optional
-    # (resolved at build).
+    # The desktop composer owns its model/effort/fast as plain UI state. Honor
+    # each as a PER-SESSION override (built into the agent below) — never a
+    # global config write. An inherited sticky effort is omitted by the
+    # client; if one still arrives, drop it when this provider cannot honor
+    # it so we fall back to config.yaml (#87036).
     create_model = str(params.get("model") or "").strip()
     session_model_override = (
         {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
@@ -55,12 +55,17 @@ def _(rid, params: dict) -> dict:
     )
     create_reasoning_override = None
     if effort := str(params.get("reasoning_effort") or "").strip():
-        try:
-            from hermes_constants import parse_reasoning_effort
+        from tui_gateway.reasoning_override import parse_create_reasoning_override
 
-            create_reasoning_override = parse_reasoning_effort(effort)
-        except Exception:
-            create_reasoning_override = None
+        create_provider = (
+            str(params.get("provider") or "").strip()
+            or (session_model_override or {}).get("provider")
+        )
+        create_reasoning_override = parse_create_reasoning_override(
+            effort,
+            provider=create_provider,
+            model=create_model or None,
+        )
     # Presence is part of the contract: omitted means inherit the profile,
     # true pins priority, and false pins normal. Empty string is the internal
     # explicit-normal sentinel because _make_agent uses None for inheritance.
@@ -146,6 +151,18 @@ def _(rid, params: dict) -> dict:
                     {"provider": session_model_override["provider"]}
                     if session_model_override and session_model_override.get("provider")
                     else {}
+                ),
+                **(
+                    {
+                        "reasoning_effort": (
+                            "none"
+                            if create_reasoning_override.get("enabled") is False
+                            else str(create_reasoning_override.get("effort") or "")
+                        ),
+                        "reasoning_override": True,
+                    }
+                    if isinstance(create_reasoning_override, dict)
+                    else {"reasoning_override": False}
                 ),
                 "tools": {},
                 "skills": {},
