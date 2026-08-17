@@ -394,6 +394,16 @@ its own design. Non-HTML targets and remote gateways fall back to the
 classic preview card. Tell the agent about your directive in a skill (that's
 how it learns to emit it).
 
+Previewed widgets can also **talk back**. Inside the frame,
+`window.hermes.send('get-price eth')` (or a declarative
+`<button data-hermes-send="get-price eth">` — no script needed) hands that
+prompt to the agent as a user turn, off-screen: no bubble takes up the
+transcript, the widget updating is the visible response. The turn is still
+real — it wakes the agent, rides the composer's steer/queue rules, and
+persists (typed `hidden`) so resume and the session DB keep the full record.
+Prompts are trimmed, capped at 500 chars, and throttled to one per second
+per frame.
+
 ### Mount-scoped chrome (`Contribute`)
 
 `ctx.register` is for **permanent** contributions. When chrome should live and
@@ -485,7 +495,12 @@ preserves backend identity without exposing connection secrets.
 Profile-shaped plugins get first-class methods too:
 `profiles.list` (each profile + its most recent conversation as
 `last_session`; pass `include_sessions: false` to skip the per-profile DB
-probe) and `profiles.create` (`name`, `description`, `clone_from`,
+probe; pass `preferred_session_ids: { profileName: sessionId }` for an
+exact, existence-checked lookup of one pinned session per profile — each
+named row gains a `preferred_session` summary that resolves hidden rows
+and compression lineages to their live tip, or `null` when the id is
+definitively gone; older gateways ignore the param and omit the field)
+and `profiles.create` (`name`, `description`, `clone_from`,
 `clone_all`, `no_skills`, `soul`, optional `model` + `provider` pin) — the
 ws twins of the dashboard's `/api/profiles` REST routes.
 `host.state.busy` is the focused chat's live turn (thinking and streaming).

@@ -32,7 +32,8 @@ import {
   openGatewayForAgent,
   openGatewayForProfile,
   requestGatewayForAgent,
-  requestGatewayForProfile
+  requestGatewayForProfile,
+  retireLocalProfileGateways
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import {
@@ -169,7 +170,21 @@ if (typeof window !== 'undefined') {
 /** Live usage of the FOCUSED session, projected out of the streamed session
  *  state — the same readout the core statusbar's context chip paints. */
 const $focusedUsage = computed($focusedSessionState, state => state?.usage ?? null)
-const $activeConnectionId = computed($connection, connection => connection?.connectionId ?? null)
+
+const $activeConnectionId = computed($connection, connection => {
+  if (!connection) {
+    return null
+  }
+
+  if (connection.connectionId) {
+    return connection.connectionId
+  }
+
+  // mode:'local' used to report null, which made Bot Mode fall back to the
+  // registry primary (often an SSH box) and treat Spark as the active source
+  // while this window was actually local.
+  return connection.mode === 'local' ? 'local' : null
+})
 
 export const host = {
   state: {
@@ -280,6 +295,10 @@ export const host = {
     // backend can't clobber the pill back to the deleted profile).
     const wasActive = normalizeProfileKey(name) === normalizeProfileKey($activeGatewayProfile.get())
 
+    // A hover-warmed Bot Mode row owns a retained renderer socket. Retire it
+    // before Electron stops the profile backend so the socket closure cannot
+    // schedule a reconnect that resurrects the deleted profile.
+    retireLocalProfileGateways(name)
     await deleteProfile(name)
 
     if (wasActive) {
