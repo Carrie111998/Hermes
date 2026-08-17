@@ -1091,6 +1091,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_realtime: Dict[int, Any] = {}  # guild_id -> RealtimeVoiceSession
         self._voice_realtime_mics: Dict[int, Any] = {}  # guild_id -> DiscordMicBridge
         self._voice_realtime_last_speaker: Dict[int, int] = {}  # guild_id -> user_id
+        self._voice_realtime_last_transcribed: Dict[int, int] = {}  # last ASR speaker
         # Supervisor function calls (consult/steer) — set by run.py, called
         # from session threads: (guild_id, name, call_id, args_json) -> None.
         self._voice_function_call_callback: Optional[Callable] = None
@@ -4278,7 +4279,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             def _on_assistant_transcript(text: str) -> None:
                 asyncio.run_coroutine_threadsafe(
-                    self._post_voice_line(guild_id, f"**[Voice] Hermes:** {text}"), loop
+                    self._post_voice_line(guild_id, f"**[Voice]:** {text}"), loop
                 )
 
             def _on_speech_started() -> None:
@@ -4340,6 +4341,7 @@ class DiscordAdapter(BasePlatformAdapter):
         session = getattr(self, "_voice_realtime", {}).pop(guild_id, None)
         getattr(self, "_voice_realtime_mics", {}).pop(guild_id, None)
         getattr(self, "_voice_realtime_last_speaker", {}).pop(guild_id, None)
+        getattr(self, "_voice_realtime_last_transcribed", {}).pop(guild_id, None)
         if session is not None:
             try:
                 session.stop()
@@ -4365,6 +4367,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 user_id = 0
         if not user_id:
             return
+        getattr(self, "_voice_realtime_last_transcribed", {})[guild_id] = int(user_id)
         if self.voice_realtime_brain(guild_id) == "supervisor":
             await self._post_voice_line(
                 guild_id, f"**[Voice]** <@{user_id}>: {transcript[:1800]}"

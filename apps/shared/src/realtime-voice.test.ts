@@ -121,6 +121,38 @@ describe('connect', () => {
     })
     expect(h.statuses).toEqual(['connecting', 'listening'])
   })
+
+  it('handles server events that arrive before handshake resolves', async () => {
+    FakeSocket.instances = []
+    const client = new RealtimeVoiceClient({
+      disableAudio: true,
+      createSocket: (url, protocols) => new FakeSocket(url, protocols) as unknown as WebSocket
+    })
+    const pending = client.connect(
+      {
+        token: 'eph-1',
+        url: 'wss://api.x.ai/v1/realtime?model=grok-voice-latest',
+        session_update: { type: 'session.update', session: { marker: true } }
+      },
+      { onFunctionCall: () => undefined }
+    )
+    const socket = FakeSocket.instances[0]
+    socket.onmessage?.({
+      data: JSON.stringify({ type: 'response.created' })
+    })
+    socket.open()
+    await pending
+    client.sendFunctionOutput('c1', 'done')
+    expect(socket.sentTypes()).not.toContain('response.create')
+  })
+
+  it('retries session.update without compat extras after a server error', async () => {
+    const h = await connect()
+    h.client.handleServerEvent({ type: 'error', error: 'unknown field reasoning' })
+    const updates = h.socket.sent.filter(f => f.type === 'session.update')
+    expect(updates).toHaveLength(2)
+    expect((updates[1].session as { reasoning?: unknown }).reasoning).toBeUndefined()
+  })
 })
 
 describe('supervisor tool contract', () => {

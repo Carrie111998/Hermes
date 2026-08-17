@@ -47,6 +47,7 @@ export {
 export {
   ACK_PHRASES,
   CONSULT_TOOL_NAME,
+  minimalSessionUpdate,
   REALTIME_INPUT_SAMPLE_RATE,
   REALTIME_OUTPUT_SAMPLE_RATE,
   type RealtimeFunctionCall,
@@ -58,6 +59,14 @@ export {
   resampleFloat32,
   STEER_TOOL_NAME
 } from './realtime-voice'
+export {
+  MAX_CONSULT_OUTPUT_CHARS,
+  STALE_CONSULT_MIN_AGE_MS,
+  type TurnRunner,
+  VoiceSupervisorController,
+  type VoiceSession,
+  ownsTurnText
+} from './voice-supervisor'
 export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,

@@ -40,10 +40,12 @@ class FakeRunner:
         self.ops = []
         self.busy = False
         self.queue_empty = True
+        self.accept = True
 
     def submit(self, task):
         self.submitted.append(task)
         self.ops.append(("submit", task))
+        return self.accept
 
     def interrupt(self):
         self.interrupts += 1
@@ -180,12 +182,34 @@ class TestTurnComplete:
 
     def test_merged_turn_containing_task_is_consumed(self):
         # Gateways may coalesce a queued consult with a steering instruction
-        # into one turn; containment still routes the result to the consult.
+        # into one turn; first-line equality still routes the result.
         ctrl, session, runner, _ = _make()
         _consult(ctrl, "c1", "check disk usage")
         merged = "check disk usage\n\nalso include inode usage"
         assert ctrl.on_turn_complete(merged, "all good") is True
         assert session.outputs[-1] == ("c1", "all good")
+
+    def test_substring_does_not_own_turn(self):
+        ctrl, session, runner, _ = _make()
+        _consult(ctrl, "c1", "check disk usage")
+        assert ctrl.owns_turn("please check disk usage now") is False
+        assert ctrl.on_turn_complete("please check disk usage now", "nope") is False
+        assert ctrl.consult_active
+
+    def test_rejected_submit_does_not_track_consult(self):
+        ctrl, session, runner, _ = _make()
+        runner.accept = False
+        _consult(ctrl)
+        assert not ctrl.consult_active
+        assert "Could not start" in session.outputs[-1][1]
+
+    def test_fail_active_consult_sends_output_and_clears(self):
+        ctrl, session, runner, _ = _make()
+        _consult(ctrl, "c1", "task")
+        ctrl.fail_active_consult("Voice session reconnected; the previous task was dropped.")
+        assert not ctrl.consult_active
+        assert session.outputs[-1][0] == "c1"
+        assert "dropped" in session.outputs[-1][1]
 
     def test_owns_turn_matches_without_consuming(self):
         # Surfaces use owns_turn to silence classic TTS paths (including

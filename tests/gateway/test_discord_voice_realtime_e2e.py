@@ -144,7 +144,7 @@ class StubGatewayRunner:
     def _session_key_for_source(self, source):
         return f"agent:main:discord:{source.guild_id}:{source.user_id}"
 
-    async def _handle_voice_channel_input(self, guild_id, user_id, transcript):
+    async def _handle_voice_channel_input(self, guild_id, user_id, transcript, **kwargs):
         self.submitted.append((guild_id, user_id, transcript))
 
 

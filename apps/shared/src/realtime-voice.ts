@@ -68,6 +68,23 @@ export function resampleFloat32(
   return out
 }
 
+/** Drop OpenAI-compat extras so a rejected session.update can be retried. */
+export function minimalSessionUpdate(payload: Record<string, unknown>): Record<string, unknown> {
+  const rawSession = payload.session
+  const session: Record<string, unknown> =
+    rawSession && typeof rawSession === 'object' ? { ...(rawSession as Record<string, unknown>) } : {}
+  delete session.reasoning
+  const turnDetection = session.turn_detection
+
+  if (turnDetection && typeof turnDetection === 'object') {
+    const next = { ...(turnDetection as Record<string, unknown>) }
+    delete next.create_response
+    session.turn_detection = next
+  }
+
+  return { ...payload, type: 'session.update', session }
+}
+
 export type RealtimeVoiceStatus =
   | 'connecting'
   | 'listening'
@@ -92,7 +109,7 @@ export interface RealtimeFunctionCall {
 
 export interface RealtimeVoiceCallbacks {
   /** Supervisor tool call (consult/steer) — the surface runs the turn. */
-  onFunctionCall: (call: RealtimeFunctionCall) => void
+  onFunctionCall: (call: RealtimeFunctionCall) => void | Promise<void>
   onStatus?: (status: RealtimeVoiceStatus, detail?: string) => void
   /** What the assistant said (its own output transcript — accurate). */
   onAssistantTranscript?: (text: string) => void
@@ -138,6 +155,8 @@ export class RealtimeVoiceClient {
   private responseHadAudio = false
   private closed = false
   private muted = false
+  private sessionUpdate: Record<string, unknown> | null = null
+  private minimalRetryDone = false
 
   constructor(options: RealtimeVoiceClientOptions = {}) {
     this.createSocket =
@@ -149,10 +168,16 @@ export class RealtimeVoiceClient {
     return this.playback !== null && this.playback.sources.size > 0
   }
 
+  get alive(): boolean {
+    return !this.closed
+  }
+
   async connect(grant: RealtimeTokenGrant, callbacks: RealtimeVoiceCallbacks): Promise<void> {
     if (this.socket) {throw new Error('realtime voice client already connected')}
     this.callbacks = callbacks
     this.closed = false
+    this.minimalRetryDone = false
+    this.sessionUpdate = grant.session_update
     callbacks.onStatus?.('connecting')
 
     // Open mic first (permission prompt) and buffer early frames — audio
@@ -164,35 +189,8 @@ export class RealtimeVoiceClient {
     const socket = this.createSocket(grant.url, [`xai-client-secret.${grant.token}`])
     this.socket = socket
 
-    await new Promise<void>((resolve, reject) => {
-      const fail = (message: string) => {
-        callbacks.onStatus?.('error', message)
-        reject(new Error(message))
-      }
-
-      socket.onopen = () => {
-        this.send(grant.session_update)
-
-        for (const frame of this.pendingMicFrames) {
-          this.send({ type: 'input_audio_buffer.append', audio: frame })
-        }
-
-        this.pendingMicFrames = []
-        callbacks.onStatus?.('listening')
-        resolve()
-      }
-
-      socket.onerror = () => fail('realtime socket error')
-
-      socket.onclose = ev => {
-        if (this.closed) {return}
-        this.closed = true
-        this.teardownAudio()
-        callbacks.onStatus?.('closed', ev.reason || undefined)
-        reject(new Error('realtime socket closed during connect'))
-      }
-    })
-
+    // Attach onmessage before open — the server can emit events during
+    // handshake (session.updated, early response.created).
     socket.onmessage = ev => {
       if (typeof ev.data !== 'string') {return}
       let event: Record<string, unknown>
@@ -204,6 +202,57 @@ export class RealtimeVoiceClient {
       }
 
       this.handleServerEvent(event)
+    }
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const fail = (message: string) => {
+          callbacks.onStatus?.('error', message)
+          reject(new Error(message))
+        }
+
+        socket.onopen = () => {
+          this.send(grant.session_update)
+
+          for (const frame of this.pendingMicFrames) {
+            this.send({ type: 'input_audio_buffer.append', audio: frame })
+          }
+
+          this.pendingMicFrames = []
+          callbacks.onStatus?.('listening')
+          resolve()
+        }
+
+        socket.onerror = () => fail('realtime socket error')
+
+        socket.onclose = ev => {
+          fail(ev.reason || 'realtime socket closed during connect')
+        }
+      })
+    } catch (error) {
+      this.teardownAudio()
+
+      try {
+        socket.close()
+      } catch {
+        // already closing
+      }
+
+      this.socket = null
+      throw error
+    }
+
+    socket.onerror = () => {
+      if (this.closed) {return}
+      callbacks.onStatus?.('error', 'realtime socket error')
+    }
+
+    socket.onclose = ev => {
+      if (this.closed) {return}
+      this.closed = true
+      this.teardownAudio()
+      this.socket = null
+      callbacks.onStatus?.('closed', ev.reason || undefined)
     }
   }
 
@@ -353,14 +402,23 @@ export class RealtimeVoiceClient {
           args = {}
         }
 
-        this.callbacks?.onFunctionCall({ name, callId, args })
+        void this.callbacks?.onFunctionCall({ name, callId, args })
 
         break
       }
 
       case 'error': {
         const detail = event.error ?? event.message ?? 'unknown realtime error'
-        this.callbacks?.onStatus?.('error', typeof detail === 'string' ? detail : JSON.stringify(detail))
+        const message = typeof detail === 'string' ? detail : JSON.stringify(detail)
+
+        if (!this.minimalRetryDone && this.sessionUpdate) {
+          this.minimalRetryDone = true
+          this.send(minimalSessionUpdate(this.sessionUpdate))
+
+          break
+        }
+
+        this.callbacks?.onStatus?.('error', message)
 
         break
       }

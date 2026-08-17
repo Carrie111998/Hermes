@@ -1,21 +1,15 @@
-"""xAI Grok realtime (S2S WebSocket) backend for voice mode.
+"""xAI Grok realtime (S2S WebSocket) session for voice mode.
 
 Two brains (``voice.realtime.brain``):
 
 * ``ears`` — input only. Server VAD + transcription; every utterance becomes
-  a normal Hermes turn; replies speak via the regular TTS pipeline. The
-  realtime model is muted (``create_response: false``, ``response.cancel``,
-  silent-relay instructions).
-* ``supervisor`` — chat-supervisor pattern. grok-voice converses instantly
-  and delegates real work to Hermes through one function tool
-  (``consult_hermes``); Hermes runs in the background, progress can be
-  narrated verbatim via ``force_message``, and the tool result is spoken
-  when ready. The model's audio plays locally; Hermes stays the only brain
-  for facts and actions.
+  a normal Hermes turn; replies speak via the regular TTS pipeline.
+* ``supervisor`` — grok-voice converses instantly and delegates real work to
+  Hermes through ``consult_hermes`` / ``steer_hermes``.
 
-The server's ``speech_started`` event doubles as the barge-in trigger,
-replacing the local RMS listener (never run both — two PortAudio input
-streams on one device is unreliable).
+Config, tool schemas, and ``session.update`` live in
+:mod:`tools.voice_realtime_config`. This module is the live session:
+mic → socket → VAD events → optional supervisor playback.
 
 Heavy deps (websockets, sounddevice, numpy, credentials) import lazily:
 tools/*.py must stay cheap to import and voice is an optional extra.
@@ -31,311 +25,32 @@ import random
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
+
+from tools.voice_realtime_config import (
+    CONSULT_TOOL_NAME,
+    DEFAULT_REALTIME_MODEL,
+    DEFAULT_SUPERVISOR_VOICE,
+    FRAME_MS,
+    FRAME_SAMPLES,
+    INPUT_SAMPLE_RATE,
+    OUTPUT_SAMPLE_RATE,
+    REALTIME_URL,
+    RECONNECT_DELAYS,
+    STEER_TOOL_NAME,
+    RealtimeConfig,
+    RealtimeVoiceError,
+    _ACK_PHRASES,
+    build_session_update,
+    check_realtime_requirements,
+    load_realtime_config,
+    realtime_voice_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
-REALTIME_URL = "wss://api.x.ai/v1/realtime"
-DEFAULT_REALTIME_MODEL = "grok-voice-latest"
-
-# 16 kHz mono int16 — matches the classic recorder; a documented PCM rate.
-INPUT_SAMPLE_RATE = 16000
-OUTPUT_SAMPLE_RATE = 24000  # supervisor speech playback (xAI default)
-FRAME_MS = 100  # xAI best practice: ~100 ms per append
-FRAME_SAMPLES = INPUT_SAMPLE_RATE * FRAME_MS // 1000
-
-# After the last delay fails, the session goes "dead" (CLI falls back).
-RECONNECT_DELAYS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
-
-# Mic frames kept while the socket is down, replayed on reconnect (~2 s).
 _PREBUFFER_MAX_FRAMES = 20
-
-# How long send_function_output waits for the current speech to finish
-# before requesting the follow-up response (xAI best practice: don't
-# response.create while audio is still playing).
 _QUIET_WAIT_TIMEOUT_S = 20.0
-
-_SILENT_RELAY_INSTRUCTIONS = (
-    "You are a silent transcription relay. Never respond, never speak. "
-    "Any response you produce is discarded unheard."
-)
-
-CONSULT_TOOL_NAME = "consult_hermes"
-STEER_TOOL_NAME = "steer_hermes"
-DEFAULT_SUPERVISOR_VOICE = "eve"
-
-_CONSULT_TOOL_SCHEMA: Dict[str, Any] = {
-    "type": "function",
-    "name": CONSULT_TOOL_NAME,
-    "description": (
-        "Delegate a task or question to Hermes, the full agent on this "
-        "machine (terminal, files, code, web, memory). Hermes' complete "
-        "answer appears on the user's screen; you receive it as the tool "
-        "result to summarize aloud."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "task": {
-                "type": "string",
-                "description": (
-                    "The user's request, restated completely with all "
-                    "context needed to act on it."
-                ),
-            },
-        },
-        "required": ["task"],
-    },
-}
-
-_STEER_TOOL_SCHEMA: Dict[str, Any] = {
-    "type": "function",
-    "name": STEER_TOOL_NAME,
-    "description": (
-        "Redirect, adjust, add to, or cancel the Hermes task that is "
-        "currently running. Use whenever the user wants to influence the "
-        "work in progress."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "instruction": {
-                "type": "string",
-                "description": (
-                    "The user's steering instruction, restated completely "
-                    "(e.g. 'also check the logs', 'skip the tests', "
-                    "'stop working on that')."
-                ),
-            },
-        },
-        "required": ["instruction"],
-    },
-}
-
-_SUPERVISOR_INSTRUCTIONS = """\
-You are the voice front-end for Hermes, a powerful agent running on this \
-machine. Keep spoken replies short and natural — one or two sentences.
-
-Rules:
-- For ANY request needing facts, files, code, commands, the web, or actions, \
-you MUST speak one short acknowledgment in your own words FIRST ("On it — \
-give me a moment.", "Sure, let me check.") and then call consult_hermes with \
-the full task. Never call the tool silently. Never attempt such work \
-yourself and never invent technical results.
-- You may answer directly only for greetings, small talk, and questions \
-about what was already said in this conversation.
-- When consult_hermes returns, summarize the outcome aloud in a sentence or \
-two. The full text is already on the user's screen — do not read long \
-output verbatim.
-- While Hermes works the user may keep chatting; reply briefly. If asked \
-about progress, say Hermes is still working. Do not call consult_hermes \
-again for the same task.
-- If the user wants to change, extend, or cancel the running task, call \
-steer_hermes with their instruction — do not start a new consult for it.
-"""
-
-# Spoken instantly (force_message — no model turn) when the model calls
-# consult_hermes without its mandated filler. Rotated to avoid sounding
-# canned; the model's own filler is still preferred when it complies.
-_ACK_PHRASES: Tuple[str, ...] = (
-    "On it — give me a moment.",
-    "Sure, let me check that.",
-    "Okay, working on it.",
-    "Alright, one moment.",
-    "Got it — digging in now.",
-    "Let me have Hermes look at that.",
-    "On it. This might take a bit.",
-    "Sure thing — checking now.",
-    "Okay, let me find out.",
-    "Alright, Hermes is on it.",
-)
-
-
-class RealtimeVoiceError(RuntimeError):
-    """Raised when the realtime voice session cannot be started."""
-
-
-@dataclass
-class RealtimeConfig:
-    """Validated ``voice.realtime`` settings."""
-
-    model: str = DEFAULT_REALTIME_MODEL
-    brain: str = "ears"  # "ears" | "supervisor"
-    voice: str = DEFAULT_SUPERVISOR_VOICE
-    instructions_extra: str = ""  # appended to the supervisor prompt
-    # Supervisor duplex: False (default) mutes the mic while speech plays so
-    # open speakers can't feed the assistant its own voice; True keeps the
-    # mic hot for voice barge-in (wear headphones).
-    full_duplex: bool = False
-    # Loud-barge trigger while half-duplex speech plays: user RMS must exceed
-    # the tracked speaker-bleed floor by this factor (voice.barge_in_threshold_multiplier).
-    barge_multiplier: float = 3.0
-    vad_threshold: Optional[float] = None       # None → server default (0.85)
-    vad_silence_ms: Optional[int] = None        # None → server default
-    vad_prefix_padding_ms: Optional[int] = None  # None → server default (333)
-    language_hint: str = ""
-    keyterms: List[str] = field(default_factory=list)
-    # Auto-pause after this many silent seconds — a hot mic streams billable
-    # audio. 0 disables.
-    idle_pause_seconds: float = 120.0
-    url: str = REALTIME_URL
-
-    @property
-    def supervisor(self) -> bool:
-        return self.brain == "supervisor"
-
-
-def _coerce_optional_number(value: Any) -> Optional[float]:
-    """YAML-shape-safe numeric coercion (bool is not a number here)."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return None
-
-
-def load_realtime_config(voice_cfg: Any) -> RealtimeConfig:
-    """Build a :class:`RealtimeConfig` from the ``voice`` config section."""
-    section = {}
-    if isinstance(voice_cfg, dict):
-        raw = voice_cfg.get("realtime")
-        if isinstance(raw, dict):
-            section = raw
-
-    cfg = RealtimeConfig()
-    model = str(section.get("model") or "").strip()
-    if model:
-        cfg.model = model
-    url = str(section.get("url") or "").strip()
-    if url:
-        cfg.url = url
-    brain = str(section.get("brain") or "").strip().lower()
-    if brain in ("ears", "supervisor"):
-        cfg.brain = brain
-    voice = str(section.get("voice") or "").strip()
-    if voice:
-        cfg.voice = voice
-    extra = section.get("instructions")
-    if isinstance(extra, str):
-        cfg.instructions_extra = extra.strip()
-    cfg.full_duplex = bool(section.get("full_duplex", False))
-    mult = _coerce_optional_number(
-        voice_cfg.get("barge_in_threshold_multiplier") if isinstance(voice_cfg, dict) else None
-    )
-    if mult is not None and mult > 1.0:
-        cfg.barge_multiplier = mult
-
-    threshold = _coerce_optional_number(section.get("vad_threshold"))
-    if threshold is not None and 0.0 < threshold <= 1.0:
-        cfg.vad_threshold = threshold
-    silence_ms = _coerce_optional_number(section.get("vad_silence_ms"))
-    if silence_ms is not None and silence_ms >= 0:
-        cfg.vad_silence_ms = int(silence_ms)
-    prefix_ms = _coerce_optional_number(section.get("vad_prefix_padding_ms"))
-    if prefix_ms is not None and prefix_ms >= 0:
-        cfg.vad_prefix_padding_ms = int(prefix_ms)
-
-    hint = section.get("language_hint")
-    if isinstance(hint, str):
-        cfg.language_hint = hint.strip()
-    keyterms = section.get("keyterms")
-    if isinstance(keyterms, (list, tuple)):
-        cfg.keyterms = [str(t).strip() for t in keyterms if str(t).strip()][:100]
-
-    idle = _coerce_optional_number(section.get("idle_pause_seconds"))
-    if idle is not None and idle >= 0:
-        cfg.idle_pause_seconds = idle
-    return cfg
-
-
-def realtime_voice_enabled(voice_cfg: Any) -> bool:
-    """True when ``voice.realtime.enabled`` is truthy in config."""
-    if not isinstance(voice_cfg, dict):
-        return False
-    section = voice_cfg.get("realtime")
-    return isinstance(section, dict) and bool(section.get("enabled"))
-
-
-def check_realtime_requirements(*, require_local_audio: bool = True) -> Tuple[bool, str]:
-    """Return (ok, detail): deps + credentials needed for the realtime backend.
-
-    ``require_local_audio=False`` skips the sounddevice check — surfaces that
-    inject their own audio transport (Discord voice channels) need numpy for
-    resampling but no local mic/speaker device.
-    """
-    try:
-        import websockets.sync.client  # noqa: F401  (lazy: keep module import cheap)
-    except Exception:
-        return False, "websockets package not available"
-    try:
-        if require_local_audio:
-            import sounddevice  # noqa: F401  (lazy: optional voice extra)
-        import numpy  # noqa: F401
-    except Exception:
-        return False, "sounddevice/numpy not installed (pip install 'hermes-agent[voice]')"
-    try:
-        from tools.xai_http import resolve_xai_http_credentials  # lazy: heavy
-
-        creds = resolve_xai_http_credentials()
-        if not str(creds.get("api_key") or "").strip():
-            return False, "no xAI credentials (set XAI_API_KEY or `hermes auth add xai`)"
-    except Exception as exc:
-        return False, f"xAI credential resolution failed: {exc}"
-    return True, ""
-
-
-def build_session_update(cfg: RealtimeConfig, *, minimal: bool = False) -> Dict[str, Any]:
-    """Build the ``session.update`` payload for this brain mode.
-    ``minimal=True`` drops the OpenAI-compat extras (``create_response``,
-    ``reasoning``) — the retry payload if the full config draws an error."""
-    turn_detection: Dict[str, Any] = {"type": "server_vad"}
-    if cfg.vad_threshold is not None:
-        turn_detection["threshold"] = cfg.vad_threshold
-    if cfg.vad_silence_ms is not None:
-        turn_detection["silence_duration_ms"] = cfg.vad_silence_ms
-    if cfg.vad_prefix_padding_ms is not None:
-        turn_detection["prefix_padding_ms"] = cfg.vad_prefix_padding_ms
-
-    transcription: Dict[str, Any] = {"model": "grok-transcribe"}
-    if cfg.language_hint:
-        transcription["language_hint"] = cfg.language_hint
-    if cfg.keyterms:
-        transcription["keyterms"] = list(cfg.keyterms)
-
-    audio: Dict[str, Any] = {
-        "input": {
-            "format": {"type": "audio/pcm", "rate": INPUT_SAMPLE_RATE},
-            "transcription": transcription,
-        },
-    }
-
-    if cfg.supervisor:
-        instructions = _SUPERVISOR_INSTRUCTIONS
-        if cfg.instructions_extra:
-            instructions += "\n" + cfg.instructions_extra
-        audio["output"] = {
-            "format": {"type": "audio/pcm", "rate": OUTPUT_SAMPLE_RATE},
-        }
-        session: Dict[str, Any] = {
-            "voice": cfg.voice,
-            "instructions": instructions,
-            "turn_detection": turn_detection,
-            "audio": audio,
-            "tools": [dict(_CONSULT_TOOL_SCHEMA), dict(_STEER_TOOL_SCHEMA)],
-        }
-    else:
-        if not minimal:
-            # OpenAI-compat param xAI doesn't document: honored → no
-            # auto-responses; ignored → the response.cancel path covers it.
-            turn_detection["create_response"] = False
-        session = {
-            "instructions": _SILENT_RELAY_INSTRUCTIONS,
-            "turn_detection": turn_detection,
-            "audio": audio,
-        }
-    if not minimal:
-        session["reasoning"] = {"effort": "none"}
-    return {"type": "session.update", "session": session}
-
 
 def _default_connect(url: str, headers: Dict[str, str]):
     """Open a synchronous WebSocket connection (thread-based client)."""
@@ -407,7 +122,7 @@ class _SounddeviceMic:
 
 
 class RealtimeVoiceSession:
-    """Ears-only xAI realtime session: mic → server VAD → transcript callbacks.
+    """xAI realtime session: mic → server VAD → transcript / supervisor speech.
 
     Callbacks fire on session threads — keep them fast/thread-safe:
     * ``on_transcript(text)`` — finished utterance (armed + gate-open only)
@@ -487,6 +202,9 @@ class RealtimeVoiceSession:
         self._barge_hot_frames = 0
         self._barge_until = 0.0
         self._gated_tail: deque = deque(maxlen=5)
+        self._np: Any = None
+        self._tool_results: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+        self._tool_result_thread: Optional[threading.Thread] = None
 
     # -- public surface ----------------------------------------------------
 
@@ -542,7 +260,7 @@ class RealtimeVoiceSession:
             except Exception:
                 pass
         self._close_ws()
-        for t in (self._net_thread, self._pump_thread, self._playout_thread):
+        for t in (self._net_thread, self._pump_thread, self._playout_thread, self._tool_result_thread):
             if t is not None and t.is_alive() and t is not threading.current_thread():
                 t.join(timeout=3)
 
@@ -611,11 +329,23 @@ class RealtimeVoiceSession:
     def send_function_output(self, call_id: str, output: str) -> None:
         """Return a tool result and ask for the follow-up response.
 
-        Per xAI best practice the ``response.create`` is deferred until the
-        current speech finished playing (bounded wait), so the follow-up
-        never talks over an in-flight answer. Runs on its own thread.
+        ``response.create`` waits until current speech finishes (bounded) so
+        the follow-up never talks over an in-flight answer. One worker thread
+        serializes deliveries.
         """
-        def _deliver():
+        self._tool_results.put((call_id, output))
+        if self._tool_result_thread is None or not self._tool_result_thread.is_alive():
+            self._tool_result_thread = threading.Thread(
+                target=self._tool_result_loop, name="voice-rt-tool-result", daemon=True
+            )
+            self._tool_result_thread.start()
+
+    def _tool_result_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                call_id, output = self._tool_results.get(timeout=0.25)
+            except queue.Empty:
+                continue
             self._send_event({
                 "type": "conversation.item.create",
                 "item": {
@@ -629,11 +359,9 @@ class RealtimeVoiceSession:
                 if not self.speaking and not self._active_response:
                     break
                 time.sleep(0.2)
+            if self._stop.is_set():
+                return
             self._send_event({"type": "response.create"})
-
-        threading.Thread(
-            target=_deliver, name="voice-rt-tool-result", daemon=True
-        ).start()
 
     def clear_playout(self) -> None:
         """Drop queued supervisor speech (barge-in / pause)."""
@@ -670,8 +398,17 @@ class RealtimeVoiceSession:
     def _enqueue_frame(self, frame: bytes) -> None:
         try:
             self._frames.put_nowait(frame)
+            return
         except queue.Full:
-            pass  # drop oldest-pressure: skipping a frame beats blocking PortAudio
+            pass
+        try:
+            self._frames.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            self._frames.put_nowait(frame)
+        except queue.Full:
+            pass
 
     def _pump_loop(self) -> None:
         """Mic frame consumer: RMS meter, gating, loud-barge, idle pause."""
@@ -739,9 +476,19 @@ class RealtimeVoiceSession:
             self._barge_hot_frames = max(0, self._barge_hot_frames - 1)
 
     def _update_rms(self, frame: bytes) -> None:
+        np = self._np
+        if np is False:
+            self._current_rms = 0
+            return
+        if np is None:
+            try:
+                import numpy as np  # lazy: optional voice extra
+                self._np = np
+            except Exception:
+                self._np = False
+                self._current_rms = 0
+                return
         try:
-            import numpy as np  # lazy: optional voice extra
-
             arr = np.frombuffer(frame, dtype=np.int16)
             if arr.size:
                 self._current_rms = int(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
@@ -834,7 +581,7 @@ class RealtimeVoiceSession:
         while not self._stop.is_set():
             raw = ws.recv()
             if isinstance(raw, (bytes, bytearray, memoryview)):
-                continue  # ears-only session never plays server audio
+                continue  # audio arrives as base64 JSON deltas, not binary frames
             try:
                 event = json.loads(raw)
             except (ValueError, TypeError):

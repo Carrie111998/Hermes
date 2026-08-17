@@ -461,6 +461,7 @@ def _make_turn_runner(loop, *, speaker_id: int = 77):
     adapter = SimpleNamespace(
         _voice_sources={5: {"user_id": "1"}},  # joiner ≠ speaker
         _voice_realtime_last_speaker={5: speaker_id},
+        _voice_realtime_last_transcribed={},
         _voice_text_channels={5: 900},
         _active_sessions={},
         _pending_messages={},
@@ -480,7 +481,9 @@ class TestDiscordVoiceTurnRunner:
             if gw._handle_voice_channel_input.await_count:
                 break
             await asyncio.sleep(0.01)
-        gw._handle_voice_channel_input.assert_awaited_once_with(5, 99, "check the logs")
+        gw._handle_voice_channel_input.assert_awaited_once_with(
+            5, 99, "check the logs", consult=True
+        )
 
     @pytest.mark.asyncio
     async def test_submit_without_speaker_context_is_dropped(self):
@@ -490,6 +493,20 @@ class TestDiscordVoiceTurnRunner:
         runner.submit("task")
         await asyncio.sleep(0.05)
         gw._handle_voice_channel_input.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_submit_prefers_last_transcribed_speaker(self):
+        loop = asyncio.get_running_loop()
+        runner, gw, adapter = _make_turn_runner(loop, speaker_id=99)
+        adapter._voice_realtime_last_transcribed = {5: 42}
+        runner.submit("task")
+        for _ in range(50):
+            if gw._handle_voice_channel_input.await_count:
+                break
+            await asyncio.sleep(0.01)
+        gw._handle_voice_channel_input.assert_awaited_once_with(
+            5, 42, "task", consult=True
+        )
 
     @pytest.mark.asyncio
     async def test_busy_and_queue_follow_latched_speaker_session(self):
@@ -547,6 +564,7 @@ def _make_gateway_runner(session, loop):
         voice_realtime_session=lambda gid: session if gid == 5 else None,
         _voice_sources={5: {"user_id": "1"}},  # joiner ≠ speaker
         _voice_realtime_last_speaker={5: 77},
+        _voice_realtime_last_transcribed={},
         _voice_text_channels={5: 900},
         _active_sessions={},
         _pending_messages={},
@@ -591,6 +609,22 @@ class TestControllerLifecycle:
         c2 = runner._ensure_voice_realtime_controller(5)
         assert c2 is not c1 and c2.session is session2
 
+    def test_reconnect_fails_out_in_flight_consult(self, bg_loop):
+        session = _fake_session()
+        runner, adapter = _make_gateway_runner(session, bg_loop)
+        runner._handle_voice_channel_input = AsyncMock()
+        runner._handle_voice_channel_function_call(
+            5, "consult_hermes", "call-1", '{"task": "list the repos"}'
+        )
+        assert runner._voice_realtime_controllers[5].consult_active
+        session2 = _fake_session()
+        adapter.voice_realtime_session = lambda gid: session2
+        c2 = runner._ensure_voice_realtime_controller(5)
+        session.send_function_output.assert_called()
+        assert "dropped" in session.send_function_output.call_args[0][1].lower()
+        assert c2.session is session2
+        assert not c2.consult_active
+
     def test_no_session_means_no_controller(self, bg_loop):
         runner, adapter = _make_gateway_runner(None, bg_loop)
         assert runner._ensure_voice_realtime_controller(5) is None
@@ -609,7 +643,7 @@ class TestControllerLifecycle:
         controller = runner._voice_realtime_controllers[5]
         assert controller.consult_active is True
         assert _wait_until(lambda: submitted.await_count == 1)
-        submitted.assert_awaited_once_with(5, 77, "list the repos")
+        submitted.assert_awaited_once_with(5, 77, "list the repos", consult=True)
 
     def test_consult_turn_silences_classic_tts_paths(self, bg_loop):
         """_voice_consult_owns_turn gates BOTH classic TTS paths (base
@@ -628,16 +662,20 @@ class TestControllerLifecycle:
         assert runner._voice_consult_owns_turn(
             source, MessageType.VOICE, "list the repos"
         ) is True
+        # Consults are agent TEXT turns, not fake STT.
+        assert runner._voice_consult_owns_turn(
+            source, MessageType.TEXT, "list the repos"
+        ) is True
         # Merged steer text still belongs to the consult.
         assert runner._voice_consult_owns_turn(
             source, MessageType.VOICE, "list the repos\n\nalso sort them"
         ) is True
-        # Unrelated utterances, typed messages, and other chats do not.
+        # Unrelated utterances, photos, and other chats do not.
         assert runner._voice_consult_owns_turn(
             source, MessageType.VOICE, "what's the weather"
         ) is False
         assert runner._voice_consult_owns_turn(
-            source, MessageType.TEXT, "list the repos"
+            source, MessageType.PHOTO, "list the repos"
         ) is False
         assert runner._voice_consult_owns_turn(
             SimpleNamespace(platform=Platform.DISCORD, chat_id="999"),
@@ -700,3 +738,6 @@ class TestControllerLifecycle:
             raw_message=SimpleNamespace(guild_id=5, guild=None),
         )
         assert runner._voice_realtime_controller_for_event(text_event) is None
+
+        text_event._hermes_voice_consult = True
+        assert runner._voice_realtime_controller_for_event(text_event) is controller

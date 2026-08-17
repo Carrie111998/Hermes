@@ -1,16 +1,13 @@
 """Surface-agnostic supervisor brain for realtime voice.
 
-One brain, many surfaces: the CLI (local mic/speakers), Discord voice
-channels, and browser clients each provide a :class:`TurnRunner` + an event
-callback; the consult/steer lifecycle, instant acknowledgments, progress
-narration, and stale-consult self-healing live here exactly once.
+One brain, many surfaces: the CLI, Discord voice channels, and browser
+clients each provide a :class:`TurnRunner` + an event callback; the
+consult/steer lifecycle, instant acknowledgments, progress narration, and
+stale-consult self-healing live here exactly once.
 
-The controller is transport-dumb: it talks to a
-:class:`tools.voice_realtime.RealtimeVoiceSession`-shaped object (function
-calls in, ``send_function_output`` / ``speak_acknowledgment`` /
-``speak_verbatim`` out) and to a surface-supplied turn runner (submit /
-interrupt / busy / queue-empty). TypeScript surfaces (desktop, dashboard)
-mirror this state machine in apps/shared rather than importing it.
+The controller is transport-dumb: it talks to a realtime session
+(function calls in, ``send_function_output`` / ``speak_acknowledgment`` /
+``speak_verbatim`` out) and to a surface-supplied turn runner.
 """
 
 from __future__ import annotations
@@ -19,6 +16,8 @@ import json
 import logging
 import time
 from typing import Any, Callable, Dict, Optional, Protocol
+
+from tools.voice_realtime_config import CONSULT_TOOL_NAME, STEER_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +35,8 @@ MAX_CONSULT_OUTPUT_CHARS = 6000
 class TurnRunner(Protocol):
     """The surface's agent-turn seam."""
 
-    def submit(self, task: str) -> None:
-        """Queue *task* as a normal agent turn."""
+    def submit(self, task: str) -> bool:
+        """Queue *task* as a normal agent turn. True if it was accepted."""
 
     def interrupt(self) -> None:
         """Interrupt the currently running turn (steering)."""
@@ -47,6 +46,21 @@ class TurnRunner(Protocol):
 
     def is_queue_empty(self) -> bool:
         """True when no turn is queued waiting to run."""
+
+
+def _owns_turn_text(task: str, message: str) -> bool:
+    """Match a consult to a finished turn without substring false positives.
+
+    Equality covers the normal path. Line equality covers pending-message
+    coalescing (``task\\n\\nsteer``) without treating ``ls`` as a match for
+    ``please list files``.
+    """
+    if message == task:
+        return True
+    for line in message.splitlines():
+        if line.strip() == task:
+            return True
+    return False
 
 
 class VoiceSupervisorController:
@@ -71,12 +85,9 @@ class VoiceSupervisorController:
         self._consult: Optional[Dict[str, Any]] = None
         self._last_narrate = 0.0
 
-    # -- state ---------------------------------------------------------------
-
     @property
     def session(self) -> Any:
-        """The realtime session this controller is bound to (identity checks
-        let surfaces detect a stale controller after a session restart)."""
+        """The realtime session this controller is bound to."""
         return self._session
 
     @property
@@ -87,6 +98,20 @@ class VoiceSupervisorController:
         """Drop tracked state (session teardown)."""
         self._consult = None
 
+    def fail_active_consult(self, reason: str) -> None:
+        """Fail the in-flight tool call (session restart / reconnect)."""
+        consult = self._consult
+        self._consult = None
+        if consult is None:
+            return
+        session = self._session
+        if session is None or not getattr(session, "alive", False):
+            return
+        try:
+            session.send_function_output(consult["call_id"], reason)
+        except Exception:
+            logger.debug("voice supervisor fail_active_consult failed", exc_info=True)
+
     def _emit(self, kind: str, text: str) -> None:
         if self._on_event is not None:
             try:
@@ -94,12 +119,8 @@ class VoiceSupervisorController:
             except Exception:
                 logger.debug("voice supervisor event callback failed", exc_info=True)
 
-    # -- voice session → agent ------------------------------------------------
-
     def on_function_call(self, name: str, call_id: str, args_json: str) -> None:
         """Dispatch a tool call from the voice model."""
-        from tools.voice_realtime import CONSULT_TOOL_NAME, STEER_TOOL_NAME
-
         try:
             args = json.loads(args_json) or {}
         except (ValueError, TypeError):
@@ -116,8 +137,6 @@ class VoiceSupervisorController:
             return
         stale = self._take_stale_consult()
         if stale is not None:
-            # Self-heal: the tracked turn died without reaching the
-            # completion hook — fail it out instead of rejecting forever.
             self._session.send_function_output(
                 stale["call_id"], "That task failed without producing a result."
             )
@@ -128,17 +147,24 @@ class VoiceSupervisorController:
                 "will arrive shortly. Tell the user to hang on.",
             )
             return
+        try:
+            accepted = bool(self._runner.submit(task))
+        except Exception:
+            logger.debug("voice consult submit failed", exc_info=True)
+            accepted = False
+        if not accepted:
+            self._session.send_function_output(
+                call_id,
+                "Could not start that task (no speaker or the turn was dropped).",
+            )
+            return
         self._consult = {"call_id": call_id, "task": task, "at": time.monotonic()}
         self._emit("consult", task)
-        self._runner.submit(task)
         if not getattr(self._session, "last_response_had_audio", True):
-            # Model called the tool silently — speak an instant "on it"
-            # (force_message, zero model latency) instead of dead air.
             self._session.speak_acknowledgment()
 
     def _on_steer(self, call_id: str, args: Dict[str, Any]) -> None:
-        """Interrupt Hermes and continue with the user's instruction; the
-        consult is retargeted so the voice model gets the FINAL result."""
+        """Interrupt Hermes and continue with the user's instruction."""
         instruction = str(args.get("instruction") or "").strip()
         if not instruction:
             self._session.send_function_output(call_id, "No steering instruction provided.")
@@ -157,7 +183,16 @@ class VoiceSupervisorController:
                 self._runner.interrupt()
         except Exception as e:
             logger.debug("voice steer interrupt failed: %s", e)
-        self._runner.submit(instruction)
+        try:
+            accepted = bool(self._runner.submit(instruction))
+        except Exception:
+            logger.debug("voice steer submit failed", exc_info=True)
+            accepted = False
+        if not accepted:
+            self._session.send_function_output(
+                call_id, "Steering failed — Hermes could not queue the new instruction."
+            )
+            return
         self._session.send_function_output(
             call_id, "Steering applied — Hermes is adjusting course."
         )
@@ -174,22 +209,16 @@ class VoiceSupervisorController:
         self._consult = None
         return consult
 
-    # -- agent → voice session ------------------------------------------------
-
     def owns_turn(self, message: Any) -> bool:
         """True when *message* is the active consult's turn.
 
-        The voice model owns that turn's speech end to end (instant ack,
-        progress narration, spoken summary) — surfaces must keep every
-        classic TTS path silent for it, including ones that fire before
-        completion (streaming TTS). Containment, not just equality, matches
-        turns whose queued text was merged with a steering instruction by
-        the surface's pending-message coalescing."""
+        Surfaces must keep classic TTS silent for that turn. Line equality
+        (not substring containment) matches coalesced queued text.
+        """
         consult = self._consult
         if not consult or not isinstance(message, str):
             return False
-        task = consult["task"]
-        return message == task or task in message
+        return _owns_turn_text(consult["task"], message)
 
     def on_turn_complete(self, message: Any, response: str) -> bool:
         """Report a finished consult turn back to the voice session.
@@ -211,8 +240,7 @@ class VoiceSupervisorController:
         return True
 
     def narrate_tool(self, function_name: str) -> None:
-        """Speak a short verbatim progress line while a consult runs.
-        Called from tool-display paths — must never raise."""
+        """Speak a short verbatim progress line while a consult runs."""
         if (
             not function_name
             or self._consult is None

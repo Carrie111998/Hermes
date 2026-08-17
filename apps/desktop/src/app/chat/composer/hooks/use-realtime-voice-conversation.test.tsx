@@ -17,7 +17,7 @@ interface FakeCall {
 }
 
 interface FakeCallbacks {
-  onFunctionCall: (call: FakeCall) => void
+  onFunctionCall: (call: FakeCall) => void | Promise<void>
   onStatus?: (status: string, detail?: string) => void
   onUserTranscript?: (text: string) => void
 }
@@ -69,11 +69,14 @@ vi.mock('@/store/notifications', () => ({
   notifyError: (...args: unknown[]) => notifyError(...args)
 }))
 
-vi.mock('@hermes/shared', () => ({
-  CONSULT_TOOL_NAME: 'consult_hermes',
-  STEER_TOOL_NAME: 'steer_hermes',
-  RealtimeVoiceClient: FakeRealtimeClient
-}))
+vi.mock('@hermes/shared', async importOriginal => {
+  const actual = await importOriginal<typeof import('@hermes/shared')>()
+
+  return {
+    ...actual,
+    RealtimeVoiceClient: FakeRealtimeClient
+  }
+})
 
 interface HarnessProps {
   busy: boolean
@@ -135,6 +138,11 @@ function makeHarness(overrides: HarnessOverrides = {}) {
       await waitFor(() => expect(fakeClients.length).toBeGreaterThan(0))
 
       return fakeClients[fakeClients.length - 1]
+    },
+    async fire(client: FakeClient, call: FakeCall) {
+      await act(async () => {
+        await client.callbacks?.onFunctionCall(call)
+      })
     }
   }
 }
@@ -149,12 +157,10 @@ describe('consult lifecycle', () => {
     const h = makeHarness()
     const client = await h.client()
 
-    act(() => {
-      client.callbacks?.onFunctionCall({
-        name: 'consult_hermes',
-        callId: 'c1',
-        args: { task: 'check disk usage' }
-      })
+    await h.fire(client, {
+      name: 'consult_hermes',
+      callId: 'c1',
+      args: { task: 'check disk usage' }
     })
     expect(h.submitTask).toHaveBeenCalledWith('check disk usage')
     // Model called silently → instant acknowledgment.
@@ -170,12 +176,10 @@ describe('consult lifecycle', () => {
     const h = makeHarness()
     const client = await h.client()
     client.lastResponseHadAudio = true
-    act(() => {
-      client.callbacks?.onFunctionCall({
-        name: 'consult_hermes',
-        callId: 'c1',
-        args: { task: 't' }
-      })
+    await h.fire(client, {
+      name: 'consult_hermes',
+      callId: 'c1',
+      args: { task: 't' }
     })
     expect(client.acks).toHaveLength(0)
   })
@@ -183,10 +187,8 @@ describe('consult lifecycle', () => {
   it('rejects a second consult while one is in flight', async () => {
     const h = makeHarness()
     const client = await h.client()
-    act(() => {
-      client.callbacks?.onFunctionCall({ name: 'consult_hermes', callId: 'c1', args: { task: 'first' } })
-      client.callbacks?.onFunctionCall({ name: 'consult_hermes', callId: 'c2', args: { task: 'second' } })
-    })
+    await h.fire(client, { name: 'consult_hermes', callId: 'c1', args: { task: 'first' } })
+    await h.fire(client, { name: 'consult_hermes', callId: 'c2', args: { task: 'second' } })
     expect(h.submitTask).toHaveBeenCalledTimes(1)
     const busyReply = client.outputs.find(([id]) => id === 'c2')
     expect(busyReply?.[1]).toMatch(/still working/)
@@ -195,9 +197,7 @@ describe('consult lifecycle', () => {
   it('does not send the result while the turn is still pending', async () => {
     const h = makeHarness()
     const client = await h.client()
-    act(() => {
-      client.callbacks?.onFunctionCall({ name: 'consult_hermes', callId: 'c1', args: { task: 't' } })
-    })
+    await h.fire(client, { name: 'consult_hermes', callId: 'c1', args: { task: 't' } })
     h.setProps({ busy: true, pending: { id: 'm1', pending: true, text: 'partial…' } })
     await new Promise(resolve => setTimeout(resolve, 700))
     expect(client.outputs).toHaveLength(0)
@@ -206,12 +206,10 @@ describe('consult lifecycle', () => {
   it("never speaks another submission's reply as the consult result", async () => {
     const h = makeHarness()
     const client = await h.client()
-    act(() => {
-      client.callbacks?.onFunctionCall({
-        name: 'consult_hermes',
-        callId: 'c1',
-        args: { task: 'check disk usage' }
-      })
+    await h.fire(client, {
+      name: 'consult_hermes',
+      callId: 'c1',
+      args: { task: 'check disk usage' }
     })
 
     // A typed message's turn settles first — consumed, not attributed.
@@ -236,15 +234,11 @@ describe('consult lifecycle', () => {
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(t0)
 
     try {
-      act(() => {
-        client.callbacks?.onFunctionCall({ name: 'consult_hermes', callId: 'c1', args: { task: 'first' } })
-      })
+      await h.fire(client, { name: 'consult_hermes', callId: 'c1', args: { task: 'first' } })
 
       // Turn died: idle, no reply, well past the stale window.
       nowSpy.mockReturnValue(t0 + 31_000)
-      act(() => {
-        client.callbacks?.onFunctionCall({ name: 'consult_hermes', callId: 'c2', args: { task: 'second' } })
-      })
+      await h.fire(client, { name: 'consult_hermes', callId: 'c2', args: { task: 'second' } })
 
       expect(client.outputs).toContainEqual(['c1', 'That task failed without producing a result.'])
       expect(h.submitTask).toHaveBeenLastCalledWith('second')
@@ -258,16 +252,12 @@ describe('steering', () => {
   it('retargets the consult, interrupts the busy turn, and confirms', async () => {
     const h = makeHarness()
     const client = await h.client()
-    act(() => {
-      client.callbacks?.onFunctionCall({ name: 'consult_hermes', callId: 'c1', args: { task: 'original' } })
-    })
+    await h.fire(client, { name: 'consult_hermes', callId: 'c1', args: { task: 'original' } })
     h.setProps({ busy: true })
-    act(() => {
-      client.callbacks?.onFunctionCall({
-        name: 'steer_hermes',
-        callId: 's1',
-        args: { instruction: 'also check logs' }
-      })
+    await h.fire(client, {
+      name: 'steer_hermes',
+      callId: 's1',
+      args: { instruction: 'also check logs' }
     })
     expect(h.submitTask).toHaveBeenLastCalledWith('also check logs')
     expect(h.onInterrupt).toHaveBeenCalled()
@@ -281,12 +271,10 @@ describe('steering', () => {
   it('reports nothing-to-steer without a consult', async () => {
     const h = makeHarness()
     const client = await h.client()
-    act(() => {
-      client.callbacks?.onFunctionCall({
-        name: 'steer_hermes',
-        callId: 's1',
-        args: { instruction: 'go faster' }
-      })
+    await h.fire(client, {
+      name: 'steer_hermes',
+      callId: 's1',
+      args: { instruction: 'go faster' }
     })
     expect(h.submitTask).not.toHaveBeenCalled()
     expect(client.outputs[0][1]).toMatch(/No Hermes task is running/)

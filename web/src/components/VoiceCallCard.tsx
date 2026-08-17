@@ -1,6 +1,11 @@
 /** Dashboard realtime voice call — own sidecar session, not the embedded TUI. */
 
-import { RealtimeVoiceClient, type RealtimeTokenGrant } from "@hermes/shared";
+import {
+  MAX_CONSULT_OUTPUT_CHARS,
+  RealtimeVoiceClient,
+  type RealtimeTokenGrant,
+  VoiceSupervisorController,
+} from "@hermes/shared";
 import { Mic, MicOff, Square } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -17,7 +22,6 @@ interface TranscriptLine {
 }
 
 const MAX_TRANSCRIPT_LINES = 8;
-const MAX_CONSULT_OUTPUT_CHARS = 6000;
 
 export function VoiceCallCard({ profile }: { profile?: string | null }) {
   const { t } = useI18n();
@@ -27,8 +31,9 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const gwRef = useRef<GatewayClient | null>(null);
   const clientRef = useRef<RealtimeVoiceClient | null>(null);
-  const consultRef = useRef<{ callId: string; task: string } | null>(null);
+  const controllerRef = useRef<VoiceSupervisorController | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  const busyRef = useRef(false);
   const lineIdRef = useRef(0);
 
   const pushLine = useCallback((who: TranscriptLine["who"], text: string) => {
@@ -38,12 +43,15 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
   }, []);
 
   const stop = useCallback(() => {
+    controllerRef.current?.failActiveConsult("Voice session ended.");
+    controllerRef.current?.reset();
+    controllerRef.current = null;
     clientRef.current?.close();
     clientRef.current = null;
     gwRef.current?.close();
     gwRef.current = null;
-    consultRef.current = null;
     sessionIdRef.current = null;
+    busyRef.current = false;
     setStatus("idle");
     setMuted(false);
   }, []);
@@ -51,7 +59,9 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
   useEffect(() => stop, [stop]);
 
   const start = useCallback(async () => {
-    if (clientRef.current) return;
+    if (clientRef.current) {
+      return;
+    }
     setError(null);
     setTranscript([]);
     setStatus("connecting");
@@ -63,78 +73,79 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
       const sessionId = `voice-web-${Date.now().toString(36)}`;
       sessionIdRef.current = sessionId;
 
+      const client = new RealtimeVoiceClient();
+      clientRef.current = client;
+      const controller = new VoiceSupervisorController(client, {
+        submit: async (task) => {
+          const sid = sessionIdRef.current;
+          const liveGw = gwRef.current;
+          if (!sid || !liveGw) {
+            return false;
+          }
+          busyRef.current = true;
+          try {
+            await liveGw.request("prompt.submit", {
+              session_id: sid,
+              text: task,
+              ...(profile ? { profile } : {}),
+            });
+            return true;
+          } catch {
+            busyRef.current = false;
+            return false;
+          }
+        },
+        interrupt: async () => {
+          const sid = sessionIdRef.current;
+          const liveGw = gwRef.current;
+          if (!sid || !liveGw) {
+            return;
+          }
+          await liveGw.request("session.interrupt", { session_id: sid }).catch(() => undefined);
+        },
+        isBusy: () => busyRef.current,
+        isQueueEmpty: () => !busyRef.current,
+      });
+      controllerRef.current = controller;
+
       // Consult turns complete via the terminal message.complete event on
       // this card's own sidecar/session.
       gw.on("message.complete", (ev) => {
-        const consult = consultRef.current;
-        const client = clientRef.current;
-        if (!consult || !client || ev.session_id !== sessionIdRef.current) return;
-        consultRef.current = null;
+        if (ev.session_id !== sessionIdRef.current) {
+          return;
+        }
+        busyRef.current = false;
+        const live = controllerRef.current;
+        if (!live?.consultActive) {
+          return;
+        }
         const payload = (ev.payload ?? {}) as { text?: string };
         let output = String(payload.text ?? "").trim() || "Hermes finished with no text output.";
         if (output.length > MAX_CONSULT_OUTPUT_CHARS) {
           output = `${output.slice(0, MAX_CONSULT_OUTPUT_CHARS)}\n[truncated]`;
         }
         pushLine("hermes", output);
-        client.sendFunctionOutput(consult.callId, output);
+        live.onTurnComplete(live.currentTask ?? "", output);
       });
 
-      const client = new RealtimeVoiceClient();
-      clientRef.current = client;
       await client.connect(grant, {
         onFunctionCall: (call) => {
-          const active = clientRef.current;
-          if (!active) return;
-          if (call.name === "consult_hermes") {
-            const task = String(call.args.task ?? "").trim();
-            if (!task) {
-              active.sendFunctionOutput(call.callId, "No task provided.");
-              return;
-            }
-            if (consultRef.current) {
-              active.sendFunctionOutput(
-                call.callId,
-                "Hermes is still working on the previous task; its result will arrive shortly.",
-              );
-              return;
-            }
-            consultRef.current = { callId: call.callId, task };
-            if (!active.lastResponseHadAudio) active.speakAcknowledgment();
-            void gw.request("prompt.submit", {
-              session_id: sessionId,
-              text: task,
-              ...(profile ? { profile } : {}),
-            });
-            return;
-          }
-          if (call.name === "steer_hermes") {
-            const instruction = String(call.args.instruction ?? "").trim();
-            if (!instruction || !consultRef.current) {
-              active.sendFunctionOutput(
-                call.callId,
-                instruction
-                  ? "No Hermes task is running — use consult_hermes to start one."
-                  : "No steering instruction provided.",
-              );
-              return;
-            }
-            consultRef.current = { callId: consultRef.current.callId, task: instruction };
-            void gw.request("prompt.submit", { session_id: sessionId, text: instruction });
-            void gw.request("session.interrupt", { session_id: sessionId }).catch(() => undefined);
-            active.sendFunctionOutput(call.callId, "Steering applied — Hermes is adjusting course.");
-            return;
-          }
-          active.sendFunctionOutput(call.callId, `Unknown tool: ${call.name}`);
+          void controllerRef.current?.onFunctionCall(call.name, call.callId, call.args);
         },
         onAssistantTranscript: (text) => pushLine("assistant", text),
         onUserTranscript: (text) => {
-          if (text.trim().toLowerCase().replace(/[.!]/g, "") === "stop") stop();
+          if (text.trim().toLowerCase().replace(/[.!]/g, "") === "stop") {
+            stop();
+          }
         },
         onStatus: (clientStatus, detail) => {
-          if (!clientRef.current) return;
-          if (clientStatus === "speaking") setStatus("speaking");
-          else if (clientStatus === "listening") {
-            setStatus(consultRef.current ? "thinking" : "listening");
+          if (!clientRef.current) {
+            return;
+          }
+          if (clientStatus === "speaking") {
+            setStatus("speaking");
+          } else if (clientStatus === "listening") {
+            setStatus(controllerRef.current?.consultActive ? "thinking" : "listening");
           } else if (clientStatus === "error") {
             setError(detail ?? "realtime error");
           } else if (clientStatus === "closed") {

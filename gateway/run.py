@@ -19996,12 +19996,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return source
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self, guild_id: int, user_id: int, transcript: str, *, consult: bool = False
     ):
-        """Handle transcribed voice from a user in a voice channel.
+        """Handle transcribed voice (or a supervisor consult) from a VC user.
 
-        Creates a synthetic MessageEvent and processes it through the
-        adapter's full message pipeline (session, typing, agent, TTS reply).
+        Consults skip STT dedup and run as ``MessageType.TEXT`` so classic
+        streaming-TTS never treats them as a voice utterance.
         """
         adapter = self.adapters.get(Platform.DISCORD)
         if not adapter:
@@ -20020,7 +20020,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
 
-        if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
+        if not consult and self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
             logger.info(
                 "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
                 guild_id,
@@ -20034,7 +20034,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel = adapter._client.get_channel(text_ch_id)
             if channel:
                 safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+                label = "**[Consult]**" if consult else "**[Voice]**"
+                await channel.send(f"{label} <@{user_id}>: {safe_text}")
         except Exception:
             pass
 
@@ -20055,10 +20056,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event = MessageEvent(
             source=source,
             text=transcript,
-            message_type=MessageType.VOICE,
+            message_type=MessageType.TEXT if consult else MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt,
         )
+        if consult:
+            event._hermes_voice_consult = True
 
         await adapter.handle_message(event)
 
@@ -20096,11 +20099,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_realtime_controllers = {}
         session = adapter.voice_realtime_session(guild_id)
         if session is None:
-            self._voice_realtime_controllers.pop(guild_id, None)
+            old = self._voice_realtime_controllers.pop(guild_id, None)
+            if old is not None:
+                old.fail_active_consult("Voice session ended.")
+                old.reset()
             return None
         controller = self._voice_realtime_controllers.get(guild_id)
         if controller is not None and controller.session is session:
             return controller
+        if controller is not None:
+            controller.fail_active_consult(
+                "Voice session reconnected; the previous task was dropped."
+            )
+            controller.reset()
         narrate = True
         try:
             from hermes_cli.config import read_raw_config
@@ -20121,8 +20132,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         controllers = getattr(self, "_voice_realtime_controllers", None)
         if (
             not controllers
-            or event.message_type != MessageType.VOICE
             or event.source.platform != Platform.DISCORD
+        ):
+            return None
+        if (
+            event.message_type != MessageType.VOICE
+            and not getattr(event, "_hermes_voice_consult", False)
         ):
             return None
         guild_id = self._get_guild_id(event)
@@ -20163,7 +20178,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         controllers = getattr(self, "_voice_realtime_controllers", None)
         if not controllers:
             return False
-        if str(getattr(message_type, "value", message_type) or "").lower() != "voice":
+        if str(getattr(message_type, "value", message_type) or "").lower() not in (
+            "voice",
+            "text",
+        ):
             return False
         if getattr(source, "platform", None) != Platform.DISCORD:
             return False

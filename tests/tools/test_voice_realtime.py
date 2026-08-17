@@ -1,8 +1,8 @@
 """Tests for the xAI realtime (S2S) voice input backend (tools.voice_realtime).
 
-The session is ears-only: server VAD + streaming transcription feed the CLI;
-the Hermes agent stays the brain. These tests drive the session with a fake
-WebSocket + fake mic — no network, no audio hardware.
+Covers both brains: ears (VAD + transcription into Hermes turns) and
+supervisor (grok-voice + consult/steer). These tests drive the session
+with a fake WebSocket + fake mic — no network, no audio hardware.
 """
 
 import base64
@@ -155,7 +155,7 @@ class TestBuildSessionUpdate:
         session = payload["session"]
         assert "create_response" not in session["turn_detection"]
         assert "reasoning" not in session
-        # Core ears-only function survives the downgrade.
+        # Core VAD + transcription survive the downgrade.
         assert session["turn_detection"]["type"] == "server_vad"
         assert session["turn_detection"]["threshold"] == 0.7
         assert session["audio"]["input"]["transcription"]["model"] == "grok-transcribe"
@@ -350,6 +350,15 @@ class TestSessionLifecycle:
         assert FakeMic.instances[0].closed
         assert h.ws.closed
         assert not h.session.alive
+
+    def test_full_queue_drops_oldest_frame_not_newest(self):
+        h = _Harness()
+        h.session._frames = queue.Queue(maxsize=2)
+        h.session._enqueue_frame(b"a")
+        h.session._enqueue_frame(b"b")
+        h.session._enqueue_frame(b"c")
+        assert h.session._frames.get_nowait() == b"b"
+        assert h.session._frames.get_nowait() == b"c"
 
     def test_reconnects_after_connection_loss(self):
         h = _Harness()

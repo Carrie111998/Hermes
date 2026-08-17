@@ -1,9 +1,8 @@
 import {
-  CONSULT_TOOL_NAME,
   type RealtimeFunctionCall,
   type RealtimeTokenGrant,
   RealtimeVoiceClient,
-  STEER_TOOL_NAME
+  VoiceSupervisorController
 } from '@hermes/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -12,8 +11,6 @@ import { notifyError } from '@/store/notifications'
 import type { ConversationStatus } from './use-voice-conversation'
 
 const CONSULT_POLL_MS = 500
-const MAX_CONSULT_OUTPUT_CHARS = 6000
-const STALE_CONSULT_MIN_AGE_MS = 30_000
 
 interface PendingVoiceResponse {
   id: string
@@ -38,12 +35,6 @@ interface RealtimeConversationOptions {
   failureLabel: string
 }
 
-interface TrackedConsult {
-  callId: string
-  task: string
-  at: number
-}
-
 /** xAI S2S supervisor loop — same surface as useVoiceConversation. */
 export function useRealtimeVoiceConversation({
   busy,
@@ -63,12 +54,11 @@ export function useRealtimeVoiceConversation({
   const [muted, setMuted] = useState(false)
   const [level, setLevel] = useState(0)
   const clientRef = useRef<RealtimeVoiceClient | null>(null)
-  const consultRef = useRef<TrackedConsult | null>(null)
+  const controllerRef = useRef<VoiceSupervisorController | null>(null)
   const generationRef = useRef(0)
   const busyRef = useRef(busy)
   busyRef.current = busy
 
-  // Keep callbacks out of the socket lifecycle deps (enabled-only).
   const optionsRef = useRef({
     requestToken,
     submitTask,
@@ -97,7 +87,9 @@ export function useRealtimeVoiceConversation({
 
   const teardown = useCallback(() => {
     generationRef.current += 1
-    consultRef.current = null
+    controllerRef.current?.failActiveConsult('Voice session ended.')
+    controllerRef.current?.reset()
+    controllerRef.current = null
     clientRef.current?.close()
     clientRef.current = null
     setStatus('idle')
@@ -105,10 +97,10 @@ export function useRealtimeVoiceConversation({
   }, [])
 
   const completeConsult = useCallback(() => {
+    const controller = controllerRef.current
     const client = clientRef.current
-    const consult = consultRef.current
 
-    if (!client || !consult) {
+    if (!controller || !client || !controller.consultActive) {
       return
     }
 
@@ -118,107 +110,20 @@ export function useRealtimeVoiceConversation({
       return
     }
 
-    // Skip unrelated typed turns; unknown trigger (null) counts as the consult's.
-    const userText = reply.userText?.trim()
+    const userText = reply.userText?.trim() ?? ''
 
-    if (userText && userText !== consult.task && !userText.includes(consult.task)) {
+    if (userText && !controller.ownsTurn(userText)) {
       optionsRef.current.consumePendingResponse()
 
       return
     }
 
-    consultRef.current = null
     optionsRef.current.consumePendingResponse()
-    let output = reply.text.trim() || 'Hermes finished with no text output.'
-
-    if (output.length > MAX_CONSULT_OUTPUT_CHARS) {
-      output = `${output.slice(0, MAX_CONSULT_OUTPUT_CHARS)}\n[truncated — full text is on screen]`
-    }
-
-    client.sendFunctionOutput(consult.callId, output)
+    controller.onTurnComplete(userText || controller.currentTask || '', reply.text)
   }, [])
 
   const handleFunctionCall = useCallback((call: RealtimeFunctionCall) => {
-    const client = clientRef.current
-
-    if (!client) {
-      return
-    }
-
-    const opts = optionsRef.current
-
-    if (call.name === CONSULT_TOOL_NAME) {
-      const task = String(call.args.task ?? '').trim()
-
-      if (!task) {
-        client.sendFunctionOutput(call.callId, 'No task provided.')
-
-        return
-      }
-
-      const tracked = consultRef.current
-
-      if (
-        tracked &&
-        !busyRef.current &&
-        Date.now() - tracked.at >= STALE_CONSULT_MIN_AGE_MS &&
-        !optionsRef.current.pendingResponse()
-      ) {
-        consultRef.current = null
-        client.sendFunctionOutput(tracked.callId, 'That task failed without producing a result.')
-      }
-
-      if (consultRef.current) {
-        client.sendFunctionOutput(
-          call.callId,
-          'Hermes is still working on the previous task; its result will arrive shortly.'
-        )
-
-        return
-      }
-
-      consultRef.current = { callId: call.callId, task, at: Date.now() }
-
-      if (!client.lastResponseHadAudio) {
-        client.speakAcknowledgment()
-      }
-
-      void opts.submitTask(task)
-
-      return
-    }
-
-    if (call.name === STEER_TOOL_NAME) {
-      const instruction = String(call.args.instruction ?? '').trim()
-
-      if (!instruction || !consultRef.current) {
-        client.sendFunctionOutput(
-          call.callId,
-          instruction
-            ? 'No Hermes task is running — use consult_hermes to start one.'
-            : 'No steering instruction provided.'
-        )
-
-        return
-      }
-
-      consultRef.current = { callId: consultRef.current.callId, task: instruction, at: Date.now() }
-
-      const steer = async () => {
-        if (busyRef.current) {
-          await opts.onInterrupt?.()
-        }
-
-        await opts.submitTask(instruction)
-      }
-
-      void steer()
-      client.sendFunctionOutput(call.callId, 'Steering applied — Hermes is adjusting course.')
-
-      return
-    }
-
-    client.sendFunctionOutput(call.callId, `Unknown tool: ${call.name}`)
+    return controllerRef.current?.onFunctionCall(call.name, call.callId, call.args)
   }, [])
 
   const start = useCallback(async () => {
@@ -227,7 +132,7 @@ export function useRealtimeVoiceConversation({
     }
 
     const generation = ++generationRef.current
-    setStatus('transcribing') // connecting: reuses the pill's spinner state
+    setStatus('transcribing')
 
     try {
       await optionsRef.current.beforeMicOpen?.()
@@ -245,6 +150,16 @@ export function useRealtimeVoiceConversation({
 
       const client = new RealtimeVoiceClient()
       clientRef.current = client
+      controllerRef.current = new VoiceSupervisorController(client, {
+        submit: async task => {
+          await optionsRef.current.submitTask(task)
+
+          return true
+        },
+        interrupt: () => optionsRef.current.onInterrupt?.(),
+        isBusy: () => busyRef.current,
+        isQueueEmpty: () => !optionsRef.current.pendingResponse()
+      })
       await client.connect(grant, {
         onFunctionCall: handleFunctionCall,
         onLevel: value => setLevel(value),
@@ -261,7 +176,7 @@ export function useRealtimeVoiceConversation({
           if (clientStatus === 'speaking') {
             setStatus('speaking')
           } else if (clientStatus === 'listening') {
-            setStatus(consultRef.current || busyRef.current ? 'thinking' : 'listening')
+            setStatus(controllerRef.current?.consultActive || busyRef.current ? 'thinking' : 'listening')
           } else if (clientStatus === 'error') {
             notifyError(new Error(detail ?? 'realtime voice error'), optionsRef.current.failureLabel)
           } else if (clientStatus === 'closed' && clientRef.current) {
@@ -297,7 +212,7 @@ export function useRealtimeVoiceConversation({
     }
 
     const timer = setInterval(() => {
-      if (consultRef.current) {
+      if (controllerRef.current?.consultActive) {
         completeConsult()
       }
     }, CONSULT_POLL_MS)
@@ -310,7 +225,7 @@ export function useRealtimeVoiceConversation({
       return
     }
 
-    if (busy || consultRef.current) {
+    if (busy || controllerRef.current?.consultActive) {
       setStatus(prev => (prev === 'speaking' ? prev : 'thinking'))
     } else {
       setStatus(prev => (prev === 'thinking' ? 'listening' : prev))
