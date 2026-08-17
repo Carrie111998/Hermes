@@ -688,6 +688,13 @@
   box-decoration-break: clone;
 }
 
+/* Kanban refs are intentionally chrome-free, but use the same secondary
+   accent as other contextual links. The card plugin owns their interaction
+   through the data attribute; the renderer only supplies inline markup. */
+.ref[data-kanban-card] {
+  --ref-color: color-mix(in srgb, var(--ui-accent-secondary) 82%, var(--foreground));
+}
+
 /* Affordance without chrome: only the ones you can actually activate respond,
    and they do it with an underline rather than a background. */
 :where(a, button).ref:hover {

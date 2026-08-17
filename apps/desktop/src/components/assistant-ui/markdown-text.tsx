@@ -17,6 +17,7 @@ import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { detectArtifact } from '@/lib/artifact-detect'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
+import { kanbanCardRefFromMarkdownHref } from '@/lib/kanban-card-refs'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
@@ -267,6 +268,16 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 
   if (sessionRef) {
     return <SessionRefLink value={sessionRef} />
+  }
+
+  const kanbanCardId = kanbanCardRefFromMarkdownHref(href)
+
+  if (kanbanCardId) {
+    return (
+      <a className={cn('ref wrap-anywhere', className)} data-kanban-card={kanbanCardId} href={href} {...props}>
+        {children}
+      </a>
+    )
   }
 
   const target = href ? normalizeExternalUrl(href) : href

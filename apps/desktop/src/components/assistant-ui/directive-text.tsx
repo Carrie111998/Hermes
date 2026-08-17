@@ -137,6 +137,12 @@ const HERMES_DIRECTIVE_RE = referenceRe()
 // something other than another slash.
 const SLASH_SKILL_RE = /(?<=^|\s)\/([a-zA-Z][\w-]*)(?![\w-]*\/)/g
 
+/** Fresh matcher for slash skills in surfaces that must protect them before
+ * applying another inline-text transform. */
+export function slashSkillRe(): RegExp {
+  return new RegExp(SLASH_SKILL_RE.source, 'g')
+}
+
 const TRAILING_PUNCTUATION_RE = /[,.;!?]+$/
 
 function unwrapRefValue(raw: string): string {
@@ -245,7 +251,7 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
         id
       }
     }),
-    ...Array.from(text.matchAll(SLASH_SKILL_RE)).map(match => ({
+    ...Array.from(text.matchAll(slashSkillRe())).map(match => ({
       start: match.index ?? 0,
       end: (match.index ?? 0) + match[0].length,
       type: 'skill',

@@ -1,8 +1,9 @@
 import type { FC } from 'react'
 import { Fragment, useMemo } from 'react'
 
-import { DirectiveContent } from '@/components/assistant-ui/directive-text'
+import { DirectiveContent, slashSkillRe } from '@/components/assistant-ui/directive-text'
 import { referenceRe } from '@/components/assistant-ui/reference-kinds'
+import { kanbanCardRefFromMarkdownHref, linkifyKanbanCardRefs } from '@/lib/kanban-card-refs'
 import { cn } from '@/lib/utils'
 
 // User messages should render the bare-minimum of markdown: backtick `code`
@@ -37,6 +38,18 @@ interface InlineTextSegment {
 
 type TopSegment = FenceSegment | InlineSegment
 type InlineNode = InlineCodeSegment | InlineTextSegment
+
+interface DirectiveSegment {
+  kind: 'directive'
+  text: string
+}
+
+interface KanbanTextSegment {
+  kind: 'text' | 'kanban-card'
+  text: string
+  id?: string
+  href?: string
+}
 
 const FENCE_RE = /```([^\n`]*)\n([\s\S]*?)```/g
 
@@ -113,6 +126,67 @@ function splitInlineCode(text: string): InlineNode[] {
   return nodes
 }
 
+function splitDirectives(text: string): Array<DirectiveSegment | InlineTextSegment> {
+  const segments: Array<DirectiveSegment | InlineTextSegment> = []
+  let cursor = 0
+
+  const matches = [...Array.from(text.matchAll(referenceRe())), ...Array.from(text.matchAll(slashSkillRe()))].sort(
+    (left, right) => (left.index ?? 0) - (right.index ?? 0)
+  )
+
+  for (const match of matches) {
+    const start = match.index ?? 0
+
+    if (start < cursor) {
+      continue
+    }
+
+    if (start > cursor) {
+      segments.push({ kind: 'inline-text', text: text.slice(cursor, start) })
+    }
+
+    segments.push({ kind: 'directive', text: match[0] })
+    cursor = start + match[0].length
+  }
+
+  if (cursor < text.length) {
+    segments.push({ kind: 'inline-text', text: text.slice(cursor) })
+  }
+
+  return segments
+}
+
+const KANBAN_CARD_MARKDOWN_RE = /\[(@card:[0-9a-f]{4,}|t_[0-9a-f]{4,})\]\((#[^\s)]+)\)/g
+
+function splitKanbanCardRefs(text: string): KanbanTextSegment[] {
+  const linked = linkifyKanbanCardRefs(text)
+  const segments: KanbanTextSegment[] = []
+  let cursor = 0
+
+  for (const match of linked.matchAll(KANBAN_CARD_MARKDOWN_RE)) {
+    const start = match.index ?? 0
+    const href = match[2] ?? ''
+    const id = kanbanCardRefFromMarkdownHref(href)
+
+    if (!id) {
+      continue
+    }
+
+    if (start > cursor) {
+      segments.push({ kind: 'text', text: linked.slice(cursor, start) })
+    }
+
+    segments.push({ kind: 'kanban-card', text: match[1] ?? '', href, id })
+    cursor = start + match[0].length
+  }
+
+  if (cursor < linked.length) {
+    segments.push({ kind: 'text', text: linked.slice(cursor) })
+  }
+
+  return segments
+}
+
 interface UserMessageTextProps {
   text: string
   className?: string
@@ -166,10 +240,49 @@ const InlineSegmentView: FC<{ text: string }> = ({ text }) => {
           // Pass plain-text bits through DirectiveContent so @file:/@url: chips
           // still render. DirectiveContent already preserves whitespace.
           <Fragment key={`text-${nodeIndex}`}>
-            <DirectiveContent text={node.text} />
+            <InlineTextView text={node.text} />
           </Fragment>
         )
       )}
     </span>
+  )
+}
+
+const InlineTextView: FC<{ text: string }> = ({ text }) => {
+  const segments = useMemo(() => splitDirectives(text), [text])
+
+  return (
+    <>
+      {segments.map((segment, segmentIndex) =>
+        segment.kind === 'directive' ? (
+          <DirectiveContent key={`directive-${segmentIndex}`} text={segment.text} />
+        ) : (
+          <KanbanTextView key={`text-${segmentIndex}`} text={segment.text} />
+        )
+      )}
+    </>
+  )
+}
+
+const KanbanTextView: FC<{ text: string }> = ({ text }) => {
+  const segments = useMemo(() => splitKanbanCardRefs(text), [text])
+
+  return (
+    <>
+      {segments.map((segment, segmentIndex) =>
+        segment.kind === 'kanban-card' ? (
+          <a
+            className="ref wrap-anywhere"
+            data-kanban-card={segment.id}
+            href={segment.href}
+            key={`kanban-${segmentIndex}`}
+          >
+            {segment.text}
+          </a>
+        ) : (
+          <Fragment key={`text-${segmentIndex}`}>{segment.text}</Fragment>
+        )
+      )}
+    </>
   )
 }
