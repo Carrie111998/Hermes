@@ -108,6 +108,8 @@ import {
   removeConnection,
   resolvedConnectionId,
   resolveRegistryLocalRoute,
+  setConnectionLaunchMode,
+  setLastUsedConnection,
   setPrimaryConnection,
   shouldDeferLocalEnumeration,
   shouldRetrySshInventory,
@@ -8425,6 +8427,8 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
   return {
     version: registry.version,
     primary: registry.primary,
+    launchMode: registry.launchMode,
+    lastUsed: registry.lastUsed,
     secureTokenStorage,
     connections: registry.connections.map(sanitizeRegistryConnection)
   }
@@ -12649,6 +12653,18 @@ ipcMain.handle('hermes:connections:remove', async (_event, id) => {
 })
 ipcMain.handle('hermes:connections:set-primary', async (_event, id) => {
   const registry = setPrimaryConnection(readDesktopConnectionsRegistry(), String(id || ''))
+  writeDesktopConnectionsRegistry(registry)
+
+  return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
+})
+ipcMain.handle('hermes:connections:set-launch-mode', async (_event, mode) => {
+  const registry = setConnectionLaunchMode(readDesktopConnectionsRegistry(), String(mode || ''))
+  writeDesktopConnectionsRegistry(registry)
+
+  return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
+})
+ipcMain.handle('hermes:connections:set-last-used', async (_event, id) => {
+  const registry = setLastUsedConnection(readDesktopConnectionsRegistry(), String(id || ''))
   writeDesktopConnectionsRegistry(registry)
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
