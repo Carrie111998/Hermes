@@ -4,8 +4,11 @@ other Hermes calendar skills use (e.g. the bundled google-workspace
 skill's `calendar` subcommand) so results are easy to parse rather than
 eyeballed from plain text.
 
-Reads RADICALE_URL / RADICALE_USERNAME / RADICALE_PASSWORD from a .env file
-next to this script by default (override with --env-path).
+Reads RADICALE_URL / RADICALE_USERNAME / RADICALE_PASSWORD from the process
+environment first, then from `~/.hermes/.env` (where Hermes's secure
+setup-on-load prompt actually stores them) and a `.env` in the current
+directory, in that order. Pass --env-path to load one specific file instead
+(e.g. running this script outside the main Hermes environment).
 
 Deliberately named `reschedule-event` rather than `move-event` - other
 CalDAV tools use "move" to mean transferring an event to a *different
@@ -21,43 +24,76 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import caldav
 
-DEFAULT_ENV_PATH = str(Path(__file__).resolve().parent.parent / ".env")
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
 
 
-def _load_dotenv(env_path: str) -> None:
-    import os
+def _dotenv_paths(env_path: str | None) -> list[Path]:
+    # An explicit --env-path loads only that file (standalone/outside-Hermes
+    # use). Otherwise fall back to the same locations Hermes itself uses -
+    # notably ~/.hermes/.env, where the secure setup-on-load prompt actually
+    # writes RADICALE_PASSWORD. A skill-local .env is deliberately not part
+    # of this list: it would be a second, unmanaged plaintext secret store
+    # outside Hermes's own, contradicting the "prompts securely" story.
+    if env_path:
+        return [Path(env_path)]
+    paths = []
+    project_env = Path.cwd() / ".env"
+    if project_env.exists():
+        paths.append(project_env)
+    user_env = _hermes_home() / ".env"
+    if user_env.exists():
+        paths.append(user_env)
+    return paths
 
-    if not env_path or not os.path.exists(env_path):
-        return
-    with open(env_path, encoding="utf-8") as env_file:
-        for raw_line in env_file:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip("'\"")
-            if key and key not in os.environ:
-                os.environ[key] = value
+
+def _load_dotenv_values(env_path: str | None) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for path in _dotenv_paths(env_path):
+        if not path.exists():
+            continue
+        with open(path, encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                if key:
+                    values[key] = value
+    return values
 
 
-def _client(env_path: str) -> caldav.DAVClient:
-    import os
+def _env_lookup(key: str, dotenv_values: dict[str, str]) -> str | None:
+    # Process environment wins over any dotenv file - lets a caller override
+    # without editing a file on disk.
+    return os.environ.get(key) or dotenv_values.get(key)
 
-    _load_dotenv(env_path)
+
+def _client(env_path: str | None) -> caldav.DAVClient:
+    dotenv_values = _load_dotenv_values(env_path)
+    creds = {}
     for var in ("RADICALE_URL", "RADICALE_USERNAME", "RADICALE_PASSWORD"):
-        if var not in os.environ:
-            _fail(f"Missing {var} - check .env or pass --env-path")
+        value = _env_lookup(var, dotenv_values)
+        if not value:
+            _fail(
+                f"Missing {var} - set it via `hermes setup`, "
+                f"{_hermes_home() / '.env'}, or --env-path"
+            )
+        creds[var] = value
     return caldav.DAVClient(
-        url=os.environ["RADICALE_URL"],
-        username=os.environ["RADICALE_USERNAME"],
-        password=os.environ["RADICALE_PASSWORD"],
+        url=creds["RADICALE_URL"],
+        username=creds["RADICALE_USERNAME"],
+        password=creds["RADICALE_PASSWORD"],
     )
 
 
@@ -82,6 +118,15 @@ def _get_calendar(principal, name: str | None):
 def _parse_dt(value: str) -> datetime:
     # Accept both a bare "Z" suffix and explicit offsets.
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _now_local() -> datetime:
+    # Timezone-aware, not naive - cal.search(..., expand=True) hands back
+    # events with aware dtstart/dtend once recurrence expansion kicks in, and
+    # comparing those against a naive default silently misses matches (or
+    # raises TypeError: can't compare offset-naive and offset-aware
+    # datetimes) instead of failing loudly.
+    return datetime.now().astimezone()
 
 
 def _parse_date(value: str) -> date:
@@ -122,7 +167,7 @@ def cmd_list_calendars(client: caldav.DAVClient, args) -> None:
 def cmd_list_events(client: caldav.DAVClient, args) -> None:
     principal = client.principal()
     cal = _get_calendar(principal, args.calendar)
-    start = _parse_dt(args.start) if args.start else datetime.now()
+    start = _parse_dt(args.start) if args.start else _now_local()
     end = _parse_dt(args.end) if args.end else start + timedelta(days=7)
     events = cal.search(start=start, end=end, event=True, expand=True)
     print(json.dumps([_event_json(e) for e in events], indent=2))
@@ -230,7 +275,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="radicale", description="Control a self-hosted Radicale calendar."
     )
-    parser.add_argument("--env-path", default=DEFAULT_ENV_PATH)
+    parser.add_argument(
+        "--env-path",
+        default=None,
+        help="Load env vars from this file only, instead of ~/.hermes/.env / ./.env",
+    )
     parser.add_argument(
         "--calendar", default=None, help="Calendar name (default: the first/only one)"
     )

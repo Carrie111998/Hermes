@@ -86,6 +86,47 @@ def test_event_json_timed_event():
     assert result["recurring"] is None
 
 
+def test_now_local_is_timezone_aware():
+    assert rc._now_local().tzinfo is not None
+
+
+def test_load_dotenv_values_reads_hermes_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)  # no stray cwd .env to pick up instead
+    user_env = tmp_path / ".env"
+    user_env.write_text("RADICALE_URL=https://example.com\n", encoding="utf-8")
+
+    values = rc._load_dotenv_values(None)
+
+    assert values["RADICALE_URL"] == "https://example.com"
+
+
+def test_load_dotenv_values_explicit_path_ignores_hermes_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    user_env = tmp_path / ".env"
+    user_env.write_text("RADICALE_URL=https://wrong.example.com\n", encoding="utf-8")
+    explicit = tmp_path / "other.env"
+    explicit.write_text("RADICALE_URL=https://right.example.com\n", encoding="utf-8")
+
+    values = rc._load_dotenv_values(str(explicit))
+
+    assert values["RADICALE_URL"] == "https://right.example.com"
+
+
+def test_env_lookup_prefers_process_environment(monkeypatch):
+    monkeypatch.setenv("RADICALE_USERNAME", "from-process-env")
+    assert (
+        rc._env_lookup("RADICALE_USERNAME", {"RADICALE_USERNAME": "from-dotenv"})
+        == "from-process-env"
+    )
+
+
+def test_env_lookup_falls_back_to_dotenv_values(monkeypatch):
+    monkeypatch.delenv("RADICALE_PASSWORD", raising=False)
+    dotenv_values = {"RADICALE_PASSWORD": "secret"}
+    assert rc._env_lookup("RADICALE_PASSWORD", dotenv_values) == "secret"
+
+
 def test_event_json_all_day_recurring_event():
     comp = {
         "uid": "bday-1",

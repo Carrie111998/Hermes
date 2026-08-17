@@ -5,8 +5,6 @@ version: 1.0.0
 author: joost (KoenradusXLVIII), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
-prerequisites:
-  env_vars: [RADICALE_URL, RADICALE_USERNAME, RADICALE_PASSWORD]
 required_environment_variables:
   - name: RADICALE_URL
     prompt: Base URL of your Radicale server (e.g. https://calendar.example.com/)
@@ -46,7 +44,8 @@ Requires the `caldav` package. Standard installs get it via `hermes-agent[caldav
 too if running this script outside the main Hermes environment.
 
 Set `RADICALE_URL` / `RADICALE_USERNAME` / `RADICALE_PASSWORD` (see frontmatter
-above - Hermes prompts for these securely on first load if any are missing).
+above - Hermes prompts for these securely on first load if any are missing,
+storing them in `~/.hermes/.env`, which is what this script reads from).
 
 ## How to Run
 
