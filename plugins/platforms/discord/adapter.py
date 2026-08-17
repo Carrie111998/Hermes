@@ -7889,6 +7889,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return str(parent_id)
         return None
 
+    def _get_parent_channel_name(self, channel: Any) -> Optional[str]:
+        """Return the parent channel's display NAME for a thread, if present.
+
+        2026-08-10: a thread message's own ``chat_name`` is the THREAD's
+        name, not the parent's — with ``discord.auto_thread`` on (the
+        default), nearly every first @mention in a fresh channel becomes a
+        thread immediately, so the parent's name was never reaching anything
+        downstream at all. Best-effort, same posture as
+        ``_get_parent_channel_id`` — only ``channel.parent`` carries a name;
+        the bare ``parent_id`` fallback there has nothing to read a name off.
+        """
+        parent = getattr(channel, "parent", None)
+        name = getattr(parent, "name", None) if parent is not None else None
+        return str(name) if name else None
+
     def _is_forum_parent(self, channel: Any) -> bool:
         """Best-effort check for whether a Discord channel is a forum channel."""
         if channel is None:
@@ -8249,12 +8264,21 @@ class DiscordAdapter(BasePlatformAdapter):
         effective_channel = auto_threaded_channel or message.channel
 
         # Determine chat type
+        parent_chat_name = None
         if isinstance(message.channel, discord.DMChannel):
             chat_type = "dm"
             chat_name = message.author.name
         elif is_thread:
             chat_type = "thread"
             chat_name = self._format_thread_chat_name(effective_channel)
+            if auto_threaded_channel is not None:
+                # A thread minted THIS turn: `message.channel` is still the
+                # original parent channel object — the swap only affected
+                # `effective_channel` (see "route responses to the new
+                # thread" above), so its name is right here, no lookup.
+                parent_chat_name = getattr(message.channel, "name", None)
+            else:
+                parent_chat_name = self._get_parent_channel_name(message.channel)
         else:
             chat_type = "group"
             chat_name = getattr(message.channel, "name", str(message.channel.id))
@@ -8279,6 +8303,7 @@ class DiscordAdapter(BasePlatformAdapter):
             is_bot=getattr(message.author, "bot", False),
             guild_id=str(guild.id) if guild else None,
             parent_chat_id=parent_channel_id,
+            parent_chat_name=parent_chat_name,
             message_id=str(message.id),
             role_authorized=role_authorized,
             auto_thread_created=auto_threaded_channel is not None,

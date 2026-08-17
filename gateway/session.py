@@ -175,6 +175,15 @@ class SessionSource:
     scope_id: Optional[str] = None
     guild_id: Optional[str] = None  # @deprecated legacy alias for scope_id (D-Q2.5)
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
+    # Parent channel's display NAME, set alongside parent_chat_id wherever the
+    # connector has it at hand (2026-08-10). parent_chat_id alone lets a
+    # plugin key state per-parent, but not name anything: for Discord's
+    # auto-thread flow specifically, chat_name on a thread message is the
+    # THREAD's name, not the parent's — a plugin that wants the parent
+    # channel's own name (e.g. to auto-derive something from it) had no way
+    # to get it before this field existed. Best-effort / connector-specific;
+    # None means "not available here", not "no parent".
+    parent_chat_name: Optional[str] = None
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     # Profile this inbound message is routed to in a multiplexing gateway
@@ -275,6 +284,8 @@ class SessionSource:
             d["guild_id"] = scope
         if self.parent_chat_id:
             d["parent_chat_id"] = self.parent_chat_id
+        if self.parent_chat_name:
+            d["parent_chat_name"] = self.parent_chat_name
         if self.message_id:
             d["message_id"] = self.message_id
         if self.profile:
@@ -304,6 +315,7 @@ class SessionSource:
             # deprecated `guild_id` alias (a peer not yet migrated still sends it).
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
+            parent_chat_name=data.get("parent_chat_name"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
