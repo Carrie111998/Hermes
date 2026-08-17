@@ -3013,6 +3013,47 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _normalize_providers_string(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode a JSON-string-typed ``providers`` value into a dict.
+
+    ``providers`` is an open-dict top-level key (``_OPEN_DICT_TOP_LEVEL_KEYS``),
+    so config validation accepts *any* shape under it and never complains when a
+    serialization round-trip (e.g. a dashboard/config write-back through
+    ``json.dumps``) persists the whole section as a single JSON string scalar:
+
+        providers: '{"custom": {"base_url": "...", "models": {...}}}'
+
+    Every consumer guards with ``isinstance(providers, dict)`` and silently
+    degrades to "no custom providers configured" — per-model ``supports_vision``
+    overrides (``agent.image_routing``) and custom-provider identity lookups
+    (``hermes_cli.runtime_provider``) never resolve, with zero warnings. Decode
+    the string here, at the single normalization chokepoint shared by the user
+    and managed configs, so every downstream reader sees the dict shape it
+    expects. Runs before ``_expand_env_vars`` so ``${VAR}`` refs inside the
+    decoded block still expand normally. A non-dict or malformed payload falls
+    back to ``{}`` (with a one-time warning) rather than surviving as a string.
+    """
+    raw = config.get("providers")
+    if not isinstance(raw, str):
+        return config
+    config = dict(config)
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, TypeError):
+        decoded = None
+    if isinstance(decoded, dict):
+        config["providers"] = decoded
+    else:
+        logger.warning(
+            "Ignoring malformed 'providers' config: expected a mapping but got "
+            "a %s-typed value; treating it as empty. Custom providers and "
+            "per-model overrides will not resolve until this is fixed.",
+            "JSON string decoding to non-dict" if decoded is not None else "string",
+        )
+        config["providers"] = {}
+    return config
+
+
 def is_provider_enabled(provider_cfg: Optional[Dict[str, Any]]) -> bool:
     """Return whether a ``providers.<name>`` config block is enabled.
 
@@ -3600,7 +3641,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        normalized = _normalize_providers_string(
+            _normalize_root_model_keys(_normalize_max_turns_config(config))
+        )
         expanded = _expand_env_vars(normalized)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
@@ -3616,7 +3659,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # ``model: <string>`` must be flattened to a string ``default``
             # paired with ``provider`` so the merged result never exposes a
             # nested dict to status/fallback/runtime readers.
-            managed_normalized = _normalize_root_model_keys(managed_config)
+            managed_normalized = _normalize_providers_string(
+                _normalize_root_model_keys(managed_config)
+            )
             if isinstance(managed_normalized.get("model"), str):
                 managed_normalized = dict(managed_normalized)
                 managed_normalized["model"] = {"default": managed_normalized["model"]}
