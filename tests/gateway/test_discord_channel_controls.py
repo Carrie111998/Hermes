@@ -288,6 +288,32 @@ async def test_auto_thread_channels_do_not_override_no_thread_channel(adapter, m
     assert event.source.chat_type == "group"
 
 
+@pytest.mark.asyncio
+async def test_auto_thread_channels_wildcard_respects_no_thread_channel(adapter, monkeypatch):
+    """Wildcard auto-threading applies to free-response channels, except hard opt-outs."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "777,888")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_CHANNELS", "*")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "888")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
+
+    message = make_message(channel=FakeTextChannel(channel_id=777), content="ambient idea")
+    await adapter._handle_message(message)
+    adapter._auto_create_thread.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+
+    adapter._auto_create_thread.reset_mock()
+    adapter.handle_message.reset_mock()
+    message = make_message(channel=FakeTextChannel(channel_id=888), content="ambient idea")
+    await adapter._handle_message(message)
+    adapter._auto_create_thread.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "group"
+
+
 # ── auto-thread failure must not silently fall back to inline (#20243) ──
 
 
