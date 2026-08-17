@@ -4,16 +4,54 @@ Long-running tests that exercise the Kanban kernel under adversarial
 conditions. **Not run by `scripts/run_tests.sh`** because they can
 take 30+ seconds each and spawn real subprocesses.
 
-Run the scripts directly; this is the sole supported execution path.
-Pytest intentionally ignores every Python file in this directory, so
-`pytest tests/stress/ --collect-only` collects no tests.
+## Running them
+
+Two supported paths, and they run the same code — the pytest lane shells
+out to the scripts.
+
+**Directly** — what you want while iterating on one script:
 
 ```bash
 ./venv/bin/python tests/stress/test_concurrency.py
-./venv/bin/python tests/stress/test_subprocess_e2e.py
-./venv/bin/python tests/stress/test_property_fuzzing.py
-./venv/bin/python tests/stress/test_benchmarks.py
 ```
+
+Every script exits 0 iff all of its checks passed, and prints a summary.
+
+**Through pytest**, for gating:
+
+```bash
+pytest tests/stress -m stress
+```
+
+`tests/stress/test_stress_entrypoints.py` is the only module pytest
+collects here; it runs each script as a subprocess and asserts the exit
+code. The scripts themselves stay ignored (see `conftest.py`) because
+none of them defines a module-level `test_*` function — collecting them
+would import eight modules and find zero tests.
+
+The `stress` marker is **deselected by default** via `addopts` in
+`pyproject.toml`, so a normal `pytest` run never pays for them. The full
+set takes roughly 25 minutes, dominated by `test_property_fuzzing`
+(~530s) and `test_benchmarks` (~500s). Narrow it with `-k`:
+
+```bash
+pytest tests/stress -m stress -k property_fuzzing
+```
+
+Deadlines in these scripts are safety nets scaled by
+`HERMES_TEST_TIMEOUT_SCALE` (see `tests/timeout_budget.py`); raise it on a
+loaded host rather than editing the numbers.
+
+### Platform notes
+
+Some checks cannot run everywhere and skip cleanly rather than fail:
+
+- `hermes_home_via_symlink` needs symlink creation, which Windows grants
+  only to elevated processes or with Developer Mode on (`WinError 1314`).
+- `test_subprocess_e2e` scenario B (crashed worker) is POSIX-only:
+  `subprocess` `pass_fds` is rejected on Windows, there is no `sleep`
+  binary, and the double-fork orphaning it relies on has no Windows
+  equivalent.
 
 ## What's covered
 

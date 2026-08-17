@@ -137,8 +137,13 @@ def main():
     print("(worker work > TTL guarantees reclaims)")
 
     ctx = mp.get_context("spawn")
-    worker_results = [f"/tmp/rc_worker_{i}.json" for i in range(NUM_WORKERS)]
-    reclaim_result = "/tmp/rc_reclaim.json"
+    # Per-run IPC files belong inside this run's HERMES_HOME; "/tmp/..."
+    # resolves against the current drive on Windows (C:\tmp\...), leaking
+    # out of the run and colliding between concurrent runs.
+    worker_results = [
+        os.path.join(home, f"rc_worker_{i}.json") for i in range(NUM_WORKERS)
+    ]
+    reclaim_result = os.path.join(home, "rc_reclaim.json")
     procs = []
     for i in range(NUM_WORKERS):
         p = ctx.Process(target=worker_loop, args=(i, home, worker_results[i]))
