@@ -121,6 +121,16 @@ _AUTH_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bare `Bearer <token>` with no `Authorization:` prefix. Credentials reach
+# agent context as prose far more often than as literal headers -- pasted curl
+# snippets, "use Bearer <tok> to authenticate", API docs quoted into chat.
+# Found by the Phase 9 / B5 canary suite: a bare bearer token matching no
+# vendor prefix was surviving every matcher.
+_BEARER_RE = re.compile(
+    r"\b(Bearer\s+)([A-Za-z0-9._~+/=-]{16,})",
+    re.IGNORECASE,
+)
+
 # Telegram bot tokens: bot<digits>:<token> or <digits>:<token>,
 # where token part is restricted to [-A-Za-z0-9_] and length >= 30
 _TELEGRAM_RE = re.compile(
@@ -348,6 +358,16 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         lambda m: m.group(1) + _mask_token(m.group(2)),
         text,
     )
+
+    # Bare `Bearer <token>`. Runs after the header pattern and skips tokens it
+    # already masked, so the two are idempotent rather than double-masking a
+    # value down to "***".
+    def _redact_bearer(m):
+        prefix, token = m.group(1), m.group(2)
+        if "..." in token or token == "***":
+            return m.group(0)
+        return prefix + _mask_token(token)
+    text = _BEARER_RE.sub(_redact_bearer, text)
 
     # Telegram bot tokens
     def _redact_telegram(m):
