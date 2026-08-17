@@ -399,23 +399,13 @@ python-version = "3.13"
 unknown-argument = "warn"
 redundant-cast = "ignore"
 
-[tool.ruff]
-preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
-
-[tool.ruff.lint]
-# All other lints are intentionally disabled (see comment history on this
-# file) while we wrangle typechecks — but PLW1514 is too load-bearing to
-# keep off.  Bare open()/read_text()/write_text() in text mode defaults to
-# the system locale encoding on Windows (cp1252 on US-locale installs),
-# which silently corrupts any non-ASCII file content.  We had three
-# separate Windows sandbox regressions in one debug session before
-# adding the explicit encoding.  This rule keeps new code honest.
-select = ["PLW1514"]
-
-[tool.ruff.lint.per-file-ignores]
-# Tests can intentionally exercise locale-encoding edge cases.
-"tests/**" = ["PLW1514"]
-# Skills and plugins are partially user-authored — their own conventions.
-"skills/**" = ["PLW1514"]
-"optional-skills/**" = ["PLW1514"]
-"plugins/**" = ["PLW1514"]
+# ruff configuration lives in ruff.toml at the repo root, NOT here.
+#
+# Do not add a [tool.ruff] table back to this file.  When ruff.toml exists,
+# ruff reads it in preference to pyproject.toml and ignores any [tool.ruff]
+# here SILENTLY -- no warning, no error -- so a table added back would be dead
+# config that still greps as live.  tests/test_lint_config.py enforces this.
+#
+# The split exists because ruff.toml carries a several-hundred-line
+# per-file-ignores sunset list that would more than double this file.
+# See docs/superpowers/specs/2026-08-16-ruff-f-group-reland-design.md

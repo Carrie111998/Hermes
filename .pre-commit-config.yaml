@@ -12,6 +12,26 @@ repos:
         args:
           - --config=C:/Users/diego/.config/gitleaks/gitleaks.toml
 
+  # ruff lint gate (Pyflakes "F" group + PLW1514).
+  #
+  # The rule set lives in ruff.toml at the repo root -- NOT pyproject.toml --
+  # so this hook and the blocking CI job (.github/workflows/lint.yml, which
+  # runs a bare `ruff check .`) stay in sync automatically. Adding a rule
+  # there arms it in both places at once.
+  #
+  # This restores enforcement that landed in May 2026 and fell out of main in
+  # the v0.15.1 cutover. Files that offended at re-land time are listed in
+  # ruff.toml's per-file-ignores sunset list; every other file is gated.
+  #
+  # Deliberately NO --fix: a pre-commit hook that rewrites source during a
+  # commit hides the change from the diff the author is reviewing, and the
+  # F841 autofix in particular can delete side-effecting statements.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12 # keep in step with the local ruff and the CI job
+    hooks:
+      - id: ruff-check
+        name: ruff (Pyflakes F group + PLW1514)
+
   # EventType / sibling-lookup-table drift guard.
   #
   # Adding a member to events/schema.py EventType requires a paired entry in
