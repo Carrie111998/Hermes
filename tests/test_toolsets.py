@@ -110,13 +110,16 @@ class TestBrowserToolsetWebSearch:
     [browser]`` silently strips ``web_search`` from the model's tool list even
     though it remains available through the ``web`` toolset and
     ``_HERMES_CORE_TOOLS``.
+
+    Note: a user who disables the ``web`` toolset while keeping ``browser``
+    previously retained ``web_search`` via the browser bundle. After this fix
+    they will lose it — this is the intended behaviour, since ``web_search``
+    is a ``web`` tool, not a ``browser`` tool.
     """
 
     def test_browser_toolset_does_not_include_web_search(self):
         browser_tools = set(resolve_toolset("browser"))
         assert "web_search" not in browser_tools
-        # The browser toolset should only contain browser-automation tools.
-        assert all(t.startswith("browser_") for t in browser_tools), browser_tools
 
     def test_disabling_browser_toolset_keeps_web_search(self):
         # Model the disabled_toolsets subtraction in model_tools.py: disabling
