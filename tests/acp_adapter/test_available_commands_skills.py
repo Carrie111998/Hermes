@@ -101,6 +101,24 @@ def help_named_bundle(synthetic_skill_library, monkeypatch):
     _reset_skill_and_bundle_caches()
 
 
+@pytest.fixture()
+def status_named_bundle(synthetic_skill_library, monkeypatch):
+    """User bundle that collides with a non-ACP Hermes CLI command."""
+    bundles_dir = synthetic_skill_library["bundles_dir"]
+    (bundles_dir / "status.yaml").write_text(
+        "name: status\n"
+        "description: User bundle shadowing the core /status command\n"
+        "skills:\n"
+        "  - acp-fixture-skill\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    _reset_skill_and_bundle_caches()
+    skill_bundles.scan_bundles()
+    yield
+    _reset_skill_and_bundle_caches()
+
+
 def test_available_commands_static_invariants():
     """Required ACP static commands exist with unique names (order free)."""
     cmds = HermesACPAgent._available_commands()
@@ -136,6 +154,30 @@ def test_available_commands_includes_skills_and_unique(synthetic_skill_library):
     assert len(names) == len({n.lower() for n in names})
     assert synthetic_skill_library["skill"] in names
     assert synthetic_skill_library["bundle"] in names
+
+
+def test_available_commands_does_not_advertise_bundle_shadowing_cli_command(
+    status_named_bundle,
+):
+    names = [command.name for command in HermesACPAgent._available_commands()]
+
+    assert skill_bundles.resolve_bundle_command_key("status") == "/status"
+    assert "status" not in names
+
+
+def test_available_commands_reserves_cap_for_skills(monkeypatch):
+    bundles = {
+        f"/bundle-{index}": {"description": f"Bundle {index}"}
+        for index in range(HermesACPAgent._MAX_ADVERTISED_SKILL_COMMANDS)
+    }
+    skills = {"/priority-skill": {"description": "A directly invokable skill"}}
+    monkeypatch.setattr(skill_bundles, "get_skill_bundles", lambda: bundles)
+    monkeypatch.setattr(skill_commands, "get_skill_commands", lambda: skills)
+
+    names = [command.name for command in HermesACPAgent._available_commands()]
+
+    assert "priority-skill" in names
+    assert len(names) == len(HermesACPAgent._ADVERTISED_COMMANDS) + 250
 
 
 def test_expand_unknown_returns_none():

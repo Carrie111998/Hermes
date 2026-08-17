@@ -2101,38 +2101,40 @@ class HermesACPAgent(acp.Agent):
                 )
             )
 
-        # Bundles first (they win over skill slugs on the same name in TUI).
         try:
             from agent.skill_bundles import get_skill_bundles
             from agent.skill_commands import get_skill_commands
+            from hermes_cli.commands import resolve_command
 
+            bundle_candidates: list[tuple[str, dict[str, Any]]] = []
             for key, info in get_skill_bundles().items():
                 slug = key.lstrip("/").lower()
-                if not slug or slug in seen:
+                if not slug or slug in seen or resolve_command(slug) is not None:
                     continue
-                desc = (info.get("description") or info.get("name") or slug)[:200]
-                seen.add(slug)
-                commands.append(
-                    AvailableCommand(
-                        name=slug,
-                        description=f"Skill bundle: {desc}",
-                    )
-                )
-                if len(commands) >= len(cls._ADVERTISED_COMMANDS) + cls._MAX_ADVERTISED_SKILL_COMMANDS:
-                    break
+                bundle_candidates.append((slug, info))
+
+            # Direct skills are the primary command surface and must not be
+            # starved by a large bundle catalog. A bundle still wins when both
+            # sources claim the same slug, matching dispatch/TUI precedence.
+            bundle_slugs = {slug for slug, _info in bundle_candidates}
+            dynamic_candidates: list[tuple[str, str, dict[str, Any]]] = []
 
             for key, info in get_skill_commands().items():
-                if len(commands) >= len(cls._ADVERTISED_COMMANDS) + cls._MAX_ADVERTISED_SKILL_COMMANDS:
-                    break
                 slug = key.lstrip("/").lower()
-                if not slug or slug in seen:
+                if not slug or slug in seen or slug in bundle_slugs:
                     continue
+                dynamic_candidates.append(("Skill", slug, info))
+
+            dynamic_candidates.extend(
+                ("Skill bundle", slug, info) for slug, info in bundle_candidates
+            )
+            for label, slug, info in dynamic_candidates[: cls._MAX_ADVERTISED_SKILL_COMMANDS]:
                 desc = (info.get("description") or info.get("name") or slug)[:200]
                 seen.add(slug)
                 commands.append(
                     AvailableCommand(
                         name=slug,
-                        description=f"Skill: {desc}",
+                        description=f"{label}: {desc}",
                     )
                 )
         except Exception:
@@ -2170,6 +2172,9 @@ class HermesACPAgent(acp.Agent):
             return None
 
         if state is not None:
+            # prompt() calls this inside copy_context().run(); runtime_cwd uses
+            # a ContextVar, so the session pin cannot leak to concurrent ACP
+            # sessions or back into the caller's context.
             set_session_cwd(state.cwd)
 
         # First token is the command; remainder is optional user instruction.
