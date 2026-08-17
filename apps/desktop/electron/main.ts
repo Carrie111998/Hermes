@@ -86,6 +86,7 @@ import {
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveRemoteSshDashboardProfile,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview,
@@ -8845,7 +8846,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     const lifecycle = platform.os === 'Windows' ? connectWindowsRemote : remoteLifecycle.connect
     result = await lifecycle({
       ssh,
-      profile: sshConfig.remoteProfile || connectionScopeKey(profile) || '',
+      profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
       remoteHermesPath: sshConfig.remoteHermesPath || '',
       ownershipId: sshOwnershipKey(profile),
       reuseToken: reuseToken || '',
