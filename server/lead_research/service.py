@@ -180,13 +180,14 @@ class LeadResearchService:
         by_field: dict[str, list[tuple[int, Any]]] = defaultdict(list)
         for stored in prepared_evidence:
             priority = 0 if stored["source"].classification == "official" else 1
-            for field in ("company_name", "domain", "country"):
+            for field in ("company_name", "domain", "country", "registry_id"):
                 for value in stored["source"].facts.get(field, []):
                     if value and all(existing != value for _, existing in by_field[field]):
                         by_field[field].append((priority, value))
         names = [value for _, value in sorted(by_field["company_name"])]
         domains = [value for _, value in sorted(by_field["domain"])]
         countries = [value for _, value in sorted(by_field["country"])]
+        registry_ids = [value for _, value in sorted(by_field["registry_id"])]
         if not names and not domains:
             return None
         return {
@@ -197,6 +198,7 @@ class LeadResearchService:
             "legal_name": names[0] if names else None,
             "domain": domains[0] if domains else None,
             "country": countries[0] if countries else None,
+            "registry_id": registry_ids[0] if registry_ids else None,
             "evidence_backed_fields": sorted(
                 field for field, values in by_field.items() if values
             ),
@@ -218,6 +220,58 @@ class LeadResearchService:
                 issue_type, "open", json_dump(data), stamp, stamp,
             ),
         )
+
+    def _try_save_processing_issue(
+        self,
+        company_id: str,
+        campaign_id: str,
+        organization_id: str | None,
+        issue_type: str,
+        data: dict,
+    ) -> bool:
+        """Keep diagnostic storage from becoming a second orchestration failure."""
+        try:
+            self._save_processing_issue(
+                company_id, campaign_id, organization_id, issue_type, data,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _finalize_terminal_state(
+        self,
+        company_id: str,
+        campaign_id: str,
+        run_id: str | None,
+        final_status: str,
+        output: dict,
+    ) -> list[dict]:
+        """Attempt campaign and run terminal writes independently."""
+        errors: list[dict] = []
+        try:
+            self.db.execute(
+                "UPDATE research_campaigns SET status=?,updated_at=? WHERE id=? AND company_id=?",
+                (final_status, now(), campaign_id, company_id),
+            )
+        except Exception as exc:
+            errors.append({"stage": "campaign_terminal_update", "message": str(exc)[:240]})
+
+        if errors:
+            output["terminal_errors"] = list(errors)
+        if run_id:
+            try:
+                self.db.execute(
+                    "UPDATE agent_runs SET status=?,output=?,completed_at=?,updated_at=? "
+                    "WHERE id=? AND company_id=?",
+                    (
+                        "failed" if final_status == "failed" or errors else "succeeded",
+                        json_dump(output), now(), now(), run_id, company_id,
+                    ),
+                )
+            except Exception as exc:
+                errors.append({"stage": "agent_run_terminal_update", "message": str(exc)[:240]})
+                output["terminal_errors"] = list(errors)
+        return errors
 
     def _candidate_payload(self, candidate: CandidateRecord, config: CampaignConfig) -> dict:
         return {
@@ -319,6 +373,43 @@ class LeadResearchService:
         return lead_id
 
     def run(self, company_id: str, campaign_id: str) -> dict:
+        """Guarantee a terminalization attempt around all started-run work."""
+        result: dict | None = None
+        outer_error: Exception | None = None
+        fallback_run_id: str | None = None
+        fallback_output: dict = {"campaign_id": campaign_id, "metrics": {}, "failed_source_ids": []}
+        try:
+            result = self._run_campaign(company_id, campaign_id)
+        except Exception as exc:
+            outer_error = exc
+            try:
+                campaign = self.db.one(
+                    "SELECT run_id FROM research_campaigns WHERE id=? AND company_id=?",
+                    (campaign_id, company_id),
+                )
+                fallback_run_id = campaign["run_id"] if campaign else None
+            except Exception:
+                fallback_run_id = None
+            diagnostic = {"stage": "campaign_processing", "message": str(exc)[:240]}
+            fallback_output["processing_error"] = diagnostic
+            self._try_save_processing_issue(
+                company_id, campaign_id, None, "campaign_processing_failed", diagnostic,
+            )
+        finally:
+            if outer_error is not None:
+                self._finalize_terminal_state(
+                    company_id, campaign_id, fallback_run_id, "failed", fallback_output,
+                )
+        if outer_error is not None:
+            return {
+                "status": "failed",
+                "run_id": fallback_run_id,
+                **fallback_output,
+            }
+        assert result is not None
+        return result
+
+    def _run_campaign(self, company_id: str, campaign_id: str) -> dict:
         row = self.db.one(
             "SELECT * FROM research_campaigns WHERE id=? AND company_id=?", (campaign_id, company_id)
         )
@@ -452,7 +543,7 @@ class LeadResearchService:
                                 "message": message,
                             })
                     if not bundles:
-                        self._save_processing_issue(
+                        self._try_save_processing_issue(
                             company_id, campaign_id, None, "candidate_processing_failed",
                             {
                                 "candidate_source_record_id": candidate.source_record_id,
@@ -466,16 +557,18 @@ class LeadResearchService:
                     evaluated_verdict = None
                     stage = "evidence"
                     try:
+                        stage = "evidence"
                         prepared_evidence = [
                             stored
                             for source_id, bundle in bundles
                             for stored in repo.prepare_verification(bundle, source_id)
                         ]
+                        stage = "claims"
                         claim_plan = self._claim_plan(prepared_evidence)
+                        stage = "identity"
                         identity_payload = self._identity_payload(prepared_evidence)
                         if not identity_payload:
                             raise RuntimeError("verification returned no evidence-backed identity")
-                        stage = "identity"
                         resolved = resolver.resolve(
                             identity_payload,
                             bundles[0][0],
@@ -493,6 +586,7 @@ class LeadResearchService:
                         claims = self._save_claim_plan(
                             company_id, campaign_id, organization_id, claim_plan
                         )
+                        stage = "eligibility"
                         candidate_for_gate = {
                             **self._candidate_payload(candidate, config),
                             "organization_id": organization_id,
@@ -501,12 +595,13 @@ class LeadResearchService:
                         if gate.eligible:
                             metrics["eligible_companies"] += 1
                         else:
-                            self._save_processing_issue(
+                            self._try_save_processing_issue(
                                 company_id, campaign_id, organization_id,
                                 "eligibility_failed", {"reasons": gate.reasons},
                             )
                         stage = "scoring"
                         score = score_lead(candidate_for_gate, claims, config.scoring)
+                        stage = "verdict"
                         official_domains = {
                             _domain(source.provenance_url)
                             for _, bundle in bundles for source in bundle.sources
@@ -521,6 +616,7 @@ class LeadResearchService:
                             candidate, claims, score, gate,
                             SourceCoverage(official_domains, independent_domains),
                         )
+                        stage = "result"
                         source_ids = list(dict.fromkeys(source_id for source_id, _ in bundles))
                         result_data = ResearchResultData(
                             reasons=evaluated_verdict.reasons,
@@ -537,7 +633,6 @@ class LeadResearchService:
                             "result_id": previous["id"] if previous else None,
                             "created_at": previous["created_at"] if previous else None,
                         }
-                        stage = "result"
                         repo.upsert_result(
                             campaign_id=campaign_id,
                             organization_id=organization_id,
@@ -579,7 +674,7 @@ class LeadResearchService:
                             diagnostic["evaluated_verdict"] = evaluated_verdict.kind
                         for source_id, _ in bundles:
                             partitions[(source_id, country)]["errors"].append(diagnostic)
-                        self._save_processing_issue(
+                        self._try_save_processing_issue(
                             company_id, campaign_id, organization_id,
                             "candidate_processing_failed", diagnostic,
                         )
@@ -593,7 +688,7 @@ class LeadResearchService:
                     "candidate_source_record_id": None,
                     **processing_error,
                 })
-            self._save_processing_issue(
+            self._try_save_processing_issue(
                 company_id, campaign_id, None,
                 "campaign_processing_failed", processing_error,
             )
@@ -666,19 +761,7 @@ class LeadResearchService:
             "metrics": metrics,
             "failed_source_ids": sorted(failed_sources),
         }
-        self.db.execute(
-            "UPDATE research_campaigns SET status=?,updated_at=? WHERE id=? AND company_id=?",
-            (final_status, now(), campaign_id, company_id),
-        )
-        self.db.execute(
-            "UPDATE agent_runs SET status=?,output=?,completed_at=?,updated_at=? WHERE id=? AND company_id=?",
-            (
-                "failed" if final_status == "failed" else "succeeded",
-                json_dump(output),
-                now(),
-                now(),
-                run_id,
-                company_id,
-            ),
+        self._finalize_terminal_state(
+            company_id, campaign_id, run_id, final_status, output,
         )
         return {"status": final_status, "run_id": run_id, **output}

@@ -226,8 +226,22 @@ def test_partition_failures_preserve_candidate_diagnostics(
     assert app.state.db.one("SELECT COUNT(*) AS n FROM organization_links")["n"] == results
 
 
-@pytest.mark.parametrize("stage", ["identity", "evidence", "scoring", "result"])
-def test_downstream_candidate_failures_are_bounded_and_terminal(monkeypatch, stage):
+@pytest.mark.parametrize(
+    ("stage", "expected_results"),
+    [
+        ("identity", 0),
+        ("evidence", 0),
+        ("claims", 0),
+        ("eligibility", 0),
+        ("scoring", 0),
+        ("verdict", 0),
+        ("result", 0),
+        ("lead", 2),
+    ],
+)
+def test_downstream_candidate_failures_are_bounded_and_terminal(
+    monkeypatch, stage, expected_results,
+):
     app, client, headers, _ = make_research_client()
 
     def fail(*_args, **_kwargs):
@@ -237,10 +251,18 @@ def test_downstream_candidate_failures_are_bounded_and_terminal(monkeypatch, sta
         monkeypatch.setattr(IdentityResolver, "resolve", fail)
     elif stage == "evidence":
         monkeypatch.setattr(EvidenceRepository, "save_verification", fail)
+    elif stage == "claims":
+        monkeypatch.setattr(LeadResearchService, "_save_claim_plan", fail)
+    elif stage == "eligibility":
+        monkeypatch.setattr(service_module.EligibilityService, "evaluate", fail)
     elif stage == "scoring":
         monkeypatch.setattr(service_module, "score_lead", fail)
-    else:
+    elif stage == "verdict":
+        monkeypatch.setattr(service_module, "evaluate_verdict", fail)
+    elif stage == "result":
         monkeypatch.setattr(EvidenceRepository, "upsert_result", fail)
+    else:
+        monkeypatch.setattr(LeadResearchService, "_upsert_lead", fail)
     body = campaign_body()
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
@@ -275,7 +297,94 @@ def test_downstream_candidate_failures_are_bounded_and_terminal(monkeypatch, sta
     } == {("buyer-de-1", stage), ("buyer-de-2", stage)}
     assert app.state.db.one(
         "SELECT COUNT(*) AS n FROM research_results WHERE campaign_id=?", (campaign["id"],)
-    )["n"] == 0
+    )["n"] == expected_results
+    if stage == "lead":
+        assert app.state.db.one(
+            "SELECT COUNT(*) AS n FROM research_results WHERE campaign_id=? AND lead_id IS NULL",
+            (campaign["id"],),
+        )["n"] == expected_results
+
+
+def test_diagnostic_persistence_failure_cannot_escape_candidate_boundary(monkeypatch):
+    app, client, headers, _ = make_research_client()
+
+    def fail_scoring(*_args, **_kwargs):
+        raise RuntimeError("injected scoring failure")
+
+    def fail_issue(*_args, **_kwargs):
+        raise RuntimeError("injected diagnostic persistence failure")
+
+    monkeypatch.setattr(service_module, "score_lead", fail_scoring)
+    monkeypatch.setattr(LeadResearchService, "_save_processing_issue", fail_issue)
+    body = campaign_body()
+    body["target_countries"] = ["DE"]
+    campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
+
+    response = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "failed"
+    persisted_campaign = app.state.db.one(
+        "SELECT status,run_id FROM research_campaigns WHERE id=?", (campaign["id"],)
+    )
+    assert persisted_campaign["status"] == "failed"
+    assert app.state.db.one(
+        "SELECT status FROM agent_runs WHERE id=?", (persisted_campaign["run_id"],)
+    )["status"] == "failed"
+    source_run = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/source-runs", headers=headers,
+    ).json()[0]
+    assert {
+        (error["candidate_source_record_id"], error["stage"])
+        for error in source_run["metrics"]["errors"]
+    } == {("buyer-de-1", "scoring"), ("buyer-de-2", "scoring")}
+    assert client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/issues", headers=headers,
+    ).json() == []
+
+
+@pytest.mark.parametrize("failing_update", ["campaign", "agent_run"])
+def test_terminal_updates_are_attempted_independently(monkeypatch, failing_update):
+    app, client, headers, _ = make_research_client()
+    body = campaign_body()
+    body["target_countries"] = ["DE"]
+    campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
+    execute = app.state.db.execute
+
+    def selectively_fail(sql, params=()):
+        is_campaign_terminal = sql.startswith(
+            "UPDATE research_campaigns SET status=?,updated_at=?"
+        )
+        is_agent_terminal = sql.startswith(
+            "UPDATE agent_runs SET status=?,output=?,completed_at=?,updated_at=?"
+        )
+        if (failing_update == "campaign" and is_campaign_terminal) or (
+            failing_update == "agent_run" and is_agent_terminal
+        ):
+            raise RuntimeError(f"injected {failing_update} terminal update failure")
+        return execute(sql, params)
+
+    monkeypatch.setattr(app.state.db, "execute", selectively_fail)
+
+    response = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
+    )
+
+    assert response.status_code == 202
+    persisted_campaign = app.state.db.one(
+        "SELECT status,run_id FROM research_campaigns WHERE id=?", (campaign["id"],)
+    )
+    agent_status = app.state.db.one(
+        "SELECT status FROM agent_runs WHERE id=?", (persisted_campaign["run_id"],)
+    )["status"]
+    if failing_update == "campaign":
+        assert persisted_campaign["status"] == "running"
+        assert agent_status == "failed"
+    else:
+        assert persisted_campaign["status"] == "succeeded"
+        assert agent_status == "running"
 
 
 class FilteringCandidates:
@@ -387,6 +496,8 @@ class EvidenceIdentityVerifier:
             facts = {**source.facts, "company_name": [verified_name]}
             if source.classification == "official":
                 facts["domain"] = [verified_domain]
+                facts["registry_id"] = [f"REG-{candidate.source_record_id}"]
+                facts.pop("country", None)
                 source = source.model_copy(update={
                     "provenance_url": f"https://{verified_domain}",
                     "retrieved_via": f"https://{verified_domain}",
@@ -435,3 +546,72 @@ def test_organization_identity_is_written_from_verified_facts_not_candidate_hint
     ).json()
     atlas_lead = next(lead for lead in leads if lead["company_name"].startswith("Verified Atlas"))
     assert atlas_lead["website"] == "verified-buyer-de-1.example.test"
+
+
+@pytest.mark.parametrize("match_mode", ["verified_identifier", "candidate_hint"])
+def test_existing_identity_match_refreshes_verified_facts_links_and_lead(match_mode):
+    app, client, headers, company_id = make_research_client()
+    definition = fixture_definition()
+    provider = EvidenceIdentityVerifier(deterministic_provider(definition))
+    app.state.lead_research = LeadResearchService(
+        app.state.db,
+        registry=ProviderRegistry([definition], {definition.source_id: provider}),
+    )
+    resolver = IdentityResolver(app.state.db, company_id)
+    matched_domain = (
+        "verified-buyer-de-1.example.test"
+        if match_mode == "verified_identifier"
+        else "atlas-de.example.test"
+    )
+    existing = resolver.resolve(
+        {
+            "display_name": "Legacy Atlas Name",
+            "domain": matched_domain,
+            "country": "DE",
+            "legacy_note": "preserve me",
+        },
+        "legacy-verified-source",
+    )
+    body = campaign_body()
+    body["target_countries"] = ["DE"]
+    campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
+
+    response = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "succeeded"
+    organization = app.state.db.one(
+        "SELECT display_name,domain,country,data FROM organizations WHERE id=?",
+        (existing["organization_id"],),
+    )
+    assert organization["display_name"] == "Verified Atlas DE GmbH"
+    assert organization["domain"] == "verified-buyer-de-1.example.test"
+    assert organization["country"] == "DE"
+    organization_data = json.loads(organization["data"])
+    assert organization_data["legacy_note"] == "preserve me"
+    assert organization_data["display_name"] == "Verified Atlas DE GmbH"
+    assert organization_data["registry_id"] == "REG-buyer-de-1"
+    links = {
+        (row["identifier_type"], row["identifier_value"], row["organization_id"])
+        for row in app.state.db.all(
+            "SELECT identifier_type,identifier_value,organization_id FROM organization_links"
+        )
+    }
+    assert (
+        "domain", "verified-buyer-de-1.example.test", existing["organization_id"]
+    ) in links
+    assert (
+        "registry_id", "DE:REG-buyer-de-1", existing["organization_id"]
+    ) in links
+    leads = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/leads", headers=headers,
+    ).json()
+    refreshed_lead = next(
+        lead for lead in leads
+        if lead["organization_id"] == existing["organization_id"]
+    )
+    assert refreshed_lead["company_name"] == "Verified Atlas DE GmbH"
+    assert refreshed_lead["website"] == "verified-buyer-de-1.example.test"
+    assert refreshed_lead["country"] == "DE"
