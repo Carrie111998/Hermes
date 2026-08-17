@@ -224,11 +224,18 @@ def campaign_leads(campaign_id: str, request: Request,
     company_id = _scope(principal, x_company_id)
     _row(request, company_id, campaign_id)
     result = []
-    for row in request.app.state.db.all("SELECT * FROM leads WHERE company_id=? ORDER BY created_at DESC", (company_id,)):
+    rows = request.app.state.db.all(
+        "SELECT leads.* FROM research_results "
+        "JOIN leads ON leads.id=research_results.lead_id AND leads.company_id=research_results.company_id "
+        "WHERE research_results.company_id=? AND research_results.campaign_id=? "
+        "AND research_results.verdict IN ('strong_fit','review') "
+        "ORDER BY leads.created_at DESC",
+        (company_id, campaign_id),
+    )
+    for row in rows:
         data = json_load(row["data"], {})
-        if data.get("research_campaign_id") == campaign_id:
-            result.append({"id": row["id"], "company_name": row["company_name"], "website": row["website"],
-                           "country": row["country"], "status": row["status"], **data})
+        result.append({"id": row["id"], "company_name": row["company_name"], "website": row["website"],
+                       "country": row["country"], "status": row["status"], **data})
     return result
 
 

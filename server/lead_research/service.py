@@ -127,18 +127,13 @@ class LeadResearchService:
         )
         return claim
 
-    def _claims_from_evidence(
-        self,
-        company_id: str,
-        campaign_id: str,
-        organization_id: str,
-        stored_evidence: list[dict],
-    ) -> list[Claim]:
+    def _claim_plan(self, prepared_evidence: list[dict]) -> list[dict]:
+        """Derive bounded claim writes before any tenant identity is created."""
         facts: dict[str, list[dict]] = defaultdict(list)
-        for stored in stored_evidence:
+        for stored in prepared_evidence:
             for field, values in stored["source"].facts.items():
                 facts[field].append({**stored, "values": values})
-        claims: list[Claim] = []
+        plan: list[dict] = []
         scalar_fields = {"company_name", "country", "domain"}
         for field in sorted(facts):
             entries = facts[field]
@@ -151,18 +146,78 @@ class LeadResearchService:
                 continue
             conflicting = field in scalar_fields and len(values) > 1
             value: Any = values[0] if len(values) == 1 else values
-            claims.append(self._save_claim(
+            plan.append({
+                "field": field,
+                "value": value,
+                "evidence_ids": list(dict.fromkeys(entry["evidence_id"] for entry in entries)),
+                "source_ids": list(dict.fromkeys(entry["source_id"] for entry in entries)),
+                "confidence": round(
+                    sum(entry["confidence"] for entry in entries) / len(entries), 3
+                ),
+                "status": "conflicted" if conflicting else "observed",
+            })
+        return plan
+
+    def _save_claim_plan(
+        self,
+        company_id: str,
+        campaign_id: str,
+        organization_id: str,
+        plan: list[dict],
+    ) -> list[Claim]:
+        return [
+            self._save_claim(
                 company_id,
                 campaign_id,
                 organization_id,
-                field,
-                value,
-                list(dict.fromkeys(entry["evidence_id"] for entry in entries)),
-                list(dict.fromkeys(entry["source_id"] for entry in entries)),
-                round(sum(entry["confidence"] for entry in entries) / len(entries), 3),
-                "conflicted" if conflicting else "observed",
-            ))
-        return claims
+                **item,
+            )
+            for item in plan
+        ]
+
+    @staticmethod
+    def _identity_payload(prepared_evidence: list[dict]) -> dict | None:
+        by_field: dict[str, list[tuple[int, Any]]] = defaultdict(list)
+        for stored in prepared_evidence:
+            priority = 0 if stored["source"].classification == "official" else 1
+            for field in ("company_name", "domain", "country"):
+                for value in stored["source"].facts.get(field, []):
+                    if value and all(existing != value for _, existing in by_field[field]):
+                        by_field[field].append((priority, value))
+        names = [value for _, value in sorted(by_field["company_name"])]
+        domains = [value for _, value in sorted(by_field["domain"])]
+        countries = [value for _, value in sorted(by_field["country"])]
+        if not names and not domains:
+            return None
+        return {
+            # A verified domain is a bounded display fallback when no source
+            # supplies a name. Candidate-corpus names remain matching hints,
+            # never stored organization facts.
+            "display_name": names[0] if names else domains[0],
+            "legal_name": names[0] if names else None,
+            "domain": domains[0] if domains else None,
+            "country": countries[0] if countries else None,
+            "evidence_backed_fields": sorted(
+                field for field, values in by_field.items() if values
+            ),
+        }
+
+    def _save_processing_issue(
+        self,
+        company_id: str,
+        campaign_id: str,
+        organization_id: str | None,
+        issue_type: str,
+        data: dict,
+    ) -> None:
+        stamp = now()
+        self.db.execute(
+            "INSERT INTO research_issues VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                new_id("issue"), company_id, campaign_id, organization_id,
+                issue_type, "open", json_dump(data), stamp, stamp,
+            ),
+        )
 
     def _candidate_payload(self, candidate: CandidateRecord, config: CampaignConfig) -> dict:
         return {
@@ -191,20 +246,31 @@ class LeadResearchService:
         company_id: str,
         campaign_id: str,
         organization_id: str,
-        candidate: CandidateRecord,
         config: CampaignConfig,
         score,
         gate,
         verdict,
         source_ids: list[str],
         evidence_domains: list[str],
-        claim_count: int,
+        claims: list[Claim],
     ) -> str:
+        organization = self.db.one(
+            "SELECT display_name,domain,country FROM organizations WHERE id=? AND company_id=?",
+            (organization_id, company_id),
+        )
+        if not organization:
+            raise RuntimeError("resolved organization is missing")
+        buyer_claim = next(
+            (claim for claim in claims if claim.field == "buyer_role" and claim.status == "observed"),
+            None,
+        )
+        buyer_value = buyer_claim.value if buyer_claim else None
+        buyer_type = buyer_value[0] if isinstance(buyer_value, list) and buyer_value else buyer_value
         lead_data = {
             "organization_id": organization_id,
             "research_campaign_id": campaign_id,
             "industry": config.sector_ids[0] if config.sector_ids else None,
-            "buyer_type": (candidate.data.get("buyer_types") or [None])[0],
+            "buyer_type": buyer_type,
             "fit_score": score.fit_score,
             "evidence_confidence": score.evidence_confidence,
             "priority_band": score.priority_band,
@@ -212,7 +278,7 @@ class LeadResearchService:
             "score_dimensions": score.dimensions,
             "confidence_factors": score.confidence_factors,
             "eligibility": gate.gates,
-            "applicable_feature_completeness": round(claim_count / max(1, len(config.features)) * 100),
+            "applicable_feature_completeness": round(len(claims) / max(1, len(config.features)) * 100),
             "source_ids": source_ids,
             "top_evidence_sources": evidence_domains,
         }
@@ -222,9 +288,9 @@ class LeadResearchService:
             self.db.execute(
                 "UPDATE leads SET company_name=?,website=?,country=?,status=?,data=?,updated_at=? WHERE id=?",
                 (
-                    candidate.company_name,
-                    candidate.domain,
-                    candidate.country,
+                    organization["display_name"],
+                    organization["domain"],
+                    organization["country"],
                     lead_status,
                     json_dump(lead_data),
                     now(),
@@ -240,9 +306,9 @@ class LeadResearchService:
                 lead_id,
                 company_id,
                 None,
-                candidate.company_name,
-                candidate.domain,
-                candidate.country,
+                organization["display_name"],
+                organization["domain"],
+                organization["country"],
                 lead_status,
                 0,
                 json_dump(lead_data),
@@ -262,10 +328,24 @@ class LeadResearchService:
         self.ensure_catalog(company_id)
         stamp = now()
         run_id = new_id("run")
+        prior_results = {
+            result["organization_id"]: dict(result)
+            for result in self.db.all(
+                "SELECT * FROM research_results WHERE company_id=? AND campaign_id=?",
+                (company_id, campaign_id),
+            )
+        }
         for table in ("campaign_partitions", "campaign_metrics", "research_issues", "feature_claims"):
             self.db.execute(
                 f"DELETE FROM {table} WHERE company_id=? AND campaign_id=?", (company_id, campaign_id)
             )
+        # Results are the current campaign view, not append-only history. Preserve
+        # their identities for unchanged candidates, but remove stale visibility
+        # before rebuilding this run.
+        self.db.execute(
+            "DELETE FROM research_results WHERE company_id=? AND campaign_id=?",
+            (company_id, campaign_id),
+        )
         self.db.execute(
             "UPDATE research_campaigns SET status='running',run_id=?,updated_at=? WHERE id=? AND company_id=?",
             (run_id, stamp, campaign_id, company_id),
@@ -297,175 +377,226 @@ class LeadResearchService:
         resolver = IdentityResolver(self.db, company_id)
         eligibility = EligibilityService()
         metrics = {key: 0 for key in FUNNEL_KEYS}
-        catalog = {item["source_id"]: item for item in self.catalog(company_id)}
-        providers = {source_id: self.registry.get(source_id) for source_id in config.enabled_source_ids}
         partitions: dict[tuple[str, str], dict] = {}
-        for country in config.target_countries:
-            for source_id in config.enabled_source_ids:
-                partition_id = new_id("part")
-                source_state = catalog[source_id]
-                partitions[(source_id, country)] = {
-                    "id": partition_id,
-                    "available": source_state["available"],
-                    "reason": source_state["unavailable_reason"],
-                    "selected": 0,
-                    "verified": 0,
-                    "evidence": 0,
-                    "errors": [],
-                }
-                self.db.execute(
-                    "INSERT INTO campaign_partitions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        partition_id,
-                        company_id,
-                        campaign_id,
-                        source_id,
-                        country,
-                        config.sector_ids[0] if config.sector_ids else None,
-                        "running",
-                        None,
-                        json_dump({}),
-                        None,
-                        now(),
-                    ),
-                )
-
-        product_terms = self._product_terms(company_id, config)
-        for country in config.target_countries:
-            candidates = self.candidates.select(
-                countries=[country],
-                product_terms=product_terms,
-                limit=config.max_qualified_leads_per_country * 3,
-            )
-            metrics["raw_records"] += len(candidates)
-            metrics["named_candidates"] += len(candidates)
-            for partition in (
-                partitions[(source_id, country)] for source_id in config.enabled_source_ids
-            ):
-                partition["selected"] = len(candidates)
-
-            query = DiscoveryQuery(
-                campaign_id=campaign_id,
-                seller_countries=config.seller_countries,
-                target_countries=[country],
-                sector_ids=config.sector_ids,
-                hs_codes=config.hs_codes,
-                buyer_types=config.buyer_types,
-                max_records=config.max_qualified_leads_per_country * 3,
-            )
-            for candidate in candidates:
-                bundles: list[tuple[str, Any]] = []
+        processing_error: dict | None = None
+        try:
+            catalog = {item["source_id"]: item for item in self.catalog(company_id)}
+            providers = {
+                source_id: self.registry.get(source_id)
+                for source_id in config.enabled_source_ids
+            }
+            for country in config.target_countries:
                 for source_id in config.enabled_source_ids:
-                    partition = partitions[(source_id, country)]
-                    if not partition["available"]:
-                        continue
-                    try:
-                        bundle = providers[source_id].verify(query, candidate)
-                        if bundle.candidate_source_record_id != candidate.source_record_id:
-                            raise ValueError("verifier returned evidence for a different candidate")
-                        bundles.append((source_id, bundle))
-                        partition["verified"] += 1
-                        partition["evidence"] += len(bundle.sources)
-                    except Exception as exc:
-                        partition["errors"].append({
-                            "candidate_source_record_id": candidate.source_record_id,
-                            "message": str(exc)[:240],
-                        })
-
-                payload = self._candidate_payload(candidate, config)
-                identity_source = bundles[0][0] if bundles else candidate.dataset_id
-                resolved = resolver.resolve(payload, identity_source)
-                organization_id = resolved["organization_id"]
-                metrics["resolved_organizations"] += 1
-                stored_evidence = [
-                    stored
-                    for source_id, bundle in bundles
-                    for stored in repo.save_verification(
-                        bundle, source_id, campaign_id, organization_id
-                    )
-                ]
-                claims = self._claims_from_evidence(
-                    company_id, campaign_id, organization_id, stored_evidence
-                )
-                candidate_for_gate = {**payload, "organization_id": organization_id}
-                gate = eligibility.evaluate(candidate_for_gate, config)
-                if gate.eligible:
-                    metrics["eligible_companies"] += 1
-                else:
-                    issue_stamp = now()
+                    partition_id = new_id("part")
+                    source_state = catalog[source_id]
+                    partitions[(source_id, country)] = {
+                        "id": partition_id,
+                        "available": source_state["available"],
+                        "reason": source_state["unavailable_reason"],
+                        "selected": 0,
+                        "verified": 0,
+                        "completed": 0,
+                        "evidence": 0,
+                        "errors": [],
+                    }
                     self.db.execute(
-                        "INSERT INTO research_issues VALUES(?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO campaign_partitions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (
-                            new_id("issue"),
-                            company_id,
-                            campaign_id,
-                            organization_id,
-                            "eligibility_failed",
-                            "open",
-                            json_dump({"reasons": gate.reasons}),
-                            issue_stamp,
-                            issue_stamp,
+                            partition_id, company_id, campaign_id, source_id, country,
+                            config.sector_ids[0] if config.sector_ids else None,
+                            "running", None, json_dump({}), None, now(),
                         ),
                     )
-                score = score_lead(candidate_for_gate, claims, config.scoring)
-                official_domains = {
-                    _domain(source.provenance_url)
-                    for _, bundle in bundles
-                    for source in bundle.sources
-                    if source.classification == "official" and _domain(source.provenance_url)
-                }
-                independent_domains = {
-                    _domain(source.provenance_url)
-                    for _, bundle in bundles
-                    for source in bundle.sources
-                    if source.classification == "independent" and _domain(source.provenance_url)
-                }
-                coverage = SourceCoverage(official_domains, independent_domains)
-                verdict = evaluate_verdict(candidate, claims, score, gate, coverage)
-                source_ids = list(dict.fromkeys(source_id for source_id, _ in bundles))
-                result_data = ResearchResultData(
-                    reasons=verdict.reasons,
-                    missing_evidence=verdict.missing_evidence,
-                    conflicting_claims=verdict.conflicting_claims,
-                    source_ids=source_ids,
-                    official_domains=sorted(official_domains),
-                    independent_domains=sorted(independent_domains),
-                    score_dimensions=score.dimensions,
-                    confidence_factors=score.confidence_factors,
-                ).model_dump(mode="json")
-                repo.upsert_result(
-                    campaign_id=campaign_id,
-                    organization_id=organization_id,
-                    lead_id=None,
-                    verdict=verdict.kind,
-                    fit_score=score.fit_score,
-                    evidence_confidence=score.evidence_confidence,
-                    data=result_data,
+
+            product_terms = self._product_terms(company_id, config)
+            for country in config.target_countries:
+                candidates = self.candidates.select(
+                    countries=[country],
+                    product_terms=product_terms,
+                    limit=config.max_qualified_leads_per_country * 3,
                 )
-                if verdict.kind in {"strong_fit", "review"}:
-                    lead_id = self._upsert_lead(
-                        company_id,
-                        campaign_id,
-                        organization_id,
-                        candidate,
-                        config,
-                        score,
-                        gate,
-                        verdict,
-                        source_ids,
-                        sorted(official_domains | independent_domains),
-                        len(claims),
-                    )
-                    metrics["qualified_leads"] += 1
-                    repo.upsert_result(
-                        campaign_id=campaign_id,
-                        organization_id=organization_id,
-                        lead_id=lead_id,
-                        verdict=verdict.kind,
-                        fit_score=score.fit_score,
-                        evidence_confidence=score.evidence_confidence,
-                        data=result_data,
-                    )
+                metrics["raw_records"] += len(candidates)
+                metrics["named_candidates"] += len(candidates)
+                for source_id in config.enabled_source_ids:
+                    partitions[(source_id, country)]["selected"] = len(candidates)
+
+                query = DiscoveryQuery(
+                    campaign_id=campaign_id,
+                    seller_countries=config.seller_countries,
+                    target_countries=[country],
+                    sector_ids=config.sector_ids,
+                    hs_codes=config.hs_codes,
+                    buyer_types=config.buyer_types,
+                    max_records=config.max_qualified_leads_per_country * 3,
+                )
+                for candidate in candidates:
+                    bundles: list[tuple[str, Any]] = []
+                    verification_messages: list[str] = []
+                    for source_id in config.enabled_source_ids:
+                        partition = partitions[(source_id, country)]
+                        if not partition["available"]:
+                            continue
+                        try:
+                            bundle = providers[source_id].verify(query, candidate)
+                            if bundle.candidate_source_record_id != candidate.source_record_id:
+                                raise ValueError("verifier returned evidence for a different candidate")
+                            bundles.append((source_id, bundle))
+                            partition["verified"] += 1
+                            partition["evidence"] += len(bundle.sources)
+                        except Exception as exc:
+                            message = str(exc)[:240]
+                            verification_messages.append(message)
+                            partition["errors"].append({
+                                "candidate_source_record_id": candidate.source_record_id,
+                                "stage": "verification",
+                                "message": message,
+                            })
+                    if not bundles:
+                        self._save_processing_issue(
+                            company_id, campaign_id, None, "candidate_processing_failed",
+                            {
+                                "candidate_source_record_id": candidate.source_record_id,
+                                "stage": "verification",
+                                "messages": verification_messages or ["no verifier was available"],
+                            },
+                        )
+                        continue
+
+                    organization_id: str | None = None
+                    evaluated_verdict = None
+                    stage = "evidence"
+                    try:
+                        prepared_evidence = [
+                            stored
+                            for source_id, bundle in bundles
+                            for stored in repo.prepare_verification(bundle, source_id)
+                        ]
+                        claim_plan = self._claim_plan(prepared_evidence)
+                        identity_payload = self._identity_payload(prepared_evidence)
+                        if not identity_payload:
+                            raise RuntimeError("verification returned no evidence-backed identity")
+                        stage = "identity"
+                        resolved = resolver.resolve(
+                            identity_payload,
+                            bundles[0][0],
+                            matching_hints={
+                                "display_name": candidate.company_name,
+                                "domain": candidate.domain,
+                                "country": candidate.country,
+                            },
+                        )
+                        organization_id = resolved["organization_id"]
+                        metrics["resolved_organizations"] += 1
+                        stage = "evidence"
+                        repo.save_verification(prepared_evidence, campaign_id, organization_id)
+                        stage = "claims"
+                        claims = self._save_claim_plan(
+                            company_id, campaign_id, organization_id, claim_plan
+                        )
+                        candidate_for_gate = {
+                            **self._candidate_payload(candidate, config),
+                            "organization_id": organization_id,
+                        }
+                        gate = eligibility.evaluate(candidate_for_gate, config)
+                        if gate.eligible:
+                            metrics["eligible_companies"] += 1
+                        else:
+                            self._save_processing_issue(
+                                company_id, campaign_id, organization_id,
+                                "eligibility_failed", {"reasons": gate.reasons},
+                            )
+                        stage = "scoring"
+                        score = score_lead(candidate_for_gate, claims, config.scoring)
+                        official_domains = {
+                            _domain(source.provenance_url)
+                            for _, bundle in bundles for source in bundle.sources
+                            if source.classification == "official" and _domain(source.provenance_url)
+                        }
+                        independent_domains = {
+                            _domain(source.provenance_url)
+                            for _, bundle in bundles for source in bundle.sources
+                            if source.classification == "independent" and _domain(source.provenance_url)
+                        }
+                        evaluated_verdict = evaluate_verdict(
+                            candidate, claims, score, gate,
+                            SourceCoverage(official_domains, independent_domains),
+                        )
+                        source_ids = list(dict.fromkeys(source_id for source_id, _ in bundles))
+                        result_data = ResearchResultData(
+                            reasons=evaluated_verdict.reasons,
+                            missing_evidence=evaluated_verdict.missing_evidence,
+                            conflicting_claims=evaluated_verdict.conflicting_claims,
+                            source_ids=source_ids,
+                            official_domains=sorted(official_domains),
+                            independent_domains=sorted(independent_domains),
+                            score_dimensions=score.dimensions,
+                            confidence_factors=score.confidence_factors,
+                        ).model_dump(mode="json")
+                        previous = prior_results.get(organization_id)
+                        result_identity = {
+                            "result_id": previous["id"] if previous else None,
+                            "created_at": previous["created_at"] if previous else None,
+                        }
+                        stage = "result"
+                        repo.upsert_result(
+                            campaign_id=campaign_id,
+                            organization_id=organization_id,
+                            lead_id=None,
+                            verdict=evaluated_verdict.kind,
+                            fit_score=score.fit_score,
+                            evidence_confidence=score.evidence_confidence,
+                            data=result_data,
+                            **result_identity,
+                        )
+                        if evaluated_verdict.kind in {"strong_fit", "review"}:
+                            stage = "lead"
+                            lead_id = self._upsert_lead(
+                                company_id, campaign_id, organization_id, config,
+                                score, gate, evaluated_verdict, source_ids,
+                                sorted(official_domains | independent_domains), claims,
+                            )
+                            metrics["qualified_leads"] += 1
+                            stage = "result"
+                            repo.upsert_result(
+                                campaign_id=campaign_id,
+                                organization_id=organization_id,
+                                lead_id=lead_id,
+                                verdict=evaluated_verdict.kind,
+                                fit_score=score.fit_score,
+                                evidence_confidence=score.evidence_confidence,
+                                data=result_data,
+                                **result_identity,
+                            )
+                        for source_id, _ in bundles:
+                            partitions[(source_id, country)]["completed"] += 1
+                    except Exception as exc:
+                        diagnostic = {
+                            "candidate_source_record_id": candidate.source_record_id,
+                            "stage": stage,
+                            "message": str(exc)[:240],
+                        }
+                        if evaluated_verdict is not None:
+                            diagnostic["evaluated_verdict"] = evaluated_verdict.kind
+                        for source_id, _ in bundles:
+                            partitions[(source_id, country)]["errors"].append(diagnostic)
+                        self._save_processing_issue(
+                            company_id, campaign_id, organization_id,
+                            "candidate_processing_failed", diagnostic,
+                        )
+        except Exception as exc:
+            processing_error = {
+                "stage": "campaign_processing",
+                "message": str(exc)[:240],
+            }
+            for partition in partitions.values():
+                partition["errors"].append({
+                    "candidate_source_record_id": None,
+                    **processing_error,
+                })
+            self._save_processing_issue(
+                company_id, campaign_id, None,
+                "campaign_processing_failed", processing_error,
+            )
 
         partition_statuses: list[str] = []
         failed_sources: set[str] = set()
@@ -474,13 +605,21 @@ class LeadResearchService:
                 status = "skipped"
                 error_category = partition["reason"] or "unavailable"
                 failed_sources.add(source_id)
-            elif partition["errors"] and partition["verified"]:
+            elif partition["errors"] and partition["completed"]:
                 status = "partial"
-                error_category = "verification_error"
+                error_category = (
+                    "verification_error"
+                    if all(error.get("stage") == "verification" for error in partition["errors"])
+                    else "candidate_processing_error"
+                )
                 failed_sources.add(source_id)
             elif partition["errors"]:
                 status = "failed"
-                error_category = "verification_error"
+                error_category = (
+                    "verification_error"
+                    if all(error.get("stage") == "verification" for error in partition["errors"])
+                    else "candidate_processing_error"
+                )
                 failed_sources.add(source_id)
             else:
                 status = "succeeded"
@@ -489,6 +628,7 @@ class LeadResearchService:
             partition_metrics = {
                 "selected_candidates": partition["selected"],
                 "verified_candidates": partition["verified"],
+                "completed_candidates": partition["completed"],
                 "evidence_records": partition["evidence"],
                 "errors": partition["errors"],
             }
@@ -515,7 +655,7 @@ class LeadResearchService:
             and (contact["email"] or contact["phone"] or contact["linkedin_url"])
         })
         CampaignMetricsRecorder(self.db, company_id, campaign_id).save(metrics, now())
-        if all(status == "succeeded" for status in partition_statuses):
+        if partition_statuses and all(status == "succeeded" for status in partition_statuses):
             final_status = "succeeded"
         elif any(status in {"succeeded", "partial"} for status in partition_statuses):
             final_status = "partial"

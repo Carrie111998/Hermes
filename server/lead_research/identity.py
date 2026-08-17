@@ -10,7 +10,7 @@ class IdentityResolver:
         self.db = db
         self.company_id = company_id
 
-    def resolve(self, payload: dict, source_id: str) -> dict:
+    def resolve(self, payload: dict, source_id: str, matching_hints: dict | None = None) -> dict:
         identifiers = []
         if payload.get("registry_id"):
             identifiers.append(("registry_id", f"{payload.get('country', '')}:{payload['registry_id']}"))
@@ -23,6 +23,19 @@ class IdentityResolver:
             )
             if row:
                 return {"organization_id": row["organization_id"], "created": False, "matched_by": kind}
+        # Candidate-corpus fields may locate an identity already established by
+        # evidence, but never create a new organization link or stored fact.
+        matching_hints = matching_hints or {}
+        hint_domain = matching_hints.get("domain")
+        if hint_domain:
+            value = str(hint_domain).lower().removeprefix("www.")
+            row = self.db.one(
+                "SELECT organization_id FROM organization_links "
+                "WHERE company_id=? AND identifier_type='domain' AND identifier_value=?",
+                (self.company_id, value),
+            )
+            if row:
+                return {"organization_id": row["organization_id"], "created": False, "matched_by": "domain_hint"}
         organization_id, stamp = new_id("org"), now()
         display = payload.get("display_name") or payload.get("legal_name") or "Unknown organization"
         self.db.execute(

@@ -82,45 +82,16 @@ class EvidenceRepository:
             ))
         return saved
 
-    def save_verification(
+    def prepare_verification(
         self,
         bundle: VerificationBundle,
         source_id: str,
-        campaign_id: str,
-        organization_id: str,
     ) -> list[dict]:
-        """Persist cited verification hashes as snapshots and normalized evidence."""
-        stored: list[dict] = []
-        stamp = now()
+        """Derive immutable evidence identities without writing tenant state."""
+        prepared: list[dict] = []
         for source in bundle.sources:
-            snapshot = self.db.one(
-                "SELECT id FROM dataset_snapshots WHERE company_id=? AND source_id=? AND raw_hash=?",
-                (self.company_id, source_id, source.raw_hash),
-            )
-            if snapshot:
-                snapshot_id = snapshot["id"]
-            else:
-                seed = f"{self.company_id}:{source_id}:{source.raw_hash}".encode()
-                snapshot_id = f"snap_{hashlib.sha256(seed).hexdigest()[:20]}"
-                self.db.execute(
-                    "INSERT INTO dataset_snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        snapshot_id,
-                        self.company_id,
-                        source_id,
-                        campaign_id,
-                        "valid",
-                        None,
-                        source.raw_hash,
-                        1,
-                        json_dump({
-                            "provenance_url": source.provenance_url,
-                            "retrieved_via": source.retrieved_via,
-                            "classification": source.classification,
-                        }),
-                        stamp,
-                    ),
-                )
+            seed = f"{self.company_id}:{source_id}:{source.raw_hash}".encode()
+            snapshot_id = f"snap_{hashlib.sha256(seed).hexdigest()[:20]}"
             evidence_seed = (
                 f"{self.company_id}:{source_id}:{bundle.candidate_source_record_id}:"
                 f"{source.provenance_url}:{source.raw_hash}"
@@ -143,16 +114,54 @@ class EvidenceRepository:
                     "retrieved_via": source.retrieved_via,
                 },
             )
-            self.save_evidence([envelope], campaign_id, {
-                envelope.source_record_id: organization_id,
-            })
-            stored.append({
+            prepared.append({
                 "evidence_id": evidence_id,
                 "source_id": source_id,
                 "source": source,
                 "confidence": envelope.confidence,
+                "envelope": envelope,
             })
-        return stored
+        return prepared
+
+    def save_verification(
+        self,
+        prepared: list[dict],
+        campaign_id: str,
+        organization_id: str,
+    ) -> list[dict]:
+        """Persist an already-derived verification plan after identity resolution."""
+        stamp = now()
+        for stored in prepared:
+            source = stored["source"]
+            envelope = stored["envelope"]
+            snapshot = self.db.one(
+                "SELECT id FROM dataset_snapshots WHERE company_id=? AND source_id=? AND raw_hash=?",
+                (self.company_id, stored["source_id"], source.raw_hash),
+            )
+            if not snapshot:
+                self.db.execute(
+                    "INSERT INTO dataset_snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        envelope.snapshot_id,
+                        self.company_id,
+                        stored["source_id"],
+                        campaign_id,
+                        "valid",
+                        None,
+                        source.raw_hash,
+                        1,
+                        json_dump({
+                            "provenance_url": source.provenance_url,
+                            "retrieved_via": source.retrieved_via,
+                            "classification": source.classification,
+                        }),
+                        stamp,
+                    ),
+                )
+            self.save_evidence([envelope], campaign_id, {
+                envelope.source_record_id: organization_id,
+            })
+        return prepared
 
     def upsert_result(
         self,
@@ -164,13 +173,15 @@ class EvidenceRepository:
         fit_score: int,
         evidence_confidence: float,
         data: dict,
+        result_id: str | None = None,
+        created_at: float | None = None,
     ) -> str:
         existing = self.db.one(
             "SELECT id,created_at FROM research_results "
             "WHERE company_id=? AND campaign_id=? AND organization_id=?",
             (self.company_id, campaign_id, organization_id),
         )
-        result_id = existing["id"] if existing else new_id("result")
+        result_id = existing["id"] if existing else result_id or new_id("result")
         stamp = now()
         self.db.execute(
             "INSERT INTO research_results("
@@ -189,7 +200,7 @@ class EvidenceRepository:
                 fit_score,
                 evidence_confidence,
                 json_dump(data),
-                existing["created_at"] if existing else stamp,
+                existing["created_at"] if existing else created_at or stamp,
                 stamp,
             ),
         )
