@@ -3613,26 +3613,33 @@ def delegate_task(
         _has_provider_override = (
             _agent_def.base_url or _agent_def.provider or _agent_def.api_key
         )
-        if _has_provider_override and _agent_def.model:
-            creds["model"] = _agent_def.model
-        elif _agent_def.model and not _has_provider_override:
+        # Treat empty/None/"None" strings as not set
+        _model = str(_agent_def.model or "").strip()
+        _model_set = _model and _model.lower() != "none"
+        if _has_provider_override and _model_set:
+            creds["model"] = _model
+        elif _model_set and not _has_provider_override:
             # Model-only override without provider — skip model override
             # so child inherits parent's full provider+model bundle.
-            # Store as hint for context injection only.
             logger.debug(
                 "Agent '%s' has model '%s' but no provider — "
                 "inheriting parent provider+model instead",
-                _agent_def.name, _agent_def.model,
+                _agent_def.name, _model,
             )
         # Provider overrides (base_url, provider, api_mode, api_key)
-        if _agent_def.base_url:
-            creds["base_url"] = _agent_def.base_url
-        if _agent_def.provider:
-            creds["provider"] = _agent_def.provider
-        if _agent_def.api_mode:
-            creds["api_mode"] = _agent_def.api_mode
-        if _agent_def.api_key:
-            creds["api_key"] = _agent_def.api_key
+        # Also treat "None" strings as not set
+        _base_url = str(_agent_def.base_url or "").strip()
+        _provider = str(_agent_def.provider or "").strip()
+        _api_mode = str(_agent_def.api_mode or "").strip()
+        _api_key = str(_agent_def.api_key or "").strip()
+        if _base_url and _base_url.lower() != "none":
+            creds["base_url"] = _base_url
+        if _provider and _provider.lower() != "none":
+            creds["provider"] = _provider
+        if _api_mode and _api_mode.lower() != "none":
+            creds["api_mode"] = _api_mode
+        if _api_key and _api_key.lower() != "none":
+            creds["api_key"] = _api_key
         # Agent-specific reasoning overrides delegation config
         if _agent_def.reasoning and _agent_def.reasoning != "medium":
             try:

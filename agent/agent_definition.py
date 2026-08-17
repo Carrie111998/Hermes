@@ -118,11 +118,12 @@ def parse_agent_file(file_path: Path) -> Optional[AgentDefinition]:
             name = file_path.stem
         
         # Extract optional fields with defaults
-        model = str(frontmatter.get('model', ''))
-        base_url = str(frontmatter.get('base_url', ''))
-        provider = str(frontmatter.get('provider', ''))
-        api_mode = str(frontmatter.get('api_mode', ''))
-        api_key = str(frontmatter.get('api_key', ''))
+        # Use (x or "") to convert YAML None to empty string
+        model = str(frontmatter.get('model') or '')
+        base_url = str(frontmatter.get('base_url') or '')
+        provider = str(frontmatter.get('provider') or '')
+        api_mode = str(frontmatter.get('api_mode') or '')
+        api_key = str(frontmatter.get('api_key') or '')
         reasoning = str(frontmatter.get('reasoning', 'medium'))
         temperature = float(frontmatter.get('temperature', 0.7))
         top_p = float(frontmatter.get('top_p', 0.9))
