@@ -894,6 +894,49 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"Session '{args.session_id}' not found.")
             return 1
 
+    elif action == "cold-store":
+        resolved_session_id = db.resolve_session_id(args.session_id)
+        if not resolved_session_id:
+            print(
+                f"Session '{args.session_id}' was not found or is ambiguous."
+            )
+            db.close()
+            return 1
+
+        archive_root = args.root.expanduser()
+        if args.dry_run:
+            print(
+                f"Would store archived session lineage '{resolved_session_id}' "
+                f"under {archive_root}; nothing was written."
+            )
+            db.close()
+            return
+
+        if not args.yes and not _confirm_prompt(
+            f"Store session lineage '{resolved_session_id}' as sensitive raw "
+            f"transcript output under {archive_root}? [y/N] "
+        ):
+            print("Cancelled.")
+            db.close()
+            return
+
+        from hermes_cli.session_cold_store import store_archived_lineage
+
+        try:
+            stored = store_archived_lineage(
+                db, resolved_session_id, archive_root
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Error: could not cold-store session lineage: {exc}")
+            db.close()
+            return 1
+
+        print("Stored archived session lineage:")
+        print(f"  terminal ID: {stored.terminal_id}")
+        print(f"  physical IDs: {', '.join(stored.physical_ids)}")
+        print(f"  fingerprint: {stored.source_fingerprint}")
+        print(f"  local snapshot: {stored.revision_dir}")
+
     elif action == "prune" and getattr(args, "never_active", False):
         # Separate branch on purpose: the shared prune/archive selector is
         # pinned to `ended_at IS NOT NULL`, so never-closed rows sit outside

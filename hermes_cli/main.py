@@ -13787,6 +13787,30 @@ def main():
         "bare number of days, or ISO timestamp)",
     )
 
+    sessions_cold_store = sessions_subparsers.add_parser(
+        "cold-store",
+        help="Store one archived terminal session lineage under a local root",
+    )
+    sessions_cold_store.add_argument(
+        "root",
+        type=Path,
+        metavar="ROOT",
+        help="Local archive root for sensitive raw transcript output",
+    )
+    sessions_cold_store.add_argument(
+        "--session-id",
+        required=True,
+        help="Exact session ID or unique prefix to store",
+    )
+    sessions_cold_store.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and report the requested store without writing anything",
+    )
+    sessions_cold_store.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation"
+    )
+
     sessions_subparsers.add_parser(
         "optimize",
         help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)",
