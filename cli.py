@@ -15664,36 +15664,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Build mode-specific instructions
                     if self._interaction_mode == 'plan':
                         _mode_note = (
-                            "[System: Current interaction mode: PLAN. "
-                            "All tool execution is disabled. You may still use read-only tools "
-                            "(read_file, search_files, session_search, skill_view, skills_list) "
-                            "to gather context. "
-                            "Do NOT fabricate answers — read the actual code first. "
-                            "Do not attempt to write, edit, or execute any tools.\n\n"
-                            "PLAN mode behavior:\n"
-                            "- Q&A: answer questions with critical analysis\n"
-                            "- Explore: read code, search files, understand architecture\n"
-                            "- Load skills: use skill_view/skills_list for relevant knowledge\n"
-                            "- Create PRD: create .ares/prd/ files when planning features\n"
-                            "- Critique: sharp, direct, no sugarcoating — problem + solution\n"
-                            "- Research: use context7 for library docs, web_search for references\n"
-                            "- Plan: break down tasks, create roadmap, identify risks\n"
-                            "- Do NOT: write code, edit files, run commands, deploy, commit]"
+                            "[System: Current interaction mode: PLAN.\n"
+                            "Plan mode is active for safe exploring, research, analysis, and architecture design. "
+                            "Modifying tools (write_file, patch, terminal commands that alter state) are disabled in this mode. "
+                            "Read-only tools (read_file, search_files, session_search, skill_view, skills_list) remain available.\n\n"
+                            "PLAN mode guidelines:\n"
+                            "- Answer user questions with critical analysis and concrete recommendations\n"
+                            "- Explore and understand the codebase before formulating plans\n"
+                            "- Research and design architecture, workflows, and task roadmaps\n"
+                            "- Do not attempt to write code, edit files, or execute mutating actions directly]"
                         )
                     else:
                         _mode_note = (
-                            "[System: Current interaction mode: BUILD. "
-                            "Tools are enabled. You may use all available tools.\n\n"
-                            "BUILD mode behavior:\n"
-                            "- Explore FIRST: read code, search files, understand structure before writing\n"
-                            "- Find exact location: locate the file, function, line number before editing\n"
-                            "- Verify approach: confirm your fix/approach is correct before implementing\n"
-                            "- Execute: write code, edit files, run commands only after exploration\n"
-                            "- Test: run tests, verify changes, check results\n"
-                            "- Deploy: commit, push, deploy when asked\n"
-                            "- Delegate: use delegate_task for subagent work\n"
-                            "- Verify: confirm changes work before reporting done\n"
-                            "- Do NOT: guess, assume, write without reading, skip exploration]"
+                            "[System: Current interaction mode: BUILD.\n"
+                            "Full tool execution is enabled for implementing changes.\n\n"
+                            "BUILD mode guidelines:\n"
+                            "- Explore first: read code, locate exact symbols/functions before editing\n"
+                            "- Implement minimal, robust changes matching project conventions\n"
+                            "- Run tests and verify changes before reporting completion\n"
+                            "- Use delegate_task to orchestrate subagent workstreams when appropriate]"
                         )
                     agent_message = _mode_note + "\n\n" + agent_message
                     result = self.agent.run_conversation(

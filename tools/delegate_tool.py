@@ -2641,13 +2641,9 @@ def _run_single_child(
             if _agent_skill_path:
                 _prev_skill_path = os.environ.get("HERMES_SKILL_PATH")
                 os.environ["HERMES_SKILL_PATH"] = str(_agent_skill_path)
-                from agent.agent_debug import log_env_inject
-                log_env_inject("HERMES_SKILL_PATH", str(_agent_skill_path))
             if _agent_skills:
                 _prev_allowed_skills = os.environ.get("HERMES_ALLOWED_SKILLS")
                 os.environ["HERMES_ALLOWED_SKILLS"] = ",".join(_agent_skills)
-                from agent.agent_debug import log_env_inject
-                log_env_inject("HERMES_ALLOWED_SKILLS", ",".join(_agent_skills))
             try:
                 with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                     return child.run_conversation(
@@ -3515,8 +3511,6 @@ def delegate_task(
     _agent_def = None
     if agent:
         try:
-            from agent.agent_debug import log_delegate_start, log_registry_load, log_registry_lookup, log_error
-            log_delegate_start(agent or "", goal or "")
             from agent.agent_registry import get_agent_registry, load_agents_from_config
             from hermes_cli.config import load_config
             registry = get_agent_registry()
@@ -3526,14 +3520,12 @@ def delegate_task(
             try:
                 cfg = load_config()
                 n = load_agents_from_config(cfg)
-                log_registry_load("config", n, list(registry.agents.keys()))
             except Exception as exc:
-                log_error("config_load", str(exc))
+                logger.debug("config_load: %s", exc)
             from pathlib import Path
             for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
                 if d.exists():
                     n = registry.load_from_directory(d)
-                    log_registry_load(str(d), n, list(registry.agents.keys()))
             _agent_def = registry.get_agent(agent)
             if _agent_def is None:
                 # Force reload — registry may be stale (loaded with old validator)
@@ -3543,16 +3535,13 @@ def delegate_task(
                 try:
                     cfg = load_config()
                     n = load_agents_from_config(cfg)
-                    log_registry_load("config_reload", n, list(registry.agents.keys()))
                 except Exception as exc:
-                    log_error("config_reload", str(exc))
+                    logger.debug("config_reload: %s", exc)
                 from pathlib import Path
                 for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
                     if d.exists():
                         n = registry.load_from_directory(d)
-                        log_registry_load(f"{d}_reload", n, list(registry.agents.keys()))
                 _agent_def = registry.get_agent(agent)
-            log_registry_lookup(agent or "", _agent_def is not None, len(registry.agents))
             if _agent_def is None:
                 return tool_error(f"Agent '{agent}' not found. Registry has: {list(registry.agents.keys()) if registry.agents else 'empty'}")
         except Exception as exc:
@@ -3926,8 +3915,6 @@ def delegate_task(
             if task_agent_def.skill_path:
                 try:
                     child._agent_skill_path = Path(task_agent_def.skill_path)
-                    from agent.agent_debug import log_skill_path as _log_sp
-                    _log_sp(task_agent_def.name, task_agent_def.skill_path, task_agent_def.skills)
                 except Exception:
                     logger.debug("Could not attach skill_path to child %d", i)
             if task_agent_def.skills:

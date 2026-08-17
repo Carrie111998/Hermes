@@ -536,11 +536,6 @@ def get_external_skills_dirs() -> List[Path]:
     """
     # Per-agent skill_path override — restrict to only that directory
     if os.environ.get("HERMES_SKILL_PATH", "").strip():
-        try:
-            from agent.agent_debug import _write as _dbg_write
-            _dbg_write(f"EXTERNAL_DIRS blocked by HERMES_SKILL_PATH={os.environ['HERMES_SKILL_PATH']}")
-        except Exception:
-            pass
         return []
     config_path = get_config_path()
     if not config_path.exists():
