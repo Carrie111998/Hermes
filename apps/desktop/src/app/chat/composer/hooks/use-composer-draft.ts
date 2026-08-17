@@ -43,7 +43,8 @@ import {
   normalizeComposerEditorDom,
   placeCaretEnd,
   REF_RE,
-  renderComposerContents
+  renderComposerContents,
+  syncElementTextDirection
 } from '../rich-editor'
 import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
@@ -278,6 +279,7 @@ export function useComposerDraft({
     normalizeComposerEditorDom(editor)
 
     const text = sanitizeComposerInput(composerPlainText(editor))
+    syncElementTextDirection(editor, text)
 
     if (text !== draftRef.current) {
       draftRef.current = text
