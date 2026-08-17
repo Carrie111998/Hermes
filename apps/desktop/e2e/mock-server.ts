@@ -339,7 +339,6 @@ const BLOCKING_CLARIFY_TURN: ScriptedTurn = {
   toolCalls: [{ name: 'clarify', args: { question: BLOCKING_CLARIFY_QUESTION, choices: ['Yes', 'No'] } }],
 }
 
-
 function includesBlockingClarifyTrigger(value: unknown): boolean {
   if (typeof value === 'string') {
     return value.includes(BLOCKING_CLARIFY_TRIGGER)
@@ -493,7 +492,6 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
             }
             return
           }
-
 
           if (isQueueStopTrigger) {
             const turn = QUEUE_STOP_SCRIPT[_queueStopIndex] ?? QUEUE_STOP_SCRIPT[QUEUE_STOP_SCRIPT.length - 1]
