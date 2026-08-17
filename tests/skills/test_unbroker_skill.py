@@ -496,10 +496,13 @@ def test_fanout_default_batch_size_is_five():
 # --- cdp (operator browser over the DevTools protocol) --------------------------------------
 
 def test_cdp_launch_command_has_debug_flags():
-    cmd = cdp.launch_command("/usr/bin/chrome", port=9333, profile=Path("/tmp/prof"))
+    # Build the expected flag from the same Path: launch_command interpolates
+    # str(profile), which is backslash-separated on Windows.
+    profile = Path("/tmp/prof")
+    cmd = cdp.launch_command("/usr/bin/chrome", port=9333, profile=profile)
     assert cmd[0] == "/usr/bin/chrome"
     assert "--remote-debugging-port=9333" in cmd
-    assert "--user-data-dir=/tmp/prof" in cmd
+    assert f"--user-data-dir={profile}" in cmd
     assert "--no-first-run" in cmd
 
 
@@ -535,7 +538,10 @@ def test_cdp_endpoint_status_parses_live_and_handles_down():
 
 
 def test_cdp_find_browser_override():
-    assert cdp.find_browser("/bin/sh") == "/bin/sh"                       # explicit path that exists
+    # sys.executable rather than a hardcoded /bin/sh: find_browser takes the
+    # override verbatim when Path(override).exists(), and /bin/sh does not
+    # exist on Windows, so the POSIX literal exercised the wrong branch there.
+    assert cdp.find_browser(sys.executable) == sys.executable             # explicit path that exists
     assert cdp.find_browser("definitely-not-a-real-browser-xyz") is None  # bogus -> None (no crash)
 
 
