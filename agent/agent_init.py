@@ -2251,6 +2251,44 @@ def init_agent(
                     f"  Falling back to provider default.\n",
                     file=sys.stderr,
                 )
+
+    # Match gateway runtime resolution for OpenAI-compatible custom providers.
+    # A local provider's ``max_output_tokens`` is deliberately a fallback: an
+    # explicit caller value and the documented global ``model.max_tokens`` both
+    # take precedence.  Without this, foreground CLI sessions omit the cap and
+    # llama.cpp falls back to its server-side n_predict default (8192), which
+    # can monopolize a single slot long after a small answer is available.
+    if agent.max_tokens is None:
+        _providers_cfg = _agent_cfg.get("providers", {})
+        # The runtime router normalizes user-defined OpenAI-compatible
+        # providers to ``custom`` while retaining the configured key as
+        # ``requested_provider``.  Prefer that key so a ``llamacpp`` cap is
+        # not lost after normalization; native providers still use
+        # ``agent.provider``.
+        _configured_provider = str(
+            getattr(agent, "requested_provider", None) or agent.provider or ""
+        ).strip()
+        _provider_cfg = _providers_cfg.get(_configured_provider, {}) if isinstance(_providers_cfg, dict) else {}
+        _provider_max_tokens = (
+            _provider_cfg.get("max_output_tokens")
+            if isinstance(_provider_cfg, dict)
+            else None
+        )
+        if _provider_max_tokens is not None:
+            try:
+                if isinstance(_provider_max_tokens, bool):
+                    raise ValueError
+                _parsed_provider_max_tokens = int(_provider_max_tokens)
+                if _parsed_provider_max_tokens <= 0:
+                    raise ValueError
+                agent.max_tokens = _parsed_provider_max_tokens
+            except (TypeError, ValueError):
+                _ra().logger.warning(
+                    "Invalid providers.%s.max_output_tokens in config.yaml: %r — "
+                    "must be a positive integer; falling back to provider default.",
+                    _configured_provider,
+                    _provider_max_tokens,
+                )
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
 
     # Read explicit context_length override from model config
