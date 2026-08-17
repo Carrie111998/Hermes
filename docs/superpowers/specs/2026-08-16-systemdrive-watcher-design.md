@@ -158,12 +158,19 @@ appear and could not read is still evidence that *something* started.
 
 #### `_on_sighting()`
 
-Ordering is the whole point. Perishable data first:
+Ordering is the whole point. Perishable data first, then **durability**, then the slow
+best-effort enrichment:
 
 1. Dump the ring buffer (already in memory — no syscalls).
-2. Enumerate live processes and partition by `cwd`.
-3. Write the sidecar snapshot JSON.
-4. Append the `SIGHTING` JSONL record.
+2. **Append the `SIGHTING` JSONL record immediately.** Everything perishable is already
+   in hand at this point, and step 3 can take minutes.
+3. Enumerate live processes under a time budget and partition by `cwd`.
+4. Write the sidecar snapshot JSON and the `SIGHTING_LIVE` record.
+
+**Steps 2 and 3 were originally the other way round.** That is a correctness bug, not a
+preference: it left the durable record trailing a 60–200 s enumeration in a design whose
+premise is that the run gets killed. See the record-format note below for the
+measurements that forced the change.
 
 **The `cwd` discriminator.** The established mechanism *requires* the writer to have
 the watched root as its working directory. So both the live enumeration and the ring
@@ -249,8 +256,27 @@ Every record carries `event`, `at` (ISO-8601 seconds), `watcher_pid`.
   be opened for a directory watch and falls back to polling, so a degraded watch is
   never mistaken for a fast one.
 - **`SIGHTING`** — `root`, `path`, `backend`, `watcher_has_systemdrive`,
-  `live_cwd_matches`, `ring_cwd_matches`, `live_process_count`, `ring_size`,
-  `snapshot_file`.
+  `ring_cwd_matches`, `ring_size`. Written **immediately** after the ring dump and
+  before any live enumeration, and marks that live data is still pending.
+- **`SIGHTING_LIVE`** — `live_cwd_matches`, `live_process_count`, `snapshot_file`,
+  plus explicit sweep-coverage fields (examined / total / truncated / elapsed).
+
+**Why these are two records and not one — corrected 2026-08-16 after measurement.**
+The original design put a single `SIGHTING` record *after* the live enumeration. On
+this box a full sweep costs **60–200 s** (`describe_pid` ≈ 204 ms × ~968 processes;
+`psutil`'s `ppid()` and `create_time()` take a fresh full-table snapshot per call on
+Windows, making it quadratic). `psutil.process_iter(attrs=…)` was measured as an
+alternative at 112.87 s for 919 processes — **no speedup**, so there is no cheap
+batched path and the cost cannot be optimised away.
+
+That meant the durable record landed minutes after the event, in a design whose whole
+premise is that *this class of run gets killed*. The ordering contained the exact
+failure it was built to prevent. Splitting the record makes the perishable evidence
+durable in milliseconds and demotes the live table to best-effort enrichment.
+
+The live sweep is time-budgeted (`live_sweep_secs`, default 30 s) and reports its own
+coverage. A partial sweep that presented itself as complete would be a silent cap —
+which this project treats as a defect, not a convenience.
 - **`done`** — `sightings`, `roots`, `watched_secs`, and a `note` that states the
   negative in words when `sightings == 0`.
 
