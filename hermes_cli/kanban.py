@@ -2407,9 +2407,14 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            ok = kb.unblock_task(conn, tid)
+            if not ok:
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                print(
+                    f"cannot unblock {tid} "
+                    "(not blocked or scheduled?)",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1

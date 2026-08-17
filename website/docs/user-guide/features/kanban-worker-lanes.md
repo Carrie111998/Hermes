@@ -69,12 +69,28 @@ Both review models carry their structured handoff on the lifecycle transition it
 
 The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the same-card review loop, and `kanban_block` for genuine blockers.
 
+## Block-loop escalation and recovery
+
+A task that keeps getting unblocked and re-blocked for the same cause is an automation loop, not a genuine blocker. `block_task` counts those cycles in `block_recurrences`; once a task is re-blocked for the same kind a second time (`BLOCK_RECURRENCE_LIMIT`), the **unblock-loop breaker** routes it to `triage` instead of `blocked` and emits a `block_loop_detected` event. The card now sits in **escalated triage**: it is waiting on a human decision, and it must not be re-specified or re-dispatched by automation.
+
+The gateway's auto-decomposer treats escalated triage differently from fresh triage:
+
+- **Fresh triage** (a card created via `kanban_create` / the Triage column) receives a durable `triage_fresh_intake` event and is auto-decomposed on the dispatcher tick when `kanban.auto_decompose` is enabled.
+- **Escalated triage** (a card that reached triage via `block_loop_detected`) is skipped by the auto-decomposer feed (`list_triage_ids`) and refused by `decompose_task` on the automated path — re-specifying it would re-dispatch the very worker that keeps blocking.
+- **Unclassified triage** (including legacy rows without an intake marker) also stays out of the automatic feed. Upgrades never assume an ambiguous backlog is fresh work.
+
+V1 deliberately provides no escalation-recovery command. A profile name, CLI author string, or manual invocation is not authenticated owner authority. Retire the escalated root and create a newly reviewed fresh-intake root; this preserves the incident record and prevents an automation identity from laundering recovery into a second graph.
+
+Decomposition also refuses a task with any open downstream child graph. The check runs in the same write transaction as child creation, so a link added while the decomposer model is running cannot race into a duplicate graph.
+
+The same kernel write maps each child's declared capability to its workspace. Only `workspace_policy: repo_write` creates an isolated worktree/branch. Missing, invalid, and explicitly non-writing policies resolve to a task-owned scratch workspace; no child inherits the root's mutable checkout. This is intentionally independent of assignee names—a profile called QA, Reviewer, or Engineer receives no branch authority unless that specific task declares repository writes.
+
 ## Logs and audit trail
 
 The dispatcher writes per-task worker stdout/stderr to `<board-root>/logs/<task_id>.log`. Logs are auditable from kanban metadata:
 
 - `task_runs` rows carry the `log_path`, exit code (where available), summary, and metadata.
-- `task_events` rows carry every state transition (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `review_requested`, `changes_requested`, `review_reopened`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
+- `task_events` rows carry every state transition (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `block_loop_detected`, `triage_escalation_recovered`, `review_requested`, `changes_requested`, `review_reopened`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
 - `kanban_show` returns both, so a reviewer (or a follow-up worker) reading the task gets the full history without needing dashboard access.
 
 The dashboard renders run history with summaries, metadata blocks, and exit-status badges. CLI users can run `hermes kanban tail <task_id>` to follow live, or `hermes kanban runs <task_id>` for the historical attempt list.

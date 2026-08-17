@@ -17,6 +17,9 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    profiles_root = home / "profiles"
+    for name in ("orchestrator", "orch", "researcher", "engineer"):
+        (profiles_root / name).mkdir(parents=True, exist_ok=True)
     kb.init_db()
     return home
 
@@ -86,7 +89,6 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
     assert any("Decomposed into" in (c.body or "") for c in comments)
     assert any(ev.kind == "decomposed" for ev in events)
-
 
 
 
