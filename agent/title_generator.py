@@ -70,8 +70,8 @@ MAX_DERIVED_TITLE_CHARS = 48
 
 # Upper bound on accepted title word count. Titling is a 3-7 word task; a
 # small tiny-model sometimes ignores the task and answers the user's message
-# instead — that answer must never become the session title (see the
-# answer-shaped output guard in generate_title; port of
+# instead — that answer must never become the session title (see the shared
+# answer-shaped output guard in _validate_title_output; port of
 # can1357/oh-my-pi#7306). 12 leaves headroom for legitimate wordy titles
 # while excluding full-sentence answers.
 _MAX_TITLE_WORDS = 12
@@ -376,6 +376,23 @@ def _clean_title(text: str) -> Optional[str]:
     return title
 
 
+def _validate_title_output(content: str) -> Optional[str]:
+    """Extract and normalize model output, rejecting answer-shaped prose."""
+    title = _clean_title(_extract_title_text(content))
+    # Titling is a 3-7 word task, so many words indicate a model that ignored
+    # the task and answered the user's message instead. Validate after cleaning:
+    # truncating an assistant blob still leaves an assistant blob, and must not
+    # allow it to become either a session title or a contextual thread rename.
+    # Port of can1357/oh-my-pi#7306.
+    if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
+        logger.debug(
+            "Rejecting answer-shaped title output (%d words > %d)",
+            len(title.split()), _MAX_TITLE_WORDS,
+        )
+        return None
+    return title
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -450,22 +467,7 @@ def generate_title(
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
         content = response.choices[0].message.content or ""
-        title = _clean_title(_extract_title_text(content))
-        # Answer-shaped output guard: titling is a 3-7 word task, so a title
-        # with many words is a model that ignored the task and answered
-        # the user's message instead ("I don't have context on X — that's
-        # not something I recognize..."). Truncating would store half an
-        # assistant blob as the session title, which is still an assistant
-        # blob — reject instead so the caller retries on the next exchange
-        # (maybe_auto_title fires for the first two exchanges).
-        # Port of can1357/oh-my-pi#7306.
-        if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
-            logger.debug(
-                "Rejecting answer-shaped title output (%d words > %d)",
-                len(title.split()), _MAX_TITLE_WORDS,
-            )
-            return None
-        return title
+        return _validate_title_output(content)
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
@@ -562,7 +564,7 @@ def generate_contextual_title(
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
         content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
+        return _validate_title_output(content)
     except Exception as exc:
         logger.warning("Contextual title generation failed: %s", exc)
         logger.debug("Contextual title generation traceback", exc_info=True)

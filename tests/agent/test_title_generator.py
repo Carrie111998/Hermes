@@ -218,6 +218,44 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             assert generate_title("question", "answer") is None
 
+    @pytest.mark.parametrize("path", ["normal", "contextual"])
+    def test_all_title_paths_reject_truncated_answer_shaped_output(self, path):
+        """A truncated 13-word assistant answer must never become any title."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "A truncated assistant answer has thirteen words and must never rename "
+            "this conversation"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            if path == "normal":
+                title = generate_title("question")
+            else:
+                context = [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+                title = generate_contextual_title("question", context)
+
+        assert title is None
+
+    def test_accepts_valid_contextual_title_after_output_validation(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            '{"title":"Philippine side hustles reflect survival pressure"}'
+        )
+        context = [
+            {"role": "user", "content": "Summarize this video"},
+            {"role": "assistant", "content": "Side hustles often offset low wages."},
+        ]
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_contextual_title("Summarize this video", context) == (
+                "Philippine side hustles reflect survival pressure"
+            )
+
     def test_accepts_normal_title(self):
         """A normal 3-7 word title is unaffected by the answer-shape guard."""
         mock_response = MagicMock()
