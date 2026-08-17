@@ -287,10 +287,15 @@ def make_acp_edit_approval_requester(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 60.0,
+    timeout: float | None = None,
     auto_approve_getter: Callable[[], tuple[str, str | None]] | None = None,
 ) -> EditApprovalRequester:
     """Return a sync requester that bridges edit proposals to ACP permissions."""
+
+    if timeout is None:
+        from acp_adapter.permissions import DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+
+        timeout = DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
 
     def _requester(proposal: EditProposal) -> bool:
         from acp.schema import PermissionOption

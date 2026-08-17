@@ -11,7 +11,10 @@ from acp.schema import (
     RequestPermissionResponse,
 )
 
-from acp_adapter.permissions import make_approval_callback
+from acp_adapter.permissions import (
+    DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS,
+    make_approval_callback,
+)
 from tools.approval import prompt_dangerous_approval
 
 
@@ -63,6 +66,34 @@ def _invoke_callback(
 
 
 class TestApprovalBridge:
+    def test_default_timeout_leaves_time_for_human_review(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = AsyncMock(name="request_permission")
+        future = MagicMock(spec=Future)
+        future.result.return_value = _make_response(
+            AllowedOutcome(option_id="allow_once", outcome="selected")
+        )
+
+        scheduled = {}
+
+        def _schedule(coro, passed_loop):
+            scheduled["coro"] = coro
+            scheduled["loop"] = passed_loop
+            return future
+
+        with patch(
+            "agent.async_utils.asyncio.run_coroutine_threadsafe",
+            side_effect=_schedule,
+        ):
+            cb = make_approval_callback(request_permission, loop, session_id="s1")
+            assert cb("rm -rf /", "dangerous command") == "once"
+
+        scheduled["coro"].close()
+        future.result.assert_called_once_with(
+            timeout=DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+        )
+        assert DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS == 600.0
+
     def test_bridge_schedules_request_on_the_given_loop(self):
         result, kwargs, scheduled, _, loop = _invoke_callback(
             AllowedOutcome(option_id="allow_once", outcome="selected"),

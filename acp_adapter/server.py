@@ -70,7 +70,11 @@ from acp_adapter.events import (
     make_thinking_cb,
     make_tool_progress_cb,
 )
-from acp_adapter.permissions import make_approval_callback
+from acp_adapter.permissions import (
+    DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS,
+    coerce_approval_timeout_seconds,
+    make_approval_callback,
+)
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 from acp_adapter.tools import build_tool_complete, build_tool_start
@@ -85,6 +89,24 @@ from tools.approval import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_approval_timeout_seconds() -> float:
+    """Load the shared ACP command/edit approval deadline from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        acp_config = config.get("acp") if isinstance(config, dict) else None
+        value = (
+            acp_config.get("approval_timeout_seconds")
+            if isinstance(acp_config, dict)
+            else DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.debug("Could not load ACP approval timeout", exc_info=True)
+        value = DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+    return coerce_approval_timeout_seconds(value)
 
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
@@ -1801,7 +1823,13 @@ class HermesACPAgent(acp.Agent):
                     streamed_message = True
                 message_cb(text)
 
-            approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+            approval_timeout = _configured_approval_timeout_seconds()
+            approval_cb = make_approval_callback(
+                conn.request_permission,
+                loop,
+                session_id,
+                timeout=approval_timeout,
+            )
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
 
@@ -1809,6 +1837,7 @@ class HermesACPAgent(acp.Agent):
                     conn.request_permission,
                     loop,
                     session_id,
+                    timeout=approval_timeout,
                     auto_approve_getter=lambda: self._edit_approval_policy_for_state(state),
                 )
             except Exception:

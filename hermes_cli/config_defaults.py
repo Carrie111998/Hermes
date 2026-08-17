@@ -25,6 +25,13 @@ DEFAULT_CONFIG = {
     "runtime": {
         "nofile_soft_limit": 4096,
     },
+    # Agent Client Protocol host behavior (editors such as Zed/Neoscript).
+    "acp": {
+        # Maximum seconds Hermes waits for a human response to either a file
+        # edit or dangerous-command approval prompt. Invalid/non-positive
+        # values fall back to this default.
+        "approval_timeout_seconds": 600,
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,

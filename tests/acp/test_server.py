@@ -40,6 +40,7 @@ from acp_adapter.server import (
     ACP_MAX_MODELS_PER_PROVIDER,
     HermesACPAgent,
     HERMES_VERSION,
+    _configured_approval_timeout_seconds,
 )
 from acp_adapter.session import SessionManager
 from hermes_state import SessionDB
@@ -402,6 +403,68 @@ class TestSessionConfiguration:
 
 
 class TestPrompt:
+    def test_configured_approval_timeout_defaults_to_ten_minutes(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        assert _configured_approval_timeout_seconds() == 600.0
+
+    def test_configured_approval_timeout_accepts_positive_seconds(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"acp": {"approval_timeout_seconds": 900}},
+        )
+        assert _configured_approval_timeout_seconds() == 900.0
+
+    @pytest.mark.parametrize("value", [None, True, 0, -1, "not-a-number"])
+    def test_invalid_configured_approval_timeout_uses_default(
+        self, monkeypatch, value
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"acp": {"approval_timeout_seconds": value}},
+        )
+        assert _configured_approval_timeout_seconds() == 600.0
+
+    @pytest.mark.asyncio
+    async def test_prompt_applies_configured_timeout_to_command_and_edit_approvals(
+        self, agent, mock_manager, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"acp": {"approval_timeout_seconds": 900}},
+        )
+        response = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(response.session_id)
+        state.agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "messages": [],
+        }
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        connection = MagicMock(spec=acp.Client)
+        connection.session_update = AsyncMock()
+        agent._conn = connection
+
+        command_factory = MagicMock(return_value=MagicMock())
+        edit_factory = MagicMock(return_value=MagicMock())
+        with (
+            patch(
+                "acp_adapter.server.make_approval_callback",
+                command_factory,
+            ),
+            patch(
+                "acp_adapter.edit_approval.make_acp_edit_approval_requester",
+                edit_factory,
+            ),
+        ):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id=response.session_id,
+            )
+
+        assert command_factory.call_args.kwargs["timeout"] == 900.0
+        assert edit_factory.call_args.kwargs["timeout"] == 900.0
+
     @pytest.mark.asyncio
     async def test_prompt_returns_refusal_for_unknown_session(self, agent):
         prompt = [TextContentBlock(type="text", text="hello")]

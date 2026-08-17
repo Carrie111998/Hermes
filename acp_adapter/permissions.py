@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from concurrent.futures import TimeoutError as FutureTimeout
 from itertools import count
 from typing import Callable
@@ -14,6 +15,23 @@ from acp.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Human-reviewed ACP prompts routinely stay open while the user reads a diff.
+# Keep the default aligned for terminal-command and file-edit approvals.
+DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS = 600.0
+
+
+def coerce_approval_timeout_seconds(value: object) -> float:
+    """Return a safe positive ACP approval timeout from user config."""
+    if isinstance(value, bool):
+        return DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+    if not math.isfinite(timeout) or timeout <= 0:
+        return DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+    return timeout
 
 # Maps ACP permission option ids to Hermes approval result strings.
 # Option ids are stable across both the ``allow_permanent=True`` and
@@ -111,7 +129,7 @@ def make_approval_callback(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 60.0,
+    timeout: float = DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS,
 ) -> Callable[..., str]:
     """
     Return a Hermes-compatible approval callback that bridges to ACP.

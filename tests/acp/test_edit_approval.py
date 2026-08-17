@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import Future
 import json
-import tempfile
 from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from acp_adapter.edit_approval import (
     EditProposal,
     build_acp_edit_tool_call,
     clear_edit_approval_requester,
+    make_acp_edit_approval_requester,
     set_edit_approval_requester,
     should_auto_approve_edit,
 )
+from acp_adapter.permissions import DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
 from model_tools import handle_function_call
 
 
@@ -39,6 +45,44 @@ def test_acp_permission_tool_call_uses_edit_kind_and_diff_content():
     assert diff.path == "demo.txt"
     assert diff.oldText == "old\n"
     assert diff.newText == "new\n"
+
+
+def test_edit_approval_default_timeout_leaves_time_for_human_review():
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    request_permission = AsyncMock(name="request_permission")
+    future = MagicMock(spec=Future)
+    future.result.return_value = SimpleNamespace(
+        outcome=SimpleNamespace(outcome="selected", option_id="allow_once")
+    )
+    scheduled = {}
+
+    def _schedule(coro, passed_loop):
+        scheduled["coro"] = coro
+        scheduled["loop"] = passed_loop
+        return future
+
+    proposal = EditProposal(
+        tool_name="write_file",
+        path="demo.txt",
+        old_text="old\n",
+        new_text="new\n",
+        arguments={"path": "demo.txt", "content": "new\n"},
+    )
+    with patch(
+        "agent.async_utils.asyncio.run_coroutine_threadsafe",
+        side_effect=_schedule,
+    ):
+        requester = make_acp_edit_approval_requester(
+            request_permission,
+            loop,
+            session_id="s1",
+        )
+        assert requester(proposal) is True
+
+    scheduled["coro"].close()
+    future.result.assert_called_once_with(
+        timeout=DEFAULT_ACP_APPROVAL_TIMEOUT_SECONDS
+    )
 
 
 

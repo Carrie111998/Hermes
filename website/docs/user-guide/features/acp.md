@@ -342,7 +342,17 @@ request programmatically instead of showing it to you, in which case these
 options exist on the wire but never reach a human. Buzz Desktop does this, so
 treat that path as unattended execution regardless of your `approvals` setting.
 
-On timeout or error, the approval bridge denies the request.
+Hermes waits 10 minutes for approval by default. You can change the shared
+file-edit and dangerous-command deadline in `~/.hermes/config.yaml`:
+
+```yaml
+acp:
+  approval_timeout_seconds: 900
+```
+
+The value is read at the start of each prompt, so the next prompt uses a saved
+change without requiring a Hermes restart. On timeout or error, the approval
+bridge denies the request.
 
 ### Session-scoped edit auto-approval
 
