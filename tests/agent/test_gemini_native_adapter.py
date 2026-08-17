@@ -457,3 +457,54 @@ class TestGemini3ToolCallIds:
         result = translate_gemini_response(resp, model="gemini-2.5-flash")
         tool_calls = result.choices[0].message.tool_calls
         assert tool_calls[0].id.startswith("call_")
+
+def test_extract_multimodal_parts_translates_video_url_to_inline_data():
+    """video_url parts (what video_analyze_tool sends) must become Gemini
+    inlineData, not be silently dropped."""
+    import base64
+
+    from agent.gemini_native_adapter import _extract_multimodal_parts
+
+    video_bytes = b"\x00\x01fake-video-bytes"
+    data_url = "data:video/mp4;base64," + base64.b64encode(video_bytes).decode("ascii")
+    content = [{"type": "video_url", "video_url": {"url": data_url}}]
+
+    parts = _extract_multimodal_parts(content)
+
+    assert parts == [
+        {
+            "inlineData": {
+                "mimeType": "video/mp4",
+                "data": base64.b64encode(video_bytes).decode("ascii"),
+            }
+        }
+    ]
+
+
+def test_extract_multimodal_parts_image_url_still_works():
+    """The image_url path must survive the refactor to the shared helper."""
+    import base64
+
+    from agent.gemini_native_adapter import _extract_multimodal_parts
+
+    img_bytes = b"fake-image-bytes"
+    data_url = "data:image/png;base64," + base64.b64encode(img_bytes).decode("ascii")
+    content = [{"type": "image_url", "image_url": {"url": data_url}}]
+
+    parts = _extract_multimodal_parts(content)
+
+    assert parts == [
+        {
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": base64.b64encode(img_bytes).decode("ascii"),
+            }
+        }
+    ]
+
+
+def test_decode_data_url_rejects_non_data_urls():
+    from agent.gemini_native_adapter import _decode_data_url
+
+    assert _decode_data_url("https://example.com/video.mp4") is None
+    assert _decode_data_url(None) is None
