@@ -1,6 +1,7 @@
 services:
   - type: web
     name: hermes-agent
+    rootDir: .
     runtime: python
     plan: starter
     buildCommand: uv sync --frozen --extra web
