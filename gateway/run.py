@@ -12334,9 +12334,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
+            # Off by default (display.runtime_footer.enabled=false). When
+            # streaming already delivered the body, edit the existing final
+            # message when its stream handle is available; the send path below
+            # keeps a trailing-message fallback for adapters without one.
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
