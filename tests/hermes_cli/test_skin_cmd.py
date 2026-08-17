@@ -80,6 +80,32 @@ def test_set_reuses_an_existing_builtin_fork_without_resetting_it():
     assert "default-custom" in (get_hermes_home() / "config.yaml").read_text()
 
 
+def test_set_explicit_builtin_reuses_fork_and_preserves_non_color_fields():
+    (_skins() / "oasis.yaml").write_text(
+        'name: oasis\ncolors:\n  background: "#08201f"\n', encoding="utf-8"
+    )
+    _activate("oasis")
+    fork = _skins() / "default-custom.yaml"
+    fork.write_text(
+        "name: default-custom\n"
+        "description: my settled terminal\n"
+        "colors:\n"
+        '  background: "#111111"\n'
+        "branding:\n"
+        "  greeting: keep-me\n"
+        'tool_prefix: "=> "\n'
+        "spinner_interval_ms: 40\n",
+        encoding="utf-8",
+    )
+    expected = yaml.safe_load(fork.read_text(encoding="utf-8"))
+    expected["colors"]["ui_tool"] = "#00FFFF"
+
+    assert skin_cmd._skin_set("ui_tool", "#00FFFF", "default") == 0
+
+    assert yaml.safe_load(fork.read_text(encoding="utf-8")) == expected
+    assert "default-custom" in (get_hermes_home() / "config.yaml").read_text()
+
+
 def test_set_rejects_non_hex():
     _activate("default")
     assert skin_cmd._skin_set("ui_tool", "teal", None) == 1
