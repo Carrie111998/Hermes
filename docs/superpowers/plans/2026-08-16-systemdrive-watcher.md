@@ -939,6 +939,10 @@ class Watcher:
         self.force_polling = force_polling
         self._sample_s = sample_ms / 1000.0
         self._poll_s = poll_ms / 1000.0
+        # Kept as its own attribute rather than read back off the deque's
+        # maxlen: the `armed` record reports it, and reaching into another
+        # object's private state to report your own config is a trap.
+        self._ring_capacity = ring_capacity
         self._ring = ProcessRing(ring_capacity)
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -1016,6 +1020,13 @@ class Watcher:
 
     def _sampler_loop(self) -> None:
         while not self._stop.is_set():
+            # Deduct the sample's own cost from the sleep. A fixed sleep AFTER
+            # sample() would make the true cadence `interval + cost`, and cost
+            # grows with process churn -- so the gap between samples would
+            # stretch precisely during a busy run, which is exactly when the
+            # writer is most likely to appear. Measured: one sample costs
+            # ~16.65ms with ~1000 live processes, more under churn.
+            started = time.monotonic()
             try:
                 self._ring.sample()
             except Exception:  # sampling must never kill the watch
@@ -1027,7 +1038,8 @@ class Watcher:
                         return
                 except OSError:
                     pass
-            self._stop.wait(self._sample_s)
+            elapsed = time.monotonic() - started
+            self._stop.wait(max(0.0, self._sample_s - elapsed))
 
     def _start_backends(self) -> dict:
         """Start one detection thread per root; return backend by root."""
@@ -1051,7 +1063,7 @@ class Watcher:
             backend_by_root=backends,
             sample_ms=int(self._sample_s * 1000),
             poll_ms=int(self._poll_s * 1000),
-            ring_capacity=self._ring._entries.maxlen,
+            ring_capacity=self._ring_capacity,
             watcher_has_systemdrive="SYSTEMDRIVE" in os.environ,
             watcher_cwd=os.getcwd(),
         )
@@ -1697,7 +1709,18 @@ print('per-sample ms:', round((time.perf_counter()-t)/20*1000, 2))
 "
 ```
 
-Record the number. If a sample costs more than roughly half the cadence, raise the default `--sample-ms` rather than shipping a watcher that saturates a core on a box with documented memory-pressure problems.
+**This measurement was taken early, during Task 3, and the cadence is already
+decided — re-run it only to confirm, not to re-open the question.** Results on this
+box: one sample costs **16.65 ms** with ~1000 live processes, and the default is now
+**100 ms** (~17% of one core).
+
+**The sizing rule this step originally gave was wrong, and the correction matters
+more than the number.** It said to raise the cadence if a sample costs more than
+half the interval. By that rule 16.65 ms against 250 ms passed comfortably — yet a
+250 ms sampler captured only **9 of 12** short-lived Python children (each living
+350–514 ms), while 50 ms captured 12 of 12. **Cost was never the binding constraint;
+capture probability is.** Size the cadence against the LIFETIME of the process class
+being hunted, not against the sample's own cost.
 
 - [ ] **Step 4: Full verification sweep, same worktree, same commit**
 
