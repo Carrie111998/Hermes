@@ -722,6 +722,8 @@ agent:
 
 `agent.api_max_retries` 控制 Hermes 在回退 provider 切换启动**之前**对瞬时错误（速率限制、连接断开、5xx）重试 provider API 调用的次数。默认为 `3` —— 总共四次尝试。如果您配置了[回退 providers](/user-guide/features/fallback-providers) 并希望更快地故障转移，请将其降至 `0`，这样主 provider 上的第一个瞬时错误会立即切换到回退，而不是对不稳定的端点进行重试。
 
+`agent.empty_response_retries` 控制 Hermes 在模型返回空响应（无内容且无推理）时、回退 provider 切换启动之前的重试次数；重试之间会进行带抖动的退避。默认值为 `5`。某些 provider 会返回瞬时空响应，此前硬编码的 `3` 可能触发过早回退。将其设为 `0` 可在首次空响应时直接回退而不重试。
+
 ### API 超时
 
 Hermes 对流式传输有单独的超时层，以及用于非流式调用的陈旧检测器。陈旧检测器仅在您将其保留为隐式默认值时才会自动调整本地 provider。

@@ -27,17 +27,20 @@ Two independent guards, both failing OPEN to today's behaviour:
 
 2. **Cost-aware retry budget** — when the estimated input cost of a
    single empty attempt exceeds the configured threshold (default
-   $0.25), the empty-retry budget for this streak drops from 3 to 1.
-   Unknown pricing, missing usage, or included/subscription routes
-   leave the budget untouched.
+   $0.25), the empty-retry budget for this streak drops to 1 (never
+   above the configured ``agent.empty_response_retries`` base). Unknown
+   pricing, missing usage, or included/subscription routes leave the
+   budget untouched.
 
 Configured via the additive ``agent.empty_response_guard`` section in
 ``config.yaml`` (resolved once at agent init by ``agent_init``)::
 
     agent:
       empty_response_guard:
-        enabled: true            # false = legacy fixed 3-retry behaviour
-        cost_threshold_usd: 0.25 # per-attempt cost that halves the budget
+        enabled: true            # false = keep the configured retry
+                                 # count unconditionally (no early stops)
+        cost_threshold_usd: 0.25 # per-attempt cost that drops the
+                                 # streak budget to 1
 
 Per project policy, no ``HERMES_*`` environment variables are involved —
 ``.env`` is reserved for credentials; behavioural settings live in
@@ -270,7 +273,9 @@ def empty_retry_budget(agent: Any, response: Any) -> int:
     if cost is None:
         return base
     if cost >= _cost_threshold_usd(agent):
-        return REDUCED_EMPTY_RETRY_BUDGET
+        # Never raise the ceiling the operator asked for: a configured
+        # 0 ("never retry") must stay 0 even on high-cost attempts.
+        return min(REDUCED_EMPTY_RETRY_BUDGET, base)
     return base
 
 

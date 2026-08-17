@@ -3308,8 +3308,9 @@ class TestRunConversation:
 
     def test_guard_disabled_via_config_restores_legacy_retries(self, agent):
         """NS-503: agent.empty_response_guard.enabled: false in config.yaml
-        (resolved to _empty_guard_enabled at init) restores the legacy
-        fixed 3-retry behaviour even for deterministic empties."""
+        (resolved to _empty_guard_enabled at init) keeps the pinned retry
+        base (3 here via _setup_agent) unconditionally, even for
+        deterministic empties."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
         agent._empty_guard_enabled = False  # as set by agent_init from config
@@ -3329,11 +3330,11 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        assert result["api_calls"] == 4  # legacy: 1 original + 3 retries
+        assert result["api_calls"] == 4  # pinned base: 1 original + 3 retries
 
     def test_empty_without_usage_keeps_full_retry_budget(self, agent):
         """NS-503 fail-open: no usage data means no evidence of a
-        deterministic empty — legacy 3-retry behaviour must be preserved
+        deterministic empty — the pinned retry base must be preserved
         (this is the flaky-provider case retries exist for)."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
