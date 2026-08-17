@@ -315,7 +315,9 @@ describe('fromSkin', () => {
     // statusStrong is a normalized foreground (ansi256 bucket); statusDim is
     // a muted foreground pinned to the muted bucket like `muted` itself.
     expect(theme.color.statusStrong).toMatch(/^ansi256\(\d+\)$/)
-    expect(theme.color.statusDim).toBe('ansi256(245)')
+    // Assert the relationship, not the bucket literal: statusDim must stay in
+    // the muted family and track the same normalization as `muted`.
+    expect(theme.color.statusDim).toBe(theme.color.muted)
   })
 
   it('overrides branding', async () => {
