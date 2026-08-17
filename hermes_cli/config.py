@@ -1643,21 +1643,6 @@ DEFAULT_CONFIG = {
                                       # after live validation.
     },
 
-    # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
-    # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
-    # implementations. Per-platform notification opt-out is handled by the
-    # kanban dashboard (see ``hermes dashboard`` -> Notifications).
-    "kanban": {
-        # Auto-subscribe the originating gateway/TUI session to task
-        # completion + block events when ``kanban_create`` is called from
-        # inside a session that has a persistent delivery channel. The
-        # agent that dispatched the task will get notified automatically
-        # instead of having to poll. Disable to mirror pre-feature
-        # behaviour — e.g. for a profile that prefers explicit
-        # ``kanban_notify-subscribe`` calls per task.
-        "auto_subscribe_on_create": True,
-    },
-
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {
@@ -2957,13 +2942,33 @@ DEFAULT_CONFIG = {
         "session_db_timeout_seconds": 10,
     },
 
-    # Kanban multi-agent coordination — controls the dispatcher loop that
-    # spawns workers for ready tasks. The dispatcher ticks every N seconds
-    # (default 60), reclaims stale claims, promotes dependency-satisfied
-    # todos to ready, and fires `hermes -p <assignee> chat -q ...` for
-    # each claimable ready task. One dispatcher per profile is sufficient;
-    # running more than one on the same kanban.db will race for claims.
+    # Kanban subsystem — orchestrator workers, dispatcher-driven child tasks,
+    # and session auto-subscription. See tools/kanban_tools.py and
+    # hermes_cli/kanban_db.py for the actual implementations. Per-platform
+    # notification opt-out is handled by the kanban dashboard
+    # (see ``hermes dashboard`` -> Notifications).
+    #
+    # The dispatcher loop spawns workers for ready tasks: it ticks every N
+    # seconds (default 60), reclaims stale claims, promotes
+    # dependency-satisfied todos to ready, and fires
+    # `hermes -p <assignee> chat -q ...` for each claimable ready task. One
+    # dispatcher per profile is sufficient; running more than one on the
+    # same kanban.db will race for claims.
+    #
+    # NOTE: there were previously TWO "kanban" keys in this dict, added by
+    # separate features. A dict literal is last-wins, so this block silently
+    # discarded the earlier one and ``auto_subscribe_on_create`` never
+    # reached DEFAULT_CONFIG at all. Merged 2026-08-16 when ruff F601 was
+    # re-enabled. Keep this section single.
     "kanban": {
+        # Auto-subscribe the originating gateway/TUI session to task
+        # completion + block events when ``kanban_create`` is called from
+        # inside a session that has a persistent delivery channel. The
+        # agent that dispatched the task will get notified automatically
+        # instead of having to poll. Disable to mirror pre-feature
+        # behaviour — e.g. for a profile that prefers explicit
+        # ``kanban_notify-subscribe`` calls per task.
+        "auto_subscribe_on_create": True,
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

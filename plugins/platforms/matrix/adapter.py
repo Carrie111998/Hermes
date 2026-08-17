@@ -996,10 +996,14 @@ class MatrixAdapter(BasePlatformAdapter):
         # Matrix reaction-based dangerous command approvals.
         self._approval_reaction_map = {
             "✅": "once",
+            # Both spellings of U+267E are kept on purpose: with the VS16
+            # emoji-presentation selector (U+FE0F) and without, because
+            # clients differ in which they send. Two further entries here
+            # wrote those SAME two strings again in \u escape form -- a
+            # second spelling, not extra coverage -- so they were dead
+            # weight that ruff F601 flagged. Removed 2026-08-16.
             "♾️": "always",
             "♾": "always",
-            "\u267e\ufe0f": "always",
-            "\u267e": "always",
             "❌": "deny",
             "❎": "deny",
         }
