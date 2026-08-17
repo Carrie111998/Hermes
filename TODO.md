@@ -1,23 +1,13 @@
 # TODO
 
-## `/data/config.yaml` is hand-placed and not reproducible
+## `server/config.yaml.example` carries one deployment's values
 
-`server/config.yaml.example` is the source of truth, but the live copy lives on
-the `interfaze_data` Fly volume and is written by hand:
-
-```bash
-fly ssh console -C "sh -c 'cat > /data/config.yaml'" < server/config.yaml.example
-```
-
-The volume persists across deploys, so this is normally a one-time step — but a
-fresh volume (region move, disaster recovery, a second machine) comes up with no
-config at all, and the failure is silent: `auth_mode` defaults to `local` (fine),
-`chat_model` defaults to `""` (chat runs on the wrong model), `cors_origins`
-defaults to localhost (breaks any off-origin dashboard).
-
-Fix by seeding it at container start — `Dockerfile.interfaze-api`'s CMD already
-runs `python -m tools.skills_sync` before uvicorn, so copying a baked-in default
-to `/data/config.yaml` when absent is a one-line addition to that chain.
+The image seeds `$HERMES_HOME/config.yaml` from this file when the volume has
+none, so a fresh volume now boots correctly. But the seed is the same template
+the repo ships, which names `agent-rota.fly.dev` in `cors_origins` — a second
+deployment gets that origin until an operator edits the file. Fine while there
+is one deployment; split the template into generic defaults plus a per-deploy
+overlay before there are two.
 
 ## Admin password recovery is a manual operator task
 

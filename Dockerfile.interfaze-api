@@ -123,6 +123,14 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /src/skills /opt/interfaze/skills
 COPY --from=builder /src/optional-skills /opt/interfaze/optional-skills
 
+# Seed for $HERMES_HOME/config.yaml. Both consumers of that file read it at
+# startup and fall back to defaults when it is missing — server/config.py to
+# auth_mode local with an EMPTY chat_model, and the hermes CLI to provider
+# auto-detection. Neither failure is loud, so a fresh volume would come up
+# serving traffic with chat pointed at the wrong model. The CMD copies this in
+# only when the file is absent, so an operator's edits are never overwritten.
+COPY --from=builder /src/server/config.yaml.example /opt/interfaze/config.yaml.default
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}" \
@@ -174,10 +182,12 @@ ENTRYPOINT ["/usr/local/bin/tini", "--"]
 # Recreate the /data layout first: on a mounted volume the image's directories
 # are shadowed, and the agent workspace, upload dir, and SQLite parent must all
 # exist before the app touches them. mkdir -p is a no-op on the compose path
-# where the volume was seeded from the image.
+# where the volume was seeded from the image. Then seed config.yaml if and only
+# if it does not already exist — -e rather than -f so a symlinked config is also
+# left alone.
 #
 # Then sync bundled skills into $HERMES_HOME/skills (idempotent; user edits
 # under /data are preserved by skills_sync's manifest) and hand PID 1 to uvicorn.
 # `--host` comes from INTERFAZE_HOST because server/api_cli.py's argparse
 # default is 127.0.0.1, which would be unreachable from outside the container.
-CMD ["sh", "-c", "mkdir -p /data/interfaze/uploads /data/workspace && cd /data/workspace && { python -m tools.skills_sync || echo '[interfaze] warning: skills sync failed; continuing'; }; exec interfaze-api --host \"${INTERFAZE_HOST:-0.0.0.0}\" --port \"${INTERFAZE_PORT:-8000}\""]
+CMD ["sh", "-c", "mkdir -p /data/interfaze/uploads /data/workspace && cd /data/workspace && { [ -e \"${HERMES_HOME:-/data}/config.yaml\" ] || { cp /opt/interfaze/config.yaml.default \"${HERMES_HOME:-/data}/config.yaml\" && echo \"[interfaze] seeded ${HERMES_HOME:-/data}/config.yaml from image default\"; }; }; { python -m tools.skills_sync || echo '[interfaze] warning: skills sync failed; continuing'; }; exec interfaze-api --host \"${INTERFAZE_HOST:-0.0.0.0}\" --port \"${INTERFAZE_PORT:-8000}\""]
