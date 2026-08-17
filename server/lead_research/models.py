@@ -334,6 +334,17 @@ class LeadScore(ApiModel):
     confidence_factors: dict[str, float]
 
 
+class ResearchResultData(ApiModel):
+    reasons: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    conflicting_claims: list[str] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    official_domains: list[str] = Field(default_factory=list)
+    independent_domains: list[str] = Field(default_factory=list)
+    score_dimensions: dict[str, float | None] = Field(default_factory=dict)
+    confidence_factors: dict[str, float] = Field(default_factory=dict)
+
+
 class CampaignEstimate(ApiModel):
     status: Literal["available", "unavailable"]
     basis: str

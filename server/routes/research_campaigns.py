@@ -132,7 +132,7 @@ def start_campaign(campaign_id: str, request: Request,
                    x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
     row = _row(request, company_id, campaign_id)
-    if row["status"] not in {"draft", "failed", "cancelled", "partial", "completed"}:
+    if row["status"] not in {"draft", "failed", "cancelled", "partial", "completed", "succeeded"}:
         raise HTTPException(409, "Campaign cannot start from its current state")
     return request.app.state.lead_research.run(company_id, campaign_id)
 

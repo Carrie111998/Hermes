@@ -56,6 +56,14 @@ CREATE TABLE IF NOT EXISTS research_issues (
     organization_id TEXT, issue_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
     data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS research_results (
+    id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+    campaign_id TEXT NOT NULL REFERENCES research_campaigns(id), organization_id TEXT NOT NULL,
+    lead_id TEXT REFERENCES leads(id), verdict TEXT NOT NULL, fit_score INTEGER NOT NULL,
+    evidence_confidence REAL NOT NULL, data TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    UNIQUE(company_id, campaign_id, organization_id)
+);
 -- Candidate corpora are service-only shared inputs.  They deliberately have
 -- no company_id: a later campaign may evaluate them, but importing a corpus
 -- cannot create a tenant lead, organization, research row, or evidence.
@@ -85,6 +93,7 @@ CREATE INDEX IF NOT EXISTS ix_research_sources_tenant ON dataset_definitions(com
 CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
 CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(company_id, campaign_id, source_id);
+CREATE INDEX IF NOT EXISTS ix_research_results_tenant ON research_results(company_id, campaign_id, verdict);
 CREATE INDEX IF NOT EXISTS ix_candidate_records_country ON candidate_records(country, dataset_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_candidate_records_domain
     ON candidate_records(dataset_id, version, domain) WHERE domain IS NOT NULL;

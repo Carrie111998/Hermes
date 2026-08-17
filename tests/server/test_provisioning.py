@@ -96,6 +96,25 @@ def test_provisioning_refuses_to_replace_an_operational_tenant(db):
         provision(db)
 
 
+def test_provisioning_refuses_to_delete_a_preexisting_research_result(db):
+    result = provision(db)
+    stamp = now()
+    campaign_id = "campaign_existing"
+    db.execute(
+        "INSERT INTO research_campaigns VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (campaign_id, result["company_id"], "Existing campaign", "succeeded", 1, "{}", None, None, stamp, stamp),
+    )
+    db.execute(
+        "INSERT INTO research_results VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("result_existing", result["company_id"], campaign_id, "org_existing", None, "reject", 0, 0.0, "{}", stamp, stamp),
+    )
+
+    with pytest.raises(RuntimeError, match="research_results"):
+        provision(db)
+
+    assert db.one("SELECT id FROM research_results WHERE id='result_existing'")["id"] == "result_existing"
+
+
 def test_provisioning_stores_a_verifiable_password_without_returning_it(db):
     result = provision(db)
     stored = db.one("SELECT password_hash FROM users WHERE id=?", (result["user_id"],))["password_hash"]

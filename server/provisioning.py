@@ -13,7 +13,7 @@ OPERATIONAL_TABLES = (
     "outreach_campaigns", "outreach_messages", "delivery_attempts", "agent_runs",
     "research_campaigns", "dataset_snapshots", "organizations", "organization_links",
     "evidence_records", "feature_claims", "campaign_partitions", "campaign_metrics",
-    "research_issues",
+    "research_issues", "research_results",
 )
 
 

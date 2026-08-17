@@ -14,6 +14,8 @@ from server.lead_research.models import (
     RawPage,
     RawRecord,
     SnapshotRef,
+    VerificationBundle,
+    VerificationSource,
 )
 
 
@@ -97,6 +99,45 @@ class DeterministicProvider:
 
     def health(self) -> ProviderHealth:
         return ProviderHealth(status="active", message="Offline deterministic contract fake")
+
+    def verify(self, query, candidate) -> VerificationBundle:
+        del query
+        official_markdown = (
+            f"{candidate.company_name} is a distributor of household appliances in {candidate.country}."
+        )
+        independent_markdown = (
+            f"Registry profile for {candidate.company_name}, a household-appliances distributor."
+        )
+        return VerificationBundle(
+            candidate_source_record_id=candidate.source_record_id,
+            sources=[
+                VerificationSource(
+                    provenance_url=f"https://{candidate.domain}",
+                    raw_hash=hashlib.sha256(official_markdown.encode()).hexdigest(),
+                    classification="official",
+                    retrieved_via=f"https://{candidate.domain}",
+                    facts={
+                        "company_name": [candidate.company_name],
+                        "country": [candidate.country],
+                        "domain": [candidate.domain],
+                        "buyer_role": ["distributor"],
+                        "product_term": ["household-appliances"],
+                    },
+                ),
+                VerificationSource(
+                    provenance_url=f"https://registry.example.test/{candidate.source_record_id}",
+                    raw_hash=hashlib.sha256(independent_markdown.encode()).hexdigest(),
+                    classification="independent",
+                    retrieved_via="https://search.example.test",
+                    facts={
+                        "company_name": [candidate.company_name],
+                        "buyer_role": ["distributor"],
+                        "product_term": ["household-appliances"],
+                    },
+                ),
+            ],
+            independent_source_count=1,
+        )
 
 
 def deterministic_provider(definition: DatasetDefinition) -> DeterministicProvider:

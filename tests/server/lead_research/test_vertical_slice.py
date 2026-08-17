@@ -1,4 +1,9 @@
+import json
+
+import pytest
+
 from tests.server.test_api_mvp import make_client
+from server.lead_research.candidates import CandidateRepository
 from server.lead_research.registry import ProviderRegistry
 from server.lead_research.service import LeadResearchService
 from tests.server.lead_research.fakes import deterministic_provider, fixture_definition
@@ -10,6 +15,24 @@ def make_research_client():
     provider = deterministic_provider(definition)
     registry = ProviderRegistry([definition], {definition.source_id: provider})
     app.state.lead_research = LeadResearchService(app.state.db, registry=registry)
+    candidates = [
+        {
+            "source_record_id": f"buyer-{country.lower()}-{index}",
+            "company_name": f"{name} {country}",
+            "country": country,
+            "domain": f"https://{name.lower()}-{country.lower()}.example.test",
+            "categories": ["household-appliances"],
+            "buyer_types": ["distributor"],
+        }
+        for country in ("DE", "AT")
+        for index, name in ((1, "Atlas"), (2, "Northstar"))
+    ]
+    CandidateRepository(app.state.db).import_file(
+        "household-appliances",
+        "2026-08",
+        "candidates.jsonl",
+        "\n".join(json.dumps(item) for item in candidates).encode(),
+    )
     return app, client, headers, company_id
 
 
@@ -25,7 +48,7 @@ def campaign_body(name="DACH appliance distributors"):
 
 
 def test_research_campaign_vertical_slice_and_tenant_scope():
-    _, client, headers, _ = make_research_client()
+    app, client, headers, _ = make_research_client()
     created = client.post("/api/v1/research-campaigns", headers=headers, json=campaign_body())
     assert created.status_code == 201, created.text
     campaign = created.json()
@@ -42,7 +65,15 @@ def test_research_campaign_vertical_slice_and_tenant_scope():
         f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
     )
     assert started.status_code == 202, started.text
-    assert started.json()["status"] == "completed"
+    assert started.json()["status"] == "succeeded"
+
+    results = app.state.db.all(
+        "SELECT verdict,lead_id FROM research_results WHERE company_id=? AND campaign_id=?",
+        (campaign["company_id"], campaign["id"]),
+    )
+    assert results
+    assert {row["verdict"] for row in results} == {"strong_fit"}
+    assert all(row["lead_id"] for row in results)
 
     metrics = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/metrics", headers=headers,
@@ -105,8 +136,8 @@ def test_source_lifecycle_copy_matches_behavior_and_purge_needs_exact_name():
     assert lead["evidence_confidence"] == 0
 
 
-def test_completed_campaign_can_refresh_without_duplicate_runtime_state():
-    _, client, headers, _ = make_research_client()
+def test_succeeded_campaign_can_refresh_without_duplicate_runtime_state():
+    app, client, headers, _ = make_research_client()
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=campaign_body()).json()
     first = client.post(f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers)
     second = client.post(f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers)
@@ -116,3 +147,63 @@ def test_completed_campaign_can_refresh_without_duplicate_runtime_state():
     ).json()
     assert len(metrics) == 1
     assert metrics[0]["resolved_organizations"] >= metrics[0]["eligible_companies"]
+    assert app.state.db.one(
+        "SELECT COUNT(*) AS n FROM research_results WHERE campaign_id=?", (campaign["id"],)
+    )["n"] == 4
+
+
+class SelectivelyFailingVerifier:
+    def __init__(self, provider, failing_ids):
+        self.provider = provider
+        self.definition = provider.definition
+        self.failing_ids = set(failing_ids)
+
+    def discover(self, query):
+        return self.provider.discover(query)
+
+    def health(self):
+        return self.provider.health()
+
+    def verify(self, query, candidate):
+        if candidate.source_record_id in self.failing_ids:
+            raise RuntimeError(f"verification unavailable for {candidate.source_record_id}")
+        return self.provider.verify(query, candidate)
+
+
+@pytest.mark.parametrize(
+    ("failing_ids", "expected_status", "expected_partition_status", "verified"),
+    [
+        ({"buyer-de-2"}, "partial", "partial", 1),
+        ({"buyer-de-1", "buyer-de-2"}, "failed", "failed", 0),
+    ],
+)
+def test_partition_failures_preserve_candidate_diagnostics(
+    failing_ids, expected_status, expected_partition_status, verified,
+):
+    app, client, headers, _ = make_research_client()
+    definition = fixture_definition()
+    provider = SelectivelyFailingVerifier(deterministic_provider(definition), failing_ids)
+    registry = ProviderRegistry([definition], {definition.source_id: provider})
+    app.state.lead_research = LeadResearchService(app.state.db, registry=registry)
+    body = campaign_body()
+    body["target_countries"] = ["DE"]
+    campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
+
+    started = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
+    )
+
+    assert started.status_code == 202
+    assert started.json()["status"] == expected_status
+    source_run = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/source-runs", headers=headers,
+    ).json()[0]
+    assert source_run["status"] == expected_partition_status
+    assert source_run["error_category"] == "verification_error"
+    assert source_run["metrics"]["verified_candidates"] == verified
+    assert {
+        error["candidate_source_record_id"] for error in source_run["metrics"]["errors"]
+    } == failing_ids
+    assert app.state.db.one(
+        "SELECT COUNT(*) AS n FROM research_results WHERE campaign_id=?", (campaign["id"],)
+    )["n"] == 2

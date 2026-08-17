@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..db import json_dump, json_load, new_id, now
-from .models import EvidenceEnvelope, RawPage
+from .models import EvidenceEnvelope, RawPage, VerificationBundle
 from .paths import tenant_research_root
 
 
@@ -81,6 +81,119 @@ class EvidenceRepository:
                  item.observed_at.timestamp() if item.observed_at else None, item.retrieved_at.timestamp()),
             ))
         return saved
+
+    def save_verification(
+        self,
+        bundle: VerificationBundle,
+        source_id: str,
+        campaign_id: str,
+        organization_id: str,
+    ) -> list[dict]:
+        """Persist cited verification hashes as snapshots and normalized evidence."""
+        stored: list[dict] = []
+        stamp = now()
+        for source in bundle.sources:
+            snapshot = self.db.one(
+                "SELECT id FROM dataset_snapshots WHERE company_id=? AND source_id=? AND raw_hash=?",
+                (self.company_id, source_id, source.raw_hash),
+            )
+            if snapshot:
+                snapshot_id = snapshot["id"]
+            else:
+                seed = f"{self.company_id}:{source_id}:{source.raw_hash}".encode()
+                snapshot_id = f"snap_{hashlib.sha256(seed).hexdigest()[:20]}"
+                self.db.execute(
+                    "INSERT INTO dataset_snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        snapshot_id,
+                        self.company_id,
+                        source_id,
+                        campaign_id,
+                        "valid",
+                        None,
+                        source.raw_hash,
+                        1,
+                        json_dump({
+                            "provenance_url": source.provenance_url,
+                            "retrieved_via": source.retrieved_via,
+                            "classification": source.classification,
+                        }),
+                        stamp,
+                    ),
+                )
+            evidence_seed = (
+                f"{self.company_id}:{source_id}:{bundle.candidate_source_record_id}:"
+                f"{source.provenance_url}:{source.raw_hash}"
+            ).encode()
+            evidence_id = f"ev_{hashlib.sha256(evidence_seed).hexdigest()[:20]}"
+            record_seed = hashlib.sha256(source.provenance_url.encode()).hexdigest()[:16]
+            envelope = EvidenceEnvelope(
+                evidence_id=evidence_id,
+                source_id=source_id,
+                source_record_id=f"{bundle.candidate_source_record_id}:{record_seed}",
+                snapshot_id=snapshot_id,
+                record_type="company_signal",
+                provenance_url=source.provenance_url,
+                raw_hash=source.raw_hash,
+                method="observed",
+                confidence=.95 if source.classification == "official" else .85,
+                payload={
+                    "facts": source.facts,
+                    "classification": source.classification,
+                    "retrieved_via": source.retrieved_via,
+                },
+            )
+            self.save_evidence([envelope], campaign_id, {
+                envelope.source_record_id: organization_id,
+            })
+            stored.append({
+                "evidence_id": evidence_id,
+                "source_id": source_id,
+                "source": source,
+                "confidence": envelope.confidence,
+            })
+        return stored
+
+    def upsert_result(
+        self,
+        *,
+        campaign_id: str,
+        organization_id: str,
+        lead_id: str | None,
+        verdict: str,
+        fit_score: int,
+        evidence_confidence: float,
+        data: dict,
+    ) -> str:
+        existing = self.db.one(
+            "SELECT id,created_at FROM research_results "
+            "WHERE company_id=? AND campaign_id=? AND organization_id=?",
+            (self.company_id, campaign_id, organization_id),
+        )
+        result_id = existing["id"] if existing else new_id("result")
+        stamp = now()
+        self.db.execute(
+            "INSERT INTO research_results("
+            "id,company_id,campaign_id,organization_id,lead_id,verdict,fit_score,"
+            "evidence_confidence,data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(company_id,campaign_id,organization_id) DO UPDATE SET "
+            "lead_id=excluded.lead_id,verdict=excluded.verdict,fit_score=excluded.fit_score,"
+            "evidence_confidence=excluded.evidence_confidence,data=excluded.data,updated_at=excluded.updated_at",
+            (
+                result_id,
+                self.company_id,
+                campaign_id,
+                organization_id,
+                lead_id,
+                verdict,
+                fit_score,
+                evidence_confidence,
+                json_dump(data),
+                existing["created_at"] if existing else stamp,
+                stamp,
+            ),
+        )
+        return result_id
 
     def impact(self, source_id: str) -> dict:
         def count(table: str, where: str, params: tuple) -> int:

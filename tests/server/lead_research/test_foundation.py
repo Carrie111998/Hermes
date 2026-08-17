@@ -3,12 +3,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from server.db import Database, now
 from server.lead_research.enrichment import FeaturePlanner
 from server.lead_research.models import (
     Claim, LeadCandidate, MarketSignal, ScoringProfile, ScoringWeights,
 )
 from server.lead_research.scoring import derive_dimension_scores, score_lead
 from server.lead_research.registry import build_registry
+from server.lead_research.service import LeadResearchService
 from server.lead_research.sectors import (
     SECTOR_CSV, SECTOR_MD, load_sectors, render_sector_csv, render_sector_markdown,
 )
@@ -18,6 +20,26 @@ def test_production_catalog_has_no_fixture_adapter():
     registry = build_registry()
     assert all(item.adapter_mode != "fixture" for item in registry.list())
     assert "fixture-directory" not in {item.source_id for item in registry.list()}
+
+
+def test_catalog_only_provider_cannot_be_enabled_as_a_candidate_verifier(tmp_path):
+    db = Database(tmp_path / "catalog.db")
+    stamp = now()
+    db.execute(
+        "INSERT INTO companies(id,name,status,data,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+        ("company_one", "Company One", "active", "{}", stamp, stamp),
+    )
+    service = LeadResearchService(db, registry=build_registry())
+    service.ensure_catalog("company_one")
+    db.execute(
+        "UPDATE dataset_definitions SET enabled=1 WHERE company_id=? AND source_id=?",
+        ("company_one", "un-comtrade"),
+    )
+
+    source = next(item for item in service.catalog("company_one") if item["source_id"] == "un-comtrade")
+
+    assert source["available"] is False
+    assert source["unavailable_reason"] == "credential_required"
 
 
 def test_generated_sector_artifacts_are_current():
