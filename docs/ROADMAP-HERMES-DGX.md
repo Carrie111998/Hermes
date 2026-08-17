@@ -55,14 +55,15 @@
 | HERMES-MONITORING-001 | BLOCKED | No merge/deployment/readiness inference from current gateway evidence. |
 | ARCH-002 | MERGED_DEPLOYED | PR #29 merge `3e9fd48d...`; 24 focused tests passed; CI `31937692260` PASS; AGY + Claude Opus implementation review PASS; immutable DGX release active. |
 | ARCH-003 | MERGED_DEPLOYED | PR #30; merge `e8cdfd1e...`; implementation review consensus PASS; CI run `31981532693` PASS after retrying an unrelated pre-existing stream-consumer slice; immutable DGX release active with rollback metadata. |
+| ARCH-004 | DESIGN_REVIEW_PASS | Identical metadata-only packet SHA-256 `224b81eaaa19a236f8e886536c35c4d89e2a508867b8e7135c711411b57937f7`; authenticated DGX `.hermes` Claude Haiku and dedicated DGX `.hermes` AGY `1.1.13` PASS with no corrections; next write and review the implementation plan. |
 
 ## Current next lane
 
-**ARCH-004 ticket design** is the next core lane. First write the plan and
-bounded design packet for redaction and SQLite/WAL safeguards, then route one
-identical packet to exactly one authenticated Claude reviewer and one
-authenticated AGY reviewer. Do not implement, migrate, deploy, or modify DGX
-until that design/review gate is complete.
+**ARCH-004 implementation planning** is the next core lane. The ticket design
+and identical-packet Claude + AGY review gate are complete with PASS. Next write
+the implementation plan and route that plan through its own independent review
+before any source change. Do not implement, migrate, deploy, or modify DGX
+until implementation authorization and its review gate are complete.
 
 ## Runtime and deployment boundary
 
