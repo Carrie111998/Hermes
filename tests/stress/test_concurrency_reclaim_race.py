@@ -27,9 +27,10 @@ import os
 import random
 import sqlite3
 import sys
-import tempfile
 import time
 from pathlib import Path
+
+from _temphome import temp_home
 
 NUM_WORKERS = 5
 NUM_TASKS = 50
@@ -121,7 +122,11 @@ def reclaimer_loop(hermes_home: str, result_file: str) -> None:
 
 
 def main():
-    home = tempfile.mkdtemp(prefix="hermes_reclaim_race_")
+    with temp_home("hermes_reclaim_race_") as home:
+        _run_reclaim_race(home)
+
+
+def _run_reclaim_race(home):
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
     sys.path.insert(0, WT)

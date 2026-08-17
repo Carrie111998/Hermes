@@ -4753,11 +4753,34 @@ def _clear_bytecode_cache(root: Path) -> int:
     """
     removed = 0
     for dirpath, dirnames, _ in os.walk(root):
-        # Skip venv / node_modules / .git entirely
+        # Skip venv / node_modules / .git entirely.
+        #
+        # ``.claude`` is load-bearing: Claude Code puts worktrees under
+        # ``.claude/worktrees/<name>``, each a FULL checkout of this repo.
+        # The old list named ``.worktrees``, which does not exist there — so
+        # this walk descended into every sibling worktree and rmtree'd their
+        # ``__pycache__``. Measured 2026-08-17: 27 worktrees, 737 cache dirs,
+        # i.e. one ``hermes update`` wiped the bytecode of every other live
+        # session on the box and forced each into a full recompile.
+        #
+        # The structural check below is the real guard, since the name list
+        # can never be exhaustive: never descend into a directory carrying a
+        # ``.git`` entry. A nested clone has a ``.git`` DIRECTORY and a git
+        # worktree has a ``.git`` FILE, so one ``exists`` covers both — and
+        # bytecode inside either belongs to a different checkout, not ours.
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in {"venv", ".venv", "node_modules", ".git", ".worktrees"}
+            if d
+            not in {
+                "venv",
+                ".venv",
+                "node_modules",
+                ".git",
+                ".worktrees",
+                ".claude",
+            }
+            and not os.path.exists(os.path.join(dirpath, d, ".git"))
         ]
         if os.path.basename(dirpath) == "__pycache__":
             try:

@@ -20,6 +20,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from _temphome import temp_home
+
 WT = str(Path(__file__).resolve().parents[2])
 
 
@@ -54,7 +56,11 @@ def seed_tasks(conn, kb, n, assignee="bench-worker", with_parents=False):
 
 
 def main():
-    home = tempfile.mkdtemp(prefix="hermes_bench_")
+    with temp_home("hermes_bench_") as home:
+        _run_benchmarks(home)
+
+
+def _run_benchmarks(home):
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
     sys.path.insert(0, WT)

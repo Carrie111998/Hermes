@@ -20,8 +20,10 @@ repos:
   # there arms it in both places at once.
   #
   # This restores enforcement that landed in May 2026 and fell out of main in
-  # the v0.15.1 cutover. Files that offended at re-land time are listed in
-  # ruff.toml's per-file-ignores sunset list; every other file is gated.
+  # the v0.15.1 cutover. The F group is enforced tree-wide with NO
+  # suppressions -- the re-land sunset list was burned to zero and deleted
+  # (2026-08-17). ruff.toml's per-file-ignores now holds only PLW1514
+  # exemptions for tests/, skills/, optional-skills/ and plugins/.
   #
   # Deliberately NO --fix: a pre-commit hook that rewrites source during a
   # commit hides the change from the diff the author is reviewing, and the

@@ -21,10 +21,11 @@ from __future__ import annotations
 import os
 import random
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
+
+from _temphome import keep_for_debugging, temp_home
 
 WT = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, WT)
@@ -34,7 +35,11 @@ WORKERS_RUN_DURATION_S = 8
 
 
 def run() -> int:
-    home = tempfile.mkdtemp(prefix="hermes_parent_gate_stress_")
+    with temp_home("hermes_parent_gate_stress_") as home:
+        return _run_parent_gate(home)
+
+
+def _run_parent_gate(home: str) -> int:
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
 
@@ -174,6 +179,9 @@ def run() -> int:
             print("  VIOLATION:", v)
         for row in list(bad)[:10]:
             print("  EVENT-LOG BAD:", dict(row))
+        # Failure here is a return code, not an exception, so temp_home
+        # cannot see it -- say so explicitly or the evidence is deleted.
+        keep_for_debugging(home)
         return 1
     print("PARENT-GATE INVARIANT HELD UNDER RACE")
     return 0

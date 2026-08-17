@@ -22,9 +22,10 @@ import os
 import random
 import sqlite3
 import sys
-import tempfile
 import time
 from pathlib import Path
+
+from _temphome import temp_home
 
 
 NUM_WORKERS = 5
@@ -117,7 +118,11 @@ def worker_loop(worker_id: int, hermes_home: str, result_file: str) -> None:
 
 
 def main():
-    home = tempfile.mkdtemp(prefix="hermes_concurrency_")
+    with temp_home("hermes_concurrency_") as home:
+        _run_concurrency(home)
+
+
+def _run_concurrency(home):
     print(f"HERMES_HOME = {home}")
 
     # Seed.
