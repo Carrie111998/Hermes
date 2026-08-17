@@ -122,7 +122,13 @@ def _profile_cli_env(source_home: Path) -> dict[str, str]:
     return env
 
 
-def _run_profile_config_check(source_home: Path, target_name: str, env):
+def _run_profile_config_check(
+    source_home: Path,
+    target_name: str,
+    env,
+    *,
+    global_args=(),
+):
     return subprocess.run(
         [
             sys.executable,
@@ -130,6 +136,7 @@ def _run_profile_config_check(source_home: Path, target_name: str, env):
             "from hermes_cli.main import main; main()",
             "--profile",
             target_name,
+            *global_args,
             "config",
             "check",
         ],
@@ -163,7 +170,8 @@ def test_profile_scoped_cli_config_check_is_byte_identical(tmp_path):
     assert _fingerprint(target_config) == before
 
 
-def test_profile_scoped_cli_blocks_startup_hook_config_write(tmp_path):
+@pytest.mark.parametrize("global_args", [(), ("--yolo",), ("--cli",)])
+def test_profile_scoped_cli_blocks_startup_hook_config_write(tmp_path, global_args):
     source_home = tmp_path / "profiles" / "source"
     target_home = tmp_path / "profiles" / "target"
     source_home.mkdir(parents=True)
@@ -194,12 +202,35 @@ env_loader.load_hermes_dotenv = load_hermes_dotenv
     env = _profile_cli_env(source_home)
     env["PYTHONPATH"] = os.pathsep.join([str(bootstrap_dir), env["PYTHONPATH"]])
 
-    result = _run_profile_config_check(source_home, target_home.name, env)
+    result = _run_profile_config_check(
+        source_home,
+        target_home.name,
+        env,
+        global_args=global_args,
+    )
 
     assert result.returncode != 0
     assert "config check` is read-only" in result.stderr
     assert _fingerprint(source_config) == source_before
     assert _fingerprint(target_config) == before
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--yolo", "config", "check"], True),
+        (["config", "--cli", "check"], True),
+        (["--model", "config", "check"], False),
+        (["--model", "gpt-5", "config", "check"], True),
+        (["--oneshot", "config", "check"], False),
+        (["mcp", "add", "demo", "--args", "config", "check"], False),
+        (["config", "get", "check"], False),
+    ],
+)
+def test_early_config_check_detection_ignores_values_and_passthrough(argv, expected):
+    from hermes_cli.main import _is_config_check_invocation
+
+    assert _is_config_check_invocation(argv) is expected
 
 
 def test_cli_process_guard_releases_after_dispatch(tmp_path):
