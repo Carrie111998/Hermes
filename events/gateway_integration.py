@@ -57,10 +57,10 @@ LAG_ALERT_COOLDOWN_SECONDS = 900  # 15 minutes
 # the loop catches on every tick.  Separate from lag cooldown so we can tune.
 POLL_LOOP_ERROR_COOLDOWN_SECONDS = 900
 # Budget for the BEST-EFFORT tail of shutdown()'s drain.  GATEWAY_STOPPED
-# consumers are always drained — that is the whole guarantee — and everything
-# else yields to this deadline.  Bounded because teardown creeping toward
-# gateway/status.py's _TASKKILL_TIMEOUT_S is what leaves the gateway DOWN on
-# this box: a stop that outruns the cap gets force-killed mid-teardown.
+# consumers are drained first and never skipped; everything else yields to this
+# deadline.  Bounded because teardown creeping toward gateway/status.py's
+# _TASKKILL_TIMEOUT_S is what leaves the gateway DOWN on this box: a stop that
+# outruns the cap gets force-killed mid-teardown.
 SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 10.0
 # Heartbeat write interval — external watchers stat gateway_heartbeat_path()
 # and alert on staleness > a few minutes, so this cadence must be tight
@@ -251,9 +251,8 @@ def _consumes_gateway_stopped(subscriber) -> bool:
     """Whether ``subscriber`` would be handed a GATEWAY_STOPPED event.
 
     ``event_types is None`` means "no filter" — the subscriber receives every
-    event — so those count too (AuditLogger is the one that matters: the
-    shutdown event reaching audit.jsonl before the bus closes is the same
-    guarantee, one consumer over).
+    event — so those count too. AuditLogger is the consumer that matters here:
+    it is how the shutdown event reaches audit.jsonl before the bus closes.
     """
     from events.schema import EventType
 
@@ -275,13 +274,25 @@ def _drain_subscribers_for_shutdown(
 
     ``gateway/run.py`` emits GATEWAY_STOPPED early in its stop path and calls
     :func:`shutdown` late in ``main()``. Without this drain, delivery inside
-    that window depended on the poll loop happening to tick — and the
-    subscriber that needs it most, ``CronStaleMonitor``, polls every 60s
-    against a teardown window measured at ~60s. Worse, the miss is
-    unrecoverable: ``_started_event_ids`` is per-process state and
-    ``BaseSubscriber`` seeds its cursor with INSERT OR IGNORE, so the
-    replacement process never replays the CRON_STARTED that built it and
-    silently drops the attribution (observed in production 2026-08-17).
+    that window depends on the poll loop happening to tick before the bus
+    closes. What that buys is a RECORD: AuditLogger writing the shutdown event
+    into audit.jsonl, and the other subscribers seeing whatever else landed
+    during teardown.
+
+    ⚠ **It is NOT what makes the cron shutdown-attribution work, despite what
+    bc07363000's commit message claims.** That commit justified this drain by
+    ``CronStaleMonitor`` needing to see GATEWAY_STOPPED before the process
+    died. The premise was falsified on 2026-08-17: PID 10168 was force-killed
+    INSIDE ``_drain_active_agents`` — it logged ``notify_active_sessions done
+    at +1.76s`` and never ``drain done`` — so this function never ran, and two
+    genuinely-killed crons went unreported. The general form is that the
+    gateway's drain budget and ``gateway/status.py``'s ``_TASKKILL_TIMEOUT_S``
+    are both ~30s, so any hook at or after the drain is reachable only when the
+    drain ended early, i.e. only when nothing was killed and there is nothing
+    to report. Attribution therefore moved to the SUCCESSOR, rebuilt from the
+    bus in ``CronStaleMonitor.startup()`` (517cc56c97), where it needs nothing
+    from this path at all. Do not re-derive a shutdown-time reporting hook from
+    that commit message; it has been tried and measured.
 
     GATEWAY_STOPPED consumers go FIRST and are never skipped; the rest are
     best-effort under ``timeout_seconds``. The deadline gates whether a
@@ -348,10 +359,13 @@ def shutdown() -> None:
     if _applier_thread:
         _applier_thread.join(timeout=5)
         _applier_thread = None
-    # Deliver whatever landed on the bus during teardown — above all the
-    # GATEWAY_STOPPED this process emitted on its way here. AFTER the joins so
-    # no subscriber is polled from two threads at once, and BEFORE close() so
-    # the bus is still open. The applier is excluded for the same reason
+    # Deliver whatever landed on the bus during teardown — chiefly getting the
+    # GATEWAY_STOPPED this process emitted into audit.jsonl before the bus
+    # closes. Best-effort by nature: a teardown force-killed before this point
+    # skips it entirely, which is why nothing CORRECTNESS-critical may depend
+    # on it (see _drain_subscribers_for_shutdown). AFTER the joins so no
+    # subscriber is polled from two threads at once, and BEFORE close() so the
+    # bus is still open. The applier is excluded for the same reason
     # _subscriber_poll_loop excludes it: its join above is bounded at 5s, so it
     # may still be running, and IntentApplier is single-threaded by design.
     if _registry:

@@ -1,28 +1,34 @@
-"""The EventBus shutdown drain — makes shutdown-time delivery deterministic.
+"""The EventBus shutdown drain — best-effort delivery of teardown-time events.
 
-``gateway/run.py`` emits GATEWAY_STOPPED early in ``_stop_impl_body`` (:9535)
-and calls ``events.gateway_integration.shutdown()`` late in ``main()``'s
-teardown (:23881). Between those two points the only thing that could deliver
-the event to a subscriber was the ordinary poll loop happening to tick — and
-``CronStaleMonitor.poll_interval_seconds`` is 60 against a teardown window
-measured at ~60s. So ``CronStaleMonitor._resolve_gateway_stopped`` (the
-2026-08-16 shutdown-attribution feature) fired on a coin flip.
+``gateway/run.py`` emits GATEWAY_STOPPED early in ``_stop_impl_body`` and calls
+``events.gateway_integration.shutdown()`` late in ``main()``'s teardown.
+Between those points, delivery depends on the poll loop happening to tick
+before the bus closes. ``shutdown()`` therefore drains subscribers itself,
+after the poll threads are joined (so nothing polls concurrently) and before
+the bus is closed. What that buys is a RECORD — chiefly AuditLogger writing the
+shutdown event into audit.jsonl.
 
-The successor process cannot cover the miss by HANDLING the event:
-``_started_event_ids`` is per-process in-memory state, and ``BaseSubscriber``
-seeds its cursor with INSERT OR IGNORE, so a restart PRESERVES the cursor and
-never replays the CRON_STARTED that built that map. Verified in production
-2026-08-17: the new process handled the GATEWAY_STOPPED at 04:12:03 and emitted
-nothing.
+⚠ **The drain is not what makes the cron shutdown-attribution correct, though
+bc07363000's commit message says so.** That commit reasoned the drain would
+stop ``CronStaleMonitor`` missing GATEWAY_STOPPED on a 60s poll. Measured
+2026-08-17, the premise fails: PID 10168 was force-killed INSIDE
+``_drain_active_agents`` (logged ``notify_active_sessions done at +1.76s``,
+never ``drain done``), so ``shutdown()`` never ran and two genuinely-killed
+crons went unreported. Generally, the gateway's drain budget and
+``_TASKKILL_TIMEOUT_S`` are both ~30s, so any hook at or after the drain is
+reachable only when the drain ended EARLY — i.e. only when nothing was killed
+and there is nothing to report.
 
-``shutdown()`` therefore drains subscribers itself, after the poll threads are
-joined (so nothing polls concurrently) and before the bus is closed.
+Attribution therefore lives in the SUCCESSOR: ``CronStaleMonitor.startup()``
+rebuilds it by QUERYING the bus, where every input is already durable
+(517cc56c97). Verified in production 2026-08-17 18:41:15Z, when a fresh boot
+backfilled three runs from two earlier shutdowns — including one from 04:08:21Z,
+14.5 hours stale — and correctly skipped the run that had completed during
+teardown.
 
-That covers a GRACEFUL teardown. A force-killed one reaches neither the drain
-nor ``shutdown_all()``, so ``CronStaleMonitor.startup()`` rebuilds the
-attribution from the bus in the SUCCESSOR — not by handling the event, but by
-querying for it. The last two tests here pin the two paths composing to exactly
-one record.
+So the tests below split by concern: the drain's own mechanics (ordering,
+deadline, exclusions, error tolerance), then the two attribution paths and the
+fact that they compose to exactly one record rather than two.
 """
 import logging
 import time
@@ -247,13 +253,16 @@ def _wire_gateway(monkeypatch, bus, *subs):
 
 
 def test_cron_stale_monitor_attributes_the_killed_run_during_teardown(bus, monkeypatch):
-    """Production shape, through the real shutdown() sequence: a cron is in
-    flight, the gateway stops, and the attribution lands before this process
-    dies — not on a 60s coin flip.
+    """The FAST PATH, through the real shutdown() sequence: a cron is in
+    flight, the gateway stops GRACEFULLY, and the attribution lands before this
+    process dies.
 
-    Both halves matter and neither works alone: the DRAIN is what makes the
-    monitor see the GATEWAY_STOPPED at all, and shutdown_all() is what flushes
-    the staged report at the last moment.
+    Fast path, not guarantee. It holds only when teardown actually reaches
+    shutdown() — the drain lets the monitor see the GATEWAY_STOPPED, and
+    shutdown_all() flushes the staged report. A force-killed teardown reaches
+    neither, which is why the successor rebuilds from the bus regardless; see
+    test_a_force_killed_teardown_is_attributed_by_the_next_gateway, and the
+    module docstring for why no later in-process hook exists.
     """
     monitor = CronStaleMonitor(bus)
 
