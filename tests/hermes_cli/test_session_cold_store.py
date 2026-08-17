@@ -1,6 +1,9 @@
 """Contract tests for the first Store-only cold archive slice."""
 
+import json
 from pathlib import Path
+
+import pytest
 
 from hermes_cli.session_cold_store import store_archived_lineage
 from hermes_state import SessionDB
@@ -30,5 +33,29 @@ def test_store_archived_compression_lineage_writes_terminal_id_revision(tmp_path
         assert (result.revision_dir / "session.jsonl").is_file()
         assert db.get_session("root") is not None
         assert db.get_session("terminal") is not None
+    finally:
+        db.close()
+
+
+def test_store_reads_raw_rows_without_flushing_and_preserves_system_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Store neither flushes pending accounting nor drops normalized prompt rows."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("terminal", source="cli", system_prompt="be helpful")
+        db.append_message("terminal", role="user", content="hello")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        def unexpected_flush() -> None:
+            raise AssertionError("Store must not flush accounting")
+
+        monkeypatch.setattr(db, "flush_token_counts", unexpected_flush)
+        result = store_archived_lineage(db, "terminal", tmp_path / "archive")
+
+        records = [
+            json.loads(line)
+            for line in (result.revision_dir / "session.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert any(record["kind"] == "system-prompt" for record in records)
     finally:
         db.close()

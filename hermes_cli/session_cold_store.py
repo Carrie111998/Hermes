@@ -53,6 +53,44 @@ def _rows(conn: sqlite3.Connection, query: str, params: tuple[Any, ...]) -> list
     ]
 
 
+def _session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+    rows = _rows(conn, "SELECT * FROM sessions WHERE id = ?", (session_id,))
+    return rows[0] if rows else None
+
+
+def _is_explicit_fork(row: dict[str, Any]) -> bool:
+    raw_config = row.get("model_config")
+    try:
+        config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config or {}
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(config, dict):
+        return True
+    parent_id = row.get("parent_session_id")
+    return bool(config.get("_branched_from") or config.get("_delegate_from")) and bool(parent_id)
+
+
+def _raw_compression_lineage(conn: sqlite3.Connection, terminal_id: str) -> tuple[str, ...]:
+    current = _session(conn, terminal_id)
+    if current is None:
+        raise ValueError(f"session not found: {terminal_id}")
+    if _is_explicit_fork(current):
+        return (terminal_id,)
+    lineage = [str(current["id"])]
+    seen = set(lineage)
+    while current.get("parent_session_id"):
+        parent = _session(conn, str(current["parent_session_id"]))
+        if parent is None or parent.get("end_reason") != "compression" or _is_explicit_fork(current):
+            break
+        parent_id = str(parent["id"])
+        if parent_id in seen:
+            raise ValueError("cyclic compression lineage")
+        lineage.append(parent_id)
+        seen.add(parent_id)
+        current = parent
+    return tuple(reversed(lineage))
+
+
 def _records(conn: sqlite3.Connection, physical_ids: tuple[str, ...]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for session_id in physical_ids:
@@ -60,6 +98,16 @@ def _records(conn: sqlite3.Connection, physical_ids: tuple[str, ...]) -> list[di
         if len(sessions) != 1:
             raise ValueError(f"session disappeared while storing: {session_id}")
         records.append({"v": 1, "kind": "session-segment", "row": sessions[0]})
+        system_prompt_hash = sessions[0].get("system_prompt_hash")
+        if system_prompt_hash:
+            prompts = _rows(
+                conn,
+                "SELECT hash, prompt FROM system_prompts WHERE hash = ?",
+                (str(system_prompt_hash),),
+            )
+            if len(prompts) != 1:
+                raise ValueError(f"missing normalized system prompt: {system_prompt_hash}")
+            records.append({"v": 1, "kind": "system-prompt", "row": prompts[0]})
         records.extend(
             {"v": 1, "kind": "message", "row": row}
             for row in _rows(
@@ -109,16 +157,15 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     fingerprint directory makes repeated stores idempotent and lets a later
     changed source produce a separate local revision.
     """
-    lineage = tuple(db.get_compression_lineage(terminal_id))
-    if not lineage:
-        raise ValueError(f"session not found: {terminal_id}")
+    conn = _connection(db)
+    lineage = _raw_compression_lineage(conn, terminal_id)
     if lineage[-1] != terminal_id:
         raise ValueError("store requires the terminal compression session ID")
 
-    sessions = [db.get_session(session_id) for session_id in lineage]
-    if any(session is None for session in sessions):
+    rows = [_session(conn, session_id) for session_id in lineage]
+    if any(session is None for session in rows):
         raise ValueError("compression lineage changed while resolving store candidate")
-    rows = [session for session in sessions if session is not None]
+    rows = [session for session in rows if session is not None]
     if any(not row.get("archived") for row in rows):
         raise ValueError("all compression lineage rows must be marked archived")
     if any(row.get("pinned") for row in rows):
@@ -127,7 +174,6 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     if ended_at is None:
         raise ValueError("terminal session must be ended before cold storage")
 
-    conn = _connection(db)
     records = _records(conn, lineage)
     fingerprint = _fingerprint(records)
     terminal_date = datetime.fromtimestamp(float(ended_at), UTC)
@@ -144,6 +190,9 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     )
     if revision_dir.exists():
         return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
+
+    if os.name == "nt":
+        raise OSError("cold store is not yet supported on Windows")
 
     revision_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=revision_dir.parent))
