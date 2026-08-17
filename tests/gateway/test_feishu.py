@@ -10,10 +10,13 @@ from collections import OrderedDict
 from importlib.machinery import PathFinder
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 from unittest.mock import AsyncMock, Mock, patch
 
 from gateway.platforms.base import ProcessingOutcome
+
+if TYPE_CHECKING:
+    from plugins.platforms.feishu.adapter import FeishuAdapter
 
 # Detect the SDK WITHOUT importing it. lark_oapi is ~10k modules; importing it
 # here cost 23.8s and 10,055 sys.modules entries at collection time — paid by

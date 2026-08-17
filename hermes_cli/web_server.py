@@ -49,7 +49,12 @@ from hermes_cli._subprocess_compat import (
 )
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    import uvicorn
+
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 
 import yaml
 

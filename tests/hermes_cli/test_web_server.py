@@ -8579,7 +8579,6 @@ class TestDashboardPluginManifestExtensions:
 # monkeypatch that hook.
 # ---------------------------------------------------------------------------
 
-import sys
 
 
 skip_on_windows = pytest.mark.skipif(

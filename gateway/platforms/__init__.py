@@ -26,8 +26,11 @@ __all__ = [
     "BasePlatformAdapter",
     "MessageEvent",
     "SendResult",
-    "QQAdapter",
-    "YuanbaoAdapter",
+    # Resolved lazily by the PEP 562 module __getattr__ below, so these are
+    # NOT missing names — ruff's F822 cannot see __getattr__ and reports them
+    # anyway. Do not "fix" by deleting: that would drop the public re-export.
+    "QQAdapter",  # noqa: F822
+    "YuanbaoAdapter",  # noqa: F822
 ]
 
 

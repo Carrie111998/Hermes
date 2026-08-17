@@ -206,9 +206,9 @@ def test_trims_trailing_blank_frames(tmp_path):
     assert r.frame_count("review") == 5
 
     # Every stepped frame is non-empty — no blank flash for the trimmed states.
-    for state in ("wave", "jump", "review"):
-        for i in range(r.frame_count(state)):
-            assert r.frame(state, i), f"{state}[{i}] rendered blank"
+    for state_name in ("wave", "jump", "review"):
+        for i in range(r.frame_count(state_name)):
+            assert r.frame(state_name, i), f"{state_name}[{i}] rendered blank"
 
     counts = render.state_frame_counts(str(sprite))
     assert counts == {
