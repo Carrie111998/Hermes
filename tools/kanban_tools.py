@@ -1511,8 +1511,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       for these rows and posts the completion message into the running
       session.
 
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
+    - **CLI / cron / test / unattached**: no persistent delivery channel.
+      Falls back to ``kanban.notify_fallback`` (``"<platform>:<chat_id>"``)
+      when configured, else no-op.
 
     Failure mode: any exception inside the function is logged at WARNING
     with the offending exception + diagnostic env vars and swallowed.
@@ -1553,9 +1554,24 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+                # CLI / cron / test — no persistent channel. Fall back to
+                # kanban.notify_fallback ("<platform>:<chat_id>") when the
+                # user configured one, so channel-less creates still reach
+                # a human. Without it, keep the historical no-op (#19718
+                # over-eagerness got reverted in #19721 — the fallback is
+                # strictly opt-in, so it can't resurrect that behaviour).
+                fallback = ""
+                try:
+                    fallback = str(cfg_get(load_config(), "kanban", "notify_fallback", default="") or "")
+                except Exception:
+                    fallback = ""
+                platform, _, fallback_chat = fallback.partition(":")
+                if not platform or not fallback_chat:
+                    return False
+                chat_id = fallback_chat
+            else:
+                platform = "tui"
+                chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None

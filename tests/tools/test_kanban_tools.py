@@ -892,6 +892,83 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     assert d["subscribed"] is False, d
 
 
+def test_channelless_create_noop_without_fallback(monkeypatch, worker_env, tmp_path):
+    """Default behaviour is unchanged: a channel-less create (CLI/cron)
+    with no kanban.notify_fallback configured writes NO subscription —
+    the historical no-op that #19721 restored."""
+    home = tmp_path / "nofb-home" / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("kanban:\n  auto_subscribe_on_create: true\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # No HERMES_SESSION_* vars: simulate CLI/cron channel-less context.
+    for var in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "channelless no fallback", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_channelless_create_uses_notify_fallback(monkeypatch, worker_env, tmp_path):
+    """kanban.notify_fallback="telegram:<chat>" makes a channel-less
+    create subscribe the fallback target instead of silently leaving
+    the task unnotified."""
+    home = tmp_path / "fb-home" / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_on_create: true\n"
+        "  notify_fallback: \"telegram:388101199\"\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for var in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "channelless with fallback", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert subs, "expected a notify sub row for the fallback target"
+    sub = subs[0]
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "388101199"
+    # The fallback row must NOT carry live-session delivery metadata
+    # (thread/reply anchors) — it is a synthetic subscription.
+    meta = sub.get("delivery_metadata") or {}
+    assert not meta.get("telegram_dm_topic_reply_fallback")
+
+
+def test_notify_fallback_ignored_when_session_has_channel(monkeypatch, worker_env, tmp_path):
+    """The fallback must never override a real session channel: when
+    HERMES_SESSION_PLATFORM/CHAT_ID are bound (gateway session), the
+    subscription targets the session chat, not the fallback."""
+    home = tmp_path / "both-home" / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_on_create: true\n"
+        "  notify_fallback: \"telegram:999999999\"\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-7")
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "session channel wins", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert subs
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat-7"
+
+
 # ---------------------------------------------------------------------------
 # Attachments — kanban_attach / kanban_attach_url / kanban_attachments
 # ---------------------------------------------------------------------------
