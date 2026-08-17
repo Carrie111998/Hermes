@@ -123,9 +123,11 @@ jobs:
     # Enforce the rules selected in ruff.toml: the Pyflakes ``F`` group plus
     # PLW1514 (unspecified-encoding), which catches bare ``open()`` /
     # ``read_text()`` / ``write_text()`` calls that default to locale
-    # encoding on Windows. Files that already offended when the F group was
-    # re-landed are held in ruff.toml's shrink-only sunset list; every other
-    # file is gated, so a new offender in a clean file fails here.
+    # encoding on Windows. The F group is enforced tree-wide with NO
+    # suppressions -- the re-land sunset list was burned to zero and deleted
+    # (2026-08-17), so any new F finding anywhere fails here. ruff.toml's
+    # per-file-ignores now holds only PLW1514 exemptions for tests/, skills/,
+    # optional-skills/ and plugins/.
     # Failure blocks merge; the advisory ``lint-diff`` job above runs
     # independently so reviewers still get the diff comment even when
     # enforcement fails.
