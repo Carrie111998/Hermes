@@ -68,7 +68,8 @@ export const es: Translations = defineLocale({
       loadingSettings: 'Cargando configuraci\u00F3n de Hermes',
       loadingSessions: 'Cargando sesiones recientes',
       startingDesktopConnection: 'Iniciando conexi\u00F3n del escritorio',
-      startingHermesDesktop: 'Iniciando Hermes Desktop\u2026'
+      startingHermesDesktop: 'Iniciando Hermes Desktop\u2026',
+      retryingRemoteBackend: 'Reconectando con el backend remoto de Hermes\u2026'
     },
     errors: {
       backgroundExited: 'El proceso en segundo plano de Hermes termin\u00F3.',
@@ -130,6 +131,7 @@ export const es: Translations = defineLocale({
     updateReadyTitle: 'Actualizaci\u00F3n lista',
     updateReadyMessage: count =>
       `${count} cambio${count === 1 ? '' : 's'} nuevo${count === 1 ? '' : 's'} disponible${count === 1 ? '' : 's'}.`,
+    updateReadyMessageUnknown: 'Hay una nueva actualizaci\u00F3n disponible.',
     seeWhatsNew: 'Ver novedades',
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT necesita ELEVENLABS_API_KEY.',
@@ -162,6 +164,14 @@ export const es: Translations = defineLocale({
       transcriptionUnavailable: 'La transcripci\u00F3n de voz a\u00FAn no est\u00E1 disponible.',
       tryRecordingAgain: 'Intenta grabar de nuevo.',
       unavailable: 'Voz no disponible'
+    },
+    mcp: {
+      needsAuthTitle: 'El servidor MCP necesita reautenticaci\u00F3n',
+      needsAuthMessage: name => `${name} MCP necesita reautenticaci\u00F3n.`,
+      errorTitle: 'Servidor MCP inalcanzable',
+      errorMessage: name => `${name} MCP fall\u00F3 su comprobaci\u00F3n de salud.`,
+      signIn: 'Iniciar sesi\u00F3n',
+      view: 'Ver'
     },
     native: {
       approvalTitle: 'Aprobaci\u00F3n necesaria',
@@ -201,9 +211,10 @@ export const es: Translations = defineLocale({
     unmuteHaptics: 'Activar h\u00E1pticos',
     openSettings: 'Abrir configuraci\u00F3n',
     openStarmap: 'Abrir gráfico de memoria',
-    openKeybinds: 'Atajos de teclado',
+    enterHud: 'Modo HUD',
+    exitHud: 'Salir del modo HUD',
     layoutEditor: 'Editor de diseño',
-    layoutEditorTitle: 'Editor de diseño — ⌘-clic restablece el diseño'
+    layoutEditorTitle: mod => `Editor de diseño — ${mod}-clic restablece el diseño`
   },
   keybinds: {
     title: 'Atajos de teclado',
@@ -336,6 +347,7 @@ export const es: Translations = defineLocale({
       providerApiKeys: 'Claves API',
       providerCustomEndpoints: 'Endpoints personalizados',
       gateway: 'Gateway',
+      connections: 'Conexiones',
       apiKeys: 'Herramientas y claves',
       keybinds: 'Atajos de teclado',
       keysTools: 'Herramientas',
@@ -363,6 +375,25 @@ export const es: Translations = defineLocale({
         bundled: 'incluido',
         disk: 'en disco',
         runtime: 'en ejecución'
+      },
+      agent: {
+        title: 'Plugins del agente',
+        blurb:
+          'Se ejecutan en el backend de Hermes — herramientas, skills, servidores MCP, hooks y comandos slash. Los portables son paquetes de Agent Plugins (skills + bundles MCP que funcionan también en otros agentes). Los conmutadores se aplican a las sesiones nuevas.',
+        empty: 'Aún no hay plugins de agente instalados.',
+        loadFailed: 'No se pudieron cargar los plugins de agente',
+        portable: 'portable',
+        search: 'Buscar plugins…',
+        noMatches: 'Ningún plugin coincide con tu búsqueda.',
+        toggleFailed: name => `No se pudo conmutar ${name}`,
+        updateBackendToManage: 'Actualiza el backend de Hermes para gestionar este plugin desde el escritorio.',
+        sources: {
+          bundled: 'incluido',
+          user: 'usuario',
+          git: 'git',
+          project: 'proyecto',
+          entrypoint: 'pip'
+        }
       }
     },
     notifications: {
@@ -453,9 +484,16 @@ export const es: Translations = defineLocale({
       toolViewTitle: 'Visualizaci\u00F3n de herramientas',
       toolViewDesc:
         'Producto oculta los datos crudos de las herramientas; T\u00E9cnico muestra entrada/salida completa.',
+      reasoningCollapsedTitle: 'Plegar el pensamiento por defecto',
+      reasoningCollapsedDesc: 'Mantener el razonamiento en streaming disponible sin expandirlo hasta que lo abras.',
       uiScaleTitle: 'Escala de interfaz',
       uiScaleDesc: percent =>
         `Escala el texto y los controles de toda la app. Cmd/Ctrl con +, - y 0 también funciona. Actual: ${percent}%`,
+      sessionDensityTitle: 'Densidad de la lista de sesiones',
+      sessionDensityDesc: 'Elige cuánto contexto aparece bajo los títulos de sesión en la barra lateral.',
+      sessionDensityCompact: 'Compacta',
+      sessionDensityComfortable: 'Cómoda',
+      sessionDensityDetailed: 'Detallada',
       terminalFontTitle: 'Tipograf\u00EDa del terminal',
       terminalFontDesc:
         'Elige una tipograf\u00EDa instalada para los terminales de Desktop. Las Nerd Fonts renderizan Powerlevel10k e iconos de shell; d\u00E9jalo en blanco para usar la JetBrains Mono incluida.',
@@ -468,6 +506,8 @@ export const es: Translations = defineLocale({
       backdropDesc: 'La tenue imagen de estatua tras la conversación.',
       reactionsTitle: 'Reacciones a mensajes',
       reactionsDesc: 'Reacciones estilo iMessage: reacciona a los mensajes y Hermes puede reaccionar a los tuyos.',
+      composerPopoutTitle: 'Compositor flotante',
+      composerPopoutDesc: 'Permitir arrastrar el compositor fuera de su muelle. Desactívalo para mantenerlo fijo abajo.',
       embedsTitle: 'Incrustaciones en línea',
       embedsDesc:
         'Las vistas previas enriquecidas se cargan desde sitios de terceros (YouTube, X, …). «Preguntar» muestra un marcador de posición hasta que permites cada uno; «Siempre» los carga sin preguntar.',
@@ -551,6 +591,7 @@ export const es: Translations = defineLocale({
       tapCheck: 'Toca "Buscar ahora" para buscar actualizaciones.',
       updateReady: count =>
         `Hay una actualización nueva lista (${count} cambio${count === 1 ? '' : 's'} incluido${count === 1 ? '' : 's'}).`,
+      updateReadyUnknown: 'Hay una actualización nueva lista.',
       lastChecked: age => `Última comprobación ${age}`,
       justNowSuffix: ' \u00B7 ahora mismo',
       automaticUpdates: 'Actualizaciones autom\u00E1ticas',
@@ -579,9 +620,13 @@ export const es: Translations = defineLocale({
       autosaveFailed: 'Error al guardar autom\u00E1ticamente',
       imported: 'Configuraci\u00F3n importada',
       invalidJson: 'JSON de configuraci\u00F3n inv\u00E1lido',
+      toolsetsWipeConfirm:
+        '¿Eliminar todos los toolsets activados? Esto desactiva la memoria, el terminal, la búsqueda web, la delegación y la mayoría de las demás herramientas hasta que los vuelvas a activar.',
       keepAwakeTitle: 'Mantener el equipo despierto',
       keepAwakeDesc:
         'Evita que esta máquina se duerma para que las ejecuciones largas o nocturnas sigan adelante. La pantalla puede seguir atenuándose.',
+      disableF12Title: 'Desactivar F12 DevTools',
+      disableF12Desc: 'Bloquea que F12 abra las herramientas de desarrollo. Ctrl+Shift+I (o Cmd+Opt+I en Mac) sigue funcionando.',
       attachmentSizeTitle: 'Tamaño máximo de previsualización / carga de imagen',
       attachmentSizeDesc: '',
       attachmentSizeUnit: 'MB',
@@ -615,6 +660,58 @@ export const es: Translations = defineLocale({
       replace: 'Reemplazar',
       set: 'Establecer',
       clear: 'Limpiar'
+    },
+    connections: {
+      title: 'Conexiones',
+      intro:
+        'Registra cada lugar donde viven tus agentes — este dispositivo, gateways remotos en tu red e instancias de Hermes Cloud. Todos se guardan aquí.',
+      stagedNote:
+        'Los chats y el elenco de agentes siguen la fuente que elijas; el backend de ventana gestionado por la app se sigue eligiendo en Ajustes → Gateway.',
+      loadFailed: 'No se pudieron cargar las conexiones',
+      primaryPill: 'Principal',
+      managedPill: 'Este dispositivo',
+      addConnection: 'Añadir conexión',
+      editConnection: 'Editar',
+      removeConnection: 'Quitar',
+      removeConfirmTitle: '¿Quitar esta conexión?',
+      removeConfirmDesc: (label: string) =>
+        `«${label}» se quitará de esta app. La instancia en sí no se toca — puedes añadirla de nuevo cuando quieras.`,
+      makePrimary: 'Hacer principal',
+      testConnection: 'Probar',
+      testOk: 'Alcanzable',
+      testFailed: 'Falló la prueba de conexión',
+      saveFailed: 'No se pudo guardar la conexión',
+      removeFailed: 'No se pudo quitar la conexión',
+      updateAll: 'Actualizar todas las instancias',
+      updateAllRunning: 'Actualizando todas las instancias…',
+      updateAllDone: 'Actualizaciones enviadas',
+      updateAllFailed: 'Falló el envío de actualizaciones',
+      updateSkippedCloud: 'Gestionado por Hermes Cloud',
+      kindLocal: 'Local',
+      kindRemote: 'Gateway remoto',
+      kindCloud: 'Hermes Cloud',
+      kindSsh: 'SSH',
+      kindLocalDesc: 'El runtime de Hermes gestionado por esta app.',
+      kindRemoteDesc: 'Un gateway de Hermes accesible por HTTP(S) — LAN, Tailscale o internet.',
+      kindCloudDesc: 'Una instancia alojada descubierta a través de tu cuenta de Hermes Cloud.',
+      kindSshDesc: 'Una instalación de Hermes a la que se llega por SSH.',
+      labelTitle: 'Nombre',
+      labelDesc:
+        'Obligatorio. Se muestra en todos los sitios donde aparece esta instancia; debe ser único (p. ej. «Homelab», «Portátil del trabajo»).',
+      labelPlaceholder: 'Homelab',
+      urlTitle: 'URL del gateway',
+      sshHostTitle: 'Host SSH',
+      headersTitle: 'Cabeceras extra del gateway',
+      headersDesc:
+        'Se envían con cada petición HTTP y WebSocket a este gateway — para proxies de acceso como Cloudflare Access (CF-Access-Client-Id / CF-Access-Client-Secret). Los valores se guardan cifrados. Las cabeceras que gestiona Hermes (Authorization, Cookie, Host…) se ignoran.',
+      headerValuePlaceholder: 'Valor',
+      headerValueSaved: 'Guardado — déjalo en blanco para conservarlo',
+      headerAdd: 'Añadir cabecera',
+      headerRemove: 'Quitar',
+      save: 'Guardar conexión',
+      saving: 'Guardando…',
+      cancel: 'Cancelar',
+      empty: 'Aún no hay conexiones registradas.'
     },
     gateway: {
       loading: 'Cargando configuraci\u00F3n del gateway...',
@@ -698,6 +795,13 @@ export const es: Translations = defineLocale({
       existingToken: value => `Token existente ${value}`,
       savedToken: 'guardado',
       pasteSessionToken: 'Pegar token de sesi\u00F3n',
+      plainTextConfirmTitle: '¿Guardar el token del gateway en texto plano?',
+      plainTextConfirmDesc:
+        'No se encontró ningún servicio de llavero del SO en esta máquina, así que el token se guardaría sin cifrar en el archivo de ajustes de conexión de la app, legible por cualquier proceso que se ejecute con este usuario. Instala o activa GNOME Keyring o KWallet para guardarlo cifrado.',
+      plainTextConfirmAction: 'Guardar como texto plano',
+      plainTextStoredTitle: 'Token guardado en texto plano',
+      plainTextStoredDesc:
+        'El almacenamiento seguro no está disponible, así que el token guardado está sin cifrar en el archivo de ajustes de conexión de la app en esta máquina. Instala o activa GNOME Keyring o KWallet para cifrarlo.',
       testRemote: 'Probar remoto',
       saveForRestart: 'Guardar para el pr\u00F3ximo reinicio',
       saveAndReconnect: 'Guardar y reconectar',
@@ -823,6 +927,9 @@ export const es: Translations = defineLocale({
       catalogEnvRequired: 'Rellena los valores obligatorios antes de instalar.',
       capabilitySummary: (tools, prompts, resources) =>
         `${[`${tools} herramientas`, ...(prompts ? [`${prompts} prompts`] : []), ...(resources ? [`${resources} recursos`] : [])].join(' · ')}`,
+      costTokens: tokens => `~${tokens} tok/llamada`,
+      usage30d: uses => `${uses} usos/30d`,
+      unusedPill: 'sin usar',
       statusConnecting: 'Conectando…',
       statusNeedsAuth: 'Requiere autenticación',
       statusError: 'Error',
@@ -835,7 +942,26 @@ export const es: Translations = defineLocale({
       unsavedConnect: 'Sin guardar — guarda mcp.json para conectar.',
       enableTool: tool => `Activar ${tool}`,
       disableTool: tool => `Desactivar ${tool}`,
-      noOutput: 'Aún no hay salida.'
+      noOutput: 'Aún no hay salida.',
+      deepLinkTitle: '¿Añadir servidor MCP?',
+      deepLinkDescription:
+        'Un enlace pidió añadir este servidor MCP a Hermes. Revisa la configuración exacta de abajo — viene del enlace, no de Hermes.',
+      deepLinkStdioWarning:
+        'Este servidor ejecuta un proceso local en tu máquina con el comando que se muestra abajo. Solo continúa si confías en su origen.',
+      deepLinkConfirm: 'Añadir servidor',
+      deepLinkNameInvalid: 'Los nombres usan 1-64 letras, dígitos, puntos, guiones o guiones bajos.',
+      deepLinkNameConflict: name => `Ya existe un servidor llamado ${name} — elige otro nombre o cancela.`,
+      deepLinkErrorTitle: 'Enlace de instalación de MCP rechazado',
+      deepLinkErrorName: 'El nombre del servidor del enlace falta o no es válido.',
+      deepLinkErrorConfig: 'La configuración del enlace no es JSON válido codificado en base64.',
+      deepLinkErrorShape: 'La configuración debe ser un objeto JSON con un campo `url` o `command` de tipo cadena.',
+      deepLinkErrorUrl: 'Solo se permiten URLs de servidor http:// y https://.',
+      deepLinkErrorTooLarge: 'El payload de configuración supera el límite de 32KB.',
+      importButton: 'Importar',
+      importPlaceholder: 'Pega un fragmento de mcp.json, un comando npx/docker, una línea claude mcp add, una URL o un enlace de Cursor…',
+      importNoMatch: 'No se reconoció ninguna configuración de servidor en el texto pegado.',
+      importConfirm: 'Añadir a mcp.json',
+      importConfirmMany: count => `Añadir ${count} servidores a mcp.json`
     },
     model: {
       loading: 'Cargando configuraci\u00F3n del modelo...',
@@ -1041,7 +1167,7 @@ export const es: Translations = defineLocale({
     tabSkills: 'Skills',
     tabToolsets: 'Toolsets',
     tabMcp: 'MCP',
-    tabHub: 'Explorar centro',
+    configuringProfile: 'Configurando:',
     all: 'Todos',
     searchSkills: 'Buscar skills...',
     searchToolsets: 'Buscar toolsets...',
@@ -1136,6 +1262,11 @@ export const es: Translations = defineLocale({
       updateStarted: 'Actualizando skills instaladas...',
       actionFailed: 'La acción de skill falló',
       actionLog: 'Registro de acciones',
+      alreadyInstalled: name => `«${name}» ya está instalada`,
+      pickerTitle: 'Centro de skills',
+      pickerBrowse: 'Explorar el centro completo',
+      pickerHide: 'Ocultar el navegador del centro',
+      pickerHint: 'Pulsa «+ Añadir a este agente» en cualquier skill — se instala y aparece en la lista de arriba.',
       loadFailed: 'El centro de skills no se pudo cargar',
       previewFailed: 'La vista previa de la skill falló',
       scanFailed: 'El escaneo de seguridad falló',
@@ -1755,12 +1886,21 @@ export const es: Translations = defineLocale({
     failedLoadSoul: 'Error al cargar SOUL.md',
     failedSaveSoul: 'Error al guardar SOUL.md',
     failedCreate: 'Error al crear perfil',
-    failedRename: 'Error al renombrar perfil'
+    failedRename: 'Error al renombrar perfil',
+    connectGateway: 'Conectar otro gateway de Hermes\u2026'
   },
   cron: {
     close: 'Cerrar cron',
     title: 'Trabajos programados',
     count: count => `${count} ${count === 1 ? 'trabajo' : 'trabajos'}`,
+    modelImpact: {
+      title: 'Los trabajos programados necesitan revisi\u00F3n',
+      message: count =>
+        `${count} trabajo${count === 1 ? '' : 's'} programado${count === 1 ? '' : 's'} se omitir\u00E1${count === 1 ? '' : 'n'} hasta que revises su configuraci\u00F3n de modelo.`,
+      detailMore: (names, remaining) => `${names} y ${remaining} m\u00E1s`,
+      review: 'Revisar trabajos programados',
+      saveFailed: 'Hermes no guard\u00F3 ese cambio de modelo.'
+    },
     search: 'Buscar tareas cron...',
     loading: 'Cargando tareas cron...',
     states: {
@@ -1955,7 +2095,8 @@ export const es: Translations = defineLocale({
       'new-session': 'Nueva sesi\u00F3n',
       skills: 'Skills y herramientas',
       messaging: 'Mensajer\u00EDa',
-      artifacts: 'Artefactos'
+      artifacts: 'Artefactos',
+      cron: 'Trabajos programados'
     },
     searchAria: 'Buscar sesiones',
     searchPlaceholder: 'Buscar sesiones\u2026',
@@ -1976,6 +2117,7 @@ export const es: Translations = defineLocale({
     noWorkspace: 'Sin espacio de trabajo',
     projectEmpty: 'Aún no hay sesiones',
     noSessions: 'Aún no hay sesiones',
+    noFilterMatches: 'Ninguna sesión coincide con estos filtros',
     projects: {
       sectionLabel: 'Proyectos',
       home: 'Inicio',
@@ -2024,6 +2166,8 @@ export const es: Translations = defineLocale({
       baseBranchPlaceholder: 'Buscar ramas…',
       baseBranchNone: 'No se encontraron ramas',
       startWorkFailed: 'No se pudo crear el worktree',
+      worktreeStaleBackend:
+        'Actualiza el backend de Hermes para crear worktrees en esta conexión remota — es anterior a la API de git worktree.',
       worktreeProjectLabel: 'Proyecto',
       worktreeProjectPlaceholder: 'Buscar proyectos…',
       worktreeProjectNone: 'No hay proyectos con carpeta',
@@ -2055,15 +2199,21 @@ export const es: Translations = defineLocale({
     loading: 'Cargando\u2026',
     loadMore: 'Cargar m\u00E1s',
     loadCount: step => `Cargar ${step} más`,
+    messageCount: count => `${count} ${count === 1 ? 'mensaje' : 'mensajes'}`,
+    toolCallCount: count => `${count} ${count === 1 ? 'llamada de herramienta' : 'llamadas de herramienta'}`,
     row: {
       pin: 'Fijar',
       unpin: 'Desfijar',
+      markUnread: 'Marcar como no le\u00EDdo',
+      markRead: 'Marcar como le\u00EDdo',
+      unreadFailed: 'No se pudo actualizar el estado de no le\u00EDdo',
       copyId: 'Copiar ID',
       export: 'Exportar',
       branchFrom: 'Rama',
       rename: 'Renombrar',
       archive: 'Archivar',
       newWindow: 'Nueva ventana',
+      openInTerminal: 'Abrir en terminal',
       hideTabBar: 'Ocultar barra de pestañas',
       openInNewTab: 'Abrir en pestaña nueva',
       openInSplit: 'Abrir en vista dividida',
@@ -2074,6 +2224,7 @@ export const es: Translations = defineLocale({
       waitingForAnswer: 'Esperando tu respuesta',
       finishedUnread: 'Terminada — sin leer',
       backgroundRunning: 'Tarea en segundo plano en curso',
+      draftSession: 'Borrador — aún no se ha enviado nada',
       handoffOrigin: platform => `Traspasado desde ${platform}`,
       ownedByProfile: profile => `Perfil: ${profile}`,
       renamed: 'Renombrado',
@@ -2081,7 +2232,13 @@ export const es: Translations = defineLocale({
       renameTitle: 'Renombrar sesi\u00F3n',
       renameDesc: 'Asigna un t\u00EDtulo memorable a este chat. D\u00E9jalo vac\u00EDo para limpiarlo.',
       untitledPlaceholder: 'Sesi\u00F3n sin t\u00EDtulo',
+      deleteTitle: '¿Eliminar sesión?',
+      deleteDesc: title => `Esto eliminará permanentemente «${title}». No se puede deshacer.`,
+      deleting: 'Eliminando…',
+      deleted: 'Sesión eliminada',
       untitledChat: id => `Chat ${id}`,
+      messageCount: count => `${count} ${count === 1 ? 'mensaje' : 'mensajes'}`,
+      todoProgress: 'Tareas completadas',
       ageNow: 'ahora',
       ageDay: 'd',
       ageHour: 'h',
@@ -2093,7 +2250,12 @@ export const es: Translations = defineLocale({
       thisWeek: 'A principios de esta semana',
       lastWeek: 'La semana pasada',
       thisMonth: 'A principios de este mes'
-    }
+    },
+    statusDivider: {
+      working: 'Trabajando',
+      done: 'Hecho'
+    },
+    markAllRead: 'Marcar todo como le\u00EDdo'
   },
   composer: {
     message: 'Mensaje',
@@ -2215,6 +2377,44 @@ export const es: Translations = defineLocale({
     snippetsDesc: 'Elige un prompt de inicio para insertarlo en el compositor.',
     dropFiles: 'Suelta archivos para adjuntar',
     dropSession: 'Suelta para enlazar este chat',
+    queueSteer: 'Redirigir — canaliza la ejecuci\u00F3n en curso ahora',
+    mcpSuggestions: {
+      label: server => `A\u00F1adir ${server}`,
+      tip: keyword => `Sugerido porque mencionaste \u00AB${keyword}\u00BB — haz clic para conectar`,
+      connecting: server => `Conectando ${server}\u2026`,
+      cancelTip: 'Haz clic para cancelar',
+      added: server => `A\u00F1adido ${server}`,
+      addedTip: 'Conectado — sus herramientas est\u00E1n listas en este chat',
+      connectFailed: server => `No se pudo conectar ${server}`
+    },
+    skillSuggestions: {
+      label: skill => `Usar skill: ${skill}`,
+      tip: skill => `Mencionaste \u00AB${skill}\u00BB — haz clic para arrancar con esa skill`,
+      done: skill => `A\u00F1adido /${skill}`,
+      doneTip: 'La skill se carga cuando env\u00EDas'
+    },
+    githubSuggestions: {
+      label: 'Configurar GitHub',
+      tip: 'GitHub funciona con las skills de gh CLI aqu\u00ED — haz clic para conectar tu cuenta',
+      done: 'A\u00F1adido /github-auth',
+      doneTip: 'Env\u00EDa el mensaje y el agente te gu\u00EDa por el inicio de sesi\u00F3n de GitHub'
+    },
+    repairSuggestions: {
+      label: server => `Reconectar ${server}`,
+      tip: server => `Una llamada a ${server} acaba de fallar con un error de conexi\u00F3n`,
+      working: server => `Reconectando ${server}\u2026`,
+      workingTip: 'Haz clic para cancelar',
+      done: server => `Reconectado ${server}`,
+      doneTip: 'Las credenciales nuevas est\u00E1n activas en este chat',
+      failed: server => `No se pudo reconectar ${server}`
+    },
+    cronSuggestions: {
+      label: 'Programar esto',
+      tip: phrase => `\u00AB${phrase}\u00BB suena recurrente — ejec\u00FAtalo con una programaci\u00F3n`,
+      prefix: 'Configurar como trabajo programado:',
+      done: 'Marcado para programaci\u00F3n',
+      doneTip: 'Env\u00EDalo y el agente crea el trabajo'
+    },
     snippets: {
       codeReview: {
         label: 'Revisi\u00F3n de c\u00F3digo',
@@ -2278,7 +2478,7 @@ export const es: Translations = defineLocale({
       scopeLastTurn: 'Último turno',
       commit: 'Confirmar',
       commitAndPush: 'Confirmar y subir',
-      commitPlaceholder: 'Mensaje (⌘↵ para confirmar)',
+      commitPlaceholder: shortcut => `Mensaje (${shortcut} para confirmar)`,
       generateCommitMessage: 'Generar mensaje de commit',
       stopGenerating: 'Dejar de generar',
       createPr: 'Crear PR',
@@ -2345,6 +2545,20 @@ export const es: Translations = defineLocale({
     applyingClose: 'Hermes se cerrar\u00E1 para aplicar la actualizaci\u00F3n.',
     errorTitle: 'La actualizaci\u00F3n no termin\u00F3',
     errorBody: 'No te preocupes \u2014 no se perdi\u00F3 nada. Puedes intentarlo de nuevo ahora.',
+    blockerTitle: '¿Cerrar las vistas previas locales para actualizar Hermes?',
+    blockerBody:
+      'Hermes necesita detener estas vistas previas locales antes de actualizar. Esto no modificará ni eliminará tus archivos.',
+    foreignBlockerTitle: 'Cerrar otros procesos para actualizar Hermes',
+    foreignBlockerBody:
+      'Hermes no puede cerrar estos procesos automáticamente de forma segura. Cierra la app, terminal o servicio que sea dueño de cada uno y vuelve a intentar la actualización.',
+    mixedBlockerBody:
+      'Hermes puede cerrar las vistas previas locales que se listan abajo. Otros procesos deben cerrarse manualmente antes de que la actualización pueda continuar.',
+    closePreviewsAndUpdate: 'Cerrar vistas previas y actualizar',
+    closePreviewsAndCheckAgain: 'Cerrar vistas previas y comprobar de nuevo',
+    localPreview: 'Vista previa local',
+    portLabel: port => `Puerto ${port}`,
+    pidLabel: pid => `PID ${pid}`,
+    technicalDetails: 'Detalles técnicos',
     notNow: 'Ahora no',
     applyStatus: {
       preparing: 'Actualizando backend\u2026',
@@ -2581,7 +2795,8 @@ export const es: Translations = defineLocale({
       connection: label => `Conexión: ${label}`,
       recentActivity: 'Actividad reciente',
       viewAllLogs: 'Ver todos los registros \u2192',
-      messagingPlatforms: 'Plataformas de mensajer\u00EDa'
+      messagingPlatforms: 'Plataformas de mensajer\u00EDa',
+      reconnectGateway: 'Reconectar gateway'
     },
     approvalMode: {
       title: 'Modo de aprobación',
@@ -2625,6 +2840,7 @@ export const es: Translations = defineLocale({
       gatewayTitle: 'Estado del gateway de inferencia de Hermes',
       customizeTitle: 'Mostrar en la barra de estado',
       hideStatusbar: 'Ocultar barra de estado',
+      resetStatusbar: 'Restablecer valores',
       toggleApprovalMode: 'Aprobaciones',
       toggleBackendVersion: 'Versión del backend',
       toggleCommandCenter: 'Centro de comandos',
@@ -2862,6 +3078,7 @@ export const es: Translations = defineLocale({
       thought: 'Pensamiento',
       thoughtBriefly: 'Pensó brevemente',
       thoughtFor: duration => `Pensó durante ${duration}`,
+      turnDuration: duration => `Esta interacci\u00F3n tard\u00F3 ${duration}`,
       today: time => `Hoy, ${time}`,
       yesterday: time => `Ayer, ${time}`,
       copy: 'Copiar',
@@ -2921,6 +3138,28 @@ export const es: Translations = defineLocale({
       lateAnswerTip: 'Redactar esta respuesta como mensaje de seguimiento',
       lateAnswerHint:
         'Esta pregunta ya no está esperando respuesta. Elige una opción para redactarla como mensaje de seguimiento.'
+    },
+    mcpSetup: {
+      installTitle: server => `\u00BFA\u00F1adir el servidor MCP ${server}?`,
+      enableTitle: server => `\u00BFActivar el servidor MCP ${server}?`,
+      authorizeTitle: server => `\u00BFAutorizar el servidor MCP ${server}?`,
+      installAction: 'Instalar',
+      enableAction: 'Activar',
+      authorizeAction: 'Autorizar',
+      decline: 'Ahora no',
+      declined: 'Rechazado',
+      installed: server => `${server} instalado`,
+      enabled: server => `${server} activado`,
+      authorized: server => `${server} autorizado`,
+      failed: server => `Configuraci\u00F3n fallida para ${server}`,
+      unanswered: 'Sin respuesta',
+      toolCount: count => (count === 1 ? '1 herramienta' : `${count} herramientas`),
+      notInCatalog: server => `\u00AB${server}\u00BB no est\u00E1 en el cat\u00E1logo de MCP`,
+      catalogSource: 'Del cat\u00E1logo aprobado por Nous',
+      envRequired: 'Rellena primero las credenciales obligatorias',
+      sendFailed: 'No se pudo enviar la respuesta de configuraci\u00F3n MCP',
+      reloadFailed: 'Servidor guardado, pero fall\u00F3 la recarga de las herramientas MCP — se cargan en la pr\u00F3xima sesi\u00F3n',
+      gatewayDisconnected: 'El gateway de Hermes no est\u00E1 conectado'
     },
     tool: {
       copyCode: 'Copiar c\u00F3digo',
@@ -3103,6 +3342,7 @@ export const es: Translations = defineLocale({
   },
   desktop: {
     audioReadFailed: 'No se pudo leer el audio grabado',
+    editTurnUnavailable: 'Esta interacci\u00F3n ya no est\u00E1 en el historial del servidor (puede haber sido comprimida).',
     sessionUnavailable: 'Sesi\u00F3n no disponible',
     createSessionFailed: 'No se pudo crear una nueva sesi\u00F3n',
     promptFailed: 'Error en el prompt',
