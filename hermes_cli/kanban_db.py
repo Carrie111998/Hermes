@@ -9357,9 +9357,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
          per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
+      5. Attachments uploaded to this task, after parent handoffs so optional
+         file metadata is truncated before decision-critical upstream results.
+      6. Cross-task role history for the assignee (most recent 5
          completed runs on other tasks).
-      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
+      7. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
     All caps exist so worker prompts stay bounded even on pathological
