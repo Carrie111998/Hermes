@@ -97,7 +97,7 @@ even then attribution must not depend on the writer still being alive.**
 |---|---|---|---|
 | Detection latency | ≤1.5 s poll | `ReadDirectoryChangesW` | **0.4–2.7 ms, median 0.7 ms** (6 trials) — ~2000× |
 | Sighting record durable | after a full process snapshot | after the ring dump | **~ms**; verified durable at 311 ms while `on_hit` ran to 571 ms |
-| Attribution of an exited writer | impossible | ring buffer at 100 ms | captures the ~440 ms process class |
+| Attribution of an exited writer | impossible | ring buffer at 100 ms | **5/8 trials fully attributed** (measured 2026-08-17) — see "Sampler cadence and end-to-end capture rate" below |
 
 **The snapshot mitigation needs a caveat, because the naive reading is wrong.**
 Replacing the PowerShell spawn removed a fixed ~0.5–1 s cost, but psutil is *not* cheap
@@ -355,13 +355,85 @@ No cross-path comparison.
    never obtained.
 5. Confirm `--help` prints usage and exits 0 **without** spawning anything.
 
-## Open tradeoff
+## Sampler cadence and end-to-end capture rate (measured, 2026-08-17)
 
-The sampler cadence is a genuine tradeoff: too slow and sub-cadence processes are
-missed even by the ring buffer; too fast and a multi-hour watch burns measurable CPU on
-a box with documented memory-pressure problems. It is therefore a flag with a
-conservative default, and the measured cost is to be recorded in the commit message
-rather than asserted from a guess.
+This was left open in the original design. It is now decided and measured, and the
+decision itself needed a correction along the way.
+
+### Per-sample cost
+
+One `ProcessRing.sample()` call costs **16.65 ms** against ~1000 live processes with
+real churn (measured during Task 3). A quiet re-check just now, with no churn, cost
+**0.87 ms** — consistent with, not contradicting, the design's own claim that cost
+scales with process *churn* rather than process *count* (only newly-appeared PIDs are
+enriched). The 16.65 ms figure is the one that matters: it was taken under the
+conditions this watcher actually runs in.
+
+### The sizing rule that was wrong
+
+The original plan said: raise the cadence if a sample costs more than half the
+interval. By that rule, 16.65 ms against a 250 ms interval passes comfortably. But a
+250 ms sampler captured only **9 of 12** short-lived Python children (each living
+350–514 ms), while a 50 ms sampler caught **12 of 12**. **Cost was never the binding
+constraint — capture probability was.** The cadence must be sized against the
+*lifetime of the process class being hunted*, not against the sample's own cost.
+Shipped default: **100 ms** (`DEFAULT_SAMPLE_MS`), ~17% of one core, chosen to sit
+comfortably below the 350–514 ms lifetimes actually observed while leaving margin for
+churn-induced slowdown.
+
+### The centerpiece: does the ring buffer attribute a writer that has already exited?
+
+This is the claim the whole ring-buffer design rests on, and the one thing no prior
+measurement in this file actually tested end-to-end. Built a real reproducer
+(`writer_stub.py`, matching brief Step 2's `python -c` script): a **separate** process
+`mkdir`s a sentinel directory, `chdir`s into it, creates the literal `%SystemDrive%`
+child, and exits — the exact failure mode the 2026-08-16 prototype hit, where the
+writer was gone by the time the snapshot ran.
+
+Ran against a fresh, never-reused sentinel directory, default 100 ms cadence, real
+`ReadDirectoryChangesW` backend, 8 independent trials:
+
+| Outcome | Trials | What it means |
+|---|---|---|
+| **Fully attributed** — pid, `cmdline`, argv naming the sentinel dir all present in the ring dump | **5/8** | A human reading the record can name the writer. |
+| **Registered but unreadable** — a bare `{"pid": ..., "error": "NoSuchProcess"}` entry, no `cmdline` | 2/8 | The sampler saw *something* start, but the process was already gone by enrichment time. In one of these two trials, six such anonymous entries appeared in the same window (background churn), making the writer unidentifiable among them even in principle. |
+| **Fully invisible** — no ring entry at all | 1/8 | The writer's entire lifetime (birth to exit) fit inside a single 100 ms inter-sample gap; `psutil.pids()` never observed it as live. |
+
+**Capture rate: writer identified by name in 5/8 trials.** This is a real number, not
+tuned or cherry-picked — cadence was left at the shipped default across all 8 trials
+and the 3 misses are reported as misses.
+
+### A second, previously-undocumented limitation: `ring_cwd_matches` raced the writer's own `chdir`
+
+The spec already documents that a process which exits before enrichment has no
+recoverable `cwd` (see "The `cwd` discriminator" above). This measurement found a
+**different** failure mode in the same field: **`ring_cwd_matches` was empty in all 8
+trials — including all 5 successes.** In every successful attribution, the captured
+`cwd` was the *writer's parent's* cwd, not the sentinel directory, because the
+sampler's enrichment read `proc.cwd()` before the child process had executed its own
+`os.chdir()` — a race between two independent processes, not a dead one. The `cmdline`
+was still fully readable in those 5 cases (it names the target directory as `argv[1]`
+regardless of `cwd`), so attribution still succeeded — but **only because a human read
+the full ring dump, not the pre-filtered `ring_cwd_matches` field.** Relying on
+`ring_cwd_matches` alone would have shown 0/8 and looked like a total failure of the
+instrument, when the raw ring array had the answer in 5/8.
+
+**Guidance for a future hunter:** read the whole `ring` array from the sidecar
+snapshot (or the ring dump attached to `SIGHTING`), matching on `cmdline` substrings,
+not just `ring_cwd_matches`. `ring_cwd_matches` is a convenience shortlist, not the
+complete evidence. If the ring shows nothing at all for the sighting window (the 1/8
+total-miss case above), the documented fallback is what actually found the first
+writer: bisecting a deterministic reproducer, not staring harder at a process
+snapshot.
+
+### Residual tradeoff
+
+The tradeoff between cadence and CPU is real but no longer open: 100 ms costs ~17% of
+one core and is the shipped default. What remains genuinely open is that even at this
+cadence, a process class living under ~100 ms (the 1/8 total-miss case, and part of
+the 2/8 unreadable case) is attributable only probabilistically, not guaranteed — a
+faster cadence would narrow but not close that gap, at proportionally higher constant
+CPU cost on a box with documented memory-pressure problems.
 
 ## Out of scope
 
