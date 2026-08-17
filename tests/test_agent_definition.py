@@ -20,7 +20,7 @@ class TestAgentDefinition:
         """Test default values."""
         agent = AgentDefinition(name="test")
         assert agent.name == "test"
-        assert agent.model == "mimo-v2.5"
+        assert agent.model == ""  # empty = inherit from parent config
         assert agent.reasoning == "medium"
         assert agent.temperature == 0.7
         assert agent.top_p == 0.9
@@ -47,8 +47,8 @@ class TestAgentDefinition:
         assert d["model"] == "mimo-v2.5"
         assert d["reasoning"] == "high"
         assert d["temperature"] == 0.5
-        assert d["tools_count"] == 2
-        assert d["skills_count"] == 1
+        assert d["tools"] == ["read_file", "terminal"]
+        assert d["skills"] == ["caveman"]
 
 
 class TestParseAgentFile:

@@ -85,9 +85,8 @@ class AgentRegistry:
                     print(f"Warning: Agent '{agent.name}' has validation errors: {errors}")
                     continue
                 
-                # Check for duplicates
+                # Check for duplicates (silent skip or log debug)
                 if agent.name in self.agents:
-                    print(f"Warning: Agent '{agent.name}' already exists, skipping {file_path}")
                     continue
                 
                 self.agents[agent.name] = agent

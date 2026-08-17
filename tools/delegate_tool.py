@@ -1486,6 +1486,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    session_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1845,6 +1846,7 @@ def _build_child_agent(
                 skip_memory=True,
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
+                session_id=session_id,
                 session_db=child_session_db,
                 parent_session_id=getattr(parent_agent, "session_id", None),
                 providers_allowed=child_providers_allowed,
@@ -2631,14 +2633,21 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            # Inject agent skill_path as env var for skill_view filtering
+            # Inject agent skill_path and skills whitelist as env vars for filtering
             _agent_skill_path = getattr(child, "_agent_skill_path", None)
+            _agent_skills = getattr(child, "_agent_skills", None)
             _prev_skill_path = None
+            _prev_allowed_skills = None
             if _agent_skill_path:
                 _prev_skill_path = os.environ.get("HERMES_SKILL_PATH")
                 os.environ["HERMES_SKILL_PATH"] = str(_agent_skill_path)
                 from agent.agent_debug import log_env_inject
                 log_env_inject("HERMES_SKILL_PATH", str(_agent_skill_path))
+            if _agent_skills:
+                _prev_allowed_skills = os.environ.get("HERMES_ALLOWED_SKILLS")
+                os.environ["HERMES_ALLOWED_SKILLS"] = ",".join(_agent_skills)
+                from agent.agent_debug import log_env_inject
+                log_env_inject("HERMES_ALLOWED_SKILLS", ",".join(_agent_skills))
             try:
                 with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                     return child.run_conversation(
@@ -2653,6 +2662,11 @@ def _run_single_child(
                         os.environ["HERMES_SKILL_PATH"] = _prev_skill_path
                     else:
                         os.environ.pop("HERMES_SKILL_PATH", None)
+                if _agent_skills:
+                    if _prev_allowed_skills is not None:
+                        os.environ["HERMES_ALLOWED_SKILLS"] = _prev_allowed_skills
+                    else:
+                        os.environ.pop("HERMES_ALLOWED_SKILLS", None)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3506,19 +3520,20 @@ def delegate_task(
             from agent.agent_registry import get_agent_registry, load_agents_from_config
             from hermes_cli.config import load_config
             registry = get_agent_registry()
-            # Always try to load if empty
-            if not registry.agents:
-                try:
-                    cfg = load_config()
-                    n = load_agents_from_config(cfg)
-                    log_registry_load("config", n, list(registry.agents.keys()))
-                except Exception as exc:
-                    log_error("config_load", str(exc))
-                from pathlib import Path
-                for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
-                    if d.exists():
-                        n = registry.load_from_directory(d)
-                        log_registry_load(str(d), n, list(registry.agents.keys()))
+            # Force refresh registry from directories so edits to .md files apply immediately
+            registry.agents.clear()
+            registry._loaded = False
+            try:
+                cfg = load_config()
+                n = load_agents_from_config(cfg)
+                log_registry_load("config", n, list(registry.agents.keys()))
+            except Exception as exc:
+                log_error("config_load", str(exc))
+            from pathlib import Path
+            for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
+                if d.exists():
+                    n = registry.load_from_directory(d)
+                    log_registry_load(str(d), n, list(registry.agents.keys()))
             _agent_def = registry.get_agent(agent)
             if _agent_def is None:
                 # Force reload — registry may be stale (loaded with old validator)
@@ -3836,6 +3851,19 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Session continuity per named agent within parent session
+        _subagent_session_id = None
+        if _agent_def and parent_agent:
+            if not hasattr(parent_agent, "_named_agent_sessions"):
+                parent_agent._named_agent_sessions = {}
+            if _agent_def.name in parent_agent._named_agent_sessions:
+                _subagent_session_id = parent_agent._named_agent_sessions[_agent_def.name]
+            else:
+                import uuid as _uuid
+                _parent_sid = getattr(parent_agent, "session_id", "default") or "default"
+                _subagent_session_id = f"sub-{_agent_def.name}-{_uuid.uuid4().hex[:8]}"
+                parent_agent._named_agent_sessions[_agent_def.name] = _subagent_session_id
+
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3857,6 +3885,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                session_id=_subagent_session_id,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -3869,14 +3898,17 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
-        # Attach agent skill_path for skill_view filtering
-        if _agent_def and _agent_def.skill_path:
-            try:
-                child._agent_skill_path = Path(_agent_def.skill_path)
-                from agent.agent_debug import log_skill_path as _log_sp
-                _log_sp(_agent_def.name, _agent_def.skill_path, _agent_def.skills)
-            except Exception:
-                logger.debug("Could not attach skill_path to child %d", i)
+        # Attach agent skill_path and skills whitelist for skill filtering
+        if _agent_def:
+            if _agent_def.skill_path:
+                try:
+                    child._agent_skill_path = Path(_agent_def.skill_path)
+                    from agent.agent_debug import log_skill_path as _log_sp
+                    _log_sp(_agent_def.name, _agent_def.skill_path, _agent_def.skills)
+                except Exception:
+                    logger.debug("Could not attach skill_path to child %d", i)
+            if _agent_def.skills:
+                child._agent_skills = list(_agent_def.skills)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -4709,6 +4741,39 @@ def _build_role_param_description() -> str:
     )
 
 
+def _build_agent_param_description() -> str:
+    """Compose the 'agent' parameter description listing available agents."""
+    try:
+        from agent.agent_registry import get_agent_registry, load_agents_from_config
+        from hermes_cli.config import load_config
+        registry = get_agent_registry()
+        if not registry.agents:
+            try:
+                cfg = load_config()
+                load_agents_from_config(cfg)
+            except Exception:
+                pass
+            from pathlib import Path
+            for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
+                if d.exists():
+                    registry.load_from_directory(d)
+        names = registry.list_agent_names()
+        if names:
+            available_str = f" Available agents: {', '.join(sorted(names))}."
+        else:
+            available_str = ""
+    except Exception:
+        available_str = ""
+
+    return (
+        "Agent name from .hermes/agents/ or .agents/ definitions. "
+        "When set, loads the agent's config (model, base_url, "
+        "provider, api_mode, reasoning, temperature, tools, skills, "
+        "context_length) and system prompt."
+        f"{available_str} Example: 'coder', 'reviewer', 'debugger'."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -4725,6 +4790,7 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    overrides_params["properties"]["agent"]["description"] = _build_agent_param_description()
 
     return {
         "description": _build_top_level_description(),
