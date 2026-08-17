@@ -94,6 +94,13 @@ class MessagesMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
 
 
+class TurnMetadataMemoryProvider(FakeMemoryProvider):
+    """Provider that opts into completed-turn provenance metadata."""
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", metadata=None):
+        self.synced_turns.append((user_content, assistant_content, session_id, metadata))
+
+
 class BlockingPrefetchProvider(FakeMemoryProvider):
     """External provider whose prefetch call blocks until released."""
 
@@ -235,6 +242,19 @@ class TestMemoryManager:
         mgr.flush_pending(timeout=5)
 
         assert legacy_provider.synced_turns == [("user", "assistant")]
+
+    def test_sync_all_forwards_generic_metadata_to_opted_in_provider(self):
+        mgr = MemoryManager()
+        provider = TurnMetadataMemoryProvider()
+        mgr.add_provider(provider)
+        metadata = {"platform": "telegram", "chat_id": "chat-42"}
+
+        mgr.sync_all("user", "assistant", metadata=metadata)
+        assert mgr.flush_pending(timeout=2)
+
+        assert provider.synced_turns == [
+            ("user", "assistant", "", metadata),
+        ]
 
     # -- Tool routing -------------------------------------------------------
 
