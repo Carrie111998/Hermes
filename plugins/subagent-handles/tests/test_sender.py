@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 
@@ -11,6 +12,11 @@ _spec.loader.exec_module(plugin)
 from subagent_handles import sender
 from subagent_handles.sender import SCHEMA, handle_cancel_subagent, handle_subagent_send
 from subagent_handles.registry import registry as shared_registry
+
+
+def _load(out: str) -> dict:
+    """Tool handlers return a JSON string; decode for assertion."""
+    return json.loads(out)
 
 
 def _install_registry():
@@ -27,11 +33,9 @@ def _install_registry():
 
 def test_subagent_send_missing_handle():
     _install_registry()
-    assert handle_subagent_send({"subagent_id": "missing", "text": "hi"}) == {
-        "ok": False,
-        "error": "subagent_id='missing' is not running or not found",
-        "subagent_id": "missing",
-    }
+    out = _load(handle_subagent_send({"subagent_id": "missing", "text": "hi"}))
+    assert "error" in out
+    assert "not running or not found" in out["error"]
 
 
 def test_subagent_send_running_ok():
@@ -39,7 +43,7 @@ def test_subagent_send_running_ok():
     registry.register(
         type("H", (), {"subagent_id": "a1", "session_id": "s1", "goal": "g1", "state": "running", "parent_subagent_id": None, "role": ""})()
     )
-    out = handle_subagent_send({"subagent_id": "a1", "text": "hello"})
+    out = _load(handle_subagent_send({"subagent_id": "a1", "text": "hello"}))
     assert out["ok"] is True
     assert out["queued"] is True
     assert out["subagent_send"]["state"] == "running"
@@ -50,22 +54,23 @@ def test_subagent_send_done_rejected():
     registry.register(
         type("H", (), {"subagent_id": "a1", "session_id": "s1", "goal": "g1", "state": "done", "parent_subagent_id": None, "role": ""})()
     )
-    out = handle_subagent_send({"subagent_id": "a1", "text": "hello"})
-    assert out["ok"] is False
+    out = _load(handle_subagent_send({"subagent_id": "a1", "text": "hello"}))
+    assert "error" in out
+    assert "not running or not found" in out["error"]
 
 
 def test_subagent_send_missing_text():
     _install_registry()
-    assert handle_subagent_send({"subagent_id": "a1", "text": ""}) == {
-        "ok": False,
-        "error": "text is required",
-    }
+    out = _load(handle_subagent_send({"subagent_id": "a1", "text": ""}))
+    assert "error" in out
+    assert out["error"] == "text is required"
 
 
 def test_cancel_subagent_missing_handle():
     _install_registry()
-    out = handle_cancel_subagent({"subagent_id": "missing"})
-    assert out["ok"] is False
+    out = _load(handle_cancel_subagent({"subagent_id": "missing"}))
+    assert "error" in out
+    assert "not found" in out["error"]
 
 
 def test_cancel_subagent_running():
@@ -73,7 +78,7 @@ def test_cancel_subagent_running():
     registry.register(
         type("H", (), {"subagent_id": "a1", "session_id": "s1", "goal": "g1", "state": "running", "parent_subagent_id": None, "role": ""})()
     )
-    out = handle_cancel_subagent({"subagent_id": "a1"})
+    out = _load(handle_cancel_subagent({"subagent_id": "a1"}))
     assert out == {"ok": True, "subagent_id": "a1", "state": "cancelled", "session_id": "s1"}
 
 
@@ -82,8 +87,9 @@ def test_cancel_already_done():
     registry.register(
         type("H", (), {"subagent_id": "a1", "session_id": "s1", "goal": "g1", "state": "done", "parent_subagent_id": None, "role": ""})()
     )
-    out = handle_cancel_subagent({"subagent_id": "a1"})
-    assert out["ok"] is False
+    out = _load(handle_cancel_subagent({"subagent_id": "a1"}))
+    assert "error" in out
+    assert "not running" in out["error"]
 
 
 def test_schema_keys():
@@ -92,11 +98,32 @@ def test_schema_keys():
     assert SCHEMA["cancel_subagent"]["name"] == "cancel_subagent"
 
 
+def test_register_tools_wiring():
+    """register_tools must use the correct PluginContext.register_tool signature.
+
+    Regression guard for the bug where SCHEMA dict was passed as `name` and
+    the handler as `toolset`, silently registering nothing.
+    """
+    calls = []
+
+    class FakeCtx:
+        def register_tool(self, **kwargs):
+            calls.append(kwargs)
+
+    sender.register_tools(FakeCtx())
+    assert len(calls) == 2
+    for kw in calls:
+        assert kw["name"] in ("subagent_send", "cancel_subagent")
+        assert kw["toolset"] == "delegation"
+        assert kw["schema"]["name"] == kw["name"]
+        assert callable(kw["handler"])
+
+
 # --- Integration: hooks and tools share the SAME registry instance ---
 # Regression test for the separate-registry bug: sender.py used to create
 # its own SubagentRegistry(), so a handle registered by the subagent_start
 # hook could never be resolved by subagent_send/cancel_subagent. Both now
-# import the module-level singleton from subagent_handles.registry.
+# import the module-level singleton from src.registry.
 
 def test_hook_registered_handle_is_resolvable_by_sender():
     from subagent_handles.registry import registry as shared
@@ -117,12 +144,12 @@ def test_hook_registered_handle_is_resolvable_by_sender():
     assert "sa-integration-1" in shared
 
     # The sender tool must be able to resolve and steer that same handle
-    out = handle_subagent_send({"subagent_id": "sa-integration-1", "text": "steer"})
+    out = _load(handle_subagent_send({"subagent_id": "sa-integration-1", "text": "steer"}))
     assert out["ok"] is True
     assert out["subagent_send"]["state"] == "running"
 
     # Cancel must find it too
-    out2 = handle_cancel_subagent({"subagent_id": "sa-integration-1"})
+    out2 = _load(handle_cancel_subagent({"subagent_id": "sa-integration-1"}))
     assert out2["ok"] is True
     assert out2["state"] == "cancelled"
 

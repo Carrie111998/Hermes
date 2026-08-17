@@ -27,8 +27,10 @@ checkout. The plugin is enabled automatically on load.
 python -m pytest plugins/subagent-handles/tests/ -q
 ```
 
-28 tests covering registry, hooks, tools, and integration (hook-registered
-handle is resolvable by sender).
+32 tests covering registry, hooks, tools, and integration (hook-registered
+handle is resolvable by sender), including a regression guard asserting
+`register_tools` uses the correct `PluginContext.register_tool(name, toolset,
+schema, handler)` signature.
 
 ## Attribution
 

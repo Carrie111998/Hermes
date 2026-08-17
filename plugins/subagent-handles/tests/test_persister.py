@@ -37,8 +37,9 @@ def test_restore_into_registry():
         registry = SubagentRegistry()
         restored = p.restore(registry)
         assert set(restored.keys()) == {"a1", "a2"}
-        # A handle persisted as "running" belongs to a since-dead process; it
-        # is reconciled to "failed" so the sender won't steer a corpse.
+        # Stale "running" handles are reconciled to "failed" on restore
+        # (the process that wrote them has since exited). "done" handles
+        # are preserved as-is.
         assert registry.resolve("a1").state == "failed"
         assert registry.resolve("a2").state == "done"
 
@@ -123,7 +124,10 @@ def test_register_restores_persisted_handles(monkeypatch, tmp_path):
 
     handle = plugin.registry.resolve("sa-old")
     assert handle is not None
-    assert handle.state == "failed"  # persisted 'running' is a dead child post-restart
+    # Handle was checkpointed as "running" by a prior (now-dead) process;
+    # restore reconciles stale "running" → "failed" so subagent_send doesn't
+    # report queued to a dead child after restart.
+    assert handle.state == "failed"
 
 
 def test_stop_hook_persists_done_state(monkeypatch, tmp_path):

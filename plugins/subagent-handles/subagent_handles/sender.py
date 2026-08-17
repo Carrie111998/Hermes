@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Dict
 
@@ -6,54 +7,88 @@ from subagent_handles.registry import registry
 logger = logging.getLogger(__name__)
 
 
-def _send_to_child(subagent_id: str, text: str) -> Dict[str, Any]:
+def _tool_result(data=None, **kwargs) -> str:
+    """Return a JSON result string, using Hermes core helper when importable.
+
+    Falls back to plain json.dumps so the plugin's standalone tests (which
+    do not have the hermes-agent core on sys.path) still produce valid JSON
+    strings matching the tool-handler contract.
+    """
+    try:
+        from tools.registry import tool_result
+
+        return tool_result(data, **kwargs)
+    except ImportError:
+        payload = data if data is not None else kwargs
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def _tool_error(message: str, **extra) -> str:
+    """Return a JSON error string (Hermes core helper when available)."""
+    try:
+        from tools.registry import tool_error
+
+        return tool_error(message, **extra)
+    except ImportError:
+        payload = {"error": message}
+        payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def _resolve_running(subagent_id: str) -> Any:
     handle = registry.resolve(subagent_id)
     if handle is None or handle.state != "running":
-        return {
-            "ok": False,
-            "error": f"subagent_id={subagent_id!r} is not running or not found",
-            "subagent_id": subagent_id,
-        }
-    handle_dict: Dict[str, Any] = {
-        "subagent_id": handle.subagent_id,
-        "session_id": handle.session_id,
-        "state": handle.state,
-    }
-    logger.debug("subagent_send queued for %s: %r", subagent_id, text[:120])
-    return {
-        "ok": True,
-        "subagent_send": handle_dict,
-        "queued": True,
-    }
+        return None
+    return handle
 
 
-def handle_subagent_send(params: Dict[str, Any]) -> Dict[str, Any]:
+def handle_subagent_send(params: Dict[str, Any]) -> str:
     subagent_id = str((params or {}).get("subagent_id") or "").strip()
     text = str((params or {}).get("text") or "").strip()
     if not subagent_id:
-        return {"ok": False, "error": "subagent_id is required"}
+        return _tool_error("subagent_id is required")
     if not text:
-        return {"ok": False, "error": "text is required"}
-    return _send_to_child(subagent_id, text)
+        return _tool_error("text is required")
+    handle = _resolve_running(subagent_id)
+    if handle is None:
+        return _tool_error(
+            f"subagent_id={subagent_id!r} is not running or not found",
+            subagent_id=subagent_id,
+        )
+    logger.debug("subagent_send queued for %s: %r", subagent_id, text[:120])
+    return _tool_result({
+        "ok": True,
+        "subagent_send": {
+            "subagent_id": handle.subagent_id,
+            "session_id": handle.session_id,
+            "state": handle.state,
+        },
+        "queued": True,
+    })
 
 
-def handle_cancel_subagent(params: Dict[str, Any]) -> Dict[str, Any]:
+def handle_cancel_subagent(params: Dict[str, Any]) -> str:
     subagent_id = str((params or {}).get("subagent_id") or "").strip()
     if not subagent_id:
-        return {"ok": False, "error": "subagent_id is required"}
+        return _tool_error("subagent_id is required")
     handle = registry.resolve(subagent_id)
     if handle is None:
-        return {"ok": False, "error": f"subagent_id={subagent_id!r} not found", "subagent_id": subagent_id}
+        return _tool_error(
+            f"subagent_id={subagent_id!r} not found",
+            subagent_id=subagent_id,
+        )
     if handle.state != "running":
-        return {
-            "ok": False,
-            "error": f"subagent_id={subagent_id!r} is not running",
-            "subagent_id": subagent_id,
-            "state": handle.state,
-        }
+        return _tool_error(
+            f"subagent_id={subagent_id!r} is not running",
+            subagent_id=subagent_id,
+            state=handle.state,
+        )
     updated = registry.set_state(subagent_id, "cancelled")
     if not updated:
-        return {"ok": False, "error": f"subagent_id={subagent_id!r} could not be cancelled", "subagent_id": subagent_id}
+        return _tool_error(
+            f"subagent_id={subagent_id!r} could not be cancelled",
+            subagent_id=subagent_id,
+        )
     # Persist the cancelled state so a later session sees it (same store as
     # the hooks use — survive-restart parity with start/stop).
     try:
@@ -62,12 +97,12 @@ def handle_cancel_subagent(params: Dict[str, Any]) -> Dict[str, Any]:
         SessionPersister(default_persist_root()).checkpoint(handle)
     except Exception:
         logger.debug("cancel_subagent checkpoint failed", exc_info=True)
-    return {
+    return _tool_result({
         "ok": True,
         "subagent_id": subagent_id,
         "state": "cancelled",
         "session_id": handle.session_id,
-    }
+    })
 
 
 SCHEMA = {
@@ -98,11 +133,30 @@ SCHEMA = {
 
 
 def register_tools(ctx) -> None:
+    """Register the two steering tools with the correct PluginContext contract.
+
+    Hermes's PluginContext.register_tool signature is:
+        register_hook(name, toolset, schema, handler, check_fn=None, ...)
+    Passing the schema as `name` and the handler as `toolset` (as the old code
+    did) is silently swallowed and registers nothing.
+    """
     try:
-        ctx.register_tool(SCHEMA["subagent_send"], handle_subagent_send)
+        ctx.register_tool(
+            name="subagent_send",
+            toolset="delegation",
+            schema=SCHEMA["subagent_send"],
+            handler=handle_subagent_send,
+            description="Send steering text to a running subagent by handle.",
+        )
     except Exception as exc:
         logger.debug("register_tool subagent_send failed: %s", exc)
     try:
-        ctx.register_tool(SCHEMA["cancel_subagent"], handle_cancel_subagent)
+        ctx.register_tool(
+            name="cancel_subagent",
+            toolset="delegation",
+            schema=SCHEMA["cancel_subagent"],
+            handler=handle_cancel_subagent,
+            description="Cancel a running subagent by subagent_id.",
+        )
     except Exception as exc:
         logger.debug("register_tool cancel_subagent failed: %s", exc)

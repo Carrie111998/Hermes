@@ -18,8 +18,6 @@ def default_persist_root() -> str:
 
         _home = str(get_hermes_home())
     except Exception:
-        # Outside the Hermes runtime (standalone tests): prefer HERMES_HOME,
-        # falling back to a per-OS user state dir only as a last resort.
         _home = os.environ.get(
             "HERMES_HOME",
             os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes"),
