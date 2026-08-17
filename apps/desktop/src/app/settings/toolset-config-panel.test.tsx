@@ -63,11 +63,13 @@ vi.mock('@/hermes', () => ({
   getHermesConfigSchema: () => getHermesConfigSchema(),
   saveHermesConfig: (config: unknown) => saveHermesConfig(config),
   getElevenLabsVoices: () => getElevenLabsVoices(),
-  // @/store/profile (pulled in transitively via use-config-record's
-  // normalizeProfileKey import) calls this at module-init; the full-replacement
-  // mock must provide it or the module graph throws on load.
+  // @/store/profile (pulled in transitively via use-config-record /
+  // useOnProfileSwitch) calls these at module-init; the full-replacement
+  // mock must provide them or the module graph throws on load.
   setApiRequestProfile: () => undefined,
-  getApiRequestProfile: () => null
+  getApiRequestProfile: () => null,
+  getProfiles: async () => ({ profiles: [] }),
+  STARTUP_REQUEST_TIMEOUT_MS: 1000
 }))
 
 vi.mock('@/store/notifications', () => ({
