@@ -51,10 +51,11 @@ jobs:
         uses: ./.github/actions/retry
         with:
           # ruff is PINNED and must equal .pre-commit-config.yaml's
-          # ruff-pre-commit rev and the local CLI -- see the ruff-blocking job
-          # below for why all three move together. ty is deliberately left
-          # floating: this job is advisory, and ty has no second enforcer to
-          # disagree with.
+          # ruff-pre-commit rev, ruff.toml's `required-version` and pyproject's
+          # dev extra -- see the ruff-blocking job below for why they all move
+          # together, and tests/test_lint_config.py::TestRuffVersionPins, which
+          # asserts it. ty is deliberately left floating: this job is advisory,
+          # and ty has no second enforcer to disagree with.
           command: uv tool install ruff==0.15.12 && uv tool install ty
 
       - name: Determine base ref
@@ -149,13 +150,22 @@ jobs:
       - name: Install ruff
         uses: ./.github/actions/retry
         with:
-          # PINNED, and the pin is load-bearing: three separate ruff binaries
+          # PINNED, and the pin is load-bearing: several separate ruff binaries
           # enforce this one rule set -- this job, the pre-commit hook
-          # (.pre-commit-config.yaml `rev:`), and the local CLI that
+          # (.pre-commit-config.yaml `rev:`), the repo .venv (pyproject's dev
+          # extra), and whatever ruff is on PATH, which
           # events/producers/ruff_gate_probe.py shells out to every 15 minutes.
           # Unpinned, this job silently drifts to whatever ruff released today
-          # and can disagree with the other two about the same tree. Bump all
-          # three in one commit or not at all.
+          # and can disagree with the others about the same tree.
+          #
+          # This pin and ruff.toml's `required-version` are two independent
+          # layers, and both are worth keeping: this one says which version to
+          # FETCH, required-version says which version is allowed to RUN. If
+          # this ever goes unpinned again, required-version turns the result
+          # into a loud failure (exit 2, config refused) instead of a silent
+          # lint with the wrong binary. Bump every site in one commit or not at
+          # all; tests/test_lint_config.py::TestRuffVersionPins fails if this
+          # pin and the hook rev diverge, or if this install goes unpinned.
           command: uv tool install ruff==0.15.12
 
       - name: ruff check .

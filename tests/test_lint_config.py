@@ -38,6 +38,7 @@ docs/superpowers/specs/2026-08-16-ruff-f-group-reland-design.md
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 
@@ -256,4 +257,176 @@ class TestPreCommitHook:
             "No ruff hook in .pre-commit-config.yaml (found "
             f"{sorted(i for i in ids if i)}).  Local commits then bypass the "
             "lint gate entirely and violations are only caught later, in CI."
+        )
+
+
+class TestRuffVersionPins:
+    """The ruff BINARIES must all name one version.
+
+    ``ruff.toml`` keeps the rule SET in sync for free -- adding a rule there
+    arms the hook, CI and the local CLI at once.  The binaries have no such
+    link: pre-commit builds an isolated env from ``rev:``, CI runs ``uv tool
+    install``, and the local CLI is whatever is on PATH.  On 2026-08-17 those
+    three sat on 0.15.12, latest-at-run-time (0.16.3) and 0.15.10.
+
+    That drift was inert when measured -- all three resolved an identical
+    44-rule set and all three passed the tree -- but that bounds rule
+    MEMBERSHIP only.  A rule can change what it flags without changing whether
+    it is enabled, and ``preview = true`` is exactly where ruff declines to
+    promise stability across versions (PLW1514 is a preview rule).  With the F
+    group gated tree-wide at zero suppressions, such a delta is a GATE delta:
+    the same tree passes in one place and fails in another.
+
+    A comment cannot hold this invariant -- one claiming the three were kept in
+    step had already gone stale, and 94960380ea had to correct it.  So these
+    tests hold it instead.
+
+    **The environment surface is no longer unreachable (2026-08-17.)** This
+    docstring used to end by conceding that the local CLI "is an environment no
+    test can reach", and that concession was load-bearing: while it stood, the
+    repo ``.venv`` sat on 0.15.10 -- installed from a ``pyproject.toml`` dev
+    extra that had never been bumped -- while the hook and CI ran 0.15.12.  The
+    15-minute whole-tree alarm in ``events/producers/ruff_gate_probe.py``
+    resolves ruff off PATH, so which binary IT linted with depended on whether
+    a session happened to have the venv activated.
+
+    ``ruff.toml`` now carries ``required-version``, which ruff enforces itself:
+    a mismatched binary refuses to load the config and exits 2, whoever invoked
+    it.  That converts the environment from untestable to self-policing, and it
+    is why a FIFTH declaration site (the dev extra) is now asserted below --
+    the four this class knew about never included it.
+    """
+
+    PRE_COMMIT_PATH = REPO_ROOT / ".pre-commit-config.yaml"
+    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "lint.yml"
+
+    #: ``uv tool install ruff`` with the ``==`` pin OPTIONAL.  Optional is the
+    #: whole point: it makes an UNPINNED install match-and-then-fail rather
+    #: than simply not match, and an install that fails to match is the one
+    #: regression this guard exists to catch.  The trailing lookahead stops
+    #: ``ruff-lsp`` and friends from reading as a bare ``ruff``.
+    _UV_INSTALL_RUFF = re.compile(
+        r"uv tool install ruff(?:==(?P<version>[\w.]+))?(?![\w.-])"
+    )
+
+    def _hook_version(self) -> str:
+        """The ruff version the pre-commit hook builds, read off its ``rev:``."""
+        import yaml
+
+        parsed = yaml.safe_load(self.PRE_COMMIT_PATH.read_text(encoding="utf-8"))
+        revs = [
+            str(repo.get("rev", ""))
+            for repo in parsed.get("repos", [])
+            if "astral-sh/ruff-pre-commit" in str(repo.get("repo", ""))
+        ]
+        assert len(revs) == 1, (
+            f"expected exactly one astral-sh/ruff-pre-commit entry in "
+            f"{self.PRE_COMMIT_PATH.name}, found {len(revs)}: {revs}.  The CI "
+            "pins cannot be compared until there is exactly one hook rev to "
+            "compare them against."
+        )
+        # The hook rev is a git TAG (``v0.15.12``); a uv pin is a PyPI VERSION
+        # (``0.15.12``).  Compare the versions, not the spellings.
+        return revs[0].lstrip("v")
+
+    def test_hook_rev_is_a_concrete_release(self):
+        """``rev:`` must name a release tag, not a moving ref.
+
+        pre-commit also accepts a branch or a SHA there.  A branch would put
+        the floating-version problem back on the one surface that actually
+        blocks commits, while still looking pinned.
+        """
+        version = self._hook_version()
+        assert re.fullmatch(r"\d+\.\d+\.\d+", version), (
+            f"the astral-sh/ruff-pre-commit rev resolves to {version!r}, which "
+            "is not a concrete x.y.z release.  A branch or SHA makes the hook's "
+            "ruff version unknowable from the file, so neither this test nor a "
+            "human reader can tell whether CI and the local CLI agree with it."
+        )
+
+    def test_every_ci_ruff_install_pins_the_hook_version(self):
+        """Every ``uv tool install ruff`` in lint.yml must pin the hook's ruff."""
+        content = self.WORKFLOW_PATH.read_text(encoding="utf-8")
+        matches = list(self._UV_INSTALL_RUFF.finditer(content))
+        assert matches, (
+            f"{self.WORKFLOW_PATH.name} no longer installs ruff via `uv tool "
+            "install ruff`.  If the install moved to another mechanism, teach "
+            "this test to read it -- otherwise CI's ruff version is unpinned "
+            "and unverified again, which is the state this test was added to "
+            "end."
+        )
+
+        expected = self._hook_version()
+        mismatched = [
+            m.group("version") for m in matches if m.group("version") != expected
+        ]
+        assert not mismatched, (
+            f"{self.WORKFLOW_PATH.name} installs ruff "
+            f"{[v or 'UNPINNED (latest at run time)' for v in mismatched]}, but "
+            f"the pre-commit hook builds {expected}.  CI and the hook then "
+            "enforce the same ruff.toml with different binaries, so one tree "
+            "can pass one gate and fail the other -- and with the F group "
+            "enforced tree-wide at zero suppressions, that is a gate delta, "
+            "not a cosmetic one.\n\n"
+            f"Fix by pinning every `uv tool install ruff` to =={expected}.  If "
+            "you meant to move the whole toolchain instead, bump the hook rev, "
+            "both lint.yml pins and the local CLI "
+            f'(`python -m pip install "ruff=={expected}"`) in ONE commit, then '
+            "re-run `ruff check --no-cache .`."
+        )
+
+    def test_ruff_toml_required_version_pins_the_hook_version(self):
+        """``ruff.toml`` must pin the hook's ruff via ``required-version``.
+
+        This is the only pin that reaches the ENVIRONMENT rather than a
+        declaration.  The other assertions in this class compare files to files,
+        so they stay green while the binary a developer or a Scheduled Task
+        actually runs drifts underneath them -- which is exactly what happened
+        to the repo .venv.  ruff enforcing its own config version is what makes
+        that undetectable case detectable.
+        """
+        required = _load_ruff_config().get("required-version")
+        expected = self._hook_version()
+        assert required is not None, (
+            "ruff.toml has no `required-version`.  Without it, nothing stops a "
+            "binary of any version from linting this tree: the pins in "
+            "pyproject.toml, .pre-commit-config.yaml and lint.yml are all "
+            "DECLARATIONS, and the tests over them compare files to each other, "
+            "never to the ruff that actually runs.  Add "
+            f'`required-version = "=={expected}"`.'
+        )
+        assert required == f"=={expected}", (
+            f"ruff.toml pins `required-version = {required!r}` but the "
+            f"pre-commit hook builds {expected}.  ruff would then refuse to run "
+            "for the hook itself -- exit 2, config load failure -- so this is a "
+            "hard break rather than a silent drift.  Set them equal.\n\n"
+            "Use an exact `==x.y.z` pin, not a range: a range re-admits the "
+            "very version spread this class exists to forbid, while still "
+            "looking pinned."
+        )
+
+    def test_dev_extra_pins_the_hook_version(self):
+        """``pyproject.toml``'s dev extra is the FIFTH declaration site.
+
+        It is the one that installs the repo ``.venv``, so a stale entry here
+        does not merely misdocument the version -- it MANUFACTURES a mismatched
+        binary on the next install.  It sat at 0.15.10 while every other site
+        said 0.15.12, and the venv it produced was really running 0.15.10.
+        """
+        dev = _load_pyproject().get("project", {}).get("optional-dependencies", {}).get("dev", [])
+        pins = [d for d in dev if re.fullmatch(r"ruff==[\w.]+", str(d).strip())]
+        assert len(pins) == 1, (
+            f"expected exactly one `ruff==x.y.z` entry in pyproject.toml's dev "
+            f"extra, found {len(pins)}: {pins}.  An unpinned or missing ruff "
+            "there installs whatever is latest into the repo .venv, which is "
+            "the binary most local tooling resolves first."
+        )
+        expected = self._hook_version()
+        actual = pins[0].split("==", 1)[1]
+        assert actual == expected, (
+            f"pyproject.toml's dev extra pins ruff {actual}, but the pre-commit "
+            f"hook builds {expected}.  `uv sync` / `pip install -e .[dev]` then "
+            "puts a mismatched ruff in the repo .venv, and ruff.toml's "
+            "required-version makes every invocation from that venv fail to "
+            f"load the config (exit 2).  Set it to =={expected}."
         )

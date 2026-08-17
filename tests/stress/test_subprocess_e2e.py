@@ -33,9 +33,16 @@ from tests.timeout_budget import scaled  # noqa: E402
 CLI_CMD = [PY, "-m", "hermes_cli.main"]
 
 
-def make_spawn_fn(home: str):
+def make_spawn_fn(home: str, procs: list | None = None):
     """Return a spawn_fn the dispatcher can call. Launches the fake
-    worker as a detached subprocess."""
+    worker as a detached subprocess.
+
+    ``procs`` collects the ``Popen`` handles so :func:`_reap` can wait for
+    the workers to actually exit. The dispatcher only ever needs the pid,
+    but a pid alone is not waitable here -- these are started with
+    ``start_new_session=True``, so nothing reaps them unless we keep the
+    object.
+    """
 
     def _spawn(task, workspace):
         log_path = os.path.join(home, f"worker_{task.id}.log")
@@ -66,17 +73,65 @@ def make_spawn_fn(home: str):
             cwd=home,
             start_new_session=True,
         )
+        # The child dup'd its own handle; ours would otherwise keep
+        # worker_*.log open in this process until the local is collected.
+        log_f.close()
+        if procs is not None:
+            procs.append(proc)
         return proc.pid
 
     return _spawn
 
 
+def _reap(procs) -> None:
+    """Wait for the spawned workers to actually exit.
+
+    This has to happen before the HERMES_HOME around them is removed.
+    ``_run_e2e`` decides the work is finished when every task reaches
+    ``done``, but a worker sets that on its *last* CLI call
+    (``hermes kanban complete``) and has not exited at that point -- so it
+    still owns ``worker_*.log`` as its stdout, and the ``complete``
+    grandchild still owns ``kanban.db``. On Windows those open handles make
+    the directory unremovable, and because ``cleanup_home`` cannot delete
+    it, every green run leaked its whole tree.
+
+    Measured 2026-08-17 before this wait existed: the directory only became
+    deletable ~1s after the *script process itself* exited, i.e. long after
+    cleanup had already run and given up. No retry inside ``cleanup_home``
+    can win that race, because the holder outlives the interpreter -- the
+    fix has to be to wait for the workers here.
+
+    Incidental safety net, not the assertion (tests/timeout_budget.py rule
+    2): these workers have already been observed reaching ``done``, so this
+    only covers process teardown. A worker still alive at the end of the
+    budget is reported rather than silently ignored, since it means the
+    directory is about to leak again.
+    """
+    deadline = time.monotonic() + scaled(60)
+    for proc in procs:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            remaining = 0.001
+        try:
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            print(f"  ! worker pid={proc.pid} still alive after the reap "
+                  f"budget; its open handles may leak HERMES_HOME")
+
+
 def main():
+    procs: list[subprocess.Popen] = []
     with temp_home("hermes_e2e_") as home:
-        _run_e2e(home)
+        try:
+            _run_e2e(home, procs)
+        finally:
+            # Inside the `with`, so it runs before cleanup_home -- and in a
+            # `finally`, so a sys.exit(1) from a failed scenario still reaps
+            # rather than leaving orphans behind.
+            _reap(procs)
 
 
-def _run_e2e(home):
+def _run_e2e(home, procs):
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
     sys.path.insert(0, WT)
@@ -104,7 +159,7 @@ def _run_e2e(home):
         )
         tids.append(tid)
 
-    spawn_fn = make_spawn_fn(home)
+    spawn_fn = make_spawn_fn(home, procs)
     result = kb.dispatch_once(conn, spawn_fn=spawn_fn)
     print(f"  dispatched: {len(result.spawned)} spawned")
     spawned_pids = []
