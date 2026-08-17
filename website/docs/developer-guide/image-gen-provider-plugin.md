@@ -315,7 +315,7 @@ These ship as standalone pip packages / repos, not under this tree. They're list
 
 | Plugin | Source | Notes |
 |---|---|---|
-| [hermes-agent-poe-image-gen](https://github.com/dzoey/hermes-agent-poe-image-gen) | [PyPI](https://pypi.org/project/hermes-agent-poe-image-gen/) / pip | Poe.com backend via `fastapi_poe` SDK. 27-bot catalog (Nano-Banana, GPT-Image, Flux-2, Grok-Imagine-Image, Ideogram, DALL-E-4, …) loaded from a `models.json` sidecar so users can add/remove bots without editing Python. Any arbitrary Poe bot name is also accepted at call time. Requires `POE_API_KEY`. |
+| [hermes-agent-poe-image-gen](https://github.com/dzoey/hermes-agent-poe-image-gen) | [PyPI](https://pypi.org/project/hermes-agent-poe-image-gen/) / pip | Poe.com backend via `fastapi_poe` SDK. Model catalog loaded from a `models.json` sidecar (see plugin README for current list). Requires `POE_API_KEY`. |
 
 Want to add yours? Open a PR against this page with a one-line entry following the same format.
 
