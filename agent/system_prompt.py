@@ -855,6 +855,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
+    # For implicit-prefix-cache backends, the volatile suffix (model/provider/timestamp)
+    # must be injected AFTER conversation history, not inside the system prompt.
+    # Otherwise any byte change invalidates the KV-cache for the entire conversation.
+    if getattr(agent, "_implicit_prefix_cache", False):
+        agent._volatile_suffix = "\n\n".join(p.strip() for p in volatile_parts if p and p.strip())
+        return {
+            "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
+            "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
+            "volatile": "",  # Volatile content is stored separately and injected later
+        }
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
@@ -878,6 +889,11 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     content most likely to change is rendered last, so when the prompt is
     rebuilt (on compaction/restore) the unchanged stable scaffold ahead of
     the change stays in the reused prefix.
+
+    For implicit-prefix-cache backends (llama.cpp, Ollama, etc.), the volatile
+    suffix is stored separately in ``agent._volatile_suffix`` and injected
+    AFTER conversation history, so a model switch only invalidates a small
+    trailing region instead of the entire conversation.
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
@@ -899,6 +915,7 @@ def invalidate_system_prompt(agent: Any) -> None:
     """
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
+    agent._volatile_suffix = None
     if agent._memory_store:
         agent._memory_store.load_from_disk()
 

@@ -907,6 +907,20 @@ def init_agent(
     agent._use_prompt_caching, agent._use_native_cache_layout = (
         agent._anthropic_prompt_cache_policy()
     )
+    # Implicit longest-common-prefix cache backends (llama.cpp, Ollama, LM Studio,
+    # vLLM) implement KV-cache matching by longest common prefix of the full prompt.
+    # They don't support explicit cache_control markers, so _use_prompt_caching is
+    # False for them. But they still benefit from prefix stability: any byte change
+    # anywhere in the prompt invalidates the cache for everything after it. For
+    # these backends we move the volatile suffix (model/provider) out of the system
+    # prompt and inject it after conversation history, so a model switch only
+    # invalidates a small trailing region instead of the whole conversation.
+    from agent.model_metadata import is_local_endpoint
+    agent._implicit_prefix_cache = (
+        not agent._use_prompt_caching
+        and is_local_endpoint(getattr(agent, "base_url", "") or "")
+    )
+    agent._volatile_suffix = None  # Set by build_system_prompt_parts()
     agent._cache_disabled = False
     # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from
     # config.yaml under prompt_caching.cache_ttl; unknown values keep "5m".
@@ -2930,6 +2944,7 @@ def init_agent(
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
+        "implicit_prefix_cache": getattr(agent, "_implicit_prefix_cache", False),
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).

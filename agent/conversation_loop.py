@@ -1001,12 +1001,18 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_model = line_value("Model")
     current_model = str(getattr(agent, "model", "") or "").strip()
     if stored_model and current_model and stored_model != current_model:
-        return False
+        # For implicit-prefix-cache backends, the Model/Provider lines are
+        # no longer embedded in the system prompt (they're stored separately
+        # in _volatile_suffix). A stored prompt from before this change or
+        # after a model switch won't have matching lines — that's expected.
+        if not getattr(agent, "_implicit_prefix_cache", False):
+            return False
 
     stored_provider = line_value("Provider")
     current_provider = str(getattr(agent, "provider", "") or "").strip()
     if stored_provider and current_provider and stored_provider != current_provider:
-        return False
+        if not getattr(agent, "_implicit_prefix_cache", False):
+            return False
 
     # Detect cwd drift: if the stored prompt was built in a different working
     # directory, reuse would silently inject a stale path into the prefix cache.
@@ -2238,6 +2244,14 @@ def run_conversation(
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
+
+        # For implicit-prefix-cache backends (llama.cpp, Ollama, etc.), the volatile
+        # suffix (model/provider/timestamp) is injected AFTER conversation history so
+        # that a model switch only invalidates a small trailing region instead of the
+        # entire conversation. The volatile content is stored on agent._volatile_suffix
+        # by build_system_prompt_parts().
+        if getattr(agent, "_implicit_prefix_cache", False) and getattr(agent, "_volatile_suffix", None):
+            api_messages.append({"role": "user", "content": agent._volatile_suffix})
 
         if moa_config:
             try:

@@ -1587,6 +1587,8 @@ def restore_primary_runtime(agent) -> bool:
             "use_native_cache_layout",
             agent.api_mode == "anthropic_messages" and agent.provider == "anthropic",
         )
+        # Restore the implicit-prefix-cache flag (for llama.cpp, Ollama, etc.)
+        agent._implicit_prefix_cache = rt.get("implicit_prefix_cache", False)
         # If the operator has disabled caching via config (cache_ttl is
         # falsy → _cache_disabled flag is set), the disable must survive
         # runtime snapshot restoration (#33555).
@@ -2895,6 +2897,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             model=new_model,
         )
     )
+    # Re-evaluate implicit-prefix-cache flag for the new provider
+    from agent.model_metadata import is_local_endpoint
+    agent._implicit_prefix_cache = (
+        not agent._use_prompt_caching
+        and is_local_endpoint(getattr(agent, "base_url", "") or "")
+    )
 
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
@@ -2969,6 +2977,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
+        "implicit_prefix_cache": getattr(agent, "_implicit_prefix_cache", False),
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
