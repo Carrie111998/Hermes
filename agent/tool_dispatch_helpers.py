@@ -67,7 +67,7 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 # state when the model batches it alongside the ``patch``/``write_file``
 # it depends on (the classic same-block write→read race).
 _PATH_SCOPED_READERS = frozenset({"read_file", "search_files"})
-_PATH_SCOPED_WRITERS = frozenset({"write_file", "patch"})
+_PATH_SCOPED_WRITERS = frozenset({"write_file", "patch", "anchored_edit"})
 
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = _PATH_SCOPED_READERS | _PATH_SCOPED_WRITERS

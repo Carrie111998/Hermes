@@ -8328,7 +8328,7 @@ class AIAgent:
 
         for tc in tool_calls or []:
             name = getattr(getattr(tc, "function", None), "name", "")
-            if name not in ("patch", "write_file", "edit_file"):
+            if name not in ("patch", "write_file", "edit_file", "anchored_edit"):
                 continue
             try:
                 args = _json.loads(getattr(getattr(tc, "function", None), "arguments", "{}"))

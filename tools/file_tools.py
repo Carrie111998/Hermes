@@ -1810,7 +1810,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 task_data["read_timestamps"] = {}
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
-        if cached_mtime is not None:
+        # The include_anchors read bypasses the dedup: the anchored
+        # coordinates are the point of the re-read, and the stale-file
+        # alert's freshness makes the re-render meaningful.
+        if cached_mtime is not None and not include_anchors:
             try:
                 current_mtime = os.path.getmtime(resolved_str)
                 if current_mtime == cached_mtime:
@@ -2939,6 +2942,13 @@ def check_path_writable(full: str) -> tuple:
         return False, f"the target directory is not writable: {exc}"
     if not _os.access(full, _os.W_OK):
         return False, "the file exists but is read-only"
+    try:
+        _vfs = _os.statvfs(_dir)
+        _free = _vfs.f_bavail * _vfs.f_frsize
+        if _free < 64 * 1024:  # the stage needs a small sibling; refuse early
+            return False, "the filesystem is nearly full (the staged sibling cannot land)"
+    except OSError:
+        pass
     _fstype = getattr(_os.statvfs(_dir), "f_fstypename", "") or ""
     _atomic = not any(_n in _fstype.lower() for _n in ("nfs", "smbfs", "cifs", "fuse", "sshfs"))
     return True, "", _atomic
@@ -2974,8 +2984,9 @@ def estimate_write_time(full: str, payload_bytes: int = 4096) -> float:
 
 def _check_syntax_after_edit(full: str):
     """Dirac's debug-syntax pattern: a .py edit whose result does not parse
-    is usually the LLM proxy's lossy compression garbling the text. The
-    edit stands, but the warning tells the model to re-check."""
+    is flagged — the cause is the model's own mistake (a misread or
+    mis-inserted line) or a proxy's lossy compression; the tool cannot tell
+    which, it only surfaces the break. The edit stands, with the warning."""
     import ast as _ast
 
     if not full.endswith(".py"):
@@ -3106,8 +3117,35 @@ def anchored_edit_tool(path: str, edits: list, task_id: str = "default") -> str:
         _fd, _staged = _tempfile.mkstemp(dir=_dir, prefix=".anchored-edit-")
         _mark_hidden(_staged)
         _os.chmod(_staged, _mode)  # mkstemp is 0600; keep the original's mode
-        with _os.fdopen(_fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(newline.join(updated) + trailing)
+        try:
+            with _os.fdopen(_fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(newline.join(updated) + trailing)
+        except OSError as _stage_exc:
+            # The disk-full rescue: the staged sibling cannot land, but the
+            # IN-PLACE write may — the existing blocks are overwritten, no
+            # new allocation, on the non-copy-on-write filesystems (the
+            # atomicity is lost; the file is never observed half-written is
+            # no longer guaranteed, but the edit lands).
+            try:
+                _os.close(_fd)
+            except OSError:
+                pass
+            try:
+                _os.unlink(_staged)
+            except OSError:
+                pass
+            if getattr(_stage_exc, "errno", None) in (28, 122):  # ENOSPC/EDQUOT
+                with open(full, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(newline.join(updated) + trailing)
+                applied = len(edits) - len(failures)
+                result = {"ok": True, "path": full, "applied": applied,
+                          "inplace_fallback": True,
+                          "atomicity": "lost (the disk is full; in-place rescue)"}
+                if failures:
+                    result["failures"] = failures[:5]
+                    result["hint"] = "re-read with include_anchors=true"
+                return _json.dumps(result)
+            raise
         try:
             _os.fsync(_fd)  # the content is durable BEFORE the rename —
             # a crash right after the rename can no longer lose the bytes

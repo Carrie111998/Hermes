@@ -1,3 +1,5 @@
+import pytest
+
 """Anchored editing (ported from Dirac's EditFileTool tests).
 
 The cases copied/adapted from Dirac: the validation (non-array edits,
@@ -294,7 +296,7 @@ def test_drift_between_read_and_write_is_detected(tmp_path):
 
 def test_drift_fails_the_edit_without_overwriting(tmp_path):
     import json as _json
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
     from tools.file_tools import anchored_edit_tool
     p = str(tmp_path / "t.py")
     open(p, "w").write("a\nb\nc\n")
@@ -326,6 +328,8 @@ def test_redacted_anchor_edits_by_id():
 
 def test_preflight_probe_detects_read_only_directory(tmp_path):
     import os
+    if os.geteuid() == 0:
+        pytest.skip("the chmod-based read-only check is meaningless as root")
     from tools.file_tools import check_path_writable
     d = tmp_path / "ro"
     d.mkdir()
@@ -442,7 +446,7 @@ def test_fs_type_reported_in_the_probe(tmp_path):
 
 def test_read_reports_atomicity_issue(tmp_path):
     import json as _json
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
     from tools.file_tools import read_file_tool
     p = str(tmp_path / "t.py")
     open(p, "w").write("a\n")
@@ -470,3 +474,147 @@ def test_garbled_py_edit_reports_a_syntax_warning(tmp_path):
     anch = render_anchored_lines(open(p).read().splitlines())
     res = _json.loads(anchored_edit_tool(p, [{"anchor": anch[0], "text": "def ok():\n    return ('"}]))
     assert res.get("syntax_warning") and "does not parse" in res["syntax_warning"]
+
+
+def test_lean_ctx_marker_is_refused(tmp_path):
+    import json as _json
+    from tools.file_tools import anchored_edit_tool
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("a\nb\nc\n")
+    anch = render_anchored_lines(open(p).read().splitlines())
+    res = _json.loads(anchored_edit_tool(p, [{"anchor": anch[0], "text": "x [lean-ctx: compressed 12 tokens] y"}]))
+    assert res["ok"] is False and "marker" in res["error"]
+
+
+
+def test_search_include_anchors_returns_anchored_matches(tmp_path):
+    import json as _json
+    from tools.file_tools import search_tool
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("def target_fn():\n    return 1\n\nx = target_fn()\n")
+    anchored = search_tool("target_fn", path=str(tmp_path), include_anchors=True)
+    assert "ANCHOR" in anchored
+    plain = search_tool("target_fn", path=str(tmp_path))
+    assert "ANCHOR" not in plain
+
+
+
+def test_disk_full_without_rescue_fails_cleanly(tmp_path):
+    """The disk-full + the in-place rescue ALSO fails (a CoW filesystem):
+    the edit fails cleanly, no clobber."""
+    import json as _json
+    from unittest.mock import patch
+    from tools.file_tools import anchored_edit_tool
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("a\nb\nc\n")
+    anch = render_anchored_lines(open(p).read().splitlines())
+    with patch("os.fdopen", side_effect=OSError(28, "No space left on device")), \
+         patch("builtins.open", side_effect=OSError(28, "No space left on device")):
+        res = _json.loads(anchored_edit_tool(p, [{"anchor": anch[0], "text": "A2"}]))
+    assert res["ok"] is False
+    assert open(p).read().startswith("a")  # untouched
+
+
+def test_free_space_preflight(tmp_path):
+    """The pre-flight refuses when the filesystem is nearly full."""
+    from unittest.mock import patch
+    from tools.file_tools import check_path_writable
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("a\n")
+    with patch("os.statvfs", return_value=type("V", (), {"f_bavail": 1, "f_frsize": 1024})()):
+        ok, reason = check_path_writable(p)
+        assert not ok and "nearly full" in reason
+
+
+def test_disk_full_falls_back_to_in_place_rescue(tmp_path):
+    """The disk-full case: the staged sibling cannot land, but the in-place
+    write rescues the edit on the non-CoW filesystems (the existing blocks
+    are overwritten, no new allocation). The atomicity is flagged as lost."""
+    import json as _json, os
+    from unittest.mock import patch
+    from tools.file_tools import anchored_edit_tool
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("a\nb\nc\n")
+    anch = render_anchored_lines(open(p).read().splitlines())
+    with patch("os.fdopen", side_effect=OSError(28, "No space left on device")):
+        res = _json.loads(anchored_edit_tool(p, [{"anchor": anch[0], "text": "A2"}]))
+    assert res["ok"] is True and res.get("inplace_fallback") is True
+    assert open(p).read().startswith("A2")  # the edit landed
+    assert "atomicity" in res and "lost" in res["atomicity"]
+
+
+def test_anchored_reread_bypasses_the_unchanged_dedup(tmp_path):
+    """The second include_anchors read of an unchanged file must return the
+    anchored coordinates, not the 'File unchanged' stub."""
+    import json as _json
+    from tools.file_tools import read_file_tool
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("def a():\n    return 1\n")
+    json.loads(read_file_tool(p, include_anchors=True))
+    second = _json.loads(read_file_tool(p, include_anchors=True))
+    assert "ANCHOR" in second["content"]
+    assert second.get("dedup") is not True
+
+
+# ── the white-box mini-max (the remaining uncovered lines) ────────────
+
+def test_tool_stat_failure_is_a_clean_error(tmp_path):
+    import json as _json
+    from unittest.mock import patch
+    from tools.file_tools import anchored_edit_tool
+    with patch("os.stat", side_effect=OSError(2, "no such")):
+        res = _json.loads(anchored_edit_tool(str(tmp_path / "gone.py"),
+                                             [{"anchor": "ANCHORx≫a", "text": "b"}]))
+    assert res["ok"] is False and "stat" in res["error"]
+
+
+def test_handler_rejects_missing_fields(tmp_path):
+    import json as _json
+    from tools.file_tools import _handle_anchored_edit
+    res = _json.loads(_handle_anchored_edit({"path": str(tmp_path)}))
+    assert res.get("error") and "edits" in res["error"]
+
+
+def test_handler_dispatches_valid_calls(tmp_path):
+    import json as _json
+    from tools.file_tools import _handle_anchored_edit
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("a\nb\n")
+    anch = render_anchored_lines(open(p).read().splitlines())
+    res = _json.loads(_handle_anchored_edit(
+        {"path": p, "edits": [{"anchor": anch[0], "text": "A2"}]}))
+    assert res["ok"] is True
+
+
+def test_drift_oses_are_reported_as_stale(tmp_path):
+    from unittest.mock import patch
+    from tools.file_tools import _file_drifted
+    p = str(tmp_path / "t.py")
+    open(p, "w").write("a\n")
+    with patch("builtins.open", side_effect=OSError(2, "no such")):
+        assert _file_drifted(p, "a\n") is True
+
+
+def test_syntax_check_skips_non_py_and_ok_py(tmp_path):
+    from tools.file_tools import _check_syntax_after_edit
+    txt = str(tmp_path / "notes.txt")
+    open(txt, "w").write("just text")
+    assert _check_syntax_after_edit(txt) is None  # the non-.py
+    py = str(tmp_path / "ok.py")
+    open(py, "w").write("x = 1\n")
+    assert _check_syntax_after_edit(py) is None  # the parse-OK
+
+
+def test_register_ignore_survives_unreadable_repo(tmp_path):
+    from unittest.mock import patch
+    from tools.file_tools import _register_temp_ignore_patterns
+    with patch("os.path.isdir", side_effect=OSError(2, "no such")):
+        _register_temp_ignore_patterns(str(tmp_path / "t.py"))  # must not raise
+    assert True
+
+
+def test_mark_hidden_windows_branch():
+    """The Windows hidden-attribute branch is the POSIX-unreachable floor:
+    the real ctypes has no windll on macOS/Linux, and the import cannot be
+    stubbed reliably. The branch is reviewed, not executed here."""
+    pytest.skip("the Windows ctypes branch is unreachable on POSIX")
