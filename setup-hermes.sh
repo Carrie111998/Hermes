@@ -251,7 +251,18 @@ else
         # at first use.
         # Also: stream stderr through directly so the user sees uv's
         # progress UI instead of staring at a frozen prompt.
-        if UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" $UV_CMD sync --extra all --locked; then
+        #
+        # env -u UV_NO_CONFIG (exported above for the sudo -u case, #21269):
+        # a locked sync MUST see the project's [tool.uv] exclude-newer in
+        # pyproject.toml. With UV_NO_CONFIG set, uv 0.12+ cannot see it,
+        # considers the lockfile's recorded settings stale ("removal of
+        # global exclude newer") and refuses --locked — silently downgrading
+        # every fresh install to the non-hash-verified PyPI fallback
+        # (#88361). The runtime refresh path already pops UV_NO_CONFIG for
+        # exactly this reason (hermes_cli/managed_uv.py, "uv 0.12+ refuses
+        # --locked"). cwd is $SCRIPT_DIR (the checkout root), so the only
+        # pyproject uv can discover here is the project's own.
+        if UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" env -u UV_NO_CONFIG $UV_CMD sync --extra all --locked; then
             echo -e "${GREEN}✓${NC} Dependencies installed (hash-verified via uv.lock)"
         else
             echo -e "${YELLOW}⚠${NC} Lockfile sync failed (see uv output above)."
