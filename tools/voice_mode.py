@@ -1592,6 +1592,8 @@ def _interrupt_other_process_playback() -> None:
     terminates it. Best-effort: any failure is swallowed — cross-process
     arbitration is a nicety, never a blocker for local playback.
     """
+    from gateway.status import _pid_exists
+
     try:
         with open(_playback_pid_path(), "r", encoding="utf-8") as fh:
             pid = int(fh.read().strip() or "0")
@@ -1617,8 +1619,11 @@ def _interrupt_other_process_playback() -> None:
             _deadline = time.monotonic() + 0.5
             while time.monotonic() < _deadline:
                 try:
-                    os.kill(pid, 0)  # signal 0 = existence probe
-                except ProcessLookupError:
+                    # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484):
+                    # it sends CTRL_C_EVENT to the target's console group.
+                    if not _pid_exists(pid):
+                        break
+                except Exception:
                     break
                 time.sleep(0.01)
         except (ProcessLookupError, PermissionError):
