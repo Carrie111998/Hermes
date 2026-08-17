@@ -2601,6 +2601,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             "message dead-lettered"
         )
 
+    # TKT-0033 Phase A Task 5: WARN-only unified report template assertions.
+    # Log missing markers as WARNINGS — NEVER block delivery on them, and
+    # never let an assert failure crash the delivery path.
+    try:
+        from cron.template_asserts import check_report_markers
+
+        for _w in check_report_markers(delivery_content):
+            logger.warning("Job '%s': %s", job["id"], _w)
+    except Exception as _ta_err:
+        logger.warning(
+            "Job '%s': report template assertion failed to run: %s",
+            job["id"], _ta_err,
+        )
+
     delivery_errors = []
 
     for target in targets:
