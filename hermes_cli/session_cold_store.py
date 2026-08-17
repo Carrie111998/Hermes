@@ -14,11 +14,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import tempfile
 from typing import Any
 
-from hermes_state import SessionDB
+from hermes_state import SessionDB, resolved_max_export_messages
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,21 @@ def _rows(conn: sqlite3.Connection, query: str, params: tuple[Any, ...]) -> list
         {column[0]: value for column, value in zip(cursor.description, row, strict=True)}
         for row in cursor.fetchall()
     ]
+
+
+def _enforce_message_limit(conn: sqlite3.Connection, physical_ids: tuple[str, ...]) -> None:
+    limit = resolved_max_export_messages()
+    if limit <= 0:
+        return
+    placeholders = ",".join("?" for _ in physical_ids)
+    count = conn.execute(
+        f"SELECT COUNT(*) FROM messages WHERE session_id IN ({placeholders})",
+        physical_ids,
+    ).fetchone()[0]
+    if count > limit:
+        raise ValueError(
+            f"cold store lineage has {count} messages, exceeding the configured export limit {limit}"
+        )
 
 
 def _session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
@@ -211,9 +227,19 @@ def _ensure_dir_tree_fsynced(path: Path) -> None:
         missing.append(current)
         current = current.parent
     for directory in reversed(missing):
-        directory.mkdir()
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            pass
+        if not directory.is_dir() or directory.is_symlink():
+            raise ValueError(f"unsafe archive parent path: {directory}")
         _fsync_dir(directory)
         _fsync_dir(directory.parent)
+
+
+def _remove_staging(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
 
 
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:
@@ -246,6 +272,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
             if ended_at is None or rows[-1].get("end_reason") == "compression":
                 raise ValueError("terminal session must be ended and non-compression before cold storage")
 
+            _enforce_message_limit(conn, lineage)
             records = _records(conn, lineage)
             fingerprint = _fingerprint(records)
         finally:
@@ -285,15 +312,15 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         )
         (staging / "artifacts").mkdir()
         _fsync_dir(staging)
-        os.replace(staging, revision_dir)
+        try:
+            os.replace(staging, revision_dir)
+        except FileExistsError:
+            if _valid_existing_revision(revision_dir, terminal_id, lineage, fingerprint):
+                _remove_staging(staging)
+                return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
+            raise
         _fsync_dir(revision_dir.parent)
     except BaseException:
-        if staging.exists():
-            for item in staging.iterdir():
-                if item.is_file():
-                    item.unlink()
-                elif item.is_dir():
-                    item.rmdir()
-            staging.rmdir()
+        _remove_staging(staging)
         raise
     return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
