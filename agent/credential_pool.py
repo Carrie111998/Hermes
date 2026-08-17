@@ -18,6 +18,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
 from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
+    _fingerprint_value,
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
 )
@@ -130,6 +131,25 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 # seconds, so a sole credential cools down briefly instead — same rationale as
 # the short 401 cooldown above. Provider-supplied reset_at still overrides.
 EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60   # 1 minute
+
+# Fuzzy "try again in a few minutes"-style provider guidance. Providers
+# routinely throttle with a message instead of a structured reset time
+# (hyper.charm.land: "Please try again in a few minutes."); without a parse
+# for that family the benched key got the 1-hour default even though the
+# provider promised minutes. Derived delays are bounded so a misparse can
+# never bench a key LONGER than the default it replaces.
+FUZZY_RETRY_DELAY_SECONDS = 180          # "try again in a few minutes"
+FUZZY_RETRY_DELAY_SHORT_SECONDS = 60     # "try again in a minute/moment/shortly"
+FUZZY_RETRY_DELAY_CAP_SECONDS = 600      # parsed guidance never exceeds 10 min
+
+# Provenance tag carried on error_context dicts: ``reset_at_source ==
+# MESSAGE_DERIVED_RESET_TAG`` means ``reset_at`` was parsed out of the error
+# MESSAGE text (fuzzy "try again in a few minutes", quotaResetDelay,
+# "resets in ..." heuristics), not supplied by the provider as a structured
+# field/header. Billing-classified failures must not inherit message-derived
+# windows — a depleted account does not reopen on a timer, and a fuzzy bench
+# would just hand the dead key back to re-fail (the #31273 money-burn class).
+MESSAGE_DERIVED_RESET_TAG = "message_parsed"
 
 # ``FailoverReason.billing`` as a bare string. The pool stores classified
 # failure semantics as plain text (it persists to JSON and must not import
@@ -406,13 +426,51 @@ def _extract_retry_delay_seconds(message: str) -> Optional[float]:
     hr_only_match = re.search(r"resets?\s+in\s+(\d+)\s*hr\b", message, re.IGNORECASE)
     if hr_only_match:
         return int(hr_only_match.group(1)) * 3600
-    min_only_match = re.search(r"resets?\s+in\s+(\d+)\s*min\b", message, re.IGNORECASE)
+    min_only_match = re.search(r"resets?\s+in\s+(\d+)\s*min", message, re.IGNORECASE)
     if min_only_match:
         return int(min_only_match.group(1)) * 60
+    # Explicit numeric retry windows phrased as "(try again|retry) in N
+    # minutes/seconds/hours" — e.g. hyper.charm.land's "Please try again in 5
+    # minutes." Capped at FUZZY_RETRY_DELAY_CAP_SECONDS so a misparse can
+    # never bench a key longer than the default TTL it replaces.
+    retry_num_match = re.search(
+        r"(?:try\s+again|retry)\s+in\s+(?:about\s+)?(\d+(?:\.\d+)?)\s*(hour|hr|minute|min|second|sec)s?\b",
+        message,
+        re.IGNORECASE,
+    )
+    if retry_num_match:
+        value = float(retry_num_match.group(1))
+        unit = retry_num_match.group(2).lower()
+        if unit.startswith("hour") or unit == "hr":
+            seconds = value * 3600
+        elif unit.startswith("min"):
+            seconds = value * 60
+        else:
+            seconds = value
+        return min(seconds, FUZZY_RETRY_DELAY_CAP_SECONDS)
+    # Fuzzy transient phrasings with no parseable number. "A few minutes" is
+    # the canonical shape; "in a minute/moment" and "shortly" are the short
+    # variants. These override nothing structured — only reached when no
+    # numeric window matched above.
+    if re.search(
+        r"(?:try\s+again|retry)\s+(?:in\s+)?(?:a\s+)?(?:few\s+|couple\s+of\s+|several\s+)?min(?:ute)?s?\b",
+        message,
+        re.IGNORECASE,
+    ):
+        return float(FUZZY_RETRY_DELAY_SECONDS)
+    if re.search(
+        r"(?:try\s+again|retry)\s+(?:in\s+)?(?:a\s+)?(?:minute|moment|short\s+while|bit)\b|try\s+again\s+shortly",
+        message,
+        re.IGNORECASE,
+    ):
+        return float(FUZZY_RETRY_DELAY_SHORT_SECONDS)
     return None
 
 
-def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_error_context(
+    error_context: Optional[Dict[str, Any]],
+    failure_reason: Optional[str] = None,
+) -> Dict[str, Any]:
     if not isinstance(error_context, dict):
         return {}
     normalized: Dict[str, Any] = {}
@@ -428,10 +486,33 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
         or error_context.get("retry_until")
     )
     parsed_reset_at = _parse_absolute_timestamp(reset_at)
+    # Provenance: a reset_at already parsed from the message by an upstream
+    # extractor (extract_api_error_context tags it) is message-derived even
+    # though the field is populated — without this the billing guard below
+    # would see a non-empty reset_at and let a fuzzy window through for a
+    # genuinely-depleted account.
+    message_derived = (
+        error_context.get("reset_at_source") == MESSAGE_DERIVED_RESET_TAG
+    )
     if parsed_reset_at is None and isinstance(message, str):
         retry_delay_seconds = _extract_retry_delay_seconds(message)
         if retry_delay_seconds is not None:
             parsed_reset_at = time.time() + retry_delay_seconds
+            message_derived = True
+    # Message-derived reset times are fuzzy provider guidance ("try again in
+    # a few minutes") and are only trustworthy for TRANSIENT failures. A
+    # billing classification means genuine credit depletion — a window parsed
+    # from the billing message body would bench the key for minutes and then
+    # hand it straight back to re-fail (and, worse, it would let the
+    # recoverable-exhaustion wait block on a window that can never reopen).
+    # Structured provider-supplied reset_at values still apply unconditionally:
+    # they are the provider's own contract, not our guesswork.
+    if (
+        parsed_reset_at is not None
+        and failure_reason == FAILURE_REASON_BILLING
+        and message_derived
+    ):
+        parsed_reset_at = None
     if parsed_reset_at is not None:
         normalized["reset_at"] = parsed_reset_at
     return normalized
@@ -691,6 +772,72 @@ class CredentialPool:
             available, _pending = self._available_entries()
             return bool(available)
 
+    def _sole_credential_unlocked(self) -> bool:
+        """True when at most one non-DEAD entry exists (nothing to rotate to).
+
+        Callers MUST hold ``self._lock``. Mirrors the computation in
+        ``_available_entries`` so cooldown sizing is consistent everywhere.
+        """
+        return sum(
+            1 for e in self._entries if e.last_status != STATUS_DEAD
+        ) <= 1
+
+    @staticmethod
+    def _entry_is_billing_benched(entry: PooledCredential) -> bool:
+        """True when an entry's exhaustion is billing/quota, not a transient
+        throttle: HTTP 402, or a classified ``failure_reason=billing``.
+
+        A 402 that the error classifier explicitly resolved to ``rate_limit``
+        (transient usage-limit with a "try again" signal) is NOT billing —
+        ``_classify_402`` disambiguates these, and treating them as billing
+        would give a transient quota a full TTL bench and refuse to wait for
+        its recovery. Check ``failure_reason`` first: an explicit non-billing
+        verdict overrides the raw 402 status.
+        """
+        fr = entry.failure_reason
+        if fr is not None and fr != FAILURE_REASON_BILLING:
+            return False
+        return (
+            entry.last_error_code == 402
+            or fr == FAILURE_REASON_BILLING
+        )
+
+    def _exhausted_candidate_unlocked(
+        self,
+    ) -> List[Tuple[float, PooledCredential, bool]]:
+        """Exhausted entries with unexpired cooldowns, earliest-recovery first.
+
+        Returns ``(until_epoch, entry, billing)`` tuples for every
+        ``STATUS_EXHAUSTED`` entry whose cooldown has not yet elapsed. The
+        ``billing`` flag is :meth:`_entry_is_billing_benched` pre-computed so
+        callers (next_available_at, recoverable_wait_seconds,
+        benched_runtime_keys) share a single pass over the pool.
+
+        Callers MUST hold ``self._lock``. Sole-credential sizing is computed
+        once here and fed to ``_exhausted_until``, so the shorter cooldown a
+        sole-credential throttle receives is reflected in every consumer —
+        ``next_available_at`` reports the seconds-level window instead of the
+        full TTL, and ``recoverable_wait_seconds`` waits for it.
+        """
+        sole_credential = self._sole_credential_unlocked()
+        candidates: List[Tuple[float, PooledCredential, bool]] = []
+        for entry in self._entries:
+            if entry.last_status != STATUS_EXHAUSTED:
+                continue
+            until = _exhausted_until(entry, sole_credential=sole_credential)
+            if until is None:
+                continue
+            candidates.append(
+                (until, entry, self._entry_is_billing_benched(entry))
+            )
+        # Sort by recovery time first, then by billing flag (False < True)
+        # so a transient entry wins a tie at the same epoch. This matters
+        # because recoverable_wait_seconds examines only candidates[0]: if a
+        # billing entry and a transient entry share the same reset_at, the
+        # transient one must come first so the wait is offered.
+        candidates.sort(key=lambda c: (c[0], c[2]))
+        return candidates
+
     def next_available_at(self) -> Optional[float]:
         """Earliest epoch time (seconds) any entry re-enters rotation.
 
@@ -710,21 +857,74 @@ class CredentialPool:
             available, _pending = self._available_entries()
             if available:
                 return None
-            # Mirror _available_entries: if the pool has no other credential
-            # to rotate to, the sole entry's transient throttle cools down in
-            # seconds — next_available_at must report that shorter window too,
-            # or the fallback restore gate waits an hour for a 60s cooldown.
-            sole_credential = sum(
-                1 for e in self._entries if e.last_status != STATUS_DEAD
-            ) <= 1
-            candidates: List[float] = []
-            for entry in self._entries:
-                if entry.last_status != STATUS_EXHAUSTED:
+            candidates = self._exhausted_candidate_unlocked()
+            return candidates[0][0] if candidates else None
+
+    def recoverable_wait_seconds(
+        self, *, max_wait: float = 600.0,
+    ) -> Optional[Tuple[float, bool]]:
+        """Bounded wait assessment for an all-exhausted pool.
+
+        Returns ``(wait_seconds, transient)`` when every non-DEAD entry is
+        exhausted and the earliest cooldown expires within *max_wait*:
+          - ``transient`` is True when the EARLIEST-recovering benched entry
+            is not billing-exhausted (status 402 or classified
+            ``failure_reason=billing``). Waiting for that specific key has a
+            real chance of recovery even when sibling entries are benched for
+            billing — the recovered key is served first and the billing keys
+            stay benched, so no paid request is burned on them.
+          - False when the earliest entry itself is billing-exhausted: the
+            caller must NOT wait — a depleted account does not reopen on a
+            timer, and waiting would just defer the same 402 (the #31273
+            money-burn class).
+        Returns None when some entry is available now, no exhausted entry
+        carries a usable recovery time (DEAD-only pools), or the earliest
+        recovery lies beyond *max_wait*.
+
+        Only the EARLIEST-recovering candidate is examined, not later ones.
+        This is deliberate: if the earliest entry is billing and a later
+        entry is transient, waiting would let the billing entry's cooldown
+        expire mid-wait — ``select()`` would then serve it and re-fail,
+        burning a paid request. Refusing to wait when the earliest entry is
+        billing is the safe choice.
+        """
+        with self._lock:
+            available, _pending = self._available_entries()
+            if available:
+                return None
+            candidates = self._exhausted_candidate_unlocked()
+            if not candidates:
+                return None
+            earliest_until, _, earliest_billing = candidates[0]
+            wait = earliest_until - time.time()
+            if wait < 0 or wait > max_wait:
+                return None
+            return (wait, not earliest_billing)
+
+    def benched_runtime_keys(self) -> Dict[str, Dict[str, Any]]:
+        """Runtime API keys currently benched in an unexpired cooldown.
+
+        Maps ``runtime_api_key`` -> ``{"billing": bool, "reset_at": epoch|None}``.
+        Only ``STATUS_EXHAUSTED`` entries whose cooldown has not yet elapsed
+        are included; DEAD entries (terminal auth) and OK entries are not.
+        Used by the runtime-resolution layer so it never hands out a key the
+        pool has benched for billing — the silent fallthrough that served a
+        depleted key for an hour after the pool benched it.
+        """
+        now = time.time()
+        result: Dict[str, Dict[str, Any]] = {}
+        with self._lock:
+            for until, entry, billing in self._exhausted_candidate_unlocked():
+                if now >= until:
                     continue
-                until = _exhausted_until(entry, sole_credential=sole_credential)
-                if until is not None:
-                    candidates.append(until)
-            return min(candidates) if candidates else None
+                key = entry.runtime_api_key
+                if not key:
+                    continue
+                result[key] = {
+                    "billing": billing,
+                    "reset_at": until,
+                }
+        return result
 
     def entries(self) -> List[PooledCredential]:
         with self._lock:
@@ -816,7 +1016,7 @@ class CredentialPool:
         persist: bool = True,
         failure_reason: Optional[str] = None,
     ) -> PooledCredential:
-        normalized_error = _normalize_error_context(error_context)
+        normalized_error = _normalize_error_context(error_context, failure_reason)
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
         # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
         # a revoked credential gets a 1-hour TTL cooldown and then re-enters
@@ -1845,9 +2045,7 @@ class CredentialPool:
         # DEAD entries never re-enter rotation, so if at most one non-DEAD entry
         # exists there is nothing to rotate to: an exhausted sole credential
         # should cool down briefly rather than bench the only key for an hour.
-        sole_credential = sum(
-            1 for e in self._entries if e.last_status != STATUS_DEAD
-        ) <= 1
+        sole_credential = self._sole_credential_unlocked()
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load.  A stale duplicate row
@@ -2427,11 +2625,60 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
-    token_changed = (
-        "access_token" in payload
-        and payload["access_token"] is not None
-        and payload["access_token"] != existing.access_token
+    # "Token changed" must mean the SECRET changed (a real key rotation —
+    # old exhaustion state is stale for the new key), NOT a re-hydration of
+    # the same secret. Borrowed entries (custom_providers config keys, env
+    # keys) persist without the secret and re-hydrate from their live source
+    # on every load_pool(); the literal string comparison treated that
+    # re-hydration as a rotation and wiped the persisted bench on each load —
+    # so a billing-benched config key was served again after every reload,
+    # defeating the cooldown filter for exactly the config-seeded pools the
+    # runtime bench filter exists to protect. Compare fingerprints instead:
+    # same secret => keep exhaustion state; genuinely new secret => clear it.
+    incoming_token = payload.get("access_token")
+    incoming_fp = (
+        _fingerprint_value(incoming_token)
+        if incoming_token is not None
+        else None
     )
+    # Existing fingerprint: prefer the live in-memory token, fall back to the
+    # persisted fingerprint (the in-memory token is absent after a borrowed
+    # entry was reloaded from its disk-safe payload).
+    existing_fp = _fingerprint_value(existing.access_token) or (
+        existing.extra.get("secret_fingerprint") if existing.extra else None
+    )
+    # Legacy auth.json written before the fingerprint field existed leaves a
+    # borrowed entry with no in-memory token AND no persisted fingerprint.
+    # The raw-string differ would treat that as a rotation and wipe the
+    # bench on the first load — exactly the defect this predicate exists to
+    # prevent. For borrowed entries with an unknown fingerprint, assume
+    # rehydration (keep the bench, carry the fingerprint forward) rather than
+    # rotation. Owned (manual) entries always persist their raw token, so this
+    # relaxation never masks a genuine rotation.
+    is_borrowed = is_borrowed_credential_source(existing.source, provider)
+    token_changed = bool(
+        "access_token" in payload
+        and incoming_token is not None
+        and incoming_token != existing.access_token
+        and not (
+            incoming_fp is not None
+            and existing_fp is not None
+            and incoming_fp == existing_fp
+        )
+        # No existing fingerprint to compare against: a borrowed entry on its
+        # first load after upgrade cannot prove rotation, so don't assume it.
+        and not (is_borrowed and existing_fp is None)
+    )
+    # Carry the incoming fingerprint onto borrowed entries so same-process
+    # re-seeds can compare even before a persist/reload round-trip stores it.
+    # Owned (manual) entries persist the raw token and compare by value.
+    if (
+        incoming_fp is not None
+        and not token_changed
+        and is_borrowed
+        and (existing.extra or {}).get("secret_fingerprint") != incoming_fp
+    ):
+        extra_updates["secret_fingerprint"] = incoming_fp
     for key, value in payload.items():
         if key in {"id", "priority"} or value is None:
             continue

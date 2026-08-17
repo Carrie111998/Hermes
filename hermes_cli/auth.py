@@ -984,6 +984,11 @@ def format_auth_error(error: Exception) -> str:
     if error.code == "insufficient_credits":
         if error.provider == "nous":
             return _format_nous_entitlement_auth_error(error)
+        if error.provider == "custom":
+            # Custom-endpoint credential pools: keep the pool-specific detail
+            # (which pool, the `hermes auth add` remedy) instead of the
+            # generic subscription wording.
+            return str(error)
         return "Subscription credits are exhausted. Top up/renew credits, then retry."
 
     if error.code in {"subscription_expired", "no_usable_credits", "account_missing", "member_spend_cap_exceeded"}:

@@ -1728,7 +1728,14 @@ def switch_model(
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
-            except Exception:
+            except Exception as e:
+                from hermes_cli.auth import AuthError
+                if isinstance(e, AuthError):
+                    # AuthError (e.g. insufficient_credits from a billing-
+                    # benched pool) must propagate — falling back to the raw
+                    # config key would serve a key the pool has benched,
+                    # defeating the cooldown filter (#40960 / #31273).
+                    raise
                 api_key = _ukey
                 base_url = _user_pdef.base_url
                 api_mode = ""
@@ -1769,7 +1776,10 @@ def switch_model(
             api_key = runtime.get("api_key", "")
             base_url = runtime.get("base_url", "")
             api_mode = runtime.get("api_mode", "")
-        except Exception:
+        except Exception as e:
+            from hermes_cli.auth import AuthError
+            if isinstance(e, AuthError):
+                raise
             pass
 
     # --- Direct alias override: use exact base_url from the alias if set ---

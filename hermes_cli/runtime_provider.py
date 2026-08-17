@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -631,8 +632,19 @@ def _try_resolve_from_custom_pool(
     provider_label: str,
     api_mode_override: Optional[str] = None,
     provider_name: Optional[str] = None,
+    exhaustion_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
+    """Check if a credential pool exists for a custom endpoint and return a runtime dict if so.
+
+    When the pool exists but every credential is benched (``select()`` returns
+    None), the caller falls through to config/env keys. Historically that
+    fallthrough served the SAME key the pool had just benched for billing —
+    burning requests against a depleted account for the whole bench window
+    with no rotation and no error ("random 402"). When *exhaustion_info* is a
+    dict, it is populated with ``pool_key``, ``benched`` (runtime key ->
+    {"billing": bool, "reset_at": epoch}) and ``next_available_at`` so the
+    caller can refuse billing-benched keys.
+    """
     pool_key = get_custom_provider_pool_key(base_url, provider_name=provider_name)
     if not pool_key:
         return None
@@ -642,6 +654,16 @@ def _try_resolve_from_custom_pool(
             return None
         entry = pool.select()
         if entry is None:
+            if isinstance(exhaustion_info, dict):
+                try:
+                    exhaustion_info["pool_key"] = pool_key
+                    exhaustion_info["benched"] = pool.benched_runtime_keys()
+                    exhaustion_info["next_available_at"] = pool.next_available_at()
+                except Exception:
+                    logger.debug(
+                        "custom pool exhaustion probe failed for %s", pool_key,
+                        exc_info=True,
+                    )
             return None
         pool_api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         if not pool_api_key:
@@ -668,6 +690,77 @@ def _try_resolve_from_custom_pool(
         }
     except Exception:
         return None
+
+
+def _fmt_bench_remaining(reset_at: Any) -> str:
+    """Human-readable remaining time for a benched credential's cooldown."""
+    try:
+        remaining = float(reset_at) - time.time()
+    except (TypeError, ValueError):
+        return "unknown"
+    if remaining <= 0:
+        return "0s"
+    if remaining < 90:
+        return f"{int(remaining)}s"
+    return f"{int(remaining // 60)}m"
+
+
+def _pick_custom_api_key(
+    candidates: List[Any],
+    exhaustion_info: Optional[Dict[str, Any]],
+    *,
+    context: str,
+) -> str:
+    """Pick the first usable candidate key, honoring credential-pool benches.
+
+    When the pool for this endpoint reported exhaustion (*exhaustion_info*),
+    candidates that the pool has benched for BILLING are skipped — serving
+    them burns paid requests against a depleted account for the full bench
+    window, with no rotation and a misleading "out of credits" on every
+    attempt. Transiently-benched keys are still served (they are the only
+    recovery vehicle when the pool has no alternative), but the bypass is
+    logged so it is visible instead of silent.
+
+    Raises :class:`AuthError` with ``code="insufficient_credits"`` when every
+    usable candidate is billing-benched — the gateway's resolution layer turns
+    that into the fallback chain / a clean billing-exhaustion message instead
+    of hitting the endpoint with a depleted key.
+    """
+    benched = (exhaustion_info or {}).get("benched") or {}
+    usable_seen = False
+    for candidate in candidates:
+        key = str(candidate or "").strip()
+        if not has_usable_secret(key):
+            continue
+        usable_seen = True
+        bench = benched.get(key)
+        if bench is None:
+            # Not tracked by the pool (e.g. env-only key never seeded):
+            # nothing the pool knows can disqualify it.
+            return key
+        if bench.get("billing"):
+            logger.info(
+                "credential pool: skipping billing-benched %s key "
+                "(cooldown %s remaining) instead of serving it",
+                context, _fmt_bench_remaining(bench.get("reset_at")),
+            )
+            continue
+        logger.warning(
+            "credential pool bypass: serving transiently-benched %s key "
+            "(%s cooldown remaining) — pool has no other credential",
+            context, _fmt_bench_remaining(bench.get("reset_at")),
+        )
+        return key
+    if usable_seen and benched:
+        pool_key = (exhaustion_info or {}).get("pool_key") or "custom pool"
+        raise AuthError(
+            f"All credentials for {pool_key} are exhausted (billing). "
+            "Add credits with the provider or add another key "
+            "(`hermes auth add`); retrying the depleted keys cannot succeed.",
+            provider="custom",
+            code="insufficient_credits",
+        )
+    return ""
 
 
 def _lift_max_output_tokens(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -1111,7 +1204,10 @@ def _resolve_named_custom_runtime(
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
-        pool_result = _try_resolve_from_custom_pool(base_url, "custom", None)
+        _da_pool_exhaustion: Dict[str, Any] = {}
+        pool_result = _try_resolve_from_custom_pool(
+            base_url, "custom", None, exhaustion_info=_da_pool_exhaustion,
+        )
         if pool_result:
             pool_result["source"] = "direct-alias"
             return pool_result
@@ -1127,9 +1223,12 @@ def _resolve_named_custom_runtime(
             # intuitive match without configuring `custom_providers` first.
             _host_derived_api_key(base_url),
         ]
-        api_key = next(
-            (c for c in api_key_candidates if has_usable_secret(c)),
-            "",
+        # Never hand out a key the pool has benched for billing; raise a
+        # structured exhaustion error when every candidate is benched.
+        api_key = _pick_custom_api_key(
+            api_key_candidates,
+            _da_pool_exhaustion,
+            context="bare-custom",
         ) or "no-key-required"
         return {
             "provider": "custom",
@@ -1152,7 +1251,12 @@ def _resolve_named_custom_runtime(
         return None
 
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
+    _cp_pool_exhaustion: Dict[str, Any] = {}
+    pool_result = _try_resolve_from_custom_pool(
+        base_url, "custom", custom_provider.get("api_mode"),
+        provider_name=custom_provider.get("name"),
+        exhaustion_info=_cp_pool_exhaustion,
+    )
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -1188,7 +1292,13 @@ def _resolve_named_custom_runtime(
         # fallback when key_env wasn't set explicitly.
         _host_derived_api_key(base_url),
     ]
-    api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
+    # Never hand out a key the pool has benched for billing; raise a
+    # structured exhaustion error when every candidate is benched.
+    api_key = _pick_custom_api_key(
+        api_key_candidates,
+        _cp_pool_exhaustion,
+        context=f"custom_provider:{custom_provider.get('name', requested_provider)}",
+    )
 
     # A ``key_cmd`` credential is minted per request rather than resolved once:
     # gateways that issue short-lived bearers would otherwise go stale
@@ -1350,12 +1460,23 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and base_url:
         # Pass requested_provider so pool lookup prefers name match over base_url,
         # fixing credential mix-ups when multiple custom providers share a base_url.
+        _mc_pool_exhaustion: Dict[str, Any] = {}
         pool_result = _try_resolve_from_custom_pool(
             base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
             provider_name=requested_provider if requested_norm != "custom" else None,
+            exhaustion_info=_mc_pool_exhaustion,
         )
         if pool_result:
             return pool_result
+        if _mc_pool_exhaustion.get("benched"):
+            # Pool exists but every credential is benched. The api_key picked
+            # above may be the very key the pool benched for billing — re-pick
+            # through the bench filter so resolution never serves a depleted
+            # key (raises a structured exhaustion error when all candidates
+            # are billing-benched).
+            api_key = _pick_custom_api_key(
+                api_key_candidates, _mc_pool_exhaustion, context="model-config",
+            )
 
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"

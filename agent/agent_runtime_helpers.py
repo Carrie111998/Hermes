@@ -939,6 +939,93 @@ def sync_credential_pool_entry_id(agent) -> None:
         agent._credential_pool_entry_id = None
 
 
+# Upper bound for the recoverable-exhaustion wait. Provider throttle windows
+# ("try again in a few minutes") recover in minutes; anything longer than
+# this must surface to the user/fallback chain instead of holding the turn.
+_POOL_RECOVERY_WAIT_MAX_SECONDS = 600.0
+
+
+def _wait_for_pool_recovery(agent, pool) -> bool:
+    """Bounded, interruptible wait for an all-exhausted pool to recover.
+
+    The observed failure class (custom OpenAI-compatible pools, e.g.
+    hyper.charm.land): a transient 429 benches the funded key for its cooldown
+    window, rotation walks into genuinely-depleted siblings, the pool reaches
+    "no available entries", and the turn aborts as "Billing or credits
+    exhausted" — even though the funded key recovers in minutes. This helper
+    closes that gap: when the earliest benched entry is TRANSIENT (not
+    billing-exhausted) and recovers within the bound, wait for it and report
+    success so the caller retries; the recovered entry is served first by the
+    next ``select()`` and billing-benched siblings stay benched.
+
+    Returns True when the wait completed (caller should retry); False when
+    recovery is impossible within the bound, the earliest entry is
+    billing-exhausted (waiting would just defer a guaranteed 402 — the
+    #31273 money-burn protection), or the wait was interrupted.
+    """
+    # Lightweight pool adapters (plugins/tests) may not implement
+    # recoverable_wait_seconds — treat "no assessment" as "no wait".
+    assessment_fn = getattr(pool, "recoverable_wait_seconds", None)
+    if not callable(assessment_fn):
+        return False
+    try:
+        assessment = assessment_fn(max_wait=_POOL_RECOVERY_WAIT_MAX_SECONDS)
+    except Exception:
+        _ra().logger.debug(
+            "credential pool: recoverable_wait_seconds probe failed",
+            exc_info=True,
+        )
+        return False
+    if not isinstance(assessment, tuple) or len(assessment) != 2:
+        return False
+    wait_seconds, transient = assessment
+    if not isinstance(wait_seconds, (int, float)) or wait_seconds <= 0:
+        return False
+    if not transient:
+        return False
+    _ra().logger.info(
+        "credential pool: all entries exhausted but a transiently-benched "
+        "credential recovers in %.0fs — waiting instead of aborting",
+        wait_seconds,
+    )
+    try:
+        vprint = getattr(agent, "_vprint", None)
+        if callable(vprint):
+            vprint(
+                f"{getattr(agent, 'log_prefix', '')}⏳ All pool credentials "
+                f"throttled — waiting {int(wait_seconds)}s for recovery...",
+                force=True,
+            )
+    except Exception:
+        pass
+    sleep_end = time.time() + wait_seconds
+    touch_counter = 0
+    while time.time() < sleep_end:
+        if getattr(agent, "_interrupt_requested", False):
+            # The interrupt flag is left SET for the outer retry loop to
+            # consume — unlike the backoff loop's
+            # clear_interrupt(preserve_redirect=True) handling, a redirect
+            # landing mid-wait is replayed on the next API attempt after the
+            # caller unwinds this recovery.
+            _ra().logger.info(
+                "credential pool: recovery wait interrupted — aborting wait"
+            )
+            return False
+        time.sleep(0.2)
+        touch_counter += 1
+        # Mirror the retry-backoff loop: keep the gateway inactivity monitor
+        # alive during the wait (conversation_loop.py retry-wait pattern).
+        if touch_counter % 150 == 0:  # 150 × 0.2s = 30s
+            try:
+                agent._touch_activity(
+                    f"credential pool recovery wait, "
+                    f"{int(sleep_end - time.time())}s remaining"
+                )
+            except Exception:
+                pass
+    return True
+
+
 def recover_with_credential_pool(
     agent,
     *,
@@ -1110,6 +1197,17 @@ def recover_with_credential_pool(
             )
             agent._swap_credential(next_entry)
             return True, False
+        # Rotation found nothing: the pool is fully benched. When the
+        # earliest benched entry is a TRANSIENT throttle recovering within
+        # the bound, wait for it instead of aborting the turn as billing-
+        # exhausted (hyper.charm.land class: 429 on the funded key, rotation
+        # into dead siblings, "no available entries"). Pure-billing
+        # exhaustion returns False immediately — the #31273 guard.
+        if _wait_for_pool_recovery(agent, pool):
+            recovered_entry = pool.select()
+            if recovered_entry is not None:
+                agent._swap_credential(recovered_entry)
+                return True, False
         return False, has_retried_429
 
     if effective_reason == FailoverReason.rate_limit:
@@ -1148,6 +1246,11 @@ def recover_with_credential_pool(
                 )
                 agent._swap_credential(next_entry)
                 return True, False
+            if _wait_for_pool_recovery(agent, pool):
+                recovered_entry = pool.select()
+                if recovered_entry is not None:
+                    agent._swap_credential(recovered_entry)
+                    return True, False
             return False, True
 
         usage_limit_reached = False
@@ -1172,6 +1275,14 @@ def recover_with_credential_pool(
             )
             agent._swap_credential(next_entry)
             return True, False
+        # Pool fully benched after rotation. If a transiently-benched entry
+        # recovers within the bound, wait and retry it instead of letting the
+        # loop fall through to "no available entries" abort.
+        if _wait_for_pool_recovery(agent, pool):
+            recovered_entry = pool.select()
+            if recovered_entry is not None:
+                agent._swap_credential(recovered_entry)
+                return True, False
         return False, True
 
     if effective_reason == FailoverReason.auth:
@@ -4175,6 +4286,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                 value = float(delay_match.group(1))
                 seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
                 context["reset_at"] = time.time() + seconds
+                context["reset_at_source"] = "message_parsed"
             else:
                 resets_in_match = re.search(
                     r"resets?\s+in\s+"
@@ -4189,6 +4301,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                     minutes = float(resets_in_match.group(2) or 0)
                     seconds = float(resets_in_match.group(3) or 0)
                     context["reset_at"] = time.time() + (hours * 3600) + (minutes * 60) + seconds
+                    context["reset_at_source"] = "message_parsed"
                 else:
                     sec_match = re.search(
                         r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
@@ -4197,6 +4310,30 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                     )
                     if sec_match:
                         context["reset_at"] = time.time() + float(sec_match.group(1))
+                        context["reset_at_source"] = "message_parsed"
+
+    if "reset_at" not in context:
+        # Fuzzy transient guidance ("Please try again in a few minutes.",
+        # hyper.charm.land-style throttles). Shares the pool's parser so both
+        # consumers agree on the window. Tagged message-derived so the pool's
+        # billing guard drops it for billing-classified failures (a depleted
+        # account must not inherit a fuzzy re-entry window — #31273).
+        # Function-level import: credential_pool is heavy and this module
+        # already imports it lazily at other call sites.
+        _message = context.get("message") or ""
+        if isinstance(_message, str) and _message.strip():
+            try:
+                from agent.credential_pool import (
+                    MESSAGE_DERIVED_RESET_TAG,
+                    _extract_retry_delay_seconds,
+                )
+                _fuzzy_delay = _extract_retry_delay_seconds(_message)
+            except Exception:
+                MESSAGE_DERIVED_RESET_TAG = "message_parsed"
+                _fuzzy_delay = None
+            if _fuzzy_delay is not None:
+                context["reset_at"] = time.time() + _fuzzy_delay
+                context["reset_at_source"] = MESSAGE_DERIVED_RESET_TAG
 
     return context
 

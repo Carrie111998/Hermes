@@ -4557,6 +4557,13 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     request.  Passing it lets mark_exhausted_and_rotate identify the correct
     pool entry even when another process has already rotated the pool (which
     would leave current() as None, causing the wrong entry to be marked).
+
+    Deliberately NOT given the recoverable-exhaustion wait
+    (``_wait_for_pool_recovery``): auxiliary calls (vision/title/compression)
+    run in the background and must fail fast rather than block up to the wait
+    bound — the main conversation loop owns that recovery. Its
+    ``_pool_error_context`` builds raw-message contexts, so the pool's fuzzy
+    parse + billing guard apply on this path unchanged.
     """
     normalized = _normalize_aux_provider(provider)
     try:
@@ -4588,10 +4595,20 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
 
     if _is_payment_error(exc) or _is_rate_limit_error(exc):
         fallback_status = 402 if _is_payment_error(exc) else 429
+        # Classify the failure semantics for the pool: a payment error is
+        # billing, a rate-limit error is transient. Without this the pool's
+        # billing guard in _normalize_error_context can't fire (failure_reason
+        # is None), and a message-derived fuzzy window leaks through for a
+        # billing 402 — giving it a short bench instead of the full TTL
+        # (#31273 money-burn class).
+        aux_failure_reason = (
+            "billing" if _is_payment_error(exc) else None
+        )
         next_entry = pool.mark_exhausted_and_rotate(
             status_code=status_code if status_code is not None else fallback_status,
             error_context=error_context,
             api_key_hint=hint,
+            failure_reason=aux_failure_reason,
         )
         if next_entry is not None:
             _evict_cached_clients(normalized)
