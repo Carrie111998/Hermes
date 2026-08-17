@@ -1236,6 +1236,7 @@ def _build_child_progress_callback(
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    route: Optional[str] = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -1281,6 +1282,8 @@ def _build_child_progress_callback(
             kw["depth"] = depth
         if model is not None:
             kw["model"] = model
+        if route:
+            kw["route"] = str(route)
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -1488,6 +1491,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    route: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1621,6 +1625,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        route=route,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -2326,6 +2331,7 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    route: Optional[str] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2496,6 +2502,7 @@ def _run_single_child(
                 "owner_session_id": owner_session_id,
                 "owner_transport": owner_transport,
                 "owner_session_record": owner_session_record,
+                "route": route,
             }
         )
 
@@ -3764,6 +3771,7 @@ def delegate_task(
                 override_acp_command=task_creds[i].get("command"),
                 override_acp_args=task_creds[i].get("args"),
                 role=effective_role,
+                route=(str(selected_aliases[i]).strip() if selected_aliases[i] else None),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -3810,6 +3818,7 @@ def delegate_task(
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
+                route=(str(selected_aliases[_i]).strip() if selected_aliases[_i] else None),
             )
             results.append(result)
         else:
@@ -3835,6 +3844,7 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                        route=(str(selected_aliases[i]).strip() if selected_aliases[i] else None),
                     )
                     futures[future] = i
 
