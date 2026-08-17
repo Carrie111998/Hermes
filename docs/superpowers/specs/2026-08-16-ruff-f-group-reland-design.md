@@ -298,3 +298,69 @@ silently loses ruff's `requires-python` inference from `pyproject.toml`, and
 `BaseExceptionGroup`/`ExceptionGroup` then report as F821 in four files that are actually
 clean on 3.11+. Pin `target-version = "py311"` in the scratch config, and treat any
 newly-required entry as a bug in the measurement before believing it.
+
+## Stage 3 — delivered (2026-08-17): F601 is zero
+
+Implemented on a separate branch and verified here before landing. The stage table above
+predicted a list of 523 after this stage; the actual figure is **522** (sunset entries),
+with **884** findings remaining — F401 534, F841 347, F541 3.
+
+**The rule this stage existed to apply.** F601 flags a duplicate key in a dict literal, where
+the later value silently wins. That makes it two different findings wearing one code: a
+redundant restatement (harmless, delete it) and a genuine disagreement (a data bug, where
+deleting the loser destroys the evidence). Every site was graded on that distinction rather
+than swept.
+
+**`hermes_cli/config.py` — the latent bug that justifies the rule.** `DEFAULT_CONFIG`
+declared `"kanban"` twice: a one-key block carrying `auto_subscribe_on_create` and, much
+later, the eleven-key dispatcher block. Last-wins meant the first was discarded outright, so
+`auto_subscribe_on_create` never reached `DEFAULT_CONFIG` at all. Not a live failure —
+`tools/kanban_tools.py` reads it via `cfg_get(..., default=True)` and that call-site default
+happened to match the lost value — but the key was missing from generated `config.yaml`
+files and from anything enumerating the defaults. Merged into one block at the surviving
+(last-wins) position so the dispatcher settings do not move. Verified structurally: one
+`kanban` block, 12 keys, both `auto_subscribe_on_create` and `dispatch_in_gateway` present;
+before, two blocks of 1 and 11.
+
+**`scripts/release.py` — 90 of the 94 findings.** `LEGACY_AUTHOR_MAP` is a hand-maintained
+contributor email→handle table: 1958 literal entries collapsing to 1868 effective ones.
+Deduped to the **last** occurrence of each key, which is by construction the value already in
+effect. The check that matters for a table this size is not the entry count or the ruff exit
+code — both would look correct even if a value had moved — but `ast.literal_eval` of the map
+before and after comparing **equal**. It does. Independently re-verified during review:
+1958 → 1868 literal entries, effective dicts identical, 74 duplicated keys.
+
+Comments were merged rather than dropped: 38 of the 164 duplicate lines carried a
+`# PR #NNNNN salvage (...)` provenance note and those differed between duplicates.
+
+**Five duplicates disagreed, and are deliberately NOT collapsed.** The effective last-wins
+value is kept untouched and a `REVIEW(F601)` marker naming the other candidate is appended,
+so the ambiguity is visible in the file rather than buried in git history:
+
+| email | kept (last-wins) | also seen as |
+|---|---|---|
+| `buraysandro9@gmail.com` | `ygd58` | `buray` |
+| `don.rhm@gmail.com` | `donrhmexe` | `rahimsais` |
+| `erenkar950@gmail.com` | `erenkarakus` | `eren-karakus0` |
+| `roseycomanagement@roseyco.co.uk` | `arnispiekus` | `Roseyco-management` |
+| `wysie@users.noreply.github.com` | `Wysie` | `wysie` |
+
+**This is the one open item left by this stage.** Resolving them needs a human with GitHub
+access, not a guess. `wysie` is a case-only difference and GitHub handles are
+case-insensitive, so it is almost certainly cosmetic. The `roseyco` pair is the interesting
+one: both lines cite the **same PR #63581**, so one salvage entry was written twice with
+different handles — meaning one of the two attributions is simply wrong.
+
+**`hermes_cli/models.py` and `plugins/platforms/matrix/adapter.py` — redundant restatements.**
+The `_COPILOT_MODEL_ALIASES` entry mapped `anthropic/claude-sonnet-5` to `claude-sonnet-5`;
+unlike the `4-6`/`4.6` pairs around it, sonnet-5 has no minor version, so its dash and dot
+spellings are the same string and the neighbouring entry already covered it. In the Matrix
+adapter, `_approval_reaction_map` listed `"♾️"` and `"♾"` — the *same two
+strings* as the literal `♾️` and `♾` above them, written in escape form. Because this map
+gates dangerous-command approvals, that claim was checked at codepoint level rather than by
+eye: 7 literal keys → 5, effective map byte-identical, all five reactions preserved. A
+second spelling is not extra coverage.
+
+**Verification.** `ruff check --isolated --select F601` over the tree returns clean, so F601
+is genuinely zero rather than suppressed by the sunset list. The list itself was re-derived
+from this tree and is exactly tight — no stale entry, no missing entry, no over-broad code.
