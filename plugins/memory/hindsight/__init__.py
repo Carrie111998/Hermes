@@ -2483,6 +2483,9 @@ class HindsightMemoryProvider(MemoryProvider):
             # Drop the structured cache too so the new session never sees a
             # prior session's warmed recall items (reject cross-session reuse).
             self._prefetch_items_cache = None
+            # Reset the indicator count in lockstep with the other two caches so
+            # the new session's first recall never inherits a stale count.
+            self._prefetch_count = 0
 
         # 3. Now rotate to the new session.
         if parent_session_id:

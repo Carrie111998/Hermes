@@ -692,6 +692,118 @@ class TestPrefetchItems:
         assert provider.prefetch("again") == ""
 
 
+class TestPrefetchItemsRecallIndicator:
+    """Regression for the merge of the tier-B RecallItem envelope with upstream's
+    deterministic recall indicator.
+
+    The MemoryManager PREFERS the structured ``prefetch_items()`` hook over the
+    legacy ``prefetch()`` string path, so in production the indicator
+    (``recall_status``/``describe_recall``) is driven from ``prefetch_items``,
+    NOT ``prefetch``. The tier-B tests only call ``prefetch_items`` and the
+    upstream indicator tests only call ``prefetch`` — neither proves the two work
+    together, which is exactly the risky seam this merge created. These tests
+    exercise both halves at once, for ``recall_sync`` off and on, and end-to-end
+    through the real manager path.
+    """
+
+    _QUERY = "what does the user like?"
+
+    def _warm(self, provider, query=None):
+        provider.queue_prefetch(query or self._QUERY)
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+    def test_prefetch_items_records_indicator_async(self, provider):
+        # Default (recall_sync off): the background prime recalls 2 memories;
+        # consuming them via prefetch_items must record the indicator so a later
+        # recall_status() reports the same count as the items served.
+        self._warm(provider)
+        items = provider.prefetch_items(self._QUERY)
+        assert len(items) == 2
+
+        status = provider.recall_status()
+        assert status is not None
+        assert status.provider_label == "Hindsight"
+        assert status.count == len(items) == 2
+
+    def test_prefetch_items_records_indicator_recall_sync(self, provider_with_config):
+        # recall_sync=True: there is no background prime, so prefetch_items does
+        # a LIVE recall against the current query and must still record the
+        # indicator for that turn.
+        p = provider_with_config(recall_sync=True)
+
+        # Nothing pre-warmed — proves the items come from a live recall.
+        assert p._prefetch_items_cache is None
+        items = p.prefetch_items("fix tests")
+        assert len(items) == 2
+
+        status = p.recall_status()
+        assert status is not None
+        assert status.count == len(items) == 2
+
+    def test_prefetch_items_records_once_per_warmed_turn(self, provider):
+        # A warmed turn is consumed exactly once. The second prefetch_items for
+        # the same turn returns nothing and clears the indicator, so the count is
+        # never double-reported.
+        self._warm(provider)
+        first = provider.prefetch_items(self._QUERY)
+        assert len(first) == 2
+        assert provider.recall_status().count == 2
+
+        second = provider.prefetch_items(self._QUERY)
+        assert second == []
+        assert provider.recall_status() is None
+
+    def test_prefetch_items_reflect_reports_generic_count(self, provider_with_config):
+        # Reflect synthesizes across memories: one item, generic (0) count,
+        # mirroring the legacy prefetch() reflect indicator semantics.
+        p = provider_with_config(recall_prefetch_method="reflect")
+        p.queue_prefetch("summarize what you know")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+        items = p.prefetch_items("summarize what you know")
+        assert len(items) == 1
+
+        status = p.recall_status()
+        assert status is not None
+        assert status.count == 0
+
+    def test_manager_prefetch_all_drives_describe_recall(self, provider):
+        # End-to-end through the production path:
+        #   MemoryManager.prefetch_all() -> Hindsight.prefetch_items()
+        #   -> MemoryManager.describe_recall()
+        # The count the user SEES must match the structured items served.
+        from agent.memory_manager import MemoryManager
+        from plugins.memory.hindsight import _HINDSIGHT_GLYPH
+
+        mgr = MemoryManager()
+        mgr.add_provider(provider)
+
+        self._warm(provider)
+        rendered = mgr.prefetch_all(self._QUERY)
+        # Both recalled memories reached the rendered context block.
+        assert "Memory 1" in rendered
+        assert "Memory 2" in rendered
+
+        indicator = mgr.describe_recall()
+        assert indicator.startswith(_HINDSIGHT_GLYPH)
+        assert "Hindsight" in indicator
+        assert "recalled 2 memories" in indicator
+
+    def test_manager_collect_items_count_matches_indicator(self, provider):
+        # Tie the reported count to the structured items themselves: the manager
+        # returns exactly 2 host-stamped items and the indicator reports 2.
+        from agent.memory_manager import MemoryManager
+
+        mgr = MemoryManager()
+        mgr.add_provider(provider)
+
+        self._warm(provider)
+        items = mgr.collect_recall_items(self._QUERY)
+        assert len(items) == 2
+        assert "recalled 2 memories" in mgr.describe_recall()
+
+
 class TestPrefetchServerRetainVisibility:
     """PR #62871 review follow-up: draining the local writer queue is not a
     read-after-write signal for async retains. With ``retain_async=True`` the
