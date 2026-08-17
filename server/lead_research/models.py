@@ -221,6 +221,16 @@ class ScoringWeights(ApiModel):
     trade_activity: int = Field(default=10, ge=0, le=100)
     contactability: int = Field(default=5, ge=0, le=100)
 
+    @field_validator(
+        "product_sector_fit", "buyer_channel_fit", "buying_intent", "market_coverage",
+        "commercial_scale", "trade_activity", "contactability",
+    )
+    @classmethod
+    def values_are_five_point_steps(cls, value: int) -> int:
+        if value % 5:
+            raise ValueError("scoring weights must be multiples of five")
+        return value
+
     @model_validator(mode="after")
     def totals_one_hundred(self):
         if sum(self.model_dump().values()) != 100:
@@ -320,7 +330,7 @@ class LeadScore(ApiModel):
     fit_score: int = Field(ge=0, le=100)
     evidence_confidence: float = Field(ge=0, le=1)
     priority_band: Literal["A", "B", "C", "Rejected"]
-    dimensions: dict[str, float]
+    dimensions: dict[str, float | None]
     confidence_factors: dict[str, float]
 
 
