@@ -11,7 +11,9 @@ entre profiles, impedir que o host entre em suspensão e recuperar-se de
 peculiaridades comuns de launchd/systemd.
 
 Se você executa apenas um agente Hermes, não precisa desta página — veja
-[Profiles](./profiles.md) para o básico.
+[Profiles](./profiles.md) para o básico. E se suas instâncias vivem em
+*máquinas diferentes* que um app desktop deveria alcançar simultaneamente, veja
+[Conectando o Desktop a Muitas Instâncias Hermes](./multi-connection-desktop.md).
 
 ## Quando usar
 
@@ -196,6 +198,31 @@ workers Kanban só veem os segredos do próprio profile). Kanban,
 skills/memória/SOUL com escopo de profile e roteamento de modelo se comportam por profile
 exatamente como com gateways separados.
 
+### Servindo profiles selecionados {#serving-selected-profiles}
+
+Por padrão, `gateway.multiplex_profiles: true` atende todo profile nomeado válido
+no host. Para manter profiles não relacionados instalados sem subir seus
+adapters ou jobs cron, defina `gateway.multiplex_profile_allowlist`:
+
+```yaml
+gateway:
+  multiplex_profiles: true
+  multiplex_profile_allowlist:
+    - worker
+    - guest
+```
+
+O profile default é sempre atendido e não precisa ser listado. Uma allowlist
+unset preserva o comportamento histórico de atender todos; uma lista vazia atende
+só o profile default. Nomes são normalizados e deduplicados. Entradas de lista
+inválidas ou nomes que não estão instalados são pulados com um warning. Um valor
+malformado que não é lista falha seguro para default-only.
+
+O conjunto atendido resultante também controla os prefixos de API e webhook
+`/p/<profile>/`, status de runtime, elegibilidade de profile-route, e quais
+profiles o scheduler cron in-process faz tick. Um profile nomeado fora da
+allowlist ainda pode rodar seu próprio gateway standalone.
+
 ### Roteando chats de bot compartilhado para profiles (`profile_routes`)
 
 A multiplexação seleciona um profile por **credencial** (token de bot próprio de cada profile)
@@ -234,9 +261,11 @@ casa threads/forum posts cujo pai é aquele canal. Mensagens sem rota ficam no p
 namespace de sessão). Roteamento funciona em todo adapter de plataforma, não só Discord.
 
 `profile_routes` exige `gateway.multiplex_profiles: true`; com
-multiplexação off as rotas são ignoradas. Se uma rota nomeia um profile que não
-existe em disco, o gateway registra aviso nomeando profile e origem e
-cai back para o home default.
+multiplexação off as rotas são ignoradas. Se uma rota explícita casar mas seu
+profile alvo não estiver instalado ou estiver fora de `multiplex_profile_allowlist`,
+o gateway rejeita aquele ingresso e registra a rota e o alvo. Ele não
+roda o profile default. Tráfego que não casa com nenhuma rota mantém o
+comportamento histórico de profile default.
 
 ## Iniciar, parar ou reiniciar todos os gateways de uma vez
 

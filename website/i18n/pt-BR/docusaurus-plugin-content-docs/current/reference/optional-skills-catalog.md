@@ -58,14 +58,15 @@ hermes skills uninstall <skill-name>
 | [**audiocraft-audio-generation**](/docs/user-guide/skills/optional/creative/creative-audiocraft-audio-generation) | AudioCraft: MusicGen texto-para-música, AudioGen texto-para-som. |
 | [**baoyu-article-illustrator**](/docs/user-guide/skills/optional/creative/creative-baoyu-article-illustrator) | Ilustrações de artigos: consistência de tipo × estilo × paleta. |
 | [**baoyu-comic**](/docs/user-guide/skills/optional/creative/creative-baoyu-comic) | Quadrinhos de conhecimento (知识漫画): educacionais, biográficos, tutoriais. |
-| [**blender-mcp**](/docs/user-guide/skills/optional/creative/creative-blender-mcp) | Opera o Blender via o MCP blender do catálogo, com receitas bpy. |
 | [**concept-diagrams**](/docs/user-guide/skills/optional/creative/creative-concept-diagrams) | Gera visuais SVG educacionais planos e minimalistas como HTML. |
 | [**creative-ideation**](/docs/user-guide/skills/optional/creative/creative-creative-ideation) | Gera ideias via métodos nomeados da prática criativa. |
+| [**draw-your-font**](/docs/user-guide/skills/optional/creative/creative-draw-your-font) | Transforma uma foto de letra manuscrita em uma fonte instalável (TTF/WOFF). |
 | [**heartmula**](/docs/user-guide/skills/optional/creative/creative-heartmula) | HeartMuLa: geração de músicas estilo Suno a partir de letras + tags. |
 | [**hyperframes**](/docs/user-guide/skills/optional/creative/creative-hyperframes) | Renderiza vídeos MP4/WebM a partir de composições HTML. |
 | [**kanban-video-orchestrator**](/docs/user-guide/skills/optional/creative/creative-kanban-video-orchestrator) | Planeja e executa pipelines de produção de vídeo multiagente. |
 | [**meme-generation**](/docs/user-guide/skills/optional/creative/creative-meme-generation) | Gera imagens de meme reais escolhendo um template e sobrepondo texto com Pillow. Produz arquivos .png de meme reais. |
 | [**pixel-art**](/docs/user-guide/skills/optional/creative/creative-pixel-art) | Pixel art com paletas de época (NES, Game Boy, PICO-8). |
+| [**simple-english**](/docs/user-guide/skills/optional/creative/creative-simple-english) | Reescreve texto técnico para ASD-STE100 Simplified Technical English. |
 | [**social-media-content-calendar**](/docs/user-guide/skills/optional/creative/creative-social-media-content-calendar) | Planeja campanhas sociais multiplataforma: do brief à publicação. |
 | [**tldraw-offline**](/docs/user-guide/skills/optional/creative/creative-tldraw-offline) | Controla e cria scripts em canvases offline do tldraw com um agente. |
 | [**unreal-mcp**](/docs/user-guide/skills/optional/creative/creative-unreal-mcp) | Automatiza cenas, atores e renders do editor Unreal Engine. |

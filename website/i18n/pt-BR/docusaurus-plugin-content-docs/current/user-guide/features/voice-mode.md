@@ -8,7 +8,7 @@ description: "Conversas de voz em tempo real com Hermes Agent — CLI, Telegram,
 
 O Hermes Agent suporta interação de voz completa na CLI e plataformas de mensagens. Fale com o agente pelo microfone, ouça respostas faladas e tenha conversas de voz ao vivo em canais de voz do Discord.
 
-Se quiser um walkthrough prático de setup com configurações recomendadas e padrões de uso reais, veja [Usar Modo de Voz com Hermes](/guides/use-voice-mode-with-hermes).
+Se quiser um walkthrough prático de setup com configurações recomendadas e padrões de uso reais, veja [Usar Modo de Voz com Hermes](../../guides/use-voice-mode-with-hermes.md).
 
 Para iniciar sessões hands-free — dizer "hey hermes" (ou qualquer frase) para abrir uma sessão de voz nova na CLI, TUI ou app desktop — veja [Wake Word](/user-guide/features/wake-word).
 

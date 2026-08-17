@@ -61,9 +61,13 @@ O que ele faz:
 
 1. Resolve um token de acesso novo do Nous Portal a partir do seu login existente
    (`~/.hermes/auth.json`) — isso prova qual org Nous (tenant) você é dono. Se
-   `gateway.idp.token_url` estiver configurado, um token genérico OAuth2 client-credentials
-   do seu próprio IdP é usado em vez disso (o caminho air-gapped / IdP auto-hospedado,
-   sem envolver o Nous Portal).
+   `gateway.idp.token_url` estiver configurado, o seu próprio IdP é usado em vez
+   disso (o caminho air-gapped / IdP auto-hospedado, sem envolver o Nous Portal):
+   com `client_id`/`client_secret` configurados, executa um grant OAuth2
+   client-credentials genérico; com nenhum dos dois configurado a URL é tratada
+   como um endpoint de token ambiente (GET simples cujo body da resposta é o
+   token — o padrão de metadata-server, ex.: `$DOMINO_API_PROXY/access-token` da
+   Domino). Configurar só uma das duas credenciais é um erro.
 2. Envia (POST) o token de cadastro e um id de gateway para o endpoint
    `/relay/enroll` do connector via TLS.
 3. O connector verifica o token (assinatura, uso único, correspondência de tenant),
@@ -105,7 +109,7 @@ uma feature flag separada. Implantações que não a definem não são afetadas.
 | `GATEWAY_RELAY_WAKE_URL` / `gateway.relay_wake_url` | env / `config.yaml` | Alvo opcional de wake-poke para gateways ociosos/suspensos. |
 | `GATEWAY_RELAY_PLATFORMS` | env | Lista de plataformas que este gateway serve de front sobre uma única conexão, separadas por vírgula (ex.: `discord,telegram`). Normalmente definido pelo deployment/orchestrator. |
 | `GATEWAY_RELAY_BOT_IDS` | env | Mapa JSON de identidades de bot por plataforma, ex.: `{"discord": {"botId": "…"}}`. Usado em conjunto com `GATEWAY_RELAY_PLATFORMS`. |
-| `gateway.idp.token_url` | `config.yaml` | Quando definido, o cadastro/provisionamento se autentica via OAuth2 client-credentials genérico contra o seu próprio IdP em vez do Nous Portal. |
+| `gateway.idp.token_url` | `config.yaml` | Quando definido, o cadastro/provisionamento se autentica contra o seu próprio IdP em vez do Nous Portal: OAuth2 client-credentials quando `gateway.idp.client_id`/`client_secret` também estão definidos; senão um endpoint de token ambiente (GET simples retornando o token, cru ou `{"access_token": …}`). |
 
 ## Capacidades suportadas {#supported-capabilities}
 

@@ -22,7 +22,7 @@ O mesmo token bearer OAuth também é reutilizado por toda superfície direto-pa
 | Nome de exibição | xAI Grok OAuth (SuperGrok / X Premium+) |
 | Tipo de autenticação | OAuth 2.0 no navegador com código de dispositivo |
 | Transporte | xAI Responses API (`codex_responses`) |
-| Modelo padrão | `grok-build-0.1` |
+| Modelo padrão | `grok-4.6` |
 | Endpoint | `https://api.x.ai/v1` |
 | Servidor de autenticação | `https://accounts.x.ai` |
 | Requer variável de ambiente | Não (`XAI_API_KEY` **não** é usada por este provedor) |
@@ -47,7 +47,7 @@ hermes model
 # → Selecione "xAI Grok OAuth (SuperGrok / X Premium+)" na lista de provedores
 # → O Hermes abre ou imprime uma URL de verificação accounts.x.ai
 # → Digite o código exibido se solicitado, depois aprove o acesso no navegador
-# → Escolha um modelo (grok-build-0.1 está no topo)
+# → Escolha um modelo (grok-4.6 está no topo)
 # → Comece a conversar
 
 hermes
@@ -94,13 +94,13 @@ A seção `◆ Auth Providers` mostrará o estado atual de cada provedor, inclui
 ```bash
 hermes model
 # → Selecione "xAI Grok OAuth (SuperGrok / X Premium+)"
-# → Escolha na lista de modelos (grok-build-0.1 está fixado no topo)
+# → Escolha na lista de modelos (grok-4.6 está fixado no topo)
 ```
 
 Ou defina o modelo diretamente:
 
 ```bash
-hermes config set model.default grok-build-0.1
+hermes config set model.default grok-4.6
 hermes config set model.provider xai-oauth
 ```
 
@@ -110,7 +110,7 @@ Após o login, o `~/.hermes/config.yaml` conterá:
 
 ```yaml
 model:
-  default: grok-build-0.1
+  default: grok-4.6
   provider: xai-oauth
   base_url: https://api.x.ai/v1
 ```
@@ -154,8 +154,9 @@ O toolset `x_search` é ativado automaticamente sempre que credenciais da xAI (u
 
 | Ferramenta | Modelo | Notas |
 |------|-------|-------|
-| Chat | `grok-build-0.1` | Padrão; selecionado automaticamente ao fazer login via OAuth |
-| Chat | `grok-4.3` | Padrão anterior |
+| Chat | `grok-4.6` | Padrão; fixado no topo do picker OAuth |
+| Chat | `grok-build-0.1` | Modelo Grok Build orientado a coding |
+| Chat | `grok-4.3` | Geração anterior |
 | Chat | `grok-4.20-0309-reasoning` | Variante de raciocínio |
 | Chat | `grok-4.20-0309-non-reasoning` | Variante sem raciocínio |
 | Chat | `grok-4.20-multi-agent-0309` | Variante multiagente |
@@ -165,7 +166,7 @@ O toolset `x_search` é ativado automaticamente sempre que credenciais da xAI (u
 | Video | `grok-imagine-video-1.5-preview` | Imagem para vídeo; alias datado `grok-imagine-video-1.5-2026-05-30` |
 | TTS | (voz padrão) | Endpoint `/v1/tts` da xAI |
 
-O catálogo de chat é derivado ao vivo do cache local do `models.dev`; novos lançamentos da xAI aparecem automaticamente quando esse cache é atualizado. O `grok-build-0.1` fica sempre fixado no topo da lista.
+O catálogo de chat é derivado ao vivo do cache local do `models.dev`; novos lançamentos da xAI aparecem automaticamente quando esse cache é atualizado. O `grok-4.6` fica sempre fixado no topo da lista.
 
 ## Variáveis de Ambiente {#environment-variables}
 

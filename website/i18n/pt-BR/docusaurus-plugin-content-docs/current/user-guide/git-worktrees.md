@@ -35,7 +35,26 @@ Com worktrees, cada agente recebe:
 
 Veja também: [Checkpoints e /rollback](./checkpoints-and-rollback.md).
 
-## Início rápido: criando um worktree
+## Início rápido: criando um worktree {#quick-start-creating-a-worktree}
+
+### De dentro de uma sessão: `/worktree new` {#from-inside-a-session-worktree-new}
+
+O caminho mais rápido (inspirado no `/worktree new` do Copilot CLI): de uma
+sessão CLI interativa, rode
+
+```
+/worktree new my-experiment
+```
+
+O Hermes cria `.worktrees/my-experiment/` dentro do repo (branch
+`hermes/my-experiment`, baseado no tip remoto recém-fetched a menos que
+`worktree_sync: false`), e retargeta as ferramentas de terminal e arquivo da
+sessão para ele — sem restart. Omita o nome para obter uma árvore aleatória
+`hermes-<id>`. `/worktree` sozinho mostra a árvore ativa; `/worktree list`
+lista todas. Na saída a árvore é mantida só se tiver commits unpushed,
+exatamente como `hermes -w`.
+
+### Manualmente com git {#manually-with-git}
 
 Do seu repositório principal (contendo `.git/`), crie um worktree novo para uma branch de feature:
 

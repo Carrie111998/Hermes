@@ -29,7 +29,15 @@ gateway:
         port: 9900
 ```
 
-As ferramentas de cliente de saída são fornecidas como o toolset `a2a`, **desativado por padrão** — ative-o com `hermes tools`.
+As ferramentas de cliente de saída são fornecidas como o toolset `a2a`, **desativado por padrão** — ative-o por plataforma:
+
+```bash
+hermes tools enable a2a --platform cli        # sessões CLI/TUI
+hermes tools enable a2a --platform telegram   # ou qualquer plataforma de mensagens
+hermes tools enable a2a --platform a2a        # deixa tarefas A2A inbound chamarem peers (encadeamento de agentes)
+```
+
+As ferramentas estão disponíveis em todo tipo de processo — CLI, TUI, gateway e cron — sem a plataforma inbound precisar estar habilitada.
 
 ## Saída: chamando outros agentes {#outbound-calling-other-agents}
 

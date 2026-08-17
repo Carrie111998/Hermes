@@ -11,8 +11,10 @@ O Hermes Agent inclui um conjunto completo de ferramentas de automação de nave
 
 - **Modo na nuvem Browserbase** via [Browserbase](https://browserbase.com) para navegadores gerenciados na nuvem e ferramentas anti-bot
 - **Modo na nuvem Browser Use** via [Browser Use](https://browser-use.com) como provedor alternativo de navegador na nuvem
+- **Modo Browser Use** via a [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) — um harness de navegador novo que é SOTA para tarefas web; automatiza seu Chrome local ou navegadores na nuvem do Browser Use
 - **Modo na nuvem Firecrawl** via [Firecrawl](https://firecrawl.dev) para navegadores na nuvem com scraping integrado
 - **Modo local Camofox** via [Camofox](https://github.com/jo-inc/camofox-browser) para navegação local anti-detecção (spoofing de fingerprint baseado em Firefox)
+- **Engine local Lightpanda** via [Lightpanda](https://lightpanda.io) — um navegador headless construído do zero em Zig para máquinas; startup instantâneo, 16x menos memória e 9x mais rápido que o Chrome, com fallback automático para Chrome nas ações que ainda não suporta
 - **CDP local da família Chromium** — conecte as ferramentas de navegador à sua própria instância de Chrome, Brave, Chromium ou Edge usando `/browser connect`
 - **Modo de navegador local** via a CLI `agent-browser` e uma instalação local do Chromium
 
@@ -58,7 +60,36 @@ Para usar o Browser Use como seu provedor de navegador na nuvem, adicione:
 BROWSER_USE_API_KEY=***
 ```
 
-Obtenha sua chave de API em [browser-use.com](https://browser-use.com). O Browser Use fornece um navegador na nuvem via sua REST API. Se credenciais do Browserbase e do Browser Use estiverem definidas, o Browserbase tem prioridade.
+Obtenha sua chave de API em [browser-use.com](https://browser-use.com).
+
+### Modo Browser Use (padrão) {#browser-use-mode-default}
+
+O modo Browser Use usa a [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) — um harness de navegador novo que é state-of-the-art em tarefas web — em vez das ferramentas de navegador built-in. O agente escreve e executa Python no navegador para clicar, digitar, arrastar, scrapear e interagir com páginas.
+
+**Este é o modo de navegador padrão**: quando `browser.backend` está indefinido e a CLI `browser-use` é executável (instalada, ou disponível via `uvx`), o agente recebe a única ferramenta `browser_exec`. Se a CLI não puder rodar, o Hermes recua automaticamente para as ferramentas de navegador built-in.
+
+O modo é um **driver** que se compõe com o backend de navegador configurado: ele dirige seu Chrome local, um navegador na nuvem de assinatura Nous, Browserbase, Firecrawl, ou navegadores na nuvem do Browser Use — qualquer fonte de navegador selecionada em `hermes tools` → Browser Automation. A única exceção é o Camofox, que não tem endpoint CDP para o harness se anexar; setups Camofox automaticamente mantêm as ferramentas de navegador built-in.
+
+**Sessões concorrentes:** `browser_exec` aceita um argumento `session=<name>` que isola o trabalho de navegador por nome em todo backend. Cada nome recebe seu próprio daemon do harness (seu próprio socket IPC, log e estado), e em backends na nuvem seu próprio navegador — então subagentes paralelos ou chats simultâneos não mais pisam numa conexão compartilhada única. Omitir `session` usa o daemon default compartilhado, o que serve para navegação uma-de-cada-vez.
+
+Para optar por sair e forçar as ferramentas de navegador built-in, use `/browser use off`, ou:
+
+```yaml
+# Add to ~/.hermes/config.yaml
+browser:
+  backend: "off"
+```
+
+(`backend: "browser-use"` permanece válido para forçar o modo explicitamente.)
+
+Os próprios navegadores na nuvem do Browser Use precisam de `browser-use auth login` ou `BROWSER_USE_API_KEY`; outras fontes de navegador usam suas credenciais existentes sem mudança.
+
+:::note
+Como o modo Browser Use executa Python escrito pelo modelo na sua máquina, a
+ferramenta `browser_exec` só é oferecida a sessões que também têm acesso ao
+terminal. Plataformas configuradas sem o toolset de terminal (ex. uma superfície
+de mensagens restrita) mantêm as ferramentas de navegador padrão.
+:::
 
 ### Modo na nuvem Firecrawl
 
@@ -304,6 +335,28 @@ A adoção só dispara até `tab_id` ser preenchido para a sessão. Se o app ext
 
 Quando o Camofox roda em modo headed (com janela de navegador visível), ele expõe uma porta VNC na resposta do health check. O Hermes descobre isso automaticamente e inclui a URL VNC nas respostas de navegação, para que o agente possa compartilhar um link para você acompanhar o navegador ao vivo.
 
+### Engine local Lightpanda {#lightpanda-local-engine}
+
+[Lightpanda](https://lightpanda.io) é um navegador headless open-source escrito do zero. Sobe instantaneamente, roda 9x mais rápido e usa 16x menos memória que o Chrome, o que importa para agentes que vivem em VMs pequenas por longos períodos.
+
+Lightpanda é uma **engine local**, selecionada no caminho local do `agent-browser` (não um provedor na nuvem). Instale o binário e coloque-o no seu `PATH` (veja o [guia de instalação do Lightpanda](https://lightpanda.io/docs)), depois defina:
+
+```yaml
+# Add to ~/.hermes/config.yaml
+browser:
+  engine: lightpanda
+```
+
+Ou via variável de ambiente:
+
+```bash
+AGENT_BROWSER_ENGINE=lightpanda
+```
+
+O Hermes dirige o Lightpanda através de `agent-browser` sobre CDP, do mesmo jeito que dirige o Chrome local.
+
+**Fallback automático para Chrome.** O Lightpanda ainda não cobre tudo que o Chrome faz, então a integração é não disruptiva: o Lightpanda trata as ações que suporta, e o Hermes retenta de forma transparente no Chrome qualquer coisa que não suporte. O conjunto suportado cobre o fluxo principal do agente — navigate, snapshot, click, type, scroll, back, press e eval. Screenshots também recuam para o Chrome porque o Lightpanda não tem renderer gráfico; `browser_vision` é pré-roteado direto para o Chrome pelo mesmo motivo.
+
 ### Navegador local da família Chromium via CDP (`/browser connect`)
 
 Em vez de um provedor na nuvem, você pode conectar as ferramentas de navegador do Hermes à sua própria instância de Chrome, Brave, Chromium ou Edge em execução via Chrome DevTools Protocol (CDP). Isso é útil quando você quer ver o que o agente está fazendo em tempo real, interagir com páginas que exigem seus próprios cookies/sessões ou evitar custos de navegador na nuvem.
@@ -402,6 +455,13 @@ BROWSERBASE_SESSION_TIMEOUT=1800
 # Inactivity timeout before auto-cleanup in seconds (default: 120)
 BROWSER_INACTIVITY_TIMEOUT=120
 
+# Local browser engine. Applies to the built-in browser tools
+# (agent-browser path). Equivalent to browser.engine in config.yaml.
+#   auto       — agent-browser's default (currently Chrome)
+#   lightpanda — Lightpanda
+#   chrome     — force Chrome explicitly
+AGENT_BROWSER_ENGINE=auto
+
 # Extra Chromium launch flags (comma- or newline-separated). Hermes auto-injects
 # `--no-sandbox,--disable-dev-shm-usage` when it detects root or AppArmor-restricted
 # unprivileged user namespaces (Ubuntu 23.10+, DGX Spark, many container images),
@@ -412,10 +472,12 @@ AGENT_BROWSER_ARGS=--no-sandbox
 
 ### Instalar a CLI agent-browser
 
+Você não precisa instalar nada — `agent-browser` resolve automaticamente via
+`npx agent-browser` no primeiro uso de ferramenta de navegador. Para evitar o
+fetch único do npx, você pode instalá-lo globalmente antecipadamente (opcional):
+
 ```bash
 npm install -g agent-browser
-# Or install locally in the repo:
-npm install
 ```
 
 :::info

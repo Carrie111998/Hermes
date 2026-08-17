@@ -69,6 +69,21 @@ não pode sobrescrever, via um diretório gerenciado em nível de sistema. Veja
 [Managed Scope](/user-guide/managed-scope).
 :::
 
+## Limites de runtime {#runtime-limits}
+
+Superfícies de servidor de longa duração do Hermes (incluindo o gateway e
+`hermes serve --isolated`) aplicam o limite soft configurado de `RLIMIT_NOFILE`
+durante o startup, quando o sistema operacional o suporta:
+
+```yaml
+runtime:
+  nofile_soft_limit: 4096
+```
+
+O padrão é `4096`. O Hermes limita o alvo ao hard limit do sistema operacional e nunca reduz um processo que já tenha um soft limit maior. Defina o valor como `0`, `false` ou `null` para desabilitar o ajuste. No Windows e em sandboxes
+onde o limite não pode ser alterado, o startup continua sem mudar o
+limite.
+
 ## Substituição de variáveis de ambiente {#environment-variable-substitution}
 
 Você pode referenciar variáveis de ambiente em `config.yaml` com a sintaxe `${VAR_NAME}`:
@@ -211,6 +226,8 @@ Executa comandos dentro de um container Docker com hardening de segurança (toda
 
 **Container persistente único, compartilhado entre processos Hermes.** O Hermes inicia UM container de longa duração no primeiro uso e roteia toda chamada de terminal, arquivo e `execute_code` via `docker exec` nesse mesmo container — entre sessões, `/new`, `/reset` e subagentes `delegate_task`. Mudanças de diretório de trabalho, pacotes instalados, arquivos em `/workspace` e **processos em segundo plano** persistem de uma chamada de ferramenta para a próxima, e de um processo Hermes para o outro. Quando você fecha uma sessão TUI, executa `/quit` ou inicia uma nova invocação `hermes`, o container continua rodando e o próximo processo Hermes o reutiliza via lookup rotulado. Veja **Ciclo de vida do container** abaixo para as regras exatas de teardown.
 
+**Modo de isolamento por sessão (`container_persistent: false`).** Definir `container_persistent: false` no backend Docker troca para um container **por sessão**: cada chat (sessão do app desktop, conversa do gateway, sessão TUI) recebe sua própria sandbox nova, criada na primeira chamada de terminal/arquivo e removida quando a sessão fecha ou fica idle além de `lifetime_seconds`. Nada persiste entre sessões — nenhum estado de filesystem, nenhum mount, nenhum processo em segundo plano. Com `docker_mount_cwd_to_workspace: true`, apenas o workspace **anexado a essa sessão** é montado em `/workspace`; uma sessão nova sem diretório anexado recebe um workspace vazio em vez de herdar o mount da sessão anterior. Subagentes `delegate_task` ainda compartilham o container da sessão pai. Use este modo quando a sandbox é uma fronteira de segurança entre conversas; mantenha o padrão `true` quando quiser o container compartilhado de longa duração descrito acima.
+
 ```yaml
 terminal:
   backend: docker
@@ -234,7 +251,7 @@ terminal:
   container_cpu: 1                 # CPU cores (0 = unlimited)
   container_memory: 5120           # MB (0 = unlimited)
   container_disk: 51200            # MB (requires overlay2 on XFS+pquota)
-  container_persistent: true       # Persist /workspace and /root bind-mount dirs
+  container_persistent: true       # true = persist /workspace + /root, shared container; false = fresh container per session (see below)
 
   # Cross-process container reuse (defaults match the "one long-lived
   # container shared across sessions" contract — see Container lifecycle).
@@ -783,6 +800,7 @@ compression:
   threshold: 0.50                                   # Compress at this % of context limit
   threshold_tokens: null                            # Absolute token cap (optional) — takes lower of ratio vs absolute
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
+  tail_mode: legacy                                 # Tail retention: "legacy" (0.20×window verbatim tail) or "lean" (clamped 2.5% tail, 10K-25K, with digests + anchor index + session_search recovery pointers in the summary — ~3x fewer retained tokens after compaction)
   protect_last_n: 20                                # Min recent messages to keep uncompressed
   protect_first_n: 3                                # Non-system head messages pinned across compactions (0 = pin nothing)
   in_place: true                                    # Compact on the same session id (no rotation) — see below
@@ -916,6 +934,20 @@ agent:
   session_stall_timeout: 300   # seconds; 0 disables the watchdog
 ```
 
+## Escalação de atenção de reconnect {#reconnect-attention-escalation}
+
+Quando um adapter de plataforma falha em conectar (queda de rede, token de bot revogado, sidecar quebrado), o gateway retenta indefinidamente com backoff exponencial limitado — as retries nunca param, então uma queda transitória sempre se auto-recupera sem ação do operador. O lado ruim é que uma falha *permanente* (um token Telegram revogado, intents privilegiados Discord faltando) parece idêntica a um blip: "retrying", para sempre.
+
+Dois mecanismos tornam falhas permanentes visíveis:
+
+- **Classificação terminal.** Falhas cujo *tipo* de exceção prova que nunca podem se auto-recuperar — tokens rejeitados/revogados (`telegram_auth_error`, `discord_auth_error`, `email_auth_error`), intents privilegiados faltando (`discord_intents_required`), um sidecar Photon cujas dependências não instalam (`SIDECAR_DEPS_MISSING`) ou cujo binário node está ausente (`SIDECAR_NODE_MISSING`) — são marcadas como fatais em vez de entrar na fila de retry. A classificação é estritamente baseada em tipo; erros ambíguos sempre continuam retentando.
+- **Escalação needs-attention.** Uma plataforma continuamente na fila de retry além de `agent.reconnect_attention_after` (padrão `7200` segundos = 2 horas, `0` desabilita) recebe `needs_attention: true` e um timestamp `retrying_since` no status de runtime do gateway (`hermes status`), mais um log WARNING. As retries continuam inalteradas — isto é um sinal, não um circuit breaker. A flag limpa no reconnect bem-sucedido.
+
+```yaml
+agent:
+  reconnect_attention_after: 7200   # seconds; 0 disables the escalation flag
+```
+
 ## Cache de agente do gateway {#gateway-agent-cache}
 
 O gateway mantém um agente por sessão para uma conversa reutilizar seu prefixo de prompt em cache em vez de reconstruir o prompt de sistema a cada turno. Esse agente em cache também segura a transcrição completa da sessão — saída de ferramenta incluída, que são dezenas de megabytes em sessão com centenas de tool calls. Em gateway multi-plataforma ocupado o cache é portanto o maior consumidor único de memória no processo.
@@ -988,7 +1020,7 @@ agent:
   coding_instructions: ""      # Standing project-wide coding rules appended to the coding brief
 ```
 
-`verify_on_stop` aceita `true` (ligado em todo lugar), `false` (desligado) ou `"auto"` (ligado para superfícies interativas de coding — CLI, TUI, desktop — e chamadores programáticos; desligado para superfícies de mensagens como Telegram/Discord onde a narrativa de verificação soa como ruído de chat). A migração de config desliga em instalações existentes, então trate off como padrão efetivo e opte in explicitamente. A env var `HERMES_VERIFY_ON_STOP` sobrescreve o valor de config quando definida.
+`verify_on_stop` aceita `true` (ligado em todo lugar), `false` (desligado — o padrão) ou `"auto"` (comportamento legado ciente da superfície: ligado para superfícies interativas de coding — CLI, TUI, desktop — e chamadores programáticos; desligado para superfícies de mensagens como Telegram/Discord onde a narrativa de verificação soa como ruído de chat). Off é o padrão em todo lugar: instalações novas vêm com `false` e a migração de config desligou em instalações existentes, então habilitar é um opt-in explícito. A env var `HERMES_VERIFY_ON_STOP` sobrescreve o valor de config quando definida.
 
 Para um gate de política user/plugin no mesmo ponto — manter o agente indo com suas próprias checagens — veja o [hook `pre_verify`](/user-guide/features/hooks#pre_verify).
 
@@ -1103,9 +1135,12 @@ $ hermes model
 [ ] triage_specifier     currently: auto / main model
 [ ] kanban_decomposer    currently: auto / main model
 [ ] profile_describer    currently: auto / main model
+[ ] delegation           currently: auto / inherit main agent
 ```
 
 Selecione uma task, escolha provedor (fluxos OAuth abrem browser; provedores API-key pedem), escolha modelo. A mudança persiste em `auxiliary.<task>.*` em `config.yaml`. Mesma maquinaria do picker de modelo principal — nenhuma sintaxe extra para aprender.
+
+A entrada **Delegation** é especial: ela roteia o modelo usado por subagentes `delegate_task` e persiste na seção top-level `delegation.*` (`delegation.provider` / `delegation.model`) em vez de `auxiliary.*`, porque subagentes são agentes filhos completos, não chamadas LLM laterais. Seu `auto` significa "herdar provider, modelo e credenciais do agente pai."
 
 Se não quiser que o Hermes auto-gere títulos após a primeira troca, defina
 `auxiliary.title_generation.enabled: false`. Títulos manuais ainda funcionam via
@@ -1165,7 +1200,7 @@ auxiliary:
 
 Quando `base_url` está definido, o Hermes ignora o provider e chama esse endpoint diretamente (usando `api_key` ou `OPENAI_API_KEY` para auth). Quando só `provider` está definido, o Hermes usa auth e base URL embutidos desse provider.
 
-Provedores disponíveis para tarefas auxiliares: `auto`, `main`, mais qualquer provedor no [provider registry](/reference/environment-variables) — `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `alibaba`, `bedrock`, `huggingface`, `arcee`, `xiaomi`, `kilocode`, `opencode-zen`, `opencode-go`, `ai-gateway`, `azure-foundry` — ou qualquer provedor custom nomeado do seu dict `providers:` (ex.: `provider: "beans"`).
+Provedores disponíveis para tarefas auxiliares: `auto`, `main`, mais qualquer provedor no [provider registry](/reference/environment-variables) — `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `alibaba`, `bedrock`, `huggingface`, `arcee`, `xiaomi`, `kilocode`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `ai-gateway`, `azure-foundry` — ou qualquer provedor custom nomeado do seu dict `providers:` (ex.: `provider: "beans"`).
 
 :::tip MiniMax OAuth
 `minimax-oauth` faz login via browser OAuth (sem API key). Execute `hermes model` e selecione **MiniMax (OAuth)** para autenticar. Tarefas auxiliares usam `MiniMax-M2.7-highspeed` automaticamente. Veja o [guia MiniMax OAuth](../guides/minimax-oauth.md).
@@ -1385,7 +1420,7 @@ Estas opções aplicam-se a **configs de tarefa auxiliar** (`auxiliary:`, `compr
 | `"auto"` | Melhor disponível (padrão). Vision tenta OpenRouter → Nous → Codex. | — |
 | `"openrouter"` | Força OpenRouter — roteia a qualquer modelo (Gemini, GPT-4o, Claude, etc.) | `OPENROUTER_API_KEY` |
 | `"nous"` | Força Nous Portal | `hermes auth` |
-| `"codex"` | Força Codex OAuth (conta ChatGPT). Suporta vision (gpt-5.3-codex). | `hermes model` → Codex |
+| `"codex"` | Força Codex OAuth (conta ChatGPT). Suporta vision (gpt-5.3-codex). | `hermes model` → ChatGPT or Codex Subscription |
 | `"minimax-oauth"` | Força MiniMax OAuth (login browser, sem API key). Usa MiniMax-M2.7-highspeed para tarefas auxiliares. | `hermes model` → MiniMax (OAuth) |
 | `"xai-oauth"` | Força xAI Grok OAuth (login browser para assinantes SuperGrok ou X Premium+, sem API key). Mesmo token OAuth cobre chat, TTS, image, video e transcription. | `hermes model` → xAI Grok OAuth (SuperGrok / Premium+) |
 | `"main"` | Usa seu endpoint custom/main ativo. Pode vir de `OPENAI_BASE_URL` + `OPENAI_API_KEY` ou endpoint custom salvo via `hermes model` / `config.yaml`. Funciona com OpenAI, modelos locais ou qualquer API OpenAI-compatible. **Só tarefas auxiliares — não válido para `model.provider`.** | Credenciais de endpoint custom + base URL |
@@ -1508,6 +1543,16 @@ Estes modelos usam thinking *adaptativo* e não aceitam o campo usual `reasoning
 os níveis suportados pelo modelo selecionado. `none` (ou unset) deixa o modelo
 no próprio default adaptativo. O
 provider Anthropic nativo já controla effort diretamente e não é afetado.
+:::
+
+:::note Modelos OpenRouter e níveis de effort suportados
+Para outros modelos roteados pelo OpenRouter, o Hermes lê os metadados de reasoning do catálogo live de modelos (`supported_parameters` + `reasoning.supported_efforts` por modelo) para decidir se envia controles de reasoning
+e para limitar o effort pedido ao nível mais próximo que a rota realmente
+suporta (sempre para baixo — ex.: `ultra` vira `high` numa rota que para
+em `high`, nunca uma escalação silenciosa). Novos vendors com reasoning funcionam
+automaticamente sem esperar um update do Hermes; quando o catálogo está
+inacessível ou um modelo não está listado, o Hermes cai para sua lista embutida
+de famílias de modelo e passa seu effort inalterado.
 :::
 
 Você também pode alterar reasoning effort em runtime com o comando `/reasoning`:
@@ -1683,6 +1728,7 @@ display:
   skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
   personality: ""         # Legacy cosmetic field still surfaced in some summaries
   compact: false          # Compact output mode (less whitespace)
+  cli_multiline_shortcuts: true  # CLI: Ctrl+J, \ + Enter, and supported Shift+Enter insert newlines (false = legacy c-j submit fallback)
   resume_display: full    # full (show previous messages on resume) | minimal (one-liner only)
   bell_on_complete: false # Play terminal bell when agent finishes (great for long tasks)
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
@@ -1698,6 +1744,7 @@ display:
     fields: ["model", "context_pct", "cwd"]
   file_mutation_verifier: true    # Append an advisory footer when write_file/patch calls failed this turn
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
+  cli_rebuild_scrollback_on_redraw: false  # Classic CLI: also wipe terminal scrollback (CSI 3J) on /redraw / Ctrl+L / width-change resize recovery. Enable when a terminal/tmux stack stamps stale prompt chrome into scrollback on maximize/restore.
   language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
 
@@ -1883,6 +1930,7 @@ stt:
   cloud_trim_silence: true     # trim long pauses with ffmpeg before uploading to a cloud provider (default: true)
   cloud_trim_threshold_db: -40 # audio quieter than this counts as silence
   cloud_trim_keep_ms: 300      # how much of each pause survives the trim (keeps natural pacing)
+  # prompt: "Hermes, Teknium, Nous Research, kanban"   # Static vocabulary hint (see below)
   local:
     model: "base"              # tiny, base, small, medium, large-v3
     language: ""               # per-provider override of stt.language
@@ -1922,6 +1970,39 @@ STT_OPENAI_MODEL=whisper-1
 GROQ_BASE_URL=https://api.groq.com/openai/v1
 STT_OPENAI_BASE_URL=https://api.openai.com/v1
 ```
+
+### Prompt de transcrição (dicas de vocabulário) {#transcription-prompt-vocabulary-hints}
+
+`stt.prompt` é uma dica estática opcional passada a backends STT que suportam prompt. Use para nomes próprios, nomes de produto e jargão que modelos da família Whisper ouvem errado:
+
+```yaml
+stt:
+  provider: "local"
+  prompt: "Hermes, Teknium, Nous Research, kanban, Ollama"
+```
+
+**Composição.** O valor de config é a base. Plugins que registram o hook [`pre_transcription`](/user-guide/features/hooks#pre_transcription) mutam por cima, last-writer-wins por campo. Dicas de múltiplos plugins se compostem de forma determinística: a descoberta de plugins carrega plugins em ordem ordenada por plugin id, e os callbacks de cada plugin rodam na própria ordem de registro, então o mesmo conjunto de plugins sempre produz o mesmo prompt final. Um hook retornando string vazia para `prompt` limpa o prompt de config daquela requisição. Hooks também podem sobrescrever `language` e `model`; `file_path` é read-only e qualquer tentativa de mudá-lo é logada e descartada. Sem hook registrado e sem `stt.prompt` definido, a requisição outgoing é idêntica a releases anteriores.
+
+**Suporte de provider.**
+
+| Provider | Parâmetro de prompt | Comportamento |
+|----------|-----------------|----------|
+| `local` (faster-whisper) | `initial_prompt` | Encaminhado inalterado ao modelo local |
+| `openai` | `prompt` | Encaminhado inalterado na requisição de transcrição |
+| `groq` | `prompt` | Encaminhado inalterado na requisição de transcrição |
+| `mistral` | `prompt` | Encaminhado inalterado na requisição de transcrição |
+| `deepinfra` | `prompt` | Caminho OpenAI-compatible, encaminhado inalterado |
+| `xai` | não suportado | Logado em DEBUG, a requisição segue sem o prompt |
+| `elevenlabs` | não suportado | Logado em DEBUG, a requisição segue sem o prompt |
+| `local_command` | não suportado | Logado em DEBUG, a requisição segue sem o prompt |
+| `stt.providers.<name>` com `type: command` | não suportado | Logado em DEBUG, a requisição segue sem o prompt |
+| Providers registrados por plugin | `prompt` nos kwargs `transcribe(**extra)` | Só enviado quando um prompt está definido, então providers anteriores a esta chave veem chamadas inalteradas |
+
+**Comprimento.** Modelos da família Whisper só condicionam nos ~224 tokens finais do prompt. Para os backends da família whisper (`local`, `openai`, `groq`, `deepinfra`) o Hermes aplica esse cap client-side: um prompt final longo demais é truncado para a cauda com um warning logado — a requisição nunca erra por comprimento de prompt. Outros backends (`mistral`, providers plugin) recebem o prompt inalterado e possuem a própria validação. Mantenha as dicas curtas e específicas de qualquer forma.
+
+:::warning Prompts são enviados junto com o áudio
+O prompt final é enviado ao provider STT configurado junto com o arquivo de áudio. Mantenha segredos e contexto derivado de sessão fora de `stt.prompt` e de qualquer coisa que um hook `pre_transcription` retorne, especialmente quando o provider é uma API hospedada em vez do `faster-whisper` local.
+:::
 
 ## Voice mode (CLI) {#voice-mode-cli}
 
@@ -2312,6 +2393,7 @@ delegation:
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
+  worktree_isolation: false                 # Give each child its own git worktree branched from HEAD (local backend + git repos only; inspired by Muse Code). See Subagent Delegation → Worktree Isolation.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
 ```

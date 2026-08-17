@@ -13,6 +13,7 @@ O Hermes Agent descobre e carrega automaticamente arquivos de contexto que molda
 | Arquivo | Propósito | Descoberta |
 |------|---------|-----------| 
 | **.hermes.md** / **HERMES.md** | Instruções do projeto (maior prioridade) | Sobe até a raiz git |
+| **AGENTS.override.md** | Override pessoal, por diretório, de AGENTS.md (tipicamente gitignored) | CWD na inicialização + subdiretórios progressivamente |
 | **AGENTS.md** | Instruções do projeto, convenções, arquitetura | CWD na inicialização + subdiretórios progressivamente |
 | **CLAUDE.md** | Arquivos de contexto Claude Code (também detectados) | CWD na inicialização + subdiretórios progressivamente |
 | **SOUL.md** | Personalidade e tom globais desta instância Hermes | Apenas `HERMES_HOME/SOUL.md` |
@@ -20,7 +21,9 @@ O Hermes Agent descobre e carrega automaticamente arquivos de contexto que molda
 | **.cursor/rules/*.mdc** | Módulos de regras do Cursor IDE | Apenas CWD |
 
 :::info Sistema de prioridade
-Apenas **um** tipo de contexto de projeto é carregado por sessão (primeira correspondência vence): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** é sempre carregado independentemente como identidade do agente (slot #1).
+Apenas **um** tipo de contexto de projeto é carregado por sessão (primeira correspondência vence): `.hermes.md` → `AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** é sempre carregado independentemente como identidade do agente (slot #1).
+
+Se um `AGENTS.override.md` existir ao lado de um `AGENTS.md`, o override é carregado **no lugar** do arquivo commitado — mantenha um `AGENTS.override.md` pessoal (geralmente gitignored) quando quiser instruções diferentes das que estão no repo, sem editar o `AGENTS.md` tracked.
 :::
 
 ## AGENTS.md {#agentsmd}

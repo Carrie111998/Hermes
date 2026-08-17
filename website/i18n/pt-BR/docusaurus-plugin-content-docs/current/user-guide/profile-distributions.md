@@ -8,6 +8,26 @@ Uma **distribuição de profile** empacota um agente Hermes completo — persona
 
 Se um [profile](./profiles.md) é um agente local, uma distribuição é esse agente tornando-se compartilhável.
 
+## Duas formas de compartilhar um profile {#two-ways-to-share-a-profile}
+
+O Hermes tem dois caminhos de compartilhamento, e eles respondem perguntas diferentes. Distribuições são o durável; arquivos de export são o rápido.
+
+| | **Distribuição** (repo git) | **Arquivo de export** (`.tar.gz`) |
+|---|---|---|
+| Envie por | `hermes profile install <repo>` | Envie um arquivo — chat, AirDrop, USB, email |
+| Destinatário precisa | git, e acesso ao repo | O arquivo |
+| Updates | `hermes profile update` puxa novas versões | Reenvie o arquivo |
+| Versionamento | Tags, branches, commit SHAs | Nenhum — um snapshot no tempo |
+| Custo de setup para o autor | `distribution.yaml` + `.gitignore` + um repo | Nenhum — um comando |
+| Carrega | SOUL, config, skills, cron, MCP, plugins | O mesmo, **mais** o tema e layout do desktop |
+| Feito com | `hermes profile install` / `update` | `/export` e `/import`, ou `hermes profile export` / `import` |
+
+Escolha uma **distribuição** quando o agente é um produto que você vai continuar melhorando e outras pessoas devem acompanhar: o agente interno revisado de uma equipe, um release da comunidade, o mesmo agente implantado em cinco máquinas.
+
+Escolha um **arquivo de export** quando você só quer que alguém tenha seu setup agora, ou está migrando para um laptop novo. Sem repo, sem manifest — rode `/export` no chat, entregue o arquivo, eles rodam `/import`. Veja [Exportar e importar um arquivo de profile](#export-and-import-a-profile-file).
+
+Os dois não são exclusivos. Muitos autores dogfood um profile, `/export` para um colega ter uma segunda opinião, depois publicam como distribuição quando vale versionar.
+
 ## O que isso significa
 
 Antes das distribuições, compartilhar um agente Hermes significava enviar a alguém:
@@ -65,9 +85,10 @@ Bons casos:
 
 Não é adequado:
 
-- **Você só quer fazer backup de um profile na sua máquina.** Use [`hermes profile export` / `import`](../reference/profile-commands.md#hermes-profile-export) — é para isso que servem.
-- **Você quer compartilhar API keys junto com o agente.** `auth.json` e `.env` são deliberadamente excluídos das distribuições. Cada instalador traz suas próprias credenciais.
-- **Você quer compartilhar memórias / sessões / histórico de conversa.** Isso é dado do usuário, não conteúdo de distribuição. Nunca é enviado.
+- **Você quer entregar seu setup a alguém uma vez, agora.** Uma distribuição precisa de um repo, um manifest e um `.gitignore`. `/export` não precisa de nada disso — veja [Exportar e importar um arquivo de profile](#export-and-import-a-profile-file). O mesmo para backup ou mover um profile para uma máquina nova.
+- **Você quer compartilhar seu tema e layout do desktop.** Uma distribuição carrega o agente — SOUL, config, skills, cron, MCP, plugins. Um export feito do app desktop também carrega a aparência: skin, modo light/dark, temas custom, cor da rail e layout da janela.
+- **Você quer compartilhar API keys junto com o agente.** `auth.json` e `.env` são deliberadamente excluídos das distribuições. Cada instalador traz suas próprias credenciais. (Arquivos de export também os removem.)
+- **Você quer compartilhar memórias / sessões / histórico de conversa.** Isso é dado do usuário, não conteúdo de distribuição. Nunca é enviado. (Arquivos de export são diferentes aqui — leia [o que um arquivo de export contém](#what-an-export-file-contains) antes de enviar um.)
 
 :::caution
 **O Hermes não controla git.** As exclusões de arquivo descritas nesta página são aplicadas pelo **instalador** quando alguém executa `hermes profile install` ou `hermes profile update`. **Não** são aplicadas quando você executa `git add` ou `git commit`.
@@ -79,7 +100,7 @@ Abaixo está o fluxo end-to-end completo. Escolha o lado que importa para você.
 
 ---
 
-## Para autores: publicando uma distribuição
+## Para autores: publicando uma distribuição {#for-authors-publishing-a-distribution}
 
 ### Passo 1 — Comece de um profile funcional
 
@@ -594,6 +615,77 @@ hermes profile install ~/.hermes/profiles/research-bot --name research-bot-test
 
 ---
 
+## Exportar e importar um arquivo de profile {#export-and-import-a-profile-file}
+
+Quando você não precisa de versionamento, pule o repo. `/export` empacota um profile em um único `.tar.gz`; `/import` desempacota como um profile novo no outro lado. Credenciais são removidas na saída.
+
+### Export {#export}
+
+Na CLI, TUI ou chat do desktop:
+
+```
+/export                          # the active profile → <name>.tar.gz
+/export research-bot             # a named profile
+/export research-bot -o ~/Desktop/research-bot.tar.gz
+```
+
+Ou de um shell, mesma maquinaria:
+
+```bash
+hermes profile export research-bot
+hermes profile export research-bot -o ./research-bot.tar.gz
+```
+
+No **app desktop** há três portas, todas desembocando em um save dialog nativo:
+
+- **⌘K → Export profile…**
+- Clique direito num quadrado de profile na rail da sidebar → **Export profile…**
+- O botão de import ao lado do **+** da rail cobre a outra direção
+
+Um export do desktop adiciona um arquivo extra que a CLI não tem: `desktop.json`, carregando sua skin, modo light/dark, quaisquer definições de tema custom que a skin precise, a cor da rail do profile e seu layout de janela. Por isso um profile compartilhado pelo desktop chega *parecendo* o seu, não só se comportando como o seu.
+
+### Import {#import}
+
+```
+/import ~/Downloads/research-bot.tar.gz
+/import ~/Downloads/research-bot.tar.gz --name research-bot-2
+```
+
+```bash
+hermes profile import ./research-bot.tar.gz
+hermes profile import ./research-bot.tar.gz --name research-bot-2
+```
+
+O nome do profile é inferido do archive a menos que você passe `--name`. Importar sobre um profile existente é recusado — renomeie ou delete o antigo primeiro. Um shell wrapper (`research-bot` → `hermes -p research-bot`) é criado quando o nome não colide com um comando existente.
+
+Importar no app desktop também aplica o overlay `desktop.json` e te coloca no profile novo em um chat fresh. Importar um archive feito no desktop pela CLI é ok — o arquivo overlay fica no disco e aplica na próxima vez que você abrir aquele profile no desktop.
+
+:::note
+Você não pode importar como `default` — esse nome é o profile root embutido (`~/.hermes`). Passe `--name something-else`.
+:::
+
+### O que um arquivo de export contém {#what-an-export-file-contains}
+
+Sempre excluídos, ambos tipos de profile: `auth.json` e `.env`. Suas API keys nunca saem da máquina.
+
+**O profile default** (`~/.hermes`) é exportado via allow-list — só artefatos conhecidos do Hermes, então um arquivo não relacionado sentado no seu home directory não é varrido:
+
+`config.yaml`, `SOUL.md`, `MEMORY.md`, `USER.md`, `todo.json`, `system_prompt.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `skills/`, `plugins/`, `cron/`, `scripts/`, `sessions/`, `memories/`, `knowledge/`, `preferences/`, e `desktop.json` quando o desktop staged um.
+
+**Um profile nomeado** (`~/.hermes/profiles/<name>`) copia o diretório inteiro menos `auth.json` / `.env`. Isso é mais amplo — se o profile tem `state.db`, logs ou caches, eles entram no archive também, e o arquivo fica grande.
+
+:::caution Leia seu archive antes de enviar
+Um export é um snapshot do seu profile, não um release curado. Diferente de uma distribuição, **pode** incluir `memories/`, `sessions/` e `USER.md` — e nada faz scan de skills, memórias ou da sua persona por qualquer coisa pessoal que você tenha escrito nelas. Credenciais são filtradas por nome de arquivo; conteúdo não.
+
+Antes de compartilhar com outra pessoa, liste o que está dentro:
+
+```bash
+tar -tzf research-bot.tar.gz | less
+```
+
+Se carrega histórico de conversa que você preferiria não entregar, publique uma [distribuição](#for-authors-publishing-a-distribution) em vez disso — essas nunca enviam memórias ou sessões.
+:::
+
 ## O que NUNCA está em uma distribuição {#whats-not-in-a-distribution-ever}
 
 O instalador hard-exclui estes caminhos mesmo se um autor enviar por acidente. Nenhuma opção de config permite sobrescrever — a guarda de segurança é invariante testada por regressão:
@@ -645,7 +737,8 @@ A versão curta:
 
 - [Profiles: Running Multiple Agents](./profiles.md) — o conceito base
 - [Profile Commands reference](../reference/profile-commands.md) — toda flag, toda opção
-- [`hermes profile export` / `import`](../reference/profile-commands.md#hermes-profile-export) — backup / restore local (não distribuição)
+- [`hermes profile export` / `import`](../reference/profile-commands.md#hermes-profile-export) — a forma CLI de [arquivos de export](#export-and-import-a-profile-file)
+- [Slash Commands reference](../reference/slash-commands.md) — `/export`, `/import` e todo outro comando in-chat
 - [Using SOUL with Hermes](../guides/use-soul-with-hermes.md) — autoria de personalidades
 - [Personality & SOUL](./features/personality.md) — como SOUL se encaixa no agente
 - [Skills catalog](../reference/skills-catalog.md) — skills que você pode embutir

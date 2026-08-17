@@ -305,6 +305,24 @@ idêntica e captura de skill quase idêntica à revisão no modelo principal.
 Deixe em `auto` (ou defina para seu modelo principal) e nada muda — a
 revisão continua no modelo principal com replay completo do cache quente.
 
+### Desabilitando revisões automáticas (`enabled`) {#disabling-automatic-reviews-enabled}
+
+O fork de revisão pode queimar uma parcela significativa dos tokens totais em hosts
+ocupados. Operadores podem desabilitá-lo sem zerar intervalos de nudge:
+
+```yaml
+auxiliary:
+  background_review:
+    enabled: true              # false = skip automatic post-turn forks
+```
+
+Com `enabled: false`, forks automáticos pós-turno não spawnam; `/refine`
+manual ainda funciona.
+
+Uso do fork é persistido em `session_model_usage` com `task='background_review'`
+e uma linha de completion é escrita em `agent.log`
+(`Background review complete: thread=bg-review calls=… in=… out=… result=…`).
+
 ## Controlando escritas de skills (`skills.write_approval`) {#controlling-skill-writes-skillswrite_approval}
 
 Skills usam o mesmo gate liga/desliga, mas a UX de revisão difere porque um

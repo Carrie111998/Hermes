@@ -15,7 +15,7 @@ Você precisa de pelo menos uma forma de se conectar a um LLM. Use `hermes model
 | Provedor | Configuração |
 |----------|-------|
 | **Nous Portal** | `hermes model` (OAuth, baseado em assinatura) |
-| **OpenAI Codex** | `hermes model` (OAuth do ChatGPT, usa modelos Codex) |
+| **OpenAI Codex** | `hermes model` → **ChatGPT or Codex Subscription** (OAuth do ChatGPT, usa modelos Codex) |
 | **GitHub Copilot** | `hermes model` (fluxo OAuth de código de dispositivo, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, ou `gh auth token`) |
 | **GitHub Copilot ACP** | `hermes model` (inicia `copilot --acp --stdio` localmente) |
 | **Anthropic** | `hermes model` (Claude Max + créditos de uso extra via OAuth; também suporta chave de API da Anthropic ou setup-token manual — veja a nota abaixo) |
@@ -37,6 +37,7 @@ Você precisa de pelo menos uma forma de se conectar a um LLM. Use `hermes model
 | **Xiaomi MiMo** | `XIAOMI_API_KEY` em `~/.hermes/.env` (provedor: `xiaomi`, aliases: `mimo`, `xiaomi-mimo`) |
 | **Tencent TokenHub** | `TOKENHUB_API_KEY` em `~/.hermes/.env` (provedor: `tencent-tokenhub`, aliases: `tencent`, `tokenhub`, `tencentmaas`) |
 | **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` em `~/.hermes/.env` (provedor: `opencode-zen`) |
+| **CommandCode** | `COMMANDCODE_API_KEY` em `~/.hermes/.env` (provedor: `commandcode`, alias: `commandcode-chat`; modelos Claude via `commandcode-anthropic`, alias: `commandcode-claude`). Funciona com planos GOAT/Pro/Max/Provider (não o plano Go de $1 — sem acesso à API). |
 | **OpenCode Go** | `OPENCODE_GO_API_KEY` em `~/.hermes/.env` (provedor: `opencode-go`) |
 | **DeepSeek** | `DEEPSEEK_API_KEY` em `~/.hermes/.env` (provedor: `deepseek`) |
 | **Hugging Face** | `HF_TOKEN` em `~/.hermes/.env` (provedor: `huggingface`, aliases: `hf`) |
@@ -82,7 +83,7 @@ Ainda não tem uma assinatura? Adquira uma em [portal.nousresearch.com/manage-su
 :::info Nota sobre o Codex
 O provedor OpenAI Codex se autentica via código de dispositivo (abra uma URL, digite um código). O Hermes armazena as credenciais resultantes em seu próprio repositório de autenticação em `~/.hermes/auth.json` e pode importar credenciais existentes da CLI do Codex a partir de `~/.codex/auth.json`, quando presentes. Nenhuma instalação da CLI do Codex é necessária.
 
-Se uma renovação de token falhar com um erro terminal (HTTP 4xx, `invalid_grant`, concessão revogada, etc.), o Hermes marca o token de refresh como morto e para de reproduzi-lo, para que você não veja uma enxurrada de falhas de autenticação idênticas. A próxima requisição exibe uma mensagem tipada de reautenticação. Execute `hermes auth add openai-codex` (ou `hermes model` → OpenAI Codex) para iniciar um novo login por código de dispositivo; a quarentena é liberada na próxima troca bem-sucedida.
+Se uma renovação de token falhar com um erro terminal (HTTP 4xx, `invalid_grant`, concessão revogada, etc.), o Hermes marca o token de refresh como morto e para de reproduzi-lo, para que você não veja uma enxurrada de falhas de autenticação idênticas. A próxima requisição exibe uma mensagem tipada de reautenticação. Execute `hermes auth add openai-codex` (ou `hermes model` → **ChatGPT or Codex Subscription**) para iniciar um novo login por código de dispositivo; a quarentena é liberada na próxima troca bem-sucedida.
 :::
 
 :::warning
@@ -1213,6 +1214,28 @@ custom_providers:
     api_mode: anthropic_messages  # para proxies compatíveis com Anthropic
 ```
 
+Cada entrada aceita: `api` (a URL base do endpoint — `base_url`/`url` são aliases aceitos), `name` (nome de exibição opcional; default para a chave do dict), `key_env` ou `api_key` inline ou `key_cmd` (veja abaixo), `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, e `enabled: false` para ocultar uma entrada sem deletá-la.
+
+#### Credenciais geradas por comando (`key_cmd`) {#command-minted-credentials-key_cmd}
+
+Gateways enterprise frequentemente emitem bearer tokens de curta duração (brokers SSO/OIDC, IAM de cloud, proxies internos de auth) em vez de API keys estáticas, então um token copiado para `.env` fica stale mid-session e as requests começam a retornar 401. `key_cmd` nomeia um comando que *imprime* um token; o Hermes o executa e cacheia o resultado até pouco antes da expiração, então sessões longas continuam funcionando sem restart:
+
+```yaml
+providers:
+  my-gateway:
+    base_url: "https://gateway.internal.example.com/v1"
+    api_mode: chat_completions
+    key_cmd: "my-auth-cli print-token --profile prod"
+```
+
+Funciona com qualquer helper que imprima um token — `databricks auth token`, `gcloud auth print-access-token`, `az account get-access-token`, `vault read`, ou scripts `apiKeyHelper` estilo Claude Code.
+
+O comando deve imprimir **somente** o token no stdout: ou bare, ou como JSON com um campo `access_token` (`expires_in` é honrado; timestamps ISO absolutos `expiry`/`expiresOn` também). Output multilinha é rejeitado em vez de adivinhado. Se nenhuma expiração for anunciada, o token é re-gerado numa janela limitada.
+
+Precedência: uma flag explícita `--api-key` ainda vence; caso contrário `key_cmd` bate um `api_key`/`key_env` estático na mesma entrada. A credencial gerada se aplica tanto ao turno principal do agente quanto a tarefas auxiliares (geração de título, compressão, visão, embedding).
+
+Não confundir com `secrets.command`, que roda um helper **uma vez no startup** para popular env vars process-wide. Use isso para um helper de vault/keychain devolvendo muitos secrets; use `key_cmd` quando a credencial de um provider precisa ser re-gerada *durante* uma sessão.
+
 Alguns endpoints compatíveis com OpenAI precisam de campos específicos do provedor no corpo da requisição. Adicione um mapa `extra_body` ao provedor personalizado correspondente e o Hermes o mesclará em cada requisição de chat-completions para esse endpoint:
 
 ```yaml
@@ -1491,7 +1514,7 @@ fallback_model:
 
 Quando ativado, o fallback troca o modelo e o provedor no meio da sessão sem perder sua conversa. A cadeia é tentada entrada por entrada; a ativação é única por sessão.
 
-Provedores suportados: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `azure-foundry`, `opencode-zen`, `opencode-go`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `custom`.
+Provedores suportados: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `azure-foundry`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `custom`.
 
 :::tip
 O fallback é configurado exclusivamente através de `config.yaml` — ou interativamente via `hermes fallback`. Para detalhes completos sobre quando ele é acionado, como a cadeia avança e como interage com tarefas auxiliares e delegação, veja [Provedores de Fallback](/user-guide/features/fallback-providers).

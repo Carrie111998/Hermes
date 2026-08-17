@@ -105,6 +105,26 @@ A landing page mostra uma visão ao vivo da sua instalação:
 
 A página de status atualiza automaticamente a cada 5 segundos.
 
+#### Banner de pressão de recursos {#resource-pressure-banner}
+
+Quando o host está com pouca memória ou disco, um banner aparece no topo do
+dashboard (alimentado pelo mesmo poll de status — sem requests extra):
+
+- **"Your agent is almost out of memory and may restart"** — a memória disponível
+  do sistema caiu para níveis *elevated* (< 128 MiB ou < 15%) ou *critical*
+  (< 64 MiB ou < 5%), conforme amostrado pelo heartbeat de 30 segundos do gateway.
+- **"Your agent restarted unexpectedly, most likely because it ran out of
+  memory"** — o ledger de lifecycle registrou uma saída unclean sob pressão
+  de memória no boot anterior (um suspected OOM kill).
+- **Avisos de disco** — o volume que contém `~/.hermes` está quase cheio
+  (*elevated* abaixo de 512 MB livres, *critical* abaixo de 256 MB livres).
+
+Só o aviso ativo mais severo aparece de cada vez (disk critical > memory
+critical > OOM restart > disk elevated > memory elevated). Dismissals são
+escopados ao boot atual do gateway: dispensar um aviso revela o próximo
+ativo, um restart do gateway ou uma escalada (elevated → critical) reabre
+o aviso, e um heartbeat stale não renderiza nada em vez de um alerta espúrio.
+
 ### Chat {#chat}
 
 A aba **Chat** embute o TUI completo do Hermes (a mesma interface que você obtém com `hermes --tui`) diretamente no browser. Tudo que você pode fazer no TUI de terminal — slash commands, seletor de model, cards de tool call, streaming markdown, prompts clarify/sudo/approval, theming de skin — funciona de forma idêntica aqui, porque o dashboard roda o binário real do TUI e renderiza sua saída ANSI via [xterm.js](https://xtermjs.org/) com o renderer WebGL para layout de células pixel-perfect.
@@ -413,6 +433,29 @@ chat sob o profile selecionado.
 ### GET /api/status {#get-apistatus}
 
 Retorna versão do agent, status do gateway, estados das plataformas e contagem de sessões ativas.
+
+A resposta também carrega dois blocos consultivos de recurso (nunca afetam o
+veredito de saúde `components`/`overall`):
+
+- **`memory`** — destilado do heartbeat de 30 segundos do gateway e do
+  ledger de lifecycle. Campos: `pressure` (`ok` / `elevated` / `critical` /
+  `unknown`), `gateway_rss_mb`, `system_total_mb`, `system_available_mb`,
+  `swap_used_mb`, `sampled_at`, `boot_id`, `last_boot_unclean`,
+  `last_boot_suspected_oom`. Pressão é `elevated` abaixo de 128 MiB (ou 15%) de
+  memória de sistema disponível e `critical` abaixo de 64 MiB (ou 5%) — os mesmos
+  níveis em que uma saída unclean subsequente seria marcada como suspected
+  OOM kill. Heartbeats com mais de 150 segundos (ou datados no futuro) mantêm
+  seus números mas degradam `pressure` para `unknown`, então a última amostra
+  de um gateway morto não pode se passar por leitura ao vivo.
+- **`disk`** — uma amostra ao vivo de `shutil.disk_usage()` do volume que contém
+  `~/.hermes`. Campos: `pressure`, `free_mb`, `total_mb`, `used_percent`,
+  `sampled_at`. Pressão é `elevated` abaixo de 512 MB livres (ou ≥85% usados com
+  menos de 4 GB de folga) e `critical` abaixo de 256 MB livres (ou ≥95% usados com
+  menos de 1 GB de folga).
+
+Ambos os coletores são fail-safe: qualquer erro de amostragem degrada o bloco para
+`{"pressure": "unknown"}` em vez de falhar o endpoint de status. Os números
+são grosseiros (MB inteiros, percentuais inteiros) já que `/api/status` é público.
 
 ### GET /api/sessions {#get-apisessions}
 

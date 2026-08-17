@@ -75,7 +75,7 @@ De cima a baixo, em ordem:
 6. **`uv pip install` em camadas** — tenta `.[all]` primeiro, faz fallback para conjuntos progressivamente menores (`[messaging,dashboard,ext]` → `[messaging]` → `.`) se uma dep `git+https` falhar com rate limit no GitHub. Evita o modo de falha "um flake te deixa com instalação mínima".
 7. **Auto-instala SDKs de mensagens** conforme `.env` — se `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` / `WHATSAPP_ENABLED` estiverem presentes, executa `python -m ensurepip --upgrade` e `pip install` direcionados para que o SDK de cada plataforma seja importável de fato.
 8. **Define `HERMES_GIT_BASH_PATH`** para o `bash.exe` resolvido, para o Hermes encontrá-lo deterministicamente em shells novos.
-9. **Adiciona `%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts` ao User PATH e define `HERMES_HOME=%LOCALAPPDATA%\hermes`** — expõe o comando `hermes` (e aponta para seu dir de dados) depois que você abrir um terminal novo.
+9. **Adiciona `%LOCALAPPDATA%\hermes\hermes-agent\bin` ao User PATH e define `HERMES_HOME=%LOCALAPPDATA%\hermes`** — expõe o comando `hermes` (e aponta para seu dir de dados) depois que você abrir um terminal novo. Só os launchers `hermes.exe` / `hermes-acp.exe` são copiados para este diretório `bin`; o `venv\Scripts` completo é deliberadamente **não** colocado no PATH para o Hermes nunca ofuscar seu próprio comando `python`.
 10. **Executa `hermes setup`** — o wizard normal de primeira execução (modelo, provedor, toolsets). Pule com `-SkipSetup`.
 
 :::tip Pule a caça a chaves de API no Windows
@@ -202,7 +202,7 @@ Serviços exigem direitos de admin para instalar e amarram o ciclo de vida do ga
 
 | Path | Contents |
 |---|---|
-| `%LOCALAPPDATA%\hermes\hermes-agent\` | Git checkout + venv. `venv\Scripts\hermes.exe` is the command added to User PATH. Safe to `Remove-Item -Recurse` and reinstall. |
+| `%LOCALAPPDATA%\hermes\hermes-agent\` | Git checkout + venv. O launcher `bin\hermes.exe` (copiado de `venv\Scripts\hermes.exe`) é o comando adicionado ao User PATH. Safe to `Remove-Item -Recurse` and reinstall. |
 | `%LOCALAPPDATA%\hermes\git\` | PortableGit (only if the installer provisioned it). |
 | `%LOCALAPPDATA%\hermes\node\` | Portable Node.js (only if the installer provisioned it). |
 | `%LOCALAPPDATA%\hermes\bin\` | Hermes's managed `uv.exe` (the Python manager it uses for updates). |
@@ -224,12 +224,12 @@ A ferramenta de browser usa `agent-browser` (helper Node) para dirigir Chromium.
 
 ### PATH após instalação
 
-O instalador adiciona `%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts` ao seu **User PATH** via `[Environment]::SetEnvironmentVariable`. Terminais existentes não pegam isso — abra uma janela PowerShell nova (ou aba do Windows Terminal) após a instalação. Feche e reabra; não faça `$env:PATH += …` manualmente a menos que saiba o que está fazendo.
+O instalador adiciona `%LOCALAPPDATA%\hermes\hermes-agent\bin` ao seu **User PATH** via `[Environment]::SetEnvironmentVariable`. Terminais existentes não pegam isso — abra uma janela PowerShell nova (ou aba do Windows Terminal) após a instalação. Feche e reabra; não faça `$env:PATH += …` manualmente a menos que saiba o que está fazendo.
 
 Verifique:
 
 ```powershell
-Get-Command hermes        # should print C:\Users\<you>\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe
+Get-Command hermes        # should print C:\Users\<you>\AppData\Local\hermes\hermes-agent\bin\hermes.exe
 hermes --version
 ```
 
@@ -288,7 +288,7 @@ Consequência: qualquer caminho que dizia "verificar se este PID está vivo" via
 ## Armadilhas comuns
 
 **`hermes: command not found` logo após instalar.**
-Abra uma janela PowerShell nova. O instalador adicionou `%LOCALAPPDATA%\hermes\bin` ao User PATH, mas shells existentes precisam reiniciar para pegar. Enquanto isso, execute `& "$env:LOCALAPPDATA\hermes\bin\hermes.cmd"`.
+Abra uma janela PowerShell nova. O instalador adicionou `%LOCALAPPDATA%\hermes\hermes-agent\bin` ao User PATH, mas shells existentes precisam reiniciar para pegar. Enquanto isso, execute `& "$env:LOCALAPPDATA\hermes\hermes-agent\bin\hermes.exe"`.
 
 **`WinError 193: %1 is not a valid Win32 application` ao executar uma ferramenta.**
 Você acertou uma invocação de script shebang que contornou o shim `.cmd`. O Hermes resolve comandos via `shutil.which(cmd, path=local_bin)` para PATHEXT pegar `.CMD` — se você invoca a ferramenta por caminho hardcoded, mude para a variante `.cmd` (ex.: `npx.cmd`, não `npx`).

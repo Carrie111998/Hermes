@@ -155,12 +155,20 @@ hermes setup
 
 ### Instale dependências Node opcionais na mão
 
-O caminho Termux testado pula o bootstrap Node/browser de propósito. Se quiser experimentar tooling de browser depois:
+O caminho Termux testado pula o bootstrap Node/browser de propósito. Se quiser experimentar tooling de browser depois, o que você precisa depende de qual backend usa:
 
-```bash
-pkg install nodejs-lts
-npm install
-```
+- **Providers de browser na nuvem** (Browserbase, Browser Use, Firecrawl) hospedam o próprio Chromium, então só o Node.js basta — o `agent-browser` resolve lazily via `npx agent-browser` no primeiro uso:
+
+  ```bash
+  pkg install nodejs-lts
+  ```
+
+- **Automação local de browser** no Termux precisa de uma instalação real de `agent-browser` — o fallback npx nu é rejeitado de propósito em modo local por ser frágil demais para anunciar como pronto:
+
+  ```bash
+  pkg install nodejs-lts
+  npm install -g agent-browser && agent-browser install
+  ```
 
 A tool de browser inclui automaticamente diretórios Termux (`/data/data/com.termux/files/usr/bin`) na busca de PATH, então `agent-browser` e `npx` são descobertos sem configuração extra de PATH.
 

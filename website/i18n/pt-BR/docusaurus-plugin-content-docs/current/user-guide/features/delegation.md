@@ -144,6 +144,23 @@ delegation:
 
 Se omitido, subagentes usam o mesmo modelo do pai.
 
+### Estratégia de custo: planner frontier, workers baratos {#cost-strategy-frontier-planner-inexpensive-workers}
+
+Decompor um problema em subtarefas bem especificadas exige julgamento de nível frontier; executar uma subtarefa que já vem com um goal claro, contexto completo e um contrato de output geralmente não. Enquanto isso, os filhos são onde os tokens vão — um lote paralelo de subagentes tipicamente queima a grande maioria dos tokens totais de uma execução, então o modelo worker é onde o custo realmente mora. Pinar `delegation.model` em um modelo barato enquanto sua sessão principal fica em um modelo frontier mantém a qualidade do planejamento onde importa e corta gasto onde o volume está:
+
+```yaml
+# ~/.hermes/config.yaml
+model:
+  default: "your-frontier-model"     # parent (planner) stays on the frontier model
+delegation:
+  model: "your-inexpensive-model"    # all delegate_task children run on this
+  provider: "openrouter"             # optional: route children to a different provider
+```
+
+Ordem de resolução: `delegation.base_url` (endpoint direto) tem precedência, depois `delegation.provider` (bundle completo de credenciais resolvido via o sistema de providers em runtime), e quando nenhum está definido os filhos herdam o provider e as credenciais do pai; `delegation.model` aplica em todos os casos, e quando está vazio os filhos herdam o modelo do pai.
+
+Note que o pin é global: `delegate_task` não tem parâmetro de modelo por tarefa, então todo filho em um lote roda no modelo de delegação configurado. Para subtarefas sensíveis a qualidade que precisam de um modelo mais forte, ou deixe `delegation.model` indefinido para aquela sessão ou entregue a tarefa ao [quadro kanban](kanban.md#per-task-model-override), que de fato suporta override de modelo por tarefa.
+
 ## Acesso herdado a ferramentas {#inherited-tool-access}
 
 `delegate_task` não aceita um parâmetro `toolsets` voltado ao modelo. Cada subagente herda os toolsets habilitados do pai, para que o modelo não possa conceder a um filho capacidades que o pai não tem. Configure as ferramentas do pai antes de iniciar a conversa se o trabalho delegado precisar de capacidades adicionais.
@@ -255,7 +272,27 @@ mostram seu tempo de quietude para distinguir "lento" de "travado" de relance.
 
 ## Direcionar um subagente em execução {#steering-a-running-subagent}
 
-Interromper um filho descarta o trabalho em andamento; muitas vezes você só quer redirecioná-lo. `steer_subagent(subagent_id, text)` em `tools/delegate_tool.py` é o espelho do lado de redirecionamento de `interrupt_subagent()`: enfileira texto em um filho vivo pelo mesmo mecanismo que [`/steer`](/reference/slash-commands) — o texto é anexado ao último resultado de ferramenta do filho no próximo limite de iteração, a chamada de ferramenta em andamento nunca é cortada, e o filho o vê como uma mensagem de usuário fora de banda. Hosts programáticos acessam via RPC de gateway `subagent.steer` com escopo de sessão, ao lado de `subagent.interrupt`:
+Interromper um filho descarta o trabalho em andamento; muitas vezes você só quer redirecioná-lo.
+
+### Do agente pai (voltado ao modelo) {#from-the-parent-agent-model-facing}
+
+O agente pai orquestra seus próprios filhos em execução com a mesma ferramenta `delegate_task` com que os gerou — sem ferramenta de controle separada:
+
+```json
+{"action": "list"}
+{"action": "steer", "subagent_id": "sa-0-1a2b3c4d", "message": "focus on pricing instead"}
+{"action": "stop",  "subagent_id": "sa-0-1a2b3c4d"}
+```
+
+- **`list`** retorna os filhos vivos da conversa: `subagent_id`, goal, status, `running_seconds`, `accepting_steer`, e o caminho da transcrição ao vivo. Ids também voltam na resposta de despacho do spawn como `subagent_ids`.
+- **`steer`** enfileira uma correção de rumo em um filho em execução sem pará-lo (semântica de entrega abaixo).
+- **`stop`** encerra um filho cedo no próximo limite de iteração; o resultado parcial ainda reentra na conversa como uma mensagem de conclusão normal.
+
+Ações de controle rodam sincronamente in-turn (nunca em background), são escopadas à árvore de spawn do próprio chamador — uma conversa nunca pode ver ou controlar filhos de outra sessão — e nunca consomem o cap de spawn de subagentes por turno, então `stop` continua funcionando mesmo depois que o cap é atingido.
+
+### Do TUI / gateway (voltado à sessão) {#from-the-tui--gateway-session-facing}
+
+`steer_subagent(subagent_id, text)` em `tools/delegate_tool.py` é o espelho do lado de redirecionamento de `interrupt_subagent()`: enfileira texto em um filho vivo pelo mesmo mecanismo que [`/steer`](/reference/slash-commands) — o texto é anexado ao último resultado de ferramenta do filho no próximo limite de iteração, a chamada de ferramenta em andamento nunca é cortada, e o filho o vê como uma mensagem de usuário fora de banda. Hosts programáticos acessam via RPC de gateway `subagent.steer` com escopo de sessão, ao lado de `subagent.interrupt`:
 
 ```json
 {"method": "subagent.steer", "params": {"session_id": "owning-ui-session", "subagent_id": "sa-0-1a2b3c4d", "text": "focus on pricing instead"}}
@@ -334,6 +371,37 @@ Para **execução durável** que deve sobreviver ao fechamento de sessão ou rei
 - Apenas o resumo final entra no contexto do pai, mantendo uso de tokens eficiente
 - Subagentes herdam a **chave de API, configuração de provedor e pool de credenciais** do pai (permitindo rotação de chave em rate limits)
 
+## Isolamento de worktree {#worktree-isolation}
+
+Por padrão, subagentes compartilham o diretório de trabalho do pai — adequado para
+pesquisa e trabalho pesado em leitura, mas filhos paralelos editando o mesmo repo
+podem colidir. Defina `delegation.worktree_isolation: true` para dar a cada filho
+seu próprio git worktree, ramificado do `HEAD` atual do repo (inspirado no
+`--subagent-worktree-isolation` do Muse Code):
+
+```yaml
+delegation:
+  worktree_isolation: true   # default: false
+```
+
+Com isolamento ligado:
+
+- Cada filho inicia seu terminal em `<repo>/.worktrees/subagent-<id>` no seu
+  próprio branch `hermes-subagent/subagent-<id>`, e a mensagem de goal diz para
+  trabalhar e commitar ali.
+- O checkout do pai permanece intacto; filhos não podem pisar nas edições uns
+  dos outros.
+- Quando um filho termina, sua entrada de resultado ganha um campo `worktree`
+  reportando `path`, `branch`, `commits` (à frente da base) e `dirty`. O pai
+  revisa ou faz merge de cada branch (`git log <branch>`, `git merge <branch>`).
+- Um worktree deixado **sem commits e com árvore limpa é podado automaticamente**
+  (`pruned: true`); qualquer um que retenha trabalho é mantido.
+
+Escopo: opt-in, só git, e só backend de terminal local. Num diretório que não é
+git, em backends docker/ssh/modal, ou se a criação do worktree falhar, a
+configuração degrada silenciosamente para o comportamento atual de workspace
+compartilhado — nunca um erro.
+
 ## Delegação vs execute_code {#delegation-vs-execute_code}
 
 | Fator | delegate_task | execute_code |
@@ -355,6 +423,7 @@ Para **execução durável** que deve sobreviver ao fechamento de sessão ou rei
 delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
   # max_concurrent_children: 3              # Parallel children per batch (default: 3)
+  # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
   model: "google/gemini-3-flash-preview"             # Optional provider/model override

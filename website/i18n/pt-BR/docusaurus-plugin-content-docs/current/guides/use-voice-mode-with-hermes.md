@@ -166,6 +166,7 @@ Se você pular essa instalação ou ela falhar, o assistente recorre ao Edge TTS
 ```yaml
 voice:
   record_key: "ctrl+b"
+  submit_mode: "direct"  # TUI: direct | draft
   max_recording_seconds: 120
   auto_tts: false
   beep_enabled: true
@@ -184,6 +185,18 @@ tts:
 ```
 
 Este é um bom padrão conservador para a maioria das pessoas.
+
+No TUI, `voice.submit_mode` controla o que acontece após a transcrição:
+
+- `direct` (padrão) envia a transcrição imediatamente.
+- `draft` coloca a transcrição no composer para você editar ou cancelar antes de pressionar Enter.
+
+Para drafts de voz editáveis, defina:
+
+```yaml
+voice:
+  submit_mode: "draft"
+```
 
 Se você quiser TTS local em vez disso, troque o bloco `tts` para:
 

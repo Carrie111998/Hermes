@@ -181,6 +181,23 @@ após update do Hermes se a versão do manifest mudou.
 Para adicionar MCP ao catálogo, abra PR contra
 [`optional-mcps/`](https://github.com/NousResearch/hermes-agent/tree/main/optional-mcps).
 
+### Metadados de sugestão (`suggest:`) {#suggestion-metadata-suggest}
+
+Um manifest pode declarar um bloco opcional `suggest:` com listas `keywords:` e/ou
+`hosts:`. Superfícies de UI (atualmente o composer do app Desktop) usam isso para
+oferecer uma pílula de um clique "Add &lt;server&gt;" quando seu rascunho menciona uma das
+keywords como palavra completa, ou contém um link colado cujo hostname termina
+com um dos sufixos de host. É puramente consultivo — installs ainda fluem
+pelos mesmos caminhos validados de catálogo/config — e a maioria das entradas
+hosted remotas (Atlassian, Sentry, Notion, Stripe, Vercel, Supabase e amigos)
+o declara.
+
+GitHub deliberadamente **não** está no catálogo: o MCP hosted dele exige que cada
+cliente traga seu próprio OAuth app (registro dinâmico genérico de client é
+rejeitado), e as skills bundled `github/*` do Hermes dirigindo a CLI `gh` são uma
+integração mais capaz. No Desktop, menções ao GitHub em vez disso oferecem a
+skill `github-auth` quando `gh` ainda não está logado.
+
 ## Dois tipos de servidores MCP {#two-kinds-of-mcp-servers}
 
 ### Servidores stdio {#stdio-servers}
@@ -437,6 +454,13 @@ Exemplos:
 | `my-api` | `query.data` | `mcp_my_api_query_data` |
 
 Na prática, você normalmente não precisa chamar o nome prefixado manualmente — o Hermes vê a ferramenta e a escolhe durante raciocínio normal.
+
+### Sanitização de tool-result e `_meta` {#tool-result-sanitization-and-_meta}
+
+Dois comportamentos se aplicam a todo resultado de ferramenta MCP antes do modelo vê-lo:
+
+- **Caracteres Unicode TAG invisíveis são stripped.** Caracteres na faixa U+E0000–U+E007F renderizam como nada em terminais e UIs de chat mas são plenamente visíveis ao modelo — um canal clássico de prompt-injection smuggling para um servidor malicioso ou comprometido. O Hermes os stripa de resultados de ferramenta, conteúdo de resource e descrições de ferramenta. Sequências legítimas de emoji tag (bandeiras regionais como 🏴󠁧󠁢󠁳󠁣󠁴󠁿) são preservadas.
+- **`_meta` de vendor é exposto; chaves reservadas do protocolo não.** Quando um servidor anexa um mapping `_meta` a um resultado de ferramenta (namespaces de vendor como `com.example/handoff`), o Hermes o passa ao modelo junto com o conteúdo do resultado. Chaves sob prefixos reservados do protocolo — um label `modelcontextprotocol` ou `mcp` seguido de outro label, ex. `modelcontextprotocol.io/...` ou `tools.mcp.com/...` — são dropped, casando com as regras de nome de chave do spec MCP. Se nada voltado ao modelo permanecer, o campo `_meta` é omitido por completo.
 
 ## Ferramentas utilitárias MCP {#mcp-utility-tools}
 

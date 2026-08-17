@@ -239,9 +239,11 @@ Skills modificadas pelo usuário nunca são sobrescritas.
 hermes profile list           # mostra todos os profiles com status
 hermes profile show coder     # info detalhada de um profile
 hermes profile rename coder dev-bot   # renomeia (atualiza alias + serviço)
-hermes profile export coder   # exporta para coder.tar.gz
-hermes profile import coder.tar.gz   # importa de archive
+hermes profile export coder   # empacota em coder.tar.gz (compartilhável; keys removidas)
+hermes profile import coder.tar.gz   # instala um archive como profile novo
 ```
+
+No chat, os mesmos dois vivem como `/export` e `/import` — e no app desktop como **⌘K → Export/Import profile…**. Veja [Compartilhando um profile](#sharing-a-profile).
 
 ## Deleting a profile {#deleting-a-profile}
 
@@ -303,9 +305,19 @@ o home real da conta quando `home_mode: profile` está ativo.
 
 O profile padrão é simplesmente o próprio `~/.hermes`. Nenhuma migração necessária — instalações existentes funcionam de forma idêntica.
 
-## Sharing profiles as distributions {#sharing-profiles-as-distributions}
+## Compartilhando um profile {#sharing-a-profile}
 
-Um profile que você construiu em uma máquina pode ser empacotado como um **repositório git** e instalado com um comando em outra máquina — sua própria workstation, o laptop de um colega ou o ambiente de um usuário da comunidade. O pacote compartilhado inclui SOUL, config, skills, cron jobs e conexões MCP. Credenciais, memórias e sessões permanecem por máquina.
+Um profile que você construiu em uma máquina pode ir para outra — sua própria workstation, o laptop de um colega, ou a comunidade. Dois caminhos:
+
+**Envie um arquivo.** `/export` empacota o profile num `.tar.gz` — skills, memória, persona, crons, plugins, settings, e (pelo desktop) seu tema e layout. API keys são removidas. O destinatário roda `/import`.
+
+```bash
+# In chat, run /export, hand over the file, and they run /import on it
+hermes profile export coder
+hermes profile import ./coder.tar.gz --name coder
+```
+
+**Publique uma distribution.** Empacote o profile como um **repositório git** para destinatários instalarem com um comando e puxarem updates versionados depois. Carrega SOUL, config, skills, cron jobs e conexões MCP; credenciais, memórias e sessões permanecem por máquina.
 
 ```bash
 # Instalar um agente completo de um repo git
@@ -315,4 +327,4 @@ hermes profile install github.com/you/research-bot --alias
 hermes profile update research-bot
 ```
 
-Veja **[Profile Distributions: Share a Whole Agent](./profile-distributions.md)** para o guia completo — autoria, publicação, semântica de update, modelo de segurança e casos de uso.
+Use um arquivo de export para uma entrega one-time ou uma mudança de máquina; use uma distribution para um agente que você vai continuar lançando. Veja **[Profile Distributions: Share a Whole Agent](./profile-distributions.md)** para ambos — a tabela de comparação, autoria, publicação, semântica de update e o modelo de segurança.

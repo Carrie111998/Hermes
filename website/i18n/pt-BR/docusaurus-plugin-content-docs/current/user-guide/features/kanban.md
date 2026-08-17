@@ -14,7 +14,7 @@ O Hermes Kanban é um board de tarefas durável, compartilhado entre todos os se
 
 O board tem duas portas, ambas respaldadas pelo mesmo `~/.hermes/kanban.db`:
 
-- **Agents dirigem o board por um toolset `kanban_*` dedicado** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`, `kanban_unblock`. O dispatcher spawna cada worker com essas ferramentas já no schema; profiles orchestrator também podem habilitar o toolset `kanban` explicitamente. O model lê e roteia tarefas chamando ferramentas diretamente, *não* fazendo shell out para `hermes kanban`. Veja [Como workers interagem com o board](#how-workers-interact-with-the-board) abaixo.
+- **Agents dirigem o board por um toolset `kanban_*` dedicado** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. O dispatcher spawna cada worker com essas ferramentas já no schema; profiles orchestrator também podem habilitar o toolset `kanban` explicitamente. O model lê e roteia tarefas chamando ferramentas diretamente, *não* fazendo shell out para `hermes kanban`. Veja [Como workers interagem com o board](#how-workers-interact-with-the-board) abaixo.
 - **Você (e scripts, e cron) dirigem o board via `hermes kanban …`** na CLI, `/kanban …` como slash command, ou o dashboard. São para humanos e automação — os lugares sem tool-calling de model por trás.
 
 Ambas as superfícies passam pela mesma camada `kanban_db`, então leituras veem vista consistente e escritas não drift. O resto desta página mostra exemplos CLI porque são fáceis de copiar e colar, mas todo verbo CLI tem equivalente em tool-call que o model usa.
@@ -59,7 +59,7 @@ Coexistem: um worker kanban pode chamar `delegate_task` internamente durante sua
   (ex.: um por projeto, repo ou domínio); veja [Boards (multi-project)](#boards-multi-project)
   abaixo. Usuários de projeto único ficam no board `default` e nunca veem a
   palavra "board" fora desta seção de docs.
-- **Task** — linha com title, body opcional, um assignee (nome de profile), status (`triage | todo | ready | running | blocked | done | archived`), tenant namespace opcional, idempotency key opcional (dedup para automação retentada).
+- **Task** — linha com title, body opcional, um assignee (nome de profile), status (`triage | todo | ready | running | blocked | review | done | archived`), tenant namespace opcional, idempotency key opcional (dedup para automação retentada).
 - **Link** — linha `task_links` registrando dependência parent → child. O dispatcher promove `todo → ready` quando todos os parents estão `done`.
 - **Comment** — protocolo inter-agent. Agents e humanos anexam comments; quando um worker é (re-)spawnado, lê a thread completa de comments como parte do contexto.
 - **Workspace** — diretório em que um worker opera. Três tipos:
@@ -227,6 +227,9 @@ no próximo tick (60s por padrão).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  review_dispatch: true            # default: spawn the assigned profile with
+                                   # the bundled sdlc-review skill. Set false
+                                   # for human-only review boards.
 ```
 
 Override da flag de config em runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -266,10 +269,11 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
 :::note Onde uma tarefa desbloqueada cai
-`unblock` em si só move uma tarefa para **`ready`** (todos os parents `done`) ou
-**`todo`** (um parent ainda aberto — a tarefa está dependency-gated e o
-dispatcher auto-promove quando o parent termina). Nunca roteia para
-`triage`.
+`unblock` restaura a fase source segura: **`review`** para trabalho originado de reviewer
+cujos parents estão complete, **`ready`** para trabalho de implementação cujos parents
+estão complete, ou **`todo`** enquanto algum parent permanece aberto. Uma tarefa `todo` mantém
+sua proveniência de source-phase e retorna a `review` ou `ready` automaticamente
+quando o gate de dependência limpa. `unblock` nunca roteia diretamente para `triage`.
 
 Se você desbloqueia uma tarefa e ela depois aparece em **`triage`**, o unblock não
 foi o que a colocou lá. Um *re-block subsequente pela mesma razão* foi: depois que uma tarefa
@@ -293,12 +297,17 @@ inacabado, input faltando, capability não atendida) antes de desbloquear, ou su
 | `kanban_show` | Lê a tarefa atual (title, body, tentativas anteriores, handoffs de parent, comments, `worker_context` pré-formatado completo). Default para o task id do env. | — |
 | `kanban_list` | Lista summaries de tarefas com filtros de `assignee`, `status`, `tenant`, visibilidade archived e limit. Destinado a orchestrators descobrindo trabalho no board. | — |
 | `kanban_complete` | Termina com handoff estruturado `summary` + `metadata`. | pelo menos um de `summary` / `result` |
+| `kanban_request_review` | Inicia review no mesmo card com `summary` durável, `metadata` opcional e profile reviewer opcional. A tarefa vai para `review`; isto não é um block. | `summary` |
+| `kanban_request_changes` | Veredito do reviewer de uma run de review ativa. Fecha essa run, reaplica gating de parent, e roteia a tarefa ao implementer original sem accounting de block-loop. | `reason` |
 | `kanban_block` | Para trabalho e roteia pelo porquê: `kind=dependency` (espera em `todo`, auto-resume), `needs_input`/`capability`/`transient` (superfície para humano). Re-blocks repetidos do mesmo kind auto-escalam para `triage`. | `reason` |
 | `kanban_heartbeat` | Sinaliza vivacidade durante operações longas. Side-effect puro. | — |
 | `kanban_comment` | Anexa nota durável à thread da tarefa. | `task_id`, `body` |
+| `kanban_attach` | Anexa um arquivo à tarefa passando seus bytes inline (base64); armazenado no dir de attachments da tarefa (cap 25 MB). | file bytes + name |
+| `kanban_attach_url` | Anexa um arquivo à tarefa por URL. | `url` |
+| `kanban_attachments` | Lista os attachments de uma tarefa. | — |
 | `kanban_create` | (Orchestrators) fan-out em tarefas filhas com `assignee`, `parents`, `skills` opcionais, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) adiciona aresta de dependência `parent_id → child_id` depois do fato. | `parent_id`, `child_id` |
-| `kanban_unblock` | (Orchestrators) move tarefa blocked para `ready` quando todos os parents estão done, ou `todo` enquanto algum parent permanece aberto. | `task_id` |
+| `kanban_unblock` | (Orchestrators) restaura uma tarefa blocked para sua source phase (`review` ou `ready`), ou `todo` enquanto um parent permanece aberto. | `task_id` |
 
 Um turn típico de worker parece:
 
@@ -454,6 +463,42 @@ hermes kanban create "audit auth flow" \
 
 O dispatcher emite uma flag `--skills <name>` por skill listada, então o worker spawna com todas carregadas além da orientação kanban auto-injetada. Os nomes de skill devem corresponder a skills realmente instaladas no profile assignee (rode `hermes skills list` para ver o disponível); não há install em runtime.
 
+### Sobrescrita de modelo por tarefa {#per-task-model-override}
+
+Fixe o worker de uma tarefa a um modelo específico (e opcionalmente provider), independente do default do profile assignee:
+
+```bash
+# At creation
+hermes kanban create "hard refactor" --assignee coder \
+    --model claude-opus-4.6 --provider anthropic
+
+# Or later — takes effect on the next dispatch
+hermes kanban set-model t_abcd claude-opus-4.6 --provider anthropic
+hermes kanban set-model t_abcd none    # clear the override
+```
+
+O dispatcher spawna o worker com o modelo pinned (`--provider <name>` é passado quando definido; `--provider` exige um modelo). O dropdown de modelo por tarefa do dashboard dirige o mesmo campo `model_override`. Sem override, o worker usa o modelo configurado do seu profile.
+
+### Estratégia de custo: orchestrator frontier, workers baratos {#cost-strategy-frontier-orchestrator-inexpensive-workers}
+
+As configs por profile do Kanban tornam o split planner/worker de custo natural. Decompor um projeto em cards bem-escopados pede julgamento frontier; executar um card que já carrega goal, contexto e evidência de handoff claros geralmente não — e os workers são onde a vasta maioria dos tokens é gasta, então o modelo do worker é onde o custo mora. Rode seu profile orchestrator/dispatcher num modelo frontier e aponte profiles worker a modelos baratos. Cada profile tem seu próprio `config.yaml` em `~/.hermes/profiles/<name>/`, e o dispatcher injeta o `HERMES_HOME` escopado ao profile quando spawna `hermes -p <assignee>`, então cada worker lê as settings de modelo do próprio profile:
+
+```yaml
+# ~/.hermes/config.yaml (orchestrator / dispatcher profile)
+model:
+  default: "your-frontier-model"
+
+# ~/.hermes/profiles/coder/config.yaml (worker profile)
+model:
+  default: "your-inexpensive-model"
+
+# ~/.hermes/profiles/researcher/config.yaml (another worker profile)
+model:
+  default: "your-inexpensive-model"
+```
+
+Para o card ocasional sensível à qualidade, pin só aquela tarefa de volta a um modelo mais forte com a [sobrescrita de modelo por tarefa](#per-task-model-override) (`--model`/`--provider` na criação, `hermes kanban set-model` depois, ou o dropdown de modelo do dashboard) — sem editar profiles.
+
 ### Cards goal-mode (`--goal`) {#goal-mode-cards-goal}
 
 Por padrão cada worker tem **uma chance** no card — faz o trabalho, chama `kanban_complete`/`kanban_block`, sai. Passe `--goal` (CLI) ou `goal_mode=True` (tool `kanban_create` / dashboard) para rodar esse worker num **goal loop**, o mesmo engine estilo Ralph por trás do slash command `/goal`: após cada turn um judge auxiliar checa a saída do worker contra title + body do card (tratados como critérios de aceitação), e se o trabalho não está done — e o orçamento de turns resta — o worker continua **na mesma sessão** até o judge concordar, o worker terminar a tarefa, ou o orçamento acabar (o que **block** o card para review humana em vez de sair silenciosamente).
@@ -492,6 +537,8 @@ kanban_complete(
 ```
 
 A orientação orchestrator vem no system prompt do worker automaticamente — nada para instalar ou sincronizar por profile.
+
+**Decida antes de fazer fan-out.** Decisões de design pertencem ao orchestrator, não aos workers. Se dois cards paralelos teriam que escolher a mesma coisa — um esquema de nomes, um schema, um formato de arquivo, uma forma de API — o orchestrator decide uma vez e carimba a decisão no body de **ambos** os cards. Workers não veem cards irmãos, então todo body de card filho deve carregar toda decisão de que depende. Exemplo: para os cards paralelos "build the exporter" e "build the importer", não deixe cada worker inventar o próprio formato de arquivo — escolha um de antemão (digamos, JSON newline-delimited com um campo `version`) e escreva nos dois bodies, ou as duas metades nunca vão round-trip.
 
 Para melhores resultados, combine com profile cujos toolsets são restritos a operações de board (`kanban`, `gateway`, `memory`) para o orchestrator literalmente não poder executar tarefas de implementação mesmo se tentar.
 
@@ -535,6 +582,8 @@ O board kanban tem duas formas de tratar uma tarefa que você joga na coluna Tri
 
 **Manual** — `kanban.auto_decompose: false`. Tarefas triage ficam em triage até você agir. Clique **⚗ Decompose** num card, rode `hermes kanban decompose <id>` (ou `--all`), ou use `/kanban decompose <id>` de um chat. Corresponde ao comportamento pré-decomposer do board, útil quando você quer controle total sobre o que roda quando.
 
+**Fronteira importante:** O modo Manual desabilita só o decomposer Triage built-in. Não impede um profile de chamar `kanban_create`, e não desabilita wake-ups de sessão creator. Com `kanban.auto_subscribe_on_create: true`, um evento terminal de uma tarefa retoma o agente originador com um turno sintético de status para ele inspecionar o handoff e decidir se realmente precisa de follow-up novo. Set `auto_subscribe_on_create: false` quando completion de tarefa deve permanecer passivo. Para proveniência, filhos do decomposer built-in usam `created_by=auto-decomposer`; tarefas criadas por um profile retomado carregam aquele nome de profile.
+
 Alterne entre os dois modos pela pill **Orchestration: Auto/Manual** no topo da página kanban (emerald = Auto, muted gray = Manual), ou editando `config.yaml` diretamente. Ambos coexistem com `hermes kanban specify` — ainda disponível como rewrite de spec de tarefa única quando você não quer fan-out.
 
 As decisões de roteamento do decomposer dependem de profile descriptions, primitivo de labeling por profile que você seta com `hermes profile create --description "..."`, `hermes profile describe <name> --text "..."`, `hermes profile describe <name> --auto` (LLM gera a partir das skills instaladas + model do profile), ou o editor por profile do dashboard no painel expandido **Orchestration settings**. Profiles sem description ainda aparecem no roster — routable por nome, só menos precisamente. O decomposer NUNCA deixa tarefa filha com `assignee=None`: quando o LLM escolhe profile desconhecido, a filha vai para `kanban.default_assignee` (ou o profile default ativo se unset).
@@ -545,11 +594,12 @@ Knobs de config (todos sob `kanban:` em `~/.hermes/config.yaml`):
 
 | Key | Padrão | Propósito |
 |---|---|---|
-| `auto_decompose` | `true` | Dispatcher auto-roda o decomposer a cada tick. |
+| `auto_decompose` | `true` | Dispatcher auto-roda o decomposer built-in para tarefas Triage a cada tick. Não gateia chamadas `kanban_create` dirigidas por profile nem turnos de wake do creator. |
 | `auto_decompose_per_tick` | `3` | Teto de decomposições por tick do dispatcher. Excesso adia para o próximo tick. |
 | `orchestrator_profile` | `""` | Profile atribuído à tarefa root/orchestration após decomposição. Vazio = fallback para profile default ativo. |
 | `default_assignee` | `""` | Onde uma tarefa filha cai quando o LLM escolhe profile desconhecido. Vazio = fallback para default ativo. |
-| `auto_subscribe_on_create` | `true` | Quando um worker chama `kanban_create` de dentro de sessão com canal de delivery persistente (messaging gateway ou TUI), a sessão originadora é auto-inscrita nos eventos completion/block da nova tarefa. O dispatcher ainda dirige a delivery — isso só muda se o chat/key do caller aparece na tabela notify-sub. Set `false` para exigir chamadas explícitas `kanban_notify-subscribe` por tarefa. |
+| `auto_subscribe_on_create` | `true` | Quando `kanban_create` roda dentro de sessão persistente gateway/TUI, eventos terminais retomam aquele agente originador com um turno sintético de status. Set `false` para completion passivo ou para exigir chamadas explícitas `kanban_notify-subscribe`. Independente de `auto_decompose`. |
+| `done_sub_retention_days` | `30` | Subscriptions de notify sobrevivem a `done` (reopen-safe) e são removidas em `archived`. O GC do notifier purge subscriptions cuja tarefa ficou `done` sem eventos novos por estes dias, limitando crescimento da tabela de subs em boards que nunca arquivam. `0` desabilita o sweep. |
 
 E os dois slots LLM auxiliares:
 
@@ -689,6 +739,10 @@ hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
+hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
+hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
+hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
+
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
         [--kinds completed,blocked,…] [--interval SECS]
@@ -703,6 +757,7 @@ hermes kanban stats [--json]                           # per-status + per-assign
 hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.hermes/kanban/logs/
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]
+        [--chat-type dm|group|channel|thread] [--delivery-mode notify|notify+wake|wake]
 hermes kanban notify-list [<id>] [--json]
 hermes kanban notify-unsubscribe <id>
         --platform <name> --chat-id <id> [--thread-id <id>]
@@ -773,7 +828,7 @@ hermes kanban swarm "Design a multi-region failover plan" \
   --verifier reviewer --synthesizer writer
 ```
 
-O grafo resultante dispatch normalmente — workers rodam em paralelo, o verifier acorda depois que todos terminam, o synthesizer acorda depois que o verifier marca o trabalho limpo.
+O grafo resultante é commitado atomicamente: dispatchers e leitores de dashboard veem ou nenhum swarm novo ou a topologia completa, nunca um grafo root/worker/verifier parcialmente linkado. Depois dispatch normalmente — workers rodam em paralelo, o verifier acorda depois que todos terminam, e o synthesizer acorda depois que o verifier marca o trabalho limpo.
 
 ## Comando slash `/kanban` {#kanban-slash-command}
 
@@ -817,7 +872,9 @@ bot> ✓ t_9fc1a3 completed by transcriber
      transcribed 42 minutes, saved to podcast/2026-05-04.md
 ```
 
-Subscriptions auto-remove quando a tarefa atinge `done` ou `archived`. Se você scripta create com `--json` (saída machine) o auto-subscribe é pulado — assume-se que callers scriptados querem gerenciar subscriptions explicitamente via `/kanban notify-subscribe`.
+Subscriptions sobrevivem a uma tarefa atingir `done` — completion é reversível (um reviewer ou controller pode reabrir uma tarefa done), então a sessão origin continua recebendo notify através de ciclos reopen. Elas auto-remove em `archived` (o estado final irreversível). Em boards que nunca arquivam, um sweep GC purge subscriptions de tarefas que ficaram em `done` sem atividade nova por `kanban.done_sub_retention_days` dias (padrão 30; set 0 para desabilitar), então rows stale não acumulam para sempre. Se você scripta create com `--json` (saída machine) o auto-subscribe é pulado — assume-se que callers scriptados querem gerenciar subscriptions explicitamente via `/kanban notify-subscribe`.
+
+Um auto-subscribe originado de chat é criado no modo `notify+wake`: num evento terminal o agente destino recebe a mensagem passiva **e** toma um turno real, então pode ler o contexto do board e responder na própria voz. Veja [Delivery modes](#delivery-modes) abaixo.
 
 ### Truncamento de saída em messaging {#output-truncation-in-messaging}
 
@@ -845,6 +902,76 @@ O board suporta estes oito padrões sem novos primitivos:
 
 Para exemplos trabalhados de cada um, veja `docs/hermes-kanban-v1-spec.pdf`.
 
+## Passando contexto a cards de follow-up (o link parent) {#handing-context-to-follow-up-cards-the-parent-link}
+
+Um link parent não é só um gate de agendamento — é o canal de handoff de contexto de um card **completed** para um novo. Quando você cria um card com `--parent <done-card-id>`, duas coisas acontecem:
+
+1. **Fica imediatamente elegível.** `create_task` seta status pelo estado do parent: um child cujos parents estão todos `done` é criado direto em `ready` — sem espera, sem promoção manual. (Children de parents ainda abertos ficam em `todo` até `recompute_ready` promovê-los quando o último parent termina.)
+2. **O handoff do parent segue junto.** O contexto de worker montado para o child (`build_worker_context`, o que `kanban_show()` retorna) contém uma seção `## Parent task results` com o `summary` e `metadata` de completion de cada parent, verbatim:
+
+```
+## Parent task results
+### t_77c26979 (completed just now)
+Added exponential backoff with jitter to the retry helper.
+_metadata_: `{"changed_files": ["hermes_cli/retry.py", "tests/test_retry.py"], "decisions": ["capped backoff at 60s", "jitter = full"]}`
+```
+
+Por isso o padrão para follow-up em um card finished é **um card child novo, não reabrir o card done**. Cards completed são história imutável — o contexto flui para frente pelo link parent. Rework no mesmo card (retry loops num card falhando) é um mecanismo diferente: tentativas anteriores no *mesmo* card aparecem como "prior attempts" no próprio contexto daquele card.
+
+Um worktree ou branch sozinho não é substituto: estado do repo diz ao worker de follow-up *como* o código está, mas não *por quê* — as decisões, testes rodados e arquivos tocados vivem no handoff estruturado do parent, não no git. Evidência que não existia quando o parent completou (ex.: um log de CI que falhou depois) pertence ao **body** do card novo.
+
+```bash
+# Implementation card t_impl is done. CI fails two hours later.
+hermes kanban create "Fix CI failure from t_impl: test_retry flakes on 3.11" \
+    --assignee coder \
+    --parent t_impl \
+    --body "$(cat <<'EOF'
+CI run #4812 failed after t_impl merged.
+Log excerpt: FAILED tests/test_retry.py::test_backoff_jitter - TimeoutError
+Acceptance: tests/test_retry.py green on 3.11 and 3.12 in CI.
+Use a fresh worktree/branch; do not force-push the original branch.
+EOF
+)"
+```
+
+O worker de remediação spawna com o summary e metadata do card original (arquivos mudados, decisões) já no contexto, mais a evidência fresh que você pôs no body.
+
+### Reconciliando branches de workers que colidem {#reconciling-colliding-worker-branches}
+
+Em pipelines de engineering (P1/P2 com worktrees), os branches de dois workers podem
+conflitar no merge. Não deixe nenhum worker auto-adjudicar — o agente em colisão
+não tem o contexto do peer e confiavelmente sobrescreve o outro lado ou
+abandona o próprio. Em vez disso, crie um card de reconciliação atribuído a um **terceiro
+profile neutro** com **ambos** os cards em conflito linkados como parents: os links
+parent carregam os summaries de completion de ambos os lados no contexto do reconciler, então
+ele recebe ambos os diffs *e* ambas as intents. A skill bundled
+[`merge-reconciler`](https://github.com/NousResearch/hermes-agent/blob/main/skills/autonomous-ai-agents/merge-reconciler/SKILL.md)
+dá a esse worker o procedimento completo: classificar cada hunk em conflito, resolver
+imparcialmente, verificar, e devolver um summary nomeando cada decisão.
+
+### Hotspots de colisão em campanhas paralelas {#collision-hotspots-in-parallel-campaigns}
+
+Em campanhas largas alguns arquivos viram ímãs de colisão: muitos workers cada um adiciona um
+pouco ao mesmo arquivo, ninguém dono de mantê-lo pequeno, e ele vira o
+site de merge conflicts constantes. A mitigação é uma convenção de comment, não um
+primitivo novo. Um worker que percebe que seu diff continua colidindo com irmãos em
+um arquivo — ou que um arquivo que toca continua aparecendo em comments recentes
+de outros cards — não deve empilhar silenciosamente. Em vez disso deixa um comment no próprio
+card com um prefix reconhecível:
+
+```
+hotspot: hermes_cli/kanban_db.py — third conflicting edit to the dispatch loop this wave
+```
+
+e repete a flag no `metadata` de completion. Orchestrators (ou humanos
+revisando o board) que veem **dois ou mais comments `hotspot:` nomeando o mesmo
+path** devem criar um card dedicado de refactor/decomposição para aquele arquivo
+**antes** de enfileirar mais trabalho que o toca — splittar o arquivo ímã é
+mais barato do que reconciliar cada colisão futura que ele causaria. Para conflitos
+que *já* aconteceram, use o padrão de card de reconciliação acima com a
+skill `merge-reconciler`; hotspot flagging é o fix upstream que impede
+o reconciler de virar uma lane permanente.
+
 ## Uso multi-tenant {#multi-tenant-usage}
 
 Quando uma frota specialist serve vários negócios, tag cada tarefa com tenant:
@@ -866,13 +993,28 @@ Você pode gerenciar subscriptions explicitamente pela CLI — útil quando scri
 
 ```bash
 hermes kanban notify-subscribe t_abcd \
-    --platform telegram --chat-id 12345678 --thread-id 7
+    --platform telegram --chat-id 12345678 --thread-id 7 \
+    --chat-type group --delivery-mode notify+wake
 hermes kanban notify-list
 hermes kanban notify-unsubscribe t_abcd \
     --platform telegram --chat-id 12345678 --thread-id 7
 ```
 
 Uma subscription se remove automaticamente quando a tarefa atinge `done` ou `archived`; sem cleanup necessário.
+
+### Delivery modes {#delivery-modes}
+
+`--delivery-mode` controla **como** o notifier reage a um evento terminal. Toda subscription está em um de três modos (`notify` é o padrão e o comportamento original):
+
+| Mode | Mensagem passiva | Acorda o agente | Use quando |
+|------|-----------------|-----------------|-------------|
+| `notify` | sim | não | Você só quer uma mensagem heads-up no chat (padrão). |
+| `notify+wake` | sim | sim | Você também quer que o agente destino tome um turno real — ler o contexto do board e responder na própria voz. Auto-subscribes originados de chat usam isto. |
+| `wake` | não | sim | Você só quer que o agente aja no evento, sem ping separado. |
+
+Um "wake" forja uma mensagem inbound sintética ao agente gateway destino para ele tomar um turno normal (lê o comment + result, raciocina, responde) em vez de receber uma notificação passiva de uma linha. Só dispara quando o notifier roda dentro de um processo gateway live; caso contrário uma subscription `notify+wake` ainda entrega sua mensagem passiva, enquanto uma subscription só `wake` não faz nada naquele processo.
+
+`--chat-type` (`dm` | `group` | `channel` | `thread`) registra o tipo do chat originador para um turno woken resolver a sessão **real** do operador: `build_session_key` chaveia groups, channels e threads diferente de DMs, então um `chat_type` impreciso rotearia o wake para uma sessão separada, sem contexto. Os paths de auto-subscribe `/kanban` e slash-command capturam isso automaticamente — você só seta na mão ao inscrever um chat de um script ou cron. Omita para deixar uma subscription existente inalterada (subscriptions novas default para `dm`).
 
 ## Runs — uma linha por tentativa {#runs-one-row-per-attempt}
 

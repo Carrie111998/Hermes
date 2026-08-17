@@ -229,6 +229,14 @@ Há duas formas de inserir mensagens multilinha:
   2. Returns the sum
 ```
 
+`Ctrl+J` e continuação com barra invertida estão habilitados por padrão, casando com os atalhos multilinha do Claude Code / Codex / OpenCode. Em terminais suportados como iTerm2, o Hermes também pede extended key reporting para `Shift+Enter` chegar como uma tecla de newline distinta. Se seu terminal envia LF para `Enter` simples e você precisa do fallback legado `Ctrl+J`-como-submit, opte por sair:
+
+```yaml
+# ~/.hermes/config.yaml
+display:
+  cli_multiline_shortcuts: false
+```
+
 :::info
 Colar texto multilinha é suportado — use qualquer uma das teclas de nova linha acima, ou simplesmente cole o conteúdo diretamente.
 :::
@@ -244,7 +252,7 @@ A maioria dos terminais envia a mesma sequência de bytes para `Enter` e `Shift+
 | Windows Terminal Preview 1.25+ | Suportado depois que o protocolo Kitty é habilitado nas configurações |
 | macOS Terminal.app, Windows Terminal estável padrão | Não suportado — `Shift+Enter` é indistinguível de `Enter` |
 
-Onde o terminal não consegue distingui-los, `Alt+Enter` e `Ctrl+J` continuam funcionando em todo lugar. **No Windows Terminal especificamente, `Alt+Enter` é capturado pelo terminal (alterna tela cheia) e nunca chega ao Hermes — use `Ctrl+Enter` (entregue como `Ctrl+J`) ou `Ctrl+J` diretamente para uma nova linha.**
+Onde o terminal não consegue distingui-los, `Alt+Enter` e `Ctrl+J` continuam funcionando por padrão. **No Windows Terminal especificamente, `Alt+Enter` é capturado pelo terminal (alterna tela cheia) e nunca chega ao Hermes — use `Ctrl+Enter` (entregue como `Ctrl+J`) ou `Ctrl+J` diretamente para uma nova linha.**
 
 ## Interrompendo o agente
 

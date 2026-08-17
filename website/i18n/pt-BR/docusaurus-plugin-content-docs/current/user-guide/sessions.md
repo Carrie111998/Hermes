@@ -112,6 +112,10 @@ hermes chat -c
 
 Isso busca a sessão `cli` mais recente no banco SQLite e carrega seu histórico completo de conversa.
 
+#### Continue por terminal {#per-terminal-continue}
+
+Um `-c` bare é ciente do terminal: cada sessão CLI deixa um pequeno arquivo breadcrumb em `~/.hermes/terminal-sessions/` chaveado pelo terminal em que roda (dispositivo tty, pane tmux, janela kitty, pane wezterm, pane Zellij, sessão Windows Terminal, ...). Quando você executa `hermes -c` de novo no *mesmo* terminal, o Hermes retoma a sessão daquele terminal — então dois panes lado a lado cada um continua a própria conversa em vez de ambos pegarem a mais recente globalmente. Se não houver breadcrumb para o terminal (primeiro uso, sessão excluída, ou breadcrumb stale com mais de 30 dias), `-c` cai para o comportamento de sessão mais recente. `-c "name"` e `--resume` não são afetados. Desabilite com `session.terminal_continue: false` em `config.yaml`.
+
 ### Resume by Name {#resume-by-name}
 
 Se você deu um título a uma sessão (veja [Session Naming](#session-naming) abaixo), pode retomá-la por nome:
@@ -415,6 +419,25 @@ hermes sessions rename 20250305_091523_a1b2c3d4 debugging auth flow
 
 Se o título já estiver em uso por outra sessão, um erro é mostrado.
 
+### Pin a Session {#pin-a-session}
+
+Pinning define uma flag durável de "keep": sessões pinned ficam isentas do sweep stale de `sessions.auto_archive` e sempre aparecem em listagens. É a mesma flag que a seção Pinned da sidebar Desktop usa — pin de qualquer superfície e ambas veem.
+
+```bash
+# Pin one or more sessions (unique ID prefixes work)
+hermes sessions pin 20250305_091523_a1b2c3d4
+hermes sessions pin 20250305 20250306
+
+# Remove the pin
+hermes sessions unpin 20250305_091523_a1b2c3d4
+
+# List pinned sessions
+hermes sessions pinned
+
+# Machine-readable output, e.g. for a nightly backup of your pin set
+hermes sessions pinned --json > pinned-sessions.json
+```
+
 ### Prune Old Sessions {#prune-old-sessions}
 
 ```bash
@@ -522,11 +545,86 @@ Database size: 12.4 MB
 
 Para analytics mais profundos — uso de tokens, estimativas de custo, breakdown de tools e padrões de atividade — use [`hermes insights`](/reference/cli-commands#hermes-insights).
 
+### Repair Stranded Gateway Sessions {#repair-stranded-gateway-sessions}
+
+Se uma conversa de gateway alguma vez "volta no tempo" após um restart — retomando
+um tópico de dias atrás como se as mensagens recentes nunca tivessem acontecido — a conversa live
+pode estar stranded em uma row de sessão que perdeu sua identidade de roteamento
+(a classe de dano corrigida no trabalho de continuidade de sessão v0.21; versões atuais
+previnem por construção e se auto-recuperam em runtime).
+
+`hermes sessions repair-routing` encontra rows de sessão com mensagens sem
+identidade de roteamento e reanexa cada uma à conversa que continua —
+mas só quando a evidência é inequívoca:
+
+```bash
+# Report only — shows each orphan, the proposed adoption, and the evidence
+hermes sessions repair-routing
+
+# Perform the adoptions (stop the gateway first — a running gateway holds
+# the old routing in memory and would write it back over the repair)
+hermes sessions repair-routing --apply
+
+# Widen/narrow the contiguity window (default 900 seconds)
+hermes sessions repair-routing --max-gap-seconds 300
+```
+
+Regras de evidência:
+
+- **lineage** — o `parent_session_id` do órfão aponta para uma row keyed da
+  mesma plataforma (um fato registrado; nenhuma janela de tempo se aplica)
+- **contiguity** — exatamente uma row keyed da mesma plataforma ficou quieta
+  dentro da janela do início do órfão
+
+Qualquer coisa ambígua (dois predecessores candidatos, dois órfãos reivindicando o mesmo
+predecessor) é reportada com uma razão e deixada intacta — uma adoção errada
+costuraria uma conversa em outro chat. A row supersedida é aposentada
+sob `superseded_by_repair`, então recovery de restart nunca pode ressuscitá-la.
+
+Repair é deliberadamente **não automático**: se o chat já acumulou um
+segundo histórico, escolher qual thread continua é sua decisão. A conversa stranded
+permanece legível via `/resume` e session search de qualquer forma —
+roteamento é a única coisa que o repair muda. Faça backup primeiro
+(`cp ~/.hermes/state.db ~/.hermes/state.db.bak`).
+
+
+## Importando sessões do Claude Code e Codex CLI {#importing-sessions-from-claude-code-and-codex-cli}
+
+Começou uma conversa em outro agent CLI? Você pode puxá-la para o Hermes e
+continuar aqui. O Hermes lê os session logs do Claude Code
+(`~/.claude/projects/`) e os rollouts do Codex CLI (`~/.codex/sessions/`) —
+os arquivos estrangeiros são apenas lidos, nunca modificados.
+
+```bash
+# Interactive picker across both tools, newest first
+hermes sessions import
+
+# Limit to one tool, or point at a specific file
+hermes sessions import --from claude
+hermes sessions import --from codex ~/.codex/sessions/2026/08/15/rollout-....jsonl
+
+# Import-and-resume in one step
+hermes --resume @claude
+hermes --resume @codex
+```
+
+`hermes sessions import` cria uma nova sessão Hermes titulada
+`Imported from Claude Code: <primeira mensagem do usuário>` (ou Codex CLI) e imprime
+o id mais um comando `hermes --resume <id>` pronto para colar.
+`--resume @claude` / `--resume @codex` mostram o mesmo picker e te colocam
+direto na conversa importada.
+
+O que vem junto: a conversa user/assistant ordenada, com atividade de
+ferramenta condensada em notas curtas `[ran tool: …]` dentro dos turnos do assistant.
+System prompts, contexto injetado, traces de reasoning e output bruto de ferramenta ficam
+para trás — o import é um transcript limpo, não um replay byte-a-byte.
+
+
 ## Session Search Tool {#session-search-tool}
 
-O agente tem uma tool built-in `session_search` que executa busca full-text em todas as conversas passadas usando o engine FTS5 do SQLite — e deixa o agente rolar por qualquer sessão que encontrar. Sem chamadas LLM, sem summarization, sem truncation. Toda forma retorna mensagens reais do DB.
+O agente tem uma tool built-in `session_search` que executa busca full-text em todas as conversas passadas usando o engine FTS5 do SQLite — e deixa o agente rolar por qualquer sessão que encontrar. Não faz chamadas LLM e retorna views de mensagens reais do DB em vez de gerar summaries.
 
-### Three calling shapes {#three-calling-shapes}
+### Four calling shapes {#four-calling-shapes}
 
 A tool infere o que você quer a partir de quais argumentos você define. Não há parâmetro `mode`.
 
@@ -536,16 +634,18 @@ A tool infere o que você quer a partir de quais argumentos você define. Não h
 session_search(query="auth refactor", limit=3)
 ```
 
-Executa FTS5, deduplica hits por linhagem de sessão, retorna as top N sessões. Cada resultado carrega:
+Executa FTS5, deduplica hits por linhagem de sessão, e retorna as top N sessões. Discovery usa detalhe adaptativo por padrão: o resultado de ranking mais alto inclui sua janela de contexto completa e bookends, enquanto resultados de ranking menor ficam compactos. Passe `detail="full"` para hidratar completamente cada resultado.
+
+Cada resultado carrega:
 
 - `session_id`, `title`, `when`, `source`
 - `snippet` — trecho de match destacado por FTS5
-- `bookend_start` — primeiras 3 mensagens user+assistant da sessão (goal/kickoff)
-- `messages` — ±5 mensagens ao redor do match FTS5, com a mensagem âncora marcada (o hit em contexto)
-- `bookend_end` — últimas 3 mensagens user+assistant da sessão (resolution/decisions)
+- `detail` — `full` ou `compact`
+- `bookend_start` / `bookend_end` — primeiras/últimas 3 mensagens user+assistant para resultados full; listas vazias para resultados compact
+- `messages` — ±5 mensagens ao redor do match FTS5 para resultados full; só a mensagem âncora marcada para resultados compact
 - `match_message_id`, `messages_before`, `messages_after`
 
-Bookends + window juntos reconstruem goal → match → resolution sem pagar pelo transcript inteiro. Wall time típico: 15–50ms em um session DB real.
+O resultado top reconstrói goal → match → resolution imediatamente. Se outro resultado compact parecer mais promissor, use seus IDs de sessão e mensagem com a forma scroll. Wall time típico é dezenas de milissegundos em um session DB real.
 
 **2. Scroll — passe `session_id` + `around_message_id`:**
 
@@ -562,7 +662,15 @@ Retorna uma janela de ±`window` mensagens centradas na âncora. Sem FTS5, sem b
 
 Wall time típico: 1–2ms por chamada scroll.
 
-**3. Browse — sem args:**
+**3. Read — passe `session_id` sem âncora:**
+
+```python
+session_search(session_id="20260510_174648_805cc2")
+```
+
+Retorna a sessão inteira, ou uma vista head/tail limitada para sessões grandes. Esta forma também é usada para resolver um link `@session:<profile>/<id>`.
+
+**4. Browse — sem args:**
 
 ```python
 session_search()
@@ -582,6 +690,7 @@ O modo keyword suporta sintaxe padrão de query FTS5:
 ### Optional parameters {#optional-parameters}
 
 - `sort` — `newest` ou `oldest`, sobre o ranking FTS5. Omita para ordenação só por relevância (o padrão; adequado para recall exploratório). Use `newest` para perguntas "onde paramos X", `oldest` para "como X começou".
+- `detail` — `adaptive` (padrão) hidrata completamente só o resultado top de discovery; `full` hidrata cada resultado de discovery.
 - `role_filter` — roles separadas por vírgula para incluir. Discovery default para `user,assistant` (output de tool geralmente é ruído). Passe `user,assistant,tool` para incluir output de tool (debugging de comportamento de tool) ou `tool` para buscar só output de tool.
 
 ### When It's Used {#when-its-used}
@@ -638,6 +747,26 @@ por resets automáticos via a seção `session_reset` em `config.yaml`:
 Antes de um auto-reset de sessão, o agente recebe um turn para salvar memórias ou skills importantes da conversa.
 
 Sessões com **processos de background ativos** nunca fazem auto-reset, independente da policy.
+
+### Continuity After Crashes and Restarts {#continuity-after-crashes-and-restarts}
+
+Um chat de gateway é projetado para ser **uma sessão contínua** — compactada
+repetidamente conforme cresce — até você executar `/new` (ou `/reset`) explicitamente. Isso
+vale através de crashes, restarts e updates do gateway:
+
+- Identidade da sessão (routing key, chat, origin) é escrita **atomicamente** quando
+  a row de sessão é criada, em todo caminho de criação (`/new`, primeira mensagem,
+  filhos `/branch`). Se essa escrita falhar, o refresh de roteamento do turno seguinte
+  repara a row automaticamente.
+- Após um restart, o gateway re-resolve cada chat para a sessão com a
+  **atividade real** mais recente — uma row mais velha e stale nunca pode vencer sobre a
+  conversa que você realmente estava tendo.
+- Recovery **respeita fronteiras de `/new`**: se o evento mais recente de um chat
+  é um reset intencional, recovery começa fresh em vez de alcançar atrás
+  do reset para ressuscitar uma sessão mais antiga. Sessões recuperadas também mantêm seu
+  idle time real, então uma policy opt-in de idle/daily reset aplica-se corretamente a
+  elas em vez de tratar toda sessão recuperada como brand new.
+
 
 ## Storage Locations {#storage-locations}
 

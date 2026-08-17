@@ -26,7 +26,7 @@ Tudo isso está disponível ao próprio Hermes pela ferramenta `cronjob`, então
 
 - **Pin por job** — definido por *você* via dashboard, `hermes cron create/edit --model … --provider …`, ou editando `~/.hermes/cron/jobs.json`. Uma vez definido, permanece até você mudar. A ferramenta `cronjob` do agente não pode definir ou mudar modelos por job — pins de inferência são de propriedade do usuário.
 - **`cron.model` / `cron.model_provider`** — default da frota cron: todo job não pinado roda neste modelo, independente do seu modelo de chat. Defina uma vez (`hermes config set cron.model <name>`) e trocar seu modelo de chat com `hermes model` ou `/model` nunca toca sua frota cron.
-- **Default global** — só quando nenhum dos acima está definido um job segue `hermes model`. Neste caso o Hermes **snapshot** provider e modelo na criação, e se o default global mudar depois o job **falha fechado**: pula a execução, não faz chamada de inferência e alerta você para pinar provider/modelo explicitamente (#44585). Isso impede job desassistido de herdar silenciosamente troca para provider/modelo pago. Definir `cron.model` (ou pin por job) é a forma deliberada de rotear gasto cron, e o drift guard não entra num eixo coberto por ele. Operadores que em vez disso querem jobs não pinados acompanharem o default global mutável podem [desabilitar o drift guard](#letting-unpinned-jobs-track-global-defaults).
+- **Default global** — só quando nenhum dos acima está definido um job segue `hermes model`. Neste caso o Hermes **snapshot** provider e modelo na criação, e se o default global mudar depois o job **falha fechado**: pula a execução, não faz chamada de inferência e alerta você **uma vez** — o job permanece pulado (e silencioso) nos ticks seguintes até você agir ou a config ser restaurada (#44585). Para jobs recorrentes ou de outro modo repetíveis, pinar o provider/modelo explicitamente (`hermes cron edit <job_id> --provider <provider> --model <model>`) para continuar. Um one-shot finito já consumido não pode ser atualizado; crie um novo one-shot futuro com provider e modelo explícitos. Isso impede job desassistido de herdar silenciosamente troca para provider/modelo pago. Definir `cron.model` (ou pin por job) é a forma deliberada de rotear gasto cron, e o drift guard não entra num eixo coberto por ele. Operadores que em vez disso querem jobs não pinados acompanharem o default global mutável podem [desabilitar o drift guard](#letting-unpinned-jobs-track-global-defaults).
 
 `hermes setup --portal` é a opção de menor atrito para execuções desassistidas já que refresh OAuth é automático. Veja [Nous Portal](/integrations/nous-portal).
 :::
@@ -258,6 +258,36 @@ O que fazem:
 
 **Lookup por nome.** Todos os quatro verbos mutantes (`pause`, `resume`, `run`, `remove`, `edit`) mais a ferramenta `cronjob` do agente agora aceitam **nome** de job (case-insensitive) no lugar do ID hex. Agente e CLI preferem match exato de ID se existir; matches ambíguos por nome (múltiplos jobs com mesmo nome) são recusados com lista completa de IDs candidatos para escolher explicitamente. Nomes não são únicos, então este guard é load-bearing — impede mutar silenciosamente o job errado quando dois compartilham nome.
 
+## Agendamento gerenciado pelo agente (jobs cron que gerenciam jobs cron) {#agent-managed-scheduling-cron-jobs-that-manage-cron-jobs}
+
+Por padrão, agentes lançados *pelo* scheduler não podem usar a ferramenta `cronjob` —
+um job agendado não pode criar, editar ou remover outros jobs. Opt-in via
+`config.yaml`:
+
+```yaml
+cron:
+  allow_agent_scheduling: true   # default: false
+```
+
+Quando habilitado, um agente agendado pode gerenciar a tabela cron como qualquer sessão
+de chat: agendar one-shots de acompanhamento de dentro de trabalho agendado, ajustar
+sua própria cadência, ou rodar um job "cron librarian" que reconcilia a tabela inteira
+(listar, depois update/remove/create conforme necessário). Duas propriedades mantêm
+isso coerente:
+
+- **Uma tabela plana, de propriedade do usuário.** Jobs criados a partir de uma execução
+  cron caem no mesmo `jobs.json` que qualquer outro job, sem ownership especial — você
+  pode listar, editar ou removê-los exatamente como se os tivesse criado você mesmo.
+- **Sem entrega pendurada.** Uma execução cron é efêmera, então `deliver: origin`
+  de dentro de uma é resolvido **no momento da criação** para o target concreto do
+  próprio job criador (`platform:chat_id[:thread_id]`, ou `local` se o job criador
+  não entrega em lugar nenhum). Um job criado por um agente agendado nunca pode apontar
+  sua saída para uma sessão que não existe mais. Targets explícitos
+  (`local`, `all`, `telegram:<chat_id>`) são honrados verbatim.
+
+Prefira prompts que atualizam jobs existentes (liste primeiro, depois atualize por ID)
+em vez de prompts que criam jobs novos a cada execução.
+
 ## Como funciona {#how-it-works}
 
 **Execução cron é tratada pelo daemon gateway.** O gateway faz tick no scheduler a cada 60 segundos, rodando jobs devidos em sessões de agente isoladas.
@@ -298,6 +328,21 @@ são rerun automaticamente.
 Inspecione tentativas recentes com `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Histórico terminal é limitado; tentativas ativas nunca são podadas. O
 ledger está incluído em quick backups.
+
+### Nudge de revisão por falhas repetidas {#repeated-failure-review-nudge}
+
+Cada job rastreia um `failure_streak` — execuções consecutivas em que o agente falhou
+(falhas de entrega não contam). Quando o streak de um job *recorrente* atinge o
+limiar, a mensagem de falha entregue no chat ganha um nudge de revisão dizendo
+que o job falhou N execuções seguidas e sugerindo que você conserte, pause
+(`hermes cron pause <job>`), ou remova. Qualquer execução bem-sucedida zera o
+streak, e `hermes cron list` mostra o streak ao lado da última execução de um job
+falhando. Jobs one-shot nunca enviam nudge.
+
+```yaml
+cron:
+  failure_nudge_threshold: 3   # default; 0 disables the nudge
+```
 
 ## Opções de entrega {#delivery-options}
 
@@ -481,6 +526,16 @@ cron:
 
 Ou defina env var `HERMES_CRON_SCRIPT_TIMEOUT`. Ordem de resolução: env var → config.yaml → default 3600s.
 
+O cron também limita a limpeza pós-execução de sessão e recursos do agente. Isso acontece depois que o turno LLM retorna, então é separado do timeout de inatividade. O padrão é 10 segundos por operação de limpeza. Se um finalizador de storage ou client parar de retornar, o scheduler registra um erro, libera o guard in-flight do job e permite que execuções posteriores sejam despachadas em vez de pular aquele job para sempre.
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  cleanup_timeout_seconds: 10
+```
+
+Defina `cleanup_timeout_seconds: 0` só para restaurar o comportamento legado de limpeza sem limite.
+
 ## Modo no-agent (jobs só script) {#no-agent-mode-script-only-jobs}
 
 Para jobs recorrentes que não precisam de raciocínio LLM — watchdogs clássicos, alertas de disco/memória, heartbeats, pings CI — passe `no_agent=True` na criação. O scheduler roda seu script no schedule e entrega stdout diretamente, pulando o agente por completo:
@@ -572,11 +627,30 @@ cronjob(
 
 Saídas são concatenadas na ordem listada.
 
+**Continuidade: carregar a saída da execução anterior**
+
+Defina `continuity=true` e o job injeta *sua própria* saída mais recente em cada execução. Jobs recorrentes normalmente começam cada execução com amnésia — um scout de notícias re-reporta as mesmas histórias, um monitor re-alerta na mesma condição. Com continuidade ligada, o job acorda vendo o que reportou da última vez e pode deduplicar e continuar de onde parou:
+
+```python
+cronjob(
+    action="create",
+    prompt="Scan HN and arXiv for new agent-tooling papers. Report only items NOT already covered in your previous run's output.",
+    schedule="every 6h",
+    continuity=True,
+    name="Agent Tooling Scout",
+)
+```
+
+A primeira execução não tem saída anterior, então o prompt roda como está. Em execuções seguintes a saída anterior é prepended com framing de continuidade ("evite repetir o que já foi reportado"). Combina livremente com jobs upstream (`context_from=["<other_job_id>"]` mais `continuity=true`), e `continuity=false` no update desliga isso preservando outras entradas de `context_from`. Internamente o flag é armazenado como a entrada reservada `self` em `context_from`.
+
+Pela CLI: `hermes cron create "every 6h" "Scan for news" --continuity`, e `hermes cron edit <job_id> --continuity` / `--no-continuity` para alternar em um job existente. O mesmo toggle aparece no editor cron do dashboard e no diálogo de routines do Bot Mode no desktop.
+
 **Quando usar:**
 
 - Pipelines multi-estágio (collect → filter → format → deliver)
 - Tarefas dependentes onde trabalho do passo N depende de saída do passo N−1
 - Padrões fan-out/fan-in onde um job agrega resultados de vários outros
+- Scouts/monitores recorrentes que devem deduplicar contra o próprio relatório anterior (`continuity=true`)
 
 ## Recuperação de provider {#provider-recovery}
 

@@ -56,6 +56,7 @@ mcp_servers:
 | `enabled` | bool | both | Ignora o servidor por completo quando false |
 | `timeout` | number | both | Timeout de chamada de ferramenta em segundos (padrão: `300`) |
 | `connect_timeout` | number | both | Timeout de conexão inicial em segundos (padrão: `60`) |
+| `protocol` | string | both | Negociação de era do protocolo: `auto` (padrão — handshake legado `initialize` primeiro, caindo para o probe stateless `server/discover` de 2026-07-28 quando o servidor rejeita o handshake como modern-only), `stateless` (probe `server/discover` primeiro; um retry legado), ou `legacy` (só handshake, sem fallback) |
 | `supports_parallel_tool_calls` | bool | both | Permite que ferramentas deste servidor executem em paralelo |
 | `skip_preflight` | bool | HTTP | Ignora a sonda fail-fast de content-type para endpoints Streamable HTTP válidos cujo HEAD/GET responde com content-type não-MCP (padrão: `false`) |
 | `transport` | string | HTTP | Defina como `sse` para usar o transporte SSE em vez de Streamable HTTP |
@@ -335,3 +336,24 @@ Comportamento:
 - Tokens são persistidos em `~/.hermes/mcp-tokens/<server>.json` e reutilizados entre sessões
 - Refresh de token é automático; reautorização só ocorre quando o refresh falha
 - Aplica-se apenas ao transporte HTTP/StreamableHTTP (servidores baseados em `url`)
+
+## Link Add to Hermes {#add-to-hermes-link}
+
+Vendors e docs de MCP podem oferecer um botão **"Add to Hermes"** de um clique que abre o app desktop do Hermes com uma config de servidor pré-preenchida, espelhando o scheme `cursor://anysphere.cursor-deeplink/mcp/install` do Cursor:
+
+```text
+hermes://mcp/install?name=NAME&config=BASE64
+```
+
+- `name` — o nome do servidor. Deve corresponder a `^[A-Za-z0-9._-]{1,64}$`.
+- `config` — o objeto de config do servidor como **JSON encoded em base64url** (base64 padrão também é aceito). O JSON decodificado deve ser um objeto com um campo string `url` (`http://`/`https://` apenas) ou um campo string `command`, e pode carregar qualquer uma das chaves de servidor documentadas acima. Payloads acima de 32KB são rejeitados.
+
+Exemplo (JavaScript):
+
+```js
+const config = { url: 'https://mcp.example.com/mcp' }
+const link = `hermes://mcp/install?name=example&config=${btoa(JSON.stringify(config))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`
+```
+
+Abrir o link nunca instala nada por si: o app desktop mostra um diálogo de confirmação com o nome do servidor e a config pretty-printed completa (com um cuidado extra para servidores baseados em `command`, que rodam um processo local), e o usuário precisa confirmar explicitamente. Nomes de servidor existentes nunca são sobrescritos — o usuário é pedido para renomear ou cancelar.

@@ -50,7 +50,7 @@ Cada entrada exige `provider` e `model`. Entradas sem qualquer um dos campos sã
 | AI Gateway | `ai-gateway` | `AI_GATEWAY_API_KEY` |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
 | Nous Portal | `nous` | `hermes setup --portal` (fresh) ou `hermes auth add nous` (OAuth) |
-| OpenAI Codex | `openai-codex` | `hermes model` (ChatGPT OAuth) |
+| OpenAI Codex | `openai-codex` | `hermes model` → **ChatGPT or Codex Subscription** (ChatGPT OAuth) |
 | GitHub Copilot | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` ou `GITHUB_TOKEN` |
 | GitHub Copilot ACP | `copilot-acp` | Processo externo (integração com editor) |
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` ou credenciais Claude Code |
@@ -71,6 +71,7 @@ Cada entrada exige `provider` e `model`. Entradas sem qualquer um dos campos sã
 | Qwen Portal (OAuth) | `qwen-oauth` | `hermes model` (Qwen Portal OAuth; opcional: `HERMES_QWEN_BASE_URL`) |
 | MiniMax (OAuth) | `minimax-oauth` | `hermes model` (MiniMax portal OAuth) |
 | OpenCode Zen | `opencode-zen` | `OPENCODE_ZEN_API_KEY` |
+| CommandCode | `commandcode` (alias `commandcode-chat`; Claude via `commandcode-anthropic`) | `COMMANDCODE_API_KEY` |
 | OpenCode Go | `opencode-go` | `OPENCODE_GO_API_KEY` |
 | Kilo Code | `kilocode` | `KILOCODE_API_KEY` |
 | Xiaomi MiMo | `xiaomi` | `XIAOMI_API_KEY` |
@@ -291,7 +292,7 @@ Essas opções se aplicam apenas a entradas `auxiliary:`, `compression:` e `fall
 | `"auto"` | Tenta providers em ordem até um funcionar (padrão) | Pelo menos um provider configurado |
 | `"openrouter"` | Força OpenRouter | `OPENROUTER_API_KEY` |
 | `"nous"` | Força Nous Portal | `hermes auth` |
-| `"codex"` | Força Codex OAuth | `hermes model` → Codex |
+| `"codex"` | Força Codex OAuth | `hermes model` → ChatGPT or Codex Subscription |
 | `"main"` | Usa qualquer provider que o agente principal usa (apenas tarefas auxiliares) | Provider principal ativo configurado |
 | `"anthropic"` | Força Anthropic nativo | `ANTHROPIC_API_KEY` ou credenciais Claude Code |
 

@@ -21,10 +21,10 @@ Se você já paga o Portal por um modelo xAI, chamadas Live Search são cobradas
 
 | Credencial | Origem | Configuração |
 |------------|--------|--------------|
-| **OAuth SuperGrok / X Premium+** (preferido) | Login no navegador em `accounts.x.ai`, renovado automaticamente | `hermes auth add xai-oauth` — veja [xAI Grok OAuth (SuperGrok / X Premium+)](../../guides/xai-grok-oauth.md) |
-| **`XAI_API_KEY`** | Chave de API paga da xAI | Defina em `~/.hermes/.env` |
+| **OAuth SuperGrok / X Premium+** | Login no navegador em `accounts.x.ai`, renovado automaticamente | `hermes auth add xai-oauth` — veja [xAI Grok OAuth (SuperGrok / X Premium+)](../../guides/xai-grok-oauth.md) |
+| **`XAI_API_KEY`** (preferido) | Chave de API paga da xAI | Defina em `~/.hermes/.env` |
 
-Ambos atingem o mesmo endpoint com o mesmo payload — a única diferença é o bearer token. **Quando ambos estão configurados, o OAuth SuperGrok vence**, para que o x_search rode contra a cota da sua assinatura em vez de gasto de API paga.
+Ambos atingem o mesmo endpoint com o mesmo payload — a única diferença é o bearer token. **Quando ambos estão configurados, a `XAI_API_KEY` explícita vence** — o bearer OAuth da assinatura autoriza `/v1/responses` mas responde x_search num modo explicativo degradado do Grok sem citações, enquanto a API key retorna posts reais. Note que isso significa que o x_search roda contra billing de API medido quando uma key está definida; remova `XAI_API_KEY` para cair na cota da sua assinatura (com a ressalva da resposta degradada).
 
 O `check_fn` da ferramenta executa o resolvedor de credenciais xAI sempre que a lista de ferramentas do modelo é reconstruída. Um retorno `True` significa que o bearer é obtível E não vazio E (se estiver expirado) renovado com sucesso. Tokens revogados com falha na renovação ocultam a ferramenta do schema; o modelo simplesmente não a vê.
 

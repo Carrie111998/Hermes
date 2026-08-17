@@ -278,9 +278,9 @@ ollama serve
 
 ### O modelo não segue as chamadas de ferramentas {#model-doesnt-follow-tool-calls}
 
-Modelos menores (3B, 7B) às vezes ignoram instruções de chamada de ferramentas e produzem texto simples em vez de chamadas de função estruturadas. Soluções:
+Modelos sem suporte a chamadas de ferramentas produzem texto simples em vez de chamadas de função estruturadas. Soluções:
 
-- **Use um modelo maior** — `gemma4:31b` ou `gemma2:27b` lidam com chamadas de ferramentas muito melhor do que modelos de 3B/7B.
+- **Use um modelo com suporte a chamadas de ferramentas** — dos modelos listados acima, só o `gemma4:31b` tem chamada de ferramentas confiável.
 - **O Hermes tem autorreparo** — ele detecta chamadas de ferramentas malformadas e tenta corrigi-las automaticamente.
 - **Configure um fallback** — se o modelo local falhar 3 vezes, o Hermes recorre a um provedor na nuvem.
 

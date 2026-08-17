@@ -18,7 +18,7 @@ Reviewer       =  humano ou proxy humano que controla "done"
 GitHub PR      =  artefato upstreamável (opcional, para lanes de código)
 ```
 
-O Hermes Kanban possui a verdade do ciclo de vida — `ready` → `running` → `blocked` / `done` / `archived`. Worker lanes executam o trabalho, mas nunca possuem essa verdade; tudo que fazem volta pelo kernel kanban via ferramentas `kanban_*` (ou, para workers externos não-Hermes, via API). Reviewers controlam a transição de "mudança de código escrita" para "tarefa done."
+O Hermes Kanban possui a verdade do ciclo de vida — `ready` → `running` → `review` / `blocked` / `done` / `archived`. Worker lanes executam o trabalho, mas nunca possuem essa verdade; tudo que fazem volta pelo kernel kanban via ferramentas `kanban_*` (ou, para workers externos não-Hermes, via API). Reviewers controlam a transição de "mudança de código escrita" para "tarefa done."
 
 ## O que uma lane fornece {#what-a-lane-provides}
 
@@ -51,27 +51,30 @@ Para lanes não-Hermes (registradas via plugin), o plugin fornece seu próprio c
 Todo claim deve terminar em exatamente um de:
 
 - `kanban_complete(summary=..., metadata=...)` — tarefa bem-sucedida, status vira `done`.
+- `kanban_request_review(summary=..., metadata=..., reviewer=...)` — a implementação same-card está completa e entra em review de primeira classe; o status vira `review`. O dispatcher carrega a skill bundled `sdlc-review` a menos que `kanban.review_dispatch` esteja desabilitado. Um reviewer aprova com `kanban_complete`, devolve rework acionável com `kanban_request_changes`, ou escala um blocker externo genuíno com `kanban_block`.
 - `kanban_block(reason=...)` — tarefa aguarda input humano, status vira `blocked`. O dispatcher respawna quando `kanban_unblock` roda.
 - O processo worker sai sem chamada de ferramenta. O kernel o colhe e emite `crashed` (PID morreu) ou `gave_up` (circuit breaker de falhas consecutivas disparou) ou `timed_out` (max_runtime excedido). Este é o caminho de falha; workers saudáveis não terminam aqui.
 
 O kernel kanban garante que exatamente um destes termina cada run. Um worker que não chama nenhum e sai normalmente é tratado como crashed.
 
-## Saídas e a convenção review-required {#outputs-and-the-review-required-convention}
+## Saídas e o handoff de review {#outputs-and-the-review-handoff}
 
-Para a maioria das tarefas que alteram código, o trabalho não está realmente *done* no momento em que o worker termina — precisa de um revisor humano. O kernel kanban não impõe essa distinção (uma "tarefa que altera código" é fuzzy e forçar block-instead-of-complete em todo worker de código quebraria fluxos onde review não é desejada). É uma convenção em camadas:
+Para tarefas que alteram código, escolha o modelo de review encodado pelo grafo de tarefas:
 
-- **Block em vez de complete**, com `reason` prefixado `review-required: ` para que o dashboard / `hermes kanban show` mostre a linha aguardando review.
-- **Deixe metadata estruturada em um `kanban_comment` primeiro**, já que `kanban_block` só carrega o `reason` legível por humanos. Comentários são o canal de anotação durável — todo campo relevante para auditoria (`changed_files`, `tests_run`, `diff_path` ou URL de PR, decisões) pertence ali.
-- **O revisor aprova e desbloqueia**, o que respawna o worker com a thread de comentários para follow-ups; ou pede mudanças via outro comentário, que a próxima run do worker vê como parte do contexto de `kanban_show`.
+- **Review same-card:** chame `kanban_request_review(summary=..., metadata=..., reviewer=...)`. A tarefa entra em `review` sem tocar a contabilidade de recorrência de block. O dispatcher faz claim com a skill bundled `sdlc-review` por padrão. O reviewer aprova com `kanban_complete`, chama `kanban_request_changes(reason=...)` para fechar a run de review e devolver a tarefa ao implementer original, ou bloqueia só para uma escalação externa genuína.
+- **Card downstream de review/QA/release pré-criado:** `kanban_show` lista IDs filhos; inspecione esses cards com `kanban_show(task_id=...)` antes de escolher a ação terminal. Quando um filho é a fase downstream de review/QA/release, chame `kanban_complete` na fase de implementação. Ele não pode promover até este parent estar `done`/`archived`. Não peça review same-card adicional e nunca faça sticky-block do parent com `review-required:` — qualquer uma das duas escolhas trava ou duplica a lane downstream.
+- **Boards só-humano:** defina `kanban.review_dispatch: false`. Uma tarefa pode então permanecer em `review` até um humano aprová-la ou usar `reopen-review`/o dashboard para devolvê-la a `ready`/`todo`.
 
-O `KANBAN_GUIDANCE` injetado cobre tanto `kanban_complete` (tarefas verdadeiramente terminais — correções de typo, mudanças de docs, writeups de pesquisa) quanto o padrão de block `review-required`.
+Ambos os modelos de review carregam o handoff estruturado na própria transição de ciclo de vida. Não coloque secrets, tokens ou PII bruto em `summary` ou `metadata`; linhas de run são duráveis.
+
+O `KANBAN_GUIDANCE` injetado cobre ambas as formas de grafo, `kanban_complete`, o loop de review same-card, e `kanban_block` para blockers genuínos.
 
 ## Logs e trilha de auditoria {#logs-and-audit-trail}
 
 O dispatcher grava stdout/stderr do worker por tarefa em `<board-root>/logs/<task_id>.log`. Logs são auditáveis a partir de metadata kanban:
 
 - Linhas `task_runs` carregam `log_path`, código de saída (quando disponível), summary e metadata.
-- Linhas `task_events` carregam toda transição de estado (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
+- Linhas `task_events` carregam toda transição de estado (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `review_requested`, `changes_requested`, `review_reopened`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
 - `kanban_show` retorna ambos, então um revisor (ou um worker de follow-up) lendo a tarefa obtém o histórico completo sem precisar de acesso ao dashboard.
 
 O dashboard renderiza histórico de runs com summaries, blocos de metadata e badges de status de saída. Usuários CLI podem rodar `hermes kanban tail <task_id>` para acompanhar ao vivo, ou `hermes kanban runs <task_id>` para a lista histórica de tentativas.
@@ -105,6 +108,7 @@ Para que autores de lane não precisem reimplementá-los:
 - **Retry em nível de run** — quando uma tarefa é retentada (pós-block, pós-crash, pós-reclaim), o worker pode usar o parâmetro `expected_run_id` em ferramentas terminadoras para falhar rápido se sua própria run já foi substituída.
 - **Max runtime por tarefa** — `task.max_runtime_seconds` limita duro o tempo de parede por run, independente da vivacidade do PID. Pega workers genuinamente deadlocked que a extensão de PID vivo manteria rodando.
 - **Detecção de tarefa stranded** — uma tarefa ready cujo assignee nunca produz claim dentro de `kanban.stranded_threshold_seconds` (padrão 30 min) aparece em `hermes kanban diagnostics` como aviso `stranded_in_ready`. A severidade escala para error em 2× o threshold e critical em 6×. Pega assignees com typo, profiles deletados e pools de worker externo down em um sinal — agnóstico de identidade, sem allowlist por board para curar.
+- **Deadlock legado de dependência de review** — um parent sticky-blocked com `review-required:` enquanto um ou mais filhos diretos continuam gated por dependência em `todo` produz um error imediato `review_dependency_deadlock`. O diagnóstico é read-only: sugere completar a fase concluída ou unsinkar a aresta incorreta, mas nunca remove um block do usuário automaticamente.
 
 ## Relacionados {#related}
 

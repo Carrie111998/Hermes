@@ -34,6 +34,7 @@ approvals:
   mode: smart                     # smart | manual | off
   timeout: 300                    # seconds to wait for user response (default: 300)
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
+  single_query_mode: deny         # deny | approve — what single-query (-q) sessions do on a dangerous command
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
 ```
@@ -45,8 +46,9 @@ O conjunto completo de chaves:
 | `mode` | `smart` | Approval policy for dangerous shell commands — see the table below. |
 | `timeout` | `300` | Seconds Hermes waits for an approval reply before timing out. |
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
+| `single_query_mode` | `deny` | Como sessões one-shot [`hermes chat -q`](./cli.md) se comportam quando disparam um prompt de comando perigoso. Uma sessão `-q` roda um único turno e sai sem um usuário esperando para responder prompts; `deny` bloqueia o comando (o agente precisa achar outro caminho), `approve` auto-aprova tudo no contexto single-query. Espelha `cron_mode`. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
-| `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. TUI uses its own modal overlay (set `HERMES_TUI_NO_CONFIRM=1` to opt out there). |
+| `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. O TUI também honra esta setting para o modal de `/clear`, `/new` e `/reset`; `HERMES_TUI_NO_CONFIRM=1` força pular aquele modal independente do valor configurado. |
 
 | Mode | Behavior |
 |------|----------|
@@ -243,13 +245,24 @@ Estas categorias são sempre negadas, mesmo quando `HERMES_WRITE_SAFE_ROOT` est�
 
 | Category | Examples |
 |----------|----------|
-| OS credential stores | `~/.ssh/`, `~/.aws/`, `~/.kube/`, `/etc/sudoers`, `~/.netrc` |
+| OS credential stores | `~/.ssh/` (keys, `authorized_keys`), `~/.aws/`, `~/.kube/`, `/etc/sudoers`, `~/.netrc` |
 | Hermes credential stores | `auth.json`, `.env`, `.anthropic_oauth.json`, `mcp-tokens/`, `pairing/` under HERMES_HOME (active profile and global root) |
 | Project secret files | `.env`, `.env.local`, `.env.production`, `.envrc` anywhere on disk |
 
 Paths sensíveis dentro do safe root ainda são bloqueados — apontar `HERMES_WRITE_SAFE_ROOT` para `$HOME` não permite escrever `~/.ssh/id_rsa`.
 
 Violações de safe-root retornam `Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (…)`. Bloqueios de credential-path usam `Write denied: '…' is a protected system/credential file.`
+
+**Exceção — `~/.ssh/config` é gated por approval, não hard-blocked.** A *client config*
+SSH não contém material de chave privada e editá-la (aliases de host,
+`ProxyJump`, targets VS Code Remote-SSH) é uma tarefa rotineira, então `write_file` /
+`patch` a roteiam pelo mesmo prompt approve-once/session/always que a
+ferramenta de terminal já usa para writes em `~/.ssh` — em vez da recusa
+plana que se aplicava antes. Ainda pode carregar diretivas `ProxyCommand` /
+`Match exec` que executam comandos, então o write nunca é silencioso. Chamadores
+não interativos (file bridge ACP, jobs em background sem canal humano) falham
+fechado. Private keys, `authorized_keys` e todo o resto sob `~/.ssh/`
+permanecem hard-blocked.
 
 ### HERMES_WRITE_SAFE_ROOT (optional sandbox) {#hermes_write_safe_root-optional-sandbox}
 

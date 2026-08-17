@@ -82,6 +82,10 @@ hermes setup --portal
 Isso faz login, define a Nous como provider e liga o Tool Gateway num único comando.
 :::
 
+:::tip Já está rodando o Hermes em outra máquina?
+Você não precisa montar o setup do zero. Restaure um backup completo com `hermes import` (veja [Exportar o Hermes para outra máquina](/reference/faq#exporting-hermes-to-another-machine)), ou traga um único agente com `hermes profile import` (veja [Mover um único profile para outra máquina](/reference/faq#moving-a-single-profile-to-another-machine)). Note que um export de profile exclui credenciais de propósito, então um export sozinho não é um backup completo — [`hermes backup` vs `hermes profile export`](/reference/faq#hermes-backup-vs-hermes-profile-export) explica qual usar.
+:::
+
 ---
 
 ## Pré-requisitos
@@ -131,6 +135,8 @@ Rodar o Hermes como usuário sem privilégios dedicado (ex.: conta de serviço s
    ```bash
    curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-browser
    ```
+
+   O instalador também pré-instala o [`cua-driver`](../user-guide/features/computer-use.md) para o toolset Computer Use funcionar no momento em que você o habilitar; passe `--skip-computer-use` para optar out (ele então instala on demand quando você habilitar a tool).
 
 3. **Deixe o `hermes` disponível nos shells do usuário de serviço.** O instalador grava o launcher em `~/.local/bin/hermes`. Contas de serviço do sistema costumam ter um PATH mínimo que não inclui `~/.local/bin`. Ou adicione ao ambiente do usuário, ou faça symlink do launcher para um local do sistema:
    ```bash

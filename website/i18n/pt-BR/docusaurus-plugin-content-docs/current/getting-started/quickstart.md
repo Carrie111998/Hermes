@@ -110,7 +110,7 @@ Bons defaults:
 | Provider | O que é | Como configurar |
 |----------|-----------|---------------|
 | **Nous Portal** | Baseado em assinatura, zero-config | Login OAuth via `hermes model` |
-| **OpenAI Codex** | ChatGPT OAuth, usa modelos Codex | Device code auth via `hermes model` |
+| **OpenAI Codex** | Assinatura ChatGPT ou Codex, usa modelos Codex | Device code auth via `hermes model` → **ChatGPT or Codex Subscription** |
 | **Anthropic** | Modelos Claude direto — plano Max + créditos extras (OAuth), ou API key pay-per-token | `hermes model` → login OAuth (exige Max + créditos extras), ou uma API key Anthropic |
 | **OpenRouter** | Routing multi-provider por muitos modelos | Informe sua API key |
 | **Fireworks AI** | API de modelos direta compatível com OpenAI | Defina `FIREWORKS_API_KEY` |

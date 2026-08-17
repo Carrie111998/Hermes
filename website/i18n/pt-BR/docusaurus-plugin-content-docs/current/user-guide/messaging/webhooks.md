@@ -84,6 +84,7 @@ Rotas definem como diferentes fontes de webhook são tratadas. Cada rota é uma 
 | `filters` | No | Filtros declarativos de payload avaliados após auth/body/event filtering e antes do trabalho de agente ou entrega direta. Não correspondências retornam `{"status":"ignored","reason":"filter"}` com HTTP 200. |
 | `script` | No | Script de filtro/transformação em `~/.hermes/scripts/`. O payload webhook é passado como JSON no stdin. Stdout JSON object substitui o payload antes do templating; stdout texto expõe como `script_output`; stdout vazio, `[SILENT]` ou exit code não zero ignoram o webhook. |
 | `skills` | No | Lista de nomes de skills a carregar na execução do agente. |
+| `toolsets` | No | Lista de chaves de toolset (ex. `["terminal", "file", "web"]`) que **substitui** o toolset webhook no nível da plataforma apenas para execuções disparadas por esta rota. Edição manual de config apenas — não definível via `hermes webhook subscribe`, então subscriptions criadas pelo agente não podem se auto-conceder ferramentas elevadas. Nomes são validados do mesmo jeito que entradas `platform_toolsets` (nomes desconhecidos ou restritos à plataforma são descartados). Veja [Toolsets por rota](#per-route-toolsets). |
 | `deliver` | No | Onde enviar a resposta: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, ou `log` (padrão). |
 | `deliver_extra` | No | Config adicional de entrega — chaves dependem do tipo `deliver` (ex.: `repo`, `pr_number`, `chat_id`). Valores suportam os mesmos templates `{dot.notation}` que `prompt`. |
 | `deliver_only` | No | Se `true`, pula o agente — o template `prompt` renderizado vira a mensagem literal entregue. Zero custo LLM, entrega sub-segundo. Veja [Direct Delivery Mode](#direct-delivery-mode) para casos de uso. Requer `deliver` como destino real (não `log`). |
@@ -442,6 +443,47 @@ hermes webhook test github-issues --payload '{"issue": {"number": 42, "title": "
 ### Agent-driven subscriptions
 
 O agente pode criar assinaturas via ferramenta terminal quando guiado pela skill `webhook-subscriptions`. Peça ao agente para "set up a webhook for GitHub issues" e ele executará o comando `hermes webhook subscribe` apropriado.
+
+---
+
+## Toolsets por rota {#per-route-toolsets}
+
+Execuções de agente webhook default para um toolset deliberadamente restrito (`web_search`, `web_extract`, `vision_analyze`, `clarify`) porque payloads de webhook podem carregar conteúdo de terceiros não confiável — um título de PR público ou comentário de issue nunca deveria poder prompt-inject seu caminho até o seu terminal.
+
+Para rotas **confiáveis** — um daemon de monitoramento localhost empurrando alertas de sistema, um sistema CI interno — você pode conceder um toolset mais amplo só àquela rota, sem alargar toda outra rota webhook:
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      routes:
+        oom-emergency:
+          secret: "monitor-secret"
+          prompt: "Memory emergency: {detail}. Diagnose with ps/free/py-spy and report."
+          toolsets: ["terminal", "file", "code_execution", "web"]
+          deliver: "telegram"
+```
+
+Para subscriptions dinâmicas, adicione a chave `toolsets` editando `~/.hermes/webhook_subscriptions.json` diretamente:
+
+```json
+{
+  "oom-emergency": {
+    "secret": "...",
+    "prompt": "...",
+    "toolsets": ["terminal", "file", "web"],
+    "deliver": "telegram"
+  }
+}
+```
+
+Propriedades de comportamento e segurança:
+
+- A lista da rota **substitui** a resolução de toolset webhook no nível da plataforma para as execuções daquela rota (não é merge).
+- Nomes são validados pelo mesmo caminho que config `platform_toolsets` — nomes desconhecidos e toolsets restritos à plataforma são descartados.
+- `hermes webhook subscribe` deliberadamente **não** aceita uma flag de toolsets. Conceder ferramentas elevadas é uma edição manual de arquivo de config, então um agente criando sua própria subscription em runtime não pode se auto-conceder `terminal`.
+- Só conceda toolsets elevados a rotas cujos senders você controla por completo, com um secret HMAC real. Quem puder POSTar um payload validamente assinado para aquela rota está efetivamente rodando um agente com aquelas ferramentas.
 
 ---
 

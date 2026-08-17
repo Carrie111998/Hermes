@@ -451,10 +451,12 @@ abaixo permite exigir revisão humana antes dessas mudanças entrarem em vigor.
 
 ### Quando o agente cria skills {#when-the-agent-creates-skills}
 
-- Após completar uma tarefa complexa (5+ chamadas de ferramenta) com sucesso
+O system prompt pede ao agente para gravar um workflow não trivial com `skill_manage` para
+reuso futuro. Na prática isso cobre:
+
+- Quando elaborou um workflow de múltiplos passos que vale repetir
 - Quando encontrou erros ou becos sem saída e achou o caminho que funciona
 - Quando o usuário corrigiu sua abordagem
-- Quando descobriu um fluxo de trabalho não trivial
 
 ### Ações {#actions}
 
@@ -745,9 +747,12 @@ O hub agora rastreia proveniência suficiente para re-verificar cópias upstream
 hermes skills check          # Report which installed hub skills changed upstream
 hermes skills update         # Reinstall only the skills with updates available
 hermes skills update react   # Update one specific installed hub skill
+hermes skills update react --force   # Overwrite a skill you've edited locally
 ```
 
 Isso usa o identificador de origem armazenado mais o hash atual do bundle upstream para detectar drift.
+
+Skills que você editou localmente (o conteúdo on-disk não corresponde mais ao hash gravado no install) são **puladas** por `hermes skills update` para que suas mudanças nunca sejam sobrescritas em silêncio. Passe `--force` para substituí-las pela versão upstream mesmo assim.
 
 :::tip Limites de rate do GitHub
 Operações do skills hub usam a API GitHub, com limite de 60 requisições/hora para usuários não autenticados. Se vir erros de rate limit durante install ou search, defina `GITHUB_TOKEN` no seu `.env` para aumentar o limite para 5.000 requisições/hora. A mensagem de erro inclui dica acionável quando isso acontece.

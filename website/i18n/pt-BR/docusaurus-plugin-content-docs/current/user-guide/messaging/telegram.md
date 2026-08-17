@@ -322,6 +322,8 @@ Esquemas suportados: `http://`, `https://`, `socks5://`.
 
 O proxy se aplica tanto à conexão principal do Telegram quanto ao transporte de IP de fallback. Se nenhum proxy específico do Telegram estiver definido, o gateway recorre a `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (ou detecção automática de proxy do sistema macOS).
 
+Se o caminho de descoberta de IP de fallback estiver unhealthy no seu host, defina `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=true` para manter o cold connect no caminho simples `api.telegram.org`. Você também pode limitar a descoberta de fallback DNS-over-HTTPS com `HERMES_TELEGRAM_FALLBACK_DISCOVERY_TIMEOUT` em segundos; o padrão é `5`.
+
 ## Canal home {#home-channel}
 
 Use o comando `/sethome` em qualquer chat do Telegram (DM ou grupo) para designá-lo como **canal home**. Tarefas agendadas (cron jobs) entregam seus resultados neste canal.
@@ -955,7 +957,7 @@ gateway:
 
 ## Renderização: mensagens ricas, tabelas e previews de link {#rendering-rich-messages-tables-and-link-previews}
 
-**Mensagens ricas (Bot API 10.1).** Respostas finais que contêm construtos que o caminho legado MarkdownV2 degrada — tabelas, listas de tarefas, `<details>` colapsáveis e matemática em bloco — são enviadas com [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) nativo do Telegram usando o **markdown bruto** do agente, então renderizam nativamente sem achatamento do lado do cliente. Durante streaming, a resposta final é entregue **editando o preview existente in-place** via parâmetro `rich_message` do `editMessageText` — sem segunda mensagem, sem delete, então não há flicker de entrega duplicada no fim de um turno. Em DMs o preview de streaming ao vivo também usa `sendRichMessageDraft`, então o draft animado corresponde à mensagem rica final. Respostas ordinárias (prosa simples, negrito/itálico, listas simples) permanecem no caminho MarkdownV2 para peso de fonte e espaçamento consistentes entre clientes.
+**Mensagens ricas (Bot API 10.1).** Respostas finais que contêm construtos que o caminho legado MarkdownV2 degrada — tabelas, listas de tarefas, `<details>` colapsáveis e matemática em bloco — são enviadas com [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) nativo do Telegram usando o **markdown bruto** do agente, então renderizam nativamente sem achatamento do lado do cliente. Em DMs, o padrão `rich_drafts: false` mantém o preview animado no caminho de draft legado editável para compatibilidade de cliente, depois envia o final persistente com `sendRichMessage`. Definir `rich_drafts: true` faz o preview ao vivo usar `sendRichMessageDraft` também. Streams baseados em edit podem finalizar um preview existente in-place via parâmetro `rich_message` do `editMessageText`. Respostas ordinárias (prosa simples, negrito/itálico, listas simples) permanecem no caminho MarkdownV2 para peso de fonte e espaçamento consistentes entre clientes.
 
 O caminho rico é pulado automaticamente quando o conteúdo excede o limite de 32.768 caracteres de rich text, e qualquer rejeição do Telegram (endpoint não suportado em python-telegram-bot mais antigo, erro de parser, blocos/colunas oversized) **recorre transparentemente** ao caminho MarkdownV2 — sua mensagem nunca se perde. Erros transitórios/de rede *não* são reenviados silenciosamente (sem mensagem final duplicada).
 

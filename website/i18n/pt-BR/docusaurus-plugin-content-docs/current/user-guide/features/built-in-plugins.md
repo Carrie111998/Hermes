@@ -203,6 +203,41 @@ Env vars com prefixo Hermes e SDK padrão (`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECR
 
 **Disabling:** `hermes plugins disable observability/langfuse`. O módulo do plugin ainda é descoberto, mas nenhum código do módulo roda até você re-habilitar.
 
+### observability/nemo_relay {#observabilitynemo_relay}
+
+Relaya boundaries de execução do Hermes — sessões, turns, LLM calls e invocações de tool — para um endpoint [NVIDIA NeMo Relay](https://docs.nvidia.com/nemo/relay/about-nemo-relay/overview). O core do Hermes é dono dos scopes de sessão/turn/LLM/tool do Relay; o plugin configura exporters (ATOF JSONL, trajetórias ATIF, OpenTelemetry) e adiciona marcas de observer para approvals e subagentes delegados. Setup completo de exporters está no `README.md` do plugin em `plugins/observability/nemo_relay/`.
+
+**Enabling:**
+
+```bash
+hermes plugins enable observability/nemo_relay
+```
+
+#### Segmentação de session-span (sessões contínuas) {#session-span-segmentation-continuous-sessions}
+
+Export do Relay é close-driven: um span exporta quando seu scope dá pop. Uma sessão contínua de gateway (o estado normal de um agente Telegram/Slack) mantém seu session scope aberto por dias ou semanas, então o span raiz da sessão — e quaisquer marcas anexadas a ele — fica sem exportar até `/new` ou idle-end, e um crash ou redeploy perde o segmento aberto inteiro. Turn spans não são afetados; eles já exportam por turn.
+
+Segmentação opt-in rotaciona o session scope em limites de turn, em `config.yaml`:
+
+```yaml
+gateway:
+  telemetry:
+    session_segments:
+      on_compaction: false   # rotate the session scope when the session compacts
+      max_turns: 0           # 0 = unlimited; N = rotate after N turns per segment
+```
+
+| Key | Default | Behaviour |
+|---|---|---|
+| `on_compaction` | `false` | Fecha e reabre o session scope depois que uma compactação de contexto completa (no próximo limite de turn, nunca mid-turn) |
+| `max_turns` | `0` | Rotaciona a cada N turns dentro de um segmento; `0` desabilita o cap |
+
+Ambos os defaults estão off — sem config definida, o lifecycle do scope é idêntico a releases anteriores (um session scope pela vida da sessão).
+
+Segmentos rotacionados mantêm o mesmo atributo `session_id` e adicionam `hermes.session.segment` (índice 0-based) mais `hermes.session.segment_reason` (`compaction` ou `max_turns`), então dashboards que agrupam em `session_id` não são afetados. Rotação acontece exclusivamente em limites de turn e usa o mesmo executor bounded de scope-op que toda outra chamada nativa do Relay — um exporter travado custa um span de segmento, nunca o agente.
+
+**Disabling:** remova o bloco `session_segments` (ou defina ambas as chaves de volta aos defaults).
+
 ### google_meet {#google_meet}
 
 Permite que o agente **entre, transcreva e participe de chamadas Google Meet** — anotar uma reunião, resumir o vai-e-vem depois, dar follow-up em pontos específicos e (opcionalmente) falar respostas de volta na chamada via TTS.

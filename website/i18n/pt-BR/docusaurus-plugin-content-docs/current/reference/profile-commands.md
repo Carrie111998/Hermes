@@ -248,7 +248,9 @@ hermes profile rename mybot assistant
 hermes profile export <name> [options]
 ```
 
-Exporta um perfil como um arquivo tar.gz compactado.
+Exporta um perfil como um arquivo tar.gz compactado — um snapshot portátil que você pode fazer backup, mover para outra máquina, ou entregar a outra pessoa. `auth.json` e `.env` são sempre excluídos.
+
+Também disponível no chat como [`/export`](./slash-commands.md), e no app desktop via **⌘K → Export profile…** ou o menu de clique direito de um quadrado de profile. Um export desktop também stageia `desktop.json` (skin, modo claro/escuro, temas custom, cor do rail, layout da janela) no archive.
 
 | Argumento / Opção | Descrição |
 |-------------------|-------------|
@@ -264,13 +266,17 @@ hermes profile export work
 hermes profile export work -o ./work-2026-03-29.tar.gz
 ```
 
+Veja [Exportar e importar um arquivo de profile](../user-guide/profile-distributions.md#export-and-import-a-profile-file) para exatamente o que entra no archive e o que checar antes de enviar um para outra pessoa.
+
 ## `hermes profile import` {#hermes-profile-import}
 
 ```bash
 hermes profile import <archive> [options]
 ```
 
-Importa um perfil a partir de um arquivo tar.gz.
+Importa um perfil a partir de um arquivo tar.gz, como um profile novo. Recusa sobrescrever um profile existente, e não pode importar como `default` (o profile raiz built-in) — passe `--name` em qualquer um dos dois casos. Um wrapper de shell é criado quando o nome não colide com um comando existente.
+
+Também disponível no chat como [`/import`](./slash-commands.md), e no app desktop via **⌘K → Import profile…** ou o botão de import ao lado do **+** do rail de profiles. Um import desktop também aplica qualquer overlay `desktop.json` incluso (tema, layout) e troca você para o profile novo.
 
 | Argumento / Opção | Descrição |
 |-------------------|-------------|
@@ -299,7 +305,7 @@ Distribuições transformam um perfil em um artefato compartilhável e versionad
 Os dados do usuário destinatário (memórias, sessões, auth, suas próprias edições em `.env`) são sempre preservados durante a instalação inicial e atualizações subsequentes.
 
 :::info
-`hermes profile export` / `import` continuam sendo os comandos certos para **backup e restauração local** de um perfil na sua própria máquina. Distribuição (`install` / `update` / `info`) é um conceito separado: enviar um perfil via git para que outra pessoa possa instalá-lo.
+Duas formas de compartilhar um profile, e elas se complementam. `hermes profile export` / `import` (também `/export` e `/import` no chat) produzem um **arquivo único** — sem repo, sem manifesto, e um export desktop leva seu tema e layout também. Distribuição (`install` / `update` / `info`) publica um profile como **repo git** para destinatários poderem puxar updates versionados depois. Backup e restauração é o outro trabalho do arquivo de export. Veja [Duas formas de compartilhar um profile](../user-guide/profile-distributions.md#two-ways-to-share-a-profile).
 :::
 
 ### `hermes profile install` {#hermes-profile-install}

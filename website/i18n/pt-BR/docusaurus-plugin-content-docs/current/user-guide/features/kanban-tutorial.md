@@ -149,56 +149,36 @@ A vista dashboard, filtrada por `auth-project`:
 
 ![Vista pipeline para feature multi-papel](/img/kanban-tutorial/08-pipeline-auth.png)
 
-Cadeia de três estágios visível de uma vez: `Spec: password reset flow` (DONE, pm), `Implement password reset flow` (DONE, backend-dev), `Review password reset PR` (READY, reviewer). Cada um tem seu parent em verde na parte inferior e children como dependências.
+O screenshot usa o modelo de **card downstream pré-criado**: o card de implementação tem um child reviewer dedicado. Nesse modelo o engineer deve chamar `kanban_complete` quando a implementação estiver pronta para o child reviewer sair de `todo`. Nunca bloqueie o parent de implementação só para pedir review.
 
-A interessante é a tarefa de implementação, porque foi blocked e retried. Aqui está a coreografia completa de três agentes, mostrada como tool calls que o model de cada worker faz:
-
-```python
-# --- PM worker spawns on $SPEC and writes the acceptance criteria ---
-# worker tool calls
-kanban_show()
-kanban_complete(
-    summary="spec approved; POST /forgot-password sends email, "
-            "GET /reset/:token renders form, POST /reset applies new password",
-    metadata={"acceptance": [
-        "expired token returns 410",
-        "reused last-3 password returns 400 with message",
-        "successful reset invalidates all active sessions",
-    ]},
-)
-# → $SPEC is done; $IMPL auto-promotes from todo to ready
-
-# --- Engineer worker spawns on $IMPL (first attempt) ---
-# worker tool calls
-kanban_show()   # reads $SPEC's summary + acceptance metadata in worker_context
-# (engineer writes code, runs tests, opens PR)
-# Reviewer feedback arrives — engineer decides the concerns are valid and blocks
-kanban_block(
-    reason="Review: password strength check missing, reset link isn't "
-           "single-use (can be replayed within 30min)",
-)
-# → $IMPL transitions to blocked; run 1 closes with outcome='blocked'
-```
-
-Agora você (o humano, ou um profile reviewer separado) lê a razão do block, decide que a direção de fix está clara, e desbloqueia do botão "Unblock" do dashboard — ou da CLI / slash command:
-
-```bash
-hermes kanban unblock $IMPL
-# or from a chat: /kanban unblock $IMPL
-```
-
-O dispatcher promove `$IMPL` de volta para `ready` e, no próximo tick, respawna o worker `backend-dev`. Este segundo spawn é uma **nova run** na mesma tarefa:
+Para workflows em que o mesmo card dono da implementação e da review, use o lifecycle de review first-class. A coreografia completa implement → review → changes → re-review é:
 
 ```python
-# --- Engineer worker spawns on $IMPL (second attempt) ---
-# worker tool calls
+# --- Engineer: first implementation attempt ---
 kanban_show()
-# → worker_context now includes the run 1 block reason, so this worker knows
-#   which two things to fix instead of re-reading the whole spec
-# (engineer adds zxcvbn check, makes reset tokens single-use, re-runs tests)
-kanban_complete(
-    summary="added zxcvbn strength check, reset tokens are now single-use "
-            "(stored + deleted on success)",
+# (write code, run tests, prepare the candidate)
+kanban_request_review(
+    summary="implemented reset flow; candidate is ready for review",
+    metadata={"changed_files": ["auth/reset.py"], "tests_run": 8},
+    reviewer="reviewer",
+)
+# → the same card enters review; the implementation run closes as
+#   outcome='review_requested'
+
+# --- Reviewer: request concrete changes ---
+kanban_show()
+# (inspect the handoff and candidate)
+kanban_request_changes(
+    reason="Add password-strength validation and make reset tokens single-use."
+)
+# → the review run closes as outcome='changes_requested'; the card returns
+#   to backend-dev in ready/todo without touching block-loop accounting
+
+# --- Engineer: second implementation attempt ---
+kanban_show()  # prior review evidence is in worker_context
+# (apply feedback and re-run tests)
+kanban_request_review(
+    summary="added zxcvbn validation and single-use reset tokens",
     metadata={
         "changed_files": [
             "auth/reset.py",
@@ -208,23 +188,21 @@ kanban_complete(
         "tests_run": 11,
         "review_iteration": 2,
     },
+    reviewer="reviewer",
 )
+
+# --- Reviewer: approve ---
+kanban_complete(summary="review passed; acceptance criteria verified")
+# → done
 ```
 
-Clique a tarefa de implementação. O drawer mostra **duas tentativas**:
+O histórico de runs da tarefa agora registra `review_requested → changes_requested → review_requested → completed`. Cada tentativa tem seu próprio actor, summary, metadata e outcome, então o segundo engineer vê exatamente o que o reviewer rejeitou e a aprovação final permanece auditável. `kanban_block` fica reservado para uma escalação externa real (acesso faltando, uma decisão de produto, infraestrutura indisponível), não feedback normal de review.
 
-![Tarefa de implementação com duas runs — blocked then completed](/img/kanban-tutorial/04b-drawer-retry-history-scrolled.png)
-
-- **Run 1** — `blocked` por `@backend-dev`. O feedback de review fica logo sob o outcome: "password strength check missing, reset link isn't single-use (can be replayed within 30min)".
-- **Run 2** — `completed` por `@backend-dev`. Summary fresh, metadata fresh.
-
-Cada run é uma linha em `task_runs` com seu próprio outcome, summary e metadata. Histórico de retry não é afterthought conceitual em cima de estado "latest" — é a representação primária. Quando um worker retrying abre a tarefa, `build_worker_context` mostra tentativas anteriores, então o worker de segunda passagem vê por que a primeira passou blocked e endereça aqueles achados específicos em vez de re-rodar do zero.
-
-O reviewer pega em seguida. Quando abrem `Review password reset PR`, veem:
+Se você usa de propósito o modelo de card downstream mostrado no screenshot, o reviewer abre `Review password reset PR` depois que o parent de implementação completa:
 
 ![Vista drawer do reviewer no pipeline](/img/kanban-tutorial/09-drawer-pipeline-review.png)
 
-O link parent é a implementação completada. Quando o worker do reviewer spawna em `Review password reset PR` e chama `kanban_show()`, o `worker_context` retornado inclui summary + metadata da run completed mais recente do parent — então o reviewer lê "added zxcvbn strength check, reset tokens are now single-use" e tem a lista de changed files em mãos antes de olhar um diff.
+O `worker_context` do card reviewer inclui o handoff da implementação completada. Isso é um workflow de cards separados; não combine com `kanban_request_review` no mesmo card ou você duplicará a lane de review.
 
 ## História 4 — Circuit breaker e crash recovery {#story-4--circuit-breaker-and-crash-recovery}
 
@@ -293,6 +271,28 @@ Quando um worker na tarefa B spawna e chama `kanban_show()`, o `worker_context` 
 Isso substitui a dança "cavar comentários e output do trabalho" que assola sistemas kanban flat. Um PM escreve acceptance criteria no metadata da spec, e o worker engineer vê estruturalmente no parent handoff. Um engineer registra quais testes rodou e quantos passaram, e o worker reviewer tem essa lista em mãos antes de abrir diff.
 
 O bulk-close guard existe porque estes dados são per-run. `hermes kanban complete a b c --summary X` (você, da CLI) é recusado — copy-paste do mesmo summary para três tarefas quase sempre está errado. Bulk close sem flags de handoff ainda funciona para o caso comum "terminei uma pilha de tarefas admin". A tool surface não expõe variante bulk; `kanban_complete` é sempre single-task-at-a-time pela mesma razão.
+
+## Follow-up em um card done — remediação de CI via o link parent {#follow-up-on-a-done-card--ci-remediation-via-the-parent-link}
+
+O card de implementação da História 1 está `done`. Duas horas depois o CI falha no branch mergeado. Não reabra o card done — cards completed são história, e o handoff flui para frente. Crie um card de remediação com o card done como **parent**:
+
+```bash
+hermes kanban create "Fix CI: test_backoff_jitter flakes on 3.11" \
+    --assignee backend-dev \
+    --parent t_impl \
+    --workspace worktree --branch wt/ci-fix-backoff \
+    --body "CI run #4812 failed after t_impl completed.
+FAILED tests/test_retry.py::test_backoff_jitter - TimeoutError
+Acceptance: tests/test_retry.py green on 3.11 and 3.12."
+```
+
+Três coisas fazem isso funcionar:
+
+- **Dispatch imediato.** Como o parent já está `done`, o child é criado direto em `ready` — o dispatcher pode reivindicá-lo no próximo tick. (Um child de um parent ainda aberto esperaria em `todo`.)
+- **Contexto herdado.** O contexto do worker de remediação inclui uma seção *Parent task results* carregando o summary e metadata de completion de `t_impl` — os arquivos mudados e decisões que o worker original registrou — então ele sabe por que o código está moldado assim antes de ler uma linha.
+- **Evidência fresh no body.** O log de CI não existia quando `t_impl` completou, então não pode estar no handoff do parent — vai no body do card novo, junto com critérios de aceitação explícitos.
+
+Prefira um worktree/branch fresh para o card de remediação. Checkout do branch original dá ao worker *estado* do repo mas nenhuma da *razão* — o handoff do parent carrega isso. O mesmo profile assignee geralmente está certo: o profile que escreveu o código tem as skills para consertá-lo.
 
 ## Inspecionando tarefa currently running {#inspecting-a-task-currently-running}
 

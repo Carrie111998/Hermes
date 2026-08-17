@@ -15,7 +15,7 @@ O Hermes tem quatro sistemas de hooks que executam código customizado em pontos
 | **[Shell hooks](#shell-hooks)** | `hooks:` block in `~/.hermes/config.yaml` pointing at shell scripts | CLI + Gateway | Drop-in scripts for blocking, auto-formatting, context injection |
 | **[Outbound webhooks](#outbound-webhooks)** | `hooks.outbound:` list in `~/.hermes/config.yaml` | CLI + Gateway | Push signed lifecycle events to external HTTP endpoints — CI, dashboards, other agents |
 
-Os quatro sistemas são non-blocking — erros em qualquer hook são capturados e logados, nunca derrubando o agente.
+Erros de callback de hook são isolados e logados em vez de derrubar o agente. Hooks não são todos passivos: hooks directive/control podem mudar o fluxo, transforms podem substituir conteúdo, e um hook shell `pre_tool_call` pode bloquear ou fail closed.
 
 ## Hooks de Eventos do Gateway {#gateway-event-hooks}
 
@@ -373,7 +373,7 @@ def register(ctx):
     ctx.register_hook("post_llm_call", my_sync_callback)
     ctx.register_hook("on_session_start", my_init_callback)
     ctx.register_hook("on_session_end", my_cleanup_callback)
-    # Kanban board lifecycle (fire after the board DB change commits):
+    # Kanban board lifecycle (dependency-wait blocking may fire inside its transaction):
     ctx.register_hook("kanban_task_claimed", my_claim_callback)     # dispatcher process
     ctx.register_hook("kanban_task_completed", my_done_callback)    # worker process
     ctx.register_hook("kanban_task_blocked", my_blocked_callback)   # worker process
@@ -381,32 +381,147 @@ def register(ctx):
 
 **Regras gerais para todos os hooks:**
 
-- Callbacks recebem **argumentos nomeados**. Sempre aceite `**kwargs` para compatibilidade futura — novos parâmetros podem ser adicionados em versões futuras sem quebrar seu plugin.
-- Se um callback **travar**, é logado e ignorado. Outros hooks e o agente continuam normalmente. Um plugin mal-comportado nunca pode quebrar o agente.
-- Dois retornos de hook afetam comportamento: [`pre_tool_call`](#pre_tool_call) pode **bloquear** a ferramenta, e [`pre_llm_call`](#pre_llm_call) pode **injetar contexto** na chamada LLM. Todos os outros hooks são observadores fire-and-forget.
-- Callbacks observadores recebem `telemetry_schema_version` automaticamente. Quando presente, `turn_id`, `api_request_id`, `task_id`, `session_id` e `api_call_count` são campos de correlação separados. Trate `api_request_id` como identificador opaco; não parseie seu formato de string.
+- Callbacks recebem **argumentos nomeados**. Sempre aceite `**kwargs` para compatibilidade futura.
+- Exceções de callback são logadas e ignoradas; callbacks posteriores continuam.
+- O catálogo abaixo é descritivo: **observers** ignoram retornos, **transforms** aceitam a primeira substituição string válida, e hooks **directive/control** consomem shapes de retorno documentados. Plugin middleware é um registry e superfície separados, não outra categoria de hook.
+- Campos de correlação como `turn_id`, `api_request_id`, `task_id`, `session_id` e `api_call_count` são específicos do hook e podem estar ausentes. Trate IDs como opacos.
+- Validade de nome de evento em runtime vem de `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lista hooks shell/outbound configurados, não todo evento disponível; `hermes hooks test <event>` reporta o set válido só quando um evento inválido é fornecido.
 
-### Referência rápida {#quick-reference}
+### Seções cache-safe de system prompt {#cache-safe-system-prompt-sections}
 
-| Hook | Quando dispara | Retorno |
-|------|----------------|---------|
-| [`pre_tool_call`](#pre_tool_call) | Antes de qualquer ferramenta executar | `{"action": "block", "message": str}` para vetar a chamada |
-| [`post_tool_call`](#post_tool_call) | Depois que qualquer ferramenta retorna | ignorado |
-| [`pre_llm_call`](#pre_llm_call) | Uma vez por turno, antes do loop de tool-calling | `{"context": str}` para prepender contexto à mensagem de usuário |
-| [`post_llm_call`](#post_llm_call) | Uma vez por turno, após o loop de tool-calling | ignorado |
-| [`pre_verify`](#pre_verify) | Uma vez por turno quando o agente editou código, antes de verificar/terminar | `{"action": "continue", "message": str}` para continuar |
-| [`on_session_start`](#on_session_start) | Nova sessão criada (só primeiro turno) | ignorado |
-| [`on_session_end`](#on_session_end) | Sessão termina | ignorado |
-| [`on_session_finalize`](#on_session_finalize) | CLI/gateway desmonta sessão ativa (flush, save, stats) | ignorado |
-| [`on_session_reset`](#on_session_reset) | Gateway troca para session key fresca (ex.: `/new`, `/reset`) | ignorado |
-| [`subagent_start`](#subagent_start) | Filho `delegate_task` foi construído e está prestes a rodar | ignorado |
-| [`subagent_stop`](#subagent_stop) | Filho `delegate_task` saiu | ignorado |
-| [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway recebeu mensagem de usuário, antes de auth + dispatch | `{"action": "skip" \| "rewrite" \| "allow", ...}` para influenciar fluxo |
-| [`pre_approval_request`](#pre_approval_request) | Decisão de aprovação solicitada, incluindo decisões auto smart-mode | ignorado |
-| [`post_approval_response`](#post_approval_response) | Decisão de aprovação tomada (ou prompt expirou) | ignorado |
-| [`transform_tool_result`](#transform_tool_result) | Depois que ferramenta retorna, antes do resultado ir ao model | `str` para substituir resultado, `None` para deixar inalterado |
-| [`transform_terminal_output`](#transform_terminal_output) | Dentro da ferramenta `terminal`, antes de truncation/ANSI-strip/redact | `str` para substituir saída bruta, `None` para deixar inalterado |
-| [`transform_llm_output`](#transform_llm_output) | Após loop de tool-calling completar, antes da resposta final ser entregue | `str` para substituir texto de resposta, `None`/vazio para deixar inalterado |
+Plugins que precisam de orientação durável e always-on podem registrar uma seção limitada de system
+prompt em vez de injetar o mesmo texto via `pre_llm_call` em
+todo turno:
+
+```python
+def board_rules(session_info):
+    return f"Apply the worker rules for profile {session_info['profile_name']}."
+
+def register(ctx):
+    ctx.register_system_prompt_section(
+        "kanban-advanced.worker-rules",
+        board_rules,                       # a string is also accepted
+        position="after_memory",
+        max_chars=4000,
+    )
+```
+
+O contrato é deliberadamente estreito:
+
+- IDs são identificadores globais, estáveis, de 1–128 caracteres lowercase usando só
+  letras, números, `.`, `_` e `-`. IDs duplicados são rejeitados.
+- `after_memory` é o único âncora de placement. Seções são ordenadas por ID,
+  renderizadas após contexto de memória/profile e antes de metadados de sessão; plugins
+  não podem reordenar ou substituir conteúdo core do prompt.
+- Um callable recebe um mapping read-only com `session_id`, `model`,
+  `provider`, `platform`, `profile_name` e `cwd`. Roda **uma vez para uma sessão
+  nova**. Seus bytes renderizados são frozen na compressão e recuperados do
+  system prompt full já persistido após restart/resume de processo;
+  estado de plugin não é relido para uma sessão existente.
+- `max_chars` é capped em 4.000 caracteres. Todas as seções plugin juntas,
+  incluindo headings de audit, são capped em 8.000 caracteres e 32
+  seções. Seções vazias, non-string, oversized, over-budget no agregado, ou que raise
+  são skipadas com warning; construção do prompt continua.
+- Toda seção aceita é nomeada no prompt e logada no início da sessão
+  com seu plugin, position e character count.
+
+Use `pre_llm_call` para contexto per-turn realmente dinâmico. Intencionalmente não
+há hook de environment-hints de plugin neste contrato: mudar cwd, branch ou
+outros dados de environment não deve mutar silenciosamente o prompt cached de uma sessão.
+Tal hook precisa de um consumidor concreto e as mesmas semânticas frozen/resume-safe
+antes de poder ser adicionado.
+
+### Catálogo shipped de plugin-hook {#shipped-plugin-hook-catalog}
+
+Os campos de payload abaixo são os campos exatos específicos do evento fornecidos por cada call site. Para backward compatibility, `PluginManager` também adiciona `telemetry_schema_version="hermes.observer.v1"` a todo callback de plugin-hook. Esse marker de envelope legado não significa que todos os payloads de hook compartilham um schema semântico; contratos versionados novos pertencem à família concreta de evento ou capability.
+
+| Hook | Categoria | Timing exato e comportamento de retorno | Campos explícitos de payload | Privacidade / sensibilidade |
+|---|---|---|---|---|
+| [`pre_tool_call`](#pre_tool_call) | Directive/control | Uma vez antes da execução; a primeira diretiva válida `block` ou `approve` vence, e retornos `modify` são shallow-merged nos argumentos da ferramenta. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Argumentos brutos podem conter conteúdo de usuário, paths, comandos ou secrets. |
+| `post_tool_call` | Observer | Após resultado blocked, error ou successful; retorno ignorado. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Texto de result/error pode conter conteúdo arbitrário de ferramenta ou usuário e secrets. |
+| `transform_tool_result` | Transform | Após `post_tool_call`, antes de append na conversa; a primeira string substitui o resultado. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Expõe o resultado completo bound ao model e os argumentos. |
+| `transform_terminal_output` | Transform | Após captura bounded de processo foreground, antes do limit final de output; a primeira string substitui o output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output podem conter credentials. |
+| `pre_transcription` | Transform | Disparado pelo dispatcher STT após resolução de provider e antes de qualquer backend (built-in, command-type ou plugin-registered) ser invocado; resultados dict são aplicados em ordem de registro, last-writer-wins por campo (`prompt`, `language`, `model`; `file_path` é read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | O prompt final é uploaded ao provider STT configurado com o áudio — mantenha secrets fora dos retornos do hook. |
+| `pre_llm_call` | Directive/control | Uma vez por turno antes do loop; todos os retornos válidos string/`{"context": ...}` são unidos e injetados na mensagem de usuário. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Mensagem de usuário completa e histórico de conversa. |
+| `post_llm_call` | Observer | Finalização de turno successful, non-interrupted; retorno ignorado. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Prompt, response e histórico completos. |
+| `transform_llm_output` | Transform | Antes de `post_llm_call` e entrega final; a primeira string não vazia substitui a response. | `response_text`, `session_id`, `model`, `platform` | Texto final completo do assistant. |
+| `pre_verify` | Directive/control | No gate bounded de verify de código editado; a primeira diretiva válida continue/block-stop mantém o turno indo. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response e changed paths. |
+| `pre_api_request` | Observer | Por tentativa de provider, imediatamente antes do request; retorno ignorado. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `user_message`, `conversation_history`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `retry_count`, `request_messages`, `message_count`, `tool_count`, `approx_input_tokens`, `request_char_count`, `max_tokens`, `started_at`, `middleware_trace`, `request` | Alta sensibilidade: `user_message`, `conversation_history` e `request_messages` legado são intencionalmente raw; prefira `request` sanitizado. |
+| `post_api_request` | Observer | Após sucesso normalizado do provider; retorno ignorado. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `finish_reason`, `message_count`, `response_model`, `response`, `usage`, `assistant_message`, `assistant_content_chars`, `assistant_tool_call_count` | `response` sanitizado está disponível, mas `assistant_message` normalizado raw pode conter conteúdo de model/usuário; `usage` é data de accounting. |
+| `api_request_error` | Observer | Em cada tentativa falha de provider; retorno ignorado. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `status_code`, `retry_count`, `max_retries`, `retryable`, `reason`, `error`, `request` | Texto de error pode conter data de provider/usuário; `request` é intended sanitizado. |
+| `on_stream_start` | Observer | Despachado quando uma response LLM streaming começa; entregue fora do token path via queue limitada owned pelo host com um worker por callback; retorno ignorado. | `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Só identificadores e metadados de roteamento. |
+| `on_stream_delta` | Observer | Despachado por delta de texto streaming normalizado via a queue observer limitada; um callback stalled dropa só seus próprios eventos mais antigos; retorno ignorado. | `delta`, `kind` (`text` ou `reasoning`), `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Texto delta é output raw do model; deltas de reasoning exigem o opt-in `plugins.stream_reasoning_deltas`. |
+| `on_stream_end` | Observer | Despachado quando uma response streaming termina ou erra, após o stream fechar; retorno ignorado. | `final_text`, `finished`, `error`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Texto de response montado completo; texto de error pode incluir data de provider. |
+| `on_interim_message` | Observer | Despachado quando uma mensagem assistant mid-loop é surfaced antes da resposta final (streaming ou non-streaming); retorno ignorado. | `text`, `already_streamed`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Texto interim completo do assistant. |
+| `transform_api_error_classification` | Transform | Em cada tentativa falha de provider, no topo do classifier built-in; todos os callbacks rodam, depois o primeiro dict com `reason` válido vence (run-all-then-pick-first), e resultados válidos skipados logam warning de runtime. Só plugins Python. | `provider`, `model`, `status_code`, `error_type`, `error_code`, `error_message`, `error_body`, `error`, `approx_tokens`, `context_length`, `num_messages` | `error_message` e `error_body` podem conter data raw de provider/usuário. |
+| `on_session_start` | Observer | Primeiro turno de sessão nova; retorno ignorado. | `session_id`, `model`, `platform` | Só identificadores e metadados de roteamento. |
+| `on_session_end` | Observer | Canonicamente em cada finalização de turno; exits CLI/TUI têm shapes legado reduzidos adicionais. Retorno ignorado. | Canonical: `session_id`, `task_id`, `turn_id`, `completed`, `failed`, `interrupted`, `turn_exit_reason`, `model`, `platform`; paths de exit podem adicionar `reason`/`api_request_id` e omitir campos. | IDs, model/platform e outcome; payload canônico não tem body de mensagem. |
+| `on_session_finalize` | Observer | Teardown CLI/TUI/gateway via `finalize_session`; shutdown ou expiry do gateway pode finalizar sem reset. Retorno ignorado. | Surface-dependent `session_id`, `platform`, opcionalmente `reason`, `old_session_id`, `new_session_id` | Identificadores de sessão e roteamento. |
+| `on_session_reset` | Observer | Boundary de sessão CLI/TUI e gateway após a sessão de substituição existir; retorno ignorado. | CLI: `session_id`, `platform`, `reason`; TUI: `session_id`, `platform`; gateway: aqueles mais `reason`, `old_session_id`, `new_session_id` | Identificadores de sessão e roteamento. |
+| `on_skill_lifecycle` | Observer | Após mudança autoritativa de estado de skill-usage; retorno ignorado. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Expõe o nome local da skill e proveniência. |
+| `subagent_start` | Observer | Filho construído e prestes a rodar; retorno ignorado. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Goal do filho pode conter conteúdo de usuário/projeto. |
+| `subagent_stop` | Observer | Exit do filho; retorno ignorado. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary e metadados redigidos de tool-history podem revelar estrutura de projeto. |
+| `pre_gateway_dispatch` | Directive/control | Mensagem inbound non-internal antes de auth/pairing/dispatch; o primeiro `skip`, `rewrite` ou `allow` válido controla o fluxo. | `event`, `gateway`, `session_store` | Objetos in-process extremamente privilegiados expõem data inbound de usuário/roteamento e handles do host. |
+| `gateway_platform_event` | Observer | Após a autorização profile-scoped do gateway suceder, quando um evento nativo de plataforma suportado é normalizado na boundary do gateway (Telegram: reações, edits de mensagem; Discord: edits/deletes de mensagem, thread created/renamed); retorno ignorado. | `platform`, `event_type`, `payload` (dict específico do tipo de evento — veja os contratos por evento abaixo) | Só envelope dict plain normalizado; objetos SDK raw, handles de adapter e bot clients nunca são expostos. |
+| `pre_command` | Observer | Slash command reconhecido prestes a ser despachado, antes do handler rodar, no cold-path CLI e gateway; retorno ignorado no v1 (dicts shaped directive são logados em debug). Comandos intercept do running-agent no gateway (`/stop`, `/approve` durante um run ativo) são deliberadamente excluídos — escape hatches de control-plane devem ficar fora do alcance de plugin. | `surface` (`"cli"` \| `"gateway"`), `command` (nome canônico), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` pode conter conteúdo de usuário ou secrets digitados após o comando. |
+| `pre_approval_request` | Observer | Antes de aprovação prompted ou smart; retorno ignorado. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command pode conter secrets; preparação observer smart force-redact, mas superfícies não têm redação idêntica. |
+| `post_approval_response` | Observer | Após uma decisão, timeout, ou falha de notificação gateway; retorno ignorado. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id`, `choice`; path smart pode adicionar `decided_by` | Mesma sensibilidade de command mais metadados de decisão. |
+| `kanban_task_claimed` | Observer | Após commit de claim, no processo dispatcher antes do spawn de worker; retorno ignorado. | `task_id`, `profile_name`, `board`, `assignee`, `run_id` | Identificadores de board/task/profile/assignee. |
+| `kanban_task_completed` | Observer | Após completion e cleanup, geralmente no processo worker; retorno ignorado. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `summary` | Summary pode conter conteúdo de projeto/usuário. |
+| `kanban_task_blocked` | Observer | Após uma transição blocked; o path de dependency-wait dispara antes da transação sair. Retorno ignorado. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `reason` | Reason pode conter conteúdo de projeto/usuário. |
+| `on_kanban_worker_spawned` | Observer | Após `spawn_fn` retornar e o PID do worker ser persistido; roda dentro do dispatch lock, mantenha callbacks rápidos. Retorno ignorado. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `worker_pid`, `workspace_path` | `workspace_path` é um path de filesystem e pode revelar layout de projeto ou usernames. |
+| `on_kanban_worker_exited` | Observer | Tick-derived: após `detect_crashed_workers` reclaimar uma tarefa dead-PID e o reclaim commitar. Retorno ignorado. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `worker_pid`, `exit_kind`, `exit_code`, `outcome`, `retry_status` | Só identificadores e metadados de exit. |
+| `on_kanban_worker_stale_claim` | Observer | Após um claim TTL-expired ser reclaimado; extensions live-PID não disparam. Retorno ignorado. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `worker_pid`, `heartbeat_stale`, `retry_status` | Só identificadores e metadados de claim. |
+| `on_kanban_task_updated` | Observer | Após um write committed de campo de tarefa fora do lifecycle claim/complete/block (assign, overrides, editors de dashboard). Retorno ignorado. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `changed_fields` | `changed_fields` carrega só nomes de campo, nunca valores; os valores title/body nomeados no board DB podem conter conteúdo de usuário/projeto. |
+| `on_kanban_dispatch_tick` | Observer | Uma vez por tick do dispatcher, estritamente após o dispatch lock ser released; ticks idle e contended também disparam. Retorno ignorado. | `board`, `profile_name`, `dry_run`, `outcome`, `result` | `result` é o `DispatchResult` do tick e carrega task ids, assignees e workspace paths. |
+
+---
+
+### Hooks de output streaming {#streaming-output-hooks}
+
+Estes hooks observer-only deixam plugins consumir output LLM streaming para telemetria, dashboards live ou pipelines TTS sem mudar a response. São entregues por queues limitadas owned pelo host com um worker background por callback registrado, então callbacks de plugin nunca rodam inline no token path. Se um callback stall, só a queue daquele callback pode encher e dropar seu evento observer pendente mais antigo; outros observers continuam recebendo eventos independentemente.
+
+Registre-os como qualquer outro plugin hook:
+
+```python
+def on_delta(delta, kind, model, provider, **kwargs):
+    if kind == "text":
+        print(delta, end="", flush=True)
+
+def register(ctx):
+    ctx.register_hook("on_stream_delta", on_delta)
+```
+
+Campos comuns para os quatro hooks:
+
+| Parâmetro | Tipo | Descrição |
+|-----------|------|-------------|
+| `turn_id` | `str` | Identificador opaco de turno, quando disponível |
+| `iteration` | `int` | Iteração atual do API-call/tool-loop |
+| `session_id` | `str` | Session id Hermes atual |
+| `model` | `str` | Identificador de modelo ativo |
+| `provider` | `str` | Nome do provider ativo |
+| `surface` | `str` | Superfície chamadora, ex. `cli`, `discord`, `telegram` |
+
+Campos adicionais:
+
+| Hook | Extra fields |
+|------|--------------|
+| `on_stream_start` | none |
+| `on_stream_delta` | `delta: str`, `kind: "text" | "reasoning"` |
+| `on_stream_end` | `final_text: str`, `finished: bool`, `error: str | None` |
+| `on_interim_message` | `text: str`, `already_streamed: bool` |
+
+`on_interim_message` também pode disparar após uma response non-streaming, então registrar só esse hook não força uma call de provider para transporte streaming.
+
+Deltas de reasoning não são expostos a plugins por padrão. Opte in explicitamente:
+
+```yaml
+plugins:
+  stream_reasoning_deltas: true
+```
+
+Valores de retorno são ignorados. Para manter o stream rápido, callbacks devem enqueue o próprio trabalho e retornar rápido. Exceções são logadas e não param o stream.
 
 ---
 
@@ -428,15 +543,33 @@ def my_callback(tool_name: str, args: dict, task_id: str, **kwargs):
 
 **Dispara:** Em `model_tools.py`, dentro de `handle_function_call()`, antes do handler da ferramenta rodar. Dispara uma vez por chamada de ferramenta — se o model chamar 3 ferramentas em paralelo, dispara 3 vezes.
 
-**Valor de retorno — vetar a chamada:**
+**Valor de retorno — bloquear ou exigir aprovação:**
 
 ```python
 return {"action": "block", "message": "Reason the tool call was blocked"}
+# or
+return {"action": "approve", "message": "Why approval is required", "rule_key": "optional:scope"}
 ```
 
-O agente encurta a ferramenta com `message` como erro retornado ao model. A primeira diretiva de block correspondente vence (plugins Python registrados primeiro, depois shell hooks). Qualquer outro valor de retorno é ignorado, então callbacks observadores existentes continuam funcionando inalterados.
+A primeira diretiva válida vence (plugins Python registrados primeiro, depois shell hooks). `block` exige um `message` não vazio e encurta a ferramenta com esse texto como o erro retornado ao model. `approve` escala a call para o gate existente de aprovação humana; `message` e `rule_key` são opcionais, e denial, timeout ou erro de gate falha closed. Outros valores de retorno são ignorados, então callbacks observer-only existentes continuam funcionando inalterados.
 
-**Casos de uso:** Logging, trilhas de auditoria, contadores de chamadas de ferramentas, bloqueio de operações perigosas, rate limiting, enforcement de política por usuário.
+**Valor de retorno — reescrever os argumentos da ferramenta:**
+
+```python
+return {"action": "modify", "args": {"new_string": "fixed content"}}
+```
+
+O dict `args` retornado é shallow-merged sobre os argumentos originais da ferramenta antes dela executar. Múltiplos hooks `modify` acumulam — as keys de cada hook são merged num dict acumulado construído dos args originais, então hook A mudando `path` e hook B mudando `content` ambos sobrevivem. Se dois hooks modificam a mesma key, o hook posterior vence.
+
+Shell hooks também aceitam o formato compatível Claude Code:
+
+```json
+{"decision": "modify", "tool_input": {"new_string": "fixed content"}}
+```
+
+Ambos os formatos são normalizados internamente para `{"action": "modify", "args": {...}}`.
+
+**Casos de uso:** Logging, trilhas de auditoria, contadores de chamadas de ferramentas, bloqueio de operações perigosas, rate limiting, enforcement de política por usuário, sanitização de argumentos, reescrita de path, injeção de parâmetros default.
 
 **Exemplo — log de auditoria de chamadas de ferramentas:**
 
@@ -522,7 +655,7 @@ def register(ctx):
 
 ### `pre_llm_call`
 
-Dispara **uma vez por turno**, antes do loop de tool-calling começar. Este é o **único hook cujo valor de retorno é usado** — pode injetar contexto na mensagem de usuário do turno atual.
+Dispara **uma vez por turno**, antes do loop de tool-calling começar. Todos os retornos válidos de callback são agregados em ordem de plugin e injetados na mensagem de usuário do turno atual.
 
 **Assinatura do callback:**
 
@@ -557,7 +690,7 @@ return None
 
 **Onde o contexto é injetado:** Sempre na **mensagem de usuário**, nunca no system prompt. Isso preserva o prompt cache — o system prompt permanece idêntico entre turnos, então tokens em cache são reutilizados. O system prompt é território do Hermes (orientação de model, enforcement de ferramentas, personalidade, skills). Plugins contribuem contexto junto ao input do usuário.
 
-Todo contexto injetado é **efêmero** — adicionado só no momento da chamada API. A mensagem de usuário original no histórico nunca é mutada, e nada é persistido no banco de sessão.
+O `content` limpo da mensagem de usuário permanece inalterado. Para estabilidade de replay e prompt-cache, o Hermes pode persistir a mensagem exact API-bound, incluindo contexto injetado por plugin, no sidecar `api_content` da row.
 
 Quando **vários plugins** retornam contexto, suas saídas são unidas com quebras de linha duplas na ordem de descoberta de plugins (alfabética por nome de diretório).
 
@@ -730,6 +863,23 @@ Para orientação permanente que deve moldar o nudge built-in de evidência falt
 
 ---
 
+### `transform_api_error_classification`
+
+Dispara uma vez por chamada API falha, no topo de `agent/error_classifier.classify_api_error()`, antes do pipeline built-in. Plugins de provider o usam para donar os quirks de erro do próprio provider sem patches no core. É behavior-changing (família transform): a classificação retornada dirige retry, compressão, rotação de credencial e roteamento de fallback.
+
+Callbacks recebem o contexto de erro parseado como kwargs — `provider` (self-scope nisto), `model`, `status_code`, `error_type`, `error_code`, `error_message`, `error_body`, `error`, `approx_tokens`, `context_length`, `num_messages`. Retorne `None` para recusar, ou um dict para reivindicar o erro:
+
+```python
+return {"reason": "model_not_found",   # required: a FailoverReason name
+        "retryable": False, "should_fallback": True}  # optional recovery-hint overrides
+```
+
+Dispatch é run-all-then-pick-first: todo callback roda, falhas são isoladas, e o primeiro resultado válido em ordem de registro vence (resultados válidos-mas-losing logam warning de runtime). Dicts inválidos e reasons desconhecidos são skipados, então um plugin quebrado nunca pode quebrar classificação.
+
+**Privacidade:** `error_message` e `error_body` podem carregar data unredacted de provider. **Só plugins Python** — registros shell são recusados no parse de config com um warning.
+
+---
+
 ### `on_session_start`
 
 Dispara **uma vez** quando uma sessão totalmente nova é criada. **Não** dispara na continuação de sessão (quando o usuário envia segunda mensagem em sessão existente).
@@ -841,7 +991,7 @@ def register(ctx):
 
 ### `on_session_finalize`
 
-Dispara quando o CLI ou gateway **desmonta** uma sessão ativa — por exemplo, quando o usuário roda `/new`, o gateway fez GC de sessão idle, ou o CLI saiu com agente ativo. Esta é a última chance de flush de estado ligado à sessão saindo antes que sua identidade se vá.
+Dispara quando o CLI ou gateway **desmonta** uma sessão ativa — por exemplo, quando o usuário roda `/new`, o gateway fez GC de sessão idle, ou o CLI saiu com agente ativo. Use para flush de estado ligado ao session ID saindo. Num reset de gateway, a sessão de substituição já existe antes deste callback rodar.
 
 **Assinatura do callback:**
 
@@ -854,7 +1004,7 @@ def my_callback(session_id: str | None, platform: str, **kwargs):
 | `session_id` | `str` or `None` | The outgoing session ID. May be `None` if no active session existed. |
 | `platform` | `str` | `"cli"` or the messaging platform name (`"telegram"`, `"discord"`, etc.). |
 
-**Dispara:** Em `cli.py` (em `/new` / exit do CLI) e `gateway/run.py` (quando sessão é resetada ou GC'd). Sempre pareado com `on_session_reset` no lado gateway.
+**Dispara:** Em teardown CLI/TUI e em paths de reset, shutdown ou idle-expiry do gateway. Shutdown e expiry do gateway podem finalizar sem um `on_session_reset` correspondente.
 
 **Valor de retorno:** Ignorado.
 
@@ -864,7 +1014,7 @@ def my_callback(session_id: str | None, platform: str, **kwargs):
 
 ### `on_session_reset`
 
-Dispara quando o gateway **troca para uma nova session key** em chat ativo — o usuário invocou `/new`, `/reset`, `/clear`, ou o adaptador escolheu sessão fresca após janela idle. Isso deixa plugins reagirem ao fato de o estado de conversa ter sido apagado sem esperar o próximo `on_session_start`.
+Dispara numa boundary de sessão CLI ou TUI, ou quando o gateway **troca para uma nova session key** em chat ativo. Isso deixa plugins reagirem a estado de conversa limpo sem esperar o próximo `on_session_start`.
 
 **Assinatura do callback:**
 
@@ -875,9 +1025,12 @@ def my_callback(session_id: str, platform: str, **kwargs):
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
 | `session_id` | `str` | The new session's ID (already rotated to the fresh value). |
-| `platform` | `str` | The messaging platform name. |
+| `platform` | `str` | `"cli"`, `"tui"`, or the messaging platform name. |
+| `reason` | `str`, optional | Presente em paths de reset CLI e gateway. |
+| `old_session_id` | `str`, optional | Session ID outgoing só gateway. |
+| `new_session_id` | `str`, optional | Session ID de substituição só gateway. |
 
-**Dispara:** Em `gateway/run.py`, imediatamente após a nova session key ser alocada mas antes da próxima mensagem inbound ser processada. No gateway, a ordem é: `on_session_finalize(old_id)` → swap → `on_session_reset(new_id)` → `on_session_start(new_id)` no primeiro turno inbound.
+**Dispara:** CLI fornece `session_id`, `platform` e `reason`; TUI fornece `session_id` e `platform`; gateway adiciona `reason`, `old_session_id` e `new_session_id` após alocar a key de substituição. Num reset de gateway, a ordem é: criar e persistir a substituição → `on_session_finalize(old_id)` → `on_session_reset(new_id)` → `on_session_start(new_id)` no primeiro turno inbound.
 
 **Valor de retorno:** Ignorado.
 
@@ -1071,6 +1224,47 @@ def register(ctx):
 
 ---
 
+### `gateway_platform_event`
+
+Dispara para eventos nativos de plataforma suportados só **depois** que a checagem de autorização profile-scoped do gateway suceder. O callback recebe dicts plain; objetos SDK raw, handles de adapter, bot clients e contextos de callback nunca fazem parte deste contrato estável.
+
+Reações de mensagem Telegram foram o primeiro evento suportado; edits de mensagem, deletes e eventos de lifecycle de thread seguiram:
+
+```python
+def on_platform_event(platform, event_type, payload, **kwargs):
+    if platform == "telegram" and event_type == "reaction":
+        print(payload["chat_id"], payload["message_id"], payload["emojis"])
+    elif event_type == "message_edited":
+        print(platform, payload["chat_id"], payload["message_id"], payload["text"])
+
+def register(ctx):
+    ctx.register_hook("gateway_platform_event", on_platform_event)
+```
+
+| Parâmetro | Tipo | Descrição |
+|-----------|------|-------------|
+| `platform` | `str` | Stable platform id (`"telegram"`, `"discord"`). |
+| `event_type` | `str` | Id de contrato local do evento (veja a tabela abaixo). |
+| `payload` | `dict` | Campos específicos do tipo de evento, documentados por tipo abaixo. |
+
+Todo payload é aditivo e específico do evento; não há um payload gateway monolítico versionado. Todos os ids são strings; campos faltando/indisponíveis são `None`, nunca guessed. Eventos malformados e eventos cuja source não pode ser autorizada são dropados (fail closed). Um rebuild transiente de Telegram Application re-registra o observer junto com os handlers core.
+
+**Contratos de payload por evento (v1, aditivo):**
+
+| `event_type` | Plataformas | Campos de payload |
+|--------------|-----------|----------------|
+| `reaction` | telegram | `emojis: list[str]`, `custom_emoji_ids: list[str]`, `chat_id: str`, `message_id: str`, `thread_id: str \| None` (updates de reação Telegram não carregam topic id, então atualmente sempre `None`). |
+| `message_edited` | telegram, discord | `chat_id: str`, `message_id: str`, `thread_id: str \| None`, `text: str \| None` (texto ou caption editado, bounded; `None` para edits só-mídia ou quando uncached), `edited_at: str \| None` (ISO 8601). |
+| `message_deleted` | discord | `chat_id: str`, `message_id: str`, `thread_id: str \| None`, `author_id: str \| None`. O evento de delete do Discord não identifica o deleter; a source autorizada é o autor da mensagem deletada, e deletes uncached nunca disparam. |
+| `thread_created` | discord | `thread_id: str`, `parent_chat_id: str \| None`, `name: str \| None`, `owner_id: str \| None`. |
+| `thread_renamed` | discord | `thread_id: str`, `parent_chat_id: str \| None`, `old_name: str \| None`, `new_name: str`. Dispara só quando o nome realmente mudou; outros updates de thread (archive, slowmode, tags) são dropados. O evento thread-update do Discord não carrega actor, então o owner da thread é a source autorizada. |
+
+Edits progressivos da própria bot (streaming) nunca disparam `message_edited` no Discord — eventos authored pela bot são dropados no fire-site.
+
+Este hook é observer-only: **não** adiciona acesso raw-event ou acesso a adapter. **Acesso raw a payload SDK é deliberadamente não shipped** — objetos SDK de adapter mudam de forma sem aviso e virariam superfície de API un-evolvable; onde genuinamente necessário exige sua própria capability explícita (`gateway.raw_events`) com label "no stability guarantee" e seu próprio design (tracked em #64228). Para *agir* numa plataforma (adicionar uma reação, renomear uma thread), use a facade `ctx.platform_actions` gated por capability documentada no [guia de plugins](plugins.md#platform-actions) — é gated off por padrão atrás da capability `gateway.platform_actions`. `PluginContext.dispatch_tool()` só pode chamar tools registradas no tool registry; `send_message` intencionalmente não está registrado lá (seu transporte é reservado para paths explícitos de delivery CLI, cron, kanban e MCP). Um contrato futuro de outbound-delivery deve primeiro fornecer conteúdo/handles delivered estáveis em todos os adapters; este slice não pré-registra um hook inerte `gateway_message_delivered`.
+
+---
+
 ### `pre_approval_request`
 
 Dispara antes de uma decisão de aprovação ser solicitada. Cobre superfícies prompted — CLI interativo, Ink TUI, plataformas gateway e clientes ACP — e decisões `approvals.mode=smart` feitas sem prompt humano (`surface="smart"`). Em smart mode, o hook roda antes do LLM auxiliar ser chamado.
@@ -1125,7 +1319,7 @@ def register(ctx):
 
 ### `post_approval_response`
 
-Dispara após decisão de aprovação prompted ou smart (ou após timeout de prompt).
+Dispara após decisão de aprovação prompted ou smart, após timeout de prompt, ou quando o gateway não consegue entregar a notificação de aprovação. Falha de notificação emite `choice="notify_failed"` antes de qualquer decisão de aprovação existir.
 
 **Assinatura do callback:**
 
@@ -1146,7 +1340,7 @@ Mesmos kwargs que `pre_approval_request`, mais:
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `choice` | `str` | Prompted surfaces use `"once"`, `"session"`, `"always"`, `"deny"`, or `"timeout"`; smart decisions use `"smart_approve"` or `"smart_deny"` |
+| `choice` | `str` | Prompted surfaces use `"once"`, `"session"`, `"always"`, `"deny"`, `"timeout"`, or `"notify_failed"`; smart decisions use `"smart_approve"` or `"smart_deny"` |
 | `decided_by` | `str` | `"aux_llm"` for smart decisions; absent on prompted surfaces |
 
 **Valor de retorno:** ignorado.
@@ -1163,6 +1357,53 @@ def register(ctx):
 
 ---
 
+### `pre_transcription`
+
+Dispara dentro do dispatcher STT (`tools.transcription_tools.transcribe_audio`) **depois** que o provider foi resolvido e **antes** de qualquer backend ser invocado, seja esse backend built-in, um provider `type: command`, ou um provider registrado por plugin. Deixa um plugin dirigir o próprio request de transcrição em vez de só observar o transcript depois.
+
+**Assinatura do callback:**
+
+```python
+def my_callback(
+    file_path: str,
+    provider: str,
+    model: str | None,
+    language: str | None,
+    prompt: str | None,
+    source: str | None,
+    **kwargs,
+) -> dict | None:
+```
+
+| Parâmetro | Tipo | Descrição |
+|-----------|------|-------------|
+| `file_path` | `str` | Absolute path to the audio file about to be transcribed. Read-only. |
+| `provider` | `str` | Resolved STT provider (`local`, `groq`, `openai`, `mistral`, `xai`, `elevenlabs`, `deepinfra`, `local_command`, a command provider name, or a plugin provider name). |
+| `model` | `str \| None` | Model resolved so far, or `None` when the backend default applies. |
+| `language` | `str \| None` | Language from the provider's config section, or `None`. |
+| `prompt` | `str \| None` | The static [`stt.prompt`](/user-guide/configuration#transcription-prompt-vocabulary-hints) value, or `None`. |
+| `source` | `str \| None` | Caller surface label (`gateway`, `voice_mode`, …). Observability only, not used for dispatch. |
+
+**Valor de retorno:** um `dict` com quaisquer de `"prompt"`, `"language"`, `"model"` mapeados a strings, ou `None` para deixar o request inalterado. Valores non-string, keys desconhecidas e `file_path` são ignorados (tentativas de `file_path` são logadas como warning). Results são aplicados em **ordem de registro, last-writer-wins por campo**, sobre o valor de config `stt.prompt`. Retornar `""` para `prompt` limpa o prompt configurado daquela requisição.
+
+**Casos de uso:** Injetar uma lista de vocabulário per-user ou per-chat antes do áudio ser uploaded, forçar `language` do locale do caller, fazer downgrade de `model` para gravações longas, rotear sources ruidosas para um modelo diferente.
+
+```python
+VOCAB = "Hermes, Teknium, Nous Research, kanban"
+
+def add_vocab(provider, prompt, source, **kwargs):
+    if source != "gateway":
+        return None
+    return {"prompt": f"{prompt}. {VOCAB}" if prompt else VOCAB}
+
+def register(ctx):
+    ctx.register_hook("pre_transcription", add_vocab)
+```
+
+Nem todo backend aceita um prompt. `local` mapeia para `initial_prompt` do faster-whisper; `openai`, `groq`, `mistral` e `deepinfra` enviam como `prompt`; `xai`, `elevenlabs`, `local_command` e providers `type: command` logam em DEBUG e transcrevem sem ele. Veja a [tabela de suporte de provider](/user-guide/configuration#transcription-prompt-vocabulary-hints) para a matriz completa e a boundary de privacidade. Erros de hook-plumbing são fail-open: o dispatch continua com o request unmodified.
+
+---
+
 ### `transform_tool_result`
 
 Dispara **depois** que uma ferramenta retorna e **antes** do resultado ser anexado à conversa. Deixa um plugin reescrever a string de resultado de QUALQUER ferramenta — não só saída de terminal — antes do model ver.
@@ -1170,23 +1411,12 @@ Dispara **depois** que uma ferramenta retorna e **antes** do resultado ser anexa
 **Assinatura do callback:**
 
 ```python
-def my_callback(
-    tool_name: str,
-    arguments: dict,
-    result: str,
-    task_id: str | None,
-    **kwargs,
-) -> str | None:
+def my_callback(tool_name: str, args: dict, result: str, task_id: str, **kwargs) -> str | None:
 ```
 
-| Parâmetro | Tipo | Descrição |
-|-----------|------|-------------|
-| `tool_name` | `str` | Tool that produced the result (`read_file`, `web_extract`, `delegate_task`, …). |
-| `arguments` | `dict` | Arguments the model called the tool with. |
-| `result` | `str` | The tool's raw result string, post-truncation and post-ANSI-strip. |
-| `task_id` | `str \| None` | Task/session ID when running inside RL/benchmark environments. |
+O payload completo também inclui `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type` e `error_message`. `result` é o resultado final retornado pelo tool dispatch; ele e `args` podem conter conteúdo arbitrário de usuário/ferramenta e secrets.
 
-**Valor de retorno:** `str` para substituir o resultado (a string retornada é o que o model vê), `None` para deixar inalterado.
+**Valor de retorno:** A primeira `str` substitui o resultado (incluindo uma string vazia); `None` deixa inalterado.
 
 **Casos de uso:** Redigir PII específico da organização de saída `web_extract`, envolver respostas JSON longas de ferramentas em header de resumo, injetar hints retrieval-augmented em resultados `read_file`, reescrever relatórios de subagente `delegate_task` em schema específico do projeto.
 
@@ -1203,13 +1433,13 @@ def register(ctx):
     ctx.register_hook("transform_tool_result", redact_secrets)
 ```
 
-Aplica-se a toda ferramenta. Para reescrita só de terminal veja `transform_terminal_output` abaixo — é mais estreito e roda mais cedo no pipeline (pre-truncation, pre-redaction).
+Aplica-se a toda ferramenta. Para reescrita só de terminal veja `transform_terminal_output` abaixo — é mais estreito, roda antes de `transform_tool_result`, e sua substituição ainda está sujeita ao limit final de output da ferramenta terminal.
 
 ---
 
 ### `transform_terminal_output`
 
-Dispara dentro do pipeline de saída foreground da ferramenta `terminal`, **antes** da truncação padrão de 50 KB, strip ANSI e redação de secrets. Deixa plugins reescrever stdout/stderr bruto de comando shell antes de qualquer processamento downstream tocá-lo.
+Dispara dentro da ferramenta `terminal` depois que a captura de processo foreground já foi limitada pelo environment, e antes do limit final de output. Deixa plugins substituir o stdout/stderr capturado; a substituição ainda está sujeita ao limit final de output.
 
 **Assinatura do callback:**
 
@@ -1217,9 +1447,9 @@ Dispara dentro do pipeline de saída foreground da ferramenta `terminal`, **ante
 def my_callback(
     command: str,
     output: str,
-    exit_code: int,
-    cwd: str,
-    task_id: str | None,
+    returncode: int,
+    task_id: str,
+    env_type: str,
     **kwargs,
 ) -> str | None:
 ```
@@ -1227,11 +1457,12 @@ def my_callback(
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
 | `command` | `str` | The shell command that produced the output. |
-| `output` | `str` | Raw combined stdout/stderr (may be very large — truncation happens after the hook). |
-| `exit_code` | `int` | Process exit code. |
-| `cwd` | `str` | Working directory the command ran in. |
+| `output` | `str` | Combined stdout/stderr after bounded process capture. |
+| `returncode` | `int` | Process return code. |
+| `task_id` | `str` | Effective task identifier, or an empty string. |
+| `env_type` | `str` | Execution-environment type. |
 
-**Return value:** `str` to replace the output, `None` to leave it unchanged.
+**Valor de retorno:** A primeira `str` substitui o output; `None` deixa inalterado. Command e output podem conter credentials ou outros dados sensíveis.
 
 **Casos de uso:** Injetar resumos para comandos que produzem saída massiva (`du -ah`, `find`, `tree`), marcar saída com marker específico do projeto para hooks downstream saberem como tratar, remover ruído de timing que varia entre runs e derrota prompt caching.
 
@@ -1247,7 +1478,7 @@ def register(ctx):
     ctx.register_hook("transform_terminal_output", summarize_find)
 ```
 
-Combina bem com `transform_tool_result` (que cobre toda outra ferramenta).
+Combina com `transform_tool_result`, que roda depois para toda ferramenta, incluindo `terminal`.
 
 ---
 
@@ -1274,7 +1505,7 @@ def my_callback(
 | `model` | `str` | Model name that produced the response (e.g. `anthropic/claude-sonnet-4.6`). |
 | `platform` | `str` | Delivery platform (`cli`, `telegram`, `discord`, …; empty when unset). |
 
-**Valor de retorno:** `str` não vazia para substituir o texto de resposta, `None` ou string vazia para deixar inalterado. **Primeira string não vazia vence** quando vários plugins registram — espelhando `transform_tool_result`.
+**Valor de retorno:** `str` não vazia para substituir o texto de resposta, `None` ou string vazia para deixar inalterado. **Primeira string não vazia vence** quando vários plugins registram. Diferente dos transforms de ferramenta e terminal, uma string vazia não é aceita como substituição.
 
 **Casos de uso:** Aplicar transform de personalidade/vocabulário (pirate-speak, Spongebob), redigir identificadores específicos do usuário do texto final, anexar footer de assinatura específico do projeto, impor guia de estilo house sem gastar tokens em instruções SOUL.
 
@@ -1297,6 +1528,50 @@ def register(ctx):
 
 O hook é guardado em resposta não vazia e não interrompida — não dispara em interrupções de botão stop ou turnos vazios. Exceções são logadas como warnings e não quebram execução do agente.
 
+### Hooks observadores de API-request {#api-request-observer-hooks}
+
+#### `pre_api_request`
+
+Dispara para cada tentativa de provider imediatamente antes de enviá-la. É observer-only. Os campos legado `user_message`, `conversation_history` e `request_messages` são raw e intencionalmente unsanitized para compatibilidade; consumidores novos devem preferir o envelope sanitizado `request`.
+
+#### `post_api_request`
+
+Dispara após uma response de provider ter sido normalizada com sucesso. É observer-only. Prefira o `response` sanitizado; `assistant_message` é a mensagem normalizada raw, e `usage` contém data de accounting.
+
+#### `api_request_error`
+
+Dispara para uma tentativa falha de provider com timing de status/retry, um objeto `error`, e `request` sanitizado. É observer-only. Mensagens de error ainda podem conter data de provider ou usuário.
+
+### `on_skill_lifecycle`
+
+Dispara após uma mudança autoritativa de estado de skill-usage. É observer-only e expõe o `skill_name` local, proveniência, IDs de correlação, usage count e flags de reuse.
+
+### Observadores de lifecycle Kanban {#kanban-lifecycle-observers}
+
+#### `kanban_task_claimed`
+
+Dispara após o commit de claim no processo dispatcher, imediatamente antes do spawn de worker.
+
+#### `kanban_task_completed`
+
+Dispara após completion e cleanup, geralmente no processo worker. Seu `summary` pode conter conteúdo de projeto ou usuário.
+
+#### `kanban_task_blocked`
+
+Dispara após uma transição blocked normal. O path de dependency-wait o invoca antes da write transaction sair. Seu `reason` pode conter conteúdo de projeto ou usuário.
+
+Todos os três hooks kanban são observer-only e carregam `task_id`, `profile_name`, `board`, `assignee` e `run_id`; completed adiciona `summary`, e blocked adiciona `reason`.
+
+### Observadores Kanban de worker-lifecycle, task-mutation e dispatch {#kanban-worker-lifecycle-task-mutation-and-dispatch-observers}
+
+Cinco observers adicionais (RFC #58548) estendem a família kanban. Todos são observer-only, disparam após a transação relevante commitar, e short-circuit em `has_hook` — sem subscriber, o comportamento de dispatch fica inalterado. Hooks task-scoped carregam os mesmos campos comuns dos hooks acima.
+
+- **`on_kanban_worker_spawned`** — após `spawn_fn` retornar e o PID do worker ser persistido. Adiciona `worker_pid` (pode ser `None`) e `workspace_path`. Roda dentro do dispatch lock; mantenha callbacks rápidos.
+- **`on_kanban_worker_exited`** — tick-derived, quando `detect_crashed_workers` reclaima uma tarefa dead-PID. Adiciona `worker_pid`, `exit_kind`, `exit_code`, `outcome`, `retry_status`.
+- **`on_kanban_worker_stale_claim`** — quando um claim TTL-expired é reclaimado; extensions live-PID não disparam. Adiciona `worker_pid`, `heartbeat_stale`, `retry_status`.
+- **`on_kanban_task_updated`** — após um write committed de campo de tarefa fora do lifecycle claim/complete/block (`assign_task`, overrides de model/reasoning, editors de dashboard). Adiciona `changed_fields` — só nomes de campo, nunca valores.
+- **`on_kanban_dispatch_tick`** — uma vez por tick do dispatcher, estritamente após o dispatch lock ser released, incluindo ticks idle e lock-contended. Payload: `board`, `profile_name`, `dry_run`, `outcome`, `result`.
+
 ---
 
 ## Hooks de Shell {#shell-hooks}
@@ -1305,7 +1580,7 @@ Declare shell-script hooks no seu `~/.hermes/config.yaml` e o Hermes os executar
 
 Use shell hooks quando quiser um script drop-in de arquivo único (Bash, Python, qualquer coisa com shebang) para:
 
-- **Bloquear chamada de ferramenta** — rejeitar comandos `terminal` perigosos, impor políticas por diretório, exigir aprovação para operações destrutivas `write_file` / `patch`.
+- **Bloquear ou modificar uma chamada de ferramenta** — rejeitar comandos `terminal` perigosos, impor políticas por diretório, exigir aprovação para operações destrutivas `write_file` / `patch`, ou reescrever argumentos (sanitizar paths, injetar defaults) antes da ferramenta rodar.
 - **Rodar após chamada de ferramenta** — auto-formatar arquivos Python ou TypeScript que o agente acabou de escrever, logar chamadas API, disparar workflow CI.
 - **Injetar contexto no próximo turno LLM** — prepender saída de `git status`, dia da semana atual ou documentos recuperados à mensagem de usuário (veja [`pre_llm_call`](#pre_llm_call)).
 - **Observar eventos de ciclo de vida** — escrever linha de log quando subagente completa (`subagent_stop`) ou sessão inicia (`on_session_start`).
@@ -1367,6 +1642,10 @@ Cada vez que o evento dispara, o Hermes spawna subprocesso para todo hook corres
 // Block a pre_tool_call (both shapes accepted; normalised internally):
 {"decision": "block", "reason":  "Forbidden: rm -rf"}   // Claude-Code style
 {"action":   "block", "message": "Forbidden: rm -rf"}   // Hermes-canonical
+
+// Modify a pre_tool_call — rewrite tool args before dispatch:
+{"action": "modify", "args": {"new_string": "fixed content"}}         // Hermes-canonical
+{"decision": "modify", "tool_input": {"new_string": "fixed content"}} // Claude-Code style
 
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}

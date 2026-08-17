@@ -517,15 +517,16 @@ Quando o agente em uma sessão em background usa `terminal(background=true)` par
 
 ```yaml
 display:
-  background_process_notifications: all    # all | result | error | off
+  background_process_notifications: concise    # concise | all | result | error | off
 ```
 
 | Modo | O que você recebe |
 |------|-----------------|
-| `all` | Running-output updates **and** the final completion message (default) |
-| `result` | Only the final completion message (regardless of exit code) |
-| `error` | Only the final message when the exit code is non-zero |
-| `off` | No process watcher messages at all |
+| `concise` | Mensagem de status de uma linha na conclusão; falhas anexam um trecho curto da saída (padrão) |
+| `all` | Atualizações de running-output **e** a mensagem final de raw-output |
+| `result` | Só a mensagem final de raw-output (independentemente do exit code) |
+| `error` | Só a mensagem final de raw-output quando o exit code é diferente de zero |
+| `off` | Sem mensagens do process watcher |
 
 Você também pode definir via variável de ambiente:
 

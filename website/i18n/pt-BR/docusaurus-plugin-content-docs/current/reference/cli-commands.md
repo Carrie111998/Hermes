@@ -105,7 +105,7 @@ Opções comuns:
 | `-q`, `--query "..."` | Prompt não interativo de disparo único. |
 | `-m`, `--model <model>` | Sobrescreve o modelo para esta execução. |
 | `-t`, `--toolsets <csv>` | Ativa um conjunto de toolsets separados por vírgula. |
-| `--provider <provider>` | Força um provedor: `auto`, `openrouter`, `nous`, `openai-codex`, `copilot-acp`, `copilot`, `anthropic`, `gemini`, `huggingface`, `novita` (aliases `novita-ai`, `novitaai`), `openai-api`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `upstage` (alias `solar`), `alibaba`, `alibaba-coding-plan` (alias `alibaba_coding`), `deepseek`, `nvidia`, `ollama-cloud`, `xai` (alias `grok`), `xai-oauth` (alias `grok-oauth`), `qwen-oauth`, `bedrock`, `opencode-zen`, `opencode-go`, `azure-foundry`, `lmstudio`, `stepfun`, `tencent-tokenhub` (alias `tencent`, `tokenhub`). |
+| `--provider <provider>` | Força um provedor: `auto`, `openrouter`, `nous`, `openai-codex`, `copilot-acp`, `copilot`, `anthropic`, `gemini`, `huggingface`, `novita` (aliases `novita-ai`, `novitaai`), `openai-api`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `upstage` (alias `solar`), `alibaba`, `alibaba-coding-plan` (alias `alibaba_coding`), `deepseek`, `nvidia`, `ollama-cloud`, `xai` (alias `grok`), `xai-oauth` (alias `grok-oauth`), `qwen-oauth`, `bedrock`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `ai-gateway`, `azure-foundry`, `lmstudio`, `stepfun`, `tencent-tokenhub` (alias `tencent`, `tokenhub`). |
 | `-s`, `--skills <name>` | Pré-carrega uma ou mais skills para a sessão (pode ser repetido ou separado por vírgula). |
 | `-v`, `--verbose` | Saída detalhada. |
 | `-Q`, `--quiet` | Modo programático: suprime banner/spinner/prévias de ferramentas. |
@@ -558,7 +558,7 @@ Quadro de colaboração multi-perfil e multi-projeto. Cada instalação pode hos
 |------|---------|
 | `--board <slug>` | Opera em um quadro específico. O padrão é o quadro atual (definido via `hermes kanban boards switch`, a variável de ambiente `HERMES_KANBAN_BOARD`, ou `default`). |
 
-**Esta é a superfície humana / de scripts.** Trabalhadores agentes gerados pelo dispatcher operam o quadro através de um [toolset](/user-guide/features/kanban#how-workers-interact-with-the-board) dedicado `kanban_*` (`kanban_show`, `kanban_complete`, `kanban_block`, `kanban_create`, `kanban_link`, `kanban_comment`, `kanban_heartbeat`; perfis orquestradores também recebem `kanban_list` e `kanban_unblock`) em vez de invocar `hermes kanban` via shell. Os trabalhadores têm `HERMES_KANBAN_BOARD` fixado em seu ambiente, então fisicamente não conseguem ver outros quadros.
+**Esta é a superfície humana / de scripts.** Trabalhadores agentes gerados pelo dispatcher operam o quadro através de um [toolset](/user-guide/features/kanban#how-workers-interact-with-the-board) dedicado `kanban_*` (`kanban_show`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_create`, `kanban_link`, `kanban_comment`, `kanban_heartbeat`; perfis orquestradores também recebem `kanban_list` e `kanban_unblock`) em vez de invocar `hermes kanban` via shell. Os trabalhadores têm `HERMES_KANBAN_BOARD` fixado em seu ambiente, então fisicamente não conseguem ver outros quadros.
 
 | Ação | Finalidade |
 |--------|---------|
@@ -579,8 +579,11 @@ Quadro de colaboração multi-perfil e multi-projeto. Cada instalação pode hos
 | `comment <id> "<text>"` | Adiciona um comentário. O próximo trabalhador que reivindicar a tarefa o lê como parte de sua resposta a `kanban_show()`. |
 | `complete <id>` | Marca a tarefa como concluída. Flags: `--result`, `--summary`, `--metadata`. |
 | `block <id> "<reason>"` | Marca a tarefa como bloqueada esperando entrada humana. Também adiciona o motivo como um comentário. |
+| `request-review <id>` | Move uma tarefa para `review` com handoff para o reviewer — NÃO é um block. Flags: `--summary`, `--metadata`, `--reviewer` (reatribui antes do dispatch de review). |
+| `request-changes <id> <reason>` | Veredito do reviewer para uma run de review ativa: fecha a tentativa de review e devolve a tarefa ao implementer original. |
+| `reopen-review <id>...` | Devolve tarefa(s) de review para mudanças (`review` → ready/todo). Flag: `--reason` (anexado como comentário). |
 | `schedule <id> "<reason>"` | Estaciona trabalho de atraso/acompanhamento em `scheduled` para que não apareça como um bloqueio humano. |
-| `unblock <id>` | Retorna uma tarefa bloqueada ou agendada para pronta (ou `todo` se as dependências ainda estiverem abertas). |
+| `unblock <id>` | Restaura uma tarefa bloqueada à sua fase de origem (`review` ou `ready`), ou `todo` enquanto as dependências continuam abertas. |
 | `archive <id>` | Oculta da lista padrão. `gc` removerá os workspaces temporários. |
 | `tail <id>` | Acompanha o fluxo de eventos de uma tarefa. |
 | `dispatch` | Uma passagem do dispatcher no quadro ativo. Flags: `--dry-run`, `--max N`, `--failure-limit N`, `--json`. |
@@ -1270,18 +1273,26 @@ Gerenciamento unificado de plugins — plugins gerais, provedores de memória e 
 | Subcomando | Descrição |
 |------------|-------------|
 | *(nenhum)* | UI interativa composta — alternâncias de plugins gerais + configuração de plugins de provedor. |
-| `install <identifier> [--force]` | Instala um plugin de uma URL Git ou `owner/repo`. |
-| `update <name>` | Baixa as últimas alterações de um plugin instalado. |
+| `install <identifier> [--force] [--ref COMMIT_SHA]` | Instala um plugin de uma URL Git, `owner/repo`, ou um nome bare do index. Nomes bare (sem barra) são resolvidos pelo index comunitário de plugins para `owner/repo` mais o commit pinado no index; nomes ambíguos listam candidatos e saem. `--ref` aceita apenas um commit SHA completo de 40 caracteres, instala essa revisão imutável exata, e sobrescreve qualquer pin do index. |
+| `search [term] [--json] [--capability CAP] [--refresh]` | Busca no index comunitário de plugins (fuzzy match em nome/descrição/tags; omita `term` para navegar). Buscado de `plugins.index_url` (padrão: o index de plugins da NousResearch), cacheado em `~/.hermes/cache/` por 24h, caindo para o cache stale e depois para o seed incluso quando offline. Indexed ≠ audited — inclusão é só uma revisão de metadata. |
+| `update <name>` | Puxa as últimas alterações de um plugin instalado unpinned. Plugins pinados precisam ser reinstalados com `--force --ref <new-commit>` para mover. |
 | `remove <name>` (aliases: `rm`, `uninstall`) | Remove um plugin instalado. |
 | `enable <name>` | Ativa um plugin desativado. |
 | `disable <name>` | Desativa um plugin sem removê-lo. |
 | `list` (alias: `ls`) | Lista os plugins instalados com status ativado/desativado. |
+| `doctor [path-or-id] [--ci]` | Valida um plugin nativo pelo parser real de manifesto, loader e caminho de registro. `--ci` sai com 1 em erros. |
+| `pack install <path-or-url> [--force]` | Instala um plugin pack (`hermes-pack.yaml`) — um conjunto declarativo de plugins, cada um pinado a um commit SHA exato de 40 caracteres. Mostra uma tela de revisão obrigatória (todo plugin, source, ref pinado, capabilities declaradas), pede uma confirmação para o conteúdo do pack, depois roda installs pinados ordinários. As capabilities declaradas de cada plugin ainda passam pelo consentimento padrão por plugin — um pack nunca faz bulk-grant. Falhas parciais são reportadas por plugin; sai non-zero quando qualquer plugin falhou. Só interativo (sem `--yes`). |
+| `pack export [--enabled-only] [--name NAME]` | Emite um YAML de pack no stdout a partir da instalação atual: repo + SHA exato de cada plugin instalado via git mais config sanitizada não secreta de `plugins.entries`. Plugins só-local (sem proveniência git) são listados como comentários de aviso, nunca como entradas instaláveis. Secrets, grants de capability e gates `allow_*` são sempre removidos. |
+| `pack show <path-or-url>` | Dry-run: parseia, valida e exibe um pack sem instalar nada. |
 
 As seleções de plugins de provedor são salvas no `config.yaml`:
 - `memory.provider` — provedor de memória ativo (vazio = apenas embutido)
 - `context.engine` — mecanismo de contexto ativo (`"compressor"` = padrão embutido)
 
 A lista de plugins gerais desativados é armazenada no `config.yaml` em `plugins.disabled`.
+Instalações Git também gravam só a source canônica, a revisão exata instalada, e
+o status de pin no sidecar `plugins/.install-metadata.json` local do profile. Ele
+não contém config de plugin, valores de environment, secrets, ou grants de capability.
 
 Veja [Plugins](../user-guide/features/plugins.md) e [Construir um Plugin do Hermes](../developer-guide/plugins/index.md).
 
@@ -1310,6 +1321,9 @@ Subcomandos:
 | `install` | Executa o instalador upstream do cua-driver (macOS, Windows e Linux). |
 | `install --upgrade` | Reexecuta o instalador mesmo que o cua-driver já esteja no PATH. O script upstream sempre baixa o lançamento mais recente, então isso executa uma atualização no local. |
 | `status` | Imprime se o `cua-driver` está no `$PATH` e qual versão está instalada. |
+| `doctor [--include CHECK] [--skip CHECK] [--json]` | Roda o relatório de health do cua-driver e mostra as checagens da plataforma. |
+| `permissions status [--json]` | Reporta os grants de Accessibility e Screen Recording no macOS. |
+| `permissions grant` | Pede ao macOS para conceder Accessibility e Screen Recording ao Cua Driver. |
 
 `hermes computer-use install` é o ponto de entrada estável para instalar o binário
 [cua-driver](https://github.com/trycua/cua) usado pelo toolset
@@ -1317,6 +1331,25 @@ Subcomandos:
 `hermes tools` invoca quando você ativa o Computer Use pela primeira vez, então é seguro
 usá-lo para reexecutar a instalação se a alternância do toolset não a disparou
 (por exemplo, em configurações de usuário recorrente).
+
+Se o cua-driver já estiver presente, o Hermes checa a versão e o manifesto de
+runtime. Uma instalação standard compatível 0.20.0 ou mais nova é deixada no lugar.
+Uma instalação standard antiga ou incompleta é reparada com o instalador upstream
+atual. O Hermes nunca substitui um binário custom selecionado via
+`HERMES_CUA_DRIVER_CMD`; atualize esse binário direto ou remova o override.
+`hermes computer-use status` reporta quando o repair é necessário.
+
+O toolset built-in `computer_use` é a integração Hermes recomendada.
+Registrar tools MCP Cua cruas é uma alternativa quando você precisa do vocabulário
+low-level da Cua. `cua-driver skills install` detecta o Hermes e linka o skill
+pack da Cua no diretório de skills do Hermes automaticamente.
+
+Modo de permissão, aprovação de capability-manifest, e o grant de profile
+existente pertencem ao launch de runtime. Em modo bounded o Hermes passa as
+flags canônicas da Cua `--capability-manifest` e `--approve-capability-manifest`.
+Todo transporte MCP possui uma sessão de lifecycle privada dentro do runtime.
+Nomes públicos de sessão rotulam estado de cursor e sessão; eles não possuem
+nem compartilham o runtime.
 
 `hermes update` reexecuta automaticamente o instalador upstream ao final
 da atualização se o cua-driver estiver no PATH, então a maioria dos usuários não precisará
@@ -1355,13 +1388,14 @@ Subcomandos:
 | Subcomando | Descrição |
 |------------|-------------|
 | `list` | Lista as sessões recentes. |
-| `browse` | Seletor interativo de sessões com busca e retomada. |
+| `browse` | Seletor interativo de sessões com busca e retomada. Cada linha mostra uma tag de status de ciclo de vida (`done` / `intr` / `err` / `empty`, derivada da mensagem final da sessão) e a contagem de mensagens. Pressione `d` numa linha destacada (enquanto o filtro de busca está vazio) para excluir aquela sessão após confirmação y/N; com um filtro ativo, `d` digita na busca. |
 | `export <output> [--session-id ID]` | Exporta sessões para JSONL. |
 | `delete <session-id>` | Exclui uma sessão. |
 | `prune` | Exclui sessões que correspondam aos filtros: limites de tempo `--older-than`/`--newer-than`/`--before`/`--after` (durações como `5h`/`2d`, dias simples, ou timestamps ISO); atributos `--source`, `--title`, `--model`, `--provider`, `--branch`, `--end-reason`, `--user`, `--chat-id`, `--chat-type`, `--cwd`; limites numéricos `--min/--max-messages`, `--min/--max-tokens`, `--min/--max-cost`, `--min/--max-tool-calls`; além de `--include-archived`, `--dry-run`, `--yes`. Padrão: mais antigas que 90 dias. |
 | `archive` | Arquiva em massa (oculta sem excluir) sessões que correspondam aos mesmos filtros de `prune`. Requer pelo menos um filtro. |
 | `stats` | Mostra estatísticas do armazenamento de sessões. |
 | `rename <session-id> <title>` | Define ou altera o título de uma sessão. |
+| `repair-routing` | Reanexa conversas do gateway presas em rows de sessão que perderam a identidade de roteamento (um chat "voltando no tempo" após um restart). Dry-run por padrão; `--apply` executa as adoções (pare o gateway primeiro); `--max-gap-seconds N` ajusta a janela de contiguidade. Só casos inequívocos são reparados. Veja [Sessões → Reparar sessões de gateway stranded](../user-guide/sessions.md#repair-stranded-gateway-sessions). |
 
 ## `hermes insights`
 

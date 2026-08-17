@@ -57,6 +57,18 @@ Quando você troca models **dentro de sessão ativa** (model picker Herm TUI, CL
 Prompt caches são keyed ao model servindo a requisição, então qualquer mudança de model mid-conversation — troca explícita `/model`, [fallback automático](./features/fallback-providers.md), ou rotação de [credential-pool](./features/credential-pools.md) para conta diferente — significa que a próxima mensagem relê a conversa inteira a preço full de input-token em vez da taxa cached (~75–90% desconto). Em sessão longa esse re-read one-time pode eclipsar a diferença per-token entre os dois models. Troque quando precisar, mas prefira cedo na conversa ou logo após iniciar sessão fresh.
 :::
 
+### Tiers de data-training desassistidos {#unattended-data-training-tiers}
+
+Modelos como `muse-spark-1.2-contributor` são com desconto porque o vendor pode treinar nos seus prompts e completions. Seleção interativa de modelo sempre mostra um prompt de confirmação. Caminhos de startup não interativos como workers Kanban e agentes cron falham fechado porque não podem fazer aquela pergunta.
+
+Se treinar nos dados da carga desassistida for aceitável, registre um acknowledgement persistente:
+
+```bash
+hermes config set security.allow_data_training_tiers_noninteractive true
+```
+
+O Hermes ainda imprime o aviso completo de política de dados e a chave de acknowledgement em cada startup desassistido, então logs de worker retêm uma trilha de auditoria. Esta setting não aprova avisos de modelo caro ou de roteamento de provider, e não substitui o prompt de confirmação interativo. Revoque com `hermes config unset security.allow_data_training_tiers_noninteractive`.
+
 ## Definindo models auxiliares {#setting-auxiliary-models}
 
 Clique **Show auxiliary** para revelar os 11 task slots:
@@ -69,7 +81,7 @@ Toda tarefa auxiliar default para `auto` — o Hermes tenta seu model principal 
 
 | Tarefa | Quando fazer override |
 |---|---|
-| **Title Gen** | Quase sempre. Um model flash $0.10/M escreve títulos de sessão tão bem quanto Opus. Config default define para `google/gemini-3-flash-preview` no OpenRouter. |
+| **Title Gen** | Quando latência ou custo do título importa mais do que casar com o model principal. Pinar um model flash conhecido como bom, ou defina `auxiliary.title_generation.prefer_fast_model: true` para o Hermes escolher o tier rápido do provider. |
 | **Vision** | Quando seu model principal não tem suporte a visão. Aponte para `google/gemini-2.5-flash` ou `gpt-4o-mini`. |
 | **Compression** | Quando você queima reasoning tokens em Opus/M2.7 só para resumir contexto. Um model chat rápido faz o job a 1/50 do custo. |
 | **Approval** | Para `approval_mode: smart` — model rápido/barato (haiku, flash, gpt-5-mini) decide se auto-aprova comandos low-risk. Models caros aqui são desperdício. |
@@ -187,6 +199,26 @@ providers:
 
 Com discovery off, o model picker (`hermes model`, `/model`) mostra a lista configurada em vez de probe live.
 
+Para um gateway compatível com Anthropic que resolve um alias bare de modelo só
+depois de receber a requisição, opte o alias em marcadores nativos de prompt-cache
+com a capability per-model `prompt_caching`:
+
+```yaml
+providers:
+  anthropic-proxy:
+    api: https://gateway.example.com/anthropic
+    transport: anthropic_messages
+    models:
+      fable:
+        context_length: 1000000
+        prompt_caching: true
+```
+
+O Hermes casa esta declaração com a rota exata do provider e o id de modelo
+em runtime, sem reescrever o alias. Defina `prompt_caching: false` para
+desabilitar explicitamente marcadores de cache para um modelo; quando omitido, o Hermes
+mantém sua detecção normal de capability de provider e modelo.
+
 :::note Formato legacy
 Configs antigos usavam lista top-level `custom_providers:` (com `base_url` em vez de `api`). Ainda funciona e é auto-migrado para dict `providers:` no `hermes update` (config v12).
 :::
@@ -258,12 +290,19 @@ model_aliases:
     provider: x-ai
 ```
 
-**Forma string curta (`model.aliases.<name>: provider/model`)** — conveniente do shell porque `hermes config set` só grava valores escalares, mas não carrega `base_url` custom:
+**Forma string curta (`model.aliases.<name>: provider/model`)** — conveniente do shell porque `hermes config set` grava escalares e agora também parseia literais inline de list/mapping, embora esta forma curta de alias ainda não possa carregar um `base_url` custom:
 
 ```bash
 hermes config set model.aliases.fav anthropic/claude-opus-4.6
 hermes config set model.aliases.grok x-ai/grok-4
 ```
+
+> `hermes config set` também aceita **literais inline de list/mapping** (estilo flow JSON/YAML). Coloque-os entre aspas para o shell passá-los intactos:
+>
+> ```bash
+> hermes config set platform_toolsets.line '["clarify", "file", "web"]'
+> hermes config set display.tool_progress_overrides '{"terminal": "off"}'
+> ```
 
 Ambos os caminhos alimentam o mesmo loader (`hermes_cli/model_switch.py`). Entradas declaradas em `model_aliases:` têm precedência sobre entradas `model.aliases:` com o mesmo nome.
 

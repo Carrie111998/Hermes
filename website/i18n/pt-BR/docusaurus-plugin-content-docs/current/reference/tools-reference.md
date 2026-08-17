@@ -42,7 +42,7 @@ Essas duas ferramentas vivem no toolset `browser`, mas só se registram quando u
 
 | Ferramenta | Descrição | Requer ambiente |
 |------|-------------|----------------------|
-| `clarify` | Faz uma pergunta ao usuário quando você precisa de esclarecimento, feedback ou uma decisão antes de continuar. Suporta dois modos: 1. **Múltipla escolha** — forneça até 4 opções. O usuário escolhe uma ou digita sua própria resposta via uma 5ª opção 'Outro'. 2.… | — |
+| `clarify` | Faz uma pergunta ao usuário quando você precisa de esclarecimento, feedback ou uma decisão antes de continuar. Suporta três modos: 1. **Múltipla escolha de seleção única** — até 4 opções; o usuário escolhe uma ou digita a própria resposta via uma 5ª opção 'Other'. 2. **Múltipla escolha multi-select** — `multi_select=true` renderiza checkboxes e retorna uma lista das opções selecionadas. 3. **Aberto** — sem opções; o usuário digita uma resposta livre. As opções são ordenadas melhor-primeiro, então a primeira é rotulada `(Recommended)` em toda superfície e é o destaque padrão; o rótulo é só apresentação e é removido da resposta que o agente lê. No CLI clássico, multi-select usa Space para alternar checkboxes; em plataformas de mensagens sem UI nativa de checkbox o usuário responde com números separados por vírgula/espaço (ex.: "1, 3") ou o texto da opção. | — |
 
 ## Toolset `code_execution` {#code_execution-toolset}
 
@@ -126,6 +126,8 @@ Registrado quando o agente é (a) criado pelo dispatcher do kanban (env `HERMES_
 | `kanban_list` | Lista tarefas do board com filtros. Somente orquestrador; oculto para workers de tarefa criados pelo dispatcher. | perfil com toolset `kanban` |
 | `kanban_complete` | Marca a tarefa atual como concluída com um payload de handoff estruturado (resultados, artefatos, próximos passos). | `HERMES_KANBAN_TASK` ou toolset `kanban` |
 | `kanban_block` | Bloqueia a tarefa atual em uma pergunta para o usuário — o dispatcher pausa, exibe a pergunta e retoma quando um humano responde. | `HERMES_KANBAN_TASK` ou toolset `kanban` |
+| `kanban_request_review` | Entrega a implementação a um reviewer com `summary`, `metadata` estruturado opcional, e um profile de reviewer opcional. Move a mesma tarefa para `review`; não é um block e não afeta a contabilidade de loop de block. | `HERMES_KANBAN_TASK` ou toolset `kanban` |
+| `kanban_request_changes` | Veredito do reviewer para uma run de review ativamente claimed. Fecha a run de review, reaplica o gating de parent, e devolve a tarefa ao implementer original sem usar um block. | `HERMES_KANBAN_TASK` ou toolset `kanban` |
 | `kanban_heartbeat` | Envia um heartbeat de progresso durante uma operação longa para que o dispatcher saiba que o worker ainda está ativo. | `HERMES_KANBAN_TASK` ou toolset `kanban` |
 | `kanban_comment` | Adiciona um comentário à thread da tarefa sem alterar seu estado — útil para expor descobertas intermediárias. | `HERMES_KANBAN_TASK` ou toolset `kanban` |
 | `kanban_create` | Gera tarefas filhas a partir da tarefa atual. Usado por orquestradores e workers que criam acompanhamentos. | `HERMES_KANBAN_TASK` ou toolset `kanban` |

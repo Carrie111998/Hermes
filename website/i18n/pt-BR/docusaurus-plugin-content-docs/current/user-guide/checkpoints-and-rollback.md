@@ -40,7 +40,8 @@ Slash commands na sessão:
 | Command | Description |
 |---------|-------------|
 | `/rollback` | List all checkpoints with change stats |
-| `/rollback <N>` | Restore to checkpoint N (also undoes last chat turn) |
+| `/rollback <N>` | Restore to checkpoint N, keeping your hand-edits (also undoes last chat turn) |
+| `/rollback <N> --all` | Full restore — overwrites your hand-edits too |
 | `/rollback diff <N>` | Preview diff between checkpoint N and current state |
 | `/rollback <N> <file>` | Restore a single file from checkpoint N |
 
@@ -130,7 +131,8 @@ O Hermes responde com uma lista formatada mostrando estatísticas de mudança:
   2. eaf4c1f  2026-03-16 04:35  before write_file
   3. b3f9d2e  2026-03-16 04:34  before terminal: sed -i s/old/new/ config.py  (1 file, +1/-1)
 
-  /rollback <N>             restore to checkpoint N
+  /rollback <N>             restore to checkpoint N (keeps your hand-edits)
+  /rollback <N> --all       full restore, overwriting your hand-edits too
   /rollback diff <N>        preview changes since checkpoint N
   /rollback <N> <file>      restore a single file from checkpoint N
 ```
@@ -188,8 +190,33 @@ Por baixo dos panos, o Hermes:
 
 1. Verifica que o commit alvo existe no shadow store.
 2. Tira um **snapshot pré-rollback** do estado atual para você poder "desfazer o desfazer" depois.
-3. Restaura arquivos rastreados no seu diretório de trabalho.
+3. Restaura arquivos rastreados no seu diretório de trabalho — **preservando suas hand-edits** (veja abaixo).
 4. **Desfaz o último turno de conversa** para o contexto do agente combinar com o estado restaurado do filesystem.
+
+### Hand-edits do usuário são preservadas por padrão {#user-hand-edits-are-preserved-by-default}
+
+`/rollback <N>` restaura só os arquivos que o próprio Hermes mudou. Toda
+`write_file` / `patch` bem-sucedida registra o hash do conteúdo do arquivo num
+**ledger de agent-write**; no restore, qualquer arquivo cujo conteúdo atual não
+casa mais com o que o Hermes escreveu por último (você editou depois, ou o Hermes
+nunca tocou) é **pulado** em vez de sobrescrito, e listado na saída:
+
+```
+✅ Restored to checkpoint a1b2c3d4: before write_file
+↷ Kept your hand-edits: src/config.py, notes.md
+Use /rollback <N> --all to restore those too.
+```
+
+Para forçar o restore clássico completo que reverte tudo — inclusive suas próprias
+edições — adicione `--all`:
+
+```
+/rollback 1 --all
+```
+
+Se o ledger estiver vazio (um store criado antes deste recurso, ou o Hermes ainda
+não escreveu arquivos no projeto), `/rollback` recua automaticamente para o
+restore completo.
 
 ## Restauração de arquivo único
 

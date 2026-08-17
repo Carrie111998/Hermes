@@ -127,6 +127,15 @@ Quick Entry é um composer pequeno sempre disponível invocado por um **hotkey g
 
 Converse com o Hermes e ouça de volta, o mesmo [voice mode](./features/voice-mode.md) disponível em outros lugares. No macOS o SO pedirá acesso ao microfone uma vez.
 
+### Modo HUD {#hud-mode}
+
+**⌘/Ctrl+Shift+H** (ou o botão da titlebar) destaca o chat numa barra flutuante sem chrome, always-on-top, que fica sobre o que você estiver trabalhando. A janela do app sai do caminho; o HUD mantém sua conversa ao vivo e um composer. Onde você o estaciona é contexto — a posição da barra diz ao Hermes qual app e tela você está perguntando, então "isto", "aqui" e "essa página" resolvem para o que está embaixo dela.
+
+- **Mover a barra** — **pressione e segure** em qualquer lugar do composer por um instante, depois arraste. Um toque rápido ainda digita; um pressionar segurado pega a janela. Esta é a única forma de mover o HUD — não há titlebar para arrastar.
+- **Redimensionar** — arraste o canto inferior direito da barra.
+- **Snap para o ponteiro** — **⌘/Ctrl+Shift+G** (hotkey global, funciona de qualquer app) salta o HUD para onde está o cursor.
+- **Sair** — clique o botão de saída na barra, ou pressione **⌘/Ctrl+Shift+H** de novo. A janela do app volta com sua sessão intacta.
+
 ### Settings e onboarding {#settings--onboarding}
 
 Gerencie providers, modelos, ferramentas e credenciais numa UI real em vez de editar YAML. O onboarding de primeira execução leva você à primeira mensagem em segundos. Os painéis de settings cobrem providers/keys, seleção de modelo, configuração de toolset, servidores MCP, gateway e gerenciamento de sessão.
@@ -153,6 +162,29 @@ O app também expõe a superfície mais ampla de gerenciamento Hermes para você
 - **Messaging** — configure canais do gateway.
 - **Agents** e **Command Center** — superfícies de orquestração para trabalho multi-agente.
 
+### Bot Mode (built-in) {#bot-mode-built-in}
+
+**Bot Mode** vem com o app e está ligado por padrão: um roster "um chat por agente"
+em que cada [profile Hermes](./profiles.md) aparece como um bot com seu
+próprio avatar (rosto geométrico, imagem enviada, retrato gerado por IA, ou um pixel
+pet), sua própria conversa canônica **Bot Chat**, e suas próprias **Routines**
+(tarefas recorrentes respaldadas pelo cron do Hermes). Crie novos agentes pelo roster —
+Name / Title / Description mais um disclosure Advanced com a superfície completa
+de capacidades (model, SOUL, skills, toolsets, servidores MCP) — agrupe-os em
+seções, e abra group chats onde vários bots deliberam.
+
+Bots mandam mensagens uns aos outros: digite `@researcher have a look at this` em qualquer chat
+e o bot ativo passa a mensagem e reporta de volta, e bots alcançam
+os Bot Chats uns dos outros diretamente (`hermes -p <bot> chat`). O backend ensina
+a cada sessão canônica **Bot Chat** de um bot o protocolo de messaging
+automaticamente (config `agent.bot_mode_protocol`, padrão ligado) — inclusive
+quando um bot colega a abre headless pela CLI — então replies e handoffs
+bot-a-bot funcionam sem tocar seu SOUL.md, e suas sessões regulares
+permanecem intactas.
+
+Não quer? Desligue em **Settings → Plugins → Bots** — o roster,
+o painel de routines e o middleware do composer desregistram ao vivo, sem restart.
+
 ### Teclado e navegação {#keyboard--navigation}
 
 - **Command palette** — pressione **Cmd+K** ou **Cmd+P** (Ctrl+K / Ctrl+P no Windows/Linux) para saltar a ações e navegar o app pelo teclado: abrir qualquer página ou seção de settings, saltar a uma sessão por título ou id, trocar model/theme/color mode, spawnar terminal, reiniciar gateway, atualizar Hermes e mais.
@@ -165,6 +197,7 @@ O app também expõe a superfície mais ampla de gerenciamento Hermes para você
 - **Overhaul da lista de sessões** — lista de sessões refeita com archiving e higiene geral de sessão para manter a lista gerenciável conforme cresce.
 - **Buscar sessões por id** — encontre uma sessão específica diretamente pelo id.
 - **Sessões multi-profile concorrentes** — rode sessões em múltiplos [profiles](./profiles.md) ao mesmo tempo, e referencie uma sessão em outro profile com links cross-profile `@session`.
+- **Exportar / importar um profile** — compartilhe um setup inteiro como um único arquivo. **⌘K → Export profile…** (ou clique direito num quadrado de profile no rail) grava um `.tar.gz` com skills, memória, persona, crons, plugins e settings; API keys são removidas. Exportar do desktop também empacota sua aparência e interface — skin, modo light/dark, temas custom, a cor do rail do profile e o layout da janela — então um profile importado chega com a cara que o remetente tinha. Importe via **⌘K → Import profile…** ou o botão ao lado do **+** do rail; aplica o overlay e te coloca no profile novo. O mesmo arquivo funciona com `/export` / `/import` no chat e `hermes profile export` / `import` no shell. Veja [Exportar e importar um arquivo de profile](./profile-distributions.md#export-and-import-a-profile-file).
 
 ## Atualização {#updating}
 
@@ -217,6 +250,19 @@ Por padrão o app inicia e gerencia seu próprio backend **local**. Você pode a
 - **Hermes Cloud** — faça login uma vez no Hermes Cloud e escolha entre os agentes da sua conta; sem URL para colar. O app descobre seus agentes (com organization picker se sua conta abrange várias orgs), e conectar a um troca a sessão automaticamente. A status bar mostra a conexão cloud enquanto ativa.
 
 Modos de conexão são configurados **por profile** — um override por profile pode apontar um profile a backend remoto ou cloud enquanto outros ficam locais (**Use default gateway** remove um override).
+
+### Settings → Connections: o registry multi-conexão {#settings--connections-the-multi-connection-registry}
+
+Junto ao modo de conexão por profile acima, **Settings → Connections** gerencia um registry nomeado de toda fonte de agente que o app conhece — o runtime local, qualquer número de gateways remotos (LAN, Tailscale, internet), instâncias Hermes Cloud e hosts SSH — todos persistidos juntos num lugar. Você chega lá pelo botão de plug no extremo direito do rail de profiles da sidebar (**Connect another Hermes gateway…**) ou via **⌘K → Connections**. O guia completo, incluindo o roster união de agentes, handles `@name-device`, updates da frota e a superfície plugin SDK, está em [Conectando o Desktop a Muitas Instâncias Hermes](./multi-connection-desktop.md).
+
+- **Toda conexão precisa de um nome único** (um nome de device como "Homelab" ou "Work laptop"). Quando o mesmo nome de profile existe em várias fontes registradas, as superfícies desambiguam como `@profile-device` (ex. `@research-homelab`).
+- **Add / edit / remove / test** conexões pelo painel. A entrada local é gerenciada pelo app e não pode ser removida. **Test** sonda as pernas HTTP e WebSocket da própria conexão diretamente.
+- Settings existentes são **importadas automaticamente** na primeira vez que você roda um build com o registry: sua conexão global atual e quaisquer overrides por profile viram entradas nomeadas. O arquivo de settings legado permanece intacto, então builds mais antigos continuam funcionando.
+- Entradas cloud vêm do fluxo de sign-in/descoberta Hermes Cloud acima, não de uma URL digitada à mão.
+- Tokens são armazenados criptografados com o keyring do SO (com o mesmo opt-in explícito de plain-text que Settings → Gateway no Linux sem keyring).
+
+Roteamento lado a lado está ao vivo: cada fonte registrada disca seus próprios backends e sockets sob demanda (keyed por conexão + profile), o plugin SDK expõe o roster união de agentes (`host.agents()` / `host.ensureAgent()`), e **Update all instances** no painel Connections despacha `hermes update` para toda fonte elegível de uma vez — entradas Hermes Cloud são puladas (a plataforma as atualiza), e cada instância reporta seu próprio resultado.
+
 
 :::info O backend remoto é um processo `hermes serve` rodando
 "Remote backend" significa um servidor **`hermes serve`** rodando na máquina remota — esse é o processo ao qual o app desktop conecta. Nada nesta seção funciona a menos que aquele backend esteja de fato up e alcançável. O app desktop não o inicia para você; você (ou um serviço `systemd`) mantém `hermes serve` rodando no host remoto, e o app se anexa a ele. Se também usa canais de messaging (Telegram, Discord, etc.), o **gateway** é um processo long-running *separado* que você inicia independentemente — veja a nota após os passos de setup.

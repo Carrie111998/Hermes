@@ -97,13 +97,16 @@ de segurança bloqueia o listener loopback, ou você fecha a aba do navegador �
 
 ## Para operadores de gateway {#for-gateway-operators}
 
-O login nativo está disponível automaticamente em qualquer gateway protegido que tenha um
-provedor OAuth intermediável registrado (ex.: o provedor **Nous** incluso). Nenhuma
-configuração é necessária — as rotas `/auth/native/*` e o anúncio de
-`auth_flows` fazem parte do subsistema de autenticação do dashboard. Provedores apenas de
-senha e apenas de token não anunciam `native_pkce` (não há redirecionamento
-upstream para intermediar), e essas implantações continuam usando o login
-existente.
+O login nativo está disponível automaticamente em qualquer gateway protegido com um
+provedor de sessão interativa registrado. Nenhuma configuração é necessária — as
+rotas `/auth/native/*` e o anúncio de `auth_flows` fazem parte do
+subsistema de autenticação do dashboard. Provedores OAuth (ex.: o provedor
+**Nous** incluso) intermediam o redirecionamento do IdP upstream; provedores de senha
+(ex.: o plugin **basic-auth** incluso) levam o browser do sistema ao formulário
+de credenciais `/login` do gateway — o que permite que gerenciadores de senha
+do SO (Senhas do macOS, etc.) preencham o formulário automaticamente, algo que
+nenhum webview embarcado do desktop consegue oferecer. Credenciais apenas de
+token (ex.: drain) não são logins interativos e não anunciam `native_pkce`.
 
 Os endpoints relevantes (todos públicos, de bootstrap pré-autenticação, assim como as
 rotas OAuth `/auth/*` existentes):

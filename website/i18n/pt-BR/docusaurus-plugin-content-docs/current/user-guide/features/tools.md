@@ -53,6 +53,13 @@ Toolsets comuns incluem `web`, `search`, `terminal`, `file`, `browser`, `vision`
 
 Veja [Referência de toolsets](/reference/toolsets-reference) para o conjunto completo, incluindo presets por plataforma como `hermes-cli`, `hermes-telegram` e toolsets MCP dinâmicos como `mcp-<server>`.
 
+## Anotações de resultado de ferramenta {#tool-result-annotations}
+
+Alguns comportamentos de ferramenta vale conhecer quando você lê transcripts do agente:
+
+- **Mortes por signal são explicadas.** Quando um comando de terminal é morto por um signal, o resultado carrega uma nota legível em vez de um código numérico nu — ex.: exit `-9`/`137` vira "terminated by signal 9: SIGKILL — often the kernel OOM killer on memory exhaustion, or an explicit kill -9", e segfaults, aborts, SIGTERM, broken pipes e limites de CPU/tamanho de arquivo são rotulados da mesma forma. Códigos negativos (semântica de subprocess) são afirmados de forma definitiva; a convenção `128+signum` do shell é hedged com "usually" porque uma aplicação pode sair legitimamente com esses códigos.
+- **Arquivos de texto UTF-16 são transcoded, não recusados.** `read_file` detecta UTF-16 (BOM ou heurística de padrão de bytes, qualquer endianness — comum em arquivos do Notepad do Windows e redirects `>` do PowerShell) e transcodifica para UTF-8 para display em vez de marcar o arquivo como binário. O resultado inclui uma dica divulgando a conversão; edições via `patch`/`write_file` re-encodam como UTF-8. Arquivos acima de 10 MB e arquivos genuinamente binários ainda recebem a recusa de arquivo binário.
+
 ## Backends de terminal {#terminal-backends}
 
 A ferramenta de terminal pode executar comandos em ambientes diferentes:

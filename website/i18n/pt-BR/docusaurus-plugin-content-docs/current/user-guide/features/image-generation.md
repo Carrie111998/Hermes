@@ -159,31 +159,29 @@ Essa tradução acontece em `_build_fal_payload()` — código do agente nunca p
 
 ## Upscaling {#upscaling}
 
-### Automático (ligado por padrão em modelos de baixa resolução) {#automatic-default-on-for-low-res-models}
+### Só opt-in {#opt-in-only}
 
-Todo modelo cuja saída nativa fica abaixo de ~2MP roda automaticamente um
-passo de alta resolução após a geração, para você nunca receber em silêncio
-uma imagem de baixa resolução:
+Nenhum modelo faz upscale por padrão. Modelos de imagem modernos emitem sua melhor
+qualidade nativamente, e os upscalers disponíveis são enhancers *criativos*
+(passos de diffusion) que podem redesenhar conteúdo sutilmente — degradando texto
+renderizado, rostos e detalhe fino. Upscaling só roda quando o agente
+o pede explicitamente.
 
-| Backend | Modelos com upscale por padrão | Upscaler |
-|---|---|---|
-| **FAL.ai** | todos exceto Seedream 5 Pro/Lite e Krea 2 Large (nativo ≥2MP) | Clarity Upscaler (2×, +$0.03/MP) |
-| **Krea** | Krea 2 Medium + Medium Turbo (1.5K nativo); Large (2K) pula | Krea Enhance (2×, teto de até 8K) |
-| Outros backends | — | sem upscaler; resolução nativa retornada |
+### O parâmetro `upscale` (opt-in por chamada) {#the-upscale-parameter-per-call-opt-in}
 
-### O parâmetro `upscale` (override por chamada) {#the-upscale-parameter-per-call-override}
+- `upscale: true` — encadeia um passo de alta resolução após a geração:
 
-O booleano `upscale` exposto ao agente sobrescreve o padrão em qualquer
-direção:
+| Backend | Upscaler |
+|---|---|
+| **FAL.ai** | Clarity Upscaler (2×, +$0.03/MP) |
+| **Krea** | Krea Enhance (2×, teto de até 8K) |
+| Outros backends | sem upscaler; resolução nativa retornada |
 
-- `upscale: false` — pula o passo automático (rascunho mais rápido/barato)
-- `upscale: true` — força o passo, mesmo em modelos hi-res nativos ou edições
-  de imagem
+- `upscale: false` / omitido — resolução nativa (o padrão)
 
 `video_generate` também aceita `upscale: true` no backend FAL, encadeando o
 upscaler de vídeo **SeedVR2** da ByteDance (2×, $0.001/MP do vídeo de saída)
-após a geração. Vídeo permanece opt-in — dobrar a resolução de todo vídeo por
-padrão dobraria custo e latência.
+após a geração.
 
 Quando o passo de imagem da FAL roda, usa estas configurações:
 
@@ -202,7 +200,7 @@ Se upscaling falhar (problema de rede, rate limit), a imagem original é retorna
 1. **Resolução de modelo** — `_resolve_fal_model()` lê `image_gen.model` de `config.yaml`, cai para a env var `FAL_IMAGE_MODEL`, depois para `fal-ai/flux-2/klein/9b`.
 2. **Construção de payload** — `_build_fal_payload()` traduz seu `aspect_ratio` para o formato nativo do modelo (enum preset, enum aspect-ratio ou literal GPT), mescla os params padrão do modelo, aplica quaisquer overrides do caller e filtra pela whitelist `supports` do modelo para que chaves não suportadas nunca sejam enviadas.
 3. **Submissão** — `_submit_fal_request()` roteia via credenciais FAL diretas ou gateway Nous gerenciado.
-4. **Upscaling** — roda quando a entrada do catálogo do modelo tem `upscale: True` (o padrão para modelos sub-2MP) ou o agente passou `upscale: true`; um `upscale: false` explícito sempre pula.
+4. **Upscaling** — roda só quando o agente passou `upscale: true`; o default do catálogo de todo modelo está off.
 5. **Entrega** — URL final da imagem retornada ao agente, que emite uma tag `MEDIA:<url>` que adapters de plataforma convertem em mídia nativa.
 
 ## Depuração {#debugging}

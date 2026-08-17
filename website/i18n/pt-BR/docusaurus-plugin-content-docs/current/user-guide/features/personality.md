@@ -211,7 +211,7 @@ São overlays convenientes, mas seu `SOUL.md` global ainda dá ao Hermes a perso
 
 ## Personalidades customizadas na config {#custom-personalities-in-config}
 
-Você também pode definir personalidades nomeadas customizadas em `~/.hermes/config.yaml` sob `agent.personalities`.
+Personalidades built-in estão sempre disponíveis em toda superfície (CLI, plataformas de mensagens, TUI e o app desktop). Você pode adicionar as suas — ou sobrescrever uma built-in reusando o nome — em `~/.hermes/config.yaml` sob `agent.personalities`.
 
 ```yaml
 agent:
@@ -227,9 +227,11 @@ Depois alterne com:
 /personality codereviewer
 ```
 
+Sua seleção é armazenada como um nome em `display.personality`. Personalidades nunca tocam `agent.system_prompt` — aquele campo é reservado para um system prompt manual que você escreve, e só se aplica quando nenhuma personalidade está selecionada.
+
 ## Resetando para o padrão {#resetting-to-the-default}
 
-Para cancelar o overlay de personalidade ativo e voltar ao comportamento base (sua persona do `SOUL.md`), use qualquer um destes:
+Para cancelar o overlay de personalidade ativo e voltar ao comportamento base (sua persona do `SOUL.md`, mais `agent.system_prompt` se você definiu um), use qualquer um destes:
 
 ```text
 /personality none
@@ -237,7 +239,11 @@ Para cancelar o overlay de personalidade ativo e voltar ao comportamento base (s
 /personality neutral
 ```
 
-Os três limpam o overlay: o `agent.system_prompt` salvo é esvaziado e a mudança vale na próxima mensagem. Rodar `/personality` sem argumentos também lista `none` junto com os presets disponíveis.
+Os três limpam a seleção (`display.personality`) e a mudança vale na próxima mensagem. Rodar `/personality` sem argumentos também lista `none` junto com os presets disponíveis e marca o ativo.
+
+:::note Reset único no upgrade
+Versões mais antigas do Hermes salvavam o estado de personalidade de forma inconsistente entre superfícies, o que podia reativar uma personalidade que você já tinha desligado. Na primeira execução após o upgrade, qualquer seleção de personalidade salva é resetada para `none` uma vez (a migração imprime qual personalidade foi limpa). Reative com `/personality <name>` se ainda quiser. Texto manual de `agent.system_prompt` nunca é tocado.
+:::
 
 ## Fluxo de trabalho recomendado {#recommended-workflow}
 

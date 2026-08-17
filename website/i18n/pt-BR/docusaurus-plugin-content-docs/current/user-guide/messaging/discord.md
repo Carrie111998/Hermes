@@ -809,11 +809,17 @@ No Discord access policy configured; inbound Discord messages will be denied by 
 
 O Hermes 0.18 falha fechado intencionalmente em adaptadores externamente alcançáveis. Um bot Discord sem `DISCORD_ALLOWED_USERS`, sem `DISCORD_ALLOWED_ROLES`, sem `DISCORD_ALLOWED_CHANNELS` e sem flag allow-all explícita conectará com sucesso, mas negará usuários inbound antes do tratamento normal de mensagens.
 
-### Erro "Disallowed Intents" no startup {#disallowed-intents-error-on-startup}
+### Erro "Privileged intents" / `PrivilegedIntentsRequired` no startup {#privileged-intents--privilegedintentsrequired-error-on-startup}
 
-**Causa**: Seu código solicita intents que não estão habilitados no Developer Portal.
+**Causa**: O Hermes solicita Privileged Gateway Intents que não estão habilitados para o seu bot no Developer Portal. O Discord então rejeita a conexão WebSocket. O Hermes sempre solicita **Message Content Intent**. Também solicita **Server Members Intent** quando sua allowlist usa usernames (não IDs numéricos) ou quando `DISCORD_ALLOWED_ROLES` está definido. Presence Intent não é exigido.
 
-**Solução**: Habilite os três Privileged Gateway Intents (Presence, Server Members, Message Content) nas configurações do Bot, depois reinicie.
+**Solução**:
+
+1. Vá em [Developer Portal](https://discord.com/developers/applications) → seu app → Bot → Privileged Gateway Intents.
+2. Habilite **Message Content Intent** (obrigatório). Habilite **Server Members Intent** se você usa usernames ou allowlists de cargo.
+3. Clique em **Save Changes**, depois reinicie o gateway (`hermes gateway restart`).
+
+O log do gateway deve nomear o(s) intent(s) exato(s) que o Hermes solicitou. Até estarem habilitados, o Discord continuará rejeitando a conexão — isso é um erro de configuração do portal, não um problema flaky de rede.
 
 ### Bot não vê mensagens em um canal específico {#bot-cant-see-messages-in-a-specific-channel}
 

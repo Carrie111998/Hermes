@@ -57,7 +57,7 @@ O Teams não pode entregar mensagens em `localhost`. Para desenvolvimento local,
 ```bash
 # devtunnel (Microsoft)
 devtunnel create hermes-bot --allow-anonymous
-devtunnel port create hermes-bot -p 3978 --protocol https  # replace 3978 with TEAMS_PORT if changed
+devtunnel port create hermes-bot -p 3978 --protocol http  # replace 3978 with TEAMS_PORT if changed
 devtunnel host hermes-bot
 
 # ngrok
@@ -68,6 +68,8 @@ cloudflared tunnel --url http://localhost:3978  # replace 3978 with TEAMS_PORT i
 ```
 
 Copie a URL `https://` da saída — você usará no próximo passo. Deixe o túnel rodando enquanto desenvolve.
+
+A URL pública do túnel usa HTTPS, mas o listener local de webhook do Hermes usa HTTP simples. O túnel termina TLS e encaminha HTTP para a porta `3978`; não configure a porta local do túnel como HTTPS.
 
 Para produção, aponte o endpoint do bot ao domínio público do seu servidor (veja [Implantação em produção](#production-deployment)).
 
@@ -232,7 +234,7 @@ Se o plugin `teams_pipeline` **não** estiver habilitado, essas configurações 
 
 ## Implantação em produção {#production-deployment}
 
-Para um servidor permanente, pule devtunnel e registre seu bot com o endpoint HTTPS público do servidor:
+Para um servidor permanente, termine TLS num reverse proxy e encaminhe as requisições para o listener HTTP simples do Hermes, normalmente `http://127.0.0.1:3978`. Registre o endpoint HTTPS público do proxy com o Teams:
 
 ```bash
 teams app create \
@@ -246,7 +248,7 @@ Se você já criou o bot e só precisa atualizar o endpoint:
 teams app update --id <teamsAppId> --endpoint "https://your-domain.com/api/messages"
 ```
 
-Certifique-se de que a porta configurada (`TEAMS_PORT`, padrão `3978`) seja acessível da internet e que seu certificado TLS seja válido — o Teams rejeita certificados autoassinados.
+Certifique-se de que o endpoint HTTPS público seja alcançável da internet e use um certificado TLS válido. O Teams rejeita certificados autoassinados. Mantenha o listener do Hermes atrás do proxy; a porta `3978` não serve HTTPS por si.
 
 ---
 
@@ -257,6 +259,7 @@ Certifique-se de que a porta configurada (`TEAMS_PORT`, padrão `3978`) seja ace
 | `Can't find a suitable configuration file` do `docker compose` | Você não está no repositório que tem `docker-compose.yml`, ou está em instalação nativa — use `hermes gateway restart`, ou `cd` no clone primeiro |
 | `requirements not met` / `Teams SDK missing` / `No adapter available for teams` | Reinicie o gateway para a instalação preguiçosa rodar, ou instale no **venv do Hermes**: `~/.hermes/hermes-agent/venv/bin/pip install microsoft-teams-apps aiohttp`. `pip` do sistema falha no Ubuntu 24.04 (PEP 668) e não afetaria o serviço mesmo |
 | Endpoint `health` funciona mas o bot não responde | Verifique se o túnel ainda está rodando e se o endpoint de mensagens do bot corresponde à URL do túnel |
+| Logs mostram `"UNKNOWN / HTTP/1.0" 400` quando o Teams envia uma mensagem | O túnel ou reverse proxy está encaminhando HTTPS para o listener HTTP simples do Hermes. Termine TLS no proxy e encaminhe HTTP para a porta `3978` |
 | `KeyError: 'teams'` nos logs | Reinicie o container — isso está corrigido na versão atual |
 | Bot responde com erros de auth | Verifique se `TEAMS_CLIENT_ID`, `TEAMS_CLIENT_SECRET` e `TEAMS_TENANT_ID` estão corretos |
 | `No inference provider configured` | Verifique se `ANTHROPIC_API_KEY` (ou outra chave de provedor) está em `~/.hermes/.env` |

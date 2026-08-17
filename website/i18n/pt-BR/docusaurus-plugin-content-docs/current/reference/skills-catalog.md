@@ -120,6 +120,7 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 | Skill | Descrição | Caminho |
 |-------|-------------|------|
 | [`airtable`](/docs/user-guide/skills/bundled/productivity/productivity-airtable) | API REST do Airtable via curl. CRUD de registros, filtros, upserts. | `productivity/airtable` |
+| [`box`](/docs/user-guide/skills/bundled/productivity/productivity-box) | Box gerencia arquivos na nuvem, compartilhamento, busca e metadata. | `productivity/box` |
 | [`document-to-action-items`](/docs/user-guide/skills/bundled/productivity/productivity-document-to-action-items) | Extrai obrigações, prazos e tarefas citadas de documentos. | `productivity/document-to-action-items` |
 | [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx) | Cria, lê, edita e usa templates de arquivos Word .docx. | `productivity/docx` |
 | [`google-workspace`](/docs/user-guide/skills/bundled/productivity/productivity-google-workspace) | Gmail, Calendar, Drive, Docs, Sheets via CLI gws ou Python. | `productivity/google-workspace` |
@@ -131,6 +132,7 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) | Cria, lê, une, preenche e protege arquivos PDF. | `productivity/pdf` |
 | [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Cria, lê e edita decks .pptx com python-pptx. | `productivity/powerpoint` |
 | [`product-price-monitor`](/docs/user-guide/skills/bundled/productivity/productivity-product-price-monitor) | Monitora preços de produtos, voos ou anúncios; alerta no alvo. | `productivity/product-price-monitor` |
+| [`session-librarian`](/docs/user-guide/skills/bundled/productivity/productivity-session-librarian) | Organiza sessões por prompt: find, rename, archive, prune. | `productivity/session-librarian` |
 | [`teams-meeting-pipeline`](/docs/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | Resumos de reuniões do Teams, replay de jobs, assinaturas Graph. | `productivity/teams-meeting-pipeline` |
 | [`weekly-review-planning`](/docs/user-guide/skills/bundled/productivity/productivity-weekly-review-planning) | Reset semanal: compromissos, trabalho parado, plano da próxima semana. | `productivity/weekly-review-planning` |
 | [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx) | Cria, lê e edita workbooks Excel .xlsx e CSVs. | `productivity/xlsx` |
@@ -140,6 +142,7 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 | Skill | Descrição | Caminho |
 |-------|-------------|------|
 | [`arxiv`](/docs/user-guide/skills/bundled/research/research-arxiv) | Busca artigos no arXiv por palavra-chave, autor, categoria ou ID. | `research/arxiv` |
+| [`blocked-page-recovery`](/docs/user-guide/skills/bundled/research/research-blocked-page-recovery) | Recupera páginas bloqueadas/paywalled/WAF via snapshots de archive e fallbacks de reader. Use quando web_extract ou o browser encontrar páginas 403/429/challenge, paywalls, ou interstitials de bot-detection. | `research/blocked-page-recovery` |
 | [`blogwatcher`](/docs/user-guide/skills/bundled/research/research-blogwatcher) | Monitora blogs e feeds RSS/Atom via a ferramenta blogwatcher-cli. | `research/blogwatcher` |
 | [`competitor-news-monitor`](/docs/user-guide/skills/bundled/research/research-competitor-news-monitor) | Monitora empresas nomeadas por notícias relevantes; digests citados. | `research/competitor-news-monitor` |
 | [`grounded-citations`](/docs/user-guide/skills/bundled/research/research-grounded-citations) | Fundamenta respostas e documentos em fontes citadas e verificáveis. | `research/grounded-citations` |

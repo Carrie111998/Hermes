@@ -104,6 +104,14 @@ Feche os processos listados e rode de novo. Se tiver certeza de que o processo c
 
 Uma segunda guarda, separada, recusa mexer no venv enquanto qualquer processo estiver rodando a partir do interpretador Python dele (backend do Desktop, gateway, REPL Python). Esses processos mantêm arquivos de extensão nativa (`.pyd`) travados, e um sync de dependências que morre no meio com access-denied deixa a instalação entre versões. Essa guarda **não** é bypassada por `--force`; se tiver certeza de que os holders detectados são falso positivo, use o explícito `hermes update --force-venv`.
 
+#### Recriação de venv no Windows é transacional {#windows-venv-recreation-is-transactional}
+
+Quando o instalador Windows precisa recriar um `venv` existente, primeiro move o diretório antigo para um nome único `venv.stale.*`, depois cria e verifica o substituto. A árvore antiga só é apagada depois que a instalação de dependências completa e os imports de baseline passam na árvore nova — até então ela é a fonte de rollback (registrada em `venv.pending-backup`).
+
+Se o move não puder ser concluído, o instalador para e deixa o `venv` live intocado. Se o `uv` falhar ou reportar sucesso sem criar o interpretador, qualquer substituto parcial é movido para `venv.failed.*` e o venv anterior é restaurado. Isso mantém as checagens de health e blocker usáveis depois de uma instalação falha.
+
+Um diretório `venv.stale.*` ou `venv.failed.*` pode permanecer quando outro processo ainda segura um file handle. Feche o Hermes Desktop, gateways e processos Python usando a instalação, depois tente o install/update de novo; diretórios estacionados são limpos best-effort após uma recriação bem-sucedida.
+
 A saída esperada parece com:
 
 ```
@@ -246,6 +254,10 @@ hermes uninstall
 ```
 
 O desinstalador oferece a opção de manter seus arquivos de configuração (`~/.hermes/`) para uma reinstalação futura.
+
+:::tip Indo para uma máquina nova em vez de sair?
+Leve o setup com você antes de remover qualquer coisa: `hermes backup` captura o diretório `~/.hermes` inteiro incluindo credenciais, enquanto `hermes profile export` empacota um único profile com credenciais excluídas de propósito (então um export sozinho não é um backup completo). Veja [`hermes backup` vs `hermes profile export`](/reference/faq#hermes-backup-vs-hermes-profile-export).
+:::
 
 ### Desinstalação manual
 
