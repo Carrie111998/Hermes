@@ -57,7 +57,20 @@ def _skin_set(key: str, value: str, skin: str | None) -> int:
         target = f"{name}-custom"
         path = _skins_dir() / f"{target}.yaml"
         if path.exists():
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, yaml.YAMLError) as exc:
+                print(
+                    f"✗ cannot read existing skin fork {display_hermes_home()}/skins/{target}.yaml: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not isinstance(data, dict):
+                print(
+                    f"✗ existing skin fork {display_hermes_home()}/skins/{target}.yaml is empty or not a mapping",
+                    file=sys.stderr,
+                )
+                return 1
         else:
             from hermes_cli.skin_engine import load_skin
 

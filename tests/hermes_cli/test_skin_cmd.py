@@ -106,6 +106,19 @@ def test_set_explicit_builtin_reuses_fork_and_preserves_non_color_fields():
     assert "default-custom" in (get_hermes_home() / "config.yaml").read_text()
 
 
+@pytest.mark.parametrize("contents", ["", "[]", "!!!"], ids=["empty", "non-mapping", "invalid"])
+def test_set_does_not_rebuild_an_invalid_existing_builtin_fork(contents, capsys):
+    fork = _skins() / "default-custom.yaml"
+    fork.write_text(contents, encoding="utf-8")
+    _activate("default")
+    config_before = (get_hermes_home() / "config.yaml").read_text()
+
+    assert skin_cmd._skin_set("ui_tool", "#00FFFF", None) == 1
+    assert fork.read_text(encoding="utf-8") == contents
+    assert (get_hermes_home() / "config.yaml").read_text() == config_before
+    assert "default-custom" in capsys.readouterr().err
+
+
 def test_set_rejects_non_hex():
     _activate("default")
     assert skin_cmd._skin_set("ui_tool", "teal", None) == 1
