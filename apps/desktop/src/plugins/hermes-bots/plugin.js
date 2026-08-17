@@ -3219,7 +3219,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   })
 
   return jsxs('div', {
-    className: 'group relative',
+    className: 'group relative w-full min-w-0 max-w-full',
     onContextMenu: event => {
       event.preventDefault()
       event.stopPropagation()
