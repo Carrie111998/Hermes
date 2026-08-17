@@ -2589,12 +2589,15 @@ def _is_browser_task_unavailable(task_id: str) -> bool:
 def _is_task_owned_shared_cdp_session(session_info: Dict[str, Any]) -> bool:
     """Return whether Hermes attached a task-owned tab to an external CDP.
 
-    Cloud providers also expose CDP URLs, but carry a provider session id and
-    retain their existing inactivity lifecycle. A fixed/user-supplied CDP
-    override has no provider session id: Hermes owns only its pinned target,
-    while the shared browser itself is externally owned.
+    Cloud providers and consented real-profile browsing also expose CDP URLs,
+    so the absence of a provider id is not a sufficient ownership signal.
+    ``_create_cdp_session`` stamps the explicit override feature; only that
+    route owns one pinned target inside an otherwise externally-owned browser.
     """
-    return bool(session_info.get("cdp_url")) and not session_info.get("bb_session_id")
+    features = session_info.get("features")
+    return bool(session_info.get("cdp_url")) and bool(
+        isinstance(features, dict) and features.get("cdp_override") is True
+    )
 
 
 def _is_browser_task_retired(task_id: str) -> bool:
@@ -3086,6 +3089,27 @@ def _orphan_target_ownership(
     if payload.get("pinned") is False:
         return OrphanTargetOwnership.CONFIRMED_UNPINNED
     return OrphanTargetOwnership.UNKNOWN
+
+
+def _read_recorded_pinned_target_id(
+    socket_dir: str,
+    session_name: str,
+) -> Optional[str]:
+    """Read only an explicitly pinned target id from daemon-owned metadata."""
+    try:
+        payload = json.loads(
+            (Path(socket_dir) / f"{session_name}.target").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("pinned") is not True:
+        return None
+    target_id = payload.get("targetId")
+    if not isinstance(target_id, str) or not target_id.strip():
+        return None
+    return target_id.strip()
 
 
 def _orphan_has_pinned_target(socket_dir: str, session_name: str) -> bool:
@@ -3988,10 +4012,13 @@ def _get_session_info(
     # tools that consume supervisor state are hidden, so the supervisor
     # would just hold an idle second CDP connection to the process.
     if not force_local and not (session_info.get("features") or {}).get("lightpanda"):
-        _ensure_cdp_supervisor(
-            task_id,
-            expected_generation=creation_generation,
-        )
+        if session_info.get("cdp_url"):
+            _ensure_cdp_supervisor(
+                task_id,
+                expected_generation=creation_generation,
+            )
+        else:
+            _ensure_cdp_supervisor(task_id)
 
     return session_info
 
@@ -4478,7 +4505,6 @@ def _discard_timed_out_browser_session(
     with _cleanup_lock:
         if _active_sessions.get(task_id) is not session_info:
             return
-        _stop_cdp_supervisor(task_id)
         if session_info.get("bb_session_id") or session_info.get("cdp_url"):
             import uuid
             replacement = dict(session_info)
@@ -4492,6 +4518,10 @@ def _discard_timed_out_browser_session(
         bare_task_id = _bare_task_id_for_session_key(task_id)
         if _last_active_session_key.get(bare_task_id) == task_id:
             _last_active_session_key.pop(bare_task_id, None)
+
+    # Stopping can join a supervisor starter whose publication guard needs the
+    # lifecycle lock. Never wait for that thread while holding _cleanup_lock.
+    _stop_cdp_supervisor(task_id)
 
     session_name = str(session_info.get("session_name") or "")
     if session_name:
@@ -4567,10 +4597,14 @@ def _handle_browser_command_timeout(
 
     The wedged-vs-alive rule:
 
-    * **Cloud / CDP sessions** — there is no local daemon to probe or kill.
-      Replace the stuck client generation immediately (fresh ``session_name``,
-      same ``bb_session_id`` so cloud cleanup still works) — #72206's
-      original behavior, preserved verbatim.
+    * **Task-owned external CDP** — never discard its named daemon or exact
+      target evidence. Enter the normal nonterminal cleanup path, which closes
+      and verifies the owned target before allowing a fresh generation. An
+      ambiguous close leaves the task RETIRING and all business commands
+      blocked for retry.
+    * **Provider / real-profile CDP sessions** — replace the stuck client
+      generation immediately (fresh ``session_name``, same provider/CDP
+      ownership) — #72206's behavior, preserved for these mainline routes.
     * **Local daemon alive** (PID readable, process alive, identity-verified
       as ours, control socket accepts a connection): the *command* wedged —
       page hang, stuck navigation — but the daemon itself is fine.  Killing
@@ -4589,6 +4623,19 @@ def _handle_browser_command_timeout(
     concurrent replacement; the flag then triggers one harmless no-op
     teardown at next use).
     """
+    if _is_task_owned_shared_cdp_session(session_info):
+        if not _cleanup_browser_session_keys(
+            task_id,
+            [task_id],
+            reason=BrowserCleanupReason.INACTIVITY,
+        ):
+            logger.warning(
+                "Timed-out shared-CDP session %s remains fail-closed until "
+                "its exact target cleanup can be confirmed",
+                task_id,
+            )
+        return
+
     if session_info.get("bb_session_id") or session_info.get("cdp_url"):
         _discard_timed_out_browser_session(task_id, session_info, task_socket_dir)
         return
@@ -5229,6 +5276,19 @@ def evaluate_url_safety(url: str) -> Optional[dict]:
     return None
 
 
+def _serialize_browser_navigation(func):
+    """Keep navigation, target binding, publication, and snapshot atomic."""
+
+    @functools.wraps(func)
+    def _wrapped(url: str, task_id: Optional[str] = None) -> str:
+        bare_task_id = _bare_task_id_for_session_key(task_id or "default")
+        with _task_cleanup_operation_lock(bare_task_id):
+            return func(url, task_id)
+
+    return _wrapped
+
+
+@_serialize_browser_navigation
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -7048,6 +7108,13 @@ def _begin_task_cleanup_locked(
 
 def _is_hermes_owned_local_browser_session(session_info: Dict[str, Any]) -> bool:
     """Return whether headed cross-turn persistence may retain this session."""
+    features = session_info.get("features")
+    if isinstance(features, dict) and features.get("local") is True:
+        return not session_info.get("bb_session_id") and not bool(
+            features.get("cdp_override")
+        )
+    # Hot-reload compatibility for older throwaway-local records that predate
+    # explicit feature metadata.
     return not session_info.get("cdp_url") and not session_info.get("bb_session_id")
 
 
@@ -7061,9 +7128,39 @@ def _cleanup_browser_session_keys(
     """Cleanup selected ownership under one bare-task lifecycle transition."""
     reason = _coerce_cleanup_reason(reason)
     bare_task_id = _bare_task_id_for_session_key(task_id or "default")
-    operation_lock = _task_cleanup_operation_lock(bare_task_id)
     include_camofox = session_keys is None and _is_camofox_mode()
 
+    # Conversation turns call the per-turn boundary even when no browser tool
+    # ran.  Do not manufacture a lifecycle generation/state/lock row for that
+    # no-op case; otherwise a long-lived process accumulates one entry per
+    # browser-free task forever.  STARTING/RETIRING are deliberately excluded:
+    # those states represent an in-flight creator or retry that still needs the
+    # generation fence below.
+    with _cleanup_lock:
+        state = _task_state_locked(bare_task_id)
+        if session_keys is None:
+            has_selected_session = any(
+                _bare_task_id_for_session_key(key) == bare_task_id
+                for key in _active_sessions
+            )
+        else:
+            has_selected_session = any(
+                key in _active_sessions for key in dict.fromkeys(session_keys)
+            )
+        has_pending_provider = any(
+            record.task_id == bare_task_id
+            for record in _pending_provider_cleanups.values()
+        )
+        if (
+            not include_camofox
+            and not has_selected_session
+            and not has_pending_provider
+            and bare_task_id not in _browser_task_cleanup_locks
+            and state in {BrowserTaskState.ACTIVE, BrowserTaskState.RETIRED}
+        ):
+            return True
+
+    operation_lock = _task_cleanup_operation_lock(bare_task_id)
     with operation_lock:
         with _cleanup_lock:
             effective_reason = _begin_task_cleanup_locked(bare_task_id, reason)
@@ -7094,9 +7191,12 @@ def _cleanup_browser_session_keys(
                 if record.task_id == bare_task_id
             ]
 
-        # Fence supervisor publication even when no browser session has been
-        # published yet. Per-session cleanup repeats this stop harmlessly.
-        for supervisor_key in set(selected_keys) | {task_id}:
+        # A selected published session stops its own supervisor only after any
+        # exact shared-CDP target close has been proved. Fence only task keys
+        # that have no selected session here (for example an in-flight creator
+        # that terminal cleanup caught before publication). Publication guards
+        # also reject starters once the task is RETIRING.
+        for supervisor_key in {task_id} - set(selected_keys):
             _stop_cdp_supervisor(supervisor_key)
 
         pending_retries_closed = _retry_provider_cleanup_records(pending_before)
@@ -7204,11 +7304,54 @@ def cleanup_browser_for_turn(task_id: Optional[str] = None) -> bool:
     """Enforce the per-turn boundary while retaining only local headed state."""
     task_id = task_id or "default"
     preserve_local = _is_headed_mode()
-    # Camofox owns its sessions outside ``_active_sessions``. Preserve the old
-    # headed cross-turn behavior explicitly; hard cleanup still goes through
-    # ``cleanup_browser`` and closes the Camofox task below.
-    if preserve_local and _is_camofox_mode():
-        return True
+    if _is_camofox_mode():
+        # Camofox owns sessions outside ``_active_sessions``. Preserve headed
+        # sessions, and avoid manufacturing lifecycle rows for turns that never
+        # created process-local Camofox ownership. Hard cleanup still goes
+        # through ``cleanup_browser`` and retains its untracked-session sweep.
+        if preserve_local:
+            return True
+        try:
+            from tools.browser_camofox import camofox_has_session
+
+            if not camofox_has_session(task_id):
+                # ``browser_navigate`` publishes its task lock before
+                # Camofox creates process-local session state.  Do not let
+                # the browser-free fast path bypass that in-flight owner;
+                # the ordinary cleanup path will wait for navigation to
+                # finish, then retire the Camofox task.
+                bare_task_id = _bare_task_id_for_session_key(task_id)
+                with _cleanup_lock:
+                    if bare_task_id not in _browser_task_cleanup_locks:
+                        return True
+        except Exception:
+            pass
+    if preserve_local:
+        bare_task_id = _bare_task_id_for_session_key(task_id)
+        with _cleanup_lock:
+            task_state = _task_state_locked(bare_task_id)
+            owned_sessions = [
+                info
+                for key, info in _active_sessions.items()
+                if _bare_task_id_for_session_key(key) == bare_task_id
+            ]
+            has_pending_provider = any(
+                record.task_id == bare_task_id
+                for record in _pending_provider_cleanups.values()
+            )
+        if (
+            task_state is BrowserTaskState.ACTIVE
+            and owned_sessions
+            and not has_pending_provider
+            and all(
+                _is_hermes_owned_local_browser_session(info)
+                for info in owned_sessions
+            )
+        ):
+            # Match main's headed-mode continuity exactly: do not advance the
+            # lifecycle generation or stop a real-profile CDP supervisor when
+            # every owned session is a local browser that should persist.
+            return True
     return _cleanup_browser_session_keys(
         task_id,
         reason=BrowserCleanupReason.TERMINAL,
@@ -7316,7 +7459,21 @@ def _cleanup_single_browser_session(
         session_info and _is_task_owned_shared_cdp_session(session_info)
     )
     if task_owned_shared_cdp and session_info:
+        session_name = str(session_info.get("session_name") or "")
+        socket_dir = os.path.join(
+            _socket_safe_tmpdir(),
+            f"agent-browser-{session_name}",
+        )
         target_id = str(session_info.get("target_id") or "").strip()
+        if not target_id and session_name:
+            target_id = _read_recorded_pinned_target_id(socket_dir, session_name) or ""
+            if target_id:
+                # Promote recovered exact ownership back into process state so
+                # retries no longer depend on another disk read.
+                with _cleanup_lock:
+                    current = _active_sessions.get(task_id)
+                    if current is session_info:
+                        current["target_id"] = target_id
         cdp_url = str(session_info.get("cdp_url") or _get_cdp_override()).strip()
         if not target_id or not _close_shared_cdp_target_confirmed(cdp_url, target_id):
             logger.warning(

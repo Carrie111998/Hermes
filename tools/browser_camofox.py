@@ -336,6 +336,13 @@ _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 
 
+def camofox_has_session(task_id: Optional[str] = None) -> bool:
+    """Return whether this process currently tracks a Camofox task session."""
+    task_id = task_id or "default"
+    with _sessions_lock:
+        return task_id in _sessions
+
+
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     """Attach process-local state to an already-open managed Camofox tab.
 
