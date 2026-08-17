@@ -38,6 +38,7 @@ def _ensure_feishu_mocks():
 _ensure_feishu_mocks()
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import _reply_anchor_for_event
 import plugins.platforms.feishu.adapter as feishu_module
 from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -304,6 +305,14 @@ class TestNonApprovalCardAction:
         event = mock_handle.call_args[0][0]
         assert event.message_id == "om_original_card_msg"
 
+        # Downstream lock (issue #7200 symptom): the reply anchor and the
+        # processing-status reaction must both resolve from the real card
+        # message ID, not the callback token.
+        assert _reply_anchor_for_event(event) == "om_original_card_msg"
+        with patch.object(adapter, "_add_reaction", new_callable=AsyncMock, return_value="reaction_1") as mock_add_reaction:
+            await adapter.on_processing_start(event)
+        mock_add_reaction.assert_awaited_once_with("om_original_card_msg", feishu_module._FEISHU_REACTION_IN_PROGRESS)
+
     @pytest.mark.asyncio
     async def test_synthetic_event_falls_back_to_token_without_open_message_id(self):
         """Fall back to the token when the payload omits open_message_id."""
@@ -328,6 +337,7 @@ class TestNonApprovalCardAction:
         mock_handle.assert_called_once()
         event = mock_handle.call_args[0][0]
         assert event.message_id == "tok_fallback_123"
+        assert _reply_anchor_for_event(event) == "tok_fallback_123"
 
 
 # ===========================================================================
