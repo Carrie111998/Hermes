@@ -8,14 +8,21 @@ the event to a subscriber was the ordinary poll loop happening to tick — and
 measured at ~60s. So ``CronStaleMonitor._resolve_gateway_stopped`` (the
 2026-08-16 shutdown-attribution feature) fired on a coin flip.
 
-The successor process cannot cover the miss: ``_started_event_ids`` is
-per-process in-memory state, and ``BaseSubscriber`` seeds its cursor with
-INSERT OR IGNORE, so a restart PRESERVES the cursor and never replays the
-CRON_STARTED that built that map. Verified in production 2026-08-17: the
-new process handled the GATEWAY_STOPPED at 04:12:03 and emitted nothing.
+The successor process cannot cover the miss by HANDLING the event:
+``_started_event_ids`` is per-process in-memory state, and ``BaseSubscriber``
+seeds its cursor with INSERT OR IGNORE, so a restart PRESERVES the cursor and
+never replays the CRON_STARTED that built that map. Verified in production
+2026-08-17: the new process handled the GATEWAY_STOPPED at 04:12:03 and emitted
+nothing.
 
 ``shutdown()`` therefore drains subscribers itself, after the poll threads are
 joined (so nothing polls concurrently) and before the bus is closed.
+
+That covers a GRACEFUL teardown. A force-killed one reaches neither the drain
+nor ``shutdown_all()``, so ``CronStaleMonitor.startup()`` rebuilds the
+attribution from the bus in the SUCCESSOR — not by handling the event, but by
+querying for it. The last two tests here pin the two paths composing to exactly
+one record.
 """
 import logging
 import time
@@ -316,4 +323,91 @@ def test_a_run_that_lands_during_teardown_is_not_reported_killed(bus, monkeypatc
     stale = [e for e in bus.query() if e.event_type == EventType.CRON_STALE]
     assert stale == [], (
         "a run that completed during teardown was reported shutdown-killed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The hard-kill path: neither the drain nor shutdown_all() ever runs
+# ---------------------------------------------------------------------------
+
+def test_a_force_killed_teardown_is_attributed_by_the_next_gateway(bus):
+    """No drain, no shutdown_all() — the predecessor simply stops existing.
+
+    GATEWAY_STOPPED survives because gateway/run.py emits it EARLY, which is
+    exactly why the snapshot has to stay there. Everything the predecessor
+    staged does not survive. The successor reconstructs from what did, through
+    the real registry call site (startup_all()).
+    """
+    predecessor = CronStaleMonitor(bus)
+    started_id = bus.emit(
+        event_type=EventType.CRON_STARTED,
+        source="jobflow-researcher",
+        payload={"job_id": "785bd746431b", "job_name": "jobflow-researcher"},
+    )
+    predecessor.poll()
+    bus.emit(
+        event_type=EventType.GATEWAY_STOPPED,
+        source="gateway",
+        payload={
+            "exit_reason": "force_kill",
+            "inflight_cron_correlation_ids": [started_id],
+        },
+    )
+    predecessor.poll()  # stages the report — and then taskkill /F lands
+    assert predecessor._pending_shutdown, "premise: a report was staged"
+    assert [e for e in bus.query() if e.event_type == EventType.CRON_STALE] == []
+
+    _registry(CronStaleMonitor(bus)).startup_all()
+
+    stale = [e for e in bus.query() if e.event_type == EventType.CRON_STALE]
+    assert len(stale) == 1, "the force-killed run was never attributed"
+    assert stale[0].payload["job_id"] == "785bd746431b"
+    assert stale[0].payload["exit_reason"] == "force_kill"
+    assert stale[0].payload["cron_started_event_id"] == started_id
+    assert stale[0].priority == Priority.NORMAL
+
+
+def test_a_graceful_teardown_is_not_reported_twice_by_the_successor(bus, monkeypatch, caplog):
+    """The two paths compose. The predecessor's flush already wrote the record,
+    so the successor's startup must find it and stay quiet — the dedupe is a bus
+    query on (gateway_stopped_event_id, cron_started_event_id), which is why no
+    new state is needed to make this safe.
+
+    The log assertion is what keeps this honest: a count of 1 is also what you
+    get from a successor that does nothing at all, so the test must show the
+    pass ran, saw the shutdown, and suppressed itself on purpose.
+    """
+    predecessor = CronStaleMonitor(bus)
+    started_id = bus.emit(
+        event_type=EventType.CRON_STARTED,
+        source="jobflow-tracker-cycle",
+        payload={"job_id": "1f8c450136b5", "job_name": "jobflow-tracker-cycle"},
+    )
+    predecessor.poll()
+    bus.emit(
+        event_type=EventType.GATEWAY_STOPPED,
+        source="gateway",
+        payload={
+            "exit_reason": "restart",
+            "inflight_cron_correlation_ids": [started_id],
+        },
+    )
+
+    _wire_gateway(monkeypatch, bus, predecessor)
+    gi.shutdown()
+    assert len([e for e in bus.query() if e.event_type == EventType.CRON_STALE]) == 1
+
+    with caplog.at_level(logging.DEBUG,
+                         logger="events.subscribers.cron_stale_monitor"):
+        _registry(CronStaleMonitor(bus)).startup_all()
+
+    stale = [e for e in bus.query() if e.event_type == EventType.CRON_STALE]
+    assert len(stale) == 1, (
+        f"the successor re-reported the predecessor's record: "
+        f"{[e.payload for e in stale]}"
+    )
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("already reported" in m for m in messages), (
+        f"the successor never examined the shutdown, so the count of 1 proves "
+        f"nothing about deduping: {messages}"
     )

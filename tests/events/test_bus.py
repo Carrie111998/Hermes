@@ -768,6 +768,122 @@ class TestRowidWindow:
         assert bus.min_rowid_since("2099-01-01T00:00:00+00:00") is None
 
 
+class TestEventWithRowid:
+    """event_id -> (rowid, Event), the window floor for after-the-fact lookups.
+
+    CronStaleMonitor's successor-side shutdown attribution resolves a
+    correlation id (a cron_started event_id) and then needs that row's rowid to
+    bound the search for the run's outcome. See
+    docs/superpowers/specs/2026-08-17-cron-shutdown-attribution-reconstruction-design.md.
+    """
+
+    def test_returns_the_rowid_alongside_the_event(self, bus):
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})
+        target = bus.emit(EventType.CRON_STARTED, "scheduler", {"job_id": "j"})
+
+        got = bus.event_with_rowid(target)
+
+        assert got is not None
+        rowid, event = got
+        assert rowid == 2
+        assert event.event_id == target
+        assert event.payload["job_id"] == "j"
+
+    def test_unknown_event_id_is_none(self, bus):
+        assert bus.event_with_rowid("no-such-event") is None
+
+    def test_plans_as_a_primary_key_seek(self, bus):
+        for i in range(50):
+            bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i})
+        conn = sqlite3.connect(str(bus.db_path))
+        try:
+            plan = " ".join(
+                row[3] for row in conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT rowid, * FROM events "
+                    "WHERE event_id = ?",
+                    ("x",),
+                )
+            )
+        finally:
+            conn.close()
+        assert "SCAN" not in plan, f"event_id lookup must not scan: {plan}"
+
+
+class TestFirstEventForJob:
+    """Earliest event of given types carrying a payload job_id, in a rowid window."""
+
+    def _started(self, bus, job_id):
+        return bus.emit(EventType.CRON_STARTED, "scheduler", {"job_id": job_id})
+
+    def test_finds_the_earliest_matching_event_in_the_window(self, bus):
+        self._started(bus, "j")  # rowid 1
+        bus.emit(EventType.CRON_COMPLETED, "scheduler", {"job_id": "j"})  # 2
+        bus.emit(EventType.CRON_FAILED, "scheduler", {"job_id": "j"})  # 3
+
+        got = bus.first_event_for_job(
+            "j",
+            [EventType.CRON_COMPLETED, EventType.CRON_FAILED],
+            after_rowid=1,
+            through_rowid=bus.head_rowid(),
+        )
+
+        assert got is not None
+        assert got.event_type == EventType.CRON_COMPLETED
+
+    def test_reads_the_payload_job_id_not_the_unpopulated_column(self, bus):
+        """No producer sets the events.job_id COLUMN.
+
+        Measured on the live bus 2026-08-17: 0 of 25,449 cron_started rows and
+        0 of 24,964 cron_completed rows had it set. A helper that filtered the
+        column would silently match nothing forever.
+        """
+        eid = bus.emit(EventType.CRON_COMPLETED, "scheduler", {"job_id": "j"})
+        conn = sqlite3.connect(str(bus.db_path))
+        try:
+            stored = conn.execute(
+                "SELECT job_id FROM events WHERE event_id = ?", (eid,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert stored is None, "emit() does not populate the column — premise check"
+
+        got = bus.first_event_for_job(
+            "j", [EventType.CRON_COMPLETED], after_rowid=0,
+            through_rowid=bus.head_rowid(),
+        )
+        assert got is not None and got.event_id == eid
+
+    def test_respects_both_rowid_bounds(self, bus):
+        early = bus.emit(EventType.CRON_COMPLETED, "scheduler", {"job_id": "j"})  # 1
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})  # 2
+        late = bus.emit(EventType.CRON_COMPLETED, "scheduler", {"job_id": "j"})  # 3
+
+        assert bus.first_event_for_job(
+            "j", [EventType.CRON_COMPLETED], after_rowid=1, through_rowid=3,
+        ).event_id == late
+        assert bus.first_event_for_job(
+            "j", [EventType.CRON_COMPLETED], after_rowid=0, through_rowid=1,
+        ).event_id == early
+        assert bus.first_event_for_job(
+            "j", [EventType.CRON_COMPLETED], after_rowid=1, through_rowid=2,
+        ) is None
+
+    def test_other_jobs_and_other_types_do_not_match(self, bus):
+        bus.emit(EventType.CRON_COMPLETED, "scheduler", {"job_id": "other"})
+        bus.emit(EventType.CRON_STALE, "monitor", {"job_id": "j"})
+
+        assert bus.first_event_for_job(
+            "j", [EventType.CRON_COMPLETED, EventType.CRON_FAILED],
+            after_rowid=0, through_rowid=bus.head_rowid(),
+        ) is None
+
+    def test_empty_type_list_matches_nothing(self, bus):
+        bus.emit(EventType.CRON_COMPLETED, "scheduler", {"job_id": "j"})
+        assert bus.first_event_for_job(
+            "j", [], after_rowid=0, through_rowid=bus.head_rowid(),
+        ) is None
+
+
 class TestAnalyze:
     """Planner statistics refresh (R61 — the bus ran with no sqlite_stat1)."""
 
