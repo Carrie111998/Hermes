@@ -80,7 +80,7 @@ def test_no_focus_topic_no_injection():
         return resp
 
     with patch("agent.context_compressor.call_llm", mock_call_llm):
-        result = compressor._generate_summary(turns)
+        compressor._generate_summary(turns)
 
     prompt_text = captured_prompt["messages"][0]["content"]
     assert "FOCUS TOPIC" not in prompt_text
@@ -92,7 +92,6 @@ def test_compress_passes_focus_to_generate_summary():
 
     # Track what _generate_summary receives
     received_kwargs = {}
-    original_generate = compressor._generate_summary
 
     def tracking_generate(turns, **kwargs):
         received_kwargs.update(kwargs)

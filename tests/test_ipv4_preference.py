@@ -51,7 +51,6 @@ class TestApplyIPv4Preference:
         from hermes_constants import apply_ipv4_preference
 
         calls = []
-        original = socket.getaddrinfo
 
         def mock_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
             calls.append(family)
@@ -69,7 +68,6 @@ class TestApplyIPv4Preference:
         from hermes_constants import apply_ipv4_preference
 
         calls = []
-        original = socket.getaddrinfo
 
         def mock_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
             calls.append(family)

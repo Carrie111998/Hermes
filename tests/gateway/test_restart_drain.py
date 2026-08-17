@@ -406,7 +406,7 @@ async def test_windows_detached_restart_uses_pythonw_for_watcher(monkeypatch, tm
 async def test_shutdown_notification_sent_to_active_sessions():
     """Active sessions receive a notification when the gateway starts shutting down."""
     runner, adapter = make_restart_runner()
-    source = make_restart_source(chat_id="999", chat_type="dm")
+    make_restart_source(chat_id="999", chat_type="dm")
     session_key = "agent:main:telegram:dm:999"
     runner._running_agents[session_key] = MagicMock()
 

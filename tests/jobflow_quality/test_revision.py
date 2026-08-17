@@ -274,7 +274,7 @@ class TestEmission:
             return real_replace(src, dst)
 
         monkeypatch.setattr(mod.os, "replace", _spy)
-        path = emit_revision_request_local = mod.emit_revision_request(
+        path = mod.emit_revision_request(
             "job-1", self._pkg_result(), mailbox_root=tmp_path / "mailbox")
         assert path is not None
         assert calls, "message was written directly; a reader can see it half-formed"

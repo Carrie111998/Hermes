@@ -2022,7 +2022,7 @@ class TestNotificationDeliveredReverseSignal:
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
-        original_id = bus.emit(
+        bus.emit(
             event_type=EventType.APPLICATION_SUBMITTED, source="applier",
             payload={"title": "X", "company": "Y"},
             priority=Priority.NORMAL,
@@ -2033,7 +2033,6 @@ class TestNotificationDeliveredReverseSignal:
         # raising version AFTER the original event was emitted by the
         # producer above. The notifier's _deliver() will call bus.emit and
         # the wrapper must swallow.
-        original_emit = bus.emit
         emit_calls = {"count": 0}
 
         def maybe_raising_emit(*args, **kwargs):

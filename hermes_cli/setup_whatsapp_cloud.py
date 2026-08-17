@@ -260,7 +260,7 @@ def run_whatsapp_cloud_setup() -> int:
     print("     start; switch to a System User permanent token later)")
     print()
     try:
-        proceed = input("Press Enter to continue, or Ctrl+C to abort... ").strip()
+        input("Press Enter to continue, or Ctrl+C to abort... ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\nSetup cancelled.")
         return 1

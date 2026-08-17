@@ -174,7 +174,7 @@ class TestRunPollEmitsTransitions:
             "output": {"title": "Compile error"},
         }]
         config = _make_config(tmp_path, state_path)
-        summary = run_poll(bus, config,
+        run_poll(bus, config,
                           fetch_prs=lambda r, c: prs,
                           fetch_builds=lambda r, s, c: builds)
 

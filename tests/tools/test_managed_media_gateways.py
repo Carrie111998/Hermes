@@ -391,7 +391,7 @@ def _load_video_gen_plugin(monkeypatch):
 def test_video_gen_managed_fal_submit_uses_gateway(monkeypatch):
     """Video gen routes through the managed gateway when FAL_KEY is absent."""
     captured = {}
-    fake_fal = _install_fake_fal_client(captured)
+    _install_fake_fal_client(captured)
     monkeypatch.delenv("FAL_KEY", raising=False)
     monkeypatch.setenv("FAL_QUEUE_GATEWAY_URL", "http://127.0.0.1:3009")
     monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "nous-video-token")
@@ -495,7 +495,6 @@ def test_video_gen_gateway_4xx_raises_actionable_valueerror(monkeypatch):
             super().__init__("forbidden")
             self.response = FakeResponse()
 
-    original_retry = sys.modules["fal_client"].client._maybe_retry_request
 
     def raising_retry(client, method, url, json=None, timeout=None, headers=None):
         raise GatewayRejectError()
@@ -533,7 +532,6 @@ def test_video_gen_prefers_gateway_overrides_direct_key(monkeypatch):
 
     # Patch prefers_gateway to return True for video_gen
     tb_helpers = sys.modules["tools.tool_backend_helpers"]
-    original_pg = tb_helpers.prefers_gateway
     monkeypatch.setattr(tb_helpers, "prefers_gateway", lambda section: section == "video_gen")
 
     plugin._submit_fal_video_request(

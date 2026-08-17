@@ -116,7 +116,6 @@ def _build_request(url: str, headers: dict | None = None) -> urllib.request.Requ
 
 def fetch_url(url: str, headers: dict | None = None, retries: int = MAX_RETRIES) -> dict | list | None:
     """Fetch a URL, parse JSON, retry on transient errors."""
-    last_err = None
     for attempt in range(retries):
         try:
             req = _build_request(url, headers)
@@ -124,17 +123,14 @@ def fetch_url(url: str, headers: dict | None = None, retries: int = MAX_RETRIES)
                 raw = resp.read()
                 return json.loads(raw.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as e:
-            last_err = e
             if e.code in {404, 400}:
                 break  # no point retrying
             wait = BACKOFF_BASE ** attempt
             time.sleep(wait)
-        except urllib.error.URLError as e:
-            last_err = e
+        except urllib.error.URLError:
             wait = BACKOFF_BASE ** attempt
             time.sleep(wait)
-        except json.JSONDecodeError as e:
-            last_err = e
+        except json.JSONDecodeError:
             break
     return None
 
@@ -572,7 +568,18 @@ def cmd_compare(symbols: list[str]) -> None:
         # 52w performance: (current - 52w_low) / (52w_high - 52w_low)
         try:
             price_f = float(entry["price"]) if entry["price"] else None
-            high_f = float(entry["52w_high"]) if entry["52w_high"] else None
+            # REVIEW(F841): the comment above documents a range-relative metric
+            # using 52w_high, but the line below divides by low_f alone, so the
+            # parsed high is discarded.  Either the comment or the formula is
+            # wrong -- resolving that is a behaviour change, not a lint fix, so
+            # it is flagged here rather than guessed at.
+            #
+            # The parse itself is KEPT, deliberately: it sits inside this
+            # try/except, so a non-numeric 52w_high currently raises ValueError
+            # and suppresses the metric entirely.  Deleting the dead binding
+            # would start emitting a performance figure for rows whose high is
+            # unparseable -- a silent behaviour change on bad input.
+            float(entry["52w_high"]) if entry["52w_high"] else None
             low_f = float(entry["52w_low"]) if entry["52w_low"] else None
             if price_f and low_f and price_f > 0 and low_f > 0:
                 perf = ((price_f - low_f) / low_f) * 100

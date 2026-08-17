@@ -31,7 +31,7 @@ def test_setup_uses_temporary_outputs_when_source_tree_is_read_only(
         captured.update(kwargs)
 
     monkeypatch.setattr(setuptools, "setup", capture_setup)
-    namespace = runpy.run_path(str(REPO_ROOT / "setup.py"))
+    runpy.run_path(str(REPO_ROOT / "setup.py"))
 
     cmdclass = captured["cmdclass"]
     monkeypatch.setitem(

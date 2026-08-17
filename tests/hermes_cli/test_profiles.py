@@ -1194,7 +1194,7 @@ class TestExportImport:
 
     def test_import_to_existing_name_raises(self, profile_env, tmp_path):
         create_profile("coder", no_alias=True)
-        profile_dir = get_profile_dir("coder")
+        get_profile_dir("coder")
 
         archive_path = tmp_path / "export" / "coder.tar.gz"
         archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1826,7 +1826,6 @@ class TestEdgeCases:
 
     def test_clone_from_named_profile(self, profile_env):
         """Clone config from a named (non-default) profile."""
-        tmp_path = profile_env
         # Create source profile with config
         source_dir = create_profile("source", no_alias=True)
         (source_dir / "config.yaml").write_text("model: cloned")
@@ -1842,7 +1841,6 @@ class TestEdgeCases:
 
     def test_delete_clears_active_profile(self, profile_env):
         """Deleting the active profile resets active to default."""
-        tmp_path = profile_env
         create_profile("coder", no_alias=True)
         set_active_profile("coder")
         assert get_active_profile() == "coder"

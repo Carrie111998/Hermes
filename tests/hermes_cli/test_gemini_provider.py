@@ -220,7 +220,7 @@ class TestGeminiAgentInit:
 
     def test_gemini_custom_base_url_keeps_openai_client(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSy_REAL_KEY")
-        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
+        with patch("agent.gemini_native_adapter.GeminiNativeClient"), \
              patch("run_agent.OpenAI") as mock_openai, \
              patch("run_agent.ContextCompressor") as mock_compressor:
             mock_openai.return_value = MagicMock()
@@ -236,7 +236,7 @@ class TestGeminiAgentInit:
 
     def test_gemini_openai_compat_base_url_keeps_openai_client(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSy_REAL_KEY")
-        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
+        with patch("agent.gemini_native_adapter.GeminiNativeClient"), \
              patch("run_agent.OpenAI") as mock_openai, \
              patch("run_agent.ContextCompressor") as mock_compressor:
             mock_openai.return_value = MagicMock()
@@ -264,7 +264,7 @@ class TestGeminiAgentInit:
     def test_gemini_resolve_provider_client_keeps_openai_for_non_native_base_url(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSy_TEST_KEY")
         monkeypatch.setenv("GEMINI_BASE_URL", "https://proxy.example.com/v1")
-        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
+        with patch("agent.gemini_native_adapter.GeminiNativeClient"), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import resolve_provider_client

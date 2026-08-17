@@ -2186,7 +2186,7 @@ class SessionBridgeCoordinator:
             ):
                 raise SidebarVerificationError("source_identity_mismatch")
             try:
-                candidate = await asyncio.to_thread(
+                await asyncio.to_thread(
                     _call,
                     self._store,
                     "get_sidebar_candidate_for_delivery",

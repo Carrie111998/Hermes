@@ -527,7 +527,7 @@ def test_sidebar_skill_accepts_only_authenticated_completed_notloaded_tasks() ->
 
 def test_sidebar_skill_reserves_the_create_boundary_before_native_creation() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
-    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+    skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
     create_step = skill.split("\n6. ", 1)[1].split("\n7. ", 1)[0]
 
     assert "`create_reserved`" in skill

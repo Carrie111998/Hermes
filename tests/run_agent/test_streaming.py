@@ -1820,7 +1820,7 @@ class TestCopilotACPStreamingDecision:
 
             assert _use_streaming is False
             # Call the non-streaming path as the loop would
-            response = mock_non_stream({})
+            mock_non_stream({})
             mock_stream.assert_not_called()
 
     @patch("run_agent.get_tool_definitions", return_value=[])

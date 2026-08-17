@@ -358,7 +358,7 @@ class TestSubscriberLagReport:
     """Registry-level lag visibility: how far behind each subscriber is."""
 
     def test_lag_report_empty_registry(self, tmp_path):
-        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        EventBus(db_path=tmp_path / "events" / "test.db")
         registry = SubscriberRegistry()
         assert registry.lag_report() == {}
 
@@ -569,7 +569,7 @@ class TestAtLeastOnceDedup:
             raise RuntimeError("simulated WAL lock")
         monkeypatch.setattr(bus, "mark_handled", boom)
 
-        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
 
         # First poll: handle() runs, mark_handled fails, in-process set records it.
         sub.poll()

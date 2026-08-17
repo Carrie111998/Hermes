@@ -10799,7 +10799,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # it must commit at least the same line.
             if function_name and self.tool_progress_mode in {"new", "all", "verbose"}:
                 duration = kwargs.get("duration", 0.0)
-                is_error = kwargs.get("is_error", False)
                 # Pop stored args from tool.started for this function
                 stored = self._pending_tool_info.get(function_name)
                 stored_args = stored.pop(0) if stored else {}

@@ -319,7 +319,7 @@ class TestDispatch:
     def test_capture_after_fires_when_action_succeeds(self, noop_backend):
         """capture_after must trigger for successful actions."""
         from tools.computer_use.tool import handle_computer_use
-        out = handle_computer_use({"action": "click", "element": 1,
+        handle_computer_use({"action": "click", "element": 1,
                                    "capture_after": True})
         # Noop backend returns ok=True, so capture should have been called.
         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
@@ -1833,7 +1833,7 @@ class TestCaptureAppFilterNoMatch:
              "structuredContent": None},
         ]
 
-        cap = backend.capture(mode="ax", app="計算機")
+        backend.capture(mode="ax", app="計算機")
 
         assert backend._active_pid == 200
         assert backend._active_window_id == 2
@@ -2078,7 +2078,7 @@ class TestCaptureAppFilterNoMatch:
              "structuredContent": None},
         ]
 
-        cap = backend.capture(mode="ax", app=None)
+        backend.capture(mode="ax", app=None)
 
         assert backend._active_pid == 100
 
@@ -2641,7 +2641,7 @@ class TestZIndexSorting:
         ]
         backend = _make_cua_backend_with_windows(windows)
 
-        cap = backend.capture(mode="ax")
+        backend.capture(mode="ax")
 
         # Firefox has z_index=10 (frontmost) — must be selected.
         assert backend._active_pid == 200
@@ -2678,7 +2678,7 @@ class TestZIndexSorting:
         ]
         backend = _make_cua_backend_with_windows(windows)
 
-        cap = backend.capture(mode="ax")
+        backend.capture(mode="ax")
 
         assert backend._active_pid == 200
         assert backend._active_window_id == 2
@@ -3761,7 +3761,7 @@ class TestCuaToolCoverageExpansion:
 
     def test_call_tool_passthrough(self):
         backend = self._backend(structured={"x": 1})
-        out = backend.call_tool("future_tool_name", {"arbitrary": "args"})
+        backend.call_tool("future_tool_name", {"arbitrary": "args"})
         name, args = backend._session.call_tool.call_args.args
         assert name == "future_tool_name"
         assert args["arbitrary"] == "args"

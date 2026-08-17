@@ -1058,7 +1058,6 @@ def test_cleanup_vm_default_honors_persist_mode(monkeypatch):
     from tools import terminal_tool
 
     env = _make_dummy_env(task_id="session-close-test")
-    container_id = env._container_id
     terminal_tool._active_environments["session-close-test"] = env
 
     cleanup_calls = []

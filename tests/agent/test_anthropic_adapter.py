@@ -1511,7 +1511,7 @@ class TestBuildAnthropicKwargs:
         # Opus 4.7 returns 400 on non-default temperature/top_p/top_k.
         # build_anthropic_kwargs must strip them as a safety net even if an
         # upstream caller injects them for older-model compatibility.
-        kwargs = build_anthropic_kwargs(
+        build_anthropic_kwargs(
             model="claude-opus-4-7",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,

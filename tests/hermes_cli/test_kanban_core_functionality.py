@@ -406,14 +406,14 @@ def test_detect_crashed_workers_reclaims(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
-        res = kb.dispatch_once(conn, spawn_fn=_spawn_pid_that_exits)
+        kb.dispatch_once(conn, spawn_fn=_spawn_pid_that_exits)
         # Brief sleep to make sure the child's pid has been reaped; on
         # busy CI the pid may be reused by another process, which would
         # fool _pid_alive. If that happens we accept the test still
         # passing as long as the dispatcher ran without error.
         time.sleep(0.2)
         res2 = kb.dispatch_once(conn)
-        task = kb.get_task(conn, tid)
+        kb.get_task(conn, tid)
         # Either crashed was detected (preferred) or the TTL reclaim path
         # will eventually fire; we accept either outcome but the worker_pid
         # should no longer be set.
@@ -492,7 +492,7 @@ def test_board_stats(kanban_home):
     conn = kb.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="x")
-        b = kb.create_task(conn, title="b", assignee="y")
+        kb.create_task(conn, title="b", assignee="y")
         kb.complete_task(conn, a, result="done")
         stats = kb.board_stats(conn)
         assert stats["by_status"]["ready"] == 1
@@ -1122,7 +1122,7 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
 
         # Now a second dispatch_once run should be a no-op on this task
         # (already released). Confirm the loop doesn't re-report it.
-        res = kb.dispatch_once(conn, spawn_fn=lambda t, ws: None)
+        kb.dispatch_once(conn, spawn_fn=lambda t, ws: None)
         task = kb.get_task(conn, tid)
         # After timeout, task is back in 'ready' and will be re-spawned
         # by the same pass. That's the intended behaviour.

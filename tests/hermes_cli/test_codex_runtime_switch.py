@@ -184,7 +184,7 @@ class TestApply:
 
     def test_disable_does_not_check_binary(self):
         cfg = {"model": {"openai_runtime": "codex_app_server"}}
-        with patch.object(crs, "check_codex_binary_ok") as bin_check:
+        with patch.object(crs, "check_codex_binary_ok"):
             r = crs.apply(cfg, "auto")
         assert r.success
         # Binary check is irrelevant when disabling — should not be called

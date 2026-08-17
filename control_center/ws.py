@@ -244,7 +244,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             # We don't expect inbound messages; receive_text just blocks on
             # disconnect. Any inbound is treated as a ping-style nop.
             try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
             except asyncio.TimeoutError:
                 # No client traffic for 60s — drop a heartbeat ourselves so
                 # the connection stays warm through proxies.
