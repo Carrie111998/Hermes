@@ -413,6 +413,15 @@ user-visible delivery claim is made by this deployment evidence.
 - Rollback manifest was retained. The temporary staging directory and local deployment helpers were removed after verification. The primary dirty checkout was unchanged. Relay remains disabled.
 - This deployment did not send or retry a Telegram message. It does not close `INBOUND_POLLING`, `OUTBOUND_DELIVERY`, or `USER_VISIBLE_DELIVERY`; no user-visible delivery PASS is inferred from service health or prior screenshot evidence.
 
+## Authorized verification attempt after correction deployment (2026-08-18)
+
+- Authorization: the operator explicitly started one test in the existing Telegram conversation and reported the single action as sent. No second action or retry was issued.
+- Service baseline and post-observation health remained `active/running` with `NRestarts=0` and `ExecMainStatus=0`.
+- The bounded gateway metadata log recorded one `inbound / accepted` event with an opaque correlation id in the same displayed minute as the operator action. The id value is withheld.
+- The operator directly confirmed a visible bot response with a screenshot. The screenshot and message body are not stored here; this closes `USER_VISIBLE_DELIVERY=PASS` only.
+- No matching `outbound / delivered` `delivery_audit` record was present in the bounded runtime log query. Therefore `OUTBOUND_DELIVERY=UNPROVEN`, and the overall ticket remains `PARTIAL` rather than full `PASS`.
+- This attempt is closed. Do not retry or change Telegram/DGX state to manufacture the missing outbound audit evidence.
+
 ## Safety stop conditions
 
 Stop and record `BLOCKED` or `UNPROVEN` if:
