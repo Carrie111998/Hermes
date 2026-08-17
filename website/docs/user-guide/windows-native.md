@@ -180,7 +180,7 @@ What happens under the hood:
 2. If you decline the UAC prompt or Scheduled Task setup is blocked, writes a `.vbs` login item into `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`. Windows launches it through `wscript.exe`, so no console window appears.
 3. Starts the gateway with the environment's `python.exe` under a hidden-console launcher. This gives the gateway and its console-subsystem children one invisible console instead of letting each child flash a new window.
 
-Flags used when spawning: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB`.
+Flags used when spawning: `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB`.
 
 ### Manage
 

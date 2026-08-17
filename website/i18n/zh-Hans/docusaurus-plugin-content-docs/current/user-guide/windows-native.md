@@ -180,7 +180,7 @@ hermes gateway install
 2. 如果你拒绝 UAC 提示或计划任务设置被阻止，则在 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` 中写入一个 `.vbs` 登录项。Windows 通过 `wscript.exe` 启动它，因此不会显示控制台窗口。
 3. 通过隐藏控制台启动器使用当前环境的 `python.exe` 启动 gateway。这样 gateway 及其控制台子进程会共享一个不可见的控制台，而不是让每个子进程都闪现新窗口。
 
-生成时使用的标志：`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB`。
+生成时使用的标志：`CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB`。
 
 ### 管理
 
