@@ -16,14 +16,17 @@ import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
 import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '@/store/layout'
 import { $previewTabs, closeRightRailTab, type PreviewTarget } from '@/store/preview'
+import { $visiblePreviewTabs } from '@/store/preview'
 
 import { paneMirror } from './pane-mirror'
 import { PreviewTilePane } from './right-rail/preview'
 import { forgetPreviewStripTools, previewStripTools } from './right-rail/preview-strip-tools'
 
-/** The target behind a tile id, or null once its tab is gone. */
+/** The target behind a tile id, or null once its tab is gone. Resolves against
+ *  the tabs VISIBLE in the current chat, so a session-scoped tab hidden by a
+ *  chat switch can't be revealed or fronted from another chat. */
 function targetFor(tabId: string): PreviewTarget | null {
-  return $previewTabs.get().find(tab => tab.id === tabId)?.target ?? null
+  return $visiblePreviewTabs.get().find(tab => tab.id === tabId)?.target ?? null
 }
 
 /** Tab title. A URL is a BROWSER — the tab names the surface, not the page, so
@@ -121,7 +124,7 @@ export function watchPreviewTiles(): void {
 }
 
 const watchPreviewTileMirror = paneMirror<{ id: string }>({
-  source: $previewTabs,
+  source: $visiblePreviewTabs,
   key: tab => tab.id,
   prefix: PREVIEW_TILE_PREFIX,
   // Identical to route (page) tiles: its own zone docked beside main, sized by
