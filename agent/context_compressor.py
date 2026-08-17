@@ -2575,6 +2575,22 @@ class ContextCompressor(ContextEngine):
     def tail_token_budget(self, value: int) -> None:
         self._tail_token_budget = value
 
+    def recalibrate_tail_budget(self) -> None:
+        """Re-derive the tail budget through the mode-aware policy.
+
+        Runtime recalibration paths (update_model, the aux compression-model
+        threshold sync) must call this instead of writing
+        ``threshold_tokens * summary_target_ratio`` themselves: that legacy
+        formula is only one branch of the ``tail_token_budget`` property.
+        Caching it unconditionally overwrote the lean clamp
+        ([LEAN_TAIL_FLOOR_TOKENS, LEAN_TAIL_CAP_TOKENS]) after model
+        switches, fallback activations, and context-window refreshes while
+        ``tail_mode`` still claimed "lean". Invalidating the cache keeps the
+        property as the single source of truth for both modes — the same
+        pattern the ``context_length`` setter uses.
+        """
+        self._tail_token_budget = None
+
     @property
     def max_summary_tokens(self) -> int:
         if self._max_summary_tokens is None:
@@ -3183,7 +3199,7 @@ class ContextCompressor(ContextEngine):
         # through the MODE-AWARE path: assigning the legacy formula here
         # directly silently reverted lean mode to the 0.20×threshold hoard
         # on every mid-session model switch.
-        self._tail_token_budget = None
+        self.recalibrate_tail_budget()
         _ = self.tail_token_budget  # eager recompute, same timing as before
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
