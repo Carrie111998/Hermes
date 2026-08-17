@@ -1965,7 +1965,34 @@ class HermesACPAgent(acp.Agent):
             # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
             # particular — used by the interactive sudo password cache scope).
             ctx = contextvars.copy_context()
-            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+            executor_future = loop.run_in_executor(_executor, ctx.run, _run_agent)
+            # Keep the executor future alive when the ACP request task is
+            # cancelled.  ``run_in_executor`` cannot stop a worker that is
+            # already running, and an unshielded await cancels only the
+            # asyncio wrapper.  The worker then continues while
+            # ``state.is_running`` stays true forever, so every later prompt
+            # is misreported as queued for a turn that no longer has an ACP
+            # owner.
+            result = await asyncio.shield(executor_future)
+        except asyncio.CancelledError:
+            # Publish the same hard interrupt as session/cancel, then wait for
+            # the worker to relinquish the per-session agent before making the
+            # session available again.  This prevents concurrent conversations
+            # on one agent while still guaranteeing that cancellation cannot
+            # strand the runtime lease.
+            await self.cancel(session_id)
+            try:
+                await executor_future
+            except Exception:
+                logger.exception(
+                    "Executor error while cancelling session %s", session_id
+                )
+            await self._mark_idle_and_drain_queued_prompts(
+                state=state,
+                session_id=session_id,
+                conn=conn,
+            )
+            raise
         except Exception:
             logger.exception("Executor error for session %s", session_id)
             with state.runtime_lock:
@@ -2025,6 +2052,35 @@ class HermesACPAgent(acp.Agent):
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
 
+        await self._mark_idle_and_drain_queued_prompts(
+            state=state,
+            session_id=session_id,
+            conn=conn,
+        )
+
+        usage = None
+        if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+            usage = Usage(
+                input_tokens=result.get("prompt_tokens", 0),
+                output_tokens=result.get("completion_tokens", 0),
+                total_tokens=result.get("total_tokens", 0),
+                thought_tokens=result.get("reasoning_tokens"),
+                cached_read_tokens=result.get("cache_read_tokens"),
+            )
+
+        await self._send_usage_update(state)
+
+        stop_reason = "cancelled" if cancelled else "end_turn"
+        return PromptResponse(stop_reason=stop_reason, usage=usage)
+
+    async def _mark_idle_and_drain_queued_prompts(
+        self,
+        *,
+        state: SessionState,
+        session_id: str,
+        conn: Any | None,
+    ) -> None:
+        """Release a completed turn and run its queued follow-ups in order."""
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as
         # normal follow-up user prompts, preserving role alternation and history.
@@ -2046,21 +2102,6 @@ class HermesACPAgent(acp.Agent):
                 prompt=[TextContentBlock(type="text", text=next_prompt)],
                 session_id=session_id,
             )
-
-        usage = None
-        if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
-            usage = Usage(
-                input_tokens=result.get("prompt_tokens", 0),
-                output_tokens=result.get("completion_tokens", 0),
-                total_tokens=result.get("total_tokens", 0),
-                thought_tokens=result.get("reasoning_tokens"),
-                cached_read_tokens=result.get("cache_read_tokens"),
-            )
-
-        await self._send_usage_update(state)
-
-        stop_reason = "cancelled" if cancelled else "end_turn"
-        return PromptResponse(stop_reason=stop_reason, usage=usage)
 
     # ---- Slash commands (headless) -------------------------------------------
 
