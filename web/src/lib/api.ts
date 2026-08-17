@@ -2325,6 +2325,7 @@ export interface CronJob {
   last_status?: string | null;
   last_error?: string | null;
   last_delivery_error?: string | null;
+  last_fire_error?: { at?: string | null; detail?: string | null } | null;
 }
 
 export interface CronDeliveryTarget {
