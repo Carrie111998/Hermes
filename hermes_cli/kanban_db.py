@@ -7428,6 +7428,7 @@ def decompose_triage_task(
                     created_at=0,
                     primary_path=project_repo,
                 )
+        can_materialize_project_children = bool(project_repo and project_obj is not None)
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7460,7 +7461,7 @@ def decompose_triage_task(
             else:
                 child_ws_path = None
             child_branch_name = None
-            child_project_id = root_project_id
+            child_project_id = root_project_id if can_materialize_project_children else None
             if child_project_id and child_ws_kind == "worktree":
                 if project_repo and child_ws_path is None:
                     child_ws_path = os.path.join(
@@ -7470,6 +7471,8 @@ def decompose_triage_task(
                     child_branch_name = _pdb.branch_name_for(
                         project_obj, new_id, title=title
                     )
+            elif root_project_id and root_ws_kind == "worktree" and child_ws_kind == "worktree" and child_ws_path is None:
+                child_ws_kind = "scratch"
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
