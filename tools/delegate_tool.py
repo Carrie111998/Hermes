@@ -3520,6 +3520,23 @@ def delegate_task(
                         n = registry.load_from_directory(d)
                         log_registry_load(str(d), n, list(registry.agents.keys()))
             _agent_def = registry.get_agent(agent)
+            if _agent_def is None:
+                # Force reload — registry may be stale (loaded with old validator)
+                logger.debug("Agent '%s' not in registry (%s), force reloading", agent, list(registry.agents.keys()))
+                registry.agents.clear()
+                registry._loaded = False
+                try:
+                    cfg = load_config()
+                    n = load_agents_from_config(cfg)
+                    log_registry_load("config_reload", n, list(registry.agents.keys()))
+                except Exception as exc:
+                    log_error("config_reload", str(exc))
+                from pathlib import Path
+                for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
+                    if d.exists():
+                        n = registry.load_from_directory(d)
+                        log_registry_load(f"{d}_reload", n, list(registry.agents.keys()))
+                _agent_def = registry.get_agent(agent)
             log_registry_lookup(agent or "", _agent_def is not None, len(registry.agents))
             if _agent_def is None:
                 return tool_error(f"Agent '{agent}' not found. Registry has: {list(registry.agents.keys()) if registry.agents else 'empty'}")
