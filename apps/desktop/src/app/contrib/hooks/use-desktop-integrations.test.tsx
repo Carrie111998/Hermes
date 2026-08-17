@@ -568,6 +568,24 @@ describe('useDesktopIntegrations', () => {
       await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/stored-session'))
     })
 
+    it('opens the session after a bounded wait when the profile swap never settles', async () => {
+      vi.useFakeTimers()
+
+      try {
+        pendingSwaps()
+
+        fireDeepLink({ kind: 'session', name: 'stored-session', params: { profile: 'research' } })
+
+        expect(navigate).not.toHaveBeenCalled()
+
+        await vi.advanceTimersByTimeAsync(15_000)
+
+        expect(navigate).toHaveBeenCalledWith('/stored-session')
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
     it('lets the newest delivery win when two links race', async () => {
       const settle = pendingSwaps()
       const onDeepLink = deepLinkHandler()

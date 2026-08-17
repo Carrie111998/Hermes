@@ -23,12 +23,10 @@ import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionR
 
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>
 
-// Deep-link deliveries are serialised by generation: switching the gateway is
-// async, so a second link can arrive while the first is still awaiting its
-// profile swap. The newest delivery owns the user's navigation intent — a stale
-// one must not open its session on top of it. Mirrors the guard #67392 adds to
-// its own dispatcher.
-let latestDeepLinkGeneration = 0
+// A stuck backend must not leave a session deep link visibly inert forever.
+// The bounded wait keeps the normal profile-first path intact while preserving
+// the existing degradation path for a gateway that cannot become ready.
+const DEEP_LINK_PROFILE_SWAP_TIMEOUT_MS = 15_000
 
 interface DesktopIntegrationsParams {
   activeProfile: string
@@ -62,6 +60,12 @@ export function useDesktopIntegrations({
   runtimeIdByStoredSessionId,
   sessions
 }: DesktopIntegrationsParams): void {
+  // Deep-link deliveries are serialised by generation: switching the gateway is
+  // async, so a second link can arrive while the first is still awaiting its
+  // profile swap. Keep this state with the renderer instance that owns the
+  // delivery stream; a separate surface must not invalidate its navigation.
+  const latestDeepLinkGeneration = useRef(0)
+
   // Update polling — populates $desktopVersion/$updateStatus, which feed the
   // statusbar version pill and the update toasts. Also honors the main
   // process's "open updates" menu request.
@@ -211,14 +215,29 @@ export function useDesktopIntegrations({
         // ladder) — and Desktop reaps idle profile backends after POOL_IDLE_MS,
         // so a link into a cold profile resolves to nothing and the session
         // opens against whichever gateway is live: the launch profile.
-        const generation = ++latestDeepLinkGeneration
+        const generation = ++latestDeepLinkGeneration.current
 
         void (async () => {
           if (profile) {
-            await ensureGatewayProfile(profile).catch(() => undefined)
+            let timeout: number | undefined
+
+            try {
+              await Promise.race([
+                ensureGatewayProfile(profile),
+                new Promise<void>(resolve => {
+                  timeout = window.setTimeout(resolve, DEEP_LINK_PROFILE_SWAP_TIMEOUT_MS)
+                })
+              ])
+            } catch {
+              // A rejected swap still opens the session, as before.
+            } finally {
+              if (timeout !== undefined) {
+                window.clearTimeout(timeout)
+              }
+            }
           }
 
-          if (generation !== latestDeepLinkGeneration) {
+          if (generation !== latestDeepLinkGeneration.current) {
             return
           }
 
