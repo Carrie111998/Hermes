@@ -2567,6 +2567,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
+    # TKT-0033 Phase A: markdown-claimed content must not leak raw HTML tags
+    # (outside code fences) to the user. Hard-fail into a dead-letter record
+    # instead of sending. Declared text/html payloads skip this check.
+    from cron.format_validator import find_html_leak, should_deadletter
+
+    if should_deadletter(_extract_payload_type(job), delivery_content):
+        leak_tag = find_html_leak(delivery_content) or "?"
+        logger.error(
+            "Job '%s': HTML tag %r found in text/markdown delivery content — "
+            "dead-lettering instead of sending",
+            job["id"], leak_tag,
+        )
+        try:
+            deadletter_path = _get_hermes_home() / "cron" / "deadletter.jsonl"
+            deadletter_path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "job_id": job["id"],
+                "payload_type": _extract_payload_type(job),
+                "leak_tag": leak_tag,
+                "content": delivery_content,
+            }
+            with open(deadletter_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+        except Exception as dl_err:
+            logger.error(
+                "Job '%s': failed to write dead-letter record: %s",
+                job["id"], dl_err,
+            )
+        return (
+            f"HTML tag {leak_tag} found in text/markdown delivery content; "
+            "message dead-lettered"
+        )
+
     delivery_errors = []
 
     for target in targets:
