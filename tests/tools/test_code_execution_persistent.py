@@ -78,9 +78,21 @@ def test_schema_exposes_reset_and_describes_configured_lifetime():
     persistent = build_execute_code_schema(mode="project", kernel_mode="session")
     per_call = build_execute_code_schema(mode="project", kernel_mode="per_call")
 
+    persistent_description = persistent["description"]
+    persistent_code = persistent["parameters"]["properties"]["code"]["description"]
+    per_call_description = per_call["description"]
+    per_call_code = per_call["parameters"]["properties"]["code"]["description"]
+
     assert persistent["parameters"]["properties"]["reset"]["type"] == "boolean"
-    assert "persist" in persistent["description"].lower()
-    assert "fresh Python process" in per_call["description"]
+    assert persistent_description.startswith("Run one Python cell")
+    assert "conversation-scoped persistent kernel" in persistent_description
+    assert "Work incrementally" in persistent_description
+    assert "reuse prior names" in persistent_description
+    assert "fix and rerun only the failing step" in persistent_description
+    assert "Prior top-level names" in persistent_code
+    assert "fresh process" in per_call_description
+    assert "no prior Python state" in per_call_description
+    assert "Prior top-level names" not in per_call_code
 
 
 def test_registry_handler_forwards_session_scope_and_reset():

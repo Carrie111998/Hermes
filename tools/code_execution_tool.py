@@ -2501,35 +2501,45 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     # temp-dir staging and hermes-agent's own python.
     if mode == "strict":
         cwd_note = (
-            "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
+            "Code runs in its own temp dir, not the session's CWD — use absolute paths "
             "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
         )
     else:
         cwd_note = (
-            "Scripts run in the session's working directory with the active venv's python, "
+            "Code runs in the session's working directory with the active venv's python, "
             "so project deps (pandas, etc.) and relative paths work like in terminal()."
         )
     if kernel_mode == "session":
-        lifetime_note = (
-            "On the local backend, variables, imports, and function definitions persist "
-            "across calls in this conversation. Set reset=true to start a fresh kernel."
+        execution_note = (
+            "Run one Python cell. On the local backend, it executes in a conversation-scoped "
+            "persistent kernel: variables, imports, functions, and in-memory objects survive "
+            "across calls. Work incrementally — import or load once, then define, test, and "
+            "reuse prior names in later calls. After an error, fix and rerun only the failing "
+            "step. Use reset=true only when a fresh kernel is required."
+        )
+        code_note = (
+            "One Python cell to execute. Prior top-level names from this conversation are "
+            "available. Import tools with "
         )
     else:
-        lifetime_note = "Each call starts a fresh Python process."
+        execution_note = (
+            "Run a Python script in a fresh process. Each call starts with no prior Python state."
+        )
+        code_note = "Python code to execute in a fresh process. Import tools with "
 
     description = (
-        "Run a Python script that calls Hermes tools programmatically. "
-        "Use when you need 3+ tool calls with logic between them: "
+        f"{execution_note}\n\n"
+        "Use this for incremental computation, or call Hermes tools programmatically when "
+        "you need 3+ tool calls with logic between them: "
         "filtering/reducing large outputs before they enter context, "
         "conditional branching, or loops (N pages/files, retry on failure). "
         "Use normal tool calls for single calls, results you must reason "
         "over in full, or anything needing user interaction.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per call. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
-        f"{lifetime_note}\n\n"
         "Print your final result or leave it as the final expression; "
         "stdlib (json, re, csv, datetime, ...) "
         "is available for processing.\n\n"
@@ -2547,9 +2557,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                 "code": {
                     "type": "string",
                     "description": (
-                        "Python code to execute. Import tools with "
-                        f"`from hermes_tools import {import_str}` "
-                        "and print your final result or leave it as the final expression."
+                        code_note
+                        + f"`from hermes_tools import {import_str}` "
+                        + "and print your final result or leave it as the final expression."
                     ),
                 },
                 "reset": {
