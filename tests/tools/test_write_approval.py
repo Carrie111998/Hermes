@@ -11,6 +11,8 @@ import json
 import os
 import tempfile
 import shutil
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -255,6 +257,525 @@ def test_memory_invalid_params_rejected_before_staging(hermes_home):
     r = json.loads(memory_tool("add", "memory", None, store=store))
     assert r["success"] is False
     assert wa.pending_count("memory") == 0
+
+
+def _background_skill_patch_result(
+    hermes_home, tmp_path, *, reset_skill=True, new_string="improved body"
+):
+    """Run one real background-review patch attempt against a temp skill."""
+    from tools.skill_manager_tool import skill_manage
+    from tools.skill_provenance import set_current_write_origin, reset_current_write_origin
+
+    _set_approval("skills", True)
+    skill_dir = tmp_path / "test-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = skill_dir / "SKILL.md"
+    if reset_skill:
+        skill_md.write_text(_SKILL, encoding="utf-8")
+
+    token = set_current_write_origin("background_review")
+    try:
+        with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]), \
+             patch("tools.skill_manager_tool._background_review_preflight", return_value=None):
+            result = json.loads(skill_manage(
+                action="patch",
+                name="test-skill",
+                old_string="body",
+                new_string=new_string,
+                task_id="task-123",
+                session_id="session-456",
+            ))
+    finally:
+        reset_current_write_origin(token)
+    return result, skill_md
+
+
+def _stage_background_skill_patch(hermes_home, tmp_path):
+    """Stage one real background-review patch against an existing temp skill."""
+    from tools import write_approval as wa
+
+    result, skill_md = _background_skill_patch_result(hermes_home, tmp_path)
+    assert result["success"] is True
+    assert result["staged"] is True
+    record = wa.get_pending(wa.SKILLS, result["pending_id"])
+    assert record is not None
+    return result, record, skill_md
+
+
+def test_background_skill_patch_stages_frozen_refinement_candidate(
+    hermes_home, tmp_path
+):
+    from tools import write_approval as wa
+
+    result, record, skill_md = _stage_background_skill_patch(hermes_home, tmp_path)
+    candidate = record["refinement_candidate"]
+
+    assert result["candidate_id"] == candidate["id"]
+    assert len(candidate["id"]) == 32
+    assert candidate["schema_version"] == 1
+    assert candidate["target"]["skill"] == "test-skill"
+    assert candidate["target"]["file"] == "SKILL.md"
+    assert Path(candidate["target"]["root"]) == tmp_path / "test-skill"
+    assert candidate["evidence"] == {
+        "origin": "background_review",
+        "task_id": "task-123",
+        "session_id": "session-456",
+    }
+    assert candidate["base"]["state"] == "present"
+    assert candidate["proposed"]["state"] == "present"
+    assert candidate["base"]["sha256"] != candidate["proposed"]["sha256"]
+    assert "-body" in candidate["diff"]
+    assert "+improved body" in candidate["diff"]
+    assert skill_md.read_text(encoding="utf-8") == _SKILL
+
+    frozen = wa.skill_pending_diff(record)
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    rendered = handle_pending_subcommand(
+        wa.SKILLS, ["diff", result["pending_id"]]
+    )
+    assert candidate["id"] in rendered
+    assert "session-456" in rendered
+    assert candidate["base"]["sha256"] in rendered
+
+    skill_md.write_text(_SKILL.replace("body", "unrelated drift"), encoding="utf-8")
+    assert wa.skill_pending_diff(record) == frozen
+
+
+def test_refinement_approval_rejects_stale_base_before_snapshot(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, _record, skill_md = _stage_background_skill_patch(hermes_home, tmp_path)
+    skill_md.write_text(_SKILL.replace("body", "newer user edit"), encoding="utf-8")
+    snapshots = []
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills",
+        lambda **kwargs: snapshots.append(kwargs) or Path("unused"),
+    )
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+        out = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    assert "base changed" in out.lower()
+    assert snapshots == []
+    assert wa.pending_count(wa.SKILLS) == 1
+    assert "newer user edit" in skill_md.read_text(encoding="utf-8")
+
+
+def test_refinement_approval_requires_snapshot_and_keeps_pending_on_failure(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, _record, skill_md = _stage_background_skill_patch(hermes_home, tmp_path)
+    snapshot_calls = []
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills",
+        lambda **kwargs: snapshot_calls.append(kwargs) or None,
+    )
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+        out = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+        immediate_retry = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    assert "snapshot" in out.lower()
+    assert "failed" in out.lower()
+    assert "cooldown" in immediate_retry.lower()
+    assert len(snapshot_calls) == 1
+    assert wa.pending_count(wa.SKILLS) == 1
+    assert skill_md.read_text(encoding="utf-8") == _SKILL
+
+
+def test_refinement_approval_snapshots_applies_and_verifies_result(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, record, skill_md = _stage_background_skill_patch(hermes_home, tmp_path)
+    candidate_id = record["refinement_candidate"]["id"]
+    snapshot = Path(hermes_home) / "skills" / ".curator_backups" / "snap-123"
+    calls = []
+
+    def _snapshot(*, reason, **kwargs):
+        calls.append(reason)
+        return snapshot
+
+    monkeypatch.setattr("agent.curator_backup.snapshot_skills", _snapshot)
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+        out = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    assert calls == [f"pre-refinement {candidate_id}"]
+    assert "Approved 1" in out
+    assert "snap-123" in out
+    assert wa.pending_count(wa.SKILLS) == 0
+    assert "improved body" in skill_md.read_text(encoding="utf-8")
+
+
+def test_refinement_approval_creates_real_curator_snapshot(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    skills_root = Path(hermes_home) / "skills"
+    result, record, skill_md = _stage_background_skill_patch(
+        hermes_home, skills_root
+    )
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]):
+        out = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    backups = skills_root / ".curator_backups"
+    manifests = list(backups.glob("*/manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["reason"] == (
+        f"pre-refinement {record['refinement_candidate']['id']}"
+    )
+    assert manifest["skill_files"] == 1
+    assert manifests[0].parent.name in out
+    assert "improved body" in skill_md.read_text(encoding="utf-8")
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_refinement_guard_allows_only_one_active_candidate_per_skill(
+    hermes_home, tmp_path
+):
+    from tools import write_approval as wa
+
+    _stage_background_skill_patch(hermes_home, tmp_path)
+    second, _skill_md = _background_skill_patch_result(
+        hermes_home, tmp_path, reset_skill=False
+    )
+
+    assert second["success"] is False
+    assert "active refinement candidate" in second["error"].lower()
+    assert wa.pending_count(wa.SKILLS) == 1
+
+
+def test_rejected_refinement_candidate_enters_cooldown(
+    hermes_home, tmp_path
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, _record, _skill_md = _stage_background_skill_patch(
+        hermes_home, tmp_path
+    )
+    rejected = handle_pending_subcommand(
+        wa.SKILLS, ["reject", result["pending_id"]]
+    )
+    assert "Rejected" in rejected
+
+    retry, _skill_md = _background_skill_patch_result(
+        hermes_home,
+        tmp_path,
+        reset_skill=False,
+        new_string="differently improved body",
+    )
+    assert retry["success"] is False
+    assert "cooldown" in retry["error"].lower()
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_exact_duplicate_remains_blocked_after_cooldown(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    now = [1_000_000.0]
+    monkeypatch.setattr(wa.time, "time", lambda: now[0])
+    result, _record, _skill_md = _stage_background_skill_patch(
+        hermes_home, tmp_path
+    )
+    handle_pending_subcommand(wa.SKILLS, ["reject", result["pending_id"]])
+    now[0] += wa.REFINEMENT_COOLDOWN_SECONDS + 1
+
+    duplicate, _skill_md = _background_skill_patch_result(
+        hermes_home, tmp_path, reset_skill=False
+    )
+    assert duplicate["success"] is False
+    assert "duplicate refinement candidate" in duplicate["error"].lower()
+
+
+def test_refinement_guard_caps_same_candidate_at_three_attempts_per_window(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    now = [1_000_000.0]
+    monkeypatch.setattr(wa.time, "time", lambda: now[0])
+
+    for attempt in range(wa.REFINEMENT_MAX_ATTEMPTS):
+        result, _skill_md = _background_skill_patch_result(
+            hermes_home,
+            tmp_path,
+            new_string=f"improved body variant {attempt}",
+        )
+        assert result["success"] is True
+        handle_pending_subcommand(
+            wa.SKILLS, ["reject", result["pending_id"]]
+        )
+        now[0] += wa.REFINEMENT_COOLDOWN_SECONDS + 1
+
+    blocked, _skill_md = _background_skill_patch_result(
+        hermes_home, tmp_path, reset_skill=False
+    )
+    assert blocked["success"] is False
+    assert "attempt limit" in blocked["error"].lower()
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_corrupt_refinement_guard_blocks_new_candidate(hermes_home, tmp_path):
+    from tools import write_approval as wa
+
+    guard = Path(hermes_home) / "pending" / "refinement_guard.json"
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    guard.write_text("not valid json", encoding="utf-8")
+
+    result, _skill_md = _background_skill_patch_result(hermes_home, tmp_path)
+    assert result["success"] is False
+    assert "loop guard" in result["error"].lower()
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_semantically_corrupt_refinement_guard_blocks_new_candidate(
+    hermes_home, tmp_path
+):
+    from tools import write_approval as wa
+
+    guard = Path(hermes_home) / "pending" / "refinement_guard.json"
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    guard.write_text(json.dumps({
+        "schema_version": 1,
+        "fingerprints": {},
+        "skills": {"test-skill": {"attempts": "corrupt", "failures": []}},
+    }), encoding="utf-8")
+
+    result, _skill_md = _background_skill_patch_result(hermes_home, tmp_path)
+    assert result["success"] is False
+    assert "loop guard" in result["error"].lower()
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_refinement_candidate_is_bound_to_exact_skill_root(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    result, _record, skill_a = _stage_background_skill_patch(
+        hermes_home, root_a
+    )
+    skill_b_dir = root_b / "test-skill"
+    skill_b_dir.mkdir(parents=True)
+    skill_b = skill_b_dir / "SKILL.md"
+    skill_b.write_text(_SKILL, encoding="utf-8")
+    snapshots = []
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills",
+        lambda **kwargs: snapshots.append(kwargs) or Path("unused"),
+    )
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", root_b), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[root_b, root_a]):
+        out = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    assert "target root changed" in out.lower()
+    assert snapshots == []
+    assert skill_a.read_text(encoding="utf-8") == _SKILL
+    assert skill_b.read_text(encoding="utf-8") == _SKILL
+    assert wa.pending_count(wa.SKILLS) == 1
+
+
+def test_refinement_apply_rechecks_base_inside_skill_writer(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, _record, skill_md = _stage_background_skill_patch(
+        hermes_home, tmp_path
+    )
+
+    def _snapshot_then_user_edit(**kwargs):
+        skill_md.write_text(
+            _SKILL.replace("body", "concurrent user edit"), encoding="utf-8"
+        )
+        return Path("snap")
+
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills", _snapshot_then_user_edit
+    )
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+        out = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    assert "changed during apply" in out.lower()
+    assert "concurrent user edit" in skill_md.read_text(encoding="utf-8")
+    assert wa.pending_count(wa.SKILLS) == 1
+
+
+def test_parallel_refinement_approvals_apply_only_once(
+    hermes_home, tmp_path, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, _record, skill_md = _stage_background_skill_patch(
+        hermes_home, tmp_path
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    apply_calls = []
+
+    def _apply_once(payload, refinement_candidate=None):
+        apply_calls.append(payload)
+        entered.set()
+        release.wait(timeout=2)
+        skill_md.write_text(_SKILL.replace("body", "improved body"), encoding="utf-8")
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills", lambda **kwargs: Path("snap")
+    )
+    monkeypatch.setattr("tools.skill_manager_tool.apply_skill_pending", _apply_once)
+
+    def _approve():
+        return handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]), \
+         ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(_approve)
+        ready = entered.wait(timeout=2)
+        assert ready, first.result(timeout=1)
+        second = pool.submit(_approve)
+        time.sleep(0.05)
+        release.set()
+        outputs = [first.result(timeout=2), second.result(timeout=2)]
+
+    assert len(apply_calls) == 1
+    assert sum("Approved 1" in output for output in outputs) == 1
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_applied_candidate_with_guard_failure_is_retained_and_not_retried(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, _record, skill_md = _stage_background_skill_patch(
+        hermes_home, tmp_path
+    )
+    original_record_outcome = wa.record_refinement_candidate_outcome
+    snapshots = []
+
+    def _record_outcome(record, outcome):
+        if outcome == "applied":
+            return False, "simulated guard write failure"
+        return original_record_outcome(record, outcome)
+
+    monkeypatch.setattr(wa, "record_refinement_candidate_outcome", _record_outcome)
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills",
+        lambda **kwargs: snapshots.append(kwargs) or Path("snap"),
+    )
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+        first = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+        second = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    retained = wa.get_pending(wa.SKILLS, result["pending_id"])
+    assert "retained" in first.lower()
+    assert "must not be retried" in second.lower()
+    assert retained["refinement_apply_state"] == "applied_guard_error"
+    assert len(snapshots) == 1
+    assert "improved body" in skill_md.read_text(encoding="utf-8")
+
+
+def test_tampered_refinement_candidate_can_still_be_rejected(
+    hermes_home, tmp_path
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, record, _skill_md = _stage_background_skill_patch(
+        hermes_home, tmp_path
+    )
+    record["refinement_candidate"]["diff"] += "\nforged"
+    wa.replace_pending_record(wa.SKILLS, record)
+
+    out = handle_pending_subcommand(
+        wa.SKILLS, ["reject", result["pending_id"]]
+    )
+    assert "Rejected" in out
+    assert wa.pending_count(wa.SKILLS) == 0
+
+
+def test_refinement_candidate_integrity_tampering_blocks_apply(
+    hermes_home, tmp_path, monkeypatch
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    result, record, skill_md = _stage_background_skill_patch(hermes_home, tmp_path)
+    record["refinement_candidate"]["diff"] += "\nforged"
+    wa.replace_pending_record(wa.SKILLS, record)
+    snapshots = []
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills",
+        lambda **kwargs: snapshots.append(kwargs) or Path("unused"),
+    )
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+        out = handle_pending_subcommand(
+            wa.SKILLS, ["approve", result["pending_id"]]
+        )
+
+    assert "integrity" in out.lower()
+    assert snapshots == []
+    assert wa.pending_count(wa.SKILLS) == 1
+    assert skill_md.read_text(encoding="utf-8") == _SKILL
 
 
 class TestSkillGist:

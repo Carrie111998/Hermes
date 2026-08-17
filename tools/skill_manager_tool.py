@@ -32,6 +32,7 @@ Directory layout for user skills:
             └── SKILL.md
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -54,6 +55,9 @@ logger = logging.getLogger(__name__)
 
 _background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
     "background_review_read_paths", default=frozenset()
+)
+_skill_apply_contract: "_ctxvars.ContextVar[Optional[Dict[str, Any]]]" = (
+    _ctxvars.ContextVar("skill_apply_contract", default=None)
 )
 
 
@@ -651,6 +655,19 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     {"path": Path} or None.
     """
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+
+    contract = _skill_apply_contract.get()
+    if isinstance(contract, dict) and contract.get("skill") == name:
+        bound_root = Path(str(contract.get("root") or ""))
+        skill_md = bound_root / "SKILL.md"
+        if (
+            bound_root.name == name
+            and skill_md.exists()
+            and not is_excluded_skill_path(skill_md)
+        ):
+            return {"path": bound_root}
+        return None
+
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
@@ -1120,6 +1137,17 @@ def _patch_skill(
         return read_guard
 
     content = target.read_text(encoding="utf-8")
+    contract = _skill_apply_contract.get()
+    if isinstance(contract, dict) and contract.get("skill") == name:
+        expected_file = str(contract.get("file") or "SKILL.md")
+        actual_file = str(target.relative_to(skill_dir)).replace("\\", "/")
+        expected_file = expected_file.replace("\\", "/")
+        current_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if actual_file != expected_file or current_sha != contract.get("base_sha256"):
+            return {
+                "success": False,
+                "error": "Refinement base or target changed during apply.",
+            }
 
     # Use the same fuzzy matching engine as the file patch tool.
     # This handles whitespace normalization, indentation differences,
@@ -1161,6 +1189,15 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
+    if (
+        isinstance(contract, dict)
+        and contract.get("skill") == name
+        and target.read_text(encoding="utf-8") != content
+    ):
+        return {
+            "success": False,
+            "error": "Refinement target changed while the approved patch was prepared.",
+        }
     atomic_write_text(target, new_content)
 
     # Security scan — roll back on block
@@ -1422,7 +1459,6 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 
 # ContextVar bypass: set while replaying an already-approved staged skill write
 # so skill_manage() does not re-gate (and re-stage) it.
-import contextvars as _ctxvars
 _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False
 )
@@ -1459,19 +1495,64 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "gist": gist, "message": decision.message},
-        ensure_ascii=False,
-    )
+    origin = wa.current_origin()
+    try:
+        candidate = wa.build_skill_refinement_candidate(payload, origin=origin)
+    except Exception as exc:
+        return tool_error(
+            f"Could not stage a safe refinement candidate: {exc}", success=False
+        )
+    if candidate is not None:
+        try:
+            record, guard_error = wa.stage_refinement_write(
+                payload,
+                summary=gist,
+                origin=origin,
+                candidate=candidate,
+            )
+        except Exception as exc:
+            return tool_error(
+                f"Refinement loop guard is unavailable: {exc}", success=False
+            )
+        if record is None:
+            return tool_error(guard_error, success=False)
+    else:
+        record = wa.stage_write(
+            wa.SKILLS,
+            payload,
+            summary=gist,
+            origin=origin,
+        )
+    result = {
+        "success": True,
+        "staged": True,
+        "pending_id": record["id"],
+        "gist": gist,
+        "message": decision.message,
+    }
+    if candidate is not None:
+        result["candidate_id"] = candidate["id"]
+    return json.dumps(result, ensure_ascii=False)
 
 
-def apply_skill_pending(payload: Dict[str, Any]) -> str:
+def apply_skill_pending(
+    payload: Dict[str, Any], refinement_candidate: Optional[Dict[str, Any]] = None
+) -> str:
     """Replay a staged skill write, bypassing the gate. Returns the tool result
     JSON string. Called by the /skills approve handler.
     """
-    token = _skill_gate_bypass.set(True)
+    contract = None
+    if isinstance(refinement_candidate, dict):
+        target = refinement_candidate.get("target", {})
+        base = refinement_candidate.get("base", {})
+        contract = {
+            "skill": str(target.get("skill") or ""),
+            "file": str(target.get("file") or "SKILL.md"),
+            "root": str(target.get("root") or ""),
+            "base_sha256": str(base.get("sha256") or ""),
+        }
+    bypass_token = _skill_gate_bypass.set(True)
+    contract_token = _skill_apply_contract.set(contract)
     try:
         return skill_manage(
             action=payload.get("action", ""),
@@ -1484,9 +1565,12 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             new_string=payload.get("new_string"),
             replace_all=payload.get("replace_all", False),
             absorbed_into=payload.get("absorbed_into"),
+            task_id=payload.get("task_id"),
+            session_id=payload.get("session_id"),
         )
     finally:
-        _skill_gate_bypass.reset(token)
+        _skill_apply_contract.reset(contract_token)
+        _skill_gate_bypass.reset(bypass_token)
 
 
 # Debounce state for the sync push hook. A burst of skill_manage writes
@@ -1571,6 +1655,7 @@ def skill_manage(
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
+        task_id=task_id, session_id=session_id,
     )
     if gate_result is not None:
         return gate_result
