@@ -1103,6 +1103,9 @@ def bump_outcome(
             reasons = reasons[-_OUTCOME_WINDOW:]
         rec["recent_outcomes"] = outcomes
         rec["recent_outcome_reasons"] = reasons
+        assert len(outcomes) == len(reasons), (
+            f"recent_outcomes/recent_outcome_reasons misaligned for {skill_name}"
+        )
 
         was_needs_review = bool(rec.get("needs_review"))
         samples = len(outcomes)
@@ -1282,10 +1285,7 @@ def is_verify_optin_eligible(skill_name: str, skill_dir: Optional[Path] = None) 
         )
     external = False
     if skill_dir is None:
-        local_dir = _find_skill_dir(skill_name)
-        if local_dir is not None:
-            external = is_external_skill_path(local_dir)
-        elif _find_external_skill_dir(skill_name) is not None:
+        if _find_skill_dir(skill_name) is None and _find_external_skill_dir(skill_name) is not None:
             external = True
     else:
         external = is_external_skill_path(skill_dir)

@@ -410,7 +410,8 @@ def evaluate_turn_outcome(
             f"  - {n}: {v}{f' ({r})' if r else ''}" for n, (v, r) in verdicts.items()
         )
         file_previews = "; ".join(
-            f"{k}: {str(v.get('error_preview') or '')[:200]}" for k, v in fm.items()
+            f"{k}: {str(v.get('error_preview') if isinstance(v, dict) else '')[:200]}"
+            for k, v in fm.items()
         )
         prompt = _build_prompt(
             user_message,
