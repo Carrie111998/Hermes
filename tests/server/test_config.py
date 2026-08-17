@@ -65,3 +65,32 @@ def test_document_settings_are_not_environment_variables(home, monkeypatch):
 def test_malformed_config_falls_back_to_defaults(home):
     (home / "config.yaml").write_text("interfaze_server: [not, a, mapping]", encoding="utf-8")
     assert Settings.load().document_workers == 2
+
+
+def test_bright_data_secret_comes_from_environment_and_behavior_from_config(home, monkeypatch):
+    _write_config(
+        home,
+        """
+        interfaze_server:
+          brightdata_enabled: true
+          brightdata_unlocker_zone: configured-zone
+          brightdata_api_key: must-not-be-read-from-config
+        """,
+    )
+    monkeypatch.setenv("BRIGHTDATA_API_KEY", "environment-secret")
+
+    settings = Settings.load()
+
+    assert settings.brightdata_api_key == "environment-secret"
+    assert settings.brightdata_enabled is True
+    assert settings.brightdata_unlocker_zone == "configured-zone"
+
+
+def test_bright_data_behavior_is_not_read_from_environment(home, monkeypatch):
+    monkeypatch.setenv("BRIGHTDATA_ENABLED", "true")
+    monkeypatch.setenv("BRIGHTDATA_UNLOCKER_ZONE", "environment-zone")
+
+    settings = Settings.load()
+
+    assert settings.brightdata_enabled is False
+    assert settings.brightdata_unlocker_zone == "cli_unlocker"

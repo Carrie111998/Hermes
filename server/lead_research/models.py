@@ -89,9 +89,31 @@ class RawPage(ApiModel):
 
 
 class ProviderHealth(ApiModel):
-    status: Literal["active", "degraded", "retired"]
+    status: Literal["active", "degraded", "retired", "unavailable"]
     checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     message: str | None = None
+    reason: Literal["credential_required", "disabled"] | None = None
+
+
+class VerificationSource(ApiModel):
+    provenance_url: str
+    raw_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    classification: Literal["official", "independent"]
+    retrieved_via: str
+    facts: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("provenance_url", "retrieved_via")
+    @classmethod
+    def require_https_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("verification sources must use https URLs")
+        return value
+
+
+class VerificationBundle(ApiModel):
+    candidate_source_record_id: str
+    sources: list[VerificationSource] = Field(default_factory=list)
+    independent_source_count: int = Field(default=0, ge=0)
 
 
 class EvidenceEnvelope(ApiModel):

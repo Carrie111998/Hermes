@@ -70,6 +70,11 @@ class Settings:
     document_workers: int = 2
     document_processing_timeout_seconds: int = 180
     document_output_max_bytes: int = 50 * 1024 * 1024
+    # Bright Data is an opt-in application service. Only its credential comes
+    # from the environment; enablement and zone are normal operator settings.
+    brightdata_api_key: str = ""
+    brightdata_enabled: bool = False
+    brightdata_unlocker_zone: str = "cli_unlocker"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -121,5 +126,10 @@ class Settings:
             ),
             document_output_max_bytes=max(
                 1, int(cfg.get("document_output_max_bytes", 50 * 1024 * 1024))
+            ),
+            brightdata_api_key=os.environ.get("BRIGHTDATA_API_KEY", ""),
+            brightdata_enabled=bool(cfg.get("brightdata_enabled")),
+            brightdata_unlocker_zone=str(
+                cfg.get("brightdata_unlocker_zone") or "cli_unlocker"
             ),
         )

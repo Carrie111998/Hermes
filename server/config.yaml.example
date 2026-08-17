@@ -63,3 +63,9 @@ interfaze_server:
   # Reject a prepared result larger than this. A spreadsheet that expands into
   # hundreds of megabytes of text is a problem to surface, not to store.
   document_output_max_bytes: 52428800  # 50 MiB
+
+  # Optional candidate verification through Bright Data Web Unlocker. The API
+  # key remains a deployment secret in BRIGHTDATA_API_KEY; only non-secret
+  # behavior belongs here.
+  brightdata_enabled: false
+  brightdata_unlocker_zone: cli_unlocker

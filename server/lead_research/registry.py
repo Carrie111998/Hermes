@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import yaml
 
+from ..config import Settings
 from .models import DatasetDefinition
 from .providers.base import CatalogProvider, Provider
+from .providers.bright_data import BrightDataVerifier
 from .sectors import REFERENCE_DIR
+from .verification import UnavailableCandidateVerifier
 
 
 CATALOG_PATH = REFERENCE_DIR / "provider-catalog.yaml"
@@ -47,6 +50,34 @@ class ProviderRegistry:
             )
 
 
-def build_registry(providers: dict[str, Provider] | None = None) -> ProviderRegistry:
+def build_registry(
+    settings: Settings | None = None,
+    providers: dict[str, Provider] | None = None,
+) -> ProviderRegistry:
     raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8")) or []
-    return ProviderRegistry([DatasetDefinition.model_validate(item) for item in raw], providers)
+    definitions = [DatasetDefinition.model_validate(item) for item in raw]
+    supplied = dict(providers or {})
+    bright_data = next(
+        (item for item in definitions if item.source_id == "brightdata-web"),
+        None,
+    )
+    if bright_data is not None and bright_data.source_id not in supplied:
+        settings = settings or Settings.load()
+        if not settings.brightdata_enabled:
+            supplied[bright_data.source_id] = UnavailableCandidateVerifier(
+                bright_data,
+                "disabled",
+            )
+        elif not settings.brightdata_api_key:
+            supplied[bright_data.source_id] = UnavailableCandidateVerifier(
+                bright_data,
+                "credential_required",
+            )
+        else:
+            verifier = BrightDataVerifier(
+                settings.brightdata_api_key,
+                settings.brightdata_unlocker_zone,
+            )
+            verifier.definition = bright_data
+            supplied[bright_data.source_id] = verifier
+    return ProviderRegistry(definitions, supplied)
