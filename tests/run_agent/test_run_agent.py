@@ -2447,6 +2447,36 @@ class TestAgentRuntimePostHookOwnershipSync:
         assert captured["caller_session_key"] == "telegram:dm:owner"
         assert captured["profile"] == "work"
 
+    def test_api_agent_persists_gateway_scope_on_lazy_session_creation(
+        self, agent, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from tools.session_search_tool import session_search
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent._session_db = db
+        agent._session_db_created = False
+        agent._persist_disabled = False
+        agent.platform = "api_server"
+        agent.session_id = "api-created-session"
+        agent._gateway_session_key = "api-conversation-scope"
+
+        try:
+            agent._ensure_db_session()
+
+            row = db.get_session("api-created-session")
+            assert row["session_key"] == "api-conversation-scope"
+            result = json.loads(
+                session_search(
+                    session_id="api-created-session",
+                    db=db,
+                    caller_session_key="api-conversation-scope",
+                )
+            )
+            assert result["success"] is True
+        finally:
+            db.close()
+
 
 class TestPathsOverlap:
     """Unit tests for the _paths_overlap helper."""
