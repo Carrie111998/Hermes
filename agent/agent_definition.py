@@ -202,9 +202,10 @@ def validate_agent_definition(agent_def: AgentDefinition) -> List[str]:
     elif not re.match(r'^[a-zA-Z0-9_-]+$', agent_def.name):
         errors.append(f"Invalid name: {agent_def.name}. Use alphanumeric, underscore, or hyphen.")
     
-    # Model validation
-    if not agent_def.model:
-        errors.append("Model is required")
+    # Model validation (optional — inherits from parent if empty)
+    # Only validate format if explicitly set
+    if agent_def.model and not re.match(r'^[a-zA-Z0-9_./-]+$', agent_def.model):
+        errors.append(f"Invalid model: {agent_def.model}")
     
     # Reasoning validation
     valid_reasoning = {'none', 'low', 'medium', 'high', 'max'}
