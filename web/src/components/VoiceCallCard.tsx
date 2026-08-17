@@ -23,6 +23,17 @@ interface TranscriptLine {
 
 const MAX_TRANSCRIPT_LINES = 8;
 
+/** Params for the voice card's dedicated sidecar session (not the TUI). */
+export function voiceCallSessionCreateParams(
+  profile?: string | null,
+): Record<string, unknown> {
+  return {
+    close_on_disconnect: true,
+    source: "tool",
+    ...(profile ? { profile } : {}),
+  };
+}
+
 export function VoiceCallCard({ profile }: { profile?: string | null }) {
   const { t } = useI18n();
   const [status, setStatus] = useState<CallStatus>("idle");
@@ -69,7 +80,16 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
       gwRef.current = gw;
       await gw.connect();
       const grant = await gw.request<RealtimeTokenGrant>("voice.realtime_token", {});
-      const sessionId = `voice-web-${Date.now().toString(36)}`;
+      // Invented ids 404 at prompt.submit — the gateway only routes sessions
+      // it created, so mint a real sidecar session first.
+      const created = await gw.request<{ session_id: string }>(
+        "session.create",
+        voiceCallSessionCreateParams(profile),
+      );
+      const sessionId = String(created.session_id || "").trim();
+      if (!sessionId) {
+        throw new Error("voice session.create returned no session_id");
+      }
       sessionIdRef.current = sessionId;
 
       const client = new RealtimeVoiceClient();
