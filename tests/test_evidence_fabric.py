@@ -50,6 +50,41 @@ def test_service_creates_run_evidence_claim_link_and_status_provenance(tmp_path)
         db.close()
 
 
+def test_scope_is_runtime_owned_and_other_scope_cannot_read_or_mutate(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    owner = EvidenceFabricService(db, EvidenceScope("scope-a", "p", "c", "agent-a"))
+    other = EvidenceFabricService(db, EvidenceScope("scope-b", "p", "c", "agent-b"))
+    try:
+        run = owner.create_research_run("private objective")
+        from research.evidence_fabric import EvidenceNotFoundError, EvidenceScopeError
+        with pytest.raises(EvidenceScopeError):
+            other.get_research_run(run.id)
+        assert other.list_research_runs() == ()
+        with pytest.raises(EvidenceScopeError):
+            other.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content="x", raw_reference="artifact:x")
+    finally:
+        db.close()
+
+
+def test_all_terminal_run_graph_mutations_are_rejected(tmp_path):
+    db, service = _service(tmp_path)
+    try:
+        run = service.create_research_run("objective")
+        evidence = service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content="x", raw_reference="artifact:x").evidence
+        claim = service.create_claim(run.id, "claim")
+        service.transition_research_run(run.id, ResearchRunStatus.CANCELLED)
+        with pytest.raises(Exception):
+            service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content="y", raw_reference="artifact:y")
+        with pytest.raises(Exception):
+            service.create_claim(run.id, "late claim")
+        with pytest.raises(Exception):
+            service.link_evidence_to_claim(claim.id, evidence.id, "CONTEXT")
+        with pytest.raises(Exception):
+            service.set_claim_status(claim.id, ClaimStatus.SUPPORTED)
+    finally:
+        db.close()
+
+
 def test_validation_rejects_bad_hash_uri_and_terminal_mutation(tmp_path):
     db, service = _service(tmp_path)
     try:
