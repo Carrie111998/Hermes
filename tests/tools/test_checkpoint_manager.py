@@ -6,6 +6,8 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
 import pytest
 from pathlib import Path
@@ -21,6 +23,8 @@ from tools.checkpoint_manager import (
     _store_path,
     _ref_name,
     _project_meta_path,
+    _checkpoint_store_lock,
+    _lock_file,
     _touch_project,
     prune_checkpoints,
     maybe_auto_prune_checkpoints,
@@ -168,6 +172,164 @@ class TestTakeCheckpoint:
         mgr.new_turn()
         (work_dir / "main.py").write_text("print('modified')\n")
         assert mgr.ensure_checkpoint(str(work_dir), "turn 2") is True
+
+    def test_prune_waits_for_snapshot_transaction(
+        self, mgr, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """GC cannot prune a tree between write-tree and update-ref."""
+        from tools import checkpoint_manager as checkpoint_module
+
+        real_run_git = checkpoint_module._run_git
+        tree_written = threading.Event()
+        release_snapshot = threading.Event()
+        prune_started = threading.Event()
+        gc_called = threading.Event()
+        prune_finished = threading.Event()
+        writer_result = []
+
+        def gated_run_git(args, *call_args, **call_kwargs):
+            if args == ["gc", "--prune=now", "--quiet"]:
+                gc_called.set()
+            result = real_run_git(args, *call_args, **call_kwargs)
+            if args == ["write-tree"]:
+                tree_written.set()
+                assert release_snapshot.wait(10)
+            return result
+
+        monkeypatch.setattr(checkpoint_module, "_run_git", gated_run_git)
+
+        writer = threading.Thread(
+            target=lambda: writer_result.append(
+                mgr.ensure_checkpoint(str(work_dir), "concurrent snapshot")
+            )
+        )
+
+        def run_prune():
+            prune_started.set()
+            prune_checkpoints(
+                retention_days=0,
+                delete_orphans=False,
+                checkpoint_base=checkpoint_base,
+            )
+            prune_finished.set()
+
+        pruner = threading.Thread(target=run_prune)
+        writer.start()
+        assert tree_written.wait(10)
+        pruner.start()
+        assert prune_started.wait(10)
+        assert not gc_called.wait(0.2)
+        assert not prune_finished.wait(0.2)
+
+        release_snapshot.set()
+        writer.join(10)
+        pruner.join(10)
+
+        assert not writer.is_alive()
+        assert not pruner.is_alive()
+        assert writer_result == [True]
+        assert prune_finished.is_set()
+
+        store = _store_path(checkpoint_base)
+        ref = _ref_name(_project_hash(str(work_dir)))
+        tree = subprocess.run(
+            ["git", f"--git-dir={store}", "rev-parse", f"{ref}^{{tree}}"],
+            capture_output=True,
+            text=True,
+        )
+        fsck = subprocess.run(
+            ["git", f"--git-dir={store}", "fsck", "--full"],
+            capture_output=True,
+            text=True,
+        )
+        assert tree.returncode == 0, tree.stderr
+        assert fsck.returncode == 0, fsck.stderr
+
+    def test_store_lock_serializes_independent_processes(
+        self, checkpoint_base, tmp_path,
+    ):
+        ready = tmp_path / "child-ready"
+        release = tmp_path / "child-release"
+        child_code = """
+import sys
+import time
+from pathlib import Path
+from tools.checkpoint_manager import _checkpoint_store_lock
+
+base, ready, release = map(Path, sys.argv[1:])
+with _checkpoint_store_lock(base):
+    ready.write_text("ready")
+    while not release.exists():
+        time.sleep(0.01)
+"""
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                str(checkpoint_base),
+                str(ready),
+                str(release),
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+        )
+        waiter = None
+        try:
+            deadline = time.time() + 10
+            while not ready.exists() and time.time() < deadline:
+                time.sleep(0.01)
+            assert ready.exists()
+
+            acquired = threading.Event()
+
+            def acquire_in_parent():
+                with _checkpoint_store_lock(checkpoint_base):
+                    acquired.set()
+
+            waiter = threading.Thread(target=acquire_in_parent)
+            waiter.start()
+            assert not acquired.wait(0.2)
+
+            release.write_text("release")
+            waiter.join(10)
+            child.wait(10)
+            assert acquired.is_set()
+            assert child.returncode == 0
+        finally:
+            release.touch()
+            if waiter is not None:
+                waiter.join(10)
+            if child.poll() is None:
+                child.terminate()
+                child.wait(5)
+
+    def test_windows_lock_retries_past_transient_contention(
+        self, tmp_path, monkeypatch,
+    ):
+        """Windows lock contention must not inherit LK_LOCK's 10-second cap."""
+        from tools import checkpoint_manager as checkpoint_module
+
+        attempts = []
+        sleeps = []
+
+        class FakeMsvcrt:
+            LK_NBLCK = 1
+
+            @staticmethod
+            def locking(_fd, mode, length):
+                attempts.append((mode, length))
+                if len(attempts) < 3:
+                    raise OSError(13, "lock is held")
+
+        lock_path = tmp_path / "windows-lock"
+        with lock_path.open("a+b") as lock_file:
+            monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+            monkeypatch.setattr(checkpoint_module.os, "name", "nt")
+            monkeypatch.setattr(checkpoint_module.time, "sleep", sleeps.append)
+            _lock_file(lock_file)
+
+        assert attempts == [(FakeMsvcrt.LK_NBLCK, 1)] * 3
+        assert sleeps == [0.1, 0.1]
 
 
 # =========================================================================
