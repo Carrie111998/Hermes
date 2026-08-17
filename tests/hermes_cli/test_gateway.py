@@ -1417,3 +1417,68 @@ def test_module_has_logger():
     """Verify module has a logger instance (regression guard for #27154)."""
     assert hasattr(gateway, "logger")
     assert gateway.logger.name == "hermes_cli.gateway"
+
+
+class TestRespawnDoesNotInheritTheCallerCwd:
+    """`... -m hermes_cli.main gateway run --replace` respawned with no cwd=.
+
+    `-m` puts the spawning process's cwd on the child's sys.path[0], AHEAD of the
+    editable-install finder (setuptools appends that finder to sys.meta_path,
+    after PathFinder). So respawning from an agent worktree hands the new
+    gateway the worktree's `hermes_cli` — the 2026-08-17 wrong-module-root
+    failure, arriving through the manual/fallback paths instead of `restart`.
+    """
+
+    @staticmethod
+    def _pin(monkeypatch, tmp_path) -> Path:
+        checkout = tmp_path / "agent-src"
+        (checkout / "hermes_cli").mkdir(parents=True)
+        monkeypatch.setattr(gateway, "installed_package_root", lambda: checkout)
+        return checkout
+
+    def test_restart_watcher_embeds_the_installed_checkout_as_respawn_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        checkout = self._pin(monkeypatch, tmp_path)
+        captured: dict[str, object] = {}
+
+        class _FakePopen:
+            pid = 999
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured.update(kwargs)
+
+        # POSIX branch: the Windows argv rewrite is what supplies a cwd there,
+        # and it must not be the ONLY platform that gets one.
+        monkeypatch.setattr(gateway.sys, "platform", "linux")
+        monkeypatch.setattr(gateway.subprocess, "Popen", _FakePopen)
+
+        assert gateway._spawn_gateway_restart_watcher(
+            4242, ["/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
+        ) is True
+
+        watcher_src = captured["argv"][2]
+        assert f"_respawn_cwd = {json.dumps(str(checkout))}" in watcher_src
+
+    def test_launchd_fallback_spawn_pins_cwd(self, monkeypatch, tmp_path):
+        checkout = self._pin(monkeypatch, tmp_path)
+        captured: dict[str, object] = {}
+
+        class _FakePopen:
+            pid = 1000
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured.update(kwargs)
+
+        monkeypatch.setattr(gateway, "get_hermes_home", lambda: tmp_path / "home")
+        monkeypatch.setattr(
+            gateway,
+            "_gateway_run_command",
+            lambda: ["/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"],
+        )
+        monkeypatch.setattr(gateway.subprocess, "Popen", _FakePopen)
+
+        assert gateway._spawn_detached_gateway() is True
+        assert captured["cwd"] == str(checkout)

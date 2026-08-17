@@ -48,6 +48,10 @@ from hermes_cli._subprocess_compat import (
     windows_detach_flags_without_breakaway,
     windows_hide_flags,
 )
+from hermes_cli.install_root import (
+    find_installed_package_root,
+    installed_package_root,
+)
 
 # Short timeouts: schtasks occasionally wedges and we don't want to hang forever.
 _SCHTASKS_TIMEOUT_S = 15
@@ -370,15 +374,33 @@ def _legacy_startup_entry_path() -> Path:
 # ---------------------------------------------------------------------------
 
 def _stable_gateway_working_dir(project_root: Path) -> str:
-    """Return a stable cwd for detached/startup gateway runs.
+    """Return the cwd a detached/startup gateway must be launched with.
 
-    Mirror the POSIX service invariant: anchor at ``HERMES_HOME`` whenever it
-    exists so Scheduled Task / Startup launches do not fail at the ``cd`` step
-    after a transient checkout or worktree is moved away. Fall back to the
-    source checkout only if ``HERMES_HOME`` cannot be used yet. Preserve the
-    configured spelling instead of resolving symlinks so AppData installs backed
-    by a junction/symlink still identify themselves as AppData.
+    Two invariants, in priority order.
+
+    1. The cwd DECIDES WHICH CODE RUNS. Every launcher here invokes
+       ``python -m hermes_cli.main``, and ``-m`` puts the cwd on ``sys.path[0]``
+       — ahead of the editable-install finder, which setuptools appends to
+       ``sys.meta_path``. So a gateway spawned with the caller's cwd runs
+       whatever copy of the tree that cwd holds. On 2026-08-17 that was an agent
+       worktree ~10 commits behind main, and reaper-deletable underneath the
+       running process. The install root fixes the cwd to the checkout the venv
+       was built from, no matter where the operator invoked the CLI from.
+    2. The cwd MUST NOT ROT. Scheduled Task / Startup entries outlive the shell
+       that generated them; a ``cd /d`` naming a deleted directory fails before
+       Python loads, so the on-boot self-heal never runs. The install root can't
+       rot without the install itself being broken — but when there is no
+       install record at all (running straight from a clone), ``HERMES_HOME``
+       is still a better anchor than a possibly-transient checkout.
+
+    ``project_root`` is the last resort. Paths keep their configured spelling
+    rather than being resolved, so an AppData install backed by a
+    junction/symlink still identifies itself as AppData.
     """
+    installed = find_installed_package_root()
+    if installed is not None:
+        return str(installed)
+
     from hermes_cli.config import get_hermes_home
 
     try:
@@ -424,8 +446,12 @@ def _build_gateway_cmd_script(
     # VIRTUAL_ENV lets the gateway's own python detection find the venv
     # if someone imports hermes_constants-based logic during startup.
     lines.append(f'set "VIRTUAL_ENV={_preserve_hermes_home_path(venv_dir)}"')
+    # The INSTALL root, not ``Path(__file__).parent.parent``: this module may
+    # itself have been imported from a worktree (the caller's cwd is
+    # ``sys.path[0]`` under ``python -m``), and baking that into the launcher
+    # deploys the worktree. See ``_stable_gateway_working_dir``.
     pythonpath_entries = [
-        _preserve_hermes_home_path(Path(__file__).resolve().parent.parent),
+        _preserve_hermes_home_path(installed_package_root()),
         *[_preserve_hermes_home_path(entry) for entry in extra_pythonpath],
     ]
     lines.append(f'set "PYTHONPATH={";".join([*pythonpath_entries, "%PYTHONPATH%"])}"')
@@ -814,7 +840,11 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
     python_exe, venv_dir, extra_pythonpath = _resolve_detached_python(
         _preserve_hermes_home_path(get_python_path())
     )
-    project_root = _preserve_hermes_home_path(PROJECT_ROOT)
+    # ``PROJECT_ROOT`` is ``__file__``-derived, so it names whichever copy of the
+    # tree THIS process imported — a worktree, when an agent session runs the
+    # CLI from one. The child must get the installed checkout instead; the
+    # ``PROJECT_ROOT`` fallback only applies when nothing is installed.
+    project_root = _preserve_hermes_home_path(installed_package_root())
     working_dir = _stable_gateway_working_dir(PROJECT_ROOT)
     hermes_home = str(Path(get_hermes_home()))
     profile_arg = _profile_arg(hermes_home)
@@ -890,7 +920,9 @@ def windowless_gateway_restart_spec(
     new_argv = [windowless_python, *rest]
 
     working_dir = _stable_gateway_working_dir(PROJECT_ROOT)
-    project_root = str(PROJECT_ROOT)
+    # Same pin as ``_build_gateway_argv``: a ``--replace`` respawn must not
+    # inherit the module root of whatever tree the caller happened to run.
+    project_root = str(installed_package_root())
     try:
         hermes_home = str(Path(get_hermes_home()).resolve())
     except Exception:
