@@ -235,12 +235,61 @@ describe('resolveStoredSession profile ownership', () => {
 
     expect(resolved?.profile).toBe('meta')
     expect(resolved?.source).toBe('unknown')
-    expect(resolved?.message_count).toBe(0)
+    expect(resolved?.message_count).toBe(' 0 ')
     expect($sessions.get().map(row => row.id)).toEqual(['s1', 'newer', 'older'])
     expect($sessions.get()[0]).toBe(resolved)
     expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
     expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'other')
     expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
+  })
+
+  it('preserves a legacy string-zero message_count when the shadow is the final fallback', async () => {
+    const emptyShadow = sessionFromRuntimeJson({
+      id: 's1',
+      message_count: '0',
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Real conversation'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.message_count).toBe('0')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
+  })
+
+  it('prefers the fresh active-backend shadow over a stale cached fallback', async () => {
+    const cachedShadow = session({
+      id: 's1',
+      last_active: 1,
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Stale title'
+    })
+
+    const freshShadow = session({
+      id: 's1',
+      last_active: 2,
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Fresh title'
+    })
+
+    $sessions.set([cachedShadow])
+    mockGetSession.mockResolvedValueOnce(freshShadow)
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(freshShadow)
+    expect($sessions.get()[0]).toBe(freshShadow)
   })
 
   it('lets a positive string message_count win as the transcript-bearing owner', async () => {

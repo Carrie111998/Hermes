@@ -854,16 +854,18 @@ function normalizeResolverSource(source: SessionInfo['source']): SessionInfo['so
 
 function withNormalizedResolverFields(session: SessionInfo): SessionInfo {
   const source = normalizeResolverSource(session.source)
-  const rawCount = session.message_count as unknown
-  const messageCount = typeof rawCount === 'string' && rawCount.trim() === '0' ? 0 : session.message_count
   const trimmedProfile = session.profile?.trim()
   const profile = trimmedProfile ? trimmedProfile : session.profile
 
-  if (source === session.source && messageCount === session.message_count && profile === session.profile) {
+  if (source === session.source && profile === session.profile) {
     return session
   }
 
-  return { ...session, message_count: messageCount, profile, source }
+  return { ...session, profile, source }
+}
+
+function isLegacyZeroMessageCount(messageCount: unknown): boolean {
+  return messageCount === 0 || (typeof messageCount === 'string' && messageCount.trim() === '0')
 }
 
 /**
@@ -874,7 +876,9 @@ function withNormalizedResolverFields(session: SessionInfo): SessionInfo {
  * materialized twin; omitted/undefined counts are not the legacy shadow.
  */
 function isLegacyEmptyUnknownShadow(session: SessionInfo): boolean {
-  return session.source === 'unknown' && session.message_count === 0 && Boolean(session.title?.trim())
+  return (
+    session.source === 'unknown' && isLegacyZeroMessageCount(session.message_count) && Boolean(session.title?.trim())
+  )
 }
 
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
@@ -921,7 +925,10 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
     session.profile = session.profile?.trim() || normalizeProfileKey($activeGatewayProfile.get())
 
     if (multiProfile && isLegacyEmptyUnknownShadow(session)) {
-      deferredEmptyUnknown ??= session
+      // A successful unscoped read is fresh active-backend truth for the same
+      // owner as the cached fallback. Keep its current metadata while scoped
+      // probes look for the observed transcript-bearing legacy twin.
+      deferredEmptyUnknown = session
     } else if (!deferredEmptyUnknown || sessionShouldHaveTranscript(session)) {
       // Transcript-bearing twins win immediately. A known-source zero-message
       // draft (desktop/0, tui/0, compression root) is not distinguishable from
