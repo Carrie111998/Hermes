@@ -1830,6 +1830,8 @@ def _build_child_agent(
                 api_mode=effective_api_mode,
                 acp_command=effective_acp_command,
                 acp_args=effective_acp_args,
+                acp_cwd=getattr(parent_agent, "acp_cwd", None),
+                acp_session_cwd=getattr(parent_agent, "acp_session_cwd", None),
                 max_iterations=max_iterations,
 
                 reasoning_config=child_reasoning,

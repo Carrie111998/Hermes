@@ -459,6 +459,7 @@ class CopilotACPClient:
         acp_command: str | None = None,
         acp_args: list[str] | None = None,
         acp_cwd: str | None = None,
+        acp_session_cwd: str | None = None,
         command: str | None = None,
         args: list[str] | None = None,
         **_: Any,
@@ -469,6 +470,12 @@ class CopilotACPClient:
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        # acp_session_cwd decouples the ACP session working directory from the
+        # spawn cwd. When a remote ACP host runs under a different user or
+        # filesystem layout, spawn-cwd (local) cannot equal session-cwd
+        # (remote); defaulting to acp_cwd keeps legacy single-cwd behaviour
+        # unchanged for existing callers.
+        self._session_cwd = str(Path(acp_session_cwd or acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -714,7 +721,7 @@ class CopilotACPClient:
             session = _request(
                 "session/new",
                 {
-                    "cwd": self._acp_cwd,
+                    "cwd": self._session_cwd,
                     "mcpServers": [],
                 },
             ) or {}
