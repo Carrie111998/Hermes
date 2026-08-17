@@ -1715,6 +1715,43 @@ export const ja = defineLocale({
     open: '開く'
   },
 
+  remoteAttach: {
+    title: 'リモートセッション',
+    subtitle: '別の Hermes インスタンスで実行中のセッションに接続します。',
+    close: 'リモートセッションを閉じる',
+    connectTitle: 'リモート Hermes に接続',
+    connectDescription: 'ホストと、リモートインスタンスに表示された6文字のペアリングコードを入力します。',
+    hostLabel: 'ホスト',
+    hostPlaceholder: 'remote-host.local',
+    portLabel: 'ポート',
+    codeLabel: 'ペアリングコード',
+    codePlaceholder: 'ABC123',
+    codeHint: 'ペアリングコードは6文字の英数字で、一度だけ使用できます。',
+    pairedUntil: date => `${date} までペアリング済み`,
+    disconnect: '切断',
+    refreshing: 'セッションを更新中',
+    reconnecting: '再接続中…',
+    sessions: 'セッション',
+    noSessions: '利用可能なリモートセッションはありません。',
+    untitled: '（無題）',
+    active: 'アクティブ',
+    idle: 'アイドル',
+    attach: '接続',
+    detach: '切断',
+    attachTo: title => `${title} に接続`,
+    detachFrom: title => `${title} から切断`,
+    eventLogLabel: 'リモートセッションのイベントログ',
+    noEvents: 'リモートセッションのイベントを待っています…',
+    message: 'メッセージ',
+    emptyMessage: '（空のメッセージ）',
+    statusChanged: status => `ステータスが ${status} に変わりました`,
+    unknown: '不明',
+    unknownTool: '不明なツール',
+    messageAria: 'リモートセッションへのメッセージ',
+    messagePlaceholder: 'このセッションにメッセージを送信…',
+    sending: '送信中'
+  },
+
   artifactPreview: {
     versionOf: (current, total) => `${total} 中 v${current}`,
     olderVersion: '前のバージョン',
@@ -1734,7 +1771,8 @@ export const ja = defineLocale({
       skills: 'スキルとツール',
       messaging: 'メッセージング',
       artifacts: 'アーティファクト',
-      cron: 'スケジュール済みジョブ'
+      cron: 'スケジュール済みジョブ',
+      remote: 'リモートセッション'
     },
     searchAria: 'セッションを検索',
     searchPlaceholder: 'セッションを検索…',

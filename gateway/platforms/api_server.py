@@ -9,6 +9,11 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
+- GET  /api/remote/sessions        — list open sessions available for remote attach
+- GET  /api/remote/sessions/{session_id}/events — live remote-session SSE events
+- POST /api/remote/sessions/{session_id}/chat — chat with an attached remote session
+- POST /api/remote/pair/code       — generate a short-lived remote pairing code
+- POST /api/remote/pair            — redeem a pairing code for an attach token
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
@@ -52,11 +57,14 @@ from functools import wraps
 import logging
 import os
 import re
+import secrets
+import socket
 import sqlite3
 import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +78,12 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+
+_REMOTE_PAIR_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_REMOTE_PAIR_CODE_TTL_SECONDS = 10 * 60
+_REMOTE_ATTACH_TOKEN_TTL_SECONDS = 24 * 60 * 60
+_REMOTE_PAIR_MAX_FAILED_ATTEMPTS = 5
+
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -988,7 +1002,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, Accept",
 }
 
 
@@ -1105,7 +1119,7 @@ _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextV
 )
 
 
-def _admit_api_agent_request(handler):
+def _admit_api_agent_request(handler=None, *, auth_checker: Optional[str] = None):
     """Reserve an authenticated API turn before its handler first awaits.
 
     Gateway shutdown and aiohttp requests share an event loop. Keeping the
@@ -1114,27 +1128,40 @@ def _admit_api_agent_request(handler):
     still parsing its body or resolving session state. The mutable reservation
     is intentionally shared with child tasks so agent/task bookkeeping releases
     this one slot exactly once.
-    """
-    @wraps(handler)
-    async def _wrapped(self, request, *args, **kwargs):
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        draining = self._draining_response()
-        if draining is not None:
-            return draining
-        reservation = {"active": True}
-        token = _api_agent_request_reservation.set(reservation)
-        self._pending_agent_requests += 1
-        try:
-            return await handler(self, request, *args, **kwargs)
-        finally:
-            if reservation["active"]:
-                reservation["active"] = False
-                self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
-            _api_agent_request_reservation.reset(token)
 
-    return _wrapped
+    Usable both as ``@_admit_api_agent_request`` and as
+    ``@_admit_api_agent_request(auth_checker=...)``. ``auth_checker`` names the
+    instance method used to authenticate the request (default ``_check_auth``).
+    Remote-attach chat reuses this admission path but must accept a scoped
+    attach token, so it passes ``_check_remote_auth``.
+    """
+
+    def _decorate(fn):
+        @wraps(fn)
+        async def _wrapped(self, request, *args, **kwargs):
+            checker = getattr(self, auth_checker) if auth_checker else self._check_auth
+            auth_err = checker(request)
+            if auth_err:
+                return auth_err
+            draining = self._draining_response()
+            if draining is not None:
+                return draining
+            reservation = {"active": True}
+            token = _api_agent_request_reservation.set(reservation)
+            self._pending_agent_requests += 1
+            try:
+                return await fn(self, request, *args, **kwargs)
+            finally:
+                if reservation["active"]:
+                    reservation["active"] = False
+                    self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                _api_agent_request_reservation.reset(token)
+
+        return _wrapped
+
+    if handler is None:
+        return _decorate
+    return _decorate(handler)
 
 
 def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
@@ -1425,6 +1452,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
         self._run_stream_subscribers: set[str] = set()
+        # Live remote-session subscribers. Unlike /v1/runs, attachment is a
+        # broadcast surface: every queue registered for a session receives
+        # each event, and no event history is retained server-side.
+        self._remote_session_subscribers: Dict[
+            str, set["asyncio.Queue[Dict[str, Any]]"]
+        ] = {}
+        self._remote_pairing_codes: Dict[str, Dict[str, Any]] = {}
+        self._remote_attach_tokens: Dict[str, Dict[str, Any]] = {}
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
@@ -1834,6 +1869,24 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _check_remote_auth(
+        self, request: "web.Request"
+    ) -> Optional["web.Response"]:
+        """Accept the static API key or an unexpired remote attach token."""
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            token_record = self._remote_attach_tokens.get(token)
+            if token_record is not None:
+                if (
+                    token_record.get("scope") == "remote"
+                    and token_record.get("expires_at", 0) > time.time()
+                ):
+                    return None
+                self._remote_attach_tokens.pop(token, None)
+
+        return self._check_auth(request)
+
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
@@ -2065,6 +2118,19 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/api/remote/pair/code", self._handle_remote_pair_code),
+            ("POST", "/api/remote/pair", self._handle_remote_pair),
+            ("GET", "/api/remote/sessions", self._handle_remote_sessions),
+            (
+                "GET",
+                "/api/remote/sessions/{session_id}/events",
+                self._handle_remote_session_events,
+            ),
+            (
+                "POST",
+                "/api/remote/sessions/{session_id}/chat",
+                self._handle_remote_session_chat,
+            ),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3286,6 +3352,308 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     # ------------------------------------------------------------------
+    # /api/remote — remote-attach discovery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _remote_expiry_iso(expires_at: float) -> str:
+        return datetime.fromtimestamp(expires_at, timezone.utc).isoformat()
+
+    def _prune_remote_credentials(self, now: float) -> None:
+        self._remote_pairing_codes = {
+            code: record
+            for code, record in self._remote_pairing_codes.items()
+            if record.get("expires_at", 0) > now
+        }
+        self._remote_attach_tokens = {
+            token: record
+            for token, record in self._remote_attach_tokens.items()
+            if record.get("expires_at", 0) > now
+        }
+
+    def _record_remote_pair_failure(self, now: float) -> None:
+        """Count a failed guess against each currently redeemable code."""
+        for record in self._remote_pairing_codes.values():
+            if record.get("used") or record.get("expires_at", 0) <= now:
+                continue
+            record["failed_attempts"] = record.get("failed_attempts", 0) + 1
+            if record["failed_attempts"] >= _REMOTE_PAIR_MAX_FAILED_ATTEMPTS:
+                record["used"] = True
+
+    @staticmethod
+    def _invalid_remote_pairing_code_response() -> "web.Response":
+        return web.json_response(
+            _openai_error(
+                "Invalid or expired pairing code", code="invalid_pairing_code"
+            ),
+            status=401,
+        )
+
+    async def _handle_remote_pair_code(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/remote/pair/code — create a single-use ten-minute code."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        now = time.time()
+        self._prune_remote_credentials(now)
+        while True:
+            code = "".join(
+                secrets.choice(_REMOTE_PAIR_CODE_ALPHABET) for _ in range(6)
+            )
+            if code not in self._remote_pairing_codes:
+                break
+        expires_at = now + _REMOTE_PAIR_CODE_TTL_SECONDS
+        self._remote_pairing_codes[code] = {
+            "expires_at": expires_at,
+            "used": False,
+            "failed_attempts": 0,
+        }
+        return web.json_response(
+            {
+                "code": code,
+                "expires_at": self._remote_expiry_iso(expires_at),
+                "ttl_minutes": 10,
+            }
+        )
+
+    async def _handle_remote_pair(self, request: "web.Request") -> "web.Response":
+        """POST /api/remote/pair — redeem a code for a 24-hour attach token.
+
+        The pairing code itself is the credential here; no API_SERVER_KEY is
+        required (a remote client only possesses the code). Brute-force
+        protection comes from the per-code failure rate limit below.
+        """
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+
+        raw_code = body.get("code")
+        code = raw_code.strip().upper() if isinstance(raw_code, str) else ""
+        now = time.time()
+        self._prune_remote_credentials(now)
+        record = self._remote_pairing_codes.get(code)
+        if (
+            len(code) != 6
+            or record is None
+            or record.get("used")
+            or record.get("expires_at", 0) <= now
+        ):
+            self._record_remote_pair_failure(now)
+            return self._invalid_remote_pairing_code_response()
+
+        record["used"] = True
+        token = secrets.token_urlsafe(32)
+        expires_at = now + _REMOTE_ATTACH_TOKEN_TTL_SECONDS
+        self._remote_attach_tokens[token] = {
+            "expires_at": expires_at,
+            "scope": "remote",
+        }
+        return web.json_response(
+            {
+                "token": token,
+                "expires_at": self._remote_expiry_iso(expires_at),
+                "ttl_hours": 24,
+            }
+        )
+
+    def _remote_session_is_active(self, session_id: str) -> bool:
+        """Return whether either live-agent registry owns this session."""
+        agents = list(self._shutdown_interruptible_agents.values())
+        agents.extend(self._active_run_agents.values())
+        return any(getattr(agent, "session_id", None) == session_id for agent in agents)
+
+    async def _get_open_remote_session_or_404(
+        self, session_id: str
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Resolve an attachable session; ended sessions are intentionally hidden."""
+        session, err = await self._get_existing_session_or_404(session_id)
+        if err is not None:
+            return None, err
+        if session.get("ended_at") is not None:
+            return None, web.json_response(
+                _openai_error(
+                    f"Session not found: {session_id}", code="session_not_found"
+                ),
+                status=404,
+            )
+        return session, None
+
+    @staticmethod
+    def _redact_remote_session_event(event: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the mandatory API-boundary redactor to a complete event payload."""
+        serialized = json.dumps(event, ensure_ascii=False, default=str)
+        return json.loads(redact_sensitive_text(serialized, force=True))
+
+    def _publish_remote_session_event(
+        self,
+        session_id: str,
+        event: Dict[str, Any],
+        *,
+        loop: Optional["asyncio.AbstractEventLoop"] = None,
+    ) -> None:
+        """Redact and broadcast one live event to every attached subscriber."""
+        if not self._remote_session_subscribers.get(session_id):
+            return
+        safe_event = self._redact_remote_session_event(event)
+
+        def _broadcast() -> None:
+            for queue in tuple(self._remote_session_subscribers.get(session_id, ())):
+                with suppress(Exception):
+                    queue.put_nowait(safe_event)
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if loop is not None and running_loop is not loop:
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(_broadcast)
+            return
+        _broadcast()
+
+    async def _handle_remote_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/remote/sessions — list sessions available for attachment."""
+        auth_err = self._check_remote_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+
+        sessions = await asyncio.to_thread(
+            db.list_sessions_rich,
+            limit=-1,
+            order_by_last_active=True,
+            compact_rows=True,
+        )
+
+        from gateway.status import normalize_updated_at
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = _api_request_profile.get() or get_active_profile_name() or "default"
+        attachable = []
+        for session in sessions:
+            if session.get("ended_at") is not None:
+                continue
+            session_id = session.get("id")
+            attachable.append(
+                {
+                    "id": session_id,
+                    "title": session.get("title"),
+                    "status": (
+                        "active"
+                        if self._remote_session_is_active(session_id)
+                        else "idle"
+                    ),
+                    "updated_at": normalize_updated_at(
+                        session.get("last_active") or session.get("started_at")
+                    ),
+                }
+            )
+
+        return web.json_response(
+            {
+                "hostname": socket.gethostname(),
+                "profile": profile,
+                "sessions": attachable,
+            }
+        )
+
+    async def _handle_remote_session_events(
+        self, request: "web.Request"
+    ) -> "web.StreamResponse":
+        """GET /api/remote/sessions/{session_id}/events — live SSE attachment."""
+        auth_err = self._check_remote_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_open_remote_session_or_404(session_id)
+        if err is not None:
+            return err
+
+        queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        subscribers = self._remote_session_subscribers.setdefault(session_id, set())
+        subscribers.add(queue)
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        # CORS middleware can't inject headers into StreamResponse after
+        # prepare() flushes them, so resolve CORS headers up front — the
+        # remote-attach desktop UI fetches this stream from a browser origin.
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        response = web.StreamResponse(status=200, headers=sse_headers)
+
+        try:
+            await response.prepare(request)
+            await response.write(
+                _sse_frame(
+                    {
+                        "event": "session.status",
+                        "session_id": session_id,
+                        "status": (
+                            "active"
+                            if self._remote_session_is_active(session_id)
+                            else "idle"
+                        ),
+                    }
+                )
+            )
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
+                await response.write(_sse_frame(event))
+        except Exception as exc:
+            logger.debug(
+                "[api_server] remote session SSE error for %s: %s",
+                session_id,
+                exc,
+            )
+        finally:
+            current = self._remote_session_subscribers.get(session_id)
+            if current is not None:
+                current.discard(queue)
+                if not current:
+                    self._remote_session_subscribers.pop(session_id, None)
+
+        return response
+
+    @_admit_api_agent_request(auth_checker="_check_remote_auth")
+    async def _handle_remote_session_chat(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/remote/sessions/{session_id}/chat — reuse session chat.
+
+        Uses the agent-request admission path (so the turn participates in
+        shutdown draining) but authenticates with the remote attach token via
+        ``_check_remote_auth`` — the plain ``_check_auth`` would reject a
+        scoped attach token before this handler ran.
+        """
+        _, err = await self._get_open_remote_session_or_404(
+            request.match_info["session_id"]
+        )
+        if err is not None:
+            return err
+        return await self._handle_session_chat_impl(request)
+
+    # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
     # ------------------------------------------------------------------
 
@@ -3687,6 +4055,10 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+        return await self._handle_session_chat_impl(request)
+
+    async def _handle_session_chat_impl(self, request: "web.Request") -> "web.Response":
+        """Shared session-chat implementation (admission is applied by callers)."""
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
@@ -3754,6 +4126,60 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
+        event_loop = asyncio.get_running_loop()
+        self._publish_remote_session_event(
+            session_id,
+            {
+                "event": "session.message",
+                "session_id": session_id,
+                "timestamp": time.time(),
+                "message": {"role": "user", "content": user_message},
+            },
+            loop=event_loop,
+        )
+
+        def _remote_tool_start(
+            tool_call_id: str, function_name: str, function_args: Any
+        ) -> None:
+            self._publish_remote_session_event(
+                session_id,
+                {
+                    "event": "session.tool_call",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                    "tool_call": {
+                        "id": tool_call_id,
+                        "name": function_name,
+                        "phase": "started",
+                        "arguments": function_args,
+                    },
+                },
+                loop=event_loop,
+            )
+
+        def _remote_tool_complete(
+            tool_call_id: str,
+            function_name: str,
+            function_args: Any,
+            function_result: Any,
+        ) -> None:
+            self._publish_remote_session_event(
+                session_id,
+                {
+                    "event": "session.tool_call",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                    "tool_call": {
+                        "id": tool_call_id,
+                        "name": function_name,
+                        "phase": "completed",
+                        "arguments": function_args,
+                        "result": function_result,
+                    },
+                },
+                loop=event_loop,
+            )
+
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -3766,10 +4192,22 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            tool_start_callback=_remote_tool_start,
+            tool_complete_callback=_remote_tool_complete,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        self._publish_remote_session_event(
+            session_id,
+            {
+                "event": "session.message",
+                "session_id": effective_session_id or session_id,
+                "timestamp": time.time(),
+                "message": {"role": "assistant", "content": final_response},
+            },
+            loop=event_loop,
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key

@@ -1656,6 +1656,43 @@ export const zhHant = defineLocale({
     open: '開啟'
   },
 
+  remoteAttach: {
+    title: '遠端工作階段',
+    subtitle: '連線到另一個 Hermes 執行個體中運行的工作階段。',
+    close: '關閉遠端工作階段',
+    connectTitle: '連線到遠端 Hermes',
+    connectDescription: '輸入主機位址和遠端執行個體顯示的六位配對碼。',
+    hostLabel: '主機',
+    hostPlaceholder: 'remote-host.local',
+    portLabel: '連接埠',
+    codeLabel: '配對碼',
+    codePlaceholder: 'ABC123',
+    codeHint: '配對碼由六個字母或數字組成，且只能使用一次。',
+    pairedUntil: date => `配對有效期至 ${date}`,
+    disconnect: '中斷連線',
+    refreshing: '正在重新整理工作階段',
+    reconnecting: '正在重新連線…',
+    sessions: '工作階段',
+    noSessions: '沒有可用的遠端工作階段。',
+    untitled: '（無標題）',
+    active: '使用中',
+    idle: '閒置',
+    attach: '連線',
+    detach: '中斷',
+    attachTo: title => `連線到 ${title}`,
+    detachFrom: title => `從 ${title} 中斷`,
+    eventLogLabel: '遠端工作階段事件記錄',
+    noEvents: '正在等待遠端工作階段事件…',
+    message: '訊息',
+    emptyMessage: '（空訊息）',
+    statusChanged: status => `狀態已變更為 ${status}`,
+    unknown: '未知',
+    unknownTool: '未知工具',
+    messageAria: '傳送訊息給遠端工作階段',
+    messagePlaceholder: '傳送訊息給此工作階段…',
+    sending: '正在傳送'
+  },
+
   artifactPreview: {
     versionOf: (current, total) => `第 ${current}/${total} 版`,
     olderVersion: '較舊版本',
@@ -1675,7 +1712,8 @@ export const zhHant = defineLocale({
       skills: '技能與工具',
       messaging: '訊息平台',
       artifacts: '成品',
-      cron: '排程工作'
+      cron: '排程工作',
+      remote: '遠端工作階段'
     },
     searchAria: '搜尋工作階段',
     searchPlaceholder: '搜尋工作階段…',

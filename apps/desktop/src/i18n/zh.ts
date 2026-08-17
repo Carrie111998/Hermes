@@ -2140,6 +2140,43 @@ export const zh: Translations = {
     open: '打开'
   },
 
+  remoteAttach: {
+    title: '远程会话',
+    subtitle: '连接到另一个 Hermes 实例中运行的会话。',
+    close: '关闭远程会话',
+    connectTitle: '连接到远程 Hermes',
+    connectDescription: '输入主机地址和远程实例显示的六位配对码。',
+    hostLabel: '主机',
+    hostPlaceholder: 'remote-host.local',
+    portLabel: '端口',
+    codeLabel: '配对码',
+    codePlaceholder: 'ABC123',
+    codeHint: '配对码由六个字母或数字组成，且只能使用一次。',
+    pairedUntil: date => `配对有效期至 ${date}`,
+    disconnect: '断开连接',
+    refreshing: '正在刷新会话',
+    reconnecting: '正在重新连接…',
+    sessions: '会话',
+    noSessions: '没有可用的远程会话。',
+    untitled: '（无标题）',
+    active: '活跃',
+    idle: '空闲',
+    attach: '连接',
+    detach: '断开',
+    attachTo: title => `连接到 ${title}`,
+    detachFrom: title => `从 ${title} 断开`,
+    eventLogLabel: '远程会话事件日志',
+    noEvents: '正在等待远程会话事件…',
+    message: '消息',
+    emptyMessage: '（空消息）',
+    statusChanged: status => `状态已变为 ${status}`,
+    unknown: '未知',
+    unknownTool: '未知工具',
+    messageAria: '向远程会话发送消息',
+    messagePlaceholder: '向此会话发送消息…',
+    sending: '正在发送'
+  },
+
   artifactPreview: {
     versionOf: (current, total) => `第 ${current}/${total} 版`,
     olderVersion: '较旧版本',
@@ -2159,7 +2196,8 @@ export const zh: Translations = {
       skills: '技能与工具',
       messaging: '消息平台',
       artifacts: '产物',
-      cron: '定时任务'
+      cron: '定时任务',
+      remote: '远程会话'
     },
     searchAria: '搜索会话',
     searchPlaceholder: '搜索会话…',
