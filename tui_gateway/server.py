@@ -4478,6 +4478,9 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
 
 
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
+    if os.environ.get("HERMES_NO_TOOLS") == "1":
+        return []
+
     session_platform = platform or _resolve_session_platform()
     explicit = [
         item.strip()
