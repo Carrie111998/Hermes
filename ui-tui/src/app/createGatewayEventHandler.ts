@@ -847,7 +847,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         setStatus(p.text)
 
-        if (p.kind === 'compressing') {
+        // Compression lifecycle states go into the transcript so the user can
+        // see compaction progress instead of a silent status-bar blip:
+        //  - "compressing"  — manual /compress progress (tui_gateway)
+        //  - "compacting"   — auto-compaction in flight (tui_gateway re-tags
+        //                     agent "lifecycle" statuses; server.py)
+        //  - "compacted"    — auto-compaction completed (conversation_compression)
+        if (p.kind === 'compressing' || p.kind === 'compacting' || p.kind === 'compacted') {
           sys(p.text)
 
           return

@@ -196,6 +196,32 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
   })
 
+  it('prints auto-compaction lifecycle status into the transcript', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: {
+        kind: 'compacting',
+        text: '🗜️ Compacting context — summarizing earlier conversation so I can continue...'
+      },
+      type: 'status.update'
+    } as any)
+
+    expect(ctx.system.sys).toHaveBeenCalledWith(
+      '🗜️ Compacting context — summarizing earlier conversation so I can continue...'
+    )
+
+    onEvent({
+      payload: { kind: 'compacted', text: '✓ Context compaction complete — continuing turn...' },
+      type: 'status.update'
+    } as any)
+
+    expect(ctx.system.sys).toHaveBeenCalledWith(
+      '✓ Context compaction complete — continuing turn...'
+    )
+  })
+
   it('keeps goal verdict text in transcript but shows a brief idle status (#goal statusbar)', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
