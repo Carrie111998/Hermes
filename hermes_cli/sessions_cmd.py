@@ -935,7 +935,7 @@ def cmd_sessions(args, sessions_parser=None):
         print(f"  terminal ID: {stored.terminal_id}")
         print(f"  physical IDs: {', '.join(stored.physical_ids)}")
         print(f"  fingerprint: {stored.source_fingerprint}")
-        print(f"  local snapshot: {stored.revision_dir}")
+        print(f"  local snapshot: {stored.snapshot_dir}")
 
     elif action == "prune" and getattr(args, "never_active", False):
         # Separate branch on purpose: the shared prune/archive selector is

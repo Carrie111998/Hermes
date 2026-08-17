@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
 from typing import Any
@@ -29,12 +30,12 @@ _MAX_SQLITE_IN_PARAMS = 500
 
 @dataclass(frozen=True)
 class StoredLineage:
-    """Identity and immutable local snapshot emitted by :func:`store_archived_lineage`."""
+    """Identity and current local snapshot emitted by :func:`store_archived_lineage`."""
 
     terminal_id: str
     physical_ids: tuple[str, ...]
     source_fingerprint: str
-    revision_dir: Path
+    snapshot_dir: Path
 
 
 def _connection(db: SessionDB) -> sqlite3.Connection:
@@ -378,16 +379,48 @@ def _remove_staging_at(snapshot_parent_fd: int, name: str, staging_fd: int) -> N
             pass
 
 
+def _remove_stale_snapshot_at(snapshot_parent_fd: int, name: str) -> None:
+    """Best-effort cleanup for a displaced snapshot; it is never archive history."""
+    try:
+        shutil.rmtree(name, dir_fd=snapshot_parent_fd)
+    except OSError:
+        try:
+            os.unlink(name, dir_fd=snapshot_parent_fd)
+        except OSError:
+            pass
+
+
+def _move_current_snapshot_aside(snapshot_parent_fd: int, snapshot_name: str) -> str | None:
+    for _ in range(100):
+        stale_name = f".stale-{secrets.token_hex(8)}"
+        try:
+            os.rename(
+                snapshot_name,
+                stale_name,
+                src_dir_fd=snapshot_parent_fd,
+                dst_dir_fd=snapshot_parent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                continue
+            raise
+        return stale_name
+    raise FileExistsError("could not allocate displaced cold-store snapshot name")
+
+
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:
     """Store one marked completed compression lineage without deleting DB rows.
 
-    The safe terminal ID names a single immutable snapshot. Repeated stores of
-    the exact source are idempotent; a changed source fails at the archival
-    boundary instead of creating a revision or overwriting the snapshot.
+    The safe terminal ID names one current snapshot. Repeated stores of the exact
+    source are idempotent; a changed or damaged snapshot is staged, verified, and
+    replaced. The source database is never modified by this operation.
     """
     if os.name == "nt":
         raise OSError("cold store is not yet supported on Windows")
 
+    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
     conn = _connection(db)
     with db._lock:
         conn.execute("SAVEPOINT cold_store_snapshot")
@@ -440,6 +473,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     staging_name: str | None = None
     staging_fd = -1
     published = False
+    stale_name: str | None = None
     try:
         existing = _valid_existing_snapshot_at(
             snapshot_parent_fd,
@@ -450,11 +484,6 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         )
         if existing is True:
             return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
-        if existing is False:
-            raise ValueError(
-                "cold-store archival boundary violation: existing snapshot is invalid "
-                "or the marked source changed after Store"
-            )
 
         staging_name, staging_fd = _create_staging_directory(snapshot_parent_fd)
         _validate_directory_chain(edges)
@@ -480,33 +509,32 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         )
         os.mkdir("artifacts", dir_fd=staging_fd)
         os.fsync(staging_fd)
+        if not _valid_existing_snapshot_at(
+            snapshot_parent_fd,
+            staging_name,
+            terminal_id,
+            lineage,
+            fingerprint,
+        ):
+            raise ValueError("staged cold-store snapshot failed verification")
         _validate_directory_chain(edges)
         if not _directory_entry_matches(snapshot_parent_fd, staging_name, staging_fd):
             raise ValueError("unsafe cold-store staging directory")
-        try:
-            os.rename(
-                staging_name,
-                snapshot_name,
-                src_dir_fd=snapshot_parent_fd,
-                dst_dir_fd=snapshot_parent_fd,
-            )
-        except OSError as exc:
-            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
-                raise
-            if _valid_existing_snapshot_at(
-                snapshot_parent_fd,
-                snapshot_name,
-                terminal_id,
-                lineage,
-                fingerprint,
-            ):
-                return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
-            raise ValueError(
-                "cold-store archival boundary violation: existing snapshot is invalid "
-                "or the marked source changed after Store"
-            ) from exc
+        stale_name = _move_current_snapshot_aside(snapshot_parent_fd, snapshot_name)
+        os.rename(
+            staging_name,
+            snapshot_name,
+            src_dir_fd=snapshot_parent_fd,
+            dst_dir_fd=snapshot_parent_fd,
+        )
         published = True
         os.fsync(snapshot_parent_fd)
+        if stale_name is not None:
+            _remove_stale_snapshot_at(snapshot_parent_fd, stale_name)
+            try:
+                os.fsync(snapshot_parent_fd)
+            except OSError:
+                pass
     finally:
         if staging_fd >= 0:
             if not published and staging_name is not None:

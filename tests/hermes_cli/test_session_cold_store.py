@@ -16,7 +16,7 @@ from hermes_state import SessionDB
 def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
     tmp_path: Path,
 ) -> None:
-    """Store writes one immutable terminal-ID snapshot without deleting DB rows."""
+    """Store writes one current terminal-ID snapshot without deleting DB rows."""
     db = SessionDB(db_path=tmp_path / "state.db")
     archive_root = tmp_path / "archive"
     try:
@@ -44,19 +44,37 @@ def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
             / f"{started:%d}"
             / "terminal"
         )
-        assert result.revision_dir == expected_snapshot
-        assert {path.name for path in result.revision_dir.iterdir()} == {
+        assert result.snapshot_dir == expected_snapshot
+        assert {path.name for path in result.snapshot_dir.iterdir()} == {
             "artifacts",
             "metadata.json",
             "session.jsonl",
         }
-        assert (result.revision_dir / "artifacts").is_dir()
-        assert (result.revision_dir / "metadata.json").is_file()
-        assert (result.revision_dir / "session.jsonl").is_file()
-        assert not list(archive_root.rglob("revisions"))
+        assert (result.snapshot_dir / "artifacts").is_dir()
+        assert (result.snapshot_dir / "metadata.json").is_file()
+        assert (result.snapshot_dir / "session.jsonl").is_file()
         assert store_archived_lineage(db, "terminal", archive_root) == result
         assert db.get_session("root") is not None
         assert db.get_session("terminal") is not None
+    finally:
+        db.close()
+
+
+def test_store_reports_the_same_canonical_path_it_writes(tmp_path: Path) -> None:
+    """A lexical ROOT alias cannot make the reported snapshot path misleading."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    canonical_root = tmp_path / "archive"
+    root_spelling = canonical_root / "not-created" / ".."
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        result = store_archived_lineage(db, "terminal", root_spelling)
+
+        assert result.snapshot_dir.is_dir()
+        assert result.snapshot_dir.is_relative_to(canonical_root)
+        assert "not-created" not in result.snapshot_dir.parts
     finally:
         db.close()
 
@@ -118,7 +136,7 @@ def test_store_reads_raw_rows_without_flushing_and_preserves_system_prompt(
 
         records = [
             json.loads(line)
-            for line in (result.revision_dir / "session.jsonl").read_text(
+            for line in (result.snapshot_dir / "session.jsonl").read_text(
                 encoding="utf-8"
             ).splitlines()
         ]
@@ -127,10 +145,10 @@ def test_store_reads_raw_rows_without_flushing_and_preserves_system_prompt(
         db.close()
 
 
-def test_store_rejects_post_store_source_mutation_without_changing_db_or_snapshot(
+def test_store_replaces_current_snapshot_when_archived_source_changes(
     tmp_path: Path,
 ) -> None:
-    """A marked lineage is an archival boundary, not a source of new revisions."""
+    """A changed archived source replaces the snapshot and leaves source rows intact."""
     db = SessionDB(db_path=tmp_path / "state.db")
     archive_root = tmp_path / "archive"
     try:
@@ -139,34 +157,55 @@ def test_store_rejects_post_store_source_mutation_without_changing_db_or_snapsho
         db.end_session("terminal", "completed")
         assert db.set_session_archived("terminal", True)
 
-        result = store_archived_lineage(db, "terminal", archive_root)
-        metadata_before = (result.revision_dir / "metadata.json").read_bytes()
-        session_before = (result.revision_dir / "session.jsonl").read_bytes()
+        first = store_archived_lineage(db, "terminal", archive_root)
+        session_before = (first.snapshot_dir / "session.jsonl").read_bytes()
 
         db.append_message("terminal", role="assistant", content="changed after Store")
         changed_messages = db.get_messages("terminal")
 
-        with pytest.raises(
-            ValueError,
-            match=r"archival boundary.*source changed after Store",
-        ):
-            store_archived_lineage(db, "terminal", archive_root)
+        replacement = store_archived_lineage(db, "terminal", archive_root)
 
         assert db.get_messages("terminal") == changed_messages
-        assert (result.revision_dir / "metadata.json").read_bytes() == metadata_before
-        assert (result.revision_dir / "session.jsonl").read_bytes() == session_before
-        assert {path.name for path in result.revision_dir.iterdir()} == {
+        assert replacement.snapshot_dir == first.snapshot_dir
+        assert replacement.source_fingerprint != first.source_fingerprint
+        replacement_payload = (replacement.snapshot_dir / "session.jsonl").read_bytes()
+        assert replacement_payload != session_before
+        assert b"changed after Store" in replacement_payload
+        assert {path.name for path in replacement.snapshot_dir.iterdir()} == {
             "artifacts",
             "metadata.json",
             "session.jsonl",
         }
-        assert not list(archive_root.rglob("revisions"))
     finally:
         db.close()
 
 
-def test_store_uses_started_date_when_terminal_ended_at_changes(tmp_path: Path) -> None:
-    """A reopened terminal keeps one snapshot identity even if it ends again later."""
+def test_store_same_fingerprint_is_idempotent_without_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="unchanged")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        first = store_archived_lineage(db, "terminal", archive_root)
+
+        def unexpected_staging(_snapshot_parent_fd: int) -> tuple[str, int]:
+            raise AssertionError("same fingerprint must not create a staged replacement")
+
+        monkeypatch.setattr(cold_store, "_create_staging_directory", unexpected_staging)
+
+        assert store_archived_lineage(db, "terminal", archive_root) == first
+        assert first.snapshot_dir.is_dir()
+    finally:
+        db.close()
+
+
+def test_store_does_not_use_old_snapshot_after_replacement(tmp_path: Path) -> None:
+    """Only the replacement payload remains at the logical session's current path."""
     db = SessionDB(db_path=tmp_path / "state.db")
     archive_root = tmp_path / "archive"
     started_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC).timestamp()
@@ -174,7 +213,7 @@ def test_store_uses_started_date_when_terminal_ended_at_changes(tmp_path: Path) 
     second_ended_at = datetime(2026, 3, 4, 5, 6, tzinfo=UTC).timestamp()
     try:
         db.create_session("terminal", source="cli")
-        db.append_message("terminal", role="user", content="immutable")
+        db.append_message("terminal", role="user", content="old payload marker")
         db.end_session("terminal", "completed")
         assert db.set_session_archived("terminal", True)
         conn = db._conn
@@ -184,22 +223,27 @@ def test_store_uses_started_date_when_terminal_ended_at_changes(tmp_path: Path) 
             (started_at, first_ended_at, "terminal"),
         )
 
-        result = store_archived_lineage(db, "terminal", archive_root)
+        first = store_archived_lineage(db, "terminal", archive_root)
         conn.execute(
             "UPDATE sessions SET ended_at = ? WHERE id = ?",
             (second_ended_at, "terminal"),
         )
+        db.append_message("terminal", role="assistant", content="new payload marker")
 
-        with pytest.raises(
-            ValueError,
-            match=r"archival boundary.*source changed after Store",
-        ):
-            store_archived_lineage(db, "terminal", archive_root)
+        replacement = store_archived_lineage(db, "terminal", archive_root)
 
-        assert result.revision_dir == (
+        assert replacement.snapshot_dir == first.snapshot_dir == (
             archive_root / "sessions" / "started" / "2026" / "01" / "02" / "terminal"
         )
-        assert list(archive_root.rglob("terminal")) == [result.revision_dir]
+        current_metadata = json.loads(
+            (replacement.snapshot_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        assert current_metadata["source_fingerprint"] == replacement.source_fingerprint
+        assert current_metadata["source_fingerprint"] != first.source_fingerprint
+        assert list(archive_root.rglob("terminal")) == [replacement.snapshot_dir]
+        payloads = list(archive_root.rglob("session.jsonl"))
+        assert payloads == [replacement.snapshot_dir / "session.jsonl"]
+        assert "new payload marker" in payloads[0].read_text(encoding="utf-8")
     finally:
         db.close()
 
@@ -209,18 +253,18 @@ def test_store_uses_started_date_when_terminal_ended_at_changes(tmp_path: Path) 
     reason="requires POSIX FIFOs and interval timers",
 )
 @pytest.mark.parametrize("payload_name", ["metadata.json", "session.jsonl"])
-def test_store_rejects_fifo_payload_without_blocking(
+def test_store_replaces_fifo_payload_without_blocking(
     tmp_path: Path,
     payload_name: str,
 ) -> None:
-    """A damaged snapshot payload that is a FIFO is invalid, not a blocking read."""
+    """A damaged current payload is safely replaced without blocking on a FIFO."""
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session("terminal", source="cli")
         db.end_session("terminal", "completed")
         assert db.set_session_archived("terminal", True)
         result = store_archived_lineage(db, "terminal", tmp_path / "archive")
-        payload = result.revision_dir / payload_name
+        payload = result.snapshot_dir / payload_name
         payload.unlink()
         os.mkfifo(payload)
 
@@ -230,27 +274,32 @@ def test_store_rejects_fifo_payload_without_blocking(
         previous_handler = signal.signal(signal.SIGALRM, fail_if_blocked)
         signal.setitimer(signal.ITIMER_REAL, 2.0)
         try:
-            with pytest.raises(ValueError, match="existing snapshot is invalid"):
-                store_archived_lineage(db, "terminal", tmp_path / "archive")
+            replacement = store_archived_lineage(db, "terminal", tmp_path / "archive")
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
             signal.signal(signal.SIGALRM, previous_handler)
+
+        assert (replacement.snapshot_dir / payload_name).is_file()
     finally:
         db.close()
 
 
-def test_store_rejects_non_object_snapshot_metadata(tmp_path: Path) -> None:
-    """Valid JSON scalars/lists are still invalid archive metadata envelopes."""
+def test_store_replaces_non_object_snapshot_metadata(tmp_path: Path) -> None:
+    """A malformed current metadata envelope is replaced by a valid snapshot."""
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session("terminal", source="cli")
         db.end_session("terminal", "completed")
         assert db.set_session_archived("terminal", True)
         result = store_archived_lineage(db, "terminal", tmp_path / "archive")
-        (result.revision_dir / "metadata.json").write_text("[]\n", encoding="utf-8")
+        (result.snapshot_dir / "metadata.json").write_text("[]\n", encoding="utf-8")
 
-        with pytest.raises(ValueError, match="existing snapshot is invalid"):
-            store_archived_lineage(db, "terminal", tmp_path / "archive")
+        replacement = store_archived_lineage(db, "terminal", tmp_path / "archive")
+
+        metadata = json.loads(
+            (replacement.snapshot_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        assert metadata["source_fingerprint"] == replacement.source_fingerprint
     finally:
         db.close()
 
