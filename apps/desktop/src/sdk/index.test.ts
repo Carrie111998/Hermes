@@ -4,12 +4,7 @@ import type { HermesConnection } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { host } from '@/sdk'
 import { $gateway } from '@/store/gateway'
-import {
-  setActiveSessionId,
-  setAwaitingResponse,
-  setBusy,
-  setConnection
-} from '@/store/session'
+import { setActiveSessionId, setAwaitingResponse, setBusy, setConnection } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 
 describe('host.state turn flags', () => {
@@ -123,8 +118,7 @@ describe('host.state turn flags', () => {
  * mode (#82187 follow-up review, item 3).
  */
 
-const conn = (mode?: 'local' | 'remote') =>
-  ({ baseUrl: 'http://127.0.0.1:8787', mode }) as unknown as HermesConnection
+const conn = (mode?: 'local' | 'remote') => ({ baseUrl: 'http://127.0.0.1:8787', mode }) as unknown as HermesConnection
 
 describe('host.request connection-mode announcement', () => {
   afterEach(() => {
@@ -139,16 +133,13 @@ describe('host.request connection-mode announcement', () => {
     return request
   }
 
-  it.each(['session.create', 'session.resume', 'prompt.submit'])(
-    'stamps the live mode onto %s',
-    async method => {
-      setConnection(conn('remote'))
-      const request = installGateway()
+  it.each(['session.create', 'session.resume', 'prompt.submit'])('stamps the live mode onto %s', async method => {
+    setConnection(conn('remote'))
+    const request = installGateway()
 
-      await expect(host.request(method, { text: 'hi' })).resolves.toBe('ok')
-      expect(request).toHaveBeenCalledWith(method, { connection_mode: 'remote', text: 'hi' })
-    }
-  )
+    await expect(host.request(method, { text: 'hi' })).resolves.toBe('ok')
+    expect(request).toHaveBeenCalledWith(method, { connection_mode: 'remote', text: 'hi' })
+  })
 
   it('leaves unrelated RPCs untouched', async () => {
     setConnection(conn('remote'))
@@ -160,14 +151,17 @@ describe('host.request connection-mode announcement', () => {
     expect(request).toHaveBeenCalledWith('session.list', params)
   })
 
-  it('adds no key when the mode is unknown', async () => {
-    // Null descriptor (reconnect window / older shell): omit rather than
-    // clear, matching withConnectionMode semantics.
+  it('announces an explicit null when the mode is unknown', async () => {
+    // Null descriptor (reconnect window / older shell). Announcing an explicit
+    // null CLEARS the backend's remembered mode; omitting the key leaves it
+    // alone (`_remember_connection_mode` only writes when the key is present),
+    // so a `local` announced before the reconnect would survive into turns
+    // that can no longer prove it. Unknown must never read as local.
     const request = installGateway()
 
     await host.request('prompt.submit', { text: 'hi' })
 
-    expect(request).toHaveBeenCalledWith('prompt.submit', { text: 'hi' })
+    expect(request).toHaveBeenCalledWith('prompt.submit', { connection_mode: null, text: 'hi' })
   })
 
   it('still throws when no gateway socket is live', async () => {
@@ -209,6 +203,41 @@ describe('host.getGateway connection-mode announcement', () => {
     await host.getGateway()?.request('session.list', params)
 
     expect(request).toHaveBeenCalledWith('session.list', params)
+  })
+
+  it('forwards the timeout and abort signal the caller passed', async () => {
+    // HermesGateway.request is (method, params, timeoutMs, signal). The
+    // announcing wrapper stands in for it, so a two-argument wrapper silently
+    // dropped arguments three and four: the request fell back to the default
+    // deadline and could no longer be aborted. Every other test here calls the
+    // two-argument form, so green CI did not cover it.
+    setConnection(conn('remote'))
+    const request = vi.fn().mockResolvedValue('ok')
+    $gateway.set({ request } as never)
+    const controller = new AbortController()
+
+    await host.getGateway()?.request('prompt.submit', { text: 'hi' }, 1234, controller.signal)
+
+    expect(request).toHaveBeenCalledWith(
+      'prompt.submit',
+      { connection_mode: 'remote', text: 'hi' },
+      1234,
+      controller.signal
+    )
+    // Identity, not shape: a copied-but-equal signal would abort nothing.
+    expect(request.mock.calls[0][3]).toBe(controller.signal)
+  })
+
+  it('forwards a timeout and signal on RPCs it does not stamp', async () => {
+    setConnection(conn('remote'))
+    const request = vi.fn().mockResolvedValue('ok')
+    $gateway.set({ request } as never)
+    const controller = new AbortController()
+    const params = { limit: 3 }
+
+    await host.getGateway()?.request('session.list', params, 99, controller.signal)
+
+    expect(request).toHaveBeenCalledWith('session.list', params, 99, controller.signal)
   })
 
   it('delegates non-request members to the real instance', () => {

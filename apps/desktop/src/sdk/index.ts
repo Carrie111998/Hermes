@@ -92,6 +92,7 @@ export interface PluginProfileRoute {
   profile: string
   /** Backend Hermes profile served by that route. */
   targetProfile: string
+}
 
 // One announcing view per real gateway, so repeated `getGateway()` calls hand
 // back a stable reference — SDK components take this as a React prop, and a
@@ -120,13 +121,18 @@ const announcingGateway = (gateway: HermesGateway): HermesGateway => {
         // wrapper silently swallows `timeoutMs` and `signal`, so any SDK
         // caller passing them lost its custom deadline and its ability to
         // abort - a wrapper must not narrow the contract it stands in for.
+        //
+        // The tail is forwarded as a REST spread rather than as two named
+        // parameters so the delegated call carries exactly the arguments the
+        // caller made. Naming them re-materializes omitted arguments as
+        // explicit `undefined`, which is invisible to a defaulted parameter
+        // but not to anything reading `arguments.length` - and it makes every
+        // pass-through call site un-assertable on its real shape.
         return <T>(
           method: string,
           params: Record<string, unknown> = {},
-          timeoutMs?: number,
-          signal?: AbortSignal
-        ): Promise<T> =>
-          target.request<T>(method, announceConnectionMode(method, params), timeoutMs, signal)
+          ...rest: [timeoutMs?: number, signal?: AbortSignal]
+        ): Promise<T> => target.request<T>(method, announceConnectionMode(method, params), ...rest)
       }
 
       const value = Reflect.get(target, prop)
