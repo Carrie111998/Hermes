@@ -5706,6 +5706,17 @@ def start_background_plugin_discovery() -> None:
                 _persist_plugin_toolset_keys()
             except Exception:
                 logger.warning("background plugin discovery failed", exc_info=True)
+            # Auto-update sweep for opted-in plugins (hermes plugins
+            # autoupdate <name> on). Runs strictly AFTER discovery so the
+            # pull never races this session's plugin imports — the fresh
+            # checkout takes effect next session. Throttled to once/24h
+            # inside the sweep; never raises.
+            try:
+                from hermes_cli.plugins_cmd import run_startup_auto_update_sweep
+
+                run_startup_auto_update_sweep()
+            except Exception:
+                logger.warning("plugin auto-update sweep failed", exc_info=True)
 
         _background_discovery_thread = threading.Thread(
             target=_run, name="plugin-discovery", daemon=True

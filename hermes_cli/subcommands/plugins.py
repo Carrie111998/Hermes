@@ -82,9 +82,35 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
     )
 
     plugins_update = plugins_subparsers.add_parser(
-        "update", help="Pull latest changes for an installed plugin"
+        "update", help="Pull latest changes for installed plugins"
     )
-    plugins_update.add_argument("name", help="Plugin name to update")
+    plugins_update.add_argument(
+        "name", nargs="?", help="Plugin name to update (omit with --all)"
+    )
+    plugins_update.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_plugins",
+        help="Update every git-installed plugin (pinned plugins are skipped)",
+    )
+
+    plugins_autoupdate = plugins_subparsers.add_parser(
+        "autoupdate",
+        help="Enable/disable auto-update at session start for a plugin",
+        description=(
+            "Opt a git-installed plugin into a background `git pull` sweep that "
+            "runs at most once per 24h at interactive session start. Updated "
+            "plugin code takes effect the NEXT session (the running session's "
+            "plugin registry and prompt cache are never touched)."
+        ),
+    )
+    plugins_autoupdate.add_argument("name", help="Plugin name")
+    plugins_autoupdate.add_argument(
+        "state",
+        nargs="?",
+        choices=["on", "off"],
+        help="Turn auto-update on or off (omit to show current state)",
+    )
 
     plugins_remove = plugins_subparsers.add_parser(
         "remove", aliases=["rm", "uninstall"], help="Remove an installed plugin"

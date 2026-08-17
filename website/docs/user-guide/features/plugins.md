@@ -338,11 +338,22 @@ hermes plugins install user/repo             # install from Git, then prompt Ena
 hermes plugins install user/repo --enable    # install AND enable (no prompt)
 hermes plugins install user/repo --no-enable # install but leave disabled (no prompt)
 hermes plugins update my-plugin              # pull latest (local edits are autostashed and re-applied)
+hermes plugins update --all                  # pull every git-installed plugin (pinned ones are skipped)
+hermes plugins autoupdate my-plugin on       # auto-pull in the background at session start (max once/24h)
+hermes plugins autoupdate my-plugin off      # turn auto-update off (omit on/off to show current state)
 hermes plugins remove my-plugin              # uninstall
 hermes plugins enable my-plugin              # add to allow-list
 hermes plugins disable my-plugin             # remove from allow-list + add to disabled
 hermes plugins capabilities [my-plugin]      # declared vs granted capabilities
 ```
+
+Auto-update (`hermes plugins autoupdate <name> on`) opts a git-installed plugin
+into a background pull that runs after plugin discovery at interactive session
+start, at most once per 24 hours. The running session keeps the code it already
+imported — updated plugin code takes effect the **next** session, so the plugin
+registry and prompt cache of the live conversation are never touched. Pinned
+plugins (`--ref`) are never auto-updated, and capabilities newly declared by an
+update stay ungranted until you re-consent interactively (fail closed).
 
 ### Plugin capabilities and consent
 

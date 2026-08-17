@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
@@ -1079,13 +1080,34 @@ def cmd_install(
     console.print()
 
 
-def cmd_update(name: str) -> None:
-    """Update an installed plugin by pulling latest from its git remote."""
+def cmd_update(name: Optional[str] = None, all_plugins: bool = False) -> None:
+    """Update installed plugin(s) by pulling latest from their git remotes.
+
+    With ``all_plugins`` (``hermes plugins update --all``), every
+    git-installed plugin is pulled in turn; pinned plugins and non-git
+    directories are skipped with a note instead of aborting the sweep.
+    Inspired by Copilot CLI's marketplace plugin auto-update (v1.0.79).
+    """
     from rich.console import Console
     from rich.markup import escape
 
     console = Console()
     plugins_dir = _plugins_dir()
+
+    if all_plugins:
+        if name:
+            console.print("[red]Error:[/red] Pass a plugin name OR --all, not both.")
+            sys.exit(1)
+        results = _update_all_plugins(console)
+        if not results:
+            console.print("[dim]No git-installed plugins found to update.[/dim]")
+        return
+    if not name:
+        console.print(
+            "[red]Error:[/red] Missing plugin name. "
+            "Run `hermes plugins update <name>` or `hermes plugins update --all`."
+        )
+        sys.exit(1)
 
     try:
         target = _require_installed_plugin(name, plugins_dir, console)
@@ -1201,6 +1223,233 @@ def cmd_update(name: str) -> None:
     else:
         console.print(f"[green]✓[/green] Plugin [bold]{name}[/bold] updated.")
         console.print(f"[dim]{out}[/dim]")
+
+
+def _iter_updatable_plugins() -> list[tuple[Path, dict]]:
+    """Git-installed plugin dirs under ``~/.hermes/plugins`` + their metadata.
+
+    Returns ``(path, install_record)`` pairs for every direct child directory
+    with a ``.git`` inside. Pinned plugins ARE included — callers decide how
+    to surface the skip.
+    """
+    plugins_dir = _plugins_dir()
+    if not plugins_dir.is_dir():
+        return []
+    try:
+        metadata = _read_install_metadata()
+    except PluginOperationError:
+        metadata = {}
+    out: list[tuple[Path, dict]] = []
+    for child in sorted(plugins_dir.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if not (child / ".git").exists():
+            continue
+        record = metadata.get(child.name)
+        out.append((child, record if isinstance(record, dict) else {}))
+    return out
+
+
+def _update_one_plugin_dir(target: Path, install_record: dict) -> dict:
+    """Pull one plugin checkout; shared by --all sweep and auto-update.
+
+    Returns ``{"name", "ok", "skipped", "unchanged", "message"}``. Never
+    raises. Does NOT handle capability re-consent — interactive consent is
+    the single-plugin ``cmd_update`` path's job; here newly declared
+    capabilities simply stay ungranted (fail closed, same as any
+    non-interactive update).
+    """
+    name = target.name
+    if install_record.get("pinned") is True:
+        return {
+            "name": name, "ok": True, "skipped": True, "unchanged": True,
+            "message": f"pinned to {str(install_record.get('revision', ''))[:12]} — skipped",
+        }
+    ok, output = _git_pull_plugin_dir(target)
+    if not ok:
+        return {
+            "name": name, "ok": False, "skipped": False, "unchanged": False,
+            "message": output.strip(),
+        }
+    unchanged = "Already up to date" in output
+    if not unchanged:
+        git_exe = _resolve_git_executable()
+        if git_exe:
+            try:
+                metadata = _read_install_metadata()
+            except PluginOperationError:
+                metadata = {}
+            record = metadata.get(name)
+            if isinstance(record, dict):
+                record["revision"] = _git_head_revision(target, git_exe)
+                metadata[name] = record
+                try:
+                    _write_install_metadata(metadata)
+                except Exception:
+                    logger.warning(
+                        "could not record updated revision for plugin %s", name
+                    )
+        _clear_plugin_bytecode(target)
+    return {
+        "name": name, "ok": True, "skipped": False, "unchanged": unchanged,
+        "message": "already up to date" if unchanged else "updated",
+    }
+
+
+_AUTOUPDATE_STAMP_NAME = "plugin_autoupdate_stamp"
+_AUTOUPDATE_INTERVAL_SECONDS = 24 * 3600
+
+
+def cmd_autoupdate(name: str, state: Optional[str] = None) -> None:
+    """Show or set a plugin's ``auto_update`` flag in the install metadata.
+
+    Opted-in plugins are ``git pull``ed by a background sweep at interactive
+    session start, at most once per 24h (Copilot CLI v1.0.79's
+    ``autoUpdate`` marketplace setting, adapted). The pull happens AFTER
+    plugin discovery finishes, so the running session keeps the code it
+    already imported; updates take effect next session.
+    """
+    from rich.console import Console
+
+    console = Console()
+    plugins_dir = _plugins_dir()
+    try:
+        target = _require_installed_plugin(name, plugins_dir, console)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        metadata = _read_install_metadata()
+    except PluginOperationError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+    record = metadata.get(target.name)
+    record = record if isinstance(record, dict) else {}
+
+    if state is None:
+        current = record.get("auto_update") is True
+        console.print(
+            f"Auto-update for [bold]{target.name}[/bold]: "
+            f"{'[green]on[/green]' if current else '[dim]off[/dim]'}"
+        )
+        return
+
+    if state == "on":
+        if record.get("pinned") is True:
+            console.print(
+                f"[red]Error:[/red] Plugin '{target.name}' is pinned to an exact "
+                "revision; unpin it (reinstall without --ref) before enabling "
+                "auto-update."
+            )
+            sys.exit(1)
+        if not (target / ".git").exists():
+            console.print(
+                f"[red]Error:[/red] Plugin '{target.name}' is not a git checkout; "
+                "auto-update needs a git-installed plugin."
+            )
+            sys.exit(1)
+        record["auto_update"] = True
+        metadata[target.name] = record
+        _write_install_metadata(metadata)
+        console.print(
+            f"[green]✓[/green] Auto-update enabled for [bold]{target.name}[/bold]. "
+            "It will be pulled in the background at session start (max once/24h); "
+            "updates apply to new sessions."
+        )
+    else:
+        record.pop("auto_update", None)
+        metadata[target.name] = record
+        _write_install_metadata(metadata)
+        console.print(
+            f"[green]✓[/green] Auto-update disabled for [bold]{target.name}[/bold]."
+        )
+
+
+def _autoupdate_stamp_path() -> Path:
+    return get_hermes_home() / "cache" / _AUTOUPDATE_STAMP_NAME
+
+
+def run_startup_auto_update_sweep(force: bool = False) -> list[dict]:
+    """Pull every ``auto_update``-flagged plugin, at most once per 24h.
+
+    Called from the background plugin-discovery thread AFTER discovery has
+    completed, so the pull never races the imports of the session that
+    triggered it — the running session keeps the already-imported code and
+    the fresh checkout is picked up by the NEXT session (bytecode for the
+    old revision is cleared by :func:`_update_one_plugin_dir`).
+
+    Throttled by a stamp file so back-to-back session starts don't hammer
+    git remotes. Never raises; returns per-plugin result dicts (empty when
+    throttled or nothing is opted in).
+    """
+    flagged = [
+        (target, record)
+        for target, record in _iter_updatable_plugins()
+        if record.get("auto_update") is True and record.get("pinned") is not True
+    ]
+    if not flagged:
+        return []
+
+    stamp = _autoupdate_stamp_path()
+    if not force:
+        try:
+            age = time.time() - stamp.stat().st_mtime
+            if 0 <= age < _AUTOUPDATE_INTERVAL_SECONDS:
+                return []
+        except OSError:
+            pass  # no stamp yet → run
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError:
+        logger.debug("could not write plugin auto-update stamp", exc_info=True)
+
+    results = []
+    for target, record in flagged:
+        try:
+            res = _update_one_plugin_dir(target, record)
+        except Exception:
+            logger.warning(
+                "plugin auto-update failed for %s", target.name, exc_info=True
+            )
+            continue
+        results.append(res)
+        if not res["ok"]:
+            logger.warning(
+                "plugin auto-update: %s: %s", res["name"], res["message"]
+            )
+        elif not res["unchanged"]:
+            logger.info(
+                "plugin auto-update: %s updated (takes effect next session)",
+                res["name"],
+            )
+    return results
+
+
+def _update_all_plugins(console) -> list[dict]:
+    """``hermes plugins update --all`` sweep. Returns per-plugin results."""
+    results = []
+    for target, record in _iter_updatable_plugins():
+        res = _update_one_plugin_dir(target, record)
+        results.append(res)
+        if res["skipped"]:
+            console.print(f"[dim]— {res['name']}: {res['message']}[/dim]")
+        elif not res["ok"]:
+            console.print(f"[red]✗ {res['name']}:[/red] {res['message']}")
+        elif res["unchanged"]:
+            console.print(f"[dim]✓ {res['name']}: already up to date[/dim]")
+        else:
+            console.print(f"[green]✓ {res['name']}: updated[/green]")
+            from rich.console import Console as _C
+
+            _copy_example_files(target, console if isinstance(console, _C) else _C())
+    updated = [r for r in results if r["ok"] and not r["unchanged"]]
+    if updated:
+        console.print(
+            "[dim]Updated plugin code takes effect in new sessions.[/dim]"
+        )
+    return results
 
 
 def _remove_plugin_core(target: Path) -> None:
@@ -3121,7 +3370,12 @@ def plugins_command(args) -> None:
             refresh=getattr(args, "refresh", False),
         )
     elif action == "update":
-        cmd_update(args.name)
+        cmd_update(
+            getattr(args, "name", None),
+            all_plugins=getattr(args, "all_plugins", False),
+        )
+    elif action == "autoupdate":
+        cmd_autoupdate(args.name, getattr(args, "state", None))
     elif action in {"remove", "rm", "uninstall"}:
         cmd_remove(args.name)
     elif action == "enable":
