@@ -4,8 +4,8 @@
 // mouse-wheel; one event = 6 rows teleports and ruins precision.
 // Heuristic on inter-event gap + direction flips:
 //
-//   gap < 5ms                 → same-batch burst → 1 row/event
-//   gap ≤ 100ms (native only) → ramp +0.3, cap 6
+//   gap < 5ms (xterm/wheel-mode) → same-batch burst → 1 row/event
+//   gap ≤ 100ms (native only)    → ramp +0.3, cap 6
 //   gap 100-200ms (native)    → decay -0.3 toward precise one-row clicks
 //   gap > 200ms (native)      → reset
 //   gap 80-500ms (xterm only) → mult = 1 + (mult-1)·0.5^(gap/150) + 5·decay
