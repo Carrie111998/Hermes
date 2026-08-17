@@ -10,10 +10,12 @@ from model_tools import (
     get_toolset_for_tool,
     get_unavailable_config_gated_tools,
     _AGENT_LOOP_TOOLS,
+    _CONFIG_GATED_TOOLSETS,
     _LEGACY_TOOLSET_MAP,
     _resolve_tool_names,
     TOOL_TO_TOOLSET_MAP,
 )
+from toolsets import TOOLSETS, resolve_toolset
 
 
 # =========================================================================
@@ -626,3 +628,34 @@ class TestGetUnavailableConfigGatedTools:
                 disabled_toolsets=["browser"],
             )
         assert result == []
+
+
+class TestConfigGatedToolsetContract:
+    """Issue #1433 Phase 2: the availability whitelist is DERIVED from the
+    ``config_gated`` flag on toolset definitions (toolsets.py). These tests
+    pin the derivation contract so the flag can't silently reference a
+    renamed toolset, or a toolset whose tools can never fail their check_fn
+    (which would make the flag dead weight).
+    """
+
+    def test_config_gated_flags_resolve_to_real_toolsets(self):
+        for ts in _CONFIG_GATED_TOOLSETS:
+            assert ts in TOOLSETS, (
+                f"{ts!r} is config_gated but missing from toolsets.TOOLSETS"
+            )
+            assert resolve_toolset(ts), (
+                f"{ts!r} is config_gated but resolves to no tools"
+            )
+
+    def test_config_gated_tools_all_carry_check_fn(self):
+        # model_tools import registers every tool module, so registry
+        # lookups below are live entries, not stubs.
+        from tools.registry import registry
+
+        for ts in _CONFIG_GATED_TOOLSETS:
+            for tool in resolve_toolset(ts):
+                entry = registry.get_entry(tool)
+                assert entry is not None, f"{tool!r} (toolset {ts!r}) not registered"
+                assert entry.check_fn is not None, (
+                    f"{tool!r} (toolset {ts!r}) is config_gated but has no check_fn"
+                )

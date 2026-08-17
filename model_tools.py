@@ -38,7 +38,7 @@ from tools.registry import (
     registry,
     tool_error,
 )
-from toolsets import resolve_toolset, validate_toolset
+from toolsets import TOOLSETS, resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
@@ -676,22 +676,18 @@ def _compute_tool_definitions(
 # environment condition (no browser binary, no Docker daemon, platform
 # worker mode, ...). Used by :func:`get_unavailable_config_gated_tools` to
 # decide which check_fn-dropped tools are worth surfacing with a
-# "Run `hermes tools`" hint. Keep in sync with
-# ``hermes_cli/tools_config.py::_DEFAULT_OFF_TOOLSETS`` and any
-# service-gated toolset added to ``toolsets.py``.
-_CONFIG_GATED_TOOLSETS = {
-    "browser",
-    "vision",
-    "tts",
-    "web",
-    "image_gen",
-    "video_gen",
-    "x_search",
-    "homeassistant",
-    "spotify",
-    "discord",
-    "discord_admin",
-}
+# "Run `hermes tools`" hint.
+#
+# DERIVED from the ``config_gated`` flag on the toolset definitions in
+# ``toolsets.py`` (single source of truth — a new service-gated toolset is
+# surfaced automatically once it declares the flag). Deliberately NOT
+# flagged there: environment/install-gated toolsets (``computer_use`` —
+# cua-driver install), pure opt-in toolsets with no credential gap
+# (``video``, ``a2a``), and config-only capabilities that ship zero tool
+# schemas (``stt`` — they can never appear in a missing-tools diff).
+_CONFIG_GATED_TOOLSETS = frozenset(
+    name for name, spec in TOOLSETS.items() if spec.get("config_gated")
+)
 
 
 def get_unavailable_config_gated_tools(
