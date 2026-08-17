@@ -12,7 +12,11 @@ tree: {pid, ppid, name, cmdline, create_time, rss}.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -157,3 +161,123 @@ def test_plan_entries_carry_age_and_cmdline_for_the_printed_plan():
     v = victims[0]
     assert v["age_minutes"] == pytest.approx(30.0)
     assert "pytest" in " ".join(v["cmdline"])
+
+
+# ------------------------------------------------ what main() PRINTS, and when
+#
+# Everything above tests build_plan, which decides. These test main(), which
+# DISCLOSES -- and the disclosure is the whole safety argument for --all-sessions:
+# `~/.claude/hooks/block-unscoped-process-kill.py` sends blocked agents here
+# calling it a box-wide mode "that prints every victim with its owning session
+# first". A warning that arrives after the kills would make that advice a lie
+# while every test above still passed.
+
+def unkillable_box():
+    """`two_session_box()` with every pid negated.
+
+    main() is driven for real below -- including the execution branch -- so the
+    fake psutil is what should receive these pids. If that injection ever
+    silently failed, real psutil.Process(-230) raises, where Process(230) would
+    kill whatever pid 230 happens to be on this machine. No arrangement of these
+    tests can kill a process.
+    """
+    box = []
+    for record in two_session_box():
+        record = dict(record)
+        record["pid"] = -record["pid"]
+        record["ppid"] = -record["ppid"]
+        box.append(record)
+    return box
+
+
+def _fake_psutil(seen_pids: list) -> types.ModuleType:
+    """A psutil stand-in for main()'s execution branch.
+
+    main() does `import psutil` INSIDE the function, so putting this in
+    sys.modules makes the real one unreachable -- which is what lets these tests
+    exercise the kill branch at all.
+    """
+    module = types.ModuleType("psutil")
+
+    class TimeoutExpired(Exception):
+        pass
+
+    class Process:
+        def __init__(self, pid):
+            seen_pids.append(pid)
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    module.TimeoutExpired = TimeoutExpired
+    module.Process = Process
+    return module
+
+
+def _drive_main(monkeypatch, argv, my_pid=-120):
+    """Run main() over `unkillable_box()` with a fixed clock and a fake psutil.
+
+    build_plan stays REAL -- only its `my_pid`/`now` are pinned, so the plan the
+    printing is asserted against is the one the logic above actually produces.
+    Returns (stdout, exit_code, pids_the_fake_psutil_was_asked_to_kill, kwargs).
+    """
+    killed: list = []
+    forwarded: dict = {}
+    real_build_plan = reap.build_plan
+
+    def _plan(records, *, my_pid=None, now=None, **kwargs):
+        forwarded.update(kwargs)
+        return real_build_plan(records, my_pid=pinned_pid, now=NOW, **kwargs)
+
+    pinned_pid = my_pid
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(killed))
+    monkeypatch.setattr(reap, "snapshot", lambda _psutil: unkillable_box())
+    monkeypatch.setattr(reap, "build_plan", _plan)
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = reap.main(argv)
+    return out.getvalue(), code, killed, forwarded
+
+
+def test_all_sessions_warns_and_names_every_owner_before_it_kills(monkeypatch):
+    printed, code, killed, forwarded = _drive_main(monkeypatch, ["--all-sessions"])
+
+    assert code == 0
+    assert forwarded.get("all_sessions") is True, (
+        f"--all-sessions never reached the planner: {forwarded}"
+    )
+    # Positive control: the execution branch really ran, so "the warning came
+    # first" is not trivially true of a run that never acted.
+    assert set(killed) == {-130, -230}, f"expected both strays reaped, got {killed}"
+
+    warning = printed.find("WARNING")
+    mine = printed.find("session=-100")
+    foreign = printed.find("session=-200")
+    executing = printed.find("=== EXECUTING ===")
+    assert warning != -1, f"box-wide reap ran with no warning:\n{printed}"
+    assert mine != -1 and foreign != -1, f"a victim was printed without its owner:\n{printed}"
+    assert executing != -1, f"cannot locate the execution phase:\n{printed}"
+    assert warning < executing, f"warning printed AFTER killing started:\n{printed}"
+    assert max(mine, foreign) < executing, f"victims disclosed AFTER killing started:\n{printed}"
+
+
+def test_scoped_run_does_not_warn_about_cross_session_kills(monkeypatch):
+    """The warning has to be specific to --all-sessions.
+
+    A reaper that warns on every run trains the caller to page past it, which
+    costs exactly as much as not warning at all on the run that matters.
+    """
+    printed, code, killed, _ = _drive_main(monkeypatch, ["--dry-run"])
+
+    assert code == 0
+    # Not vacuous: this run really did plan a kill, it just planned only my own.
+    assert "session=-100" in printed, f"scoped run found nothing to plan:\n{printed}"
+    assert "-230" not in printed, f"scoped run listed the sibling's live run:\n{printed}"
+    assert "WARNING" not in printed, (
+        f"scoped run warns about cross-session kills it cannot do:\n{printed}"
+    )
+    assert killed == [], f"--dry-run reached the kill path: {killed}"
