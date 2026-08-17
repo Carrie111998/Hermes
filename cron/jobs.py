@@ -2233,6 +2233,70 @@ def clear_drift_alerted(job_id: str) -> None:
     _set_alert_flag(job_id, "drift_alerted", False)
 
 
+def rebase_unpinned_inference_snapshots(
+    *,
+    provider: Any = None,
+    model: Any = None,
+) -> List[str]:
+    """Rebase unpinned snapshot axes after an official global model/provider write.
+
+    Unpinned jobs follow the global default. An operator writing
+    ``model.default`` / ``model.provider`` (``hermes model``, ``hermes config
+    set``, TUI ``/model``) is an intentional upgrade — including MoA preset
+    renames like ``grok-4.5->m3`` → ``m3->grok-4.6``. Rebase those snapshots
+    in place so the #44585 fire-time guard does not skip the next tick.
+
+    Pinned axes, ``no_agent`` jobs, and jobs with no snapshot on that axis
+    are left alone. Returns the job ids that were rewritten.
+    """
+    new_provider = _normalize_job_optional_text(provider)
+    new_model = _normalize_job_optional_text(model)
+    if new_provider is None and new_model is None:
+        return []
+
+    rewritten: List[str] = []
+    with _jobs_lock():
+        jobs = load_jobs()
+        changed = False
+        for i, job in enumerate(jobs):
+            if not isinstance(job, dict) or bool(job.get("no_agent")):
+                continue
+            if not is_job_runnable(job):
+                continue
+            job_id = _coerce_job_text(job.get("id")).strip()
+            if not job_id:
+                continue
+            updated = dict(job)
+            axis_changed = False
+            if (
+                new_provider is not None
+                and not _normalize_job_optional_text(updated.get("provider"))
+                and _normalize_job_optional_text(updated.get("provider_snapshot"))
+            ):
+                snapshot = _normalize_job_optional_text(updated.get("provider_snapshot"))
+                if snapshot and snapshot.lower() != new_provider.lower():
+                    updated["provider_snapshot"] = new_provider
+                    axis_changed = True
+            if (
+                new_model is not None
+                and not _normalize_job_optional_text(updated.get("model"))
+                and _normalize_job_optional_text(updated.get("model_snapshot"))
+            ):
+                snapshot = _normalize_job_optional_text(updated.get("model_snapshot"))
+                if snapshot and snapshot.lower() != new_model.lower():
+                    updated["model_snapshot"] = new_model
+                    axis_changed = True
+            if not axis_changed:
+                continue
+            updated.pop("drift_alerted", None)
+            jobs[i] = updated
+            rewritten.append(job_id)
+            changed = True
+        if changed:
+            save_jobs(jobs)
+    return rewritten
+
+
 def _mark_job_run_locked(
     job_id: str,
     success: bool,

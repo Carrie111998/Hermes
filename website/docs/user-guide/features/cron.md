@@ -96,9 +96,14 @@ Or: `hermes config set cron.preflight false`
 
 ## Letting unpinned jobs track global defaults
 
-The model/provider drift guard is enabled by default. If your unpinned cron
-jobs should deliberately follow every global model or provider change, disable
-it in `config.yaml`:
+The model/provider drift guard is enabled by default. Official upgrades made
+through `hermes config set`, `hermes model`, or TUI `/model` rebase unpinned
+job snapshots automatically, including MoA preset renames. Hand-edited
+`config.yaml` and env-only swaps still fail closed at the next tick.
+
+If your unpinned cron jobs should deliberately follow every global model or
+provider change — including those unofficial paths — disable the guard in
+`config.yaml`:
 
 ```yaml
 cron:

@@ -4972,12 +4972,55 @@ def _load_cron_jobs_for_config_warning() -> List[Dict[str, Any]]:
         return []
 
 
+def rebase_unpinned_cron_jobs_after_model_config_change(
+    key: str,
+    value: Any,
+    config: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Rebase unpinned cron snapshots after an official model/provider write.
+
+    Operator-facing writes (``hermes config set``, ``hermes model``, TUI
+    ``/model``) are intentional upgrades, including MoA preset renames.
+    Rebase matching unpinned snapshots so the fire-time #44585 guard does
+    not skip the next tick. The runtime skip still fires for drift that was
+    not written through this path (hand-edited config, env-only swaps).
+
+    Returns the job ids that were rewritten. Best-effort: a store error
+    never fails the config write that already landed.
+    """
+    axis = _cron_model_drift_axis_for_config_key(key)
+    if axis is None:
+        return []
+    new_value = _model_assignment_text(value)
+    if not new_value:
+        return []
+    if not cron_model_drift_guard_enabled(config):
+        return []
+    if _cron_fleet_default_covers_axis(axis, config):
+        return []
+    try:
+        from cron.jobs import rebase_unpinned_inference_snapshots
+    except Exception:
+        return []
+    try:
+        if axis == "provider":
+            return rebase_unpinned_inference_snapshots(provider=new_value)
+        return rebase_unpinned_inference_snapshots(model=new_value)
+    except Exception:
+        return []
+
+
 def warn_unpinned_cron_jobs_after_model_config_change(
     key: str,
     value: Any,
     config: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Warn when a global model/provider change will trip cron's drift guard."""
+    """Rebase unpinned snapshots after an official model/provider change.
+
+    Intentional upgrades (including MoA preset renames) should not skip the
+    next cron tick. Hand-edited or env-only drift still fail closed at fire
+    time via the #44585 guard.
+    """
     axis = _cron_model_drift_axis_for_config_key(key)
     if axis is None:
         return
@@ -4985,6 +5028,18 @@ def warn_unpinned_cron_jobs_after_model_config_change(
     new_value = _model_assignment_text(value)
     if not new_value:
         return
+    rewritten = rebase_unpinned_cron_jobs_after_model_config_change(
+        key, value, config
+    )
+    if rewritten:
+        noun = "job" if len(rewritten) == 1 else "jobs"
+        print(
+            f"✓ Rebased {len(rewritten)} unpinned cron {noun} to the new "
+            f"global {axis} ({new_value}). The spend-safety guard still "
+            "skips jobs whose snapshots were not updated by this write."
+        )
+        return
+
     impact = build_cron_model_impact(
         current_provider=new_value if axis == "provider" else "",
         current_model=new_value if axis == "model" else "",

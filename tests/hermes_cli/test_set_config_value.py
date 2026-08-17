@@ -300,11 +300,40 @@ def _write_cron_jobs(tmp_path, jobs):
 
 
 class TestCronModelDriftConfigWarning:
-    """Warn operators before unpinned snapshot-bearing cron jobs fail closed."""
+    """Official model writes rebase unpinned snapshots instead of skipping."""
 
+    def test_model_default_write_rebases_unpinned_snapshot(
+        self,
+        _isolated_hermes_home,
+        capsys,
+    ):
+        _write_cron_jobs(
+            _isolated_hermes_home,
+            [
+                {
+                    "id": "model-drift-job",
+                    "enabled": True,
+                    "model": None,
+                    "provider": None,
+                    "model_snapshot": "grok-4.5->m3",
+                    "provider_snapshot": "moa",
+                    "drift_alerted": True,
+                }
+            ],
+        )
 
+        set_config_value("model.default", "m3->grok-4.6")
 
-
+        captured = capsys.readouterr()
+        assert "Rebased 1 unpinned cron job" in captured.out
+        assert "fail closed" not in captured.out
+        stored = json.loads(
+            (_isolated_hermes_home / "cron" / "jobs.json").read_text(encoding="utf-8")
+        )
+        job = stored["jobs"][0]
+        assert job["model_snapshot"] == "m3->grok-4.6"
+        assert job["provider_snapshot"] == "moa"
+        assert "drift_alerted" not in job
 
     def test_explicit_opt_out_suppresses_warning(
         self,
