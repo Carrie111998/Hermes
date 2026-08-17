@@ -1,4 +1,4 @@
-import { test, expect } from './test'
+import { expect, test } from './test'
 
 import {
   type MockBackendFixture,
