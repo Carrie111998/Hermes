@@ -179,19 +179,31 @@ def _install_literal_key_data_patch() -> bool:
     except Exception:
         return False
 
-    if getattr(Vt100Parser, "_hermes_literal_key_data", False):
+    # `_call_handler` is prompt_toolkit-private. Fetch it defensively so a
+    # future rename degrades to the same no-op as a missing module, rather
+    # than raising through install_modify_other_keys_aliases() into cli.py's
+    # blanket `except Exception: pass` — which would silently skip the
+    # installers that run after it.
+    original_call_handler = getattr(Vt100Parser, "_call_handler", None)
+    if original_call_handler is None:
         return False
 
-    original_call_handler = Vt100Parser._call_handler
+    # The idempotency marker rides on the wrapper rather than the class, so
+    # it cannot outlive the wrapper it describes: if anything later replaces
+    # `_call_handler`, the marker goes with it and we wrap the replacement
+    # instead of skipping on a stale flag.
+    if getattr(original_call_handler, "_hermes_literal_key_data", False):
+        return False
 
     def _call_handler(self, key, insert_text):  # type: ignore[no-untyped-def]
         if isinstance(key, str) and not isinstance(key, Keys) and len(key) == 1:
             insert_text = key
         return original_call_handler(self, key, insert_text)
 
+    _call_handler._hermes_literal_key_data = True  # type: ignore[attr-defined]
+
     try:
         Vt100Parser._call_handler = _call_handler  # type: ignore[assignment]
-        Vt100Parser._hermes_literal_key_data = True  # type: ignore[attr-defined]
     except Exception:
         return False
     return True

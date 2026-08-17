@@ -17,7 +17,6 @@ from __future__ import annotations
 import pytest
 
 from prompt_toolkit.input import create_pipe_input
-from prompt_toolkit.input.vt100_parser import Vt100Parser
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.shortcuts import PromptSession
@@ -29,10 +28,26 @@ from hermes_cli.pt_input_extras import (
 )
 
 
+def _parser_class():
+    """Resolve ``Vt100Parser`` per call, the way the installer does.
+
+    `tests/cli/test_bracketed_paste_timeout.py` reloads
+    ``prompt_toolkit.input.vt100_parser``, which rebinds the module's class
+    to a new object. A module-level import here would hold the pre-reload
+    class and patch something the parser no longer uses.
+    """
+    from prompt_toolkit.input.vt100_parser import Vt100Parser
+    return Vt100Parser
+
+
 @pytest.fixture(autouse=True)
 def _ensure_alias_installed():
     from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES as _seq
     saved = dict(_seq)
+    # The parser patch is process-global; restore it too so it cannot leak
+    # into sibling test files the way the table mappings must not.
+    parser_cls = _parser_class()
+    saved_call_handler = parser_cls._call_handler
     # Same order as cli.py — also proves the Enter aliases are not clobbered.
     install_shift_enter_alias()
     install_ctrl_enter_alias()
@@ -40,6 +55,7 @@ def _ensure_alias_installed():
     yield
     _seq.clear()
     _seq.update(saved)
+    parser_cls._call_handler = saved_call_handler
     from prompt_toolkit.input.vt100_parser import _IS_PREFIX_OF_LONGER_MATCH_CACHE
     _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
 
@@ -90,7 +106,7 @@ def test_key_press_data_matches_the_character():
     """The mechanism, asserted directly: data drives insertion, so it must
     be the character rather than the bytes that produced it."""
     presses = []
-    parser = Vt100Parser(presses.append)
+    parser = _parser_class()(presses.append)
     for ch in _mok(ord("q")):
         parser.feed(ch)
     parser.flush()
@@ -106,7 +122,7 @@ def test_ctrl_combo_bindings_still_fire():
 
 def test_named_keys_keep_their_raw_data():
     presses = []
-    parser = Vt100Parser(presses.append)
+    parser = _parser_class()(presses.append)
     for ch in "\x1b[A":
         parser.feed(ch)
     parser.flush()
@@ -125,3 +141,48 @@ def test_plain_typing_is_unaffected():
 
 def test_bracketed_paste_is_unaffected():
     assert _type("\x1b[200~Pasted TEXT\x1b[201~") == "Pasted TEXT"
+
+
+def test_missing_private_method_degrades_to_a_no_op(monkeypatch):
+    """`_call_handler` is prompt_toolkit-private. If a future release renames
+    it, the install must return False rather than raise — an exception here
+    would propagate into cli.py's blanket handler and silently skip the
+    installers that run after it."""
+    from hermes_cli import pt_input_extras
+
+    monkeypatch.delattr(_parser_class(), "_call_handler", raising=False)
+    assert pt_input_extras._install_literal_key_data_patch() is False
+    # The caller keeps working and still reports its table registrations.
+    assert install_modify_other_keys_aliases() >= 0
+
+
+def test_patch_is_idempotent_and_does_not_stack():
+    from hermes_cli import pt_input_extras
+
+    parser_cls = _parser_class()
+    first = parser_cls._call_handler
+    assert pt_input_extras._install_literal_key_data_patch() is False
+    assert parser_cls._call_handler is first
+
+
+def test_marker_cannot_outlive_the_wrapper(monkeypatch):
+    """If something else replaces `_call_handler`, the marker goes with it,
+    so the next install wraps the replacement instead of skipping."""
+    from hermes_cli import pt_input_extras
+
+    calls = []
+
+    def _foreign_call_handler(self, key, insert_text):
+        calls.append((key, insert_text))
+
+    parser_cls = _parser_class()
+    monkeypatch.setattr(parser_cls, "_call_handler", _foreign_call_handler)
+    assert pt_input_extras._install_literal_key_data_patch() is True
+    assert parser_cls._call_handler is not _foreign_call_handler
+
+    # The replacement is wrapped, not bypassed, and still sees fixed data.
+    parser = parser_cls(lambda kp: None)
+    for ch in _mok(ord("q")):
+        parser.feed(ch)
+    parser.flush()
+    assert ("Q", "Q") in calls
