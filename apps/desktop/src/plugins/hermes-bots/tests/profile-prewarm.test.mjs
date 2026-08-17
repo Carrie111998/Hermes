@@ -112,3 +112,19 @@ test('behavior: right-click opens bot actions', () => {
   assert.equal(stopped, true)
   assert.deepEqual(actionStates, [true])
 })
+
+test('behavior: the visible actions button opens bot actions without opening the chat', () => {
+  const { actionStates, tree } = renderBotRow('alpha')
+  const actionsButton = tree.props.children[1]
+  let stopped = false
+
+  actionsButton.props.onClick({
+    stopPropagation: () => {
+      stopped = true
+    }
+  })
+
+  assert.equal(actionsButton.props['aria-label'], 'Actions for alpha')
+  assert.equal(stopped, true)
+  assert.deepEqual(actionStates, [true])
+})
