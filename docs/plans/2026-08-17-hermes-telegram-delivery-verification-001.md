@@ -1,6 +1,6 @@
 ---
 title: "HERMES-TELEGRAM-DELIVERY-VERIFICATION-001: prove one user-visible Telegram response"
-status: IMPLEMENTATION_REVIEW_PASS
+status: MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN
 date: 2026-08-17
 type: verification
 ticket: HERMES-TELEGRAM-DELIVERY-VERIFICATION-001
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status and boundary
 
-Current gate: `IMPLEMENTATION_REVIEW_PASS`.
+Current gate: `MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN`.
 
 This design review evaluates whether incomplete evidence is classified safely;
 it does not require the current candidate to satisfy every delivery class.
@@ -362,7 +362,7 @@ reconciliation.
    that its own environment could not rerun the suite; the same 38-test suite
    was reproduced in the isolated WSL environment and AGY also confirmed the
     38-test result. No reviewer edited the worktree.
- - CI correction review reconciliation: `PASS` from one authenticated Claude
+- CI correction review reconciliation: `PASS` from one authenticated Claude
    reviewer and one authenticated AGY reviewer, both reviewing the identical
    corrected packet
    `7E72D5448F0D97585ADEC40AB0DA92FD40DDD2595DE61EE15B765F5930206487`.
@@ -370,6 +370,37 @@ reconciliation.
    could not execute the suite because its environment lacked dependencies,
    but found no implementation or privacy defect. No reviewer edited the
    worktree.
+
+## Merge, CI, and DGX deployment evidence
+
+These are separate post-review gates. They do not close inbound polling,
+outbound delivery, or user-visible Telegram delivery.
+
+- Commit/push: implementation commits `19666a9030beab096d06eb620bf559b9f84fbf7b`
+  and CI correction `57bfaf5d6b181864048b212f0aa23392609fdfb1` were pushed.
+- Merge: PR #36 merged to `main` as
+  `1aec269ff4adda5de67fa39b60f003e2faba4495`.
+- CI: required checks passed in run `32039164808`, including all eight Python
+  test slices, e2e, Ruff/ty, Windows footguns, Windows DGX wrappers, lock,
+  contributors, common ancestor, and the aggregate required-check gate.
+- DGX deployment: the release identity was
+  `v2026.8.17-hermes-telegram-delivery-verification-1aec269f`, with marker
+  `1aec269ff4adda5de67fa39b60f003e2faba4495` and effective drop-in
+  `38-hermes-telegram-delivery-verification-1aec269f.conf`.
+- Rollback: the prior Relay release and drop-in remain retained; a new
+  rollback manifest and pre/post-deploy metadata were preserved for this
+  release. Relay remains disabled.
+- Restart/runtime: after the authorized restart, the service was
+  `ActiveState=active`, `SubState=running`, MainPID `2372026`,
+  `NRestarts=0`, `ExecMainStatus=0`; the process cwd matched the new release
+  both immediately and after a bounded ten-second check.
+- Cleanup: the temporary deployment clone was removed after verifying that
+  the immutable release and marker were complete. The primary dirty checkout
+  was preserved.
+
+No Telegram configuration, credentials, allowlists, webhook state, or message
+content was changed or recorded. No new inbound polling, outbound delivery, or
+user-visible delivery claim is made by this deployment evidence.
 
 ## Safety stop conditions
 
@@ -387,7 +418,7 @@ Stop and record `BLOCKED` or `UNPROVEN` if:
 
 ## Current status
 
-`IMPLEMENTATION_REVIEW_PASS`. The screenshot remains candidate evidence for the
-user-visible class; merge, deployment, DGX restart, Relay enablement, and
-Telegram state mutation remain separate gates. This ticket does not claim a
-new user-visible delivery or authorize a retry.
+`MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN`. The screenshot remains
+candidate evidence for the user-visible class. Runtime health, inbound
+polling, outbound delivery, and user-visible delivery remain separate gates;
+this ticket does not claim a new user-visible delivery or authorize a retry.
