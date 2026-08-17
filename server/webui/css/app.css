@@ -5711,11 +5711,6 @@ h1, h2, h3, h4, p { margin: 0; }
   vertical-align: middle;
   white-space: nowrap;
 }
-.ifz-result-table tbody tr {
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-system);
-}
-.ifz-result-table tbody tr:hover,
 .ifz-result-table tbody tr.selected {
   background: var(--surface);
 }
@@ -5723,9 +5718,21 @@ h1, h2, h3, h4, p { margin: 0; }
   border-left: 3px solid var(--accent);
   padding-left: 9px;
 }
-.ifz-result-table tbody tr:focus-visible {
+.ifz-result-company-button {
+  min-height: 32px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-strong);
+  font: inherit;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+.ifz-result-company-button:hover { color: var(--accent-text); }
+.ifz-result-company-button:focus-visible {
   outline: var(--focus-ring);
-  outline-offset: -2px;
+  outline-offset: var(--focus-offset);
 }
 .ifz-result-table td.cell-num,
 .ifz-result-table th.cell-num { text-align: right; }
@@ -5929,8 +5936,4 @@ h1, h2, h3, h4, p { margin: 0; }
     border-bottom: 1px solid var(--border);
   }
   .ifz-result-evidence-metrics > div:last-child { border-bottom: 0; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .ifz-result-table tbody tr { transition: none; }
 }

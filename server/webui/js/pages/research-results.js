@@ -7,6 +7,7 @@ import {
 
 const itemsOf = value => Array.isArray(value) ? value : value?.items || [];
 const TERMINAL_CAMPAIGN_STATES = new Set(['succeeded', 'completed', 'partial', 'failed']);
+const SUPPORTING_CLAIM_STATUSES = new Set(['observed', 'estimated_range']);
 
 function sentence(value, fallback = 'Not known') {
   const text = String(value || '').replace(/[_-]+/g, ' ').trim();
@@ -146,8 +147,10 @@ function evidencePanel(result, claimState) {
     el('p', { class: 'ifz-prose' }, 'The verdict is unchanged. Select the company again to retry.'));
 
   const claims = claimState.items || [];
-  const supporting = claims.filter(claim => claim.status !== 'conflicted');
+  const supporting = claims.filter(claim => SUPPORTING_CLAIM_STATUSES.has(claim.status));
   const conflicting = claims.filter(claim => claim.status === 'conflicted');
+  const neutral = claims.filter(claim =>
+    !SUPPORTING_CLAIM_STATUSES.has(claim.status) && claim.status !== 'conflicted');
   const conflictNames = new Set(result.conflicting_claims || []);
   for (const claim of conflicting) conflictNames.delete(claim.field);
 
@@ -177,6 +180,11 @@ function evidencePanel(result, claimState) {
             [...conflictNames].map(field => el('p', { class: 'ifz-result-conflict ifz-prose' }, sentence(field))))
         : el('p', { class: 'ifz-result-none ifz-prose' }, 'No conflicting claims were recorded.')),
     el('section', { class: 'ifz-result-evidence-section' },
+      el('h3', {}, 'Unknown or not applicable'),
+      neutral.length
+        ? el('div', { class: 'ifz-result-claim-list neutral' }, neutral.map(claimNode))
+        : el('p', { class: 'ifz-result-none ifz-prose' }, 'No neutral claims were recorded.')),
+    el('section', { class: 'ifz-result-evidence-section' },
       el('h3', {}, 'Missing evidence'),
       textList(result.missing_evidence, 'No required evidence is marked missing.')));
 }
@@ -189,28 +197,20 @@ function resultTable(results, selectedId, onSelect) {
       el('thead', {}, el('tr', {}, headers.map(label => el('th', {}, label)))),
       el('tbody', {}, results.map(result => {
         const selected = result.id === selectedId;
-        const row = el('tr', {
-          class: selected ? 'selected' : '',
-          tabindex: '0',
-          role: 'button',
-          'aria-current': selected ? 'true' : null,
+        return el('tr', { class: selected ? 'selected' : '' },
+        el('td', {}, el('button', {
+          class: 'ifz-result-company-button',
+          type: 'button',
           'aria-label': `Inspect evidence for ${result.company_name}`,
-        },
-        el('td', {}, el('strong', {}, result.company_name)),
+          'aria-current': selected ? 'true' : null,
+          onclick: () => onSelect(result),
+        }, result.company_name)),
         el('td', {}, verdictBadge(result.verdict)),
         el('td', { class: 'cell-num' }, `${result.fit_score} / 100`),
         el('td', { class: 'cell-num' }, confidencePercent(result.evidence_confidence)),
         el('td', {}, result.country || 'Not known'),
         el('td', {}, sentence(result.buyer_role)),
         el('td', { class: 'cell-num' }, String(result.source_count ?? 0)));
-        row.addEventListener('click', () => onSelect(result));
-        row.addEventListener('keydown', event => {
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            onSelect(result);
-          }
-        });
-        return row;
       }))));
 }
 
@@ -226,6 +226,7 @@ export async function mount(root, ctx) {
     selected: { active: '', rejected: '' },
     claims: new Map(),
     campaignError: null,
+    contextVersion: 0,
   };
   const page = el('div', { class: 'ifz-research-results' }, loadingNode('Loading research briefs'));
   root.append(page);
@@ -239,16 +240,30 @@ export async function mount(root, ctx) {
     return viewState.items.find(item => item.id === state.selected[state.view]) || null;
   }
 
+  function contextMatches(context, { selection = false } = {}) {
+    return !disposed
+      && state.contextVersion === context.version
+      && state.campaignId === context.campaignId
+      && state.view === context.view
+      && (!selection || state.selected[context.view] === context.resultId);
+  }
+
   async function loadClaims(result) {
     if (!result || state.claims.get(result.id)?.status === 'loaded') return;
+    const context = {
+      version: state.contextVersion,
+      campaignId: state.campaignId,
+      view: state.view,
+      resultId: result.id,
+    };
     state.claims.set(result.id, { status: 'loading', items: [] });
     render();
     try {
       const response = await call('researchResults.claims', { params: { resultId: result.id } });
-      if (disposed) return;
+      if (!contextMatches(context, { selection: true })) return;
       state.claims.set(result.id, { status: 'loaded', items: itemsOf(response) });
     } catch (error) {
-      if (disposed) return;
+      if (!contextMatches(context, { selection: true })) return;
       state.claims.set(result.id, { status: 'error', error, items: [] });
     }
     render();
@@ -261,15 +276,26 @@ export async function mount(root, ctx) {
   }
 
   async function loadResults(view) {
-    if (!state.campaignId || state.resultStates[view].status === 'loaded') return;
+    if (!state.campaignId) return;
+    const context = {
+      version: state.contextVersion,
+      campaignId: state.campaignId,
+      view,
+    };
+    if (state.resultStates[view].status === 'loaded') {
+      const selected = state.resultStates[view].items
+        .find(item => item.id === state.selected[view]);
+      if (selected) await loadClaims(selected);
+      return;
+    }
     state.resultStates[view] = { status: 'loading', items: [] };
     render();
     try {
       const response = await call('researchCampaigns.results', {
-        params: { campaignId: state.campaignId },
+        params: { campaignId: context.campaignId },
         query: { view },
       });
-      if (disposed) return;
+      if (!contextMatches(context)) return;
       const items = itemsOf(response);
       state.resultStates[view] = { status: 'loaded', items };
       if (!state.selected[view] && items.length) state.selected[view] = items[0].id;
@@ -277,7 +303,7 @@ export async function mount(root, ctx) {
       const first = items.find(item => item.id === state.selected[view]);
       if (first) await loadClaims(first);
     } catch (error) {
-      if (disposed) return;
+      if (!contextMatches(context)) return;
       state.resultStates[view] = { status: 'error', error, items: [] };
       render();
     }
@@ -285,12 +311,14 @@ export async function mount(root, ctx) {
 
   async function switchView(view) {
     if (state.view === view) return;
+    state.contextVersion += 1;
     state.view = view;
     render();
     await loadResults(view);
   }
 
   async function switchCampaign(campaignId) {
+    state.contextVersion += 1;
     state.campaignId = campaignId;
     state.view = 'active';
     state.resultStates = {
@@ -304,14 +332,21 @@ export async function mount(root, ctx) {
   }
 
   async function exportView(action) {
+    const context = {
+      version: state.contextVersion,
+      campaignId: state.campaignId,
+      view: state.view,
+    };
     setBusy(action, true, 'Preparing');
     try {
       const file = await call('researchCampaigns.export', {
-        params: { campaignId: state.campaignId },
-        query: { view: state.view },
+        params: { campaignId: context.campaignId },
+        query: { view: context.view },
       });
+      if (!contextMatches(context)) return;
       blobDownload(file.filename, file.blob, `Downloaded ${file.filename}`);
     } catch {
+      if (!contextMatches(context)) return;
       toast('The research export could not be prepared.', 'error');
     } finally {
       setBusy(action, false);
@@ -425,8 +460,10 @@ export async function mount(root, ctx) {
       await loadResults('active');
     }
   } catch (error) {
-    state.campaignError = error;
-    render();
+    if (!disposed) {
+      state.campaignError = error;
+      render();
+    }
   }
 
   return () => {
