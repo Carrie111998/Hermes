@@ -1351,3 +1351,118 @@ class TestWslPathTranslation:
         assert hermes_constants.translate_cwd_for_wsl_backend(r"\\wsl.localhost\Ubuntu\home\alex") == "/home/alex"
         # Already-POSIX paths pass through untouched.
         assert hermes_constants.translate_cwd_for_wsl_backend("/home/alex") == "/home/alex"
+
+
+class TestAgentBrowserRunnableIsCached:
+    """The probe SPAWNS a process, so it must not re-run per call.
+
+    ``agent_browser_runnable`` shells out to ``<binary> --version`` with a 10s
+    bound. That bound is correct and honoured — the defect is frequency, not
+    duration. ``_has_agent_browser()`` calls it once for the PATH copy and
+    again for the node_modules copy (up to 2 spawns), and
+    ``get_nous_subscription_features`` calls ``_has_agent_browser()`` directly
+    AND via ``_local_browser_runnable()`` — so ~4 spawns per call. That sits
+    inside ``_prompt_toolset_checklist``'s per-toolset loop, which calls
+    ``_toolset_has_keys`` -> ``_visible_providers`` -> the whole chain again
+    per category.
+
+    The result: ``hermes tools`` re-probed the same binary dozens of times per
+    checklist render, and
+    ``tests/hermes_cli/test_tools_config.py::test_configure_*_configures_selected_tool_missing_provider``
+    blew a 180s per-test budget on nothing but repeated spawns — which, under
+    ``--timeout-method=thread``, ``os._exit``s the whole pytest process and
+    aborted the tests/hermes_cli sweep at 83%.
+
+    Whether a binary executes cannot change within a process except by an
+    install, so the answer is cached and the one install path
+    (``tools_config._run_post_setup``) invalidates it explicitly.
+    """
+
+    def _probe(self):
+        from hermes_constants import agent_browser_runnable
+
+        return agent_browser_runnable
+
+    def test_repeated_probes_spawn_only_once(self, tmp_path, monkeypatch):
+        import subprocess as _sp
+
+        probe = self._probe()
+        probe.cache_clear()
+
+        exe = tmp_path / "agent-browser"
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return _sp.CompletedProcess(list(cmd), 0)
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+
+        assert probe(str(exe)) is True
+        assert probe(str(exe)) is True
+        assert probe(str(exe)) is True
+
+        assert len(calls) == 1, (
+            f"probe spawned {len(calls)} times for one binary — an uncached "
+            "subprocess probe inside a per-toolset loop is what blew the "
+            "180s test budget and made `hermes tools` re-probe dozens of times"
+        )
+
+    def test_cache_clear_re_probes(self, tmp_path, monkeypatch):
+        """Invalidation must work — an install mid-process changes the answer."""
+        import subprocess as _sp
+
+        probe = self._probe()
+        probe.cache_clear()
+
+        exe = tmp_path / "agent-browser"
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return _sp.CompletedProcess(list(cmd), 0)
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+
+        probe(str(exe))
+        probe.cache_clear()
+        probe(str(exe))
+
+        assert len(calls) == 2, (
+            "cache_clear() did not force a re-probe; a post-install "
+            "invalidation would be silently ineffective"
+        )
+
+    def test_distinct_paths_are_cached_separately(self, tmp_path, monkeypatch):
+        import subprocess as _sp
+
+        probe = self._probe()
+        probe.cache_clear()
+
+        a = tmp_path / "a-browser"
+        b = tmp_path / "b-browser"
+        for p in (a, b):
+            p.write_text("#!/bin/sh\nexit 0\n")
+            p.chmod(0o755)
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return _sp.CompletedProcess(list(cmd), 0)
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+
+        probe(str(a))
+        probe(str(b))
+        probe(str(a))
+
+        assert len(calls) == 2, (
+            f"expected one spawn per distinct path, got {len(calls)}: {calls}"
+        )
