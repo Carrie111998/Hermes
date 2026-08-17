@@ -1838,14 +1838,8 @@ def _build_skills_system_prompt_inner(
 
     if snapshot is not None:
         # Fast path: use pre-parsed metadata from disk
-        _allowed_skills_attr = getattr(agent, "_agent_skills", None)
         _allowed_env = os.environ.get("HERMES_ALLOWED_SKILLS", "").strip()
-        if _allowed_skills_attr:
-            _allowed_set = set(_allowed_skills_attr)
-        elif _allowed_env:
-            _allowed_set = {s.strip() for s in _allowed_env.split(",") if s.strip()}
-        else:
-            _allowed_set = None
+        _allowed_set = {s.strip() for s in _allowed_env.split(",") if s.strip()} if _allowed_env else None
         for entry in snapshot.get("skills", []):
             if not isinstance(entry, dict):
                 continue

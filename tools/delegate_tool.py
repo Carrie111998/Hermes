@@ -3835,7 +3835,14 @@ def delegate_task(
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
     children = []
+    from agent.agent_registry import get_agent_registry
+    _reg = get_agent_registry()
+
     for i, t in enumerate(task_list):
+        # Resolve per-task agent if specified
+        task_agent_name = t.get("agent")
+        task_agent_def = _reg.get_agent(task_agent_name) if task_agent_name else _agent_def
+
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3844,8 +3851,8 @@ def delegate_task(
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         # Prepend agent definition prompt to context if agent is specified
-        if _agent_def and _agent_def.prompt:
-            _agent_header = f"[Agent: {_agent_def.name}]\n{_agent_def.prompt}\n\n"
+        if task_agent_def and task_agent_def.prompt:
+            _agent_header = f"[Agent: {task_agent_def.name}]\n{task_agent_def.prompt}\n\n"
             _child_context = _agent_header + (_child_context or "")
         if _task_schema is not None:
             from tools.delegation_output_schema import append_output_contract
@@ -3853,16 +3860,32 @@ def delegate_task(
             _child_context = append_output_contract(_child_context, _task_schema)
         # Session continuity per named agent within parent session
         _subagent_session_id = None
-        if _agent_def and parent_agent:
+        if task_agent_def and parent_agent:
             if not hasattr(parent_agent, "_named_agent_sessions"):
                 parent_agent._named_agent_sessions = {}
-            if _agent_def.name in parent_agent._named_agent_sessions:
-                _subagent_session_id = parent_agent._named_agent_sessions[_agent_def.name]
+            if task_agent_def.name in parent_agent._named_agent_sessions:
+                _subagent_session_id = parent_agent._named_agent_sessions[task_agent_def.name]
             else:
                 import uuid as _uuid
                 _parent_sid = getattr(parent_agent, "session_id", "default") or "default"
-                _subagent_session_id = f"sub-{_agent_def.name}-{_uuid.uuid4().hex[:8]}"
-                parent_agent._named_agent_sessions[_agent_def.name] = _subagent_session_id
+                _subagent_session_id = f"sub-{task_agent_def.name}-{_uuid.uuid4().hex[:8]}"
+                parent_agent._named_agent_sessions[task_agent_def.name] = _subagent_session_id
+
+        # Compute effective task credentials
+        task_creds = dict(creds)
+        if task_agent_def and task_agent_name:
+            if task_agent_def.model:
+                task_creds["model"] = task_agent_def.model
+            if task_agent_def.provider:
+                task_creds["provider"] = task_agent_def.provider
+            if task_agent_def.base_url:
+                task_creds["base_url"] = task_agent_def.base_url
+            if task_agent_def.api_key:
+                task_creds["api_key"] = task_agent_def.api_key
+            if task_agent_def.api_mode:
+                task_creds["api_mode"] = task_agent_def.api_mode
+            if task_agent_def.max_tokens:
+                task_creds["max_output_tokens"] = task_agent_def.max_tokens
 
         try:
             child = _build_child_preserving_parent_tools(
@@ -3872,18 +3895,18 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
                 session_id=_subagent_session_id,
             )
@@ -3899,16 +3922,16 @@ def delegate_task(
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
         # Attach agent skill_path and skills whitelist for skill filtering
-        if _agent_def:
-            if _agent_def.skill_path:
+        if task_agent_def:
+            if task_agent_def.skill_path:
                 try:
-                    child._agent_skill_path = Path(_agent_def.skill_path)
+                    child._agent_skill_path = Path(task_agent_def.skill_path)
                     from agent.agent_debug import log_skill_path as _log_sp
-                    _log_sp(_agent_def.name, _agent_def.skill_path, _agent_def.skills)
+                    _log_sp(task_agent_def.name, task_agent_def.skill_path, task_agent_def.skills)
                 except Exception:
                     logger.debug("Could not attach skill_path to child %d", i)
-            if _agent_def.skills:
-                child._agent_skills = list(_agent_def.skills)
+            if task_agent_def.skills:
+                child._agent_skills = list(task_agent_def.skills)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
