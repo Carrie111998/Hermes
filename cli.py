@@ -5040,6 +5040,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
         else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        # Keep the CLI override so per-turn config refreshes cannot replace it.
+        self._max_turns_cli_override = max_turns
         # Max turns priority: CLI arg > config file > env var > default
         if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
@@ -15318,6 +15320,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    def _refresh_max_turns_from_config(self) -> None:
+        """Refresh the long-lived agent's iteration budget for the next turn."""
+        if getattr(self, "_max_turns_cli_override", None) is not None:
+            return
+
+        from hermes_cli.agent_budget import resolve_agent_max_turns
+
+        self.max_turns = resolve_agent_max_turns(load_cli_config())
+        if self.agent is not None:
+            self.agent.max_iterations = self.max_turns
+
     def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -15352,6 +15365,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
             return None
+
+        self._refresh_max_turns_from_config()
 
         turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
