@@ -16,12 +16,14 @@ Two fixes, both covered here:
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+import hermes_state
 from hermes_cli import kanban_db as kb
 
 
@@ -70,6 +72,113 @@ def test_initialized_path_connect_skips_init_lock(kanban_home):
     finally:
         release.set()
         t.join(timeout=5)
+
+
+def _init_lock_is_held(db_path: Path) -> bool:
+    """Is the cross-process init lock for ``db_path`` held right now?
+
+    Probes with a second handle to the same lock file. Both backends conflict
+    with themselves across handles within one process — ``flock`` locks are
+    per open-file-description, and Windows byte-range locks are per handle —
+    so this reports a lock held by ``connect()`` on this very thread.
+    """
+    lock_path = db_path.with_name(db_path.name + ".init.lock")
+    handle = lock_path.open("a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return False
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def test_wal_setup_runs_outside_the_cross_process_init_lock(kanban_home, monkeypatch):
+    """Per-connection WAL/pragma setup must NOT hold the cross-process lock.
+
+    On a hot board the WAL probe is the statement that attaches the ``-shm``
+    and takes the first read lock, so it queues behind live writers for 1-2s
+    per process. Holding the init lock across it made every first-connecting
+    process pay for all its predecessors: measured on Windows with 12 workers
+    first-connecting at once, serialized hold time reached 16s against the 10s
+    budget, so the "not acquired within 10s" fallback fired on healthy queues
+    instead of wedged holders. Narrowing the lock cut that to under a second.
+    """
+    db_path = kb.kanban_db_path(board="default")
+    observed = {}
+
+    real = hermes_state.apply_wal_with_fallback
+
+    def spy(conn, **kwargs):
+        observed["held"] = _init_lock_is_held(db_path)
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(hermes_state, "apply_wal_with_fallback", spy)
+    kb.connect().close()
+
+    assert observed.get("held") is False, (
+        "apply_wal_with_fallback ran while holding the cross-process init lock; "
+        "that serializes 1-2s of per-connection setup per process and blows the "
+        f"{kb._INIT_LOCK_TIMEOUT_SECONDS:.0f}s budget under ordinary contention"
+    )
+
+
+def test_schema_ddl_still_holds_the_cross_process_init_lock(kanban_home, monkeypatch):
+    """The narrowing must not un-protect the section that needs serializing.
+
+    ``executescript(SCHEMA_SQL)`` + the additive ALTER TABLE pass are the only
+    writes in ``connect()``; they must stay single-writer across the host.
+    """
+    db_path = kb.kanban_db_path(board="default")
+    observed = {}
+
+    real = kb._migrate_add_optional_columns
+
+    def spy(conn):
+        observed["held"] = _init_lock_is_held(db_path)
+        return real(conn)
+
+    monkeypatch.setattr(kb, "_migrate_add_optional_columns", spy)
+    kb.connect().close()
+
+    assert observed.get("held") is True, (
+        "schema init ran without the cross-process init lock — concurrent "
+        "processes can now race the additive migration pass"
+    )
+
+
+def test_integrity_probe_still_holds_the_cross_process_init_lock(kanban_home, monkeypatch):
+    """The corruption probes stay serialized so one process wins the verdict."""
+    db_path = kb.kanban_db_path(board="default")
+    observed = {}
+
+    real = kb._guard_existing_db_is_healthy
+
+    def spy(path):
+        observed["held"] = _init_lock_is_held(db_path)
+        return real(path)
+
+    monkeypatch.setattr(kb, "_guard_existing_db_is_healthy", spy)
+    kb.connect().close()
+
+    assert observed.get("held") is True, (
+        "the integrity probe ran without the cross-process init lock"
+    )
 
 
 def test_first_init_connect_is_bounded_when_lock_held(kanban_home, monkeypatch):
