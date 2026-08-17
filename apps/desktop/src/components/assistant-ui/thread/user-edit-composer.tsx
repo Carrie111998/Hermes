@@ -114,7 +114,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const [staging, setStaging] = useState(false)
   const expanded = draft.includes('\n')
   const canSubmit = draft.trim().length > 0
-  const at = useAtCompletions({ cwd, gateway, sessionId })
+  const at = useAtCompletions({ cwd, gateway, sessionId, mentionEntries: [] })
   const slash = useSlashCompletions({ gateway })
   const emoji = useEmojiCompletions()
 

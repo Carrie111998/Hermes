@@ -82,13 +82,15 @@ function classify(entry: CompletionEntry): {
   }
 }
 
-/** Live `@` completions backed by the gateway's `complete.path` RPC. */
+/** Live `@` completions backed by the gateway's `complete.path` RPC, plus
+ *  plugin-contributed mention entries (composer.mentions area). */
 export function useAtCompletions(options: {
   gateway: HermesGateway | null
   sessionId: string | null
   cwd: string | null
+  mentionEntries: CompletionEntry[]
 }): { adapter: Unstable_TriggerAdapter; loading: boolean } {
-  const { gateway, sessionId, cwd } = options
+  const { gateway, sessionId, cwd, mentionEntries } = options
   const enabled = Boolean(gateway)
 
   // Cache key: the completion depends on the query AND the directory it's
@@ -127,12 +129,24 @@ export function useAtCompletions(options: {
 
         const items = result.items ?? []
 
-        return { items: items.length > 0 ? items : starters, query }
+        // Plugin-contributed mentions ride along whenever their handle/name
+        // matches what the user is typing. They are grouped so the picker
+        // reads as one list with a labeled "Bots" (or plugin-chosen) section,
+        // not a wall of mixed kinds.
+        const displayOf = (e: CompletionEntry) => (typeof e.display === 'string' ? e.display : e.text)
+        const mentionMatches = mentionEntries.filter(
+          e => !query || e.text.toLowerCase().includes(query.toLowerCase()) || displayOf(e).toLowerCase().includes(query.toLowerCase())
+        )
+
+        return { items: items.length > 0 ? [...items, ...mentionMatches] : [...starters, ...mentionMatches], query }
       } catch {
-        return { items: starters, query }
+        return {
+          items: [...starters, ...mentionEntries.filter(e => !query || e.text.toLowerCase().includes(query.toLowerCase()))],
+          query
+        }
       }
     },
-    [cacheKey, gateway, sessionId, cwd]
+    [cacheKey, gateway, mentionEntries, sessionId, cwd]
   )
 
   const toItem = useCallback((entry: CompletionEntry, index: number): Unstable_TriggerItem => {
@@ -153,7 +167,9 @@ export function useAtCompletions(options: {
       type: classified.type,
       label: classified.display,
       ...(classified.meta ? { description: classified.meta } : {}),
-      metadata
+      // Mark plugin-contributed mentions so the mid-message trigger keeps
+      // them alongside skills (bots are legitimate inline references).
+      ...(entry.group ? { metadata: { ...metadata, mention: true } } : { metadata })
     }
   }, [])
 

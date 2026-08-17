@@ -22,6 +22,7 @@ import { $hudMode } from '@/store/hud'
 import { sessionBlockingPrompt } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
 import { $gatewayState } from '@/store/session'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
@@ -34,7 +35,7 @@ import {
   slashArgStage
 } from './composer-utils'
 import { ContextMenu } from './context-menu'
-import { COMPOSER_AREAS, runComposerMiddleware } from './contrib'
+import { COMPOSER_AREAS, runComposerMiddleware, useComposerMentionProviders } from './contrib'
 import { ComposerControls } from './controls'
 import { ComposerDirectiveActions } from './directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
@@ -202,7 +203,25 @@ export function ChatBar({
   const composingRef = useRef(false) // true during IME composition (CJK input)
 
   const { availableThemes, themeName } = useTheme()
-  const at = useAtCompletions({ gateway: gateway ?? null, sessionId: sessionId ?? null, cwd: cwd ?? null })
+  const gatewayProfileName = useStore($activeGatewayProfile)
+  // Plugin-contributed `@` mentions (e.g. bot roster names) — resolved once
+  // per composer render, then filtered per keystroke inside useAtCompletions.
+  const mentionProviders = useComposerMentionProviders()
+  const mentionEntries = useMemo(() => {
+    const ctx = {
+      sessionId: sessionId ?? '',
+      gatewayProfile: (gatewayProfileName || '').trim()
+    }
+
+    return mentionProviders.flatMap(provider => {
+      try {
+        return provider.resolve(ctx) ?? []
+      } catch {
+        return []
+      }
+    })
+  }, [gatewayProfileName, mentionProviders, sessionId])
+  const at = useAtCompletions({ gateway: gateway ?? null, sessionId: sessionId ?? null, cwd: cwd ?? null, mentionEntries })
   const slash = useSlashCompletions({ activeSkin: themeName, gateway: gateway ?? null, skinThemes: availableThemes })
   const emoji = useEmojiCompletions()
 

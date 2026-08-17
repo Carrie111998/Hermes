@@ -36,7 +36,8 @@ export const COMPOSER_AREAS = {
   actions: 'composer.actions',
   middleware: 'composer.middleware',
   attachments: 'composer.attachments',
-  microActions: 'composer.microActions'
+  microActions: 'composer.microActions',
+  mentions: 'composer.mentions'
 } as const
 
 export interface ComposerDraft {
@@ -134,6 +135,51 @@ export function useComposerMicroActionProviders(): ComposerMicroActionProvider[]
 
   return useMemo(
     () => contributions.map(c => c.data as ComposerMicroActionProvider).filter(p => typeof p?.resolve === 'function'),
+    [contributions]
+  )
+}
+
+/**
+ * Payload of a `composer.mentions` data contribution — extra entries offered
+ * by the composer's `@` picker alongside file/URL/git references.
+ *
+ * `resolve` is called with the live session context and returns the entries
+ * to offer, or `[]` for "nothing from me". Entries render as a group headed
+ * by `group` when present; the text is what picking the row inserts (use the
+ * same wire shape the gateway's `complete.path` uses, e.g. `@researcher`).
+ */
+export interface ComposerMentionProvider {
+  resolve: (ctx: ComposerMentionContext) => ComposerMentionEntry[]
+}
+
+export interface ComposerMentionEntry {
+  /** Raw text inserted on pick, e.g. `@researcher` (no trailing space — the
+   *  composer adds it, matching file refs). */
+  text: string
+  /** Row label. Defaults to `text`. */
+  display?: string
+  /** Secondary line under the label (role/title). */
+  meta?: string
+  /** Optional section header rendered above the group ("Bots"). When absent,
+   *  entries merge into the plain list. */
+  group?: string
+}
+
+/** What a mention provider gets to branch on. Deliberately small — every
+ *  field here is a standing compatibility promise to the plugins using it. */
+export interface ComposerMentionContext {
+  sessionId: string
+  /** The profile the live gateway is routed to ('' when detached). */
+  gatewayProfile: string
+}
+
+/** Mention providers, memoised against the registry's own stable snapshot —
+ *  resolved once per composer render, not per keystroke. */
+export function useComposerMentionProviders(): ComposerMentionProvider[] {
+  const contributions = useContributions(COMPOSER_AREAS.mentions)
+
+  return useMemo(
+    () => contributions.map(c => c.data as ComposerMentionProvider).filter(p => typeof p?.resolve === 'function'),
     [contributions]
   )
 }

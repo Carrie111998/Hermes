@@ -20,10 +20,12 @@ function gatewayStub(latencyMs = 40) {
   return { calls, gateway }
 }
 
-function setup(latencyMs = 40) {
+function setup(latencyMs = 40, mentionEntries = []) {
   const { calls, gateway } = gatewayStub(latencyMs)
 
-  const { result } = renderHook(() => useAtCompletions({ gateway: gateway as never, sessionId: 's1', cwd: '/repo' }))
+  const { result } = renderHook(() =>
+    useAtCompletions({ gateway: gateway as never, sessionId: 's1', cwd: '/repo', mentionEntries })
+  )
 
   return { calls, result }
 }
@@ -101,6 +103,82 @@ describe('PERF: @ path completions are cached and skip the debounce', () => {
 
     expect(result.current.loading).toBe(false)
     expect(calls.length).toBe(1)
+
+    vi.useRealTimers()
+  })
+})
+
+describe('plugin-contributed mentions ride along the @ picker', () => {
+  const mentions = [
+    { text: '@researcher', display: 'Researcher', meta: 'Model research', group: 'Bots' },
+    { text: '@bookie', display: 'Bookie', meta: 'Betting analytics', group: 'Bots' }
+  ]
+
+  function setupWithMentions(latencyMs = 40) {
+    const { calls, gateway } = gatewayStub(latencyMs)
+
+    const { result } = renderHook(() =>
+      useAtCompletions({ gateway: gateway as never, sessionId: 's1', cwd: '/repo', mentionEntries: mentions as never[] })
+    )
+
+    return { calls, result }
+  }
+
+  it('offers matching mentions alongside path completions', async () => {
+    vi.useFakeTimers()
+    queryClient.clear()
+
+    const { result } = setupWithMentions()
+
+    await type(result, ['res'], 0)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200)
+    })
+
+    const items = result.current.adapter.search?.('res') ?? []
+    const labels = items.map(i => i.label)
+
+    // Gateway returned @folder:resx/ — the bot mention must ride along.
+    expect(labels).toContain('Researcher')
+    expect(labels).not.toContain('Bookie')
+    expect(labels).toContain('resx/')
+
+    vi.useRealTimers()
+  })
+
+  it('filters mentions by their display name too', async () => {
+    vi.useFakeTimers()
+    queryClient.clear()
+
+    const { result } = setupWithMentions()
+
+    await type(result, ['book'], 0)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200)
+    })
+
+    const labels = result.current.adapter.search?.('book')?.map(i => i.label) ?? []
+    expect(labels).toContain('Bookie')
+    expect(labels).not.toContain('Researcher')
+
+    vi.useRealTimers()
+  })
+
+  it('tags mention items so the mid-message filter keeps them', async () => {
+    vi.useFakeTimers()
+    queryClient.clear()
+
+    const { result } = setupWithMentions()
+
+    await type(result, ['@'], 0)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200)
+    })
+
+    const items = result.current.adapter.search?.('@') ?? []
+    const mentionItem = items.find(i => i.label === 'Researcher')
+    expect(mentionItem).toBeTruthy()
+    expect((mentionItem?.metadata as { mention?: boolean } | undefined)?.mention).toBe(true)
 
     vi.useRealTimers()
   })
