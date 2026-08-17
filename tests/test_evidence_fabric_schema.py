@@ -100,6 +100,7 @@ def test_evidence_identity_indexes_reject_exact_uri_and_raw_duplicates(tmp_path)
     connection = _raw_connection(db_path)
     try:
         _insert_open_run(connection, "run")
+        _insert_evidence(connection, "e", "run")
         connection.execute(
             "INSERT INTO evidence_records "
             "(id, research_run_id, source_type, retrieval_method, canonical_uri, "
@@ -141,6 +142,17 @@ def test_terminal_run_cannot_reopen_or_mutate_graph_via_direct_sql(tmp_path):
     connection = _raw_connection(db_path)
     try:
         _insert_open_run(connection, "run")
+        _insert_evidence(connection, "e", "run")
+        connection.execute(
+            "INSERT INTO claims "
+            "(id, research_run_id, text, status, created_by_agent, metadata_json, created_at, updated_at) "
+            "VALUES ('c', 'run', 'claim', 'UNVERIFIED', 'agent', '{}', 1, 1)"
+        )
+        connection.execute(
+            "INSERT INTO claim_evidence_links "
+            "(claim_id, evidence_id, research_run_id, relation, created_by_agent, created_at) "
+            "VALUES ('c', 'e', 'run', 'CONTEXT', 'agent', 1)"
+        )
         connection.execute("UPDATE research_runs SET status = 'COMPLETED' WHERE id = 'run'")
         for status in ("OPEN", "FAILED"):
             with pytest.raises(sqlite3.IntegrityError):
@@ -148,10 +160,8 @@ def test_terminal_run_cannot_reopen_or_mutate_graph_via_direct_sql(tmp_path):
         with pytest.raises(sqlite3.IntegrityError):
             _insert_evidence(connection, "e", "run")
         with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(
-                "INSERT INTO claims "
-                "(id, research_run_id, text, status, created_by_agent, metadata_json, created_at, updated_at) "
-                "VALUES ('c', 'run', 'claim', 'UNVERIFIED', 'agent', '{}', 1, 1)"
-            )
+            connection.execute("UPDATE claims SET status = 'SUPPORTED' WHERE id = 'c'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE claim_evidence_links SET relation = 'SUPPORTS' WHERE claim_id = 'c'")
     finally:
         connection.close()
