@@ -264,6 +264,16 @@ class TestWebServerEndpoints:
         assert response.status_code == 200
         assert response.headers["strict-transport-security"] == "max-age=86400"
 
+    def test_unauthenticated_redirect_includes_hsts_header(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        response = TestClient(web_server.app, follow_redirects=False).get("/")
+
+        assert response.status_code == 302
+        assert response.headers["strict-transport-security"] == "max-age=86400"
+
     @pytest.mark.requires_wal
     def test_get_sessions_poll_preserves_pending_wal(self):
         """Repeated GET-only polls must not checkpoint another writer's WAL."""

@@ -483,14 +483,6 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 _HSTS_HEADER_VALUE = "max-age=86400"
 
 
-@app.middleware("http")
-async def hsts_middleware(request: Request, call_next):
-    """Advertise the short initial HSTS policy on every dashboard response."""
-    response = await call_next(request)
-    response.headers.setdefault("Strict-Transport-Security", _HSTS_HEADER_VALUE)
-    return response
-
-
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
@@ -943,6 +935,14 @@ async def _dashboard_health_middleware(request: Request, call_next):
         raise
     if response.status_code >= 500:
         DASHBOARD_HEALTH.record_error(f"http_{response.status_code}", request.url.path)
+    return response
+
+
+@app.middleware("http")
+async def hsts_middleware(request: Request, call_next):
+    """Advertise the short initial HSTS policy on every dashboard response."""
+    response = await call_next(request)
+    response.headers.setdefault("Strict-Transport-Security", _HSTS_HEADER_VALUE)
     return response
 
 
