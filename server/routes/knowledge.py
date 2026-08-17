@@ -9,7 +9,13 @@ from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal
 from ..db import Database, json_dump, json_load, new_id, now
-from ..product_import import ProductImportConflict, ProductImportValidationError, import_products, parse_product_catalog
+from ..product_import import (
+    ProductImportConflict,
+    ProductImportValidationError,
+    import_products,
+    normalized_product_name,
+    parse_product_catalog,
+)
 from ..schemas import DataPatch
 
 
@@ -215,7 +221,7 @@ def create_product(body: ProductCreate, request: Request, principal: Principal =
                    x_company_id: str | None = Header(default=None)):
     company_id, stamp = _scope(principal, x_company_id), now()
     product_id = new_id("prd")
-    normalized = " ".join(body.product_name.lower().split())
+    normalized = normalized_product_name(body.product_name)
     data = {**body.data, "product_name": body.product_name}
     try:
         request.app.state.db.execute(

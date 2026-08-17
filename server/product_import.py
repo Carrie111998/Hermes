@@ -65,10 +65,11 @@ def _read_records(filename: str, content: bytes) -> list[tuple[int, dict[str, An
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ProductImportValidationError([_error(0, "file", "File is not valid JSON")]) from exc
-    if isinstance(payload, dict):
-        payload = payload.get("products")
-    if not isinstance(payload, list):
-        raise ProductImportValidationError([_error(0, "file", "JSON must be an array of products")])
+    if not isinstance(payload, dict) or not isinstance(payload.get("products"), list):
+        raise ProductImportValidationError([
+            _error(0, "file", "JSON must be an object containing a products array"),
+        ])
+    payload = payload["products"]
     errors = [_error(number, "row", "Each product must be an object")
               for number, record in enumerate(payload, start=1) if not isinstance(record, dict)]
     if errors:
@@ -98,7 +99,7 @@ def _parse_row(source: dict[str, Any], row_number: int) -> ProductImportRow:
         category=_clean_text(source.get("category")),
         model=_clean_text(source.get("model")),
         aliases=aliases,
-        extra={key: value for key, value in source.items() if key not in known and value not in (None, "")},
+        extra={key: value for key, value in source.items() if key not in known},
     )
 
 
