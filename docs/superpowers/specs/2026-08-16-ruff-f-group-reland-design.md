@@ -364,3 +364,81 @@ second spelling is not extra coverage.
 **Verification.** `ruff check --isolated --select F601` over the tree returns clean, so F601
 is genuinely zero rather than suppressed by the sunset list. The list itself was re-derived
 from this tree and is exactly tight — no stale entry, no missing entry, no over-broad code.
+
+## Stage 4 — delivered (2026-08-17): F401 and F541 are zero
+
+Predicted list-after was 172; actual is **171**, with **347 findings left — all F841**.
+F401 (534) and F541 (3) both go to zero. Every rule in the group except F841 is now clean
+tree-wide with no exemption anywhere.
+
+381 files changed. 501 findings took ruff's safe autofix, 9 more took `--unsafe-fixes`
+after each was individually checked, and the remainder were hand-graded — because F401 has
+a failure mode a green lint run cannot see.
+
+### "Unused import" is not the same as "unreferenced name"
+
+Seven imports were load-bearing despite being flagged unused, in three failure modes. They
+are listed here because the modes generalise, and only the first one fails loudly:
+
+**1. Re-export — fails at COLLECTION.** The module itself never uses the name; another
+module does `from <this module> import <name>`.
+
+| removed from | name | imported by |
+|---|---|---|
+| `gateway/run.py` | `_is_dangerous_confirmation` | `tests/gateway/test_stale_confirmation_expiry.py` |
+| `gateway/run.py` | `_PORT_BINDING_PLATFORM_VALUES` | `tests/gateway/test_multiplex_adapter_registry.py` |
+| `hermes_cli/config.py` | `get_process_hermes_home` | `hermes_cli/web_server.py` |
+
+The third is the one that mattered: `web_server` is imported across a wide slice of the
+suite, so one removal took **36 test modules** out at collection time — while `ruff check`
+stayed green.
+
+**2. Patch target — fails at RUNTIME, invisible to `ruff check` AND to collect-only.**
+`patch("pkg.mod.name")` resolves a dotted string at call time, so the name must be bound on
+the module even though no code in it reads the import.
+
+| removed from | name | patched as |
+|---|---|---|
+| `cron/scheduler.py` | `get_due_jobs` | `patch("cron.scheduler.get_due_jobs")` |
+| `hermes_cli/nous_subscription.py` | `managed_nous_tools_enabled` | `monkeypatch.setattr("hermes_cli.nous_subscription.managed_nous_tools_enabled", ...)` |
+| `plugins/memory/mem0/_setup.py` | `get_hermes_home` | `monkeypatch.setattr("plugins.memory.mem0._setup.get_hermes_home", ...)` |
+
+**3. Side effect — fails as a silently passing assertion.** Five sites in
+`tests/tools/test_kanban_tools.py` read `import tools.kanban_tools  # ensure registered`;
+the import populates the tool registry the assertions below then query. Removing it does
+not raise — it makes the test assert against an empty registry. Same class:
+`tests/tools/test_command_guards.py`, whose import carries the comment "Ensure the module
+is importable so we can patch it".
+
+All seven are restored with `# noqa: F401` and the reason recorded at the site, so a future
+sweep does not have to rediscover them.
+
+### Two more things worth keeping
+
+**16 availability probes** — `import X` inside `try/except ImportError`, where the import
+*is* the test. AST-verified all 16 sit in such a block; ruff declines to autofix them and
+suggests `importlib.util.find_spec`, but rewriting 16 probe sites is a larger change than
+the finding warrants, so they carry `noqa`.
+
+**An inert suppression, live for months.** `agent/transports/__init__.py` had
+`# noqa: F401` on the **closing paren** of a multi-line import. ruff attributes F401 to the
+individual name lines, so it suppressed nothing — and read as live protection for as long
+as the F group was off. Replaced with a real `__all__`. Worth checking for this shape
+elsewhere: a trailing `noqa` after `)` on a parenthesised import is always inert.
+
+### Verification
+
+The check that caught the damage was **`pytest --collect-only` against the base**, not the
+lint gate. Static analysis alone was badly incomplete: a scan of bare `import X` statements
+found 6 sites, a hand spot-check of the largest production diff found 2 more, and
+collection then reported 36 broken modules. Two independent scans afterwards — an AST index
+of every `from X import Y` in the repo, plus a dotted-reference/patch-target regex — over
+**454 removed names in 344 files** report zero remaining breakage.
+
+Baseline discipline: the first "main" collect-only read 51655 and appeared to show 18 lost
+tests. It had been run in the **shared checkout, which carried 14 uncommitted files from
+other live sessions**, including a new test file. Re-run against a clean worktree at the
+actual base commit, base and branch match exactly: **51637/51704 collected, 67 deselected,
+0 errors** on both. Never take a baseline from a checkout other sessions are writing to.
+
+Per-file tests over every hand-touched file: 1139 passed, 2 skipped, 0 failed.
