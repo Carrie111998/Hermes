@@ -480,7 +480,13 @@ def _ensure_direct_aliases() -> None:
 def direct_alias_api_key(alias: DirectAlias) -> str:
     """Resolve a direct alias's own credential, or "" when it has none.
 
-    Accepts a literal ``api_key``, a ``${VAR}`` indirection, or ``key_env``.
+    Precedence, highest first — ``api_key`` always wins over ``key_env``, so
+    an entry carrying both is not ambiguous:
+
+    1. ``api_key: "${VAR}"`` — indirection, read from the environment.
+    2. ``api_key: "sk-..."`` — literal.
+    3. ``key_env: VAR`` — read from the environment.
+    4. otherwise "" — the caller resolves from the alias host instead.
     Environment reads go through the per-profile secret scope for the same
     reason the user-provider branch does: a raw ``os.environ`` read hands
     this profile whatever key the process env holds — another profile's,
@@ -1854,6 +1860,15 @@ def switch_model(
                 # second local-endpoint model probe.
                 base_url = _da.base_url
                 api_key = _alias_key
+            elif api_key and api_key != "no-key-required" and (
+                _may_reuse_session_credential(base_url, _da.base_url)
+            ):
+                # The alias points at the very origin the resolution above
+                # already produced a key for, so that key is the
+                # host-appropriate one and re-entering the resolver would only
+                # repeat the work — including, for a local endpoint with no
+                # configured model, a second bounded /models probe.
+                base_url = _da.base_url
             else:
                 try:
                     # Resolve as bare `custom` REGARDLESS of the alias's

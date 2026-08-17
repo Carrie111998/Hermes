@@ -1536,10 +1536,10 @@ display:
 #
 # An alias pointing at its own endpoint can carry that endpoint's
 # credential with `api_key` (a literal, or a "${VAR}" reference) or
-# `key_env` (an env var name). When neither is set the key is resolved
-# from the alias HOST — never from whatever provider was active before
-# the switch, which would send that provider's secret to an unrelated
-# third party.
+# `key_env` (an env var name). `api_key` wins if both are set. When
+# neither is set the key is resolved from the alias HOST — never from
+# whatever provider was active before the switch, which would send that
+# provider's secret to an unrelated third party.
 #
 # model_aliases:
 #   opus:

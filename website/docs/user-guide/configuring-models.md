@@ -258,7 +258,8 @@ model_aliases:
 
 An alias that points at its own endpoint can also carry that endpoint's
 credential, with either `api_key` (a literal, or a `"${VAR}"` reference) or
-`key_env` (the name of an environment variable):
+`key_env` (the name of an environment variable). If both are set, `api_key`
+wins:
 
 ```yaml
 model_aliases:

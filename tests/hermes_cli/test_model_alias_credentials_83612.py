@@ -413,6 +413,75 @@ class TestSessionCredentialIsScopedToTheOrigin:
         assert result.api_key == "sk-SESSION-SECRET"
 
 
+class TestCredentialPrecedenceIsExplicit:
+    """`api_key` outranks `key_env`, so an entry carrying both is unambiguous."""
+
+    def test_api_key_wins_over_key_env(self, monkeypatch):
+        monkeypatch.setenv("THETA_API_KEY", "sk-from-key-env")
+        from hermes_cli.model_switch import DirectAlias, direct_alias_api_key
+
+        alias = DirectAlias("theta-1", "custom", ALIAS_HOST,
+                            "sk-literal", "THETA_API_KEY")
+        assert direct_alias_api_key(alias) == "sk-literal"
+
+    def test_env_template_api_key_also_wins_over_key_env(self, monkeypatch):
+        monkeypatch.setenv("PRIMARY", "sk-from-template")
+        monkeypatch.setenv("FALLBACK", "sk-from-key-env")
+        from hermes_cli.model_switch import DirectAlias, direct_alias_api_key
+
+        alias = DirectAlias("theta-1", "custom", ALIAS_HOST,
+                            "${PRIMARY}", "FALLBACK")
+        assert direct_alias_api_key(alias) == "sk-from-template"
+
+    def test_key_env_used_when_api_key_is_blank(self, monkeypatch):
+        monkeypatch.setenv("FALLBACK", "sk-from-key-env")
+        from hermes_cli.model_switch import DirectAlias, direct_alias_api_key
+
+        alias = DirectAlias("theta-1", "custom", ALIAS_HOST, "   ", "FALLBACK")
+        assert direct_alias_api_key(alias) == "sk-from-key-env"
+
+
+class TestSchemelessBaseUrls:
+    """Scheme-less base URLs.
+
+    A loopback alias written without a scheme keeps working — the loopback
+    exemption does not depend on the scheme. A scheme-less URL that also
+    changes origin is refused, which costs nothing in practice: httpx cannot
+    build a client from one at all (`localhost:11434/v1` parses as
+    scheme='localhost', host=''), so such a base_url is non-functional
+    regardless of what this comparison decides.
+    """
+
+    def test_hostname_and_port_survive_without_a_scheme(self):
+        from utils import base_url_origin
+
+        assert base_url_origin("localhost:11434/v1") == ("", "localhost", 11434)
+        assert base_url_origin("127.0.0.1:11434") == ("", "127.0.0.1", 11434)
+
+    @pytest.mark.parametrize("url", ["localhost:11434/v1", "127.0.0.1:11434/v1"])
+    def test_schemeless_loopback_alias_keeps_the_session_credential(self, url):
+        from hermes_cli.model_switch import _may_reuse_session_credential
+
+        assert _may_reuse_session_credential(url, url) is True
+
+    def test_schemeless_is_not_treated_as_the_schemed_origin(self):
+        """`http://h` and `h` are not asserted equal — an unknown scheme is
+        not evidence that the origin is unchanged."""
+        from hermes_cli.model_switch import _may_reuse_session_credential
+
+        assert _may_reuse_session_credential(
+            "http://localhost:11434/v1", "localhost:11434/v1"
+        ) is False
+
+    def test_httpx_cannot_use_a_schemeless_base_url(self):
+        """Pins the premise above: this is why the strict answer is harmless."""
+        httpx = pytest.importorskip("httpx")
+
+        assert httpx.URL("localhost:11434/v1").host == ""
+        assert httpx.URL("api.example.com/v1").host == ""
+        assert httpx.URL("http://localhost:11434/v1").host == "localhost"
+
+
 class TestBaseUrlOrigin:
     """The origin helper the reuse decision is built on."""
 

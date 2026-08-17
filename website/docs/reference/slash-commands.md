@@ -200,7 +200,8 @@ model_aliases:
 
 An alias with its own `base_url` can carry that endpoint's credential via
 `api_key` (a literal, or a `"${VAR}"` reference) or `key_env` (an environment
-variable name). With neither set, the key is resolved from the alias **host**
+variable name); `api_key` wins if both are set. With neither set, the key is
+resolved from the alias **host**
 and never inherited from the provider that was active before the switch.
 
 **Short form** — `provider/model` in one string. Set from the shell without editing YAML:
