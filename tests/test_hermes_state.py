@@ -1175,6 +1175,41 @@ class TestPruneSessions:
         assert db.get_session("other-source")["archived"] == 0
         assert db.get_session("ended")["archived"] == 0
 
+    def test_archive_open_prune_matches_rolls_back_the_batch_on_failure(self, db):
+        db.create_session(session_id="first", source="cron")
+        db.create_session(session_id="second", source="cron")
+        old = time.time() - 200 * 86400
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id IN (?, ?)",
+            (old, "first", "second"),
+        )
+        calls = 0
+
+        def fail_second_archive():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("forced archive failure")
+
+        db._conn.create_function("fail_second_archive", 0, fail_second_archive)
+        db._conn.execute(
+            """
+            CREATE TRIGGER fail_archive_batch
+            BEFORE UPDATE OF archived ON sessions
+            WHEN NEW.archived = 1
+            BEGIN
+                SELECT fail_second_archive();
+            END
+            """
+        )
+        db._conn.commit()
+
+        with pytest.raises(sqlite3.OperationalError):
+            db.archive_open_prune_matches(older_than_days=90, source="cron")
+
+        assert db.get_session("first")["archived"] == 0
+        assert db.get_session("second")["archived"] == 0
+
 
 
 

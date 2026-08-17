@@ -39,7 +39,14 @@ def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
     assert "Deleted session '20260315_092437_c9a6ff'." in output
 
 
-def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0):
+def _run_prune(
+    monkeypatch,
+    capsys,
+    argv_tail,
+    candidates=None,
+    skipped_open=0,
+    allow_distinct_open_filters=False,
+):
     """Run `hermes sessions prune <argv_tail>` against a FakeDB, capturing
     the filter kwargs passed to list_prune_candidates. Auto-confirms."""
     import hermes_cli.main as main_mod
@@ -75,7 +82,10 @@ def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0):
             return rows
 
         def count_open_prune_matches(self, **kwargs):
-            assert kwargs == seen
+            if allow_distinct_open_filters:
+                seen["open_match_filters"] = kwargs
+            else:
+                assert kwargs == seen
             return skipped_open
 
         def prune_sessions(self, **kwargs):
@@ -160,6 +170,23 @@ def test_sessions_prune_include_live_runs_when_only_open_sessions_match(monkeypa
     assert archived_filters == filters
     assert "Pruned 0 ended session(s); archived 2 open session(s)." in out
     assert "No sessions match" not in out
+
+
+def test_sessions_prune_include_live_ignores_already_archived_open_sessions(
+    monkeypatch, capsys
+):
+    filters, _out = _run_prune(
+        monkeypatch,
+        capsys,
+        ["--include-archived", "--include-live", "--yes"],
+        skipped_open=2,
+        allow_distinct_open_filters=True,
+    )
+
+    archived_filters = filters.pop("archived_open_with")
+    open_match_filters = filters.pop("open_match_filters")
+    assert filters["archived"] is None
+    assert open_match_filters == archived_filters == {**filters, "archived": False}
 
 
 def test_sessions_prune_rejects_include_live_with_never_active(monkeypatch, capsys):

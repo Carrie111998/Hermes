@@ -11876,9 +11876,10 @@ def _prune_sessions(body: SessionPrune):
             max_tool_calls=body.max_tool_calls,
             archived=None if body.include_archived else False,
         )
-        open_matches = db.count_open_prune_matches(
-            **({**filters, "archived": False} if body.include_live else filters)
+        archive_filters = (
+            {**filters, "archived": False} if body.include_live else filters
         )
+        open_matches = db.count_open_prune_matches(**archive_filters)
         if body.dry_run:
             rows = db.list_prune_candidates(**filters)
             result = {
@@ -11923,7 +11924,7 @@ def _prune_sessions(body: SessionPrune):
             "skipped_open": 0 if body.include_live else open_matches,
         }
         if body.include_live:
-            result["archived"] = db.archive_open_prune_matches(**filters)
+            result["archived"] = db.archive_open_prune_matches(**archive_filters)
         return result
     finally:
         db.close()

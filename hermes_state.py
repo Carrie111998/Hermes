@@ -11816,21 +11816,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         This is deliberately separate from :meth:`prune_sessions`: destructive
         pruning must retain its ended-session guard. Only unarchived rows are
-        selected, and each match is archived through ``set_session_archived`` so
-        compression lineages remain hidden and recoverable as a unit.
+        selected, and every match's compression lineage is archived atomically
+        so the conversation remains hidden and recoverable as a unit.
         """
         filters["archived"] = False
         open_where, params = self._open_prune_filter_where(
             older_than_days, source, filters
         )
-        with self._lock:
-            cursor = self._conn.execute(
-                f"SELECT s.id FROM sessions s WHERE {open_where}", params
+
+        def _do(conn):
+            matched = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params
+                ).fetchone()[0]
             )
-            session_ids = [row["id"] for row in cursor.fetchall()]
-        for session_id in session_ids:
-            self.set_session_archived(session_id, True)
-        return len(session_ids)
+            if not matched:
+                return 0
+            conn.execute(
+                f"""
+                WITH RECURSIVE
+                  matches(id) AS (
+                    SELECT s.id FROM sessions s WHERE {open_where}
+                  ),
+                  ancestors(id) AS (
+                    SELECT id FROM matches
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT id FROM matches
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET archived = 1
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                params,
+            )
+            return matched
+
+        return self._execute_write(_do)
 
     def archive_sessions(
         self,

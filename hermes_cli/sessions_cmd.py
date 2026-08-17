@@ -950,13 +950,14 @@ def cmd_sessions(args, sessions_parser=None):
 
         candidates = db.list_prune_candidates(**filters)
         include_live = action == "prune" and getattr(args, "include_live", False)
+        archive_filters = (
+            {**filters, "archived": False} if include_live else filters
+        )
         # Archive expands each selected row to its compression lineage, which
         # can include open continuations; a direct-open count would therefore
         # describe the eventual archive effect inaccurately.
         skipped_open = (
-            db.count_open_prune_matches(
-                **({**filters, "archived": False} if include_live else filters)
-            )
+            db.count_open_prune_matches(**archive_filters)
             if action == "prune"
             else 0
         )
@@ -1035,7 +1036,7 @@ def cmd_sessions(args, sessions_parser=None):
             sessions_dir = get_hermes_home() / "sessions"
             count = db.prune_sessions(sessions_dir=sessions_dir, **filters)
             if include_live:
-                archived = db.archive_open_prune_matches(**filters)
+                archived = db.archive_open_prune_matches(**archive_filters)
                 print(
                     f"Pruned {count} ended session(s); archived {archived} "
                     "open session(s)."
