@@ -24,6 +24,16 @@ from pathlib import Path
 from string import Template
 from typing import Any, Dict, Iterable, List, Optional
 
+try:
+    from hermes_constants import display_hermes_home, get_hermes_home
+except Exception:  # pragma: no cover - fallback when running outside Hermes package
+    def display_hermes_home() -> str:
+        return "~/.hermes"
+
+    def get_hermes_home() -> Path:
+        return Path.home() / ".hermes"
+
+
 logger = None  # lazily loaded hermes_logging
 
 _KIT_DATA = Path(__file__).parent / "vertical_agent_kit_data"
@@ -144,6 +154,13 @@ def render_blueprint(
     if dest.exists() and not overwrite:
         raise FileExistsError(f"Destination already exists: {dest}")
     if dest.exists():
+        # Only overwrite a directory that looks like a previously generated
+        # scaffold. Wholesale deletion of arbitrary directories is dangerous.
+        existing = _find_scaffold_files(dest)
+        if not any(existing.values()):
+            raise FileExistsError(
+                f"Destination exists and does not look like a vertical-agent scaffold: {dest}"
+            )
         shutil.rmtree(dest)
 
     written: List[Path] = []
@@ -167,12 +184,13 @@ def render_blueprint(
 
 
 def _input_default(prompt: str, default: str = "") -> str:
-    """Read a line of input, returning ``default`` when the user presses enter."""
+    """Read a line of input, returning ``default`` when the user presses enter.
+
+    ``EOFError`` is re-raised so that callers can treat Ctrl+D/EOF as an abort
+    signal rather than silently accepting the default.
+    """
     suffix = f" [{default}]" if default else ""
-    try:
-        answer = input(f"{prompt}{suffix}: ")
-    except EOFError:
-        answer = ""
+    answer = input(f"{prompt}{suffix}: ")
     return answer.strip() or default
 
 
@@ -282,6 +300,11 @@ def smoke_scaffold(path: Path) -> tuple[List[str], List[str]]:
                 timeout=30,
                 check=True,
             )
+        except subprocess.CalledProcessError as exc:
+            err = (exc.stderr or "").strip()[:200]
+            errors.append(f"Hermes --version probe failed: {err or exc}")
+        except subprocess.TimeoutExpired as exc:
+            errors.append(f"Hermes --version probe timed out: {exc}")
         except Exception as exc:
             errors.append(f"Hermes --version probe failed: {exc}")
     else:
@@ -335,11 +358,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
     for f in written:
         print(f"  - {f.relative_to(output_dir)}")
 
-    user_target = Path.home() / ".hermes" / "memories" / "USER.md"
+    user_target = get_hermes_home() / "memories" / "USER.md"
     print(
         f"\nNext steps:\n"
         f"  1. Review SOUL.md, OPERATIONS.md, and USER.template.md.\n"
-        f"  2. Copy USER.template.md to {user_target} if this is the default profile.\n"
+        f"  2. Copy USER.template.md to {display_hermes_home()}/memories/USER.md if this is the default profile.\n"
         f"  3. Create a Hermes profile: hermes profile create {profile_name} --clone\n"
         f"  4. Verify: hermes vertical-agent verify {output_dir / profile_name}"
     )

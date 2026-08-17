@@ -87,6 +87,31 @@ def test_render_blueprint_overwrite_flag(temp_out: Path):
     render_blueprint("support", temp_out, variables, overwrite=True)
 
 
+def test_render_blueprint_force_refuses_non_scaffold(temp_out: Path):
+    variables = {
+        "PROFILE_NAME": "existing-dir",
+        "ROLE": "Role A",
+        "OBJECTIVE": "Objective A",
+        "USERS": "team",
+        "TONE": "calm",
+        "SCOPE": "scope",
+        "REFUSALS": "refuse",
+        "SOURCES": "docs",
+        "SYSTEMS": "none",
+        "DECISION_STYLE": "fast",
+    }
+    # Pre-create a directory that does not look like a scaffold.
+    (temp_out / "existing-dir").mkdir(parents=True)
+    (temp_out / "existing-dir" / "my-data.txt").write_text("important")
+
+    with pytest.raises(FileExistsError) as exc_info:
+        render_blueprint("support", temp_out, variables, overwrite=True)
+    assert "does not look like a vertical-agent scaffold" in str(exc_info.value)
+
+    # The pre-existing file must survive.
+    assert (temp_out / "existing-dir" / "my-data.txt").exists()
+
+
 def test_verify_scaffold_passes_for_rendered(temp_out: Path):
     variables = {
         "PROFILE_NAME": "verify-agent",
