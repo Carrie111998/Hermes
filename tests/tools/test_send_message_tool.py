@@ -1087,6 +1087,146 @@ class TestSendDiscordThreadId:
         response.json.assert_not_awaited()
         response.text.assert_not_awaited()
 
+
+class TestSendDiscord429Retry:
+    """Standalone Discord REST sends retry bounded 429s (#44468)."""
+
+    @staticmethod
+    def _resp(status, json_data=None, text="", headers=None):
+        resp = MagicMock()
+        resp.status = status
+        resp.json = AsyncMock(return_value=json_data or {"id": "msg123"})
+        resp.text = AsyncMock(return_value=text)
+        resp.headers = headers or {}
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=None)
+        return resp
+
+    @staticmethod
+    def _session(responses):
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        session.post = MagicMock(side_effect=responses)
+        return session
+
+    @staticmethod
+    def _429_body(retry_after=None):
+        payload = {"message": "You are being rate limited.", "global": False}
+        if retry_after is not None:
+            payload["retry_after"] = retry_after
+        return json.dumps(payload)
+
+    def test_429_then_success_honors_body_retry_after(self):
+        mock_session = self._session([
+            self._resp(429, text=self._429_body(0.3)),
+            self._resp(200, json_data={"id": "777"}),
+        ])
+        sleep_mock = AsyncMock()
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", sleep_mock):
+            result = asyncio.run(_send_discord("tok", "111", "hi", thread_id="999"))
+
+        assert result["success"] is True
+        assert result["message_id"] == "777"
+        assert mock_session.post.call_count == 2
+        sleep_mock.assert_awaited_once_with(0.3)
+
+    def test_429_then_success_honors_header_retry_after(self):
+        mock_session = self._session([
+            self._resp(429, text="not json", headers={"Retry-After": "0.4"}),
+            self._resp(200, json_data={"id": "888"}),
+        ])
+        sleep_mock = AsyncMock()
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", sleep_mock):
+            result = asyncio.run(_send_discord("tok", "111", "hi", thread_id="999"))
+
+        assert result["success"] is True
+        assert result["message_id"] == "888"
+        sleep_mock.assert_awaited_once_with(0.4)
+
+    def test_429_without_retry_after_uses_backoff(self):
+        mock_session = self._session([
+            self._resp(429, text="not json"),
+            self._resp(200, json_data={"id": "999"}),
+        ])
+        sleep_mock = AsyncMock()
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", sleep_mock):
+            result = asyncio.run(_send_discord("tok", "111", "hi", thread_id="999"))
+
+        assert result["success"] is True
+        assert result["message_id"] == "999"
+        sleep_mock.assert_awaited_once_with(1.0)
+
+    def test_429_exhausts_attempts_returns_error(self):
+        mock_session = self._session([
+            self._resp(429, text=self._429_body(0.1)),
+            self._resp(429, text=self._429_body(0.1)),
+            self._resp(429, text=self._429_body(0.1)),
+        ])
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", AsyncMock()):
+            result = asyncio.run(_send_discord("tok", "111", "hi", thread_id="999"))
+
+        assert "error" in result
+        assert "429" in result["error"]
+        assert mock_session.post.call_count == 3
+
+    def test_huge_retry_after_gives_up_immediately(self):
+        mock_session = self._session([
+            self._resp(429, text=self._429_body(3600.0)),
+        ])
+        sleep_mock = AsyncMock()
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", sleep_mock):
+            result = asyncio.run(_send_discord("tok", "111", "hi", thread_id="999"))
+
+        assert "error" in result
+        assert "429" in result["error"]
+        assert mock_session.post.call_count == 1
+        sleep_mock.assert_not_awaited()
+
+    def test_non_429_error_is_not_retried(self):
+        mock_session = self._session([
+            self._resp(403, text='{"message": "Forbidden"}'),
+        ])
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", AsyncMock()):
+            result = asyncio.run(_send_discord("tok", "111", "hi", thread_id="999"))
+
+        assert "error" in result
+        assert "403" in result["error"]
+        assert mock_session.post.call_count == 1
+
+    def test_multipart_media_retry_rebuilds_form(self, tmp_path):
+        media = tmp_path / "photo.png"
+        media.write_bytes(b"fake image bytes")
+        mock_session = self._session([
+            self._resp(429, text=self._429_body(0.2)),
+            self._resp(200, json_data={"id": "media-msg"}),
+        ])
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", AsyncMock()):
+            result = asyncio.run(
+                _send_discord("tok", "111", "", media_files=[(str(media), False)])
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "media-msg"
+        assert mock_session.post.call_count == 2
+        first_form = mock_session.post.call_args_list[0].kwargs["data"]
+        second_form = mock_session.post.call_args_list[1].kwargs["data"]
+        assert first_form is not second_form
+
 class TestSendToPlatformDiscordThread:
     """_send_to_platform passes thread_id through to _send_discord."""
 

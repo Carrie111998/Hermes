@@ -9938,6 +9938,92 @@ async def _standalone_read_json_limited(resp: Any, limit_bytes: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+_DISCORD_STANDALONE_RETRY_ATTEMPTS = 3
+_DISCORD_STANDALONE_MAX_RETRY_AFTER_SECONDS = 10.0
+
+
+def _standalone_retry_after_seconds(resp: Any, body: str) -> Optional[float]:
+    """Extract Discord retry_after seconds from a 429 response."""
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and parsed.get("retry_after") is not None:
+            return max(float(parsed["retry_after"]), 0.0)
+    except (TypeError, ValueError):
+        pass
+
+    headers = getattr(resp, "headers", {}) or {}
+    header = headers.get("Retry-After") or headers.get("X-RateLimit-Reset-After")
+    if header is None:
+        return None
+    try:
+        return max(float(header), 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _standalone_noop_cleanup() -> None:
+    return None
+
+
+async def _standalone_post_with_retry(
+    session: Any,
+    url: str,
+    *,
+    headers: Dict[str, str],
+    req_kw: Dict[str, Any],
+    json_payload: Optional[dict] = None,
+    form_factory: Optional[Callable[[], Tuple[Any, Callable[[], None]]]] = None,
+    attempts: int = _DISCORD_STANDALONE_RETRY_ATTEMPTS,
+) -> Tuple[int, Any]:
+    """POST to Discord REST with bounded 429 retry for standalone sends.
+
+    Returns ``(status, data)`` where ``data`` is parsed JSON for success and
+    limited body text for errors. Multipart callers pass ``form_factory`` so
+    each retry gets a fresh body; aiohttp FormData cannot be reused.
+    """
+    body = ""
+    max_attempts = max(1, attempts)
+    for attempt in range(max_attempts):
+        kwargs = dict(req_kw)
+        cleanup = _standalone_noop_cleanup
+        if json_payload is not None:
+            kwargs["json"] = json_payload
+        if form_factory is not None:
+            form, cleanup = form_factory()
+            kwargs["data"] = form
+        try:
+            async with session.post(url, headers=headers, **kwargs) as resp:
+                status = resp.status
+                if status in {200, 201}:
+                    return status, await _standalone_read_json_limited(
+                        resp,
+                        _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                    )
+                body = await _standalone_read_text_limited(
+                    resp,
+                    _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
+                )
+                if status != 429 or attempt >= max_attempts - 1:
+                    return status, body
+                delay = _standalone_retry_after_seconds(resp, body)
+        finally:
+            with suppress(Exception):
+                cleanup()
+
+        if delay is None:
+            delay = float(2 ** attempt)
+        if delay > _DISCORD_STANDALONE_MAX_RETRY_AFTER_SECONDS:
+            return status, body
+        logger.warning(
+            "Discord standalone REST POST rate limited (attempt %d/%d), retrying in %.2fs",
+            attempt + 1,
+            max_attempts,
+            delay,
+        )
+        await asyncio.sleep(delay)
+    return 429, body
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -10057,52 +10143,47 @@ async def _standalone_send(
                         starter_message = {"content": (caption or message), "attachments": attachments_meta}
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
 
-                        form = aiohttp.FormData()
-                        form.add_field("payload_json", payload_json, content_type="application/json")
-
                         try:
-                            for idx, media_path in enumerate(valid_media):
-                                with open(media_path, "rb") as fh:
+                            def _build_thread_form():
+                                handles = []
+                                form = aiohttp.FormData()
+                                form.add_field("payload_json", payload_json, content_type="application/json")
+                                for idx, media_path in enumerate(valid_media):
+                                    fh = open(media_path, "rb")
+                                    handles.append(fh)
                                     form.add_field(
                                         f"files[{idx}]",
-                                        fh.read(),
+                                        fh,
                                         filename=os.path.basename(media_path),
                                     )
-                            async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
-                                if resp.status not in {200, 201}:
-                                    body = await _standalone_read_text_limited(
-                                        resp,
-                                        _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
-                                    )
-                                    return {"error": f"Discord forum thread creation error ({resp.status}): {body}"}
-                                data = await _standalone_read_json_limited(
-                                    resp,
-                                    _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                                )
+                                return form, lambda: [fh.close() for fh in handles]
+
+                            status, data = await _standalone_post_with_retry(
+                                session,
+                                thread_url,
+                                headers=auth_headers,
+                                req_kw=_req_kw,
+                                form_factory=_build_thread_form,
+                            )
+                            if status not in {200, 201}:
+                                return {"error": f"Discord forum thread creation error ({status}): {data}"}
                         except Exception as e:
                             return {"error": _standalone_sanitize_error(f"Discord forum thread upload failed: {e}")}
                     else:
                         # No media — simple JSON POST creates the thread with
                         # just the text starter.
-                        async with session.post(
+                        status, data = await _standalone_post_with_retry(
+                            session,
                             thread_url,
                             headers=json_headers,
-                            json={
+                            req_kw=_req_kw,
+                            json_payload={
                                 "name": thread_name,
                                 "message": {"content": message},
                             },
-                            **_req_kw,
-                        ) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await _standalone_read_text_limited(
-                                    resp,
-                                    _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
-                                )
-                                return {"error": f"Discord forum thread creation error ({resp.status}): {body}"}
-                            data = await _standalone_read_json_limited(
-                                resp,
-                                _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                            )
+                        )
+                        if status not in {200, 201}:
+                            return {"error": f"Discord forum thread creation error ({status}): {data}"}
 
                 thread_id_created = data.get("id")
                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
@@ -10122,17 +10203,16 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
-                    if resp.status not in {200, 201}:
-                        body = await _standalone_read_text_limited(
-                            resp,
-                            _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
-                        )
-                        return {"error": f"Discord API error ({resp.status}): {body}"}
-                    last_data = await _standalone_read_json_limited(
-                        resp,
-                        _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                    )
+                status, data = await _standalone_post_with_retry(
+                    session,
+                    url,
+                    headers=json_headers,
+                    req_kw=_req_kw,
+                    json_payload={"content": message},
+                )
+                if status not in {200, 201}:
+                    return {"error": f"Discord API error ({status}): {data}"}
+                last_data = data
 
             # Send each media file as a separate multipart upload. When a
             # MEDIA:<path> caption was supplied, ride it as the message content
@@ -10148,44 +10228,50 @@ async def _standalone_send(
                     warnings.append(warning)
                     if caption_pending:
                         try:
-                            async with session.post(
-                                url, headers=json_headers,
-                                json={"content": caption}, **_req_kw,
-                            ) as resp:
-                                if resp.status in {200, 201}:
-                                    last_data = await _standalone_read_json_limited(
-                                        resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                                    )
-                                    caption_pending = False
+                            status, data = await _standalone_post_with_retry(
+                                session,
+                                url,
+                                headers=json_headers,
+                                req_kw=_req_kw,
+                                json_payload={"content": caption},
+                            )
+                            if status in {200, 201}:
+                                last_data = data
+                                caption_pending = False
                         except Exception:
                             logger.warning("Discord caption-fallback send failed for missing media")
                     continue
                 try:
-                    form = aiohttp.FormData()
                     filename = os.path.basename(media_path)
+                    caption_for_upload = caption if caption_pending else None
                     if caption_pending:
-                        form.add_field(
-                            "payload_json",
-                            json.dumps({"content": caption}),
-                            content_type="application/json",
-                        )
                         caption_pending = False
-                    with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
-                        async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await _standalone_read_text_limited(
-                                    resp,
-                                    _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
-                                )
-                                warning = _standalone_sanitize_error(f"Failed to send media {media_path}: Discord API error ({resp.status}): {body}")
-                                logger.error(warning)
-                                warnings.append(warning)
-                                continue
-                            last_data = await _standalone_read_json_limited(
-                                resp,
-                                _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+
+                    def _build_media_form():
+                        form = aiohttp.FormData()
+                        if caption_for_upload:
+                            form.add_field(
+                                "payload_json",
+                                json.dumps({"content": caption_for_upload}),
+                                content_type="application/json",
                             )
+                        fh = open(media_path, "rb")
+                        form.add_field("files[0]", fh, filename=filename)
+                        return form, fh.close
+
+                    status, data = await _standalone_post_with_retry(
+                        session,
+                        url,
+                        headers=auth_headers,
+                        req_kw=_req_kw,
+                        form_factory=_build_media_form,
+                    )
+                    if status not in {200, 201}:
+                        warning = _standalone_sanitize_error(f"Failed to send media {media_path}: Discord API error ({status}): {data}")
+                        logger.error(warning)
+                        warnings.append(warning)
+                        continue
+                    last_data = data
                 except Exception as e:
                     warning = _standalone_sanitize_error(f"Failed to send media {media_path}: {e}")
                     logger.error(warning)
