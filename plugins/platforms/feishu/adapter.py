@@ -3104,6 +3104,12 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
         )
+        # If the payload omitted open_message_id, the event is routed with the
+        # callback token — log it so future 99992354 reports are diagnosable.
+        if not card_message_id and token:
+            logger.debug(
+                "[Feishu] Card action callback omitted open_message_id; falling back to callback token as message_id"
+            )
         synthetic_event = MessageEvent(
             text=synthetic_text,
             message_type=MessageType.COMMAND,
