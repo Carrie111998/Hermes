@@ -165,6 +165,19 @@ class TestWalkerDirect:
         out = repr(redact_object({"wibble_wobble_field": CANARIES["openai_prefixed"]}))
         assert CANARIES["openai_prefixed"] not in out
 
+    @pytest.mark.parametrize("name", list(CANARIES))
+    def test_every_canary_still_contained_under_the_ambiguous_key(self, name):
+        """Phase 9 / C2 added a shape exemption to the bare `key` name so that
+        browser_press ("Enter", "Tab") survives. This asserts the exemption did
+        not open a hole: every canary in the corpus is long enough or
+        odd-shaped enough to still be redacted there.
+
+        The exemption's residual -- a SHORT identifier-shaped credential under
+        bare `key` -- is pinned separately in tests/agent/test_redact_object.py.
+        """
+        out = repr(redact_object({"key": CANARIES[name]}))
+        assert CANARIES[name] not in out
+
 
 # --------------------------------------------------------------------------
 # Sink 4 -- MEASURE AND RECORD (expected positive; Phase E input)

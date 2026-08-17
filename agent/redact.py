@@ -419,6 +419,25 @@ REDACTED_PLACEHOLDER = "[REDACTED]"
 # rather than walked.
 _MAX_REDACT_DEPTH = 64
 
+# Key names that are ambiguous: they mark a credential often enough to keep in
+# the set, but are also ordinary parameter names in real tool schemas. Bare
+# `key` is the case that bit us -- `browser_press` takes `key` holding "Enter",
+# "Tab", "ArrowDown", and blanket redaction destroyed both the recorded tool
+# call AND the tool schema's property definition.
+#
+# Every OTHER name in _SENSITIVE_BODY_KEYS stays unambiguous and is redacted
+# wholesale with no shape test, so `{"api_key": "short"}` is unaffected.
+_AMBIGUOUS_BODY_KEYS = frozenset({"key"})
+
+# A value that is short and identifier-shaped is not credential-shaped:
+# "Enter", "Tab", "Escape", "ArrowDown", "F5", "ctrl-c". Real opaque
+# credentials are long and high-entropy and fail this test.
+#
+# RESIDUAL, accepted deliberately: a SHORT credential under a bare `key`
+# (e.g. {"key": "hunter2"}) is now kept. Pinned by a test so the cost of this
+# guard stays visible. Unambiguous key names have no such exemption.
+_IDENTIFIER_SHAPED_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,15}$")
+
 
 def _is_sensitive_key(key) -> bool:
     """Exact-match a mapping key against _SENSITIVE_BODY_KEYS.
@@ -430,6 +449,47 @@ def _is_sensitive_key(key) -> bool:
     if not isinstance(key, str):
         return False
     return key.strip().lower().replace("-", "_") in _SENSITIVE_BODY_KEYS
+
+
+def _is_ambiguous_key(key) -> bool:
+    """True for sensitive key names that are also ordinary parameter names."""
+    if not isinstance(key, str):
+        return False
+    return key.strip().lower().replace("-", "_") in _AMBIGUOUS_BODY_KEYS
+
+
+def _redact_keyed_value(value, *, ambiguous: bool, recurse):
+    """Decide what to write for a value whose KEY marked it sensitive.
+
+    Unambiguous key names (``api_key``, ``token``, ``password``, ...) are
+    replaced wholesale with no inspection -- we cannot assume the value's shape
+    is recognisable, and that is the whole point of key-based matching.
+
+    Ambiguous names (bare ``key``) get a shape test first, because they are
+    also real tool parameters:
+
+    * short identifier-shaped string  -> kept  ("Enter", "Tab", "ArrowDown")
+    * any other string                -> redacted wholesale
+    * dict / list                     -> RECURSED, not replaced
+
+    That last branch is the half a string-only guard would miss. A tool
+    *schema* has ``{"key": {"type": "string", "description": ...}}`` -- a dict,
+    not a string -- and replacing it wholesale erased the entire property
+    definition from every session log and transcript.
+    """
+    if not ambiguous:
+        return None if value is None else REDACTED_PLACEHOLDER
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if _IDENTIFIER_SHAPED_RE.match(value):
+            return value
+        return REDACTED_PLACEHOLDER
+    if isinstance(value, (dict, list, tuple, set, frozenset)):
+        return recurse(value)
+    # Non-string scalars (ints, bools) are not credentials.
+    return value
 
 
 def redact_object(
@@ -507,19 +567,26 @@ def _redact_obj(obj, *, force, code_file, depth, max_depth, seen):
             return "[REDACTED: circular reference]"
         seen.add(marker)
         try:
+            def _recurse(v):
+                return _redact_obj(
+                    v,
+                    force=force,
+                    code_file=code_file,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    seen=seen,
+                )
+
             out = {}
             for key, value in obj.items():
                 if _is_sensitive_key(key):
-                    out[key] = None if value is None else REDACTED_PLACEHOLDER
-                else:
-                    out[key] = _redact_obj(
+                    out[key] = _redact_keyed_value(
                         value,
-                        force=force,
-                        code_file=code_file,
-                        depth=depth + 1,
-                        max_depth=max_depth,
-                        seen=seen,
+                        ambiguous=_is_ambiguous_key(key),
+                        recurse=_recurse,
                     )
+                else:
+                    out[key] = _recurse(value)
             return out
         finally:
             seen.discard(marker)

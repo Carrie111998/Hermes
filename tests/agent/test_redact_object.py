@@ -157,8 +157,86 @@ class TestForceDefault:
         assert result["content"] == "sk-proj-abc123def456ghi789"
 
 
+class TestAmbiguousKeyGuard:
+    """Phase 9 / C2 -- regression for the `key` false positive.
+
+    `browser_press` takes a parameter literally named `key`, holding "Enter",
+    "Tab", "ArrowDown". Blanket key-based redaction destroyed both the recorded
+    tool call and the tool schema's property definition in every session log
+    and gateway transcript.
+    """
+
+    @pytest.mark.parametrize("value", ["Enter", "Tab", "Escape", "ArrowDown", "F5", "ctrl-c"])
+    def test_short_identifier_shaped_values_kept(self, value):
+        assert redact_object({"key": value})["key"] == value
+
+    def test_browser_press_tool_call_intact(self):
+        call = {"name": "browser_press", "arguments": {"key": "Enter"}}
+        assert redact_object(call)["arguments"]["key"] == "Enter"
+
+    def test_browser_press_tool_schema_intact(self):
+        """The dict-valued case. A string-only guard would still have erased
+        this -- the schema's value is a dict, not a string."""
+        schema = {
+            "name": "browser_press",
+            "parameters": {
+                "properties": {
+                    "key": {"type": "string", "description": "Key to press (e.g., 'Enter')"}
+                },
+                "required": ["key"],
+            },
+        }
+        prop = redact_object(schema)["parameters"]["properties"]["key"]
+        assert isinstance(prop, dict), "schema property was replaced wholesale"
+        assert prop["type"] == "string"
+        assert "Enter" in prop["description"]
+
+    def test_list_under_ambiguous_key_is_recursed(self):
+        out = redact_object({"key": ["Enter", "Tab"]})
+        assert out["key"] == ["Enter", "Tab"]
+
+    def test_non_string_scalar_under_ambiguous_key_kept(self):
+        assert redact_object({"key": 27})["key"] == 27
+
+    # --- containment must NOT be weakened ------------------------------------
+
+    @pytest.mark.parametrize("value", [
+        "Zq7Z4mKp2Wf9Lx3Rv8Tn1Yb6Hd5Gs0Jc",          # opaque, 32 chars
+        "sk-proj-CANARYaaaabbbbccccddddeeeeffff",     # vendor-prefixed
+        "this value has spaces and is long",          # not identifier-shaped
+        "0123456789abcdef0123",                       # starts with a digit
+    ])
+    def test_credential_shaped_values_still_redacted_under_bare_key(self, value):
+        assert redact_object({"key": value})["key"] == REDACTED_PLACEHOLDER
+
+    @pytest.mark.parametrize("keyname", [
+        "api_key", "apikey", "token", "secret", "password",
+        "authorization", "access_token", "private_key", "client_secret",
+    ])
+    def test_unambiguous_keys_have_no_shape_exemption(self, keyname):
+        """The guard is scoped to bare `key` only. A short value under any
+        unambiguous name is still redacted wholesale."""
+        assert redact_object({keyname: "Enter"})[keyname] == REDACTED_PLACEHOLDER
+
+    def test_unambiguous_key_with_dict_value_still_wholesale(self):
+        """Only the ambiguous name recurses. `{"api_key": {...}}` is odd enough
+        that replacing it wholesale remains the safe reading."""
+        out = redact_object({"api_key": {"nested": "anything"}})
+        assert out["api_key"] == REDACTED_PLACEHOLDER
+
+
 class TestKnownLimitation:
     """Documented boundary, asserted so a future change is visible."""
+
+    def test_short_credential_under_bare_key_survives(self):
+        """RESIDUAL introduced by the C2 guard -- the price of keeping
+        `browser_press` readable, asserted rather than left to be discovered.
+
+        A short, identifier-shaped credential under a bare `key` is now kept.
+        Unambiguous key names have no such exemption, and any credential long
+        enough to be high-entropy still fails the shape test.
+        """
+        assert redact_object({"key": "hunter2"})["key"] == "hunter2"
 
     def test_high_entropy_value_under_innocuous_key_is_NOT_caught(self):
         """A credential matching no vendor prefix, stored under a key that is
