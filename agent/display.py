@@ -1122,9 +1122,9 @@ def render_edit_diff_with_delta(
 # model and never aborts a turn.
 #
 # Security: only local existing files are read (no network I/O); file size is
-# checked before any bytes are read and capped at 5 MiB for the inline
-# protocols; every failure is swallowed (logger.debug) so the display path
-# can never abort or hang a turn.
+# checked before any bytes are read and capped at 5 MiB for every protocol,
+# with a ~20s cumulative wall-time budget across previews; every failure is
+# swallowed (logger.debug) so the display path can never abort or hang a turn.
 # =========================================================================
 
 _IMAGE_EXT = r"png|jpe?g|gif|webp|bmp|avif"
@@ -1137,16 +1137,50 @@ _IMAGE_PATH_TOKEN_RE = re.compile(
     rf"""(?P<quoted>["'](?:/|~|\.\.?/|[A-Za-z]:)[^"']+?\.(?:{_IMAGE_EXT})["'])|(?P<bare>[^\s'"]+?\.(?:{_IMAGE_EXT})(?![.\w-](?=[^\s'"])))""",
     re.IGNORECASE,
 )
+# Bare-token alternative, used to re-tokenize the inner text of a quoted
+# token that did not resolve to a single existing file (see
+# _extract_image_paths).
+_BARE_IMAGE_PATH_TOKEN_RE = re.compile(
+    rf"""(?P<bare>[^\s'"]+?\.(?:{_IMAGE_EXT})(?![.\w-](?=[^\s'"])))""",
+    re.IGNORECASE,
+)
 _MAX_IMAGE_PREVIEWS = 3
 _KITTY_CHUNK_SIZE = 4096
-# Cap on bytes inlined through the terminal image protocols.  Larger files
-# would be base64'd fully into memory and dumped as one escape burst —
-# terminal redraws stall long before that is useful.  chafa is unaffected
-# (it renders scaled output bounded by its own timeout).
+# Cap on bytes read for a single preview, enforced for every protocol
+# (iTerm2/kitty escape bursts and the chafa decode path alike): larger files
+# would either be base64'd fully into memory as one escape burst (terminal
+# redraws stall long before that is useful) or cost a long chafa decode.
 _MAX_IMAGE_PREVIEW_BYTES = 5 * 1024 * 1024
+# Cumulative wall-time budget across all previews in one tool result, so a
+# pathological set of files cannot stall the CLI main thread for the full
+# 3 × 15s worst case.
+_MAX_IMAGE_PREVIEW_TOTAL_SECONDS = 20.0
 
 
-def _extract_image_paths(result_text: str) -> list[str]:
+def _resolve_image_path(cleaned: str, base_dir: Path | None) -> Path:
+    """Expand ``~`` and anchor relative candidates against *base_dir* or the cwd."""
+    candidate = Path(os.path.expanduser(cleaned))
+    if not candidate.is_absolute():
+        candidate = (base_dir or Path.cwd()) / candidate
+    return candidate
+
+
+def _add_image_path_candidate(cleaned: str, base_dir: Path | None, found: list[str], seen: set[str]) -> None:
+    """Resolve *cleaned* and append it to *found* when it is an existing file.
+
+    Deduped by resolved path; the *seen* mark is added even for non-files so
+    a candidate is not re-tested on later tokens.
+    """
+    candidate = _resolve_image_path(cleaned, base_dir)
+    key = str(candidate)
+    if key in seen:
+        return
+    seen.add(key)
+    if candidate.is_file():
+        found.append(key)
+
+
+def _extract_image_paths(result_text: str, base_dir: str | None = None) -> list[str]:
     """Extract up to ``_MAX_IMAGE_PREVIEWS`` existing local image file paths.
 
     Matches absolute, ``~``-prefixed, quoted, JSON-embedded and cwd-relative
@@ -1154,9 +1188,21 @@ def _extract_image_paths(result_text: str) -> list[str]:
     excluded — remote fetching would add network I/O to the display path, and
     URLs already render as clickable text.  Only paths that exist on disk are
     returned.
+
+    Relative candidates resolve against *base_dir* when it is an absolute
+    path (the tool call's ``workdir``/``cwd`` where known), else the process
+    cwd.  A quoted token is tried as one path first (``'/tmp/my shot.png'``);
+    when it is not an existing file — e.g. a quoted run of several paths,
+    ``'/tmp/a.png and /tmp/b.png'`` — the bare tokenizer is re-run on the
+    unquoted inner text so the individual paths are still recovered.
     """
     found: list[str] = []
     seen: set[str] = set()
+    base = None
+    if base_dir:
+        expanded = Path(os.path.expanduser(base_dir))
+        if expanded.is_absolute():
+            base = expanded
     for match in _IMAGE_PATH_TOKEN_RE.finditer(result_text):
         token = match.group("quoted") or match.group("bare")
         if not token:
@@ -1164,17 +1210,19 @@ def _extract_image_paths(result_text: str) -> list[str]:
         if "://" in token or token.lower().startswith(("data:", "mailto:")):
             continue
         cleaned = token.strip("'\"([{").rstrip(".,;:!?)]}")
-        candidate = Path(os.path.expanduser(cleaned))
-        if not candidate.is_absolute():
-            candidate = Path.cwd() / candidate
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        if candidate.is_file():
-            found.append(key)
-            if len(found) >= _MAX_IMAGE_PREVIEWS:
-                break
+        if match.group("quoted"):
+            if _resolve_image_path(cleaned, base).is_file():
+                _add_image_path_candidate(cleaned, base, found, seen)
+            else:
+                inner = token.strip("'\"")
+                for inner_match in _BARE_IMAGE_PATH_TOKEN_RE.finditer(inner):
+                    _add_image_path_candidate(inner_match.group("bare"), base, found, seen)
+                    if len(found) >= _MAX_IMAGE_PREVIEWS:
+                        break
+        else:
+            _add_image_path_candidate(cleaned, base, found, seen)
+        if len(found) >= _MAX_IMAGE_PREVIEWS:
+            break
     return found
 
 
@@ -1250,7 +1298,7 @@ def _stdout_is_tty() -> bool:
         return False
 
 
-def render_image_preview(result: str | None, *, print_fn=None) -> bool:
+def render_image_preview(result: str | None, *, base_dir: str | None = None, print_fn=None) -> bool:
     """Render local image file paths in a tool result inline in the terminal.
 
     Emits terminal-native image escapes (iTerm2 OSC 1337 / kitty graphics)
@@ -1258,6 +1306,10 @@ def render_image_preview(result: str | None, *, print_fn=None) -> bool:
     wrapped in ``\\001``/``\\002`` (prompt_toolkit ``[ZeroWidthEscape]``) so
     the CLI's prompt_toolkit ANSI renderer passes them through verbatim — its
     parser drops ``\\x1b]`` and ``\\x1b_G`` sequences otherwise.
+
+    *base_dir* anchors relative image paths (the tool call's ``workdir``/
+    ``cwd`` when known); without it, relative paths resolve against the
+    process cwd.
 
     Purely cosmetic: returns False and never raises when the feature is
     disabled, stdout is not a TTY, the terminal is unsupported, or the
@@ -1270,18 +1322,22 @@ def render_image_preview(result: str | None, *, print_fn=None) -> bool:
     if not isinstance(result, str) or not result.strip():
         return False
     try:
-        paths = _extract_image_paths(result)
+        paths = _extract_image_paths(result, base_dir=base_dir)
         if not paths:
             return False
         protocol = _terminal_supports_inline_images()
         emitted = False
+        started_at = time.monotonic()
         for path in paths:
+            if time.monotonic() - started_at > _MAX_IMAGE_PREVIEW_TOTAL_SECONDS:
+                logger.debug("Image preview time budget exceeded before %s", path)
+                break
             try:
                 p = Path(path)
+                if p.stat().st_size > _MAX_IMAGE_PREVIEW_BYTES:
+                    logger.debug("Skipping inline preview for %s (%d bytes)", path, p.stat().st_size)
+                    continue
                 if protocol == "iterm2":
-                    if p.stat().st_size > _MAX_IMAGE_PREVIEW_BYTES:
-                        logger.debug("Skipping inline preview for %s (%d bytes)", path, p.stat().st_size)
-                        continue
                     seq = _iterm2_image_escape(p, _image_preview_max_width)
                     if not emitted:
                         print_fn("  ┊ image")
@@ -1291,16 +1347,13 @@ def render_image_preview(result: str | None, *, print_fn=None) -> bool:
                     if p.suffix.lower() != ".png":
                         # The kitty graphics protocol accepts only PNG (f=100)
                         # or raw RGB/RGBA — fall back to chafa for other
-                        # formats (bounded by chafa's own timeout).
+                        # formats.
                         text = _chafa_render(p)
                         if text:
                             if not emitted:
                                 print_fn("  ┊ image")
                             print_fn(text)
                             emitted = True
-                        continue
-                    if p.stat().st_size > _MAX_IMAGE_PREVIEW_BYTES:
-                        logger.debug("Skipping inline preview for %s (%d bytes)", path, p.stat().st_size)
                         continue
                     chunks = _kitty_image_escapes(p)
                     if not emitted:

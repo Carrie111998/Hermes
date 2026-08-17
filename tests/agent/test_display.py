@@ -352,6 +352,14 @@ class TestImagePreviewLatches:
         assert display_module.get_image_preview_enabled() is True
         assert display_module.get_image_preview_max_width() == 400
 
+    def test_setter_malformed_width_keeps_explicit_disable(self):
+        # cli.py passes raw YAML values through; a malformed width must not
+        # abort the latch update or re-enable previews (int(_ipw) at the call
+        # site previously raised before the setter ever ran).
+        display_module.set_image_preview(False, "400px")  # type: ignore[arg-type]
+        assert display_module.get_image_preview_enabled() is False
+        assert display_module.get_image_preview_max_width() == 0
+
 
 class TestExtractImagePaths:
     def test_quoted_absolute_path(self, tmp_path):
@@ -433,6 +441,24 @@ class TestExtractImagePaths:
         d = tmp_path / "dir.png"
         d.mkdir()
         assert display_module._extract_image_paths(str(d)) == []
+
+    def test_quoted_run_of_two_paths_both_found(self, tmp_path):
+        # Regression: a quoted string wrapping two image paths was captured
+        # as ONE token that did not exist as a file, hiding both paths.
+        a = _make_image(tmp_path, "a.png")
+        b = _make_image(tmp_path, "b.png")
+        assert display_module._extract_image_paths(f"compare '{a} and {b}'") == [a, b]
+
+    def test_relative_resolves_against_base_dir(self, tmp_path):
+        img = tmp_path / "out.png"
+        img.write_bytes(b"x")
+        assert display_module._extract_image_paths("wrote out.png", base_dir=str(tmp_path)) == [str(img)]
+
+    def test_base_dir_ignored_when_not_absolute(self, tmp_path, monkeypatch):
+        img = tmp_path / "out.png"
+        img.write_bytes(b"x")
+        monkeypatch.chdir(tmp_path)
+        assert display_module._extract_image_paths("wrote out.png", base_dir="relative/base") == [str(img)]
 
 
 class TestITerm2Escape:
@@ -613,6 +639,48 @@ class TestRenderImagePreview:
         calls = []
         assert display_module.render_image_preview(f"Saved {img}", print_fn=calls.append) is True
         assert calls == ["  ┊ image", "\x1b[31m█\x1b[0m\n"]
+
+    def test_chafa_skips_file_over_cap(self, tmp_path, monkeypatch):
+        # The 5 MiB cap applies to the chafa path too, not just the
+        # iTerm2/kitty escape protocols — a huge file must not be handed to
+        # chafa for a potentially long decode.
+        self._tty_and_terminal(monkeypatch, protocol="")
+        big = tmp_path / "big.png"
+        big.write_bytes(b"x" * (display_module._MAX_IMAGE_PREVIEW_BYTES + 1))
+        fake = tmp_path / "chafa"
+        fake.write_text("#!/bin/sh\nprintf 'x\\n'\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        calls = []
+        assert display_module.render_image_preview(str(big), print_fn=calls.append) is False
+        assert calls == []
+
+    def test_time_budget_breaks_loop(self, tmp_path, monkeypatch):
+        # A pathological set of previews must not stall the CLI main thread
+        # for the full 3 × 15s worst case: once the cumulative budget is
+        # exceeded, remaining images are skipped.
+        self._tty_and_terminal(monkeypatch, protocol="iterm2")
+        imgs = [_make_image(tmp_path, f"a{i}.png") for i in range(3)]
+        calls = []
+        vals = [0.0, 0.1, 25.0]
+
+        def fake_monotonic():
+            return vals.pop(0) if vals else 25.0
+
+        monkeypatch.setattr(display_module.time, "monotonic", fake_monotonic)
+        assert display_module.render_image_preview(" ".join(imgs), print_fn=calls.append) is True
+        assert calls == ["  ┊ image", "\001" + display_module._iterm2_image_escape(Path(imgs[0]), 0) + "\002"]
+
+    def test_render_uses_base_dir_for_relative_path(self, tmp_path, monkeypatch):
+        # Relative paths in tool output resolve against the tool call's
+        # workdir when one was provided — not the CLI process cwd.
+        self._tty_and_terminal(monkeypatch, protocol="iterm2")
+        img = tmp_path / "out.png"
+        img.write_bytes(b"x")
+        monkeypatch.chdir(tmp_path.parent)
+        calls = []
+        assert display_module.render_image_preview("wrote out.png", base_dir=str(tmp_path), print_fn=calls.append) is True
+        assert calls == ["  ┊ image", "\001" + display_module._iterm2_image_escape(img, 0) + "\002"]
 
     def test_no_result_or_empty_result_emits_nothing(self, monkeypatch):
         self._tty_and_terminal(monkeypatch)
