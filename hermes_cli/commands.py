@@ -390,6 +390,12 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         plugin_cmds = getattr(pm, "_plugin_commands", {})
         for cmd_name in sorted(plugin_cmds):
             tg_name = cmd_name.replace("-", "_")
+            # Telegram BotCommand.command is capped at 32 chars; setMyCommands
+            # rejects the *entire* batch if any one entry violates this, so
+            # oversized names must be dropped rather than truncated (a
+            # truncated name would no longer match on dispatch).
+            if len(tg_name) > 32:
+                continue
             desc = "Plugin command"
             if len(desc) > 40:
                 desc = desc[:37] + "..."
@@ -399,6 +405,7 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
 
     # Remaining slots go to built-in skill commands (not hub-installed).
     skill_entries: list[tuple[str, str]] = []
+    oversized_count = 0
     try:
         from agent.skill_commands import get_skill_commands
         from tools.skills_tool import SKILLS_DIR
@@ -413,6 +420,10 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
             if skill_path.startswith(_hub_dir):
                 continue
             name = cmd_key.lstrip("/").replace("-", "_")
+            # See length note above — skip rather than truncate.
+            if len(name) > 32:
+                oversized_count += 1
+                continue
             desc = info.get("description", "")
             # Keep descriptions short — setMyCommands has an undocumented
             # total payload limit.  40 chars fits 100 commands safely.
@@ -424,7 +435,7 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
 
     # Skills fill remaining slots — they're the only tier that gets trimmed
     remaining_slots = max(0, max_commands - len(all_commands))
-    hidden_count = max(0, len(skill_entries) - remaining_slots)
+    hidden_count = max(0, len(skill_entries) - remaining_slots) + oversized_count
     all_commands.extend(skill_entries[:remaining_slots])
     return all_commands[:max_commands], hidden_count
 
