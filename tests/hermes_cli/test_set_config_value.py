@@ -362,6 +362,18 @@ class TestListAppend:
 
         assert load_config()["toolsets"] == ["hermes-cli", "web"]
 
+    def test_append_rejects_known_non_list_default(
+        self, _isolated_hermes_home, capsys
+    ):
+        from hermes_cli.config import append_config_value
+
+        with pytest.raises(SystemExit) as exc:
+            append_config_value("model", '"gpt-4"')
+
+        assert exc.value.code == 1
+        assert "configured as a list" in capsys.readouterr().err
+        assert not (_isolated_hermes_home / "config.yaml").exists()
+
     def test_append_rejects_invalid_json(self, capsys):
         from hermes_cli.config import append_config_value
 

@@ -5464,12 +5464,20 @@ def append_config_value(key: str, value: str):
         )
         sys.exit(1)
 
+    default_value = _get_nested(DEFAULT_CONFIG, key)
+    if default_value is not _MISSING and not isinstance(default_value, list):
+        print(
+            f"✗ Cannot append to '{key}': this configuration path is not "
+            "configured as a list.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     config_path = get_config_path()
     require_readable_config_before_write(config_path)
     try:
         from utils import atomic_roundtrip_yaml_append
 
-        default_value = _get_nested(DEFAULT_CONFIG, key)
         initial_values = (
             copy.deepcopy(default_value) if isinstance(default_value, list) else None
         )
