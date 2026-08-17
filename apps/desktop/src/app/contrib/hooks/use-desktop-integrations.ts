@@ -4,6 +4,8 @@ import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
 import { pathFromHermesDeepLink } from '@/lib/hermes-open-target'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
+import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
+import { startMcpHealthChecker, stopMcpHealthChecker } from '@/store/mcp-health'
 import {
   clearPluginNotifyHandlers,
   invokePluginNotifyAction,
@@ -65,11 +67,15 @@ export function useDesktopIntegrations({
   // process's "open updates" menu request.
   useEffect(() => {
     startUpdatePoller()
+    // Background MCP health: HTTP/SSE servers only (never spawns stdio),
+    // notifies on transitions into needs-auth/error with a Sign in action.
+    startMcpHealthChecker()
     const unsubscribe = window.hermesDesktop?.onOpenUpdatesRequested?.(() => openUpdatesWindow())
 
     return () => {
       unsubscribe?.()
       stopUpdatePoller()
+      stopMcpHealthChecker()
     }
   }, [])
 
@@ -219,12 +225,19 @@ export function useDesktopIntegrations({
   }, [navigate])
 
   // hermes:// deep links:
+  //  - mcp/install?… → pending MCP install (explicit confirm, never auto-install)
   //  - <plugin>/<path>?… → in-app navigate (e.g. index-network/intent/1)
   //  - open/<path>?… → in-app navigate (generic)
   //  - blueprint/<name>?… → reviewable /blueprint command in the composer
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
       if (!payload?.kind) {
+        return
+      }
+
+      if (payload.kind === 'mcp' && payload.name === 'install') {
+        requestMcpInstallFromDeepLink(payload.params || {})
+
         return
       }
 
