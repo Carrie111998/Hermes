@@ -58,6 +58,12 @@ LAG_ALERT_COOLDOWN_SECONDS = 900  # 15 minutes
 # Cooldown for outer poll-loop exception alerts — prevents alert storms if
 # the loop catches on every tick.  Separate from lag cooldown so we can tune.
 POLL_LOOP_ERROR_COOLDOWN_SECONDS = 900
+# Budget for the BEST-EFFORT tail of shutdown()'s drain.  GATEWAY_STOPPED
+# consumers are always drained — that is the whole guarantee — and everything
+# else yields to this deadline.  Bounded because teardown creeping toward
+# gateway/status.py's _TASKKILL_TIMEOUT_S is what leaves the gateway DOWN on
+# this box: a stop that outruns the cap gets force-killed mid-teardown.
+SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 10.0
 # Heartbeat write interval — external watchers stat gateway_heartbeat_path()
 # and alert on staleness > a few minutes, so this cadence must be tight
 # enough that a single missed write stays under the alert threshold.
@@ -243,6 +249,95 @@ def startup(adapters: Optional[Dict] = None) -> None:
                 len(_registry.subscribers))
 
 
+def _consumes_gateway_stopped(subscriber) -> bool:
+    """Whether ``subscriber`` would be handed a GATEWAY_STOPPED event.
+
+    ``event_types is None`` means "no filter" — the subscriber receives every
+    event — so those count too (AuditLogger is the one that matters: the
+    shutdown event reaching audit.jsonl before the bus closes is the same
+    guarantee, one consumer over).
+    """
+    from events.schema import EventType
+
+    event_types = getattr(subscriber, "event_types", None)
+    if event_types is None:
+        return True
+    try:
+        return EventType.GATEWAY_STOPPED in event_types
+    except TypeError:
+        return False
+
+
+def _drain_subscribers_for_shutdown(
+    registry,
+    skip=(),
+    timeout_seconds: Optional[float] = None,
+) -> Dict[str, int]:
+    """Poll subscribers one last time so teardown-time events are delivered.
+
+    ``gateway/run.py`` emits GATEWAY_STOPPED early in its stop path and calls
+    :func:`shutdown` late in ``main()``. Without this drain, delivery inside
+    that window depended on the poll loop happening to tick — and the
+    subscriber that needs it most, ``CronStaleMonitor``, polls every 60s
+    against a teardown window measured at ~60s. Worse, the miss is
+    unrecoverable: ``_started_event_ids`` is per-process state and
+    ``BaseSubscriber`` seeds its cursor with INSERT OR IGNORE, so the
+    replacement process never replays the CRON_STARTED that built it and
+    silently drops the attribution (observed in production 2026-08-17).
+
+    GATEWAY_STOPPED consumers go FIRST and are never skipped; the rest are
+    best-effort under ``timeout_seconds``. The deadline gates whether a
+    subscriber is STARTED, not how long it may take — a single wedged
+    subscriber can still overrun it, exactly as it can in the poll loop.
+    """
+    if registry is None:
+        return {}
+    if timeout_seconds is None:
+        timeout_seconds = SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+    excluded = {id(sub) for sub in skip if sub is not None}
+
+    guaranteed: List[Any] = []
+    best_effort: List[Any] = []
+    for sub in registry.subscribers:
+        if id(sub) in excluded:
+            continue
+        if _consumes_gateway_stopped(sub):
+            guaranteed.append(sub)
+        else:
+            best_effort.append(sub)
+
+    results: Dict[str, int] = {}
+
+    def _poll_once(sub) -> None:
+        try:
+            results[sub.subscriber_id] = sub.poll()
+        except Exception:
+            logger.exception(
+                "Shutdown drain: %s poll failed", sub.subscriber_id,
+            )
+            results[sub.subscriber_id] = 0
+
+    for sub in guaranteed:
+        _poll_once(sub)
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    for index, sub in enumerate(best_effort):
+        if time.monotonic() >= deadline:
+            # Never silent: a bounded sweep that does not say what it dropped
+            # reads as full coverage.
+            logger.warning(
+                "Shutdown drain: %.1fs budget exhausted, %d subscriber(s) not "
+                "drained: %s",
+                timeout_seconds,
+                len(best_effort) - index,
+                ", ".join(s.subscriber_id for s in best_effort[index:]),
+            )
+            break
+        _poll_once(sub)
+
+    return results
+
+
 def shutdown() -> None:
     """Stop polling and clean up."""
     global _subscriber_thread, _applier_thread, _applier_subscriber, _bus
@@ -255,6 +350,14 @@ def shutdown() -> None:
     if _applier_thread:
         _applier_thread.join(timeout=5)
         _applier_thread = None
+    # Deliver whatever landed on the bus during teardown — above all the
+    # GATEWAY_STOPPED this process emitted on its way here. AFTER the joins so
+    # no subscriber is polled from two threads at once, and BEFORE close() so
+    # the bus is still open. The applier is excluded for the same reason
+    # _subscriber_poll_loop excludes it: its join above is bounded at 5s, so it
+    # may still be running, and IntentApplier is single-threaded by design.
+    if _registry:
+        _drain_subscribers_for_shutdown(_registry, skip=(_applier_subscriber,))
     _applier_subscriber = None
     if _registry:
         _registry.shutdown_all()
