@@ -40,6 +40,7 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
+    mod.router._test_plugin_module = mod
     return mod.router
 
 
@@ -57,7 +58,9 @@ def kanban_home(tmp_path, monkeypatch):
 @pytest.fixture
 def client(kanban_home):
     app = FastAPI()
-    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    router = _load_plugin_router()
+    app.include_router(router, prefix="/api/plugins/kanban")
+    app.state.kanban_plugin_module = router._test_plugin_module
     return TestClient(app)
 
 
@@ -519,14 +522,15 @@ def test_dispatch_dry_run(client, monkeypatch):
         "build_worker_lane_dispatch",
         lambda: (lane_spawn, lane_predicate),
     )
-    original_dispatch = kb.dispatch_once
+    endpoint_kb = client.app.state.kanban_plugin_module.kanban_db
+    original_dispatch = endpoint_kb.dispatch_once
     captured = {}
 
     def capture_dispatch(conn, **kwargs):
         captured.update(kwargs)
         return original_dispatch(conn, **kwargs)
 
-    monkeypatch.setattr(kb, "dispatch_once", capture_dispatch)
+    monkeypatch.setattr(endpoint_kb, "dispatch_once", capture_dispatch)
     r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
     assert r.status_code == 200
     body = r.json()
