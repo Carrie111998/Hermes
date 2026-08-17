@@ -271,18 +271,10 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 
   const target = href ? normalizeExternalUrl(href) : href
 
+  // Non-http(s) must not become target=_blank — Electron routes that through
+  // openExternalUrl, which intentionally allows file: for the artifacts panel.
   if (!target || !/^https?:\/\//i.test(target)) {
-    return (
-      <a
-        className={cn('ref wrap-anywhere', className)}
-        href={href}
-        rel="noopener noreferrer"
-        target="_blank"
-        {...props}
-      >
-        {children}
-      </a>
-    )
+    return <span className={cn('ref wrap-anywhere', className)}>{children}</span>
   }
 
   const text = childrenToText(children)

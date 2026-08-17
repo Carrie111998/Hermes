@@ -53,6 +53,15 @@ describe('terminal links', () => {
     expect(openExternal).not.toHaveBeenCalled()
   })
 
+
+  it('does not open non-http(s) URLs through the desktop bridge', () => {
+    terminalLinkHandler.activate(new MouseEvent('click', { metaKey: true }), 'file:///tmp/secret', {
+      end: { x: 10, y: 1 },
+      start: { x: 1, y: 1 }
+    })
+
+    expect(openExternal).not.toHaveBeenCalled()
+  })
   it('routes OSC 8 hyperlinks the same way, instead of xterm\u2019s confirm() dialog', () => {
     terminalLinkHandler.activate(new MouseEvent('click', { metaKey: true }), 'https://example.com/osc8', {
       end: { x: 10, y: 1 },

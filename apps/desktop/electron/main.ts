@@ -10531,6 +10531,17 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
 
   installContextMenu(win)
   win.webContents.setWindowOpenHandler(details => {
+    // window.open from the renderer (markdown/terminal) must not use the
+    // artifact file: openPath path — that stays on hermes:openExternal IPC.
+    let parsed: URL
+    try {
+      parsed = new URL(details.url)
+    } catch {
+      return { action: 'deny' }
+    }
+    if (!['http:', 'https:', 'mailto:'].includes(parsed.protocol)) {
+      return { action: 'deny' }
+    }
     openExternalUrl(details.url)
 
     return { action: 'deny' }

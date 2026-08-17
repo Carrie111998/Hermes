@@ -195,10 +195,22 @@ export function useLinkTitle(url?: null | string): string {
   return title
 }
 
-export function openExternalLink(href: string): void {
-  if (href) {
-    void window.hermesDesktop?.openExternal?.(href)
+/** http(s) only — agent/terminal/markdown must not reach file: openPath. */
+export function isSafeExternalUrl(value: string): boolean {
+  try {
+    const parsed = new URL(normalizeExternalUrl(value))
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && Boolean(parsed.hostname.trim())
+  } catch {
+    return false
   }
+}
+
+export function openExternalLink(href: string): void {
+  if (!href || !isSafeExternalUrl(href)) {
+    return
+  }
+
+  void window.hermesDesktop?.openExternal?.(normalizeExternalUrl(href))
 }
 
 interface ExternalLinkProps extends Omit<ComponentProps<'a'>, 'href' | 'target'> {
