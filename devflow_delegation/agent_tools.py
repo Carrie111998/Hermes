@@ -14,6 +14,7 @@ from typing import List, Optional
 
 from devflow_delegation.agent_policy import scrubbed_env
 from devflow_delegation.allowlist import TargetConfig, _glob_matches, path_allowed
+from hermes_cli._subprocess_compat import run_text_capture
 
 MAX_READ_CHARS = 100_000
 MAX_TEST_OUTPUT_CHARS = 20_000
@@ -139,9 +140,18 @@ def run_tests(worktree: Path, target: TargetConfig, *, timeout_seconds: Optional
             raise ToolError("test commands must be argv lists, not shell strings")
         argv = [str(part) for part in command]
         try:
-            completed = subprocess.run(
-                argv, cwd=str(worktree), env=env, shell=False, capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=effective_timeout,
+            # run_text_capture, not capture_output=True: `argv` is an
+            # allowlist-owned *build/test* command (pytest, npm test), so a
+            # grandchild is the norm rather than the exception. On Windows a
+            # grandchild inherits the capture pipes and holds their write end
+            # open, so `timeout` never fires — subprocess.run kills only the
+            # direct child, then blocks re-draining a pipe that can no longer
+            # reach EOF, and a wedged test command hangs the tick forever.
+            # Capturing into temp files removes the pipes entirely. Mirrors
+            # validator.py::validate_worktree, which was converted for this
+            # same reason; this sibling was missed until an AST sweep.
+            completed = run_text_capture(
+                argv, cwd=str(worktree), env=env, timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired:
             raise ToolError(f"test command timed out after {effective_timeout}s: {' '.join(argv)}")
