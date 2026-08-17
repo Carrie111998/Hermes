@@ -186,3 +186,71 @@ class TestFetchModels:
             second = profile.fetch_models(api_key="k")
 
         assert second == first
+
+    def test_cache_expires_so_new_models_appear_without_a_restart(
+        self, profile, inworld, monkeypatch
+    ):
+        clock = [1000.0]
+        monkeypatch.setattr(inworld.time, "monotonic", lambda: clock[0])
+
+        self._fetch(profile, {"models": [_entry()]})
+        clock[0] += inworld._CACHE_TTL_SECONDS + 1
+        refreshed, _ = self._fetch(
+            profile, {"models": [_entry(model="gpt-6")]}
+        )
+
+        assert refreshed == [inworld.ROUTER_MODEL, "openai/gpt-6"]
+
+    @pytest.mark.parametrize("key", ["abc\r\nX-Injected: 1", "abc def", "ké"])
+    def test_keys_that_cannot_form_a_header_are_rejected(
+        self, profile, inworld, key
+    ):
+        """A malformed key is named, not sent as an opaque failed request."""
+        with patch(
+            "hermes_cli.urllib_security.open_credentialed_url",
+            side_effect=AssertionError("network touched"),
+        ):
+            assert profile.fetch_models(api_key=key) is None
+
+    def test_empty_catalog_warns_while_transport_failure_does_not(
+        self, profile, inworld, caplog
+    ):
+        """An operator can tell 'no usable models' from 'network down'."""
+        with caplog.at_level("WARNING"):
+            self._fetch(profile, {"models": []})
+        assert any("no tool-calling models" in r.message for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level("WARNING"), patch(
+            "hermes_cli.urllib_security.open_credentialed_url",
+            side_effect=OSError("unreachable"),
+        ):
+            profile.fetch_models(api_key="k")
+        assert not caplog.records
+
+
+class TestResolveAuxModel:
+    def _fetch(self, profile, payload):
+        def _open(request, *, timeout):
+            return _FakeResponse(payload)
+
+        with patch("hermes_cli.urllib_security.open_credentialed_url", _open):
+            profile.fetch_models(api_key="k")
+
+    def test_no_opinion_without_a_cached_catalog(self, profile, inworld):
+        """Falls through to default_aux_model rather than guessing."""
+        assert profile.resolve_aux_model() == ""
+
+    def test_no_opinion_while_the_pinned_model_is_live(self, profile, inworld):
+        self._fetch(
+            profile,
+            {"models": [_entry(provider="inworld", model="models/gemma-4-26b-a4b-it")]},
+        )
+
+        assert profile.resolve_aux_model() == ""
+
+    def test_retired_aux_model_falls_back_to_the_router(self, profile, inworld):
+        """Aux calls survive Inworld retiring the pinned model."""
+        self._fetch(profile, {"models": [_entry()]})
+
+        assert profile.resolve_aux_model() == inworld.ROUTER_MODEL

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 import urllib.request
 from urllib.parse import urljoin
 
@@ -17,12 +18,29 @@ CATALOG_PATH = "/llm/v1alpha/models"
 # Selects a model server-side, so it works before any catalog fetch.
 ROUTER_MODEL = "auto"
 
-_CACHE: dict[str, list[str]] = {}
+# Matches _PROVIDER_MODELS_CACHE_TTL in hermes_cli/models.py, so a long-lived
+# gateway picks up catalog changes without a restart.
+_CACHE_TTL_SECONDS = 3600
+
+# url -> (monotonic timestamp, model ids)
+_CACHE: dict[str, tuple[float, list[str]]] = {}
 
 
 def clear_cache() -> None:
     """Drop cached catalogs so the next fetch hits the network."""
     _CACHE.clear()
+
+
+def _cached_models(url: str) -> list[str] | None:
+    """Return the cached catalog for *url* while it is still fresh."""
+    entry = _CACHE.get(url)
+    if entry is None:
+        return None
+    fetched_at, models = entry
+    if time.monotonic() - fetched_at >= _CACHE_TTL_SECONDS:
+        _CACHE.pop(url, None)
+        return None
+    return list(models)
 
 
 def parse_catalog(payload: object) -> list[str]:
@@ -66,6 +84,33 @@ def parse_catalog(payload: object) -> list[str]:
 class _InworldProfile(ProviderProfile):
     """Inworld router profile — the catalog needs its own path, auth, and shape."""
 
+    def resolve_aux_model(self, *, vision: bool = False) -> str:
+        """Fall back to the router when the pinned aux model leaves the catalog.
+
+        ``default_aux_model`` is a hardcoded id, so it rots the day Inworld
+        retires that model and every auxiliary call 404s. Consults only an
+        already-cached catalog — this runs on client-resolution paths and has
+        no credential to fetch with — and returns "" when it has no basis for
+        an opinion, which sends the caller to ``default_aux_model`` as before.
+        """
+        try:
+            catalogs = [
+                models
+                for models in (_cached_models(url) for url in list(_CACHE))
+                if models
+            ]
+            if not catalogs:
+                return ""
+            if any(self.default_aux_model in models for models in catalogs):
+                return ""
+            logger.debug(
+                "Inworld aux model %s is absent from the catalog; using %s",
+                self.default_aux_model, ROUTER_MODEL,
+            )
+            return ROUTER_MODEL
+        except Exception:
+            return ""
+
     def fetch_models(
         self,
         *,
@@ -76,12 +121,21 @@ class _InworldProfile(ProviderProfile):
         """Fetch the router catalog, or None to fall back to ``fallback_models``."""
         url = urljoin(base_url or self.base_url or DEFAULT_BASE_URL, CATALOG_PATH)
 
-        cached = _CACHE.get(url)
+        cached = _cached_models(url)
         if cached is not None:
-            return list(cached)
+            return cached
 
-        if not api_key:
+        key = (api_key or "").strip()
+        if not key:
             logger.debug("fetch_models(inworld): no credential, skipping %s", url)
+            return None
+
+        if not key.isascii() or any(c.isspace() for c in key):
+            logger.warning(
+                "Skipping Inworld catalog discovery: INWORLD_API_KEY contains "
+                "characters that cannot appear in an Authorization header. "
+                "Expected the base64 key string shown in the Inworld portal."
+            )
             return None
 
         if not url.startswith(("http://", "https://")):
@@ -95,9 +149,7 @@ class _InworldProfile(ProviderProfile):
         from hermes_cli.urllib_security import open_credentialed_url
 
         req = urllib.request.Request(url)
-        # The catalog wants Basic; completions get Bearer from the OpenAI
-        # client. Inworld accepts both.
-        req.add_header("Authorization", f"Basic {api_key}")
+        req.add_header("Authorization", f"Basic {key}")
         req.add_header("Accept", "application/json")
         for k, v in self.default_headers.items():
             req.add_header(k, v)
@@ -111,11 +163,17 @@ class _InworldProfile(ProviderProfile):
 
         discovered = parse_catalog(payload)
         if not discovered:
-            logger.debug("Inworld catalog at %s returned no usable models", url)
+            # Reached and understood the catalog, and it offered nothing usable
+            # — an account/region problem an operator can act on, unlike the
+            # transient transport failures logged at debug above.
+            logger.warning(
+                "Inworld catalog at %s returned no tool-calling models; "
+                "only %r will be offered.", url, ROUTER_MODEL,
+            )
             return None
 
         models = [ROUTER_MODEL, *discovered]
-        _CACHE[url] = list(models)
+        _CACHE[url] = (time.monotonic(), list(models))
         return models
 
 
