@@ -57,6 +57,12 @@ jobs:
   # Which released versions do we test updating FROM? Resolved once and shared
   # by both route matrices, so the two routes cover the same set.
   pick-releases:
+    # Only run on the upstream repository, not on forks. A fork has no release
+    # tags of its own, so pick-release-tags.sh exits 1 ("no release tags found")
+    # and every scheduled run is red. The script is right to be strict -- here,
+    # an empty tag list means the checkout lost its tags and the matrix would
+    # silently cover nothing -- so gate the workflow rather than soften it.
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Pick release tags
     runs-on: ubuntu-latest
     timeout-minutes: 5
