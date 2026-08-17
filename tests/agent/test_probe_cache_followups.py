@@ -15,6 +15,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Calls detect_local_server_type directly, so it opts out of the autouse stub
+# that defaults it to None. Safe because httpx is stubbed beneath the probe.
+pytestmark = pytest.mark.real_local_server_probe
+
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():

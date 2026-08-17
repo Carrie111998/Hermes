@@ -866,3 +866,116 @@ def test_real_gateway_pid_scan_marker_restores_the_scanner(monkeypatch):
     assert gateway._scan_gateway_pids(set()) == [98765], (
         "the real_gateway_pid_scan marker did not restore the real scanner"
     )
+
+
+# ──────────────────── local-server probe guard ────────────────────
+#
+# Sibling canary for ``_local_server_probe_guard``. Like the PID-scan guard
+# this is about cost, not signal safety — and the cost is platform-dependent,
+# which is what makes a canary necessary rather than nice to have. Where a
+# closed port refuses instantly the unguarded probes are free and nobody
+# notices they are gone; on a host where a closed port takes ~2 s to refuse
+# (measured on this developer's box 2026-08-17) the same five-endpoint
+# waterfall costs ~10 s per call and killed 10 test files on the 30 s
+# pytest-timeout cap. A silently-uninstalled guard would therefore stay
+# invisible in CI and reappear as "no tests ran" on a developer machine.
+#
+# ``_install_local_server_probe_guard`` swallows exceptions so a conftest bug
+# cannot break every import in the suite — these tests are what convert that
+# silence back into a red result.
+#
+# Both tests import ``agent.model_metadata`` INSIDE the body, on purpose: the
+# guard is armed by a ``sys.meta_path`` finder at import time precisely so that
+# works.
+
+
+def test_local_server_probe_is_stubbed_by_default():
+    """Network probes of a local model server must not run in an unmarked test."""
+    import agent.model_metadata as mm
+
+    for attr in (
+        "detect_local_server_type",
+        "_query_local_context_length",
+        "_query_ollama_api_show",
+        "fetch_endpoint_model_metadata",
+    ):
+        assert getattr(getattr(mm, attr), "_hermes_local_server_probe_guard", False), (
+            f"the autouse _local_server_probe_guard is not installed on {attr} — "
+            "an unmarked test can reach the network"
+        )
+
+    # Behaviour and cost, not just identity: a wrapper that delegated anyway
+    # would pass the attribute check above. 4000 is closed on the dev box and
+    # costs ~4 s per request there (IPv6 then IPv4, ~2 s each), so the real
+    # probes cannot possibly finish inside the budget below.
+    url = "http://127.0.0.1:4000/v1"
+    started = time.perf_counter()
+    assert mm.detect_local_server_type(url) is None
+    assert mm._query_local_context_length("some-model", url) is None
+    assert mm._query_ollama_api_show("some-model", url) is None
+    assert mm.fetch_endpoint_model_metadata(url) == {}
+    assert time.perf_counter() - started < 0.5, (
+        "the stub took long enough to have reached the network"
+    )
+
+    # The dict stub must be a fresh object per call — a shared one lets a
+    # mutation in one test surface in the next.
+    first = mm.fetch_endpoint_model_metadata(url)
+    first["poisoned"] = True
+    assert mm.fetch_endpoint_model_metadata(url) == {}
+
+
+def test_local_server_probe_stub_leaves_the_public_api_real():
+    """Only the two probes are stubbed — the metadata logic stays under test."""
+    import agent.model_metadata as mm
+
+    assert mm.get_model_context_length.__name__ == "get_model_context_length"
+
+
+@pytest.mark.real_local_server_probe
+def test_real_local_server_probe_marker_restores_the_probe(monkeypatch):
+    """Tests of the probes themselves must still get the real implementation.
+
+    Asserts by BEHAVIOUR with ``httpx`` faked one layer beneath, rather than by
+    comparing ``__name__``: the wrapper stays installed under the marker and
+    delegates at call time, so an identity assertion would be both wrong and —
+    since it never calls anything — vacuous if delegation ever broke.
+
+    ``httpx`` is injected through ``sys.modules`` because
+    ``detect_local_server_type`` does ``import httpx`` inside the function, so
+    setting a module attribute would not be seen. No real request is made.
+    """
+    import types
+
+    import agent.model_metadata as mm
+
+    class _Resp:
+        def __init__(self, status_code=200):
+            self.status_code = status_code
+            self.text = ""
+
+        def json(self):
+            return {"models": []}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, *args, **kwargs):
+            # Ollama's tell: /api/tags answering 200 with a "models" key.
+            return _Resp(200 if url.endswith("/api/tags") else 404)
+
+    fake_httpx = types.ModuleType("httpx")
+    fake_httpx.Client = _Client
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    mm._endpoint_probe_path_cache.clear()
+
+    assert mm.detect_local_server_type("http://127.0.0.1:11434/v1") == "ollama", (
+        "the real_local_server_probe marker did not restore the real probe"
+    )

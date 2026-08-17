@@ -12,6 +12,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# This file tests the probes themselves, so it opts out of the autouse stub
+# that defaults them to None for everyone else. Safe because every test here
+# stubs ``httpx`` BENEATH the probe — the docstring's "no live server required"
+# is what the opt-out relies on, not an exception to it.
+pytestmark = pytest.mark.real_local_server_probe
+
 
 @pytest.fixture(autouse=True)
 def _clear_local_ctx_probe_cache():
