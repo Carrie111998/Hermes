@@ -448,7 +448,7 @@ async def test_run_agent_proxy_receives_event_delivery_metadata(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(monkeypatch, tmp_path):
-    """Telegram DM progress must not reuse event message id as thread metadata."""
+    """Telegram DM keeps audit correlation without using event id as a thread."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -480,12 +480,20 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
         session_id="sess-2",
         session_key="agent:main:telegram:dm:12345",
         event_message_id="777",
+        event_metadata={
+            "telegram_delivery_correlation_id": "dm-correlation",
+        },
     )
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] is None
-    assert all(call["metadata"] is None for call in adapter.typing)
+    assert adapter.sent[0]["metadata"] == {
+        "telegram_delivery_correlation_id": "dm-correlation",
+    }
+    assert all(
+        call["metadata"] == {"telegram_delivery_correlation_id": "dm-correlation"}
+        for call in adapter.typing
+    )
 
 
 @pytest.mark.asyncio
