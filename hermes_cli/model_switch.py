@@ -38,6 +38,7 @@ from hermes_cli.providers import (
     resolve_provider_full,
 )
 from hermes_cli.model_normalize import (
+    model_name_resolves_for_provider,
     normalize_model_for_provider,
 )
 from agent.models_dev import (
@@ -950,6 +951,50 @@ def _ambiguous_alias_message(err: "AmbiguousAliasError") -> str:
     )
 
 
+def _match_family_alias_with_version(key: str) -> Optional[tuple[str, str]]:
+    """Return ``(alias_key, version)`` for a versioned family alias input.
+
+    Handles shorthand like ``sonnet-5`` -> ``("sonnet", "5")``,
+    ``glm-5.2`` -> ``("glm", "5.2")``, ``grok-3-fast`` ->
+    ``("grok", "3-fast")``.  The version suffix must look version-like
+    (starts with a digit or ``v``) so full model names that merely begin
+    with an alias family (``claude-sonnet-5`` -> alias ``claude``) are
+    NOT captured here — they already resolve through the catalog /
+    provider-detection paths.
+
+    Longest alias wins (``gpt5-mini`` prefers alias ``gpt5`` over ``gpt``).
+
+    The alias's *family* must end with the alias key itself (``sonnet`` ->
+    ``claude-sonnet``; ``glm`` -> ``glm``).  This excludes stale legacy
+    families whose models stopped using the alias stem (``deepseek`` ->
+    ``deepseek-chat``: real models are ``deepseek-v4-*``, so a versioned
+    ``deepseek-v4-pro`` must NOT be misread as an alias + version and
+    rejected by the fallback gate).
+
+    Args:
+        key: Lowercased, stripped model input.
+
+    Returns:
+        ``(alias_key, version)`` or ``None`` when the input is a bare alias
+        or carries no version-like suffix.
+    """
+    if not key or "-" not in key:
+        return None
+    for alias_key in sorted(MODEL_ALIASES, key=len, reverse=True):
+        if not key.startswith(alias_key + "-"):
+            continue
+        version = key[len(alias_key) + 1:]
+        if not version or not (version[0].isdigit() or version[0].lower() == "v"):
+            continue
+        identity = MODEL_ALIASES[alias_key]
+        if not identity.family.lower().endswith(alias_key):
+            # The family no longer uses the alias stem (e.g. deepseek's
+            # legacy ``deepseek-chat`` family vs ``deepseek-v4-*`` models).
+            continue
+        return (alias_key, version)
+    return None
+
+
 def resolve_alias(
     raw_input: str,
     current_provider: str,
@@ -960,6 +1005,12 @@ def resolve_alias(
     current provider's models.dev catalog for the model whose ID starts
     with ``vendor/family`` (or just ``family`` for non-aggregator
     providers) and has the **highest version**.
+
+    Versioned family shorthand (``sonnet-5``, ``glm-5.2``) resolves the
+    same way: the version suffix is appended to the family prefix
+    (``claude-sonnet-5``, ``glm-5.2``) and matched against the catalog.
+    This is what lets ``/model sonnet-5`` switch to ``anthropic/claude-sonnet-5``
+    instead of silently no-op'ing on a provider that doesn't serve it.
 
     Returns:
         ``(provider, resolved_model_id, alias_name)`` if a match is
@@ -982,6 +1033,13 @@ def resolve_alias(
             return (da.provider, da.model, alias_name)
 
     identity = MODEL_ALIASES.get(key)
+    version_suffix = ""
+    if identity is None:
+        # Versioned family alias: "sonnet-5" -> alias "sonnet" + version "5"
+        matched = _match_family_alias_with_version(key)
+        if matched is not None:
+            alias_key, version_suffix = matched
+            identity = MODEL_ALIASES[alias_key]
     if identity is None:
         return None
 
@@ -1007,19 +1065,33 @@ def resolve_alias(
 
     if aggregator:
         prefix = f"{vendor}/{family}".lower()
+    else:
+        prefix = family.lower()
+    if version_suffix:
+        prefix = f"{prefix}-{version_suffix}"
+
+    if aggregator:
         matches = [
             mid for mid in catalog
             if mid.lower().startswith(prefix)
         ]
     else:
-        family_lower = family.lower()
         matches = [
             mid for mid in catalog
-            if mid.lower().startswith(family_lower)
+            if mid.lower().startswith(prefix)
         ]
 
     if not matches:
         return None
+
+    # Versioned input: prefer the exact family-version entry (e.g.
+    # ``claude-sonnet-5``) over dated snapshots that share the prefix
+    # (``claude-sonnet-5-20250514``).  Only fall back to prefix matching
+    # when the exact id isn't catalogued.
+    if version_suffix:
+        exact = [m for m in matches if m.lower() == prefix]
+        if len(exact) == 1:
+            return (current_provider, exact[0], key)
 
     # Sort by version descending (best guess first) for display, but NEVER
     # silently pick among multiple candidates: version-sort heuristics have
@@ -1347,6 +1419,10 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    # Recognition tracking, shared across both paths (must be defined before
+    # the PATH A / PATH B split; the branches reassign as needed).
+    resolved_in_current_catalog = False
+    config_routed = False
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1524,7 +1600,11 @@ def switch_model(
         else:
             # --- Step b: Alias exists but not on current provider -> fallback ---
             key = raw_input.strip().lower()
-            if key in MODEL_ALIASES:
+            alias_match = (
+                key in MODEL_ALIASES
+                or _match_family_alias_with_version(key) is not None
+            )
+            if alias_match:
                 authed = get_authenticated_provider_slugs(
                     current_provider=current_provider,
                     user_providers=user_providers,
@@ -1545,12 +1625,18 @@ def switch_model(
                         resolved_alias, new_model, target_provider,
                     )
                 else:
-                    identity = MODEL_ALIASES[key]
+                    identity = MODEL_ALIASES.get(key)
+                    if identity is None:
+                        _mv = _match_family_alias_with_version(key)
+                        if _mv is not None:
+                            identity = MODEL_ALIASES[_mv[0]]
+                    vendor = identity.vendor if identity else key
+                    family = identity.family if identity else key
                     return ModelSwitchResult(
                         success=False,
                         is_global=is_global,
                         error_message=(
-                            f"Alias '{key}' maps to {identity.vendor}/{identity.family} "
+                            f"Alias '{key}' maps to {vendor}/{family} "
                             f"but no matching model was found in any provider catalog. "
                             f"Try specifying the full model name."
                         ),
@@ -1578,7 +1664,6 @@ def switch_model(
         # Critical for flat-namespace resellers like opencode-go / opencode-zen
         # whose live /v1/models returns bare IDs (e.g. "deepseek-v4-flash") that
         # coincidentally match entries in native providers' static catalogs.
-        resolved_in_current_catalog = False
         if is_aggregator(target_provider) and not resolved_alias:
             catalog = list_provider_models(target_provider)
             if catalog:
@@ -1606,7 +1691,6 @@ def switch_model(
         # detection.  Unlike step e this is deliberately NOT gated on
         # ``not is_custom`` — switching from a local/custom provider A to a
         # configured provider B that declares the typed model is the point.
-        config_routed = False
         if (
             not resolved_alias
             and not resolved_in_current_catalog
@@ -1801,7 +1885,37 @@ def switch_model(
     new_model = _resolve_named_custom_model_id(
         new_model, target_provider, custom_providers
     )
+    pre_normalize = new_model
     new_model = normalize_model_for_provider(new_model, target_provider)
+
+    # --- Phantom-switch guard ---
+    # A name that resolved NOWHERE must fail loudly, never report a phantom
+    # success.  If no alias, catalog, configured-provider, or detection step
+    # recognized the user's input and the normalizer REWROTE it (deepseek's
+    # catch-all folding an unknown name to the configured default), the
+    # session model would not change yet we would report "switched" — a lie.
+    # Fail loudly so the user sees the real state and the actual model name.
+    if (
+        not resolved_alias
+        and not resolved_in_current_catalog
+        and not config_routed
+        and not resolved_moa_preset
+        and pre_normalize != new_model
+        and not model_name_resolves_for_provider(pre_normalize, target_provider)
+    ):
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=(
+                f"Unknown model '{raw_input.strip()}': it did not match any model "
+                f"on {provider_label} or in the provider catalog, and Hermes would "
+                f"not silently rewrite it to '{new_model}'. Use /model "
+                f"<exact-model-name> or the model picker."
+            ),
+        )
 
     # --- Validate ---
     try:

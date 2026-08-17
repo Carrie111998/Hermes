@@ -138,6 +138,61 @@ class TestDeepseekCanonicalAndReasonerMapping:
         assert _normalize_for_deepseek(model) == "deepseek-v4-flash"
 
 
+# ── Phantom-switch regression: unknown names must not silently fold ─────
+
+class TestDeepseekUnknownNameFoldTarget:
+    """The deepseek catch-all folds to the CURRENT configured default, never
+    a hardcoded literal — and switch_model fails loudly on names that
+    resolve nowhere (see test_model_switch_versioned_alias.py)."""
+
+    def test_unknown_name_folds_to_configured_default(self, monkeypatch):
+        """A typo'd/unknown name folds to the user's configured default,
+        resolved dynamically from config (not a hardcoded literal)."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"default": "deepseek-v4-flash", "provider": "deepseek"}},
+        )
+        assert _normalize_for_deepseek("sonnet-5") == "deepseek-v4-flash"
+        assert _normalize_for_deepseek("floobarp") == "deepseek-v4-flash"
+
+    def test_fold_target_follows_config_change(self, monkeypatch):
+        """Change the configured default; the fold follows — it must not be
+        baked in as today's literal."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"default": "deepseek-v4-pro", "provider": "deepseek"}},
+        )
+        assert _normalize_for_deepseek("sonnet-5") == "deepseek-v4-pro"
+
+    def test_foreign_provider_default_does_not_leak(self, monkeypatch):
+        """A default configured for another provider (anthropic) must not be
+        used as the deepseek fold target."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {
+                    "default": "anthropic/claude-sonnet-5",
+                    "provider": "anthropic",
+                }
+            },
+        )
+        # Falls back to deepseek's curated default (first entry).
+        assert _normalize_for_deepseek("sonnet-5") == "deepseek-v4-pro"
+
+    def test_model_name_resolves_for_provider(self):
+        """Recognition helper: known deepseek ids resolve; garbage does not."""
+        from hermes_cli.model_normalize import model_name_resolves_for_provider
+
+        assert model_name_resolves_for_provider("deepseek-v4-flash", "deepseek")
+        assert model_name_resolves_for_provider("deepseek-chat", "deepseek")
+        assert model_name_resolves_for_provider("deepseek-r1", "deepseek")
+        assert not model_name_resolves_for_provider("sonnet-5", "deepseek")
+        assert not model_name_resolves_for_provider("floobarp", "deepseek")
+        # Non-deepseek providers: pass-through only, always "resolves"
+        # (their normalizers never swap identity).
+        assert model_name_resolves_for_provider("whatever", "anthropic")
+
+
 # ── Regression: issue #78796 ───────────────────────────────────────────
 
 class TestIssue78796NvidiaPrefixRepair:

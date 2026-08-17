@@ -180,7 +180,13 @@ def _normalize_for_deepseek(model_name: str) -> str:
       (covers future ``deepseek-v5-*`` and dated variants without a release).
     - Contains a reasoner keyword (r1, think, reasoning, cot, reasoner)
       -> ``deepseek-v4-flash``.
-    - Everything else -> ``deepseek-v4-flash``.
+    - Everything else -> the provider's **current** configured default via
+      :func:`normalize_for_default`.  The fold target is resolved
+      dynamically, never a hardcoded literal: what is DeepSeek's default
+      today (``deepseek-v4-flash``) may not be tomorrow, and folding to a
+      stale literal recreates the phantom-switch bug (unknown name
+      rewritten to a hardcoded id, validated clean, reported as success
+      while the session model never changed).
 
     Args:
         model_name: The bare model name (vendor prefix already stripped).
@@ -207,12 +213,107 @@ def _normalize_for_deepseek(model_name: str) -> str:
         if keyword in bare:
             return "deepseek-v4-flash"
 
-    return "deepseek-v4-flash"
+    # Everything else: fold to the provider's CURRENT configured default.
+    # Never a hardcoded literal — see normalize_for_default().
+    return normalize_for_default(bare, "deepseek")
 
 
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
+
+def normalize_for_default(model_input: str, target_provider: str) -> str:
+    """Fold an unrecognized model name to the provider's CURRENT default.
+
+    The fold target is resolved dynamically from the configured
+    ``model.default`` (when it belongs to *target_provider*), falling back
+    to the provider's curated default. It is NEVER a hardcoded literal:
+    the model that is the default today (e.g. ``deepseek-v4-flash``) can
+    change without a code release, and a stale literal would silently
+    rewrite an unknown name to a model the user did not configure —
+    the phantom-switch bug.
+
+    Args:
+        model_input: The model name that failed to resolve.
+        target_provider: The provider the name is being normalized for.
+
+    Returns:
+        The provider's current default model id (or *model_input* when no
+        default can be determined).
+    """
+    name = (model_input or "").strip()
+    provider = _normalize_provider_alias(target_provider)
+
+    # 1) Configured default, scoped to this provider.  A default configured
+    #    for a DIFFERENT provider (e.g. ``anthropic/claude-sonnet-5`` while
+    #    folding for deepseek) must not leak across — the fold would land on
+    #    a model the target provider cannot serve.
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model") or {}
+        if isinstance(model_cfg, dict):
+            configured_default = str(model_cfg.get("default") or "").strip()
+            configured_provider = str(model_cfg.get("provider") or "").strip()
+            if configured_default and configured_provider:
+                if _normalize_provider_alias(configured_provider) == provider:
+                    # A vendor-prefixed default must agree with the target
+                    # provider (e.g. ``deepseek/deepseek-v4-flash`` on
+                    # deepseek).  A bare name is used as-is.
+                    if "/" in configured_default:
+                        prefix, _ = configured_default.split("/", 1)
+                        if _normalize_provider_alias(prefix.strip()) == provider:
+                            return _strip_vendor_prefix(configured_default)
+                    else:
+                        return configured_default
+    except Exception:
+        pass
+
+    # 2) Provider-curated default (cost-safe for metered aggregators).
+    try:
+        from hermes_cli.models import get_default_model_for_provider
+
+        fallback = get_default_model_for_provider(provider)
+        if fallback:
+            return fallback
+    except Exception:
+        pass
+
+    return name
+
+
+def model_name_resolves_for_provider(model_input: str, target_provider: str) -> bool:
+    """Return True when *model_input* is a known id for the provider.
+
+    ``True`` means the name maps to a real model through canonical ids,
+    documented remaps (retired aliases, reasoner keywords), or pass-through
+    providers — i.e. the normalizer's catch-all will NOT silently swap the
+    identity.  ``False`` means the name only survived because the catch-all
+    folded it to the provider default — a phantom switch in the making.
+
+    Used by ``switch_model`` to fail loudly instead of reporting success
+    for a name that resolved nowhere.
+
+    Non-deepseek providers return ``True`` unconditionally: their
+    normalizers only convert form (dots↔hyphens, vendor-prefix stripping),
+    never identity.
+    """
+    name = (model_input or "").strip()
+    if not name:
+        return True
+    provider = _normalize_provider_alias(target_provider)
+    if provider != "deepseek":
+        return True
+    bare = _strip_vendor_prefix(name).lower()
+    if bare in _DEEPSEEK_RETIRED_ALIASES:
+        return True
+    if bare in _DEEPSEEK_CANONICAL_MODELS:
+        return True
+    if _DEEPSEEK_V_SERIES_RE.match(bare):
+        return True
+    return any(keyword in bare for keyword in _DEEPSEEK_REASONER_KEYWORDS)
+
 
 def _strip_vendor_prefix(model_name: str) -> str:
     """Remove a ``vendor/`` prefix if present.
