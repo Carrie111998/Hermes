@@ -142,3 +142,9 @@ test('source contract: session controls expose filter and selection state to ass
   assert.match(pluginSource, /'aria-current': active \? 'page' : undefined/)
 })
 
+test('source contract: a fresh agent session is labelled separately from canonical Bot Chat', () => {
+  assert.match(pluginSource, /host\.newChat\(bot\.name\)/)
+  assert.match(pluginSource, /children: 'New session with this agent'/)
+  assert.doesNotMatch(pluginSource, /children: 'New chat with this agent'/)
+})
+

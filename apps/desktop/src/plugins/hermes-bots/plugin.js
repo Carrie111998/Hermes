@@ -3268,7 +3268,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                 host.newChat(bot.name)
               }
             },
-            children: 'New chat with this agent'
+            children: 'New session with this agent'
           }),
           bot.is_default ? null : jsx(ContextMenuSeparator, {}),
           bot.is_default
