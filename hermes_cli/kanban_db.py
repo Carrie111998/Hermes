@@ -73,6 +73,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import random
@@ -5349,6 +5350,493 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# Exact assignee/profile names win. The title/workflow fallback is only
+# ``review`` / ``reviewer`` — words like ``release`` or ``qa`` mis-route
+# implementation children (e.g. "release notes", "release-candidate").
+_REVIEW_CHILD_ASSIGNEES = frozenset({"hermes-review", "reviewer"})
+_REVIEW_CHILD_RE = re.compile(r"\b(review|reviewer)\b", re.IGNORECASE)
+
+
+def _review_metadata_has_candidate(metadata: Any) -> bool:
+    """Return whether *metadata* claims to carry PR recovery evidence."""
+    if not isinstance(metadata, Mapping):
+        return False
+    if any(key in metadata for key in (
+        "review_evidence", "pr_url", "pull_request_url", "pr_number",
+        "head_sha", "commit_sha", "head_branch",
+    )):
+        return True
+    return isinstance(metadata.get("review"), Mapping) or isinstance(
+        metadata.get("pr"), Mapping
+    )
+
+
+def _review_evidence_from_metadata(metadata: Any):
+    """Return ``(evidence, diagnostic, candidate_present)``."""
+    from hermes_cli.kanban_review_recovery import extract_review_evidence
+
+    candidate = _review_metadata_has_candidate(metadata)
+    if not candidate:
+        return None, None, False
+    evidence, diagnostic = extract_review_evidence(metadata)
+    return evidence, diagnostic, True
+
+
+def _latest_blocked_review_metadata(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Read the newest structured evidence attached to a blocked attempt."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'block_loop_detected', 'review_recovery_blocked') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        # The newest block transition is authoritative. An older PR handoff
+        # must not revive a card that was subsequently blocked for an
+        # unrelated reason without evidence.
+        evidence = payload.get("review_evidence")
+        if isinstance(evidence, Mapping):
+            return {"review_evidence": dict(evidence)}, "blocked_event"
+        return None, "blocked_event"
+
+    rows = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'blocked' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if _review_metadata_has_candidate(metadata):
+            return metadata, "blocked_run"
+    return None, None
+
+
+def _latest_review_request_payload(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _review_child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Find explicitly review-shaped direct children without creating cards."""
+    rows = conn.execute(
+        "SELECT t.id, t.title, t.body, t.assignee, t.skills, "
+        "t.workflow_template_id FROM tasks t "
+        "JOIN task_links l ON l.child_id = t.id "
+        "WHERE l.parent_id = ? ORDER BY t.created_at ASC, t.id ASC",
+        (task_id,),
+    ).fetchall()
+    review_ids: list[str] = []
+    for row in rows:
+        skills = row["skills"]
+        try:
+            skills = json.loads(skills) if isinstance(skills, str) else skills
+        except (TypeError, json.JSONDecodeError):
+            skills = []
+        skill_text = " ".join(str(item) for item in skills) if isinstance(skills, list) else ""
+        graph_text = " ".join(
+            str(row[key] or "")
+            for key in ("title", "workflow_template_id")
+        )
+        assignee = str(row["assignee"] or "").casefold().strip()
+        if (
+            assignee in _REVIEW_CHILD_ASSIGNEES
+            or "sdlc-review" in skill_text.casefold()
+            or _REVIEW_CHILD_RE.search(graph_text)
+        ):
+            review_ids.append(row["id"])
+    return review_ids
+
+
+def _review_reviewer(metadata: Any, prior_request: Optional[dict]) -> str:
+    """Resolve an independent reviewer, preserving prior same-card provenance."""
+    value = None
+    if isinstance(metadata, Mapping):
+        value = metadata.get("reviewer") or metadata.get("reviewer_profile")
+        evidence = metadata.get("review_evidence")
+        if value is None and isinstance(evidence, Mapping):
+            value = evidence.get("reviewer") or evidence.get("reviewer_profile")
+    if value is None and isinstance(prior_request, Mapping):
+        value = prior_request.get("reviewer")
+    if value is None:
+        try:
+            from hermes_cli.config import load_config
+            kanban_cfg = (load_config() or {}).get("kanban", {})
+            value = kanban_cfg.get(
+                "review_reviewer",
+                kanban_cfg.get("blocked_review_reviewer"),
+            )
+        except Exception:
+            value = None
+    value = str(value or "hermes-review").strip()
+    return value or "hermes-review"
+
+
+def _review_recovery_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    evidence: dict,
+    diagnostic: str,
+    source: str,
+) -> None:
+    """Append one deduplicated operator-visible recovery diagnostic."""
+    diagnostic = str(redact_review_value(diagnostic or "recovery could not be verified"))[:1000]
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["kind"] == "review_recovery_blocked":
+        try:
+            prior = json.loads(latest["payload"]) if latest["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            prior = {}
+        if (
+            isinstance(prior, dict)
+            and prior.get("diagnostic") == diagnostic
+            and prior.get("review_evidence") == evidence
+        ):
+            return
+    _append_event(
+        conn,
+        task_id,
+        "review_recovery_blocked",
+        {
+            "diagnostic": diagnostic,
+            "source": source,
+            "review_evidence": evidence,
+        },
+    )
+
+
+def _review_recovery_already_routed(
+    conn: sqlite3.Connection, task_id: str, evidence: dict,
+) -> Optional[str]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_recovery_routed' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("review_evidence") != evidence:
+        return None
+    lane = payload.get("lane")
+    return lane if lane in {"same_card", "downstream"} else None
+
+
+def _review_summary_line(value: Optional[str], fallback: str) -> str:
+    lines = str(value or "").strip().splitlines()
+    return lines[0][:400] if lines else fallback
+
+
+def recover_blocked_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    provider=None,
+    dry_run: bool = False,
+) -> tuple[bool, Optional[str]]:
+    """Safely route a blocked implementation with a verified live PR.
+
+    The provider query runs before the SQLite write transaction. The final
+    status change is a compare-and-swap on ``status='blocked'`` and the
+    append-only ``review_recovery_routed`` event makes retries and concurrent
+    dispatcher ticks idempotent. The return value is ``(routed, diagnostic)``;
+    a false result never changes a blocked card.
+    """
+    from hermes_cli.kanban_review_recovery import verify_live_review_state
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, "task not found"
+    candidate_metadata = metadata
+    if not _review_metadata_has_candidate(candidate_metadata):
+        candidate_metadata, _ = _latest_blocked_review_metadata(conn, task_id)
+    evidence, diagnostic, candidate = _review_evidence_from_metadata(candidate_metadata)
+    if not candidate:
+        return False, None
+    if evidence is None:
+        diagnostic = diagnostic or "structured review evidence is malformed"
+        if not dry_run:
+            with write_txn(conn):
+                _review_recovery_event(
+                    conn, task_id, evidence={}, diagnostic=diagnostic, source="metadata",
+                )
+        return False, diagnostic
+
+    evidence_dict = evidence.as_dict()
+    already = _review_recovery_already_routed(conn, task_id, evidence_dict)
+    if already:
+        return True, already
+
+    ok, diagnostic, provider_snapshot = verify_live_review_state(
+        evidence, provider=provider,
+    )
+    if not ok:
+        if not dry_run:
+            with write_txn(conn):
+                current = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if current is not None and current["status"] == "blocked":
+                    _review_recovery_event(
+                        conn,
+                        task_id,
+                        evidence=evidence_dict,
+                        diagnostic=diagnostic or "live provider state is unknown",
+                        source="provider",
+                    )
+        return False, diagnostic or "live provider state is unknown"
+
+    prior_request = _latest_review_request_payload(conn, task_id)
+    child_ids = _review_child_ids(conn, task_id)
+    if len(child_ids) > 1:
+        diagnostic = (
+            "blocked completion has multiple downstream review children; "
+            "remove the duplicate lane before retrying recovery"
+        )
+        if not dry_run:
+            with write_txn(conn):
+                _review_recovery_event(
+                    conn, task_id, evidence=evidence_dict, diagnostic=diagnostic,
+                    source="graph",
+                )
+        return False, diagnostic
+    if child_ids and prior_request is not None:
+        diagnostic = (
+            "review graph has both a downstream child and a same-card "
+            "review_requested handoff; choose exactly one review lane"
+        )
+        if not dry_run:
+            with write_txn(conn):
+                _review_recovery_event(
+                    conn, task_id, evidence=evidence_dict, diagnostic=diagnostic,
+                    source="graph",
+                )
+        return False, diagnostic
+    lane = "downstream" if child_ids else "same_card"
+    reviewer = _review_reviewer(candidate_metadata, prior_request)
+    if lane == "same_card" and reviewer.casefold() == str(task.assignee or "").casefold():
+        diagnostic = "reviewer must be independent from the implementation assignee"
+        if not dry_run:
+            with write_txn(conn):
+                _review_recovery_event(
+                    conn, task_id, evidence=evidence_dict, diagnostic=diagnostic,
+                    source="graph",
+                )
+        return False, diagnostic
+
+    if dry_run:
+        return True, lane
+
+    recovery_metadata = {
+        "review_evidence": evidence_dict,
+        "review_provider_state": provider_snapshot,
+        "review_recovery": "blocked_completion",
+        "review_lane": lane,
+    }
+    routed_run_id: Optional[int] = None
+    routed_assignee = task.assignee
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False, "task not found"
+        if current["status"] != "blocked":
+            existing = _review_recovery_already_routed(conn, task_id, evidence_dict)
+            if existing:
+                return True, existing
+            return False, f"task is {current['status']}; blocked recovery is no longer applicable"
+        # Re-read graph policy after acquiring the writer lock. A child can be
+        # linked (or a same-card handoff can be recorded) while the provider
+        # query above is in flight; never route on the stale pre-query shape.
+        locked_children = _review_child_ids(conn, task_id)
+        locked_prior_request = _latest_review_request_payload(conn, task_id)
+        locked_lane = "downstream" if len(locked_children) == 1 else "same_card"
+        if (
+            len(locked_children) > 1
+            or locked_lane != lane
+            or bool(locked_children) != bool(child_ids)
+            or (locked_prior_request is not None) != (prior_request is not None)
+        ):
+            diagnostic = (
+                "review graph changed during recovery; choose exactly one "
+                "stable review lane and retry"
+            )
+            _review_recovery_event(
+                conn, task_id, evidence=evidence_dict, diagnostic=diagnostic,
+                source="graph",
+            )
+            return False, diagnostic
+        child_ids = locked_children
+        prior_request = locked_prior_request
+        if lane == "same_card" and reviewer.casefold() == str(current["assignee"] or "").casefold():
+            diagnostic = "reviewer must be independent from the implementation assignee"
+            _review_recovery_event(
+                conn, task_id, evidence=evidence_dict, diagnostic=diagnostic,
+                source="graph",
+            )
+            return False, diagnostic
+        if expected_run_id is not None:
+            latest_block = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? "
+                "AND outcome = 'blocked' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if latest_block is None or int(latest_block["id"]) != int(expected_run_id):
+                return False, "blocked completion run_id mismatch"
+        if not _parents_satisfied(conn, task_id):
+            diagnostic = "parent dependencies are not satisfied; review recovery is waiting"
+            _review_recovery_event(
+                conn, task_id, evidence=evidence_dict, diagnostic=diagnostic,
+                source="dependency",
+            )
+            return False, diagnostic
+
+        if lane == "downstream":
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'done', result = ?, completed_at = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, block_recurrences = 0 "
+                "WHERE id = ? AND status = 'blocked'",
+                (result, int(time.time()), task_id),
+            )
+            if cur.rowcount != 1:
+                existing = _review_recovery_already_routed(conn, task_id, evidence_dict)
+                return (True, existing) if existing else (False, "task changed during recovery")
+            routed_run_id = _end_run(
+                conn, task_id, outcome="completed", status="done",
+                summary=summary if summary is not None else result,
+                metadata=recovery_metadata,
+            )
+            if routed_run_id is None:
+                routed_run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="completed",
+                    summary=summary if summary is not None else result,
+                    metadata=recovery_metadata,
+                )
+            _append_event(
+                conn, task_id, "completed",
+                {
+                    "summary": _review_summary_line(
+                        summary if summary is not None else result,
+                        "Implementation recovered; downstream review released.",
+                    ),
+                    "review_recovery": True,
+                    "review_lane": lane,
+                    "review_evidence": evidence_dict,
+                },
+                run_id=routed_run_id,
+            )
+        else:
+            reviewer = _canonical_assignee(reviewer) or "hermes-review"
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'review', assignee = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, block_recurrences = 0 "
+                "WHERE id = ? AND status = 'blocked'",
+                (reviewer, task_id),
+            )
+            if cur.rowcount != 1:
+                existing = _review_recovery_already_routed(conn, task_id, evidence_dict)
+                return (True, existing) if existing else (False, "task changed during recovery")
+            routed_assignee = reviewer
+            routed_run_id = _end_run(
+                conn, task_id, outcome="review_requested", status="review",
+                summary=summary,
+                metadata=recovery_metadata,
+            )
+            if routed_run_id is None:
+                routed_run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="review_requested",
+                    summary=summary,
+                    metadata=recovery_metadata,
+                )
+            _append_event(
+                conn, task_id, "review_requested",
+                {
+                    "summary": _review_summary_line(
+                        summary,
+                        "Implementation recovered; review requested.",
+                    ),
+                    "implementer": current["assignee"],
+                    "reviewer": reviewer,
+                    "review_recovery": True,
+                    "review_evidence": evidence_dict,
+                },
+                run_id=routed_run_id,
+            )
+        _append_event(
+            conn, task_id, "review_recovery_routed",
+            {
+                "lane": lane,
+                "reviewer": reviewer if lane == "same_card" else None,
+                "child_id": child_ids[0] if child_ids else None,
+                "review_evidence": evidence_dict,
+                "provider_state": provider_snapshot,
+            },
+            run_id=routed_run_id,
+        )
+
+    if lane == "downstream":
+        _clear_failure_counter(conn, task_id)
+        recompute_ready(conn)
+        _cleanup_workspace(conn, task_id)
+        done_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_completed", task_id,
+            board=get_current_board(),
+            assignee=done_task.assignee if done_task else None,
+            run_id=routed_run_id,
+            summary=summary if summary is not None else result,
+        )
+    _log.info(
+        "kanban: blocked implementation %s recovered to %s review lane%s",
+        task_id,
+        lane,
+        f" (reviewer={routed_assignee})" if lane == "same_card" else "",
+    )
+    return True, lane
+
+
+# Descriptive alias used by dispatcher/gateway call sites and external tests.
+recover_blocked_review = recover_blocked_completion
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5360,7 +5848,12 @@ def complete_task(
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+    """Transition ``running|ready|review -> done`` and record ``result``.
+
+    A blocked implementation is not completed directly: it must carry a
+    structured ``review_evidence`` handoff and pass the live provider gate,
+    after which it is routed to same-card or downstream review. This prevents
+    a manual unblock/complete cycle from bypassing the active-PR guard.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -5393,6 +5886,40 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    prior_state = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if prior_state is not None and prior_state["status"] == "blocked":
+        # A blocked implementation may have finished after its worker's block
+        # terminator closed the run.  Do not silently turn that state into
+        # ``done`` when the caller supplies (or the blocked run already holds)
+        # a PR handoff: route it through the live-evidence gate instead.
+        recovered, recovery_reason = recover_blocked_completion(
+            conn,
+            task_id,
+            metadata=metadata,
+            summary=summary,
+            result=result,
+            expected_run_id=expected_run_id,
+        )
+        if recovered:
+            return True
+        if recovery_reason:
+            return False
+        diagnostic = (
+            "blocked completion requires structured review_evidence with an "
+            "immutable branch/head/PR identity and live green exact-head checks"
+        )
+        with write_txn(conn):
+            current = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if current is not None and current["status"] == "blocked":
+                _review_recovery_event(
+                    conn, task_id, evidence={}, diagnostic=diagnostic,
+                    source="completion",
+                )
+        return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -6250,6 +6777,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6282,6 +6810,18 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    metadata = redact_review_value(metadata)
+    blocked_evidence, _blocked_evidence_reason, _has_evidence = (
+        _review_evidence_from_metadata(metadata)
+    )
+    blocked_evidence_payload = (
+        blocked_evidence.as_dict() if blocked_evidence is not None else None
+    )
+    blocked_metadata = (
+        {"review_evidence": blocked_evidence_payload}
+        if blocked_evidence_payload is not None
+        else None
+    )
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6328,10 +6868,12 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=blocked_metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=blocked_metadata,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
@@ -6339,6 +6881,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "source_status": source_status,
+                    "review_evidence": blocked_evidence_payload,
                 },
                 run_id=run_id,
             )
@@ -6386,10 +6929,12 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=blocked_metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=blocked_metadata,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -6399,6 +6944,7 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                    "review_evidence": blocked_evidence_payload,
                 },
                 run_id=run_id,
             )
@@ -6440,6 +6986,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=blocked_metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6448,6 +6995,7 @@ def block_task(
                     conn, task_id,
                     outcome="blocked",
                     summary=reason,
+                    metadata=blocked_metadata,
                 )
             _append_event(
                 conn, task_id, "blocked",
@@ -6456,6 +7004,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
+                    "review_evidence": blocked_evidence_payload,
                 },
                 run_id=run_id,
             )
@@ -8064,6 +8613,10 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    review_recovered: list[tuple[str, str]] = field(default_factory=list)
+    """Blocked implementation ids routed to ``(same_card|downstream)`` review."""
+    review_recovery_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """Blocked implementation ids retained with an actionable recovery diagnostic."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -9379,6 +9932,81 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _parse_finite_int_timestamp(value: Any) -> Optional[int]:
+    """Return a finite integral timestamp, or ``None`` for malformed input.
+
+    SQLite's dynamic typing means callers can encounter text, floats, NaN,
+    or infinity in columns that are declared ``INTEGER``. Respawn decisions
+    must fail closed rather than letting malformed values raise or sort ahead
+    of a valid handoff.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        numeric = float(value)
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            return None
+        return int(numeric)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _review_rework_follows_pr_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    assignee: Optional[str],
+    pr_handoff_at: int,
+    now: int,
+) -> bool:
+    """Return whether the latest valid review rework follows the PR handoff.
+
+    This is deliberately narrow: only a durable ``changes_requested`` or
+    ``review_reopened`` event for the current implementer, landing in a
+    dispatchable phase, can reset the ready-lane active-PR guard. Timestamp
+    ties are not treated as ordering because comments and events have
+    independent whole-second clocks; malformed or future provenance fails
+    closed as well.
+    """
+    row = conn.execute(
+        "SELECT kind, created_at, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('changes_requested', 'review_reopened') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+
+    event_at = _parse_finite_int_timestamp(row["created_at"])
+    if event_at is None or event_at > now:
+        return False
+
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    implementer = payload.get("implementer")
+    status = payload.get("status")
+    if (
+        not isinstance(implementer, str)
+        or not implementer.strip()
+        or not isinstance(assignee, str)
+        or implementer.strip() != assignee.strip()
+        or status not in {"ready", "todo"}
+    ):
+        return False
+
+    # Strict ordering is intentional. Equal timestamps provide no evidence
+    # that the rework followed the PR comment, so the duplicate-work guard
+    # remains active.
+    return event_at > pr_handoff_at
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9430,7 +10058,12 @@ def check_respawn_guard(
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        opened a PR; re-spawning risks a duplicate PR on the same task. The
+        ready-lane guard is bypassed only when the latest valid
+        ``changes_requested``/``review_reopened`` event names the current
+        implementer, lands in ``ready``/``todo``, and is strictly newer than
+        the latest PR handoff comment. Missing, malformed, or same-second
+        provenance remains guarded.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9438,7 +10071,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9453,14 +10086,15 @@ def check_respawn_guard(
     #    the regex would otherwise match → defer forever (no failure counter
     #    increment on this path means the breaker can never free it).
     #
-    #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
-    #    newer crash/completion superseded the rate-limit run, this guard
-    #    no longer applies and the normal paths take over.
+    #    We look at the LATEST run only (ORDER BY id DESC LIMIT 1): if a newer
+    #    crash/completion superseded the rate-limit run, this guard no longer
+    #    applies and the normal paths take over. Ordering by the row id avoids
+    #    SQLite's dynamic-type ordering for malformed ended_at values.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if (
@@ -9472,8 +10106,14 @@ def check_respawn_guard(
             # blocker_auth regex so the stamped rate-limit text doesn't
             # re-trap the task.
             return None
-        ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        ended_at = _parse_finite_int_timestamp(latest_run["ended_at"])
+        if ended_at is None:
+            # A rate_limited run should always receive ended_at via
+            # ``_end_run``. If it does not, fail open for this guard only:
+            # parking forever on a missing timestamp is worse than one
+            # cheap probe. Future/malformed-but-numeric values stay closed.
+            return None
+        if ended_at > now or (now - ended_at) < rl_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
@@ -9500,32 +10140,112 @@ def check_respawn_guard(
     #    deferring. Without this, a manual done→ready just sits there,
     #    silently held by the guard, until the window elapses.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    recent_completed = conn.execute(
+    completed_rows = conn.execute(
         "SELECT ended_at FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
-        "ORDER BY ended_at DESC LIMIT 1",
-        (task_id, cutoff),
-    ).fetchone()
-    if recent_completed:
-        completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
-        ).fetchone()
+        "WHERE task_id = ? AND outcome = 'completed' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    recent_completed_at: Optional[int] = None
+    for completed_row in completed_rows:
+        completed_at = _parse_finite_int_timestamp(completed_row["ended_at"])
+        if completed_at is None or completed_at > now:
+            # A malformed/future completion is safer to treat as guarded than
+            # to risk a duplicate run after an untrusted timestamp.
+            return "recent_success"
+        if completed_at >= cutoff:
+            if recent_completed_at is None or completed_at > recent_completed_at:
+                recent_completed_at = completed_at
+    if recent_completed_at is not None:
+        requeued_after = False
+        for event_row in conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')",
+            (task_id,),
+        ).fetchall():
+            event_at = _parse_finite_int_timestamp(event_row["created_at"])
+            if (
+                event_at is not None
+                and event_at <= now
+                and event_at >= recent_completed_at
+            ):
+                requeued_after = True
+                break
         if not requeued_after:
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    A same-card review rework is the one narrow ready-lane exception:
+    #    require valid implementer/status provenance and strict timestamp
+    #    ordering so a fresh task with an existing PR remains guarded.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_handoff_at: Optional[int] = None
+    # Bound the hot-path scan to the guard window. Keep NULL / non-integer
+    # created_at rows so malformed provenance still fail-closes as active_pr.
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND ("
+        "created_at IS NULL OR typeof(created_at) != 'integer' "
+        "OR created_at >= ?) "
+        "ORDER BY id ASC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        if not c["body"] or not _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            continue
+        comment_at = _parse_finite_int_timestamp(c["created_at"])
+        # A matching comment with malformed/future provenance is safer to
+        # treat as active than to risk a duplicate PR.
+        if comment_at is None or comment_at > now:
             return "active_pr"
+        if comment_at >= pr_cutoff:
+            if latest_pr_handoff_at is None or comment_at > latest_pr_handoff_at:
+                latest_pr_handoff_at = comment_at
+
+    if latest_pr_handoff_at is not None:
+        if _review_rework_follows_pr_handoff(
+            conn,
+            task_id,
+            assignee=row["assignee"],
+            pr_handoff_at=latest_pr_handoff_at,
+            now=now,
+        ):
+            return None
+        return "active_pr"
+
+    # Structured recovery evidence is stronger than a free-form PR comment and
+    # must keep protecting the implementation lane even if an operator
+    # unblocks the card without copying the URL into a comment. The only
+    # ready-lane exception is the same narrow reviewer rework transition used
+    # above; a fresh unblock with an existing PR remains guarded.
+    structured_metadata, _source = _latest_blocked_review_metadata(conn, task_id)
+    if _review_metadata_has_candidate(structured_metadata):
+        structured_evidence, _evidence_reason, _candidate = (
+            _review_evidence_from_metadata(structured_metadata)
+        )
+        if structured_evidence is None:
+            return "active_pr"
+        evidence_event = conn.execute(
+            "SELECT created_at FROM task_events WHERE task_id = ? "
+            "AND kind IN ('blocked', 'block_loop_detected', 'review_recovery_blocked') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        evidence_at = (
+            _parse_finite_int_timestamp(evidence_event["created_at"])
+            if evidence_event is not None
+            else None
+        )
+        if evidence_at is None:
+            return "active_pr"
+        if _review_rework_follows_pr_handoff(
+            conn,
+            task_id,
+            assignee=row["assignee"],
+            pr_handoff_at=evidence_at,
+            now=now,
+        ):
+            return None
+        return "active_pr"
 
     return None
 
@@ -9603,6 +10323,40 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def recover_blocked_review_tasks(
+    conn: sqlite3.Connection,
+    *,
+    provider=None,
+    dry_run: bool = False,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Recover only blocked cards carrying structured PR evidence.
+
+    A plain blocked card is intentionally untouched.  This keeps dependency,
+    capability, and human-input blocks out of the provider path while allowing
+    a later worker completion (or a retry after a transient provider failure)
+    to be reconciled by the normal dispatcher tick.
+    """
+    routed: list[tuple[str, str]] = []
+    retained: list[tuple[str, str]] = []
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked' "
+        "AND claim_lock IS NULL ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        metadata, _source = _latest_blocked_review_metadata(conn, task_id)
+        if not _review_metadata_has_candidate(metadata):
+            continue
+        ok, reason = recover_blocked_completion(
+            conn, task_id, metadata=metadata, provider=provider, dry_run=dry_run,
+        )
+        if ok:
+            routed.append((task_id, str(reason or "same_card")))
+        elif reason:
+            retained.append((task_id, reason))
+    return routed, retained
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9617,6 +10371,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    review_provider=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9652,6 +10407,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            review_provider=review_provider,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9672,6 +10428,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                review_provider=review_provider,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9699,6 +10456,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    review_provider=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9760,6 +10518,15 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Reconcile a worker that finished on a trustworthy PR after its block
+    # terminator closed the run.  This runs before dependency promotion so a
+    # downstream review child is released in the same tick; plain blocked
+    # cards and active-PR ready cards never enter this provider path.
+    recovered, recovery_blocked = recover_blocked_review_tasks(
+        conn, provider=review_provider, dry_run=dry_run,
+    )
+    result.review_recovered.extend(recovered)
+    result.review_recovery_blocked.extend(recovery_blocked)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Both knobs are total in-flight caps. Collapse them before either lane
