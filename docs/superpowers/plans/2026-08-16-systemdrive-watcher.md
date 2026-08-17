@@ -23,7 +23,25 @@
 - **`HERMES_TEST_JUNK_PROBE` is opt-in, default off.**
 - Log location derives from `Path.home()` (survives `env -i`) and lives **outside** any watched root.
 - Verification runs **in this worktree at this commit only** — test outcomes here are location-dependent (22–23 failures inside the shared checkout vs 3 from a Temp-resident worktree). Never A/B across paths.
-- Commits in this repo go through `python C:\Users\diego\.hermes\ops\git-quiet-commit.py -C <repo> -F <msgfile> -- <paths>` from PowerShell. Never `git commit -- <paths>`, never `git commit -a`, never `--no-verify`.
+- **Committing — read this before the first commit step.** Commits go through
+  `python C:\Users\diego\.hermes\ops\git-quiet-commit.py -C <repo> -F <msgfile> -- <paths>`,
+  run from **PowerShell**, with an absolute `-C`. Never `git commit -- <paths>`, never
+  `git commit -a`, never `--no-verify`.
+
+  Each task below shows its commit message inside a ```bash fence. **That fence is the
+  message text, not the invocation.** Two reasons you must not run it as written:
+  a `git commit` spawned from the Bash tool on this box cannot spawn the pre-commit
+  hook, and PowerShell 5.1 mangles multi-line quoted strings passed to `-m`. So for
+  every commit step: write the message to a file, then run the wrapper from PowerShell
+  with `-F`:
+
+  ```
+  Write the message to <scratchpad>/task-N-msg.txt
+  python C:\Users\diego\.hermes\ops\git-quiet-commit.py -C <abs worktree path> -F <scratchpad>/task-N-msg.txt -- <paths>
+  ```
+
+  An exit-2 refusal (foreign staged files, a mid-operation repo, index divergence) is
+  the wrapper working as designed. Report it and stop — never work around one.
 
 ---
 
@@ -537,14 +555,23 @@ def test_describe_pid_of_a_dead_process_is_kept_with_an_error():
     assert "error" in entry
 
 
-def test_describe_pid_partial_failure_keeps_the_other_fields():
+def test_describe_pid_partial_failure_keeps_the_other_fields(monkeypatch):
     """cwd is AccessDenied for many Windows processes.
 
     Fields are captured individually so losing cwd does not also lose the
-    cmdline, which is the actual identifying field.
+    cmdline, which is the actual identifying field. A single try/except
+    around the whole block would drop both -- so this test INDUCES the cwd
+    failure rather than hoping for one.
     """
+    import psutil
+
+    def boom(self):
+        raise psutil.AccessDenied(self.pid)
+
+    monkeypatch.setattr(psutil.Process, "cwd", boom)
     entry = describe_pid(os.getpid())
-    assert "cmdline" in entry  # present regardless of whether cwd resolved
+    assert entry["cmdline"], "cmdline must survive a cwd failure"
+    assert entry["errors"]["cwd"] == "AccessDenied"
 
 
 def test_first_sample_is_a_baseline_not_a_flood():
@@ -1304,7 +1331,10 @@ Replace `Watcher._start_backends` with the selecting version, and add handle boo
             use_fast = sys.platform == "win32" and not self.force_polling
             if use_fast:
                 try:
-                    _open_directory_handle(root)[0]  # probe openability
+                    # Probe openability, then close immediately -- the watch
+                    # thread opens its own handle.
+                    probe_k32, probe_handle = _open_directory_handle(root)
+                    probe_k32.CloseHandle(ctypes.c_void_p(probe_handle))
                 except OSError as exc:
                     write_record(
                         self.log, "backend_downgrade", root=str(root),
@@ -1338,8 +1368,6 @@ And in `run()`, after `self._stop.set()` and before the `done` record, unblock a
             except Exception:
                 pass
 ```
-
-> **Note on the openability probe:** it opens a handle and lets it fall out of scope without closing, leaking one handle per root per run. With at most a handful of roots per process this is acceptable, but if you prefer, close it explicitly — `kernel32.CloseHandle(ctypes.c_void_p(h))` on the returned pair.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
