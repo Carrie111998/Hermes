@@ -11899,6 +11899,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                event_metadata=getattr(event, "metadata", None),
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -14689,6 +14690,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        return metadata
+
+    def _thread_metadata_for_event(
+        self,
+        event: MessageEvent,
+        reply_to_message_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Build reply metadata while preserving event-scoped audit data."""
+        return self._thread_metadata_for_event_data(
+            event.source,
+            getattr(event, "metadata", None),
+            reply_to_message_id,
+        )
+
+    def _thread_metadata_for_event_data(
+        self,
+        source: SessionSource,
+        event_metadata: Optional[Dict[str, Any]],
+        reply_to_message_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Build reply metadata from source plus event-scoped audit data."""
+        metadata = self._thread_metadata_for_source(
+            source,
+            reply_to_message_id,
+        )
+        correlation_id = (
+            event_metadata.get("telegram_delivery_correlation_id")
+            if isinstance(event_metadata, dict)
+            else None
+        )
+        if correlation_id:
+            metadata = dict(metadata) if metadata else {}
+            metadata["telegram_delivery_correlation_id"] = str(correlation_id)
+            correlation_ids = event_metadata.get("telegram_delivery_correlation_ids")
+            if isinstance(correlation_ids, (list, tuple)):
+                metadata["telegram_delivery_correlation_ids"] = [
+                    str(value) for value in correlation_ids if value
+                ]
         return metadata
 
     def _thread_metadata_for_target(
@@ -18269,6 +18308,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -18288,6 +18328,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                event_metadata=event_metadata,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -18299,6 +18340,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                event_metadata=event_metadata,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -18330,6 +18372,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -18800,11 +18843,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _progress_thread_id = _resolve_progress_thread_id(
             source.platform, source.thread_id, event_message_id,
         )
-        _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
-            if _progress_thread_id == source.thread_id
-            else {"thread_id": _progress_thread_id}
-        ) if _progress_thread_id else None
+        _progress_metadata = None
+        if _progress_thread_id:
+            _progress_metadata = self._thread_metadata_for_event_data(
+                source,
+                event_metadata,
+                event_message_id,
+            )
+            if _progress_thread_id != source.thread_id:
+                _progress_metadata = dict(_progress_metadata or {})
+                _progress_metadata["thread_id"] = _progress_thread_id
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
@@ -19267,7 +19315,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+            _status_thread_metadata = (
+                self._thread_metadata_for_event_data(
+                    source,
+                    event_metadata,
+                    event_message_id,
+                )
+                if _progress_thread_id
+                else None
+            )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -21301,6 +21357,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    event_metadata=(
+                        getattr(pending_event, "metadata", None)
+                        if pending_event is not None
+                        else None
+                    ),
                     channel_prompt=next_channel_prompt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

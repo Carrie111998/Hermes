@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.run import GatewayRunner
 from gateway.platforms.base import MessageEvent, SendResult, _thread_metadata_for_event
 from gateway.platforms.base import Platform, SessionSource
 from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -43,6 +44,32 @@ def test_event_metadata_is_carried_into_outbound_metadata():
     assert metadata["telegram_delivery_correlation_id"] == CORRELATION
     assert "redacted" not in repr(metadata)
     assert "not-logged" not in repr(metadata)
+
+
+def test_gateway_runner_stream_metadata_preserves_event_correlation():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = MagicMock(return_value={"thread_id": "topic-1"})
+    event = MessageEvent(
+        text="redacted",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="not-logged",
+            chat_type="dm",
+        ),
+        metadata={
+            "telegram_delivery_correlation_id": CORRELATION,
+            "telegram_delivery_correlation_ids": [CORRELATION, "second-id"],
+        },
+    )
+
+    metadata = runner._thread_metadata_for_event(event, "reply-1")
+
+    assert metadata == {
+        "thread_id": "topic-1",
+        "telegram_delivery_correlation_id": CORRELATION,
+        "telegram_delivery_correlation_ids": [CORRELATION, "second-id"],
+    }
+    runner._thread_metadata_for_source.assert_called_once_with(event.source, "reply-1")
 
 
 def test_batched_event_metadata_carries_all_correlation_ids():
