@@ -12,9 +12,9 @@ not 'done'. The claim_task gate added in hermes_cli/kanban_db.py must
 demote such tasks back to 'todo' and emit a 'claim_rejected' event
 instead of spawning.
 
-Run as a script (`python tests/stress/test_concurrency_parent_gate.py`)
-or via `pytest --run-stress`. The default pytest collection in
-tests/stress/conftest.py ignores *.py globs, so this is a script.
+Run as a script (`python tests/stress/test_concurrency_parent_gate.py`).
+tests/stress/conftest.py sets collect_ignore_glob = ["*.py"], so pytest
+never collects this file; running it directly is the only path.
 """
 from __future__ import annotations
 
