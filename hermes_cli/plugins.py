@@ -769,9 +769,9 @@ def _parse_manifest_v2_fields(data: Mapping, key: str) -> Dict[str, Any]:
     # provider settings. Normalize it into the existing config_schema mapping
     # so validation and downstream consumers share one representation.
     raw_fields = data.get("config_fields")
-    if raw_schema is None and raw_fields is not None:
+    normalized_fields: Dict[str, Any] = {}
+    if raw_fields is not None:
         if isinstance(raw_fields, list):
-            raw_schema = {}
             for field_spec in raw_fields:
                 if not isinstance(field_spec, Mapping) or not field_spec.get("key"):
                     logger.warning(
@@ -781,9 +781,23 @@ def _parse_manifest_v2_fields(data: Mapping, key: str) -> Dict[str, Any]:
                     continue
                 field_spec = dict(field_spec)
                 field_key = str(field_spec.pop("key"))
-                raw_schema[field_key] = field_spec
+                normalized_fields[field_key] = field_spec
         else:
             logger.warning("Plugin %s: config_fields must be a list; ignoring", key)
+    if raw_schema is None:
+        raw_schema = normalized_fields
+    elif normalized_fields:
+        if isinstance(raw_schema, Mapping):
+            raw_schema = dict(raw_schema)
+            for field_key, field_spec in normalized_fields.items():
+                if field_key in raw_schema:
+                    logger.warning(
+                        "Plugin %s: config_schema takes precedence over duplicate "
+                        "config_fields key %r",
+                        key, field_key,
+                    )
+                else:
+                    raw_schema[field_key] = field_spec
     schema: Dict[str, Any] = {}
     if raw_schema is not None and not isinstance(raw_schema, Mapping):
         logger.warning(

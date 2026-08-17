@@ -148,6 +148,27 @@ class TestV2Parsing:
             },
         }
 
+    def test_config_schema_wins_on_duplicate_config_fields_key(self, hermes_home, caplog):
+        _write_plugin(
+            hermes_home / "plugins", "mixed",
+            manifest_extra={
+                "manifest_version": 2,
+                "config_schema": {"stt.mixed.model": {"type": "string"}},
+                "config_fields": [
+                    {"key": "stt.mixed.model", "type": "select"},
+                    {"key": "stt.mixed.language", "type": "string"},
+                ],
+            },
+        )
+        _enable(hermes_home, ["mixed"])
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            mgr = PluginManager()
+            mgr.discover_and_load()
+        schema = mgr._plugins["mixed"].manifest.config_schema
+        assert schema["stt.mixed.model"]["type"] == "string"
+        assert schema["stt.mixed.language"]["type"] == "string"
+        assert "takes precedence" in caplog.text
+
     def test_unknown_field_in_v2_warns_but_loads(self, hermes_home, caplog):
         _write_plugin(
             hermes_home / "plugins", "modern",

@@ -1516,13 +1516,19 @@ def _plugin_config_schema_fields() -> Dict[str, Dict[str, Any]]:
         "str": "string", "string": "string", "text": "text",
         "select": "select", "list": "list", "array": "list",
     }
-    for loaded in loaded_plugins:
+    for loaded in sorted(
+        loaded_plugins,
+        key=lambda item: str(getattr(getattr(item, "manifest", None), "key", "")),
+    ):
         manifest = getattr(loaded, "manifest", None)
         schema = getattr(manifest, "config_schema", None)
         if not isinstance(schema, dict):
             continue
         for key, spec in schema.items():
             if not isinstance(key, str) or "." not in key or not isinstance(spec, dict):
+                continue
+            if key in CONFIG_SCHEMA or key in fields:
+                _log.warning("Ignoring plugin config field collision for %s", key)
                 continue
             field: Dict[str, Any] = {
                 "type": type_map.get(str(spec.get("type", "string")).lower(), "string"),
@@ -1534,30 +1540,11 @@ def _plugin_config_schema_fields() -> Dict[str, Dict[str, Any]]:
             if isinstance(spec.get("options"), list):
                 field["options"] = list(spec["options"])
             fields[key] = field
-    # Provider registries can expose a live model catalog. Merge it into the
-    # corresponding model field without requiring manifests to duplicate it.
-    for kind, registry_module in (
-        ("tts", "agent.tts_registry"),
-        ("stt", "agent.transcription_registry"),
-    ):
-        try:
-            registry = __import__(registry_module, fromlist=["list_providers"])
-            for provider in registry.list_providers():
-                name = getattr(provider, "name", None)
-                if not name or not hasattr(provider, "list_models"):
-                    continue
-                models = provider.list_models() or []
-                options = [
-                    item.get("id", item.get("name")) if isinstance(item, dict) else str(item)
-                    for item in models
-                ]
-                options = [str(item) for item in options if item]
-                if options:
-                    key = f"{kind}.{name}.model"
-                    base = fields.get(key, {"type": "select"})
-                    fields[key] = {**base, "type": "select", "options": options}
-        except Exception:
-            continue
+    # Provider model catalogs are intentionally not queried here: this
+    # endpoint runs on the web-server event loop and plugin implementations
+    # may perform network I/O in list_models(). Plugins should declare stable
+    # options in config_fields; live catalogs belong in provider-specific,
+    # cached discovery endpoints.
     return fields
 
 
