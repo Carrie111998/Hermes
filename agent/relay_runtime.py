@@ -173,11 +173,13 @@ def _segments_config() -> dict[str, Any]:
                 try:
                     # Do NOT import gateway.run from a non-gateway host: its
                     # module top level sets os.environ["_HERMES_GATEWAY"] /
-                    # HERMES_QUIET / HERMES_EXEC_ASK — gateway-process
-                    # semantics. Dragged into a CLI/TUI/desktop/cron process,
-                    # HERMES_EXEC_ASK=1 flips tools/approval.py onto the
-                    # gateway approval path with no notify_cb, so dangerous
-                    # commands hang forever in pending_approval (#87183).
+                    # HERMES_QUIET — gateway-process semantics. Dragged into a
+                    # CLI/TUI/desktop/cron process, _HERMES_GATEWAY flips
+                    # tools/approval.py onto the gateway approval path with no
+                    # notify_cb, so dangerous commands hang forever in
+                    # pending_approval (#87183). (HERMES_EXEC_ASK was already
+                    # moved to start_gateway() by #86043, but _HERMES_GATEWAY
+                    # and HERMES_QUIET remain at module level.)
                     # read_raw_config() + managed overlay reproduce
                     # gateway.run._load_gateway_config() for this read without
                     # the import side effects.
