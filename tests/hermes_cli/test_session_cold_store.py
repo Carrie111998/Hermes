@@ -79,6 +79,40 @@ def test_store_reports_the_same_canonical_path_it_writes(tmp_path: Path) -> None
         db.close()
 
 
+def test_store_keeps_distinct_ids_that_only_differ_by_trailing_space(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    started_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC).timestamp()
+    try:
+        for session_id, marker in (("foo", "plain"), ("foo ", "trailing-space")):
+            db.create_session(session_id, source="cli")
+            db.append_message(session_id, role="user", content=marker)
+            db.end_session(session_id, "completed")
+            assert db.set_session_archived(session_id, True)
+            assert db._conn is not None
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (started_at, session_id),
+            )
+
+        plain = store_archived_lineage(db, "foo", archive_root)
+        trailing_space = store_archived_lineage(db, "foo ", archive_root)
+
+        assert plain.snapshot_dir != trailing_space.snapshot_dir
+        assert plain.snapshot_dir.is_dir()
+        assert trailing_space.snapshot_dir.is_dir()
+        assert '"content":"plain"' in (
+            plain.snapshot_dir / "session.jsonl"
+        ).read_text(encoding="utf-8")
+        assert '"content":"trailing-space"' in (
+            trailing_space.snapshot_dir / "session.jsonl"
+        ).read_text(encoding="utf-8")
+    finally:
+        db.close()
+
+
 def test_store_rejects_a_compression_ancestor_when_a_tip_exists(tmp_path: Path) -> None:
     """An archive snapshot must be keyed to the complete chain terminal, never a prefix."""
     db = SessionDB(db_path=tmp_path / "state.db")
