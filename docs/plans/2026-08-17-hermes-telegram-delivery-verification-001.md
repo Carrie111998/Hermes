@@ -1,6 +1,6 @@
 ---
 title: "HERMES-TELEGRAM-DELIVERY-VERIFICATION-001: prove one user-visible Telegram response"
-status: MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN
+status: PASS_MERGED_DEPLOYED_RUNTIME_HEALTH_INBOUND_OUTBOUND_USER_VISIBLE
 date: 2026-08-17
 type: verification
 ticket: HERMES-TELEGRAM-DELIVERY-VERIFICATION-001
@@ -11,12 +11,12 @@ target_repo: hermes-agent
 
 ## Status and boundary
 
-Current gate: `MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN`.
+Current gate: `PASS_MERGED_DEPLOYED_RUNTIME_HEALTH_INBOUND_OUTBOUND_USER_VISIBLE`.
 
-This design review evaluates whether incomplete evidence is classified safely;
-it does not require the current candidate to satisfy every delivery class.
-The current candidate is intentionally `PARTIAL`, and no additional runtime
-observation is authorized merely to make the design review pass.
+The design review and implementation gates are complete. The latest authorized
+runtime observation satisfies all four delivery classes; the historical
+partial candidate below is retained as an audit trail and is not the final
+ticket result.
 
 This is a repo-local verification ticket. Its implementation scope is limited
 to redacted, metadata-only Telegram observability needed for correlation. It
@@ -422,6 +422,23 @@ user-visible delivery claim is made by this deployment evidence.
 - No matching `outbound / delivered` `delivery_audit` record was present in the bounded runtime log query. Therefore `OUTBOUND_DELIVERY=UNPROVEN`, and the overall ticket remains `PARTIAL` rather than full `PASS`.
 - This attempt is closed. Do not retry or change Telegram/DGX state to manufacture the missing outbound audit evidence.
 
+## Final authorized verification after outbound-audit correction (2026-08-18)
+
+- Authorization: one test action in the existing Telegram conversation; no
+  second action or retry was issued.
+- Service health: `SERVICE_HEALTH=PASS`; the service remained active/running
+  with `NRestarts=0` and `ExecMainStatus=0` after deployment.
+- Inbound: `INBOUND_POLLING=PASS`; one metadata-only `inbound / accepted`
+  record was observed for the test correlation.
+- Outbound: `OUTBOUND_DELIVERY=PASS`; four metadata-only `outbound / delivered`
+  records were observed on the same correlation and platform message id, with
+  no failed outbound record. These records are not counted as four operator
+  attempts; the verifier issued one test action and no retry.
+- User-visible: `USER_VISIBLE_DELIVERY=PASS`; the operator directly confirmed
+  seeing the bot response. Message content and the screenshot are not retained.
+- Overall result: `PASS` under the closed aggregation rule. Relay remains
+  disabled and no Telegram configuration or credential state changed.
+
 ## Safety stop conditions
 
 Stop and record `BLOCKED` or `UNPROVEN` if:
@@ -438,7 +455,8 @@ Stop and record `BLOCKED` or `UNPROVEN` if:
 
 ## Current status
 
-`MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN`. The screenshot remains
-candidate evidence for the user-visible class. Runtime health, inbound
-polling, outbound delivery, and user-visible delivery remain separate gates;
-this ticket does not claim a new user-visible delivery or authorize a retry.
+`PASS_MERGED_DEPLOYED_RUNTIME_HEALTH_INBOUND_OUTBOUND_USER_VISIBLE`. The
+implementation, review, CI, merge, deployment, runtime health, inbound
+acceptance, outbound delivery audit, and direct user-visible confirmation gates
+are all separately evidenced. This ticket is closed; do not retry the
+conversation or change Telegram/DGX state to manufacture additional evidence.

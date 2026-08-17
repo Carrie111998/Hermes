@@ -9,7 +9,7 @@
 
 - **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
 - **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Merged runtime code baseline:** `36c2d243461e7e9f9be7c8b98e8a9063eef8fd1c` (PR #38, Telegram delivery audit correlation correction; ARCH-004 remains the prior runtime-state baseline).
+- **Merged runtime code baseline:** `3bf3f21007eb77ce0a59c5868742174e37b74ec9` (PR #43, normal Telegram DM outbound correlation fix; ARCH-004 remains the prior runtime-state baseline).
 - **DGX runtime:** host `140.96.58.171`, hostname `55-0940189-03`, user service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
 - **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
@@ -20,20 +20,20 @@ The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`
 
 ## 2. Goal and roadmap
 
-- **Current goal:** preserve the merged ARCH-002/ARCH-003/ARCH-004 runtime-state contracts, keep Telegram service/inbound/outbound gates separate, and verify real user-visible Telegram delivery.
+- **Current goal:** preserve the merged ARCH-002/ARCH-003/ARCH-004 runtime-state contracts, keep Telegram service/inbound/outbound gates separate, and retain the completed end-to-end Telegram delivery evidence.
 - **Completed and deployed:** ARCH-002, PR #29, merge `3e9fd48dc28b7df186c780992351ef01febaa070`; ARCH-003, PR #30, merge `e8cdfd1e65191b68423afd7e12248d3c6e728e00`; and ARCH-004, PR #33, merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`. Each has separate review, CI, immutable-release, rollback, and post-deploy evidence.
-- **Telegram runtime:** the gateway recovered from a transient startup timeout through its bounded retry path. The authorized post-correction test produced an accepted inbound audit and a user-confirmed visible response; runtime outbound audit remains unproven.
+- **Telegram runtime:** the gateway recovered from a transient startup timeout through its bounded retry path. The latest authorized test produced a correlated inbound accepted audit, correlated outbound delivered audit records, and direct user confirmation of the visible response.
 - **Deferred/blocked:** HERMES-MONITORING-001 remains BLOCKED. Telegram user-visible delivery is not claimed from service or polling health.
-- **Next gate:** outbound delivery audit correlation. The corrected implementation is merged and deployed with runtime health PASS; the single user-visible response is confirmed, but the matching outbound runtime audit is still unproven.
+- **Next gate:** none remains for this Telegram delivery verification. Do not retry the conversation; select any future work as a separately ticketed roadmap item.
 
 ## 3. Verified runtime and deployment state
 
 - **DGX host identity:** `cwliao@55-0940189-03`.
-- **Active release:** `/home/cwliao/.hermes/releases/v2026.8.18-hermes-telegram-delivery-audit-fix-36c2d243`.
-- **Release marker:** `HERMES_RELEASE_SHA=36c2d243461e7e9f9be7c8b98e8a9063eef8fd1c`.
-- **Effective service:** user `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `2601915`, `NRestarts=0`, `ExecMainStatus=0` after the authorized correction deployment restart and bounded stability check.
+- **Active release:** `v2026.8.18-hermes-telegram-outbound-audit-fix-3bf3f210`.
+- **Release marker:** `HERMES_RELEASE_SHA=3bf3f21007eb77ce0a59c5868742174e37b74ec9`.
+- **Effective service:** user `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `2812244`, `NRestarts=0`, `ExecMainStatus=0` after the authorized deployment restart and bounded stability check.
 - **Effective WorkingDirectory/PYTHONPATH:** the Telegram delivery audit correction release above; both resolved to that immutable release.
-- **Effective drop-in:** `39-hermes-telegram-delivery-audit-fix-36c2d243.conf`.
+- **Effective drop-in:** `41-hermes-telegram-outbound-audit-fix-3bf3f210.conf`.
 - **Rollback:** ARCH-003 release `v2026.8.17-hermes-arch-003-e8cdfd1e`, ARCH-002 release `v2026.8.16-hermes-arch-002-3e9fd48dc2`, and prior Telegram releases/drop-ins remain available.
 - **Deployment manifest:** ARCH-004 rollback metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-arch-004-e2f94e26`; the prior ARCH-003 drop-in remains intact.
 
@@ -70,7 +70,7 @@ remains disabled.
 - **HERMES-MONITORING-001:** BLOCKED; do not infer readiness from gateway health.
 - **ARCH-003:** `MERGED_DEPLOYED`; PR #30, implementation commit `9b777c0b1`, merge `e8cdfd1e...`; focused Windows dependency test `29 passed`; canonical runner ARCH-003 tests `24 passed` with its gateway integration collection limited by the borrowed KLIB venv missing PyYAML; authenticated AGY and fresh authenticated WSL Claude implementation reviews both `PASS`; CI run `31981532693` passed after retrying an unrelated pre-existing stream-consumer slice; immutable release and runtime health verified on DGX.
 - **ARCH-004:** `MERGED_DEPLOYED`; PR #33, implementation commit `650a34808`, merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`; focused runtime-state tests `32 passed`, compileall PASS; required CI checks PASS in run `31990198398`; Claude and active DGX `.hermes` AGY implementation reviews both `PASS` with no correction set; immutable release and user-service health verified above.
-- **HERMES-TELEGRAM-DELIVERY-VERIFICATION-001:** `PARTIAL_USER_VISIBLE_DELIVERY_PASS_OUTBOUND_UNPROVEN`; PR #38, implementation head `bd295e1d9`, merge `36c2d243`; final CI run `32056603324` had no failures; final Claude/AGY packet review was `PASS`; correction release is active with rollback metadata. PR #40 records one authorized test, direct user-visible confirmation, and the missing matching outbound audit. No retry was issued.
+- **HERMES-TELEGRAM-DELIVERY-VERIFICATION-001:** `PASS`; PR #43, implementation commit `2ee79107b`, merge `3bf3f210`; required CI run `32075681273` passed; Claude and AGY reviewed the identical metadata-only packet and returned `PASS`; the latest release is active with rollback metadata. The one authorized test produced one inbound accepted record, four same-correlation outbound delivered records with one platform message id, no failed outbound record, and direct user-visible confirmation. No retry was issued.
 
 ### Repository inventory
 
@@ -91,4 +91,4 @@ Ticket design, implementation, tests, independent review, reconciliation, CI, me
 4. Keep reviewer packets metadata-only; never send source, secrets, tokens, absolute paths, message bodies, or generated evidence text.
 5. ARCH-004 is merged and deployed with separate implementation, review, CI, merge, release, rollback, and runtime evidence; do not repeat its implementation lane.
 6. Keep ARCH-002, ARCH-003, and Telegram delivery evidence separate.
-7. The exact next action is to address or separately ticket the missing outbound audit correlation; do not retry the Telegram conversation merely to manufacture evidence.
+7. Telegram delivery verification is complete; do not retry the conversation merely to manufacture more evidence. HERMES-MONITORING-001 remains a separate blocked ticket, and any new work requires a new ticket and authorization.
