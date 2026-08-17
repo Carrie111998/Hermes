@@ -476,7 +476,14 @@ def show_status(args):
     try:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
-            configured = entry.check_fn()
+            # deps_available_fn, not check_fn: for adapters that defer a heavy
+            # SDK, check_fn *is* the loader. Feishu's
+            # check_feishu_requirements() imports lark_oapi, whose top-level
+            # __init__ eagerly pulls ~10k modules — measured 238.2s and 404.9s
+            # on two consecutive runs here. Printing one status line must not
+            # cost that. Mirrors gateway/config.py::_apply_env_overrides.
+            deps_probe = entry.deps_available_fn or entry.check_fn
+            configured = deps_probe()
             status_str = "configured" if configured else "not configured"
             label = entry.label
             print(f"  {label:<12}  {check_mark(configured)} {status_str} (plugin)")
