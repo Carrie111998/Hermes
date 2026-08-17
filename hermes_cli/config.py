@@ -2011,6 +2011,25 @@ def iter_base_url_values(
         yield from _walk_url_values(tree, key_set, section)
 
 
+def _base_url_warning_hint(path: str) -> str:
+    """Pick the remediation hint for a scanned config path.
+
+    ``hermes setup`` / ``hermes model`` configure model-provider endpoints, so
+    they are the right hint for model/custom_providers/providers/auxiliary
+    paths. MCP, speech, and the honcho plugin section are configured in
+    config.yaml directly (``hermes mcp add`` for HTTP/SSE MCP servers).
+    """
+    if path.startswith("mcp_servers."):
+        return (
+            "Re-add the server with `hermes mcp add <name> --url <valid URL>`, "
+            "or fix the URL in config.yaml under `mcp_servers`."
+        )
+    if path.startswith(("stt.", "tts.", "honcho.")):
+        section = path.split(".")[0]
+        return f"Fix the URL in config.yaml under `{section}`."
+    return "Run `hermes setup` or `hermes model` and enter a valid http(s) base URL."
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
@@ -2169,7 +2188,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             issues.append(ConfigIssue(
                 "warning",
                 f"{path} is not a valid http(s) URL: {value!r}",
-                "Run `hermes setup` or `hermes model` and enter a valid http(s) base URL.",
+                _base_url_warning_hint(path),
             ))
 
     return issues

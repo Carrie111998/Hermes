@@ -305,3 +305,44 @@ class TestBaseUrlValidation:
             },
         }
         assert list(iter_base_url_values(config)) == []
+
+    # ── warning hints are section-aware ───────────────────────────────────
+
+    def _base_url_warning_hints(self, config):
+        """Return (path, hint) pairs for the base_url-format warnings."""
+        issues = validate_config_structure(config)
+        return [
+            (i.message.split(" is not a valid http(s) URL", 1)[0], i.hint)
+            for i in issues
+            if i.severity == "warning" and "is not a valid http(s) URL" in i.message
+        ]
+
+    def test_mcp_server_warning_hint_names_hermes_mcp(self):
+        hints = self._base_url_warning_hints({
+            "mcp_servers": {"srv": {"url": "http://x:6153export"}},
+        })
+        assert hints == [("mcp_servers.srv.url", (
+            "Re-add the server with `hermes mcp add <name> --url <valid URL>`, "
+            "or fix the URL in config.yaml under `mcp_servers`."
+        ))]
+
+    def test_stt_tts_honcho_warning_hints_point_to_config_yaml(self):
+        hints = dict(self._base_url_warning_hints({
+            "stt": {"openai": {"base_url": "http://bad:99999"}},
+            "tts": {"openai": {"base_url": "http://bad:99999"}},
+            "honcho": {"base_url": "http://bad:99999"},
+        }))
+        assert hints["stt.openai.base_url"] == "Fix the URL in config.yaml under `stt`."
+        assert hints["tts.openai.base_url"] == "Fix the URL in config.yaml under `tts`."
+        assert hints["honcho.base_url"] == "Fix the URL in config.yaml under `honcho`."
+
+    def test_model_path_warning_hints_keep_setup_guidance(self):
+        hints = dict(self._base_url_warning_hints({
+            "custom_providers": [{"name": "bad", "base_url": "http://x:6153export"}],
+            "providers": {"myprov": {"base_url": "http://bad:99999"}},
+            "model": {"base_url": "http://bad:99999"},
+        }))
+        expected = "Run `hermes setup` or `hermes model` and enter a valid http(s) base URL."
+        assert hints["custom_providers[0].base_url"] == expected
+        assert hints["providers.myprov.base_url"] == expected
+        assert hints["model.base_url"] == expected
