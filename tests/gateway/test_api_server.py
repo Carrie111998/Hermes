@@ -2488,6 +2488,87 @@ class TestSessionKeyHeader:
             db.close()
 
     @pytest.mark.asyncio
+    async def test_keyless_compression_child_reuses_inherited_session_scope(
+        self, auth_adapter, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from tools.session_search_tool import session_search
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "parent-session", source="api_server", session_key="parent-session"
+        )
+        db.create_session(
+            "compression-child",
+            source="api_server",
+            session_key="parent-session",
+            parent_session_id="parent-session",
+        )
+        db.append_message(
+            "compression-child", role="user", content="current compressed transcript"
+        )
+        db.create_session(
+            "foreign-session", source="api_server", session_key="foreign-session"
+        )
+        db.append_message(
+            "foreign-session", role="user", content="foreign compressed transcript"
+        )
+        auth_adapter._session_db = db
+        observed = {}
+
+        def _fake_create_agent(**kwargs):
+            observed["scope"] = kwargs.get("gateway_session_key")
+            mock_agent = MagicMock()
+
+            def _run(**_run_kwargs):
+                observed["own_read"] = json.loads(
+                    session_search(
+                        session_id="compression-child",
+                        db=db,
+                        caller_session_key=observed["scope"],
+                    )
+                )
+                observed["foreign_read"] = json.loads(
+                    session_search(
+                        session_id="foreign-session",
+                        db=db,
+                        caller_session_key=observed["scope"],
+                    )
+                )
+                return {"final_response": "ok", "messages": []}
+
+            mock_agent.run_conversation.side_effect = _run
+            mock_agent.session_id = "compression-child"
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_app(auth_adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(
+                    auth_adapter, "_create_agent", side_effect=_fake_create_agent
+                ):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        headers={
+                            "X-Hermes-Session-Id": "compression-child",
+                            "Authorization": "Bearer sk-secret",
+                        },
+                        json={
+                            "model": "hermes-agent",
+                            "messages": [{"role": "user", "content": "continue"}],
+                        },
+                    )
+            assert resp.status == 200
+            assert observed["scope"] == "parent-session"
+            assert observed["own_read"]["success"] is True
+            assert observed["foreign_read"]["success"] is False
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
     async def test_responses_endpoint_accepts_session_key(self, auth_adapter):
         """Responses API honors the same X-Hermes-Session-Key contract."""
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}

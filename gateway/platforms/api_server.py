@@ -2233,6 +2233,31 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
+    def _effective_agent_session_key(
+        self,
+        gateway_session_key: Optional[str],
+        session_id: Optional[str],
+    ) -> str:
+        """Resolve the stable ownership scope for an API agent turn."""
+        if gateway_session_key:
+            return gateway_session_key
+        sid = str(session_id or "").strip()
+        if not sid:
+            return ""
+        try:
+            db = self._ensure_session_db()
+            row = db.get_session(sid) if db is not None else None
+            inherited = str((row or {}).get("session_key") or "").strip()
+            if inherited:
+                return inherited
+        except Exception:
+            logger.debug(
+                "Could not resolve API session ownership scope for %s",
+                sid,
+                exc_info=True,
+            )
+        return sid
+
     async def _ensure_session_db_async(self):
         """Async variant for request handlers: offload the SQLite open/schema
         init off the single aiohttp event-loop thread.
@@ -6328,12 +6353,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
-        effective_session_key = gateway_session_key or session_id or ""
 
         def _run():
             from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
+                effective_session_key = self._effective_agent_session_key(
+                    gateway_session_key, session_id
+                )
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=effective_session_key,
@@ -6723,7 +6750,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
-        effective_session_key = gateway_session_key or session_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -6789,6 +6815,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return
                 with self._profile_scope(request_profile):
+                    effective_session_key = self._effective_agent_session_key(
+                        gateway_session_key, session_id
+                    )
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
