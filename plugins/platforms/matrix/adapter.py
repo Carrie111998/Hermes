@@ -1572,9 +1572,16 @@ class MatrixAdapter(BasePlatformAdapter):
         try:
             # share_keys() only uploads an account identity when this flag is
             # false. This is a deliberate repair, not an accidental
-            # rebootstrap caused by an empty store.
+            # rebootstrap caused by an empty store. Restore the prior flag on
+            # failure so a failed repair does not leave the account looking
+            # unshared (which would trigger repeat upload attempts).
+            previously_shared = olm.account.shared
             olm.account.shared = False
-            await olm.share_keys()
+            try:
+                await olm.share_keys()
+            except Exception:
+                olm.account.shared = previously_shared
+                raise
         except Exception as exc:
             logger.error(
                 "Matrix: could not re-upload local keys for repaired device %s: %s",
