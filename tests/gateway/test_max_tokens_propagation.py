@@ -95,3 +95,24 @@ def test_per_provider_max_output_tokens_fallback(isolated_home):
     assert kw["max_tokens"] == 12000
 
 
+def test_explicit_provider_keeps_its_output_cap(isolated_home):
+    """A channel override must pass its provider output cap to the agent."""
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          default: cloud-model
+          provider: openai-codex
+        providers:
+          llamacpp:
+            api: http://127.0.0.1:18080/v1
+            api_key: local
+            default_model: qwen3.8-27b-q4_k_m-128k
+            max_output_tokens: 12000
+        """
+    )
+    grun = fresh_gateway()
+    kw = grun._resolve_runtime_agent_kwargs_for_provider("llamacpp")
+    assert kw["max_tokens"] == 12000
+
+

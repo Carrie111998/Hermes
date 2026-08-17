@@ -2743,11 +2743,18 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
+        _get_model_config,
     )
     try:
         runtime = resolve_runtime_provider(requested=provider)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
+    model_cfg = _get_model_config()
+    max_tokens = model_cfg.get("max_tokens") if isinstance(model_cfg, dict) else None
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = runtime.get("max_output_tokens")
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = None
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
@@ -2757,6 +2764,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": max_tokens,
     }
 
 
@@ -20472,10 +20480,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(source)
+        return self._format_session_info(source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -20519,9 +20527,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Resolve runtime credentials for probing
+        # Resolve the same route the next turn will use. A channel override
+        # must be reflected in /new before any agent has been constructed.
         try:
-            runtime = _resolve_runtime_agent_kwargs()
+            if source is not None:
+                model, runtime = self._resolve_session_agent_runtime(source=source)
+            else:
+                runtime = _resolve_runtime_agent_kwargs()
             provider = runtime.get("provider") or provider
             base_url = runtime.get("base_url") or base_url
             api_key = runtime.get("api_key")
