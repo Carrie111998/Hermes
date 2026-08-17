@@ -3,10 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { turnController } from '../app/turnController.js'
-import { getTurnState, resetTurnState } from '../app/turnStore.js'
+import { getTurnState, resetTurnState, resolveToolIcon } from '../app/turnStore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import { ZERO } from '../domain/usage.js'
-import { estimateTokensRough } from '../lib/text.js'
+import { estimateTokensRough, toolTrailBaseLabel } from '../lib/text.js'
 import type { Msg } from '../types.js'
 
 // Mock the external-URL opener so the billing.step_up.verification test can
@@ -1297,6 +1297,121 @@ describe('createGatewayEventHandler', () => {
     const hints = getTurnState().activity.filter(a => a.text.includes('/agents'))
     expect(hints).toHaveLength(1)
     expect(hints[0]).toMatchObject({ tone: 'info' })
+  })
+
+  describe('tool icons ride the wire and survive completion', () => {
+    const startTerminal = (onEvent: (ev: any) => void, icon?: string) =>
+      onEvent({
+        payload: { context: 'ls -la', name: 'terminal', tool_id: 'tool-1', ...(icon ? { icon } : {}) },
+        type: 'tool.start'
+      } as any)
+
+    it('propagates the icon from tool.start onto the live row', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      startTerminal(onEvent, '💻')
+
+      expect(getTurnState().tools[0]?.icon).toBe('💻')
+    })
+
+    it('keeps the icon on the completed row after tool.complete', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      startTerminal(onEvent, '💻')
+      onEvent({
+        payload: { icon: '💻', name: 'terminal', summary: 'ok', tool_id: 'tool-1' },
+        type: 'tool.complete'
+      } as any)
+
+      // The completed row is a formatted string by now; the trail label is the
+      // key that recovers the same glyph the live row drew.
+      const completedRow = getTurnState().streamPendingTools.find(line => line.startsWith('Terminal('))
+
+      expect(getTurnState().tools).toHaveLength(0)
+      expect(completedRow).toBeDefined()
+      expect(resolveToolIcon(toolTrailBaseLabel(completedRow!))).toBe('💻')
+    })
+
+    it('accepts the icon from tool.complete alone (client attached mid-call)', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      // No tool.start was ever seen for this id.
+      onEvent({
+        payload: { icon: '📖', name: 'read_file', summary: 'ok', tool_id: 'tool-9' },
+        type: 'tool.complete'
+      } as any)
+
+      expect(resolveToolIcon('Read File')).toBe('📖')
+    })
+
+    it('falls back to ⚡ when the gateway sends no icon', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      startTerminal(onEvent)
+
+      expect(getTurnState().tools[0]?.icon).toBeUndefined()
+      expect(resolveToolIcon('Terminal')).toBe('⚡')
+    })
+
+    it('keeps subagent tool icons index-aligned with the tool lines', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { goal: 'child', subagent_id: 'sa-icons', task_index: 0 },
+        type: 'subagent.start'
+      } as any)
+      onEvent({
+        payload: { icon: '💻', subagent_id: 'sa-icons', task_index: 0, tool_name: 'terminal', tool_preview: 'ls' },
+        type: 'subagent.tool'
+      } as any)
+      onEvent({
+        payload: {
+          icon: '📖',
+          subagent_id: 'sa-icons',
+          task_index: 0,
+          tool_name: 'read_file',
+          tool_preview: 'app.ts'
+        },
+        type: 'subagent.tool'
+      } as any)
+
+      const sub = getTurnState().subagents.find(s => s.id === 'sa-icons')
+
+      expect(sub?.tools).toHaveLength(2)
+      expect(sub?.toolIcons).toEqual(['💻', '📖'])
+    })
+
+    it('pads a subagent frame that arrived without an icon so later rows stay aligned', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { goal: 'child', subagent_id: 'sa-mixed', task_index: 0 },
+        type: 'subagent.start'
+      } as any)
+      onEvent({
+        payload: { subagent_id: 'sa-mixed', task_index: 0, tool_name: 'terminal', tool_preview: 'ls' },
+        type: 'subagent.tool'
+      } as any)
+      onEvent({
+        payload: {
+          icon: '📖',
+          subagent_id: 'sa-mixed',
+          task_index: 0,
+          tool_name: 'read_file',
+          tool_preview: 'app.ts'
+        },
+        type: 'subagent.tool'
+      } as any)
+
+      const sub = getTurnState().subagents.find(s => s.id === 'sa-mixed')
+
+      expect(sub?.toolIcons).toHaveLength(sub?.tools.length ?? 0)
+      expect(sub?.toolIcons?.[1]).toBe('📖')
+    })
   })
 
   it('nudges toward /agents on subagent.start (spawn_requested dropped in CLI path)', () => {

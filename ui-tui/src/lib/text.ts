@@ -211,6 +211,23 @@ export const formatToolCall = (name: string, context = '') => {
   return preview ? `${label}("${preview}")` : label
 }
 
+// Glyph rendered for a tool row whose frame carried no `icon` — an older
+// gateway, a replayed transcript, or a mirror frame. Matches the `⚡` default
+// that `agent.display.get_tool_emoji` falls back to server-side, so the two
+// halves of the contract agree instead of drifting.
+export const TOOL_ICON_FALLBACK = '⚡'
+
+// Invert `formatToolCall` (plus any ` (1.2s)` the trail line appended) back to
+// the bare `toolTrailLabel` key, so a completed trail row can look its icon up
+// by the same key `recordToolStart` filed it under. Tool names never contain
+// `(`, so the first `("` is unambiguously the preview boundary.
+export const toolTrailBaseLabel = (call: string) => {
+  const { label } = splitToolDuration(call)
+  const paren = label.indexOf('("')
+
+  return (paren >= 0 ? label.slice(0, paren) : label).trim()
+}
+
 export const buildToolTrailLine = (
   name: string,
   context: string,

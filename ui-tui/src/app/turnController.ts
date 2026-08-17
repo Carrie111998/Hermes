@@ -22,7 +22,7 @@ import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '
 import type { Notice } from './interfaces.js'
 import { resetFlowOverlays } from './overlayStore.js'
 import { pushSnapshot } from './spawnHistoryStore.js'
-import { archiveDoneTodos, getTurnState, patchTurnState, resetTurnState } from './turnStore.js'
+import { archiveDoneTodos, getTurnState, patchTurnState, rememberToolIcon, resetTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
 const INTERRUPT_COOLDOWN_MS = 1500
@@ -800,14 +800,15 @@ class TurnController {
     summary?: string,
     duration?: number,
     todos?: unknown,
-    resultText?: string
+    resultText?: string,
+    icon?: string
   ) {
     if (this.interrupted) {
       return
     }
 
     this.recordTodos(todos)
-    const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText)
+    const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText, icon)
 
     this.pendingSegmentTools = [...this.pendingSegmentTools, line]
     this.flushPendingToolsIntoLastSegment()
@@ -820,14 +821,17 @@ class TurnController {
     fallbackName?: string,
     error?: string,
     duration?: number,
-    resultText?: string
+    resultText?: string,
+    icon?: string
   ) {
     if (this.interrupted) {
       return
     }
 
     this.flushStreamingSegment()
-    this.pushInlineDiffSegment(diffText, [this.completeTool(toolId, fallbackName, error, '', duration, resultText)])
+    this.pushInlineDiffSegment(diffText, [
+      this.completeTool(toolId, fallbackName, error, '', duration, resultText, icon)
+    ])
     this.publishToolState()
   }
 
@@ -837,11 +841,18 @@ class TurnController {
     error?: string,
     summary?: string,
     duration?: number,
-    resultText?: string
+    resultText?: string,
+    icon?: string
   ) {
     const done = this.activeTools.find(tool => tool.id === toolId)
     const name = done?.name ?? fallbackName ?? 'tool'
     const label = toolTrailLabel(name)
+
+    // Re-file on completion as well. The live row's icon came from tool.start,
+    // but a client that attached mid-call never saw it — tool.complete carries
+    // the same glyph so the completed row still matches the CLI. The active
+    // tool's own icon wins when present (it is the frame that opened this row).
+    rememberToolIcon(label, done?.icon ?? icon)
     const fallbackDuration = done?.startedAt ? (Date.now() - done.startedAt) / 1000 : undefined
 
     const line =
@@ -906,10 +917,15 @@ class TurnController {
     }, STREAM_BATCH_MS)
   }
 
-  recordToolStart(toolId: string, name: string, context: string, verboseArgs?: string) {
+  recordToolStart(toolId: string, name: string, context: string, verboseArgs?: string, icon?: string) {
     if (this.interrupted) {
       return
     }
+
+    // File the glyph under the trail label too: once this tool completes, its
+    // row is only a formatted string and the label is the only key left to
+    // recover the icon by.
+    rememberToolIcon(toolTrailLabel(name), icon)
 
     this.flushStreamingSegment()
     this.closeReasoningSegment()
@@ -919,7 +935,7 @@ class TurnController {
     const sample = `${name} ${context}`.trim()
 
     this.toolTokenAcc += sample ? estimateTokensRough(sample) : 0
-    this.activeTools = [...this.activeTools, { context, id: toolId, name, startedAt: Date.now(), verboseArgs }]
+    this.activeTools = [...this.activeTools, { context, icon, id: toolId, name, startedAt: Date.now(), verboseArgs }]
 
     patchTurnState({ toolTokens: this.toolTokenAcc, tools: this.activeTools })
   }

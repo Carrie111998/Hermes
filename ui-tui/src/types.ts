@@ -1,5 +1,8 @@
 export interface ActiveTool {
   context?: string
+  // Server-resolved glyph from the tool.start payload. Absent on frames from
+  // an older gateway; renderers fall back to TOOL_ICON_FALLBACK.
+  icon?: string
   id: string
   name: string
   verboseArgs?: string
@@ -45,6 +48,8 @@ export interface SubagentProgress {
   thinking: string[]
   toolCount: number
   tools: string[]
+  // Parallel to `tools`: the icon that came with each subagent.tool frame.
+  toolIcons?: string[]
   toolsets?: string[]
 }
 

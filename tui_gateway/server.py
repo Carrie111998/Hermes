@@ -5806,6 +5806,24 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
     return f"{text}{suffix}" if text else None
 
 
+def _tool_icon(name: str | None) -> str:
+    """Canonical display icon for *name*, resolved by the ONE source of truth.
+
+    ``agent.display.get_tool_emoji`` already owns the skin ``tool_emojis`` →
+    registry ``emoji`` → ``⚡`` fallback chain that the classic CLI renders
+    with; the TUI must show the same glyph, so it ships the resolved icon on
+    the wire instead of letting the renderer keep its own tool→icon table.
+    Never raises: a missing name (or an import failure in a stripped-down
+    embedding) degrades to the same ``⚡`` the helper falls back to.
+    """
+    try:
+        from agent.display import get_tool_emoji
+
+        return get_tool_emoji(name or "")
+    except Exception:
+        return "⚡"
+
+
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
@@ -5823,6 +5841,7 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
             "tool_id": tool_call_id,
             "name": name,
             "context": _tool_ctx(name, args),
+            "icon": _tool_icon(name),
         }
         # The desktop renders the expanded tool row (the `$` transcript) from
         # the args of the part, and `context` is an 80-char display preview.
@@ -5841,7 +5860,16 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
 
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
-    payload = {"tool_id": tool_call_id, "name": name, "args": args}
+    # `icon` rides on BOTH lifecycle events on purpose: a client that attached
+    # mid-call (reconnect, `session.resume`) never saw tool.start, so without
+    # it the completed row would fall back to ⚡ while the live row two frames
+    # earlier showed the real glyph.
+    payload = {
+        "tool_id": tool_call_id,
+        "name": name,
+        "args": args,
+        "icon": _tool_icon(name),
+    }
     session = _sessions.get(sid)
     snapshot = None
     started_at = None
@@ -6019,6 +6047,8 @@ def _on_tool_progress(
             payload["output_tail"] = list(_kwargs["output_tail"])  # list of dicts
         if name:
             payload["tool_name"] = str(name)
+            if event_type == "subagent.tool":
+                payload["icon"] = _tool_icon(str(name))
         if preview:
             payload["text"] = str(preview)
         if _kwargs.get("status"):
@@ -6112,10 +6142,14 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             if st["open_tool"]:
                 _emit("tool.complete", csid, st["open_tool"])
             st["seq"] += 1
+            mirrored_name = str(payload.get("tool_name") or "tool")
             tool = {
-                "name": str(payload.get("tool_name") or "tool"),
+                "name": mirrored_name,
                 "tool_id": f"submirror:{child_key}:{st['seq']}",
                 "args": {},
+                # Same payload is replayed as the mirror's tool.complete, so
+                # the child window's completed row keeps the glyph too.
+                "icon": str(payload.get("icon") or _tool_icon(mirrored_name)),
             }
             if preview := str(payload.get("tool_preview") or payload.get("text") or ""):
                 tool["preview"] = preview

@@ -541,6 +541,8 @@ export interface SubagentEventPayload {
   files_read?: string[]
   files_written?: string[]
   goal: string
+  // Set on `subagent.tool` only — same server-resolved glyph as tool.start.
+  icon?: string
   input_tokens?: number
   iteration?: number
   model?: string
@@ -684,7 +686,18 @@ export type GatewayEvent =
   | { payload: { name?: string; preview?: string }; session_id?: string; type: 'tool.progress' }
   | { payload: { name?: string }; session_id?: string; type: 'tool.generating' }
   | {
-      payload: { args_text?: string; context?: string; name?: string; tool_id: string; todos?: unknown[] }
+      payload: {
+        args_text?: string
+        context?: string
+        // Canonical per-tool glyph resolved server-side by
+        // `agent.display.get_tool_emoji` (skin → registry → ⚡).  Optional so
+        // an older gateway (or a mirror frame) still parses; renderers fall
+        // back to ⚡ rather than deriving an icon from the tool name.
+        icon?: string
+        name?: string
+        tool_id: string
+        todos?: unknown[]
+      }
       session_id?: string
       type: 'tool.start'
     }
@@ -692,6 +705,7 @@ export type GatewayEvent =
       payload: {
         duration_s?: number
         error?: string
+        icon?: string
         inline_diff?: string
         name?: string
         result_text?: string

@@ -280,10 +280,10 @@ Primary event types the client handles today:
 | `status.update`            | `{ kind, text }`                                                            |
 | `notification.show`        | `{ id, key, kind, level, text, ttl_ms? }`                                   |
 | `notification.clear`       | `{ key }`                                                                   |
-| `tool.start`               | `{ tool_id, name, context?, args_text? }`                                   |
+| `tool.start`               | `{ tool_id, name, icon?, context?, args_text? }`                             |
 | `tool.generating`          | `{ name }`                                                                  |
 | `tool.progress`            | `{ name, preview }`                                                         |
-| `tool.complete`            | `{ tool_id, name, error?, summary?, duration_s?, inline_diff?, todos? }`    |
+| `tool.complete`            | `{ tool_id, name, icon?, error?, summary?, duration_s?, inline_diff?, todos? }` |
 | `clarify.request`          | `{ question, choices?, request_id }`                                        |
 | `approval.request`         | `{ command, description, allow_permanent? }`                                |
 | `sudo.request`             | `{ request_id }`                                                            |
@@ -299,13 +299,29 @@ Primary event types the client handles today:
 | `subagent.spawn_requested` | `{ subagent_id?, task_index, goal?, depth?, parent_id? }`                   |
 | `subagent.start`           | `{ subagent_id?, task_index, goal?, depth?, parent_id? }`                   |
 | `subagent.thinking`        | `{ text }`                                                                  |
-| `subagent.tool`            | `{ tool_name?, tool_preview?, text? }`                                      |
+| `subagent.tool`            | `{ tool_name?, icon?, tool_preview?, text? }`                                |
 | `subagent.progress`        | `{ text }`                                                                  |
 | `subagent.complete`        | `{ status, summary?, text?, duration_seconds? }`                            |
 | `error`                    | `{ message }`                                                               |
 | `gateway.stderr`           | synthesized from child stderr                                               |
 | `gateway.protocol_error`   | synthesized from malformed stdout                                           |
 | `gateway.start_timeout`    | `{ cwd?, python?, stderr_tail? }`                                           |
+
+### Tool icons
+
+`icon` carries the canonical per-tool glyph (`terminal` → 💻, `read_file` → 📖,
+`patch` → 🔧, …). The gateway resolves it once with `agent.display.get_tool_emoji`
+— the same skin `tool_emojis` → registry → `⚡` chain the classic CLI printer
+uses — so the two frontends can never disagree. **The client never maps a tool
+name to a glyph**; there is no tool→icon table in TypeScript.
+
+It rides on `tool.start`, `tool.complete` and `subagent.tool`. Shipping it on
+`tool.complete` too is what keeps a *completed* row's icon correct for a client
+that attached mid-call and never saw the matching `tool.start`.
+
+The field is optional in both directions: an older gateway simply omits it and
+the renderer falls back to `⚡` (`TOOL_ICON_FALLBACK` in `lib/text.ts`), and an
+older client ignores it. A tool row is never drawn with a generic bullet.
 
 ## Theme model
 

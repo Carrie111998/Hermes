@@ -2642,6 +2642,134 @@ def test_tool_start_ships_full_args(monkeypatch):
     assert "args" not in events[1][2]
 
 
+def _capture_tool_events(monkeypatch, sid: str) -> list[tuple[str, str, dict]]:
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, s, payload: events.append((event_type, s, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        sid,
+        {"tool_progress_mode": "all", "tool_started_at": {}},
+    )
+    return events
+
+
+# Tools whose icon the classic CLI has always drawn, so the TUI must too. This
+# is a floor, not a catalog: it asserts these tools ship a REAL glyph rather
+# than the unknown-tool fallback. The glyphs themselves are never frozen here --
+# `tools/*.py` owns them, and an upstream release that adds a tool or retunes an
+# emoji must not turn into a red test for behaviour that is still correct.
+CORE_ICON_TOOLS = ("terminal", "read_file", "patch", "cronjob", "skill_view", "memory")
+
+TOOL_ICON_FALLBACK = "⚡"
+
+
+def _registered_tools_with_icons():
+    """Every registered tool that declares an emoji, straight from the registry."""
+    import model_tools  # noqa: F401  -- triggers tools/*.py auto-discovery
+    from tools.registry import registry
+
+    names = sorted(getattr(registry, "_tools", {}))
+
+    return [(n, registry.get_emoji(n, default="")) for n in names if registry.get_emoji(n, default="")]
+
+
+def test_tui_tool_start_ships_the_registry_icon_for_every_registered_tool(monkeypatch):
+    # The TUI used to draw a generic bullet for EVERY tool row. The icon is
+    # resolved once server-side (skin -> registry -> fallback) and shipped on the
+    # wire, so the renderer never needs a tool->icon table of its own.
+    #
+    # Sweeping the whole registry (not a hand-picked few) is the point: a tool
+    # added by a future release is covered the moment it declares an emoji, with
+    # no edit here. The assertion is the relationship registry->event, so it
+    # survives any glyph change upstream.
+    tools = _registered_tools_with_icons()
+
+    assert len(tools) > 20, "registry looks unpopulated; auto-discovery probably did not run"
+
+    events = _capture_tool_events(monkeypatch, "icon-start")
+
+    mismatched = []
+    for index, (tool_name, expected) in enumerate(tools):
+        events.clear()
+        server._on_tool_start("icon-start", f"tool-{index}", tool_name, {})
+        if not events or events[0][0] != "tool.start" or events[0][2].get("icon") != expected:
+            mismatched.append((tool_name, expected, events[0][2].get("icon") if events else None))
+
+    assert not mismatched, f"tool.start icon != registry emoji for: {mismatched}"
+
+
+@pytest.mark.parametrize("tool_name", CORE_ICON_TOOLS)
+def test_tui_core_tools_ship_a_real_icon_not_the_fallback(monkeypatch, tool_name):
+    # Guards the regression that started this work: a core tool rendering the
+    # generic marker instead of its own glyph. Checks identity with the CLI's
+    # helper rather than a frozen literal.
+    import model_tools  # noqa: F401
+    from agent.display import get_tool_emoji
+
+    events = _capture_tool_events(monkeypatch, "icon-core")
+
+    server._on_tool_start("icon-core", "tool-1", tool_name, {})
+
+    icon = events[0][2]["icon"]
+    assert icon == get_tool_emoji(tool_name)
+    assert icon != TOOL_ICON_FALLBACK, f"{tool_name} lost its icon and fell back to the bolt"
+
+
+def test_tui_tool_icon_matches_the_shared_display_helper(monkeypatch):
+    # Parity contract, independent of which glyphs are configured: whatever
+    # `get_tool_emoji` resolves (including a skin override) is exactly what the
+    # event carries. One source of truth, asserted as a relationship.
+    from agent import display
+
+    monkeypatch.setattr(display, "_get_skin", lambda: None)
+    monkeypatch.setattr(display, "get_tool_emoji", lambda name, default="⚡": f"<{name}>")
+
+    events = _capture_tool_events(monkeypatch, "icon-parity")
+
+    server._on_tool_start("icon-parity", "tool-1", "terminal", {})
+    server._on_tool_complete("icon-parity", "tool-1", "terminal", {}, "ok")
+
+    assert events[0][2]["icon"] == "<terminal>"
+    assert events[1][2]["icon"] == "<terminal>"
+
+
+def test_tui_tool_complete_repeats_the_icon_for_a_client_that_missed_the_start(monkeypatch):
+    # A client that attached mid-call never saw tool.start, so tool.complete
+    # has to carry the glyph too or the completed row degrades to the fallback
+    # while the live row showed the real icon.
+    import model_tools  # noqa: F401
+    from agent.display import get_tool_emoji
+
+    events = _capture_tool_events(monkeypatch, "icon-complete")
+
+    server._on_tool_complete("icon-complete", "tool-1", "read_file", {}, "contents")
+
+    assert events[0][0] == "tool.complete"
+    assert events[0][2]["icon"] == get_tool_emoji("read_file")
+    assert events[0][2]["icon"] != TOOL_ICON_FALLBACK
+
+
+def test_tui_tool_icon_falls_back_for_an_unregistered_tool():
+    # An MCP/plugin tool with no registry emoji still gets a glyph, never an
+    # empty string the renderer would have to special-case.
+    assert server._tool_icon("no_such_tool_anywhere") == "⚡"
+
+
+@pytest.mark.parametrize("bad_name", [None, ""])
+def test_tui_tool_icon_survives_a_missing_tool_name(bad_name):
+    # Icon resolution is presentation, never a reason to break a tool call.
+    assert server._tool_icon(bad_name) == "⚡"
+
+
+def test_tui_tool_icon_survives_an_unavailable_display_module(monkeypatch):
+    # Stripped-down embeddings may not import agent.display at all.
+    monkeypatch.setitem(sys.modules, "agent.display", None)
+
+    assert server._tool_icon("terminal") == "⚡"
+
+
 def test_tool_ctx_sends_an_arg_preview_not_a_phrased_label():
     # Clients phrase their own verb around this string: the TUI renders
     # `Terminal("<ctx>")` and the desktop prepends "Running"/"Ran". Sending a

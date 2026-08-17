@@ -20,7 +20,7 @@ import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
 import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '../lib/terminalModes.js'
-import { formatAbandonedClarify, formatToolCall, stripAnsi } from '../lib/text.js'
+import { formatAbandonedClarify, formatToolCall, stripAnsi, TOOL_ICON_FALLBACK } from '../lib/text.js'
 import { bootSeededPin, invalidateBootBackground, writeBootTheme } from '../lib/themeBoot.js'
 import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, themeToneHex } from '../theme.js'
 import type { Msg, SubagentProgress, SubagentStatus, Usage } from '../types.js'
@@ -394,6 +394,25 @@ const pushUnique =
 const pushThinking = pushUnique(6)
 const pushNote = pushUnique(6)
 const pushTool = pushUnique(8)
+
+// Keep a subagent's icon list index-aligned with its tool list across
+// pushTool's dedupe-and-cap, padding any earlier frame that arrived without an
+// icon so row N always reads the glyph that came with tool line N.
+const alignToolIcons = (
+  prevTools: string[],
+  nextTools: string[],
+  prevIcons: string[] | undefined,
+  icon: string
+): string[] | undefined => {
+  if (nextTools === prevTools) {
+    return prevIcons
+  }
+
+  const kept = prevTools.length ? (prevIcons ?? []).slice(-prevTools.length) : []
+  const pad = new Array(Math.max(0, prevTools.length - kept.length)).fill(TOOL_ICON_FALLBACK) as string[]
+
+  return [...pad, ...kept, icon].slice(-nextTools.length)
+}
 
 const KNOWN_SUBAGENT_STATUSES = new Set<SubagentStatus>([
   'completed',
@@ -1171,7 +1190,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           ev.payload.tool_id,
           ev.payload.name ?? 'tool',
           ev.payload.context ?? '',
-          ev.payload.args_text ? stripAnsi(String(ev.payload.args_text)) : undefined
+          ev.payload.args_text ? stripAnsi(String(ev.payload.args_text)) : undefined,
+          // Forwarded verbatim — the client never derives a glyph from the
+          // tool name. Absent (older gateway) leaves it undefined so the
+          // renderer applies TOOL_ICON_FALLBACK.
+          ev.payload.icon ? String(ev.payload.icon) : undefined
         )
 
         return
@@ -1188,6 +1211,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           ev.payload.inline_diff && getUiState().inlineDiffs ? stripAnsi(String(ev.payload.inline_diff)).trim() : ''
 
         const resultText = ev.payload.result_text ? stripAnsi(String(ev.payload.result_text)) : undefined
+        const icon = ev.payload.icon ? String(ev.payload.icon) : undefined
 
         if (inlineDiffText) {
           turnController.recordInlineDiffToolComplete(
@@ -1196,7 +1220,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.name,
             ev.payload.error,
             ev.payload.duration_s,
-            resultText
+            resultText,
+            icon
           )
         } else {
           turnController.recordToolComplete(
@@ -1206,7 +1231,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.summary,
             ev.payload.duration_s,
             ev.payload.todos,
-            resultText
+            resultText,
+            icon
           )
         }
 
@@ -1338,12 +1364,19 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           ev.payload.tool_preview ?? ev.payload.text ?? ''
         )
 
+        const icon = ev.payload.icon ? String(ev.payload.icon) : TOOL_ICON_FALLBACK
+
         turnController.upsertSubagent(
           ev.payload,
-          c => ({
-            status: keepTerminalElseRunning(c.status),
-            tools: pushTool(c.tools, line)
-          }),
+          c => {
+            const tools = pushTool(c.tools, line)
+
+            return {
+              status: keepTerminalElseRunning(c.status),
+              toolIcons: alignToolIcons(c.tools, tools, c.toolIcons, icon),
+              tools
+            }
+          },
           { createIfMissing: false }
         )
 

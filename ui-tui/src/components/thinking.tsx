@@ -2,6 +2,7 @@ import { Box, NoSelect, Text } from '@hermes/ink'
 import { memo, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import spinners, { type BrailleSpinnerName } from 'unicode-animations'
 
+import { resolveToolIcon } from '../app/turnStore.js'
 import { THINKING_COT_MAX } from '../config/limits.js'
 import { sectionMode } from '../domain/details.js'
 import {
@@ -24,6 +25,8 @@ import {
   pick,
   splitToolDuration,
   thinkingPreview,
+  TOOL_ICON_FALLBACK,
+  toolTrailBaseLabel,
   toolTrailLabel
 } from '../lib/text.js'
 import type { Theme } from '../theme.js'
@@ -454,7 +457,9 @@ function SubagentAccordion({
               color={t.color.text}
               content={
                 <>
-                  <Text color={t.color.tool}>● </Text>
+                  {/* Index-aligned with `tools` by alignToolIcons; a frame
+                      that predates the icon contract falls back to ⚡. */}
+                  <Text color={t.color.tool}>{item.toolIcons?.[index] || TOOL_ICON_FALLBACK} </Text>
                   {line}
                 </>
               }
@@ -669,6 +674,11 @@ interface Group {
   color: string
   content: ReactNode
   details: DetailRow[]
+  // Canonical glyph for this tool row, always populated — the gateway-sent
+  // icon for live rows, the registry lookup for completed trail rows, and
+  // TOOL_ICON_FALLBACK when neither is available. Never a generic bullet:
+  // the TUI must render the same icon the classic CLI printer does.
+  icon: string
   key: string
   label: string
 }
@@ -830,6 +840,9 @@ export const ToolTrail = memo(function ToolTrail({
         color: parsed.mark === '✗' ? t.color.error : t.color.text,
         content: parsed.call,
         details: [],
+        // A completed row is only a formatted string by now, so recover the
+        // glyph the gateway sent at tool.start via the trail label.
+        icon: resolveToolIcon(toolTrailBaseLabel(parsed.call)),
         key: `tr-${i}`,
         label: parsed.call
       })
@@ -853,6 +866,7 @@ export const ToolTrail = memo(function ToolTrail({
         color: t.color.text,
         content: label,
         details: [{ color: t.color.muted, content: 'drafting...', dimColor: true, key: `tr-${i}-d` }],
+        icon: resolveToolIcon(label),
         key: `tr-${i}`,
         label
       })
@@ -885,6 +899,8 @@ export const ToolTrail = memo(function ToolTrail({
 
     groups.push({
       color: t.color.text,
+      // Live row: the glyph rode in on this tool's own tool.start frame.
+      icon: tool.icon || TOOL_ICON_FALLBACK,
       key: tool.id,
       label,
       details: tool.verboseArgs
@@ -1117,7 +1133,7 @@ export const ToolTrail = memo(function ToolTrail({
                   color={group.color}
                   content={
                     <>
-                      <Text color={t.color.tool}>● </Text>
+                      <Text color={t.color.tool}>{group.icon} </Text>
                       {toolLabel(group)}
                       {isDelegateGroup ? (
                         <Text color={t.color.statusFg} dim>
