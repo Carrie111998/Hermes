@@ -232,6 +232,7 @@ export interface MessagingPlatformInfo {
   name: string
   state?: null | string
   updated_at?: null | string
+  whatsapp_setup?: WhatsAppSetupInfo | null
 }
 
 export interface MessagingPlatformsResponse {
@@ -263,6 +264,40 @@ export interface MessagingPlatformTestResponse {
   message: string
   ok: boolean
   state?: null | string
+}
+
+export type WhatsAppOnboardingMode = 'bot' | 'self-chat'
+
+export type WhatsAppOnboardingStatus =
+  'starting' | 'installing' | 'waiting' | 'connected' | 'error' | 'expired' | 'cancelled'
+
+export interface WhatsAppSetupInfo {
+  allowed_users_set: boolean
+  home_channel_set: boolean
+  mode: '' | WhatsAppOnboardingMode
+}
+
+export interface WhatsAppOnboardingResponse {
+  account_id?: null | string
+  account_name?: null | string
+  account_phone?: null | string
+  allowed_users: string
+  error?: null | string
+  expires_at: string
+  mode: WhatsAppOnboardingMode
+  pairing_id: string
+  qr_payload?: null | string
+  status: WhatsAppOnboardingStatus
+}
+
+export interface WhatsAppOnboardingApplyResponse {
+  needs_restart?: boolean
+  ok: boolean
+  platform: 'whatsapp'
+  restart_action?: string
+  restart_error?: string
+  restart_pid?: null | number
+  restart_started?: boolean
 }
 
 // -- Webhooks (subscription CRUD) --------------------------------------------

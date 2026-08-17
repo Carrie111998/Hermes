@@ -9113,12 +9113,16 @@ def _whatsapp_phone_from_identifier(value: Any) -> str | None:
     return digits or None
 
 
-def _whatsapp_linked_account_from_session(session_path: Path) -> tuple[str | None, str | None, str | None]:
+def _whatsapp_linked_account_from_session(
+    session_path: Path,
+) -> tuple[bool, str | None, str | None, str | None]:
     creds_path = session_path / "creds.json"
     try:
         payload = json.loads(creds_path.read_text(encoding="utf-8"))
     except Exception:
-        return None, None, None
+        return False, None, None, None
+    if not isinstance(payload, dict):
+        return False, None, None, None
 
     account_id: str | None = None
     account_name: str | None = None
@@ -9143,7 +9147,15 @@ def _whatsapp_linked_account_from_session(session_path: Path) -> tuple[str | Non
     collect(payload.get("me"))
     collect(payload.get("account"))
     collect(payload)
-    return account_id, account_name, _whatsapp_phone_from_identifier(account_id)
+    # Baileys creates creds.json before pairing completes.  An explicit
+    # ``registered: false`` must therefore continue into the QR flow instead
+    # of being mistaken for a linked account.  Older credential files may not
+    # carry the flag; preserve those only when they contain an account identity.
+    registered = payload.get("registered")
+    is_registered = registered is True or (registered is None and bool(account_id))
+    if not is_registered:
+        return False, None, None, None
+    return True, account_id, account_name, _whatsapp_phone_from_identifier(account_id)
 
 
 def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
@@ -9390,6 +9402,23 @@ def _whatsapp_onboarding_payload(pairing_id: str, record: _WhatsAppOnboardingSes
     }
 
 
+def _whatsapp_onboarding_record_for_profile(
+    pairing_id: str, profile: Optional[str]
+) -> _WhatsAppOnboardingSession:
+    record = _whatsapp_onboarding_sessions.get(pairing_id)
+    requested_profile = str(profile or "").strip() or None
+    record_profile = (str(record.profile or "").strip() or None) if record else None
+    if not record or record_profile != requested_profile:
+        # A random pairing id is still profile-private.  Return the same 404 for
+        # missing and cross-profile records so profile isolation does not leak
+        # whether another profile currently has an active pairing flow.
+        raise HTTPException(
+            status_code=404,
+            detail="WhatsApp setup session was not found. Start a new setup.",
+        )
+    return record
+
+
 def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) -> dict[str, Any]:
     try:
         proc, reused = _spawn_gateway_restart(profile)
@@ -9412,18 +9441,22 @@ def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) ->
 
 
 @app.post("/api/messaging/whatsapp/onboarding/start")
-async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart):
+async def start_whatsapp_onboarding(
+    body: WhatsAppOnboardingStart, profile: Optional[str] = None
+):
     mode = _normalize_whatsapp_onboarding_mode(body.mode)
     allowed_users = _normalize_whatsapp_allowed_users(body.allowed_users)
-    effective_profile = body.profile
+    effective_profile = body.profile or profile
 
     with _config_profile_scope(effective_profile):
         session_path = _whatsapp_session_path()
         expires_at_ts = time.time() + _WHATSAPP_ONBOARDING_TTL_SECONDS
         expires_at = _utc_iso_from_ts(expires_at_ts)
-        if (session_path / "creds.json").exists():
+        registered, account_id, account_name, account_phone = (
+            _whatsapp_linked_account_from_session(session_path)
+        )
+        if registered:
             pairing_id = secrets.token_urlsafe(16)
-            account_id, account_name, account_phone = _whatsapp_linked_account_from_session(session_path)
             record = _WhatsAppOnboardingSession(
                 proc=None,
                 mode=mode,
@@ -9469,15 +9502,12 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart):
 
 
 @app.get("/api/messaging/whatsapp/onboarding/{pairing_id}")
-async def get_whatsapp_onboarding_status(pairing_id: str):
+async def get_whatsapp_onboarding_status(
+    pairing_id: str, profile: Optional[str] = None
+):
     with _whatsapp_onboarding_lock:
         _prune_whatsapp_onboarding_sessions()
-        record = _whatsapp_onboarding_sessions.get(pairing_id)
-        if not record:
-            raise HTTPException(
-                status_code=404,
-                detail="WhatsApp setup session was not found. Start a new setup.",
-            )
+        record = _whatsapp_onboarding_record_for_profile(pairing_id, profile)
         if record.status == "expired":
             raise HTTPException(status_code=410, detail=record.error or "WhatsApp setup expired.")
         return _whatsapp_onboarding_payload(pairing_id, record)
@@ -9487,14 +9517,12 @@ async def get_whatsapp_onboarding_status(pairing_id: str):
 async def apply_whatsapp_onboarding(
     pairing_id: str, body: WhatsAppOnboardingApply, profile: Optional[str] = None
 ):
+    requested_profile = body.profile or profile
     with _whatsapp_onboarding_lock:
         _prune_whatsapp_onboarding_sessions()
-        record = _whatsapp_onboarding_sessions.get(pairing_id)
-        if not record:
-            raise HTTPException(
-                status_code=404,
-                detail="WhatsApp setup session was not found. Start a new setup.",
-            )
+        record = _whatsapp_onboarding_record_for_profile(
+            pairing_id, requested_profile
+        )
         if record.status != "connected":
             raise HTTPException(status_code=409, detail="WhatsApp setup is not connected yet.")
         mode = _normalize_whatsapp_onboarding_mode(body.mode or record.mode)
@@ -9505,7 +9533,7 @@ async def apply_whatsapp_onboarding(
             allowed_users = record.account_phone or record.account_id or ""
         record_profile = record.profile
 
-    effective_profile = body.profile or profile or record_profile
+    effective_profile = record_profile
     try:
         with _config_profile_scope(effective_profile):
             save_env_value("WHATSAPP_MODE", mode)
@@ -9540,12 +9568,14 @@ async def apply_whatsapp_onboarding(
 
 
 @app.delete("/api/messaging/whatsapp/onboarding/{pairing_id}")
-async def cancel_whatsapp_onboarding(pairing_id: str):
+async def cancel_whatsapp_onboarding(
+    pairing_id: str, profile: Optional[str] = None
+):
     with _whatsapp_onboarding_lock:
-        record = _whatsapp_onboarding_sessions.pop(pairing_id, None)
-    if record:
-        record.status = "cancelled"
-        _terminate_whatsapp_pairing(record.proc)
+        record = _whatsapp_onboarding_record_for_profile(pairing_id, profile)
+        _whatsapp_onboarding_sessions.pop(pairing_id, None)
+    record.status = "cancelled"
+    _terminate_whatsapp_pairing(record.proc)
     return {"ok": True}
 
 

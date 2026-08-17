@@ -71,7 +71,10 @@ import type {
   WebhookCreatePayload,
   WebhookCreateResponse,
   WebhookEnableResponse,
-  WebhooksResponse
+  WebhooksResponse,
+  WhatsAppOnboardingApplyResponse,
+  WhatsAppOnboardingMode,
+  WhatsAppOnboardingResponse
 } from '@/types/hermes'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
@@ -231,7 +234,12 @@ export type {
   WebhookCreateResponse,
   WebhookEnableResponse,
   WebhookRoute,
-  WebhooksResponse
+  WebhooksResponse,
+  WhatsAppOnboardingApplyResponse,
+  WhatsAppOnboardingMode,
+  WhatsAppOnboardingResponse,
+  WhatsAppOnboardingStatus,
+  WhatsAppSetupInfo
 } from '@/types/hermes'
 
 export class HermesGateway extends JsonRpcGatewayClient {
@@ -1437,8 +1445,9 @@ export function grantComputerUsePermissions(): Promise<ActionResponse> {
   })
 }
 
-export function getMessagingPlatforms(): Promise<MessagingPlatformsResponse> {
+export function getMessagingPlatforms(profile?: null | string): Promise<MessagingPlatformsResponse> {
   return window.hermesDesktop.api<MessagingPlatformsResponse>({
+    ...profileScoped(profile),
     path: '/api/messaging/platforms'
   })
 }
@@ -1448,6 +1457,7 @@ export function updateMessagingPlatform(
   body: MessagingPlatformUpdate
 ): Promise<{ ok: boolean; platform: string }> {
   return window.hermesDesktop.api<{ ok: boolean; platform: string }>({
+    ...profileScoped(),
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}`,
     method: 'PUT',
     body
@@ -1456,8 +1466,55 @@ export function updateMessagingPlatform(
 
 export function testMessagingPlatform(platformId: string): Promise<MessagingPlatformTestResponse> {
   return window.hermesDesktop.api<MessagingPlatformTestResponse>({
+    ...profileScoped(),
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}/test`,
     method: 'POST'
+  })
+}
+
+export function startWhatsAppOnboarding(
+  body: {
+    allowed_users: string
+    mode: WhatsAppOnboardingMode
+  },
+  profile?: null | string
+): Promise<WhatsAppOnboardingResponse> {
+  return window.hermesDesktop.api<WhatsAppOnboardingResponse>({
+    ...profileScoped(profile),
+    path: '/api/messaging/whatsapp/onboarding/start',
+    method: 'POST',
+    body
+  })
+}
+
+export function getWhatsAppOnboardingStatus(
+  pairingId: string,
+  profile?: null | string
+): Promise<WhatsAppOnboardingResponse> {
+  return window.hermesDesktop.api<WhatsAppOnboardingResponse>({
+    ...profileScoped(profile),
+    path: `/api/messaging/whatsapp/onboarding/${encodeURIComponent(pairingId)}`
+  })
+}
+
+export function applyWhatsAppOnboarding(
+  pairingId: string,
+  body: { allowed_users: string; mode: WhatsAppOnboardingMode },
+  profile?: null | string
+): Promise<WhatsAppOnboardingApplyResponse> {
+  return window.hermesDesktop.api<WhatsAppOnboardingApplyResponse>({
+    ...profileScoped(profile),
+    path: `/api/messaging/whatsapp/onboarding/${encodeURIComponent(pairingId)}/apply`,
+    method: 'POST',
+    body
+  })
+}
+
+export function cancelWhatsAppOnboarding(pairingId: string, profile?: null | string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(profile),
+    path: `/api/messaging/whatsapp/onboarding/${encodeURIComponent(pairingId)}`,
+    method: 'DELETE'
   })
 }
 
@@ -1468,9 +1525,9 @@ export function testMessagingPlatform(platformId: string): Promise<MessagingPlat
 // returned by the API, while an authenticated admin is only ever identifying
 // a row they can already see.
 
-export function getPairing(): Promise<PairingResponse> {
+export function getPairing(profile?: null | string): Promise<PairingResponse> {
   return window.hermesDesktop.api<PairingResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/pairing'
   })
 }
