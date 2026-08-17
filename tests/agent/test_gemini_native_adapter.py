@@ -290,6 +290,45 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
     assert first[-1].choices[0].finish_reason == "tool_calls"
 
 
+def test_stream_event_translation_preserves_function_argument_key_order():
+    from agent.gemini_native_adapter import translate_stream_event
+
+    event = json.loads(
+        """
+        {
+          "candidates": [{
+            "content": {"parts": [
+              {"functionCall": {"name": "terminal", "args": {
+                "command": "echo one", "timeout": 10
+              }}},
+              {"functionCall": {"name": "terminal", "args": {
+                "timeout": 10, "command": "echo one"
+              }}}
+            ]},
+            "finishReason": "STOP"
+          }]
+        }
+        """
+    )
+
+    chunks = translate_stream_event(
+        event,
+        model="gemini-2.5-flash",
+        tool_call_indices={},
+    )
+    arguments = [
+        chunk.choices[0].delta.tool_calls[0].function.arguments
+        for chunk in chunks
+        if chunk.choices[0].delta.tool_calls
+    ]
+
+    assert arguments == [
+        '{"command": "echo one", "timeout": 10}',
+        '{"timeout": 10, "command": "echo one"}',
+    ]
+    assert arguments[0] != arguments[1]
+
+
 def test_build_gemini_request_preserves_explicit_max_tokens_without_thinking():
     from agent.gemini_native_adapter import build_gemini_request
 
@@ -342,7 +381,6 @@ def test_build_gemini_request_does_not_raise_when_thinking_is_disabled():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
 
 
 
