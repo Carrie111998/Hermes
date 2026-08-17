@@ -2667,6 +2667,17 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
+def _positive_output_token_cap(value) -> Optional[int]:
+    """Return a configured output cap only when it is a positive integer."""
+    if isinstance(value, bool):
+        return None
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -2706,24 +2717,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()
-    max_tokens = None
-    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
-    if _env_mt:
-        try:
-            max_tokens = int(_env_mt)
-        except (ValueError, TypeError):
-            max_tokens = None
-    elif isinstance(model_cfg, dict):
-        mt = model_cfg.get("max_tokens")
-        if isinstance(mt, int):
-            max_tokens = mt
+    max_tokens = _positive_output_token_cap(os.environ.get("HERMES_MAX_TOKENS"))
+    if max_tokens is None and isinstance(model_cfg, dict):
+        max_tokens = _positive_output_token_cap(model_cfg.get("max_tokens"))
     # Fall back to a per-provider output cap (custom_providers max_output_tokens)
     # only when the documented global model.max_tokens isn't set, so the global
     # key always wins.
     if max_tokens is None:
-        _runtime_mot = runtime.get("max_output_tokens")
-        if isinstance(_runtime_mot, int) and _runtime_mot > 0:
-            max_tokens = _runtime_mot
+        max_tokens = _positive_output_token_cap(runtime.get("max_output_tokens"))
 
     return {
         "api_key": runtime.get("api_key"),
@@ -2750,19 +2751,11 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     model_cfg = _get_model_config()
-    max_tokens = None
-    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
-    if _env_mt:
-        try:
-            max_tokens = int(_env_mt)
-        except (ValueError, TypeError):
-            max_tokens = None
-    elif isinstance(model_cfg, dict):
-        max_tokens = model_cfg.get("max_tokens")
-    if not isinstance(max_tokens, int) or max_tokens <= 0:
-        max_tokens = runtime.get("max_output_tokens")
-    if not isinstance(max_tokens, int) or max_tokens <= 0:
-        max_tokens = None
+    max_tokens = _positive_output_token_cap(os.environ.get("HERMES_MAX_TOKENS"))
+    if max_tokens is None and isinstance(model_cfg, dict):
+        max_tokens = _positive_output_token_cap(model_cfg.get("max_tokens"))
+    if max_tokens is None:
+        max_tokens = _positive_output_token_cap(runtime.get("max_output_tokens"))
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
@@ -20488,6 +20481,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         model = _resolve_gateway_model()
         config_context_length = None
         provider = None
+        display_provider = None
         base_url = None
         api_key = None
         custom_provs = None
@@ -20528,6 +20522,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 runtime = _resolve_runtime_agent_kwargs()
             provider = runtime.get("provider") or provider
+            display_provider = runtime.get("requested_provider") or provider
             base_url = runtime.get("base_url") or base_url
             api_key = runtime.get("api_key")
         except Exception:
@@ -20590,7 +20585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         lines = [
             f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
+            f"◆ Provider: {display_provider or provider or 'openrouter'}",
             f"◆ Context: {ctx_display} tokens ({ctx_source})",
         ]
 

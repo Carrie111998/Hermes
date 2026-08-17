@@ -32,7 +32,8 @@ class TestFormatSessionInfo:
 
         source = SessionSource(platform=Platform.SLACK, chat_id="C0BQDHWP3M0", user_id="u1")
         runtime = {
-            "provider": "llamacpp",
+            "provider": "custom",
+            "requested_provider": "llamacpp",
             "base_url": "http://127.0.0.1:18080/v1",
             "api_key": "local",
         }
