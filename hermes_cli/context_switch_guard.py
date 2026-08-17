@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional
 
+from agent.context_compressor import resolve_model_threshold
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 from hermes_cli.model_switch import ModelSwitchResult, resolve_display_context_length
 
@@ -25,8 +26,41 @@ def _append_warning(result: ModelSwitchResult, text: str) -> None:
         result.warning_message = text
 
 
-def _threshold_tokens(context_length: int, threshold_percent: float) -> int:
-    return max(int(context_length * threshold_percent), MINIMUM_CONTEXT_LENGTH)
+def _threshold_tokens(compressor: Any, model: str, context_length: int) -> int:
+    config_percent = float(
+        getattr(
+            compressor,
+            "_config_threshold_percent",
+            getattr(compressor, "threshold_percent", 0.5),
+        )
+    )
+    threshold_percent = resolve_model_threshold(
+        model,
+        getattr(compressor, "model_thresholds", {}),
+        config_percent,
+    )
+
+    effective_percent = getattr(compressor, "_effective_threshold_percent", None)
+    if callable(effective_percent):
+        threshold_percent = effective_percent(context_length, threshold_percent)
+
+    compute_threshold = getattr(compressor, "_compute_threshold_tokens", None)
+    if callable(compute_threshold):
+        threshold = compute_threshold(
+            context_length,
+            threshold_percent,
+            getattr(compressor, "max_tokens", None),
+        )
+    else:
+        threshold = max(
+            int(context_length * threshold_percent),
+            MINIMUM_CONTEXT_LENGTH,
+        )
+
+    cap = getattr(compressor, "threshold_tokens_cap", None)
+    if isinstance(cap, int) and cap > 0:
+        threshold = min(threshold, cap, context_length)
+    return threshold
 
 
 def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int]:
@@ -122,8 +156,7 @@ def merge_preflight_compression_warning(
     if estimate is None:
         return
 
-    pct = float(getattr(cc, "threshold_percent", 0.5))
-    new_threshold = _threshold_tokens(new_ctx, pct)
+    new_threshold = _threshold_tokens(cc, result.new_model, new_ctx)
     if estimate < new_threshold:
         return
 
