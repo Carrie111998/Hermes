@@ -241,3 +241,60 @@ entries remain in `per-file-ignores`, land, and update the agent-memory record
   inside the sentence. There is no malformed directive. The 2026-08-15 audit and the
   2026-08-16 triage both examined it and recorded **do not fix**; that decision stands.
   The warning rides along on every ruff run and should be left alone.
+
+## Stage 2 — delivered (2026-08-17), reconciled from two branches
+
+Stage 1 and Stage 2 were implemented **concurrently and independently** by two sessions
+that could not see each other, and `main` moved under both while they worked. The landed
+result is a reconciliation of three sources, not a fast-forward of either branch.
+
+| Source | Carried forward | Dropped |
+|---|---|---|
+| `claude/youthful-newton-d06c7d` (A) | `ruff.toml`, the `[tool.ruff]` deletion, the pre-commit hook, `tests/test_lint_config.py`, the SMS fix + its tests | — |
+| `claude/heuristic-shirley-9f2baa` (B) | 28 source/test files: the `TYPE_CHECKING` gaps, F402 loop-var renames, F811 duplicate removals, the F822 `noqa` pair | its `pyproject.toml` `[tool.ruff]` edit; its SMS fix; its `google_meet` rewording |
+| `main` | the `google_meet` fix (`c43e02a9e4`), the WhatsApp `json` bind (`3e5113bcfe`), the unique SMS end-to-end test | its SMS wrapper, superseded by A |
+
+Three collisions had to be graded rather than merged:
+
+1. **SMS (`_strip_markdown_for_sms`) — three different fixes.** `main` repaired the
+   `NameError` by delegating the wrapper to the shared `strip_markdown`; A deleted the
+   wrapper outright and called the helper at the one call site; B added `import re` and
+   **restored the inlined duplicate regexes**. B's is a regression, not a fix: its bare
+   `_(.+?)_` has no word-boundary guard and collapses `snake_case_names` to
+   `snakecasenames`, and its `[a-z]*` fence charset leaves "Python"/"++" in the body.
+   A's resolution is the one that landed. B's version was rejected on measured behaviour,
+   not on style — the two pins live in
+   `tests/gateway/test_sms.py::TestSmsStandaloneSendMarkdown`.
+2. **`tests/gateway/test_sms.py` — both sides added a test class.** Neither was discarded.
+   A's class pins the shared helper's string behaviour (fenced-code charset, the
+   `__init__` → `init` known limitation); `main`'s contributed the two tests A had no
+   equivalent of — an in-process/out-of-process parity assertion and an end-to-end
+   `_standalone_send` test asserting the stripped `Body` actually reaches the Twilio POST.
+   The four of `main`'s tests that called the now-deleted wrapper were rewritten onto
+   `strip_markdown`; the two unique ones kept as `TestSmsStandaloneSendDelivery`.
+3. **`gateway/platforms/__init__.py` F822.** A suppressed the whole file via the sunset
+   list; B used two line-level `# noqa: F822`. B's won — the PEP 562 `__getattr__`
+   re-export is a permanent, deliberate condition that wants a comment at the site, and
+   the file-level entry would have masked any *future* real `__all__` typo in that file.
+   Falsifier for the "just delete the `__all__` entries" reflex:
+   `getattr(gateway.platforms, "QQAdapter")` returns the class.
+
+**Result.** Sunset list **542 → 524** entries: 18 retired outright, 11 trimmed to fewer
+codes. Remaining: **979 findings** — F401 535, F841 347, F601 94, F541 3.
+
+**F821 and F822 are now zero tree-wide and gated in every file.** Neither code appears in
+the sunset list at all, so a new undefined name or bad `__all__` export is a hard failure
+anywhere in the repo. That is stronger than the stage-2 plan above, which assumed the
+annotation-gap F821s would be suppressed rather than fixed; B had already fixed them with
+`TYPE_CHECKING` blocks. The predicted "list after" of 525 was one off.
+
+The list was **regenerated from the fixed tree**, not hand-edited: findings were recomputed
+with the sunset block removed and the entries rebuilt from that output, so no entry is
+stale by construction and none was widened. `tests/test_lint_config.py`'s stale-entry guard
+independently re-proves this.
+
+**One trap, if this is ever regenerated again.** Recomputing with `--config <other>.toml`
+silently loses ruff's `requires-python` inference from `pyproject.toml`, and
+`BaseExceptionGroup`/`ExceptionGroup` then report as F821 in four files that are actually
+clean on 3.11+. Pin `target-version = "py311"` in the scratch config, and treat any
+newly-required entry as a bug in the measurement before believing it.
