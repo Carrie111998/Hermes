@@ -21,6 +21,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -788,3 +789,80 @@ def test_bypass_marker_disables_guard():
     # so we get the real os.kill. Calling os.kill(os.getpid(), 0) just
     # checks that the PID exists — harmless.
     os.kill(os.getpid(), 0)  # No exception — guard is OFF.
+
+
+# ──────────────────── gateway PID-scan guard ────────────────────
+#
+# Sibling canary for ``_gateway_pid_scan_guard``. That guard is about cost and
+# determinism rather than signal safety: the real ``_scan_gateway_pids`` shells
+# out to ``Get-CimInstance Win32_Process`` on Windows (``wmic`` is gone from
+# Win11) or walks ``/proc``, and on 2026-08-15 it returned the developer's LIVE
+# gateway PID [47164] in ~2–3 s per call.
+#
+# Every test below imports ``hermes_cli.gateway`` INSIDE its body, on purpose.
+# The guard is armed by a ``sys.meta_path`` finder at import time precisely so
+# that this works; an implementation that looked the module up in
+# ``sys.modules`` at fixture-setup time would leave these unguarded, which is
+# how the 2026-08-17 dropped candidate failed.
+
+
+def test_gateway_pid_scan_is_stubbed_by_default():
+    """The host process-table sweep must not run in an unmarked test."""
+    import hermes_cli.gateway as gateway
+
+    assert getattr(gateway._scan_gateway_pids, "_hermes_pid_scan_guard", False), (
+        "the autouse _gateway_pid_scan_guard is not installed — an unmarked "
+        "test can shell out to the host process table"
+    )
+    # Behaviour, not just identity: a wrapper that delegated anyway would pass
+    # the attribute check above.
+    started = time.perf_counter()
+    assert gateway._scan_gateway_pids(set()) == []
+    assert time.perf_counter() - started < 0.5, (
+        "the stub took long enough to have reached the real process table"
+    )
+
+
+def test_gateway_pid_scan_stub_leaves_find_gateway_pids_real():
+    """Only the sweep is stubbed — the composition logic stays under test."""
+    import hermes_cli.gateway as gateway
+
+    assert gateway.find_gateway_pids.__name__ == "find_gateway_pids"
+
+
+@pytest.mark.real_gateway_pid_scan
+def test_real_gateway_pid_scan_marker_restores_the_scanner(monkeypatch):
+    """Tests of the scanner itself must still get the real implementation.
+
+    Asserts by BEHAVIOUR, with the process table faked one layer beneath the
+    scanner, rather than by comparing ``__name__`` to the real function's. The
+    wrapper stays installed under the marker and delegates at call time, so an
+    identity assertion would be both wrong and — since it never calls anything
+    — vacuous if delegation ever broke.
+
+    No real sweep happens here: ``shutil.which`` and ``subprocess.run`` are
+    stubbed, so the scanner parses canned ``Get-CimInstance`` output.
+    """
+    import hermes_cli.gateway as gateway
+
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+    # wmic absent (Win11) so the PowerShell fallback is taken, as on this host.
+    monkeypatch.setattr(
+        gateway.shutil, "which", lambda name: None if name == "wmic" else "ps.exe"
+    )
+
+    def _fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout='CommandLine=C:\\v\\Scripts\\hermes.exe" gateway run\n'
+            "ProcessId=98765\n\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(gateway.subprocess, "run", _fake_run)
+
+    assert gateway._scan_gateway_pids(set()) == [98765], (
+        "the real_gateway_pid_scan marker did not restore the real scanner"
+    )

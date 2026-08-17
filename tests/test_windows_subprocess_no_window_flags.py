@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -172,6 +174,7 @@ def test_copilot_gh_cli_probe_hides_gh_windows(monkeypatch):
     assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
 
 
+@pytest.mark.real_gateway_pid_scan  # asserts the scanner's own spawn flags
 def test_gateway_pid_scan_hides_wmic_and_powershell_windows(monkeypatch):
     from hermes_cli import gateway
     from hermes_cli import _subprocess_compat

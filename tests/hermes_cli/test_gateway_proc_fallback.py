@@ -9,7 +9,15 @@ See: NousResearch/hermes-agent#7622
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import hermes_cli.gateway as gateway_mod
+
+# Every test here calls ``_scan_gateway_pids`` directly to exercise the
+# /proc-vs-ps branch, so all of them opt out of the autouse stub. They stay
+# hermetic by patching the process-table source (os.listdir / open /
+# subprocess.run) beneath the scanner.
+pytestmark = pytest.mark.real_gateway_pid_scan
 
 
 # ---------------------------------------------------------------------------

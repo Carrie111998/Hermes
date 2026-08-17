@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-17
 **Baseline:** `3bc7442b9b` (worktree `objective-gates-1b04a5`, branch `claude/practical-pascal-63397b`)
-**Status:** design approved, implementation not started
+**Status:** implemented and verified 2026-08-17
 **Supersedes:** `backup/pre-drop-pidguard-20260817` (`e865ab09db` + `ca17d36a45`), dropped 2026-08-17
 
 ## Problem
@@ -226,9 +226,37 @@ host sweep.
 - `tests/test_conftest_import_cost.py` green against the real conftest.
 - `tests/test_live_system_guard_self_test.py` green, including all three new canaries.
 - The four marked scanner tests green.
-- Per-file before/after on the five known offenders: pass/fail/skip counts identical to
-  baseline, and the original timing wins reproduce (`test_cron.py` 126.4 s -> 65.4 s,
-  `test_gateway_windows.py` 94.3 s -> 58.2 s).
+- Per-file before/after on the known offenders: pass/fail/skip counts identical to
+  baseline, and zero real host sweeps afterwards.
+
+**Result (measured 2026-08-17, after implementation).** Both arms run at
+`--timeout=300`, because at the pinned 30 s cap the *unguarded* baseline dies: a
+`test_cron.py` BEFORE run was killed by pytest-timeout inside `subprocess.communicate`
+under the real sweep, never reaching `sessionfinish`. That is the cost defect reproducing
+directly, but it also means a comparable baseline needs the raised cap.
+
+Sweep counts come from a probe plugin that wraps `subprocess.run` and matches the
+`Win32_Process` / `wmic` argv, so it measures identically on both arms and is independent
+of the guard's mechanism.
+
+| File | BEFORE | AFTER | Sweeps eliminated |
+|---|---|---|---|
+| `tests/hermes_cli/test_cron.py` | 16 passed, 102.08 s | 16 passed, 52.31 s | 3 / 34.03 s |
+| `tests/hermes_cli/test_gateway_windows.py` | 51 passed, 47.22 s | 51 passed, 22.06 s | 2 / 19.91 s |
+| `tests/hermes_cli/test_status.py` | 17 passed, 56.55 s | 17 passed, 33.63 s | 1 / 15.62 s |
+
+Counts identical on every file; zero sweeps after, on every file. `test_status.py`
+confirms it reaches the scanner transitively through `show_status`.
+
+**The dropped commit's figures (`test_cron.py` 126.4 s -> 65.4 s,
+`test_gateway_windows.py` 94.3 s -> 58.2 s) did NOT reproduce and are not carried
+forward.** The direction and rough magnitude hold, the numbers do not — unsurprising on a
+differently-loaded box. The table above supersedes them.
+
+An earlier wall-clock harness for this measurement was discarded as unusable: its elapsed
+time disagreed with pytest's own reported duration by ~59 s on one run, and it keyed log
+and probe filenames on label+round without the file name, so the two files collided. The
+figures above come from pytest's own summary line and a per-file probe path.
 
 ## Evidence
 
@@ -258,6 +286,8 @@ through posture above.
   Removing it would be tidier in principle, but pytest's own assertion-rewriting finder is
   equally permanent, and removal mid-session could unarm the guard for a late import.
   Decision: leave it installed.
-- Two claims in the acceptance criteria are carried over from the dropped commit's message
-  and have **not** been re-measured in this session: the per-file timing wins. They are
-  acceptance criteria to verify during implementation, not established facts.
+- ~~Two claims carried over from the dropped commit's message have not been re-measured:
+  the per-file timing wins.~~ **Resolved:** measured after implementation; they did not
+  reproduce and were replaced by the table under Test plan.
+- The unguarded baseline is not reliably runnable at the pinned 30 s timeout — it dies
+  inside the sweep. Anyone re-measuring must raise the cap on **both** arms.

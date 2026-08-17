@@ -1178,6 +1178,7 @@ def test_gateway_install_noninteractive_skips_legacy_unit_prompt(monkeypatch, tm
     assert all(c[0] != "prompt" for c in calls)
 
 
+@pytest.mark.real_gateway_pid_scan  # drives the scan's own ps-failure branch
 def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkeypatch):
     monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
     monkeypatch.setattr(gateway, "is_windows", lambda: False)
@@ -1270,6 +1271,7 @@ def test_reap_unsupervised_orphans_returns_false_when_none_found(monkeypatch):
     assert killed == []
 
 
+@pytest.mark.real_gateway_pid_scan  # tests the scanner itself
 def test_scan_gateway_pids_detects_windows_hermes_exe_case_variants(monkeypatch):
     monkeypatch.setattr(gateway, "is_windows", lambda: True)
     monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
