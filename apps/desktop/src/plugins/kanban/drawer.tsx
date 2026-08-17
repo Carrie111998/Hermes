@@ -27,20 +27,28 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState
+} from 'react'
 
 import {
   $boardSlug,
   addComment,
+  assignTask,
+  BOARDS_KEY,
   deleteTask,
   estimateTask,
   fetchLog,
-  fetchProfiles,
   fetchTask,
   logKey,
   patchTask,
-  PROFILES_KEY,
-  reassignTask,
+  profileQueryOptions,
   reclaimTask,
   taskKey,
   uploadAttachment
@@ -234,20 +242,26 @@ function Diagnostics({ items, onReclaim }: { items: Diagnostic[]; onReclaim: () 
  *  assignee to reassign (reclaims a running worker first, resets the failure
  *  streak — the explicit human recovery action). */
 function AssigneeMenu({
+  busy,
   current,
-  onReassign
+  onAssign
 }: {
+  busy: boolean
   current: null | string | undefined
-  onReassign: (p: string) => void
+  onAssign: (profile: null | string) => void
 }) {
   const k = useKanban()
-  const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
+  const slug = useValue($boardSlug)
+  const { data: roster } = useQuery(profileQueryOptions(slug))
+  const effectiveProfiles = (roster?.profiles ?? []).filter(profile => profile.effective_allowed)
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <button
+          aria-label={current ?? k.unassigned}
           className="-mx-1 inline-flex max-w-full items-center gap-1.5 rounded px-1 py-0.5 text-left transition-colors hover:bg-(--chrome-action-hover)"
+          disabled={busy}
           type="button"
         >
           {current ? (
@@ -262,13 +276,17 @@ function AssigneeMenu({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
-        {(roster?.profiles ?? []).map(profile => (
-          <DropdownMenuItem key={profile.name} onSelect={() => onReassign(profile.name)}>
+        {effectiveProfiles.map(profile => (
+          <DropdownMenuItem disabled={busy} key={profile.name} onSelect={() => onAssign(profile.name)}>
             <Avatar name={profile.name} size="0.875rem" />
             {profile.name}
             {profile.name === current && <Codicon className="ml-auto" name="check" size="0.8rem" />}
           </DropdownMenuItem>
         ))}
+        {effectiveProfiles.length > 0 && <DropdownMenuSeparator />}
+        <DropdownMenuItem disabled={busy || !current} onSelect={() => onAssign(null)}>
+          {current ? k.unassignAction : k.unassigned}
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -473,14 +491,50 @@ function AttachmentsSection({
 // behind an explicit click + disclaimer since it makes a model call. The
 // control keeps a stable footprint (spinner swaps in place) so there's no
 // layout jump when it runs.
-function EstimateSection({ id }: { id: string }) {
+interface DrawerAction {
+  board: string
+  generation: number
+  taskId: string
+}
+
+interface AssignmentOperation extends DrawerAction {
+  owner: symbol
+  profile: null | string
+}
+
+const DRAWER_FOCUSABLE = 'a[href], button, input, select, textarea, [tabindex]'
+
+function getFocusable(container: HTMLElement): HTMLElement[] {
+  return [...container.querySelectorAll<HTMLElement>(DRAWER_FOCUSABLE)].filter(
+    element =>
+      element.tabIndex >= 0 &&
+      !element.matches(':disabled, input[type="hidden"]') &&
+      !element.closest('[hidden], [aria-hidden="true"]')
+  )
+}
+
+function EstimateSection({
+  action,
+  isCurrent
+}: {
+  action: DrawerAction
+  isCurrent: (action: DrawerAction) => boolean
+}) {
   const k = useKanban()
   const [result, setResult] = useState<null | TaskEstimate>(null)
 
   const est = useMutation({
-    mutationFn: () => estimateTask(id),
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: r => {
+    mutationFn: (candidate: DrawerAction) => estimateTask(candidate.board, candidate.taskId),
+    onError: (err, candidate) => {
+      if (isCurrent(candidate)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    },
+    onSuccess: (r, candidate) => {
+      if (!isCurrent(candidate)) {
+        return
+      }
+
       if (r.ok) {
         setResult(r)
       } else {
@@ -489,8 +543,11 @@ function EstimateSection({ id }: { id: string }) {
     }
   })
 
-  // A new task resets the cached estimate (the drawer reuses one instance).
-  useEffect(() => setResult(null), [id])
+  // Every drawer lifecycle gets a clean estimate, including close/reopen with
+  // the same board/task identity.
+  useEffect(() => setResult(null), [action.generation])
+
+  const estimating = est.isPending && Boolean(est.variables && isCurrent(est.variables))
 
   return (
     <Section label={k.estimate}>
@@ -509,12 +566,12 @@ function EstimateSection({ id }: { id: string }) {
               <Button
                 aria-label={k.reEstimate}
                 className="ml-auto"
-                disabled={est.isPending}
-                onClick={() => est.mutate()}
+                disabled={estimating}
+                onClick={() => est.mutate(action)}
                 size="icon-xs"
                 variant="ghost"
               >
-                <Codicon name="refresh" size="0.75rem" spinning={est.isPending} />
+                <Codicon name="refresh" size="0.75rem" spinning={estimating} />
               </Button>
             </Tip>
           </div>
@@ -524,9 +581,9 @@ function EstimateSection({ id }: { id: string }) {
         </div>
       ) : (
         <div className="flex items-center gap-2">
-          <Button disabled={est.isPending} onClick={() => est.mutate()} size="xs" variant="outline">
-            <Codicon name={est.isPending ? 'loading' : 'dashboard'} size="0.75rem" spinning={est.isPending} />
-            {est.isPending ? k.estimating : k.estimateEffort}
+          <Button disabled={estimating} onClick={() => est.mutate(action)} size="xs" variant="outline">
+            <Codicon name={estimating ? 'loading' : 'dashboard'} size="0.75rem" spinning={estimating} />
+            {estimating ? k.estimating : k.estimateEffort}
           </Button>
           <Tip label={k.estimateTipLong}>
             <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.makesModelCall}</span>
@@ -551,14 +608,78 @@ export function TaskDrawer({
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const drawerOpen = Boolean(id)
+  const lifecycle = useRef({ board: slug, generation: 0, open: drawerOpen, taskId: id })
+  const assignmentOwner = useRef<null | symbol>(null)
+  const drawerRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const titleId = useId()
+
+  if (lifecycle.current.board !== slug || lifecycle.current.open !== drawerOpen || lifecycle.current.taskId !== id) {
+    lifecycle.current = {
+      board: slug,
+      generation: lifecycle.current.generation + 1,
+      open: drawerOpen,
+      taskId: id
+    }
+  }
+
+  const action: DrawerAction | null = id ? { board: slug, generation: lifecycle.current.generation, taskId: id } : null
+
+  const isCurrent = useCallback((candidate: DrawerAction) => {
+    const current = lifecycle.current
+
+    return (
+      current.open &&
+      current.board === candidate.board &&
+      current.generation === candidate.generation &&
+      current.taskId === candidate.taskId
+    )
+  }, [])
+
+  const closeDrawer = useCallback(
+    (candidate: DrawerAction) => {
+      if (!isCurrent(candidate)) {
+        return
+      }
+
+      const current = lifecycle.current
+      lifecycle.current = {
+        board: current.board,
+        generation: current.generation + 1,
+        open: false,
+        taskId: null
+      }
+      onClose()
+    },
+    [isCurrent, onClose]
+  )
+
+  const openDrawerTask = (taskId: string) => {
+    const current = lifecycle.current
+
+    if (!current.open) {
+      return
+    }
+
+    lifecycle.current = {
+      board: slug,
+      generation: current.generation + 1,
+      open: true,
+      taskId
+    }
+    onOpen(taskId)
+  }
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
-  const { data: detail, error } = useQuery({
+  const detailQuery = useQuery({
     enabled: !!id,
-    queryFn: () => fetchTask(id!),
+    queryFn: () => fetchTask(slug, id!),
     queryKey: taskKey(slug, id ?? ''),
     refetchInterval: 30_000
   })
+
+  const { data: detail, error } = detailQuery
 
   const task = detail?.task
   const running = task?.status === 'running'
@@ -566,97 +687,251 @@ export function TaskDrawer({
 
   const { data: log } = useQuery({
     enabled: !!id,
-    queryFn: () => fetchLog(id!),
+    queryFn: () => fetchLog(slug, id!),
     queryKey: logKey(slug, id ?? ''),
     refetchInterval: running ? 3_000 : 15_000
   })
 
-  // Esc closes the drawer even though it isn't modal (no backdrop to click off).
+  // Move focus into the modal drawer. Restore the prior target only when focus
+  // is still owned by this drawer (or fell back to body) so cleanup never steals
+  // a deliberate focus move elsewhere.
   useEffect(() => {
-    if (!id) {
+    if (!drawerOpen) {
       return
     }
 
-    const onKey = (event: KeyboardEvent) => event.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey)
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const drawer = drawerRef.current
+    closeButtonRef.current?.focus()
 
-    return () => window.removeEventListener('keydown', onKey)
-  }, [id, onClose])
+    return () => {
+      const active = document.activeElement
 
-  const invalidate = () => {
-    void qc.invalidateQueries({ queryKey: taskKey(slug, id!) })
-    void qc.invalidateQueries({ queryKey: ['kanban', 'board', slug] })
+      if (
+        previous?.isConnected &&
+        (active === document.body || (active instanceof Node && Boolean(drawer?.contains(active))))
+      ) {
+        previous.focus()
+      }
+    }
+  }, [drawerOpen])
+
+  // Capture Escape before shell shortcuts so one key closes exactly one modal.
+  useEffect(() => {
+    if (!drawerOpen) {
+      return
+    }
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        const drawer = drawerRef.current
+        const active = document.activeElement
+
+        // Portaled menus/selects own their first Escape. Their focused content
+        // sits outside the drawer node even though it belongs to this dialog.
+        if (active instanceof Node && active !== document.body && !drawer?.contains(active)) {
+          return
+        }
+
+        event.preventDefault()
+        event.stopPropagation()
+
+        const current = lifecycle.current
+
+        if (current.open && current.taskId) {
+          closeDrawer({ board: current.board, generation: current.generation, taskId: current.taskId })
+        }
+      }
+    }
+
+    window.addEventListener('keydown', onKey, true)
+
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [closeDrawer, drawerOpen])
+
+  const trapFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Tab') {
+      return
+    }
+
+    const drawer = drawerRef.current
+    const focusable = drawer ? getFocusable(drawer) : []
+
+    if (focusable.length === 0) {
+      event.preventDefault()
+
+      return
+    }
+
+    const first = focusable[0]
+    const last = focusable.at(-1)!
+    const active = document.activeElement
+
+    if (event.shiftKey ? active === first || !drawer?.contains(active) : active === last || !drawer?.contains(active)) {
+      event.preventDefault()
+      ;(event.shiftKey ? last : first).focus()
+    }
   }
+
+  const invalidate = (board = slug, taskId = id!, countChanged = false) => {
+    void qc.invalidateQueries({ queryKey: taskKey(board, taskId) })
+    void qc.invalidateQueries({ queryKey: ['kanban', 'board', board] })
+
+    if (countChanged) {
+      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+    }
+  }
+
+  const assignment = useMutation({
+    mutationFn: ({ board, profile, taskId }: AssignmentOperation) => assignTask(board, taskId, profile),
+    onError: (err, vars, context) => {
+      if (context?.optimistic && context.previous && isCurrent(vars)) {
+        qc.setQueryData(context.key, context.previous)
+      }
+
+      if (isCurrent(vars)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    },
+    onMutate: async (vars: AssignmentOperation) => {
+      const key = taskKey(vars.board, vars.taskId)
+      await qc.cancelQueries({ queryKey: key })
+      const previous = qc.getQueryData<KanbanTaskDetail>(key)
+      const optimistic = Boolean(previous && isCurrent(vars))
+
+      if (previous && optimistic) {
+        qc.setQueryData(key, { ...previous, task: { ...previous.task, assignee: vars.profile } })
+      }
+
+      return { key, optimistic, previous }
+    },
+    onSettled: (_data, _error, vars) => {
+      if (assignmentOwner.current === vars.owner) {
+        assignmentOwner.current = null
+      }
+
+      invalidate(vars.board, vars.taskId)
+    }
+  })
 
   // Optimistic status change against the task cache; rolls back + toasts on a
   // rejected transition (the backend enforces the workflow).
   const moveMut = useMutation({
-    mutationFn: (status: string) => patchTask(id!, { status }),
-    onMutate: async status => {
-      await qc.cancelQueries({ queryKey: taskKey(slug, id!) })
-      const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(slug, id!))
+    mutationFn: ({ board, status, taskId }: DrawerAction & { fromStatus: string; status: string }) =>
+      patchTask(board, taskId, { status }),
+    onMutate: async ({ board, status, taskId }) => {
+      const key = taskKey(board, taskId)
+      await qc.cancelQueries({ queryKey: key })
+      const previous = qc.getQueryData<KanbanTaskDetail>(key)
 
       if (previous) {
-        qc.setQueryData(taskKey(slug, id!), { ...previous, task: { ...previous.task, status } })
+        qc.setQueryData(key, { ...previous, task: { ...previous.task, status } })
       }
 
-      return { previous }
+      return { key, previous }
     },
-    onError: (err, _status, context) => {
-      if (context?.previous) {
-        qc.setQueryData(taskKey(slug, id!), context.previous)
+    onError: (err, vars, context) => {
+      if (context?.previous && isCurrent(vars)) {
+        qc.setQueryData(context.key, context.previous)
       }
 
-      host.notify({ kind: 'error', message: errText(err) })
+      if (isCurrent(vars)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
     },
-    onSettled: invalidate
+    onSettled: (_data, _error, vars) =>
+      invalidate(vars.board, vars.taskId, vars.fromStatus === 'archived' || vars.status === 'archived')
   })
 
-  const mutate = (fn: () => Promise<unknown>, onDone?: () => void) => () =>
-    fn().then(
-      () => {
-        invalidate()
-        onDone?.()
-      },
-      (err: unknown) => host.notify({ kind: 'error', message: errText(err) })
-    )
+  const mutate =
+    (
+      fn: (candidate: DrawerAction) => Promise<unknown>,
+      onDone?: (candidate: DrawerAction) => void,
+      countChanged = false
+    ) =>
+    () => {
+      const candidate = action
+
+      if (!candidate) {
+        return
+      }
+
+      void fn(candidate).then(
+        () => {
+          invalidate(candidate.board, candidate.taskId, countChanged)
+
+          if (isCurrent(candidate)) {
+            onDone?.(candidate)
+          }
+        },
+        (err: unknown) => {
+          if (isCurrent(candidate)) {
+            host.notify({ kind: 'error', message: errText(err) })
+          }
+        }
+      )
+    }
 
   const commentMut = useMutation({
-    mutationFn: (body: string) => addComment(id!, body),
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: invalidate
+    mutationFn: ({ board, body, taskId }: DrawerAction & { body: string }) => addComment(board, taskId, body),
+    onError: (err, vars) => {
+      if (isCurrent(vars)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    },
+    onSuccess: (_data, vars) => invalidate(vars.board, vars.taskId)
   })
 
   // "Note & requeue" for a running task: post the note, then reclaim so the
   // dispatcher re-runs it with the note in the worker's context — the one-click
   // replacement for the block → comment → unblock dance.
   const requeueMut = useMutation({
-    mutationFn: async (body: string) => {
-      await addComment(id!, body)
-      await reclaimTask(id!)
+    mutationFn: async ({ board, body, taskId }: DrawerAction & { body: string }) => {
+      await addComment(board, taskId, body)
+      await reclaimTask(board, taskId)
     },
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: () => {
-      host.notify({ kind: 'info', message: k.notePosted })
-      invalidate()
+    onError: (err, vars) => {
+      if (isCurrent(vars)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    },
+    onSuccess: (_data, vars) => {
+      invalidate(vars.board, vars.taskId)
+
+      if (isCurrent(vars)) {
+        host.notify({ kind: 'info', message: k.notePosted })
+      }
     }
   })
 
   const uploadMut = useMutation({
-    mutationFn: async (file: File) =>
-      uploadAttachment(id!, {
+    mutationFn: async ({ board, file, taskId }: DrawerAction & { file: File }) =>
+      uploadAttachment(board, taskId, {
         bytes: await file.arrayBuffer(),
         contentType: file.type || undefined,
         filename: file.name
       }),
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: invalidate
+    onError: (err, vars) => {
+      if (isCurrent(vars)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    },
+    onSuccess: (_data, vars) => invalidate(vars.board, vars.taskId)
   })
 
   if (!id) {
     return null
   }
 
+  const currentAction = action!
+
+  const assignmentBusy = assignmentOwner.current !== null
+
+  const commentPending =
+    (commentMut.isPending && Boolean(commentMut.variables && isCurrent(commentMut.variables))) ||
+    (requeueMut.isPending && Boolean(requeueMut.variables && isCurrent(requeueMut.variables)))
+
+  const uploadPending = uploadMut.isPending && Boolean(uploadMut.variables && isCurrent(uploadMut.variables))
   const errorMessage = error ? errText(error) : null
 
   const move = (status: string) => {
@@ -670,11 +945,30 @@ export function TaskDrawer({
       return
     }
 
-    moveMut.mutate(status)
+    if (action) {
+      moveMut.mutate({ ...action, fromStatus: task.status, status })
+    }
+  }
+
+  const assign = (profile: null | string) => {
+    if (assignmentOwner.current || (task?.assignee ?? null) === profile) {
+      return
+    }
+
+    const owner = Symbol('kanban-drawer-assignment')
+    assignmentOwner.current = owner
+    assignment.mutate({ ...currentAction, owner, profile })
   }
 
   return (
-    <div className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4">
+    <div
+      aria-labelledby={titleId}
+      aria-modal="true"
+      className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4"
+      onKeyDown={trapFocus}
+      ref={drawerRef}
+      role="dialog"
+    >
       <header className="flex flex-col gap-2 px-4 pt-3.5 pb-3">
         <div className="flex items-center gap-2">
           {task ? (
@@ -719,11 +1013,20 @@ export function TaskDrawer({
                     {k.copyTitle}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
+                  <DropdownMenuItem
+                    onSelect={mutate(
+                      candidate => patchTask(candidate.board, candidate.taskId, { status: 'archived' }),
+                      closeDrawer,
+                      true
+                    )}
+                  >
                     <Codicon name="archive" size="0.85rem" />
                     {k.archiveTask}
                   </DropdownMenuItem>
-                  <DropdownMenuItem className="text-destructive" onSelect={mutate(() => deleteTask(task.id), onClose)}>
+                  <DropdownMenuItem
+                    className="text-destructive"
+                    onSelect={mutate(candidate => deleteTask(candidate.board, candidate.taskId), closeDrawer, true)}
+                  >
                     <Codicon name="trash" size="0.85rem" />
                     {k.deleteTask}
                   </DropdownMenuItem>
@@ -733,23 +1036,27 @@ export function TaskDrawer({
             <button
               aria-label={k.close}
               className="grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
-              onClick={onClose}
+              onClick={() => closeDrawer(currentAction)}
+              ref={closeButtonRef}
               type="button"
             >
               <Codicon name="close" size="0.9rem" />
             </button>
           </div>
         </div>
-        {task && (
-          <h2 className="text-sm leading-snug font-semibold text-foreground" data-selectable-text="true">
-            {task.title || task.id}
-          </h2>
-        )}
+        <h2 className="text-sm leading-snug font-semibold text-foreground" data-selectable-text="true" id={titleId}>
+          {task?.title || task?.id || shortId(id)}
+        </h2>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4" data-selectable-text="true">
-        {errorMessage ? (
-          <ErrorState title={errorMessage} />
+        {errorMessage && !detail ? (
+          <ErrorState description={errorMessage} title={k.taskLoadError}>
+            <Button onClick={() => void detailQuery.refetch()} size="sm" variant="outline">
+              <Codicon name="refresh" size="0.8rem" />
+              {k.retry}
+            </Button>
+          </ErrorState>
         ) : !detail || !task ? (
           <div className="grid h-32 place-items-center">
             <Loader type="lemniscate-bloom" />
@@ -758,10 +1065,7 @@ export function TaskDrawer({
           <div className="flex flex-col gap-4 text-sm">
             <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-[0.71rem]">
               <MetaRow label={k.assignee}>
-                <AssigneeMenu
-                  current={task.assignee}
-                  onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
-                />
+                <AssigneeMenu busy={assignmentBusy} current={task.assignee} onAssign={assign} />
               </MetaRow>
               {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
               {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
@@ -773,7 +1077,9 @@ export function TaskDrawer({
               )}
               <MetaRow label={k.model}>
                 <ModelOverrideField
-                  onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                  onChange={next =>
+                    void mutate(candidate => patchTask(candidate.board, candidate.taskId, overridePatch(next)))()
+                  }
                   value={{
                     effort: task.reasoning_effort ?? '',
                     model: task.model_override ?? '',
@@ -794,13 +1100,19 @@ export function TaskDrawer({
 
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={k.diagnosticsN(task.diagnostics.length)}>
-                <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
+                <Diagnostics
+                  items={task.diagnostics}
+                  onReclaim={() => void mutate(candidate => reclaimTask(candidate.board, candidate.taskId))()}
+                />
               </Section>
             )}
 
-            <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
+            <DescriptionSection
+              body={task.body}
+              onSave={body => void mutate(candidate => patchTask(candidate.board, candidate.taskId, { body }))()}
+            />
 
-            <EstimateSection id={task.id} />
+            <EstimateSection action={currentAction} isCurrent={isCurrent} />
 
             {task.result && (
               <Section label={k.result}>
@@ -826,7 +1138,7 @@ export function TaskDrawer({
                         <button
                           className="rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 font-mono text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
                           key={linked}
-                          onClick={() => onOpen(linked)}
+                          onClick={() => openDrawerTask(linked)}
                           type="button"
                         >
                           {shortId(linked)}
@@ -862,9 +1174,9 @@ export function TaskDrawer({
                 </ul>
               )}
               <CommentComposer
-                onRequeue={body => requeueMut.mutate(body)}
-                onSubmit={body => commentMut.mutate(body)}
-                pending={commentMut.isPending || requeueMut.isPending}
+                onRequeue={body => requeueMut.mutate({ ...currentAction, body })}
+                onSubmit={body => commentMut.mutate({ ...currentAction, body })}
+                pending={commentPending}
                 running={running}
               />
             </Section>
@@ -947,8 +1259,8 @@ export function TaskDrawer({
 
             <AttachmentsSection
               attachments={detail.attachments}
-              onUpload={file => uploadMut.mutate(file)}
-              pending={uploadMut.isPending}
+              onUpload={file => uploadMut.mutate({ ...currentAction, file })}
+              pending={uploadPending}
             />
           </div>
         )}

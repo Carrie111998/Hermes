@@ -13,11 +13,12 @@ import {
   profileColor,
   profileColorSoft,
   relativeTime,
-  useQuery
+  useQuery,
+  useValue
 } from '@hermes/plugin-sdk'
 import { type ReactNode, useEffect, useState } from 'react'
 
-import { fetchOrchestration, ORCHESTRATION_KEY } from './api'
+import { $boardSlug, fetchOrchestration, orchestrationKey } from './api'
 import { columnLabel, useKanban } from './i18n'
 import { columnMeta, type KanbanTask } from './types'
 
@@ -32,15 +33,17 @@ export { columnHelp, columnLabel, type KanbanText, lockedReason, useKanban } fro
  *  persisted, so a remount can't reopen a dialog the user already dismissed. */
 export const $newTaskLane = atom<null | string>(null)
 
-/** Orchestration knobs (cached app-wide; the settings panel invalidates). */
+/** Orchestration knobs cached independently for each selected board. */
 export function useOrchestration() {
-  return useQuery({ queryKey: ORCHESTRATION_KEY, queryFn: fetchOrchestration, staleTime: 60_000 }).data
+  const slug = useValue($boardSlug)
+
+  return useQuery({ queryKey: orchestrationKey(slug), queryFn: () => fetchOrchestration(slug), staleTime: 60_000 }).data
 }
 
 /** The dispatcher's configured fallback for unassigned ready cards
  *  (`kanban.default_assignee`) — '' when unset, i.e. unassigned never runs. */
 export function useDefaultAssignee(): string {
-  return useOrchestration()?.default_assignee.trim() ?? ''
+  return useOrchestration()?.resolved_default_assignee?.trim() ?? ''
 }
 
 // System-owned drop targets — you can drag a card OUT of these, never INTO

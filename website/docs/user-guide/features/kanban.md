@@ -153,6 +153,11 @@ matters.
   inherits (git repo → preserved worktree, plain dir → preserved
   directory); each task can still override it at creation time. Clearing
   the field reverts new tasks to disposable scratch workspaces.
+- **Orchestration settings** — expand the panel to set **Profiles allowed
+  on this board**. You can inherit the machine ceiling, select profiles
+  from an explicit checklist, or explicitly allow none. Profiles excluded
+  by the machine ceiling remain visible but disabled because a board cannot
+  re-enable them.
 - **Archive** — only shown on non-`default` boards. Confirms, then moves
   the board dir to `boards/_archived/`.
 
@@ -601,7 +606,7 @@ The kanban board has two ways to handle a task you drop into the Triage column:
 
 Flip between the two modes from the **Orchestration: Auto/Manual** pill at the top of the kanban page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` — that's still available as a single-task spec rewrite when you don't want fan-out.
 
-The decomposer's routing decisions depend on profile descriptions, which is a per-profile labeling primitive you set with `hermes profile create --description "..."`, `hermes profile describe <name> --text "..."`, `hermes profile describe <name> --auto` (LLM-generates from the profile's installed skills + model), or the dashboard's per-profile editor in the expanded **Orchestration settings** panel. Profiles without a description still appear in the roster — they're routable by name, just less precisely. The decomposer NEVER lands a child task with `assignee=None`: when the LLM picks an unknown profile, the child gets routed to `kanban.default_assignee` (or the active default profile if that's unset).
+The decomposer's routing decisions depend on profile descriptions, which is a per-profile labeling primitive you set with `hermes profile create --description "..."`, `hermes profile describe <name> --text "..."`, `hermes profile describe <name> --auto` (LLM-generates from the profile's installed skills + model), or the dashboard's per-profile editor in the expanded **Orchestration settings** panel. Profiles without a description still appear in the roster — they're routable by name, just less precisely. Routing and assignment use the active board's effective profile set: the machine ceiling intersected with the board's selection. The decomposer NEVER lands a child task with `assignee=None`: when the LLM picks an unknown profile, it tries `kanban.default_assignee` (or the active default profile if that's unset), subject to the same effective board policy.
 
 `kanban.orchestrator_profile` does not load that profile's prompt, skills, or custom logic into the decomposition call. It controls who owns the root/orchestration task after fan-out. To change the decomposer's model/provider, configure `auxiliary.kanban_decomposer`. To use a profile's custom task-splitting logic instead of the built-in decomposer, switch to Manual mode and have that profile create or decompose tasks explicitly.
 
@@ -609,6 +614,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 
 | Key | Default | Purpose |
 |---|---|---|
+| `allowed_profiles` | `null` | Machine-wide Kanban safety ceiling that boards may inherit or narrow. `null` is unrestricted; `[]` permits no profiles. No board or named profile can widen this ceiling. |
 | `auto_decompose` | `true` | Dispatcher auto-runs the built-in decomposer for Triage tasks every tick. It does not gate profile-driven `kanban_create` calls or creator wake turns. |
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
@@ -622,6 +628,39 @@ And the two auxiliary LLM slots:
 |---|---|
 | `auxiliary.kanban_decomposer` | Model that produces the task graph (called by Decompose). Set `provider`/`model` to override the main chat model. |
 | `auxiliary.profile_describer` | Model that auto-generates profile descriptions (called by `hermes profile describe --auto`). |
+
+### Profile assignment policy
+
+`kanban.allowed_profiles` in shared `~/.hermes/config.yaml` sets the machine
+safety ceiling. Each board may persist its own `allowed_profiles` selection
+in that board's `board.json` under Hermes home. Among installed profiles, the
+effective assignment set is the machine ceiling intersected with the board
+selection:
+
+| Machine `kanban.allowed_profiles` | Board `allowed_profiles` | Effective assignment set |
+|---|---|---|
+| `null` | absent or `null` | All installed profiles |
+| `null` | `[]` | No profiles |
+| `null` | Nonempty list | The board list |
+| Nonempty list | absent or `null` | The machine list |
+| Nonempty list | `[]` | No profiles |
+| Nonempty list | Nonempty list | Profiles present in both lists |
+| `[]` | Any value | No profiles |
+
+An absent board field therefore preserves existing-board behavior and needs
+no migration. The effective set is enforced for creation, reassignment,
+triage and decomposition, review handoff and restoration, dashboard rosters
+and selectors, and both normal and review dispatch. Named-profile configs and
+gateways cannot bypass the shared machine ceiling. Tightening either layer
+does not hide historical cards, but a card assigned to a now-excluded profile
+will not dispatch until it is reassigned or the policy changes.
+
+#### Update durability
+
+Policy state lives under Hermes home: the machine ceiling in `config.yaml`
+and each board selection in its `board.json`. Hermes source updates do not
+overwrite these files. This persistence guarantee covers policy data only;
+source-code and update integration are separate concerns.
 
 ### Architecture
 
@@ -663,11 +702,11 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `POST` | `/tasks/:id/comments` | Append a comment |
 | `POST` | `/tasks/:id/specify` | Run the triage specifier — auxiliary LLM fleshes out the task body and promotes it from `triage` to `todo`. Returns `{ok, task_id, reason, new_title}`; `ok=false` with a human-readable reason on "not in triage" / no aux client / LLM error is a 200, not a 4xx |
 | `POST` | `/tasks/:id/decompose` | Run the kanban decomposer — auxiliary LLM produces a task graph and the helper atomically creates the children + links the root + flips `triage → todo`. Returns `{ok, task_id, reason, fanout, child_ids, new_title}`. Same 200-on-LLM-error convention as `/specify`. |
-| `GET` | `/profiles` | List installed profiles with their descriptions (consumed by the dashboard's profile-description editor and the orchestrator picker). |
+| `GET` | `/profiles?board=<slug>` | List every installed profile with its description plus machine-ceiling, board-selection, and effective-eligibility flags for the selected board. |
 | `PATCH` | `/profiles/:name` | Set or clear a profile's description (user-authored — `description_auto: false`). Returns `{ok, profile, description}`. |
 | `POST` | `/profiles/:name/describe-auto` | Generate a description for a profile via `auxiliary.profile_describer`. Persists with `description_auto: true` so the dashboard can surface a "review" badge. |
-| `GET` | `/orchestration` | Read the kanban orchestration settings (`orchestrator_profile`, `default_assignee`, `auto_decompose`) plus the *resolved* effective values after fallbacks. |
-| `PUT` | `/orchestration` | Update one or more of the three orchestration keys in `config.yaml`. Validates that non-empty profile names actually exist. |
+| `GET` | `/orchestration?board=<slug>` | Read the global orchestration settings and resolved fallbacks, plus the board's `allowed_profiles` policy and effective profile list. |
+| `PUT` | `/orchestration?board=<slug>` | Update orchestration settings. `allowed_profiles: null` makes this board inherit the machine ceiling; a list stores an explicit board selection, including `[]` for allow none. Other orchestration keys remain global. |
 | `POST` | `/links` | Add a dependency (`parent_id` → `child_id`) |
 | `DELETE` | `/links?parent_id=…&child_id=…` | Remove a dependency |
 | `POST` | `/dispatch?max=…&dry_run=…` | Nudge the dispatcher — skip the 60 s wait |

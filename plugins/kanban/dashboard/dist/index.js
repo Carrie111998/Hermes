@@ -198,6 +198,15 @@
     return count && count > 1 ? tx(t, "selectedTasks", "{n} selected tasks", { n: count }) : tx(t, "thisTask", "this task");
   }
 
+  function settleDialogOwner(resolverRef, setDialogState, confirmed, extras) {
+    const resolve = resolverRef.current;
+    resolverRef.current = null;
+    setDialogState(null);
+    if (!resolve) return false;
+    resolve(Object.assign({ confirmed: confirmed }, extras || {}));
+    return true;
+  }
+
   /**
    * Hook owning the kanban plugin's modal dialog state. Returns
    *   - `request(req)` — imperative API. Resolves to
@@ -226,12 +235,7 @@
     }, []);
 
     const close = React.useCallback(function (confirmed, extras) {
-      const resolve = resolverRef.current;
-      resolverRef.current = null;
-      setDialogState(null);
-      if (resolve) {
-        resolve(Object.assign({ confirmed: confirmed }, extras || {}));
-      }
+      return settleDialogOwner(resolverRef, setDialogState, confirmed, extras);
     }, []);
 
     const onConfirm = React.useCallback(function (maybeSummary) {
@@ -258,11 +262,18 @@
       };
     }, [dialogState, t, onConfirm, onCancel]);
 
-    return { dialogState: dialogState, dialogProps: dialogProps, request: request };
+    return {
+      dialogState: dialogState,
+      dialogProps: dialogProps,
+      request: request,
+      cancel: onCancel,
+    };
   }
 
   const API = "/api/plugins/kanban";
   const MIME_TASK = "text/x-hermes-task";
+  const ASSIGNEE_UNASSIGNED = "__kanban_unassigned__";
+  const ASSIGNEE_DISPATCHER = "__kanban_dispatcher__";
 
   // Docs link — surfaced as a `?` icon next to the board switcher and as
   // `title=` hints on unlabelled controls. Kept in one place so rebrands or
@@ -311,6 +322,119 @@
     if (!board) return url;
     const sep = url.indexOf("?") >= 0 ? "&" : "?";
     return `${url}${sep}board=${encodeURIComponent(board)}`;
+  }
+
+  function effectiveProfileNames(profiles) {
+    return (profiles || []).filter(function (profile) {
+      return profile && profile.effective_allowed;
+    }).map(function (profile) { return profile.name; });
+  }
+
+  function canSubmitAssignee(value, effectiveNames, allowUnassigned) {
+    if (allowUnassigned && value === ASSIGNEE_UNASSIGNED) return true;
+    return (effectiveNames || []).indexOf(value) >= 0;
+  }
+
+  function assignmentPatchValue(value) {
+    return value === ASSIGNEE_UNASSIGNED ? "" : value;
+  }
+
+  function assignmentCreateValue(value) {
+    return value === ASSIGNEE_DISPATCHER ? null : value;
+  }
+
+  function normalizeCreateAssignee(value, effectiveNames) {
+    if (value === ASSIGNEE_DISPATCHER) return value;
+    return (effectiveNames || []).indexOf(value) >= 0
+      ? value
+      : ASSIGNEE_DISPATCHER;
+  }
+
+  function createTaskAssigneeValue(value, effectiveNames) {
+    return assignmentCreateValue(normalizeCreateAssignee(value, effectiveNames));
+  }
+
+  function isExactBoardRequestCurrent(
+    boardRef,
+    generationRef,
+    requestBoard,
+    requestGeneration,
+  ) {
+    return boardRef.current === requestBoard
+      && generationRef.current === requestGeneration;
+  }
+
+  function retryExactBoardLoad(boardRef, requestBoard, setLoading, loadBoard) {
+    if (boardRef.current !== requestBoard) return Promise.resolve(null);
+    setLoading(true);
+    return loadBoard();
+  }
+
+  function taskDrawerIdentity(board, taskId) {
+    return JSON.stringify([
+      board == null ? "" : String(board),
+      taskId == null ? "" : String(taskId),
+    ]);
+  }
+
+  function createTaskRequestState(identity) {
+    return { active: true, identity: identity, generation: 0 };
+  }
+
+  function beginTaskLoad(state, identity) {
+    state.active = true;
+    state.identity = identity;
+    state.generation += 1;
+    return { identity: identity, generation: state.generation };
+  }
+
+  function isTaskLoadCurrent(state, token) {
+    return !!state.active
+      && state.identity === token.identity
+      && state.generation === token.generation;
+  }
+
+  function isTaskIdentityActive(state, identity) {
+    return !!state.active && state.identity === identity;
+  }
+
+  function deactivateTaskRequests(state) {
+    state.active = false;
+    state.generation += 1;
+  }
+
+  function createOperationOwner() {
+    return { serial: 0, token: null };
+  }
+
+  function claimOwnedOperation(owner, operation) {
+    if (owner.token !== null) return null;
+    const token = { id: ++owner.serial, operation: operation };
+    owner.token = token;
+    return token;
+  }
+
+  function ownsOperation(owner, token) {
+    return token !== null && owner.token === token;
+  }
+
+  function operationOwnerIsBusy(owner) {
+    return owner.token !== null;
+  }
+
+  function releaseOwnedOperation(owner, token) {
+    if (!ownsOperation(owner, token)) return false;
+    owner.token = null;
+    return true;
+  }
+
+  function invalidateOperationOwner(owner) {
+    owner.token = null;
+  }
+
+  function settleInlineCreateSubmission(owner, token, succeeded) {
+    if (!releaseOwnedOperation(owner, token)) return false;
+    return !!succeeded;
   }
 
   // The SDK's Select component fires ``onValueChange(value)`` directly
@@ -618,6 +742,9 @@
     const boardData = kanbanBoard;
     const setBoardData = setKanbanBoard;
     const [config, setConfig] = useState(null);
+    const [profiles, setProfiles] = useState([]);
+    const [profilesBoard, setProfilesBoard] = useState(null);
+    const [profilesError, setProfilesError] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
@@ -643,9 +770,16 @@
 
     const cursorRef = useRef(0);
     const reloadTimerRef = useRef(null);
-    const wsRef = useRef(null);
-    const wsBackoffRef = useRef(1000);
-    const wsClosedRef = useRef(false);
+    const boardRef = useRef(board);
+    const boardActionGenerationRef = useRef(0);
+    const boardLoadGenerationRef = useRef(0);
+    const boardListGenerationRef = useRef(0);
+    const profilesGenerationRef = useRef(0);
+    boardRef.current = board;
+
+    const effectiveAssignees = useMemo(function () {
+      return profilesBoard === board ? effectiveProfileNames(profiles) : [];
+    }, [profiles, profilesBoard, board]);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -664,32 +798,84 @@
 
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
+      const requestBoard = board;
+      if (boardRef.current !== requestBoard) return Promise.resolve(null);
+      const requestGeneration = ++boardLoadGenerationRef.current;
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
-      return SDK.fetchJSON(withBoard(url, board))
+      return SDK.fetchJSON(withBoard(url, requestBoard))
         .then(function (data) {
+          if (!isExactBoardRequestCurrent(
+            boardRef, boardLoadGenerationRef, requestBoard, requestGeneration,
+          )) return null;
           setBoardData(data);
           cursorRef.current = data.latest_event_id || 0;
           setError(null);
+          return data;
         })
         .catch(function (err) {
+          if (!isExactBoardRequestCurrent(
+            boardRef, boardLoadGenerationRef, requestBoard, requestGeneration,
+          )) return null;
           setError(String(err && err.message ? err.message : err));
+          return null;
         })
-        .finally(function () { setLoading(false); });
+        .finally(function () {
+          if (isExactBoardRequestCurrent(
+            boardRef, boardLoadGenerationRef, requestBoard, requestGeneration,
+          )) setLoading(false);
+        });
     }, [tenantFilter, includeArchived, board]);
+
+    const retryBoardLoad = useCallback(function () {
+      return retryExactBoardLoad(boardRef, board, setLoading, loadBoard);
+    }, [board, loadBoard]);
+
+    const loadProfiles = useCallback(function () {
+      const requestBoard = board;
+      if (boardRef.current !== requestBoard) return Promise.resolve(null);
+      const requestGeneration = ++profilesGenerationRef.current;
+      if (!requestBoard) return Promise.resolve(null);
+      return SDK.fetchJSON(withBoard(`${API}/profiles`, requestBoard))
+        .then(function (data) {
+          if (!isExactBoardRequestCurrent(
+            boardRef, profilesGenerationRef, requestBoard, requestGeneration,
+          )) return null;
+          setProfiles((data && data.profiles) || []);
+          setProfilesBoard(requestBoard);
+          setProfilesError(null);
+          return data;
+        })
+        .catch(function (err) {
+          if (!isExactBoardRequestCurrent(
+            boardRef, profilesGenerationRef, requestBoard, requestGeneration,
+          )) return null;
+          setProfiles([]);
+          setProfilesBoard(requestBoard);
+          setProfilesError(tx(t, "profilesLoadFailed", "Failed to load board profiles: ")
+            + parseApiErrorMessage(err));
+          return null;
+        });
+    }, [board, t]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
-      return SDK.fetchJSON(withBoard(`${API}/boards`, board))
+      const requestBoard = board;
+      if (boardRef.current !== requestBoard) return Promise.resolve(null);
+      const requestGeneration = ++boardListGenerationRef.current;
+      return SDK.fetchJSON(withBoard(`${API}/boards`, requestBoard))
         .then(function (data) {
+          if (!isExactBoardRequestCurrent(
+            boardRef, boardListGenerationRef, requestBoard, requestGeneration,
+          )) return null;
           const boards = (data && data.boards) || [];
           const storedBoard = readSelectedBoard();
           setBoardList(boards);
           if (!storedBoard && !board && data && data.current) {
             setBoard(data.current);
-            return;
+            return data;
           }
           // If the stored slug isn't in the list any longer (board was
           // deleted in the CLI while dashboard was open), fall back to
@@ -698,11 +884,13 @@
             setBoard("default");
             writeSelectedBoard("default");
           }
+          return data;
         })
         .catch(function () { /* non-fatal */ });
     }, [board]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
+    useEffect(function () { loadProfiles(); }, [loadProfiles]);
 
     const scheduleReload = useCallback(function () {
       if (reloadTimerRef.current) return;
@@ -725,9 +913,24 @@
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
       if (!boardData) return undefined;
-      wsClosedRef.current = false;
+      const socketBoard = board;
+      let closed = false;
+      let socket = null;
+      let reconnectTimer = null;
+      let backoff = 1000;
+
+      function scheduleReconnect() {
+        if (closed || boardRef.current !== socketBoard || reconnectTimer) return;
+        const delay = Math.min(backoff, 30000);
+        backoff = Math.min(backoff * 2, 30000);
+        reconnectTimer = setTimeout(function () {
+          reconnectTimer = null;
+          openWs();
+        }, delay);
+      }
+
       function openWs() {
-        if (wsClosedRef.current) return;
+        if (closed || boardRef.current !== socketBoard) return;
         // Build the WS URL via the host SDK so the correct auth param is used
         // in BOTH modes: single-use ?ticket= in gated OAuth mode, ?token= in
         // loopback. Reading window.__HERMES_SESSION_TOKEN__ directly (the old
@@ -741,14 +944,18 @@
         // dashboard's own board pin always wins over the server-side
         // ``current`` file — same rationale as ``withBoard()`` above.
         // Regression: #20879.
-        if (board) wsParams.board = board;
+        if (socketBoard) wsParams.board = socketBoard;
         SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
-          if (wsClosedRef.current) return;
+          if (closed || boardRef.current !== socketBoard) return;
           let ws;
-          try { ws = new WebSocket(url); } catch (_e) { return; }
-          wsRef.current = ws;
-          ws.onopen = function () { wsBackoffRef.current = 1000; };
+          try { ws = new WebSocket(url); } catch (_e) { scheduleReconnect(); return; }
+          socket = ws;
+          ws.onopen = function () {
+            if (closed || socket !== ws || boardRef.current !== socketBoard) return;
+            backoff = 1000;
+          };
           ws.onmessage = function (ev) {
+            if (closed || socket !== ws || boardRef.current !== socketBoard) return;
             try {
               const msg = JSON.parse(ev.data);
               if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
@@ -766,31 +973,37 @@
             } catch (_e) { /* ignore */ }
           };
           ws.onclose = function (ev) {
-            if (wsClosedRef.current) return;
+            if (closed || socket !== ws || boardRef.current !== socketBoard) return;
+            socket = null;
             if (ev && ev.code === 1008) {
               setError(tx(t, "wsAuthFailed",
                 "WebSocket auth failed — reload the page to refresh the session token."));
               return;
             }
-            const delay = Math.min(wsBackoffRef.current, 30000);
-            wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-            setTimeout(openWs, delay);
+            scheduleReconnect();
           };
         }).catch(function () {
           // Ticket mint / URL build failed (e.g. session expired). Back off
           // and retry; a hard auth failure surfaces via the 1008 close path.
-          if (wsClosedRef.current) return;
-          const delay = Math.min(wsBackoffRef.current, 30000);
-          wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-          setTimeout(openWs, delay);
+          if (closed || boardRef.current !== socketBoard) return;
+          scheduleReconnect();
         });
       }
       openWs();
       return function () {
-        wsClosedRef.current = true;
-        try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
+        closed = true;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        const ws = socket;
+        socket = null;
+        if (ws) {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onclose = null;
+          try { ws.close(); } catch (_e) { /* noop */ }
+        }
       };
-    }, [!!boardData, board, scheduleReload]);
+    }, [!!boardData, board, scheduleReload, t]);
 
     // --- filtering ----------------------------------------------------------
     const filteredBoard = useMemo(function () {
@@ -822,34 +1035,51 @@
     //   taskId  — required when count <= 1 (single-task PATCH endpoint)
     //           — ignored when count >  1 (bulk endpoint uses selectedIds)
     //   summary — completion summary string, or null/undefined to skip
-    const performMoveTask = useCallback(function (taskId, newStatus, count, summary) {
+    const performMoveTask = useCallback(function (
+      taskId,
+      newStatus,
+      count,
+      summary,
+      requestBoard,
+      requestGeneration,
+      requestIds,
+    ) {
+      const actionIsCurrent = function () {
+        return isExactBoardRequestCurrent(
+          boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+        );
+      };
       const patch = { status: newStatus };
       const finalPatch = summary
         ? Object.assign({}, patch, { result: summary, summary: summary })
         : patch;
       if (count > 1) {
+        const ids = requestIds || [];
+        const idSet = new Set(ids);
         // Bulk path: optimistic UI prepends all moved tasks to dest column.
-        setBoardData(function (b) {
-          if (!b) return b;
-          const moved = [];
-          const columns = b.columns.map(function (col) {
-            const kept = [];
-            for (const tk of col.tasks) {
-              if (selectedIds.has(tk.id)) moved.push(Object.assign({}, tk, { status: newStatus }));
-              else kept.push(tk);
-            }
-            return Object.assign({}, col, { tasks: kept });
+        if (actionIsCurrent()) {
+          setBoardData(function (b) {
+            if (!b || !actionIsCurrent()) return b;
+            const moved = [];
+            const columns = b.columns.map(function (col) {
+              const kept = [];
+              for (const tk of col.tasks) {
+                if (idSet.has(tk.id)) moved.push(Object.assign({}, tk, { status: newStatus }));
+                else kept.push(tk);
+              }
+              return Object.assign({}, col, { tasks: kept });
+            });
+            const dest = columns.find(function (c) { return c.name === newStatus; });
+            if (dest) dest.tasks = moved.concat(dest.tasks);
+            return Object.assign({}, b, { columns });
           });
-          const dest = columns.find(function (c) { return c.name === newStatus; });
-          if (dest) dest.tasks = moved.concat(dest.tasks);
-          return Object.assign({}, b, { columns });
-        });
-        const ids = Array.from(selectedIds);
-        SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
+        }
+        return SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, requestBoard), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(Object.assign({ ids: ids }, finalPatch)),
         }).then(function (res) {
+          if (!actionIsCurrent()) return res;
           const failed = (res.results || []).filter(function (r) { return !r.ok; });
           if (failed.length > 0) {
             setError(`Bulk move: ${failed.length} of ${res.results.length} failed`);
@@ -860,39 +1090,52 @@
           setSelectedIds(new Set());
           setLastSelectedId(null);
           loadBoard();
+          if (newStatus === "archived") loadBoardList();
+          return res;
         }).catch(function (err) {
+          if (!actionIsCurrent()) return null;
           setError(`Move failed: ${err.message || err}`);
-          setFailedIds(new Set(selectedIds));
+          setFailedIds(new Set(ids));
           loadBoard();
+          return null;
         });
-        return;
       }
       // Single-task path.
-      setBoardData(function (b) {
-        if (!b) return b;
-        let moved = null;
-        const columns = b.columns.map(function (col) {
-          const next = col.tasks.filter(function (tk) {
-            if (tk.id === taskId) { moved = Object.assign({}, tk, { status: newStatus }); return false; }
-            return true;
+      if (actionIsCurrent()) {
+        setBoardData(function (b) {
+          if (!b || !actionIsCurrent()) return b;
+          let moved = null;
+          const columns = b.columns.map(function (col) {
+            const next = col.tasks.filter(function (tk) {
+              if (tk.id === taskId) { moved = Object.assign({}, tk, { status: newStatus }); return false; }
+              return true;
+            });
+            return Object.assign({}, col, { tasks: next });
           });
-          return Object.assign({}, col, { tasks: next });
+          if (moved) {
+            const dest = columns.find(function (c) { return c.name === newStatus; });
+            if (dest) dest.tasks = [moved].concat(dest.tasks);
+          }
+          return Object.assign({}, b, { columns });
         });
-        if (moved) {
-          const dest = columns.find(function (c) { return c.name === newStatus; });
-          if (dest) dest.tasks = [moved].concat(dest.tasks);
-        }
-        return Object.assign({}, b, { columns });
-      });
-      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
+      }
+      return SDK.fetchJSON(withBoard(
+        `${API}/tasks/${encodeURIComponent(taskId)}`, requestBoard,
+      ), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(finalPatch),
+      }).then(function (res) {
+        if (!actionIsCurrent()) return res;
+        if (newStatus === "archived") loadBoardList();
+        return res;
       }).catch(function (err) {
+        if (!actionIsCurrent()) return null;
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
+        return null;
       });
-    }, [loadBoard, board, t, selectedIds]);
+    }, [loadBoard, loadBoardList, t]);
 
     // Pre-dispatch dialog step for both moveTask and moveSelected. Drives
     // the new in-app ConfirmDialog instead of window.confirm. The flow:
@@ -941,20 +1184,27 @@
     // Single-task card move. Drives confirmation + completion summary
     // dialogs via the hook, then dispatches via performMoveTask.
     const moveTask = useCallback(function (taskId, newStatus) {
+      const requestBoard = board;
+      const requestGeneration = boardActionGenerationRef.current;
       requestMoveConfirm(newStatus, 1)
         .then(function (r1) {
           if (!r1.confirmed) return null;
           if (newStatus !== "done") {
-            performMoveTask(taskId, newStatus, 1, null);
+            performMoveTask(
+              taskId, newStatus, 1, null, requestBoard, requestGeneration, [taskId],
+            );
             return null;
           }
           return requestCompletionSummary(1).then(function (r2) {
             if (!r2.confirmed) return null;
-            performMoveTask(taskId, newStatus, 1, r2.summary || null);
+            performMoveTask(
+              taskId, newStatus, 1, r2.summary || null,
+              requestBoard, requestGeneration, [taskId],
+            );
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [board, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -963,29 +1213,43 @@
     }, []);
     const moveSelected = useCallback(function (newStatus) {
       if (selectedIds.size === 0) return;
-      const count = selectedIds.size;
-      const taskId = Array.from(selectedIds)[0]; // representative id for performMoveTask's single-task branch
+      const requestBoard = board;
+      const requestGeneration = boardActionGenerationRef.current;
+      const requestIds = Array.from(selectedIds);
+      const count = requestIds.length;
+      const taskId = requestIds[0]; // representative id for performMoveTask's single-task branch
       requestMoveConfirm(newStatus, count)
         .then(function (r1) {
           if (!r1.confirmed) return null;
           if (newStatus !== "done") {
-            performMoveTask(taskId, newStatus, count, null);
+            performMoveTask(
+              taskId, newStatus, count, null,
+              requestBoard, requestGeneration, requestIds,
+            );
             return null;
           }
           return requestCompletionSummary(count).then(function (r2) {
             if (!r2.confirmed) return null;
-            performMoveTask(taskId, newStatus, count, r2.summary || null);
+            performMoveTask(
+              taskId, newStatus, count, r2.summary || null,
+              requestBoard, requestGeneration, requestIds,
+            );
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [selectedIds, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [selectedIds, board, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
 
     const createTask = useCallback(function (body) {
-      return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
+      const requestBoard = board;
+      const requestGeneration = boardActionGenerationRef.current;
+      return SDK.fetchJSON(withBoard(`${API}/tasks`, requestBoard), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }).then(function (res) {
+        if (!isExactBoardRequestCurrent(
+          boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+        )) return res;
         // Surface dispatcher-presence warnings (e.g. "no gateway is
         // running") via the existing error banner channel. Not fatal —
         // the task was created successfully — but the user should know
@@ -1075,19 +1339,28 @@
 
     const applyBulk = useCallback(function (patch, confirmMsg) {
       if (selectedIds.size === 0) return;
+      const requestBoard = board;
+      const requestGeneration = boardActionGenerationRef.current;
+      const requestIds = Array.from(selectedIds);
+      const requestIdSet = new Set(requestIds);
       const count = selectedIds.size;
       const run = function () {
+        const actionIsCurrent = function () {
+          return isExactBoardRequestCurrent(
+            boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+          );
+        };
         const finalPatch = patch;
-        const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
+        const body = Object.assign({ ids: requestIds }, finalPatch);
         // Optimistic UI for status moves (same pattern as moveSelected).
-        if (finalPatch.status) {
+        if (finalPatch.status && actionIsCurrent()) {
           setBoardData(function (b) {
-            if (!b) return b;
+            if (!b || !actionIsCurrent()) return b;
             const moved = [];
             const columns = b.columns.map(function (col) {
               const kept = [];
               for (const t of col.tasks) {
-                if (selectedIds.has(t.id)) moved.push(Object.assign({}, t, { status: finalPatch.status }));
+                if (requestIdSet.has(t.id)) moved.push(Object.assign({}, t, { status: finalPatch.status }));
                 else kept.push(t);
               }
               return Object.assign({}, col, { tasks: kept });
@@ -1097,12 +1370,13 @@
             return Object.assign({}, b, { columns });
           });
         }
-        SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
+        return SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, requestBoard), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         })
           .then(function (res) {
+            if (!actionIsCurrent()) return res;
             const failed = (res.results || []).filter(function (r) { return !r.ok; });
             if (failed.length > 0) {
               setError(tx(t, "bulkFailed", "Bulk: ") +
@@ -1115,35 +1389,49 @@
             setSelectedIds(new Set());
             setLastSelectedId(null);
             loadBoard();
+            if (finalPatch.archive === true || finalPatch.status === "archived") {
+              loadBoardList();
+            }
+            return res;
           })
           .catch(function (e) {
+            if (!actionIsCurrent()) return null;
             setError(String(e.message || e));
-            setFailedIds(new Set(selectedIds));
+            setFailedIds(new Set(requestIds));
             loadBoard();
+            return null;
           });
       };
       if (!confirmMsg) {
-        run();
-        return;
+        return run();
       }
-      kanbanDialogs.request({
+      return kanbanDialogs.request({
         kind: "confirm",
         title: tx(t, "bulkConfirmTitle", "Apply bulk change"),
         description: confirmMsg,
         confirmLabel: tx(t, "apply", "Apply"),
         destructive: false,
       }).then(function (r) {
-        if (r.confirmed) run();
+        if (r.confirmed) return run();
+        return null;
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, loadBoard, board, t, kanbanDialogs]);
+    }, [selectedIds, loadBoard, loadBoardList, board, t, kanbanDialogs]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
       if (!nextSlug || nextSlug === board) return;
+      boardRef.current = nextSlug;
+      boardActionGenerationRef.current += 1;
+      boardLoadGenerationRef.current += 1;
+      boardListGenerationRef.current += 1;
+      profilesGenerationRef.current += 1;
       // Optimistic UI: clear the current grid + show loading, reset the
       // event cursor so the WS reopens aligned to the new board's
       // latest_event_id on the next loadBoard.
       setBoardData(null);
+      setProfiles([]);
+      setProfilesBoard(null);
+      setProfilesError(null);
       cursorRef.current = 0;
       setLoading(true);
       setBoard(nextSlug);
@@ -1153,8 +1441,15 @@
       setTenantFilter("");
       setAssigneeFilter("");
       setIncludeArchived(false);
+      setSelectedTaskId(null);
+      setShowNewBoard(false);
+      setShowBoardSettings(false);
+      setTaskEventTick({});
+      setDraggingTaskId(null);
+      setError(null);
+      kanbanDialogs.cancel();
       clearSelected();
-    }, [board, clearSelected]);
+    }, [board, clearSelected, kanbanDialogs]);
 
     const createNewBoard = useCallback(function (payload) {
       return SDK.fetchJSON(`${API}/boards`, {
@@ -1185,15 +1480,23 @@
 
     const deleteBoard = useCallback(function (slug) {
       if (!slug || slug === "default") return Promise.resolve();
+      const requestBoard = board;
+      const requestGeneration = boardActionGenerationRef.current;
       return SDK.fetchJSON(`${API}/boards/${encodeURIComponent(slug)}`, {
         method: "DELETE",
       }).then(function () {
+        if (!isExactBoardRequestCurrent(
+          boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+        )) return null;
         loadBoardList();
-        if (board === slug) switchBoard("default");
+        if (requestBoard === slug) switchBoard("default");
+        return null;
       });
     }, [board, loadBoardList, switchBoard]);
 
    const deleteTask = useCallback(function (taskId) {
+     const requestBoard = board;
+     const requestGeneration = boardActionGenerationRef.current;
      return kanbanDialogs.request({
        kind: "confirm",
        title: tx(t, "trash.confirmTitle", "Delete task?"),
@@ -1202,22 +1505,36 @@
        destructive: true,
      }).then(function (r) {
        if (!r.confirmed) return null;
-       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
+       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, requestBoard), {
          method: "DELETE",
        }).then(function () {
+         if (!isExactBoardRequestCurrent(
+           boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+         )) return null;
          loadBoard();
+         loadBoardList();
          setSelectedIds(function (prev) {
            const next = new Set(prev);
            next.delete(taskId);
            return next;
          });
-       }).catch(function (e) { setError(String(e.message || e)); });
+         return null;
+       }).catch(function (e) {
+         if (!isExactBoardRequestCurrent(
+           boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+         )) return null;
+         setError(String(e.message || e));
+         return null;
+       });
      }).catch(function () { /* cancelled */ });
-   }, [board, loadBoard, t, kanbanDialogs]);
+   }, [board, loadBoard, loadBoardList, t, kanbanDialogs]);
 
     const deleteSelected = useCallback(function (count) {
       if (selectedIds.size === 0) return Promise.resolve();
-      kanbanDialogs.request({
+      const requestBoard = board;
+      const requestGeneration = boardActionGenerationRef.current;
+      const ids = Array.from(selectedIds);
+      return kanbanDialogs.request({
         kind: "confirm",
         title: tx(t, "trash.confirmManyTitle", "Delete {n} tasks?", { n: count }),
         description: tx(t, "trash.confirmMany", "Permanently delete {n} selected tasks? This cannot be undone.", { n: count }),
@@ -1225,15 +1542,30 @@
         destructive: true,
       }).then(function (r) {
         if (!r.confirmed) return null;
-        const ids = Array.from(selectedIds);
-        setSelectedIds(new Set());
+        if (isExactBoardRequestCurrent(
+          boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+        )) setSelectedIds(new Set());
         return Promise.all(ids.map(function (id) {
-          return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+          return SDK.fetchJSON(
+            withBoard(`${API}/tasks/${encodeURIComponent(id)}`, requestBoard),
+            { method: "DELETE" },
+          );
         })).then(function () {
+          if (!isExactBoardRequestCurrent(
+            boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+          )) return null;
           loadBoard();
-        }).catch(function (e) { setError(String(e.message || e)); });
+          loadBoardList();
+          return null;
+        }).catch(function (e) {
+          if (!isExactBoardRequestCurrent(
+            boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+          )) return null;
+          setError(String(e.message || e));
+          return null;
+        });
       }).catch(function () { /* cancelled */ });
-    }, [selectedIds, board, loadBoard, t, kanbanDialogs]);
+    }, [selectedIds, board, loadBoard, loadBoardList, t, kanbanDialogs]);
 
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
@@ -1248,6 +1580,13 @@
           h("div", { className: "text-xs text-muted-foreground mt-2" },
             tx(t, "loadFailedHint",
               "The backend auto-creates kanban.db on first read. If this persists, check the dashboard logs.")),
+          h(Button, {
+            type: "button",
+            size: "sm",
+            className: "mt-4",
+            onClick: retryBoardLoad,
+            disabled: loading,
+          }, tx(t, "retry", "Retry")),
         ),
       );
     }
@@ -1280,7 +1619,10 @@
             return updateBoard(board, payload).then(function () { setShowBoardSettings(false); });
           },
         }) : null,
-        h(OrchestrationPanel, null),
+        h(OrchestrationPanel, {
+          board: board,
+          onProfilesReload: loadProfiles,
+        }),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1293,26 +1635,41 @@
           laneByProfile, setLaneByProfile,
           search, setSearch,
           onNudgeDispatch: function () {
-            SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
-              .then(loadBoard)
-              .catch(function (e) { setError(String(e.message || e)); });
+            const requestBoard = board;
+            const requestGeneration = boardActionGenerationRef.current;
+            SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, requestBoard), { method: "POST" })
+              .then(function (res) {
+                if (!isExactBoardRequestCurrent(
+                  boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+                )) return res;
+                return loadBoard().then(function () { return res; });
+              })
+              .catch(function (e) {
+                if (!isExactBoardRequestCurrent(
+                  boardRef, boardActionGenerationRef, requestBoard, requestGeneration,
+                )) return null;
+                setError(String(e.message || e));
+                return null;
+              });
           },
           onRefresh: loadBoard,
         }),
        selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
-         assignees: (boardData && boardData.assignees) || [],
+         effectiveAssignees: effectiveAssignees,
          onApply: applyBulk,
          onClear: clearSelected,
          onSelectAllVisible: selectAllVisible,
          onDelete: deleteSelected,
        }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
+        profilesError ? h("div", { className: "text-xs text-destructive px-2" }, profilesError) : null,
         h(KanbanDialogs, {
           dialogProps: kanbanDialogs.dialogProps,
           dialogState: kanbanDialogs.dialogState,
         }),
         h(BoardColumns, {
+          key: board,
           board: filteredBoard,
           boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
           laneByProfile,
@@ -1330,17 +1687,20 @@
           onDeleteSelected: deleteSelected,
           onOpen: setSelectedTaskId,
           onCreate: createTask,
+          effectiveAssignees: effectiveAssignees,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
         selectedTaskId ? h(TaskDrawer, {
+          key: taskDrawerIdentity(board, selectedTaskId),
           taskId: selectedTaskId,
           boardSlug: board,
           onClose: function () { setSelectedTaskId(null); },
           onOpenTask: setSelectedTaskId,
           onRefresh: loadBoard,
+          onCountsRefresh: loadBoardList,
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
-          assignees: (boardData && boardData.assignees) || [],
+          effectiveAssignees: effectiveAssignees,
           eventTick: taskEventTick[selectedTaskId] || 0,
           // Hook for the side-drawer's doPatch to use the same in-app
           // dialog machinery as the column-card flow. TaskDetail also
@@ -1530,11 +1890,15 @@
 
   function DiagnosticCard(props) {
     const { t } = useI18n();
-    const { diag, task, boardSlug, assignees, onRefresh } = props;
+    const { diag, task, boardSlug, effectiveAssignees, onRefresh } = props;
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState(null);
     const [copiedKey, setCopiedKey] = useState(null);
     const [reassignProfile, setReassignProfile] = useState(task.assignee || "");
+
+    useEffect(function () {
+      setReassignProfile(task.assignee || "");
+    }, [task.id, task.assignee]);
 
     const execAction = function (action) {
       if (busy) return;
@@ -1610,14 +1974,15 @@
         return;
       }
       if (action.kind === "reassign") {
-        if (!reassignProfile) {
+        if (!canSubmitAssignee(reassignProfile, effectiveAssignees, true)) {
           setMsg({ ok: false, text: tx(t, "pickProfileFirst", "Pick a profile first.") });
           return;
         }
         setBusy(true); setMsg(null);
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/reassign`, boardSlug);
+        const nextProfile = assignmentPatchValue(reassignProfile);
         const body = {
-          profile: reassignProfile || null,
+          profile: nextProfile || null,
           reclaim_first: !!(action.payload && action.payload.reclaim_first),
           reason: `recovery action for ${diag.kind}`,
         };
@@ -1629,7 +1994,7 @@
           setMsg({
             ok: true,
             text: tx(t, "reassignedMessage", "Reassigned {id} to {profile}.",
-              { id: task.id, profile: reassignProfile }),
+              { id: task.id, profile: nextProfile || tx(t, "unassigned", "unassigned") }),
           });
           if (onRefresh) onRefresh();
         }).catch(function (err) {
@@ -1690,8 +2055,15 @@
               value: reassignProfile,
               onChange: function (e) { setReassignProfile(e.target.value); },
             },
-              h("option", { value: "" }, "(unassigned)"),
-              (assignees || []).map(function (a) {
+              h("option", { value: "" }, tx(t, "chooseAssignment", "— choose assignment —")),
+              h("option", { value: ASSIGNEE_UNASSIGNED },
+                tx(t, "unassignAndPark", "Unassign / park")),
+              task.assignee && (effectiveAssignees || []).indexOf(task.assignee) < 0
+                ? h("option", { value: task.assignee, disabled: true },
+                    tx(t, "historicalAssignee", "{name} (not allowed on this board)",
+                      { name: task.assignee }))
+                : null,
+              (effectiveAssignees || []).map(function (a) {
                 return h("option", { key: a, value: a }, a);
               }),
             ),
@@ -1706,7 +2078,8 @@
             busy: busy,
             extra: {
               copied: copiedKey === a.label,
-              disabled: (a.kind === "reassign" && !reassignProfile),
+              disabled: (a.kind === "reassign"
+                && !canSubmitAssignee(reassignProfile, effectiveAssignees, true)),
             },
           });
         }),
@@ -1757,7 +2130,7 @@
                 diag: d,
                 task: props.task,
                 boardSlug: props.boardSlug,
-                assignees: props.assignees,
+                effectiveAssignees: props.effectiveAssignees,
                 onRefresh: props.onRefresh,
               });
             }),
@@ -1791,122 +2164,279 @@
   // auto-generate). Backed by /orchestration + /profiles endpoints.
   // ---------------------------------------------------------------------
 
-  function OrchestrationPanel() {
+  function OrchestrationPanel(props) {
+    const { t } = useI18n();
+    const board = props.board;
     const [expanded, setExpanded] = useState(false);
     const [settings, setSettings] = useState(null);
     const [profiles, setProfiles] = useState([]);
+    const [loadedBoard, setLoadedBoard] = useState(null);
     const [busy, setBusy] = useState({});
     const [msg, setMsg] = useState(null);
+    const [saving, setSaving] = useState(false);
+    const boardRef = useRef(board);
+    const loadVersionRef = useRef(0);
+    const panelGenerationRef = useRef(0);
+    const savingRef = useRef(false);
+    const profileOperationOwnerRef = useRef(createOperationOwner());
+    boardRef.current = board;
 
-    const loadAll = useCallback(function () {
-      Promise.all([
-        SDK.fetchJSON(`${API}/orchestration`),
-        SDK.fetchJSON(`${API}/profiles`),
+    const loadAll = useCallback(function (options) {
+      if (boardRef.current !== board) return Promise.resolve(null);
+      const requestVersion = ++loadVersionRef.current;
+      const keepMessage = !!(options && options.keepMessage);
+      return Promise.all([
+        SDK.fetchJSON(withBoard(`${API}/orchestration`, board)),
+        SDK.fetchJSON(withBoard(`${API}/profiles`, board)),
       ]).then(function (results) {
+        if (requestVersion !== loadVersionRef.current || boardRef.current !== board) {
+          return null;
+        }
         setSettings(results[0] || null);
         setProfiles((results[1] && results[1].profiles) || []);
-        setMsg(null);
+        setLoadedBoard(board);
+        if (!keepMessage) setMsg(null);
+        return results;
       }).catch(function (err) {
-        setMsg({ ok: false, text: "Failed to load: " + (err.message || String(err)) });
+        if (requestVersion !== loadVersionRef.current || boardRef.current !== board) {
+          return null;
+        }
+        setMsg({
+          ok: false,
+          text: tx(t, "orchestrationLoadFailed", "Failed to load orchestration settings: ")
+            + parseApiErrorMessage(err),
+        });
+        return null;
       });
-    }, []);
+    }, [board, t]);
 
     useEffect(function () {
-      // Load on mount so the collapsed pill shows the real mode without
-      // requiring the user to expand the panel first.
-      if (settings === null) loadAll();
-    }, [settings, loadAll]);
+      // Hide the previous board's policy immediately and invalidate its
+      // board-scoped loads. Profile-description writes are global, so their
+      // exact owner token and busy UI survive the board transition until the
+      // write's own finally releases that token.
+      panelGenerationRef.current += 1;
+      loadVersionRef.current += 1;
+      setSettings(null);
+      setProfiles([]);
+      setLoadedBoard(null);
+      setMsg(null);
+      loadAll();
+      return function () {
+        panelGenerationRef.current += 1;
+        loadVersionRef.current += 1;
+      };
+    }, [board, loadAll]);
+
+    // React preserves component state when only props change. Gate every
+    // board-specific value on the board that produced it so one render during
+    // a switch can never flash the previous board's policy.
+    const activeSettings = loadedBoard === board ? settings : null;
+    const activeProfiles = loadedBoard === board ? profiles : [];
 
     const saveSettings = function (patch) {
+      if (savingRef.current) return Promise.resolve(null);
+      savingRef.current = true;
+      setSaving(true);
       setMsg(null);
-      return SDK.fetchJSON(`${API}/orchestration`, {
+      const saveBoard = board;
+      const saveGeneration = panelGenerationRef.current;
+      return SDK.fetchJSON(withBoard(`${API}/orchestration`, saveBoard), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
       }).then(function (res) {
-        setSettings(res);
-        setMsg({ ok: true, text: "Settings saved." });
-        return res;
+        if (boardRef.current !== saveBoard
+            || panelGenerationRef.current !== saveGeneration) return res;
+        setSettings(null);
+        setProfiles([]);
+        setLoadedBoard(null);
+        setMsg({ ok: true, text: tx(t, "orchestrationSettingsSaved", "Settings saved.") });
+        // Policy changes alter both the settings payload and the per-profile
+        // machine/board/effective flags, so refresh the pair together.
+        return loadAll({ keepMessage: true }).then(function () {
+          if (boardRef.current !== saveBoard
+              || panelGenerationRef.current !== saveGeneration
+              || !props.onProfilesReload) return res;
+          return Promise.resolve(props.onProfilesReload()).then(function () { return res; });
+        });
       }).catch(function (err) {
-        setMsg({ ok: false, text: "Save failed: " + (err.message || String(err)) });
+        if (boardRef.current !== saveBoard
+            || panelGenerationRef.current !== saveGeneration) return null;
+        setMsg({
+          ok: false,
+          text: tx(t, "orchestrationSaveFailed", "Failed to save orchestration settings: ")
+            + parseApiErrorMessage(err),
+        });
+        return null;
+      }).finally(function () {
+        savingRef.current = false;
+        setSaving(false);
       });
     };
 
     const saveProfileDescription = function (name, description) {
-      setBusy(function (b) { return Object.assign({}, b, { [name]: "save" }); });
+      if (savingRef.current) return Promise.resolve(null);
+      const actionBoard = board;
+      const actionGeneration = panelGenerationRef.current;
+      const operationToken = claimOwnedOperation(profileOperationOwnerRef.current, {
+        board: actionBoard, name: name, kind: "save",
+      });
+      if (operationToken === null) return Promise.resolve(null);
+      setBusy({ [name]: "save" });
       return SDK.fetchJSON(`${API}/profiles/${encodeURIComponent(name)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ description: description }),
       }).then(function () {
-        loadAll();
-        setMsg({ ok: true, text: `Description saved for ${name}.` });
-      }).catch(function (err) {
-        setMsg({ ok: false, text: "Save failed: " + (err.message || String(err)) });
-      }).then(function () {
-        setBusy(function (b) {
-          const next = Object.assign({}, b); delete next[name]; return next;
+        if (boardRef.current !== actionBoard
+            || panelGenerationRef.current !== actionGeneration) return;
+        loadAll({ keepMessage: true });
+        setMsg({
+          ok: true,
+          text: tx(t, "profileDescriptionSaved", "Description saved for {name}.",
+            { name: name }),
         });
+      }).catch(function (err) {
+        if (boardRef.current !== actionBoard
+            || panelGenerationRef.current !== actionGeneration) return;
+        setMsg({
+          ok: false,
+          text: tx(t, "profileDescriptionSaveFailed", "Failed to save profile description: ")
+            + parseApiErrorMessage(err),
+        });
+      }).finally(function () {
+        if (!releaseOwnedOperation(profileOperationOwnerRef.current, operationToken)) return;
+        setBusy({});
+        if (boardRef.current !== actionBoard
+            || panelGenerationRef.current !== actionGeneration) return;
       });
     };
 
     const autoGenerateDescription = function (name, overwrite) {
-      setBusy(function (b) { return Object.assign({}, b, { [name]: "auto" }); });
+      if (savingRef.current) return Promise.resolve(null);
+      const actionBoard = board;
+      const actionGeneration = panelGenerationRef.current;
+      const operationToken = claimOwnedOperation(profileOperationOwnerRef.current, {
+        board: actionBoard, name: name, kind: "auto",
+      });
+      if (operationToken === null) return Promise.resolve(null);
+      setBusy({ [name]: "auto" });
       return SDK.fetchJSON(`${API}/profiles/${encodeURIComponent(name)}/describe-auto`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ overwrite: !!overwrite }),
       }).then(function (res) {
+        if (boardRef.current !== actionBoard
+            || panelGenerationRef.current !== actionGeneration) return;
         if (res && res.ok) {
-          loadAll();
-          setMsg({ ok: true, text: `Auto-generated description for ${name}.` });
+          loadAll({ keepMessage: true });
+          setMsg({
+            ok: true,
+            text: tx(t, "profileDescriptionGenerated",
+              "Auto-generated description for {name}.", { name: name }),
+          });
         } else {
           setMsg({
             ok: false,
-            text: "Auto-generate failed: " + ((res && res.reason) || "unknown error"),
+            text: tx(t, "profileDescriptionGenerateFailed",
+              "Failed to auto-generate profile description: ")
+              + ((res && res.reason) || tx(t, "unknownError", "unknown error")),
           });
         }
       }).catch(function (err) {
-        setMsg({ ok: false, text: "Auto-generate failed: " + (err.message || String(err)) });
-      }).then(function () {
-        setBusy(function (b) {
-          const next = Object.assign({}, b); delete next[name]; return next;
+        if (boardRef.current !== actionBoard
+            || panelGenerationRef.current !== actionGeneration) return;
+        setMsg({
+          ok: false,
+          text: tx(t, "profileDescriptionGenerateFailed",
+            "Failed to auto-generate profile description: ") + parseApiErrorMessage(err),
         });
+      }).finally(function () {
+        if (!releaseOwnedOperation(profileOperationOwnerRef.current, operationToken)) return;
+        setBusy({});
+        if (boardRef.current !== actionBoard
+            || panelGenerationRef.current !== actionGeneration) return;
       });
     };
 
+    const inheritsMachinePolicy = !!(
+      activeSettings && activeSettings.board_allowed_profiles === null
+    );
+    const effectivePolicyEmpty = !!(
+      activeSettings
+      && (activeSettings.effective_allowed_profiles || []).length === 0
+    );
+    const profileDescriptionBusy = operationOwnerIsBusy(profileOperationOwnerRef.current);
+
+    // Convert a displayed selection into an explicit board policy using only
+    // profiles that still pass the machine ceiling. A blocked historical
+    // selection can remain visible, but is never echoed back on a new list.
+    const sanitizeExplicitAllowed = function (names) {
+      const selected = new Set(Array.isArray(names) ? names : []);
+      return activeProfiles.filter(function (p) {
+        return p.machine_allowed && selected.has(p.name);
+      }).map(function (p) { return p.name; });
+    };
+
+    const setPolicyInheritance = function (checked) {
+      if (!activeSettings || savingRef.current) return;
+      const nextAllowed = checked === true
+        ? null
+        : sanitizeExplicitAllowed(activeSettings.effective_allowed_profiles || []);
+      saveSettings({ allowed_profiles: nextAllowed });
+    };
+
+    const setProfileAllowed = function (profile, checked) {
+      if (!activeSettings || savingRef.current || !profile.machine_allowed
+          || inheritsMachinePolicy) return;
+      const source = Array.isArray(activeSettings.board_allowed_profiles)
+        ? activeSettings.board_allowed_profiles
+        : (activeSettings.effective_allowed_profiles || []);
+      const selected = new Set(sanitizeExplicitAllowed(source));
+      if (checked === true) selected.add(profile.name);
+      else selected.delete(profile.name);
+      const nextAllowed = activeProfiles.filter(function (p) {
+        return p.machine_allowed && selected.has(p.name);
+      }).map(function (p) { return p.name; });
+      saveSettings({ allowed_profiles: nextAllowed });
+    };
+
     const headerLabel = expanded
-      ? "▾ Orchestration settings"
-      : "▸ Orchestration settings";
+      ? tx(t, "collapseOrchestrationSettings", "▾ Orchestration settings")
+      : tx(t, "expandOrchestrationSettings", "▸ Orchestration settings");
 
     // Mode pill — always visible (collapsed or expanded). One click flips
     // between Auto and Manual. Auto = dispatcher decomposes new triage tasks
     // every tick. Manual = pre-PR behavior, the user clicks ⚗ Decompose on
     // each triage card (or runs `hermes kanban decompose <id>`) and tasks
     // stay in triage until then.
-    const autoOn = !!(settings && settings.auto_decompose);
-    const modePillTitle = settings === null
-      ? "Loading mode…"
+    const autoOn = !!(activeSettings && activeSettings.auto_decompose);
+    const modePillTitle = activeSettings === null
+      ? tx(t, "orchestrationModeLoading", "Loading mode…")
       : (autoOn
-          ? "Orchestration: Auto — the dispatcher decomposes new triage tasks automatically every tick. Click to switch to Manual (pre-PR behavior)."
-          : "Orchestration: Manual — triage tasks stay in triage until you click ⚗ Decompose on each card. Click to switch to Auto.");
+          ? tx(t, "orchestrationAutoHint", "Orchestration: Auto — the dispatcher decomposes new triage tasks automatically every tick. Click to switch to Manual (pre-PR behavior).")
+          : tx(t, "orchestrationManualHint", "Orchestration: Manual — triage tasks stay in triage until you click ⚗ Decompose on each card. Click to switch to Auto."));
     const modePill = h("button", {
       type: "button",
       onClick: function () {
-        if (settings === null) return;  // not loaded yet
+        if (activeSettings === null || savingRef.current) return;  // not loaded yet
         saveSettings({ auto_decompose: !autoOn });
       },
-      disabled: settings === null,
+      disabled: activeSettings === null || saving,
       title: modePillTitle,
+      "aria-label": modePillTitle,
       className: "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 "
                  + "text-xs font-medium "
                  + (autoOn
                     ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
                     : "border-muted-foreground/30 bg-muted/30 text-muted-foreground"),
     },
-      "Orchestration: ",
+      tx(t, "orchestrationLabel", "Orchestration: "),
       h("span", { className: "ml-1 font-semibold" },
-        settings === null ? "…" : (autoOn ? "Auto" : "Manual"))
+        activeSettings === null
+          ? "…"
+          : (autoOn ? tx(t, "auto", "Auto") : tx(t, "manual", "Manual")))
     );
 
     if (!expanded) {
@@ -1916,13 +2446,14 @@
           type: "button",
           onClick: function () { setExpanded(true); },
           className: "underline text-muted-foreground hover:text-foreground",
-          title: "Configure the kanban orchestrator (profile picker, default assignee, auto-decompose, profile descriptions)",
+          title: tx(t, "configureOrchestrationHint", "Configure the kanban orchestrator (profile picker, default assignee, auto-decompose, profile descriptions)"),
         }, headerLabel),
       );
     }
 
-    const profileOptions = profiles.map(function (p) {
-      const tag = p.is_default ? " (default)" : "";
+    const effectiveNames = effectiveProfileNames(activeProfiles);
+    const profileOptions = activeProfiles.filter(function (p) { return p.effective_allowed; }).map(function (p) {
+      const tag = p.is_default ? tx(t, "defaultProfileTag", " (default)") : "";
       return h(SelectOption, { key: p.name, value: p.name }, p.name + tag);
     });
 
@@ -1935,80 +2466,194 @@
             className: "text-sm font-medium underline-offset-2 hover:underline",
           }, headerLabel),
           modePill,
-          h(Button, { onClick: loadAll, size: "sm" }, "Reload"),
+          h(Button, {
+            onClick: function () { loadAll(); },
+            size: "sm",
+            disabled: saving,
+          }, tx(t, "reload", "Reload")),
         ),
         msg ? h("div", {
           className: msg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
         }, msg.text) : null,
 
-        settings ? h("div", { className: "grid gap-3 sm:grid-cols-3" },
+        activeSettings ? h("div", { className: "grid gap-3 sm:grid-cols-3" },
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs text-muted-foreground" },
-              "Orchestrator profile"),
+              tx(t, "orchestratorProfile", "Orchestrator profile")),
             h(Select, Object.assign({
-              value: settings.orchestrator_profile || "",
+              value: activeSettings.orchestrator_profile || "",
               className: "h-8",
+              disabled: saving,
+              "aria-label": tx(t, "orchestratorProfile", "Orchestrator profile"),
             }, selectChangeHandler(function (v) {
+              if (v && effectiveNames.indexOf(v) < 0) return;
               saveSettings({ orchestrator_profile: v });
             })),
               h(SelectOption, { value: "" },
-                "(default: " + (settings.active_profile || "default") + ")"),
+                tx(t, "automaticProfile", "(automatic: {name})", {
+                  name: activeSettings.resolved_orchestrator_profile
+                    || tx(t, "noAllowedProfile", "no allowed profile"),
+                })),
+              activeSettings.orchestrator_profile
+                  && effectiveNames.indexOf(activeSettings.orchestrator_profile) < 0
+                ? h(SelectOption, {
+                    value: activeSettings.orchestrator_profile,
+                    disabled: true,
+                  }, tx(t, "historicalAssignee", "{name} (not allowed on this board)",
+                    { name: activeSettings.orchestrator_profile }))
+                : null,
               profileOptions,
             ),
             h("div", { className: "text-[10px] text-muted-foreground" },
-              "Resolved: " + (settings.resolved_orchestrator_profile || "default")),
+              tx(t, "resolvedProfile", "Resolved: {name}", {
+                name: activeSettings.resolved_orchestrator_profile || tx(t, "none", "none"),
+              })),
             h("div", { className: "text-[10px] text-muted-foreground" },
               "Owns the root task after fan-out (wakes back up to judge completion). Does not drive how tasks split — configure the decomposer model under auxiliary.kanban_decomposer."),
           ),
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs text-muted-foreground" },
-              "Default assignee"),
+              tx(t, "defaultAssignee", "Default assignee")),
             h(Select, Object.assign({
-              value: settings.default_assignee || "",
+              value: activeSettings.default_assignee || "",
               className: "h-8",
+              disabled: saving,
+              "aria-label": tx(t, "defaultAssignee", "Default assignee"),
             }, selectChangeHandler(function (v) {
+              if (v && effectiveNames.indexOf(v) < 0) return;
               saveSettings({ default_assignee: v });
             })),
               h(SelectOption, { value: "" },
-                "(default: " + (settings.active_profile || "default") + ")"),
+                tx(t, "automaticProfile", "(automatic: {name})", {
+                  name: activeSettings.resolved_default_assignee
+                    || tx(t, "noAllowedProfile", "no allowed profile"),
+                })),
+              activeSettings.default_assignee
+                  && effectiveNames.indexOf(activeSettings.default_assignee) < 0
+                ? h(SelectOption, {
+                    value: activeSettings.default_assignee,
+                    disabled: true,
+                  }, tx(t, "historicalAssignee", "{name} (not allowed on this board)",
+                    { name: activeSettings.default_assignee }))
+                : null,
               profileOptions,
             ),
             h("div", { className: "text-[10px] text-muted-foreground" },
-              "Resolved: " + (settings.resolved_default_assignee || "default")),
+              tx(t, "resolvedProfile", "Resolved: {name}", {
+                name: activeSettings.resolved_default_assignee || tx(t, "none", "none"),
+              })),
           ),
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs text-muted-foreground" },
-              "Orchestration mode"),
+              tx(t, "orchestrationMode", "Orchestration mode")),
             h("label", { className: "flex items-center gap-2 text-xs h-8" },
               h(Checkbox, {
-                checked: !!settings.auto_decompose,
+                checked: !!activeSettings.auto_decompose,
+                disabled: saving,
+                "aria-label": tx(t, "autoDecomposeTasks", "Auto-decompose triage tasks"),
                 onCheckedChange: function (checked) {
                   saveSettings({ auto_decompose: checked === true });
                 },
               }),
-              "Auto-decompose triage tasks",
+              tx(t, "autoDecomposeTasks", "Auto-decompose triage tasks"),
             ),
             h("div", { className: "text-[10px] text-muted-foreground" },
-              settings.auto_decompose
-                ? "The dispatcher decomposes new triage tasks automatically."
-                : "Triage tasks stay in triage until you click ⚗ Decompose."),
+              activeSettings.auto_decompose
+                ? tx(t, "autoDecomposeOnHint", "The dispatcher decomposes new triage tasks automatically.")
+                : tx(t, "autoDecomposeOffHint", "Triage tasks stay in triage until you click ⚗ Decompose.")),
           ),
         ) : h("div", { className: "text-xs text-muted-foreground" },
-          "Loading…"),
+          tx(t, "loading", "Loading…")),
+
+        activeSettings ? h("div", { className: "border-t pt-3 flex flex-col gap-2" },
+          h(Label, { className: "text-xs text-muted-foreground" },
+            tx(t, "profilesAllowedOnBoard", "Profiles allowed on this board")),
+          h("label", { className: "flex items-center gap-2 text-xs" },
+            h(Checkbox, {
+              checked: inheritsMachinePolicy,
+              disabled: saving,
+              "aria-label": tx(t, "inheritMachinePolicy", "Inherit machine policy"),
+              onCheckedChange: setPolicyInheritance,
+            }),
+            tx(t, "inheritMachinePolicy", "Inherit machine policy"),
+          ),
+          h("div", { className: "text-[10px] text-muted-foreground" },
+            inheritsMachinePolicy
+              ? tx(t, "inheritedProfilePolicyHint", "This board currently follows the machine-wide profile roster. Uncheck to customize it.")
+              : tx(t, "explicitProfilePolicyHint", "The board list can narrow, but never expand, the machine-wide profile roster.")),
+          activeProfiles.length === 0
+            ? h("div", { className: "text-xs text-muted-foreground" },
+                tx(t, "noProfilesInstalled", "No profiles installed."))
+            : h("div", { className: "grid gap-2 sm:grid-cols-2 lg:grid-cols-3" },
+                activeProfiles.map(function (p) {
+                  const blocked = !p.machine_allowed;
+                  const blockedReason = tx(t, "blockedByMachinePolicy",
+                    "blocked by machine policy");
+                  const blockedReasonId = `kanban-machine-policy-${String(p.name)
+                    .replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+                  const selected = inheritsMachinePolicy
+                    ? !!p.effective_allowed
+                    : !!p.board_selected;
+                  return h("label", {
+                    key: p.name,
+                    className: "flex items-center gap-2 rounded border px-2 py-1.5 text-xs "
+                      + (blocked ? "opacity-60" : ""),
+                    title: blocked
+                      ? tx(t, "profileBlockedByMachineTitle",
+                          "{name} is blocked by machine policy", { name: p.name })
+                      : (inheritsMachinePolicy
+                          ? tx(t, "disablePolicyInheritanceHint", "Turn off inheritance to edit this board's roster")
+                          : tx(t, "allowProfileOnBoardHint",
+                              "Allow {name} to run work on this board", { name: p.name })),
+                  },
+                    h(Checkbox, {
+                      checked: selected,
+                      disabled: saving || inheritsMachinePolicy || blocked,
+                      "aria-describedby": blocked ? blockedReasonId : undefined,
+                      "aria-label": blocked
+                        ? `${p.name} — ${blockedReason}`
+                        : tx(t, "allowProfileOnBoardHint",
+                            "Allow {name} to run work on this board", { name: p.name }),
+                      onCheckedChange: function (checked) {
+                        setProfileAllowed(p, checked);
+                      },
+                    }),
+                    h("span", { className: "font-medium" }, p.name),
+                    p.is_default
+                      ? h("span", { className: "text-[10px] text-muted-foreground" },
+                          tx(t, "defaultProfile", "(default)"))
+                      : null,
+                    blocked
+                      ? h("span", {
+                          id: blockedReasonId,
+                          className: "text-[10px] text-destructive",
+                        }, blockedReason)
+                      : null,
+                  );
+                }),
+              ),
+          effectivePolicyEmpty
+            ? h("div", { className: "text-xs text-destructive font-medium" },
+                tx(t, "noWorkersAllowedOnBoard", "No workers can run on this board."))
+            : null,
+        ) : null,
 
         h("div", { className: "border-t pt-3" },
           h(Label, { className: "text-xs text-muted-foreground" },
-            "Profile descriptions"),
+            tx(t, "profileDescriptions", "Profile descriptions")),
           h("div", { className: "text-[10px] text-muted-foreground pb-2" },
-            "Descriptions guide the decomposer's routing. Click ⚗ to auto-generate, or edit and save."),
-          profiles.length === 0
-            ? h("div", { className: "text-xs text-muted-foreground" }, "No profiles installed.")
+            tx(t, "profileDescriptionsHint",
+              "Descriptions guide the decomposer's routing. Click ⚗ to auto-generate, or edit and save.")),
+          activeProfiles.length === 0
+            ? h("div", { className: "text-xs text-muted-foreground" },
+                tx(t, "noProfilesInstalled", "No profiles installed."))
             : h("div", { className: "flex flex-col gap-2" },
-                profiles.map(function (p) {
+                activeProfiles.map(function (p) {
                   return h(ProfileDescriptionRow, {
                     key: p.name,
                     profile: p,
                     busy: busy[p.name] || null,
+                    disabled: saving || profileDescriptionBusy,
                     onSave: saveProfileDescription,
                     onAuto: autoGenerateDescription,
                   });
@@ -2020,47 +2665,60 @@
   }
 
   function ProfileDescriptionRow(props) {
+    const { t } = useI18n();
     const p = props.profile;
     const [draft, setDraft] = useState(p.description || "");
     const busy = props.busy;
+    const disabled = !!props.disabled;
     // Re-sync the local draft if the server-side description changes (e.g.
     // after auto-generate). Cheap because re-runs only happen on prop change.
     useEffect(function () {
       setDraft(p.description || "");
     }, [p.description]);
 
-    const tag = p.description_auto && p.description ? " [auto, review]" : "";
     return h("div", { className: "flex flex-col gap-1 border-l-2 pl-2",
       style: { borderColor: p.description ? "#888" : "#cc6" } },
       h("div", { className: "flex items-center gap-2 text-xs" },
         h("span", { className: "font-medium" }, p.name),
-        p.is_default ? h("span", { className: "text-[10px] text-muted-foreground" }, "(default)") : null,
+        p.is_default ? h("span", { className: "text-[10px] text-muted-foreground" },
+          tx(t, "defaultProfile", "(default)")) : null,
         p.description_auto && p.description
-          ? h("span", { className: "text-[10px] text-yellow-600" }, "auto — review")
+          ? h("span", { className: "text-[10px] text-yellow-600" },
+              tx(t, "autoDescriptionReview", "auto — review"))
           : null,
         !p.description
-          ? h("span", { className: "text-[10px] text-yellow-600" }, "⚠ no description")
+          ? h("span", { className: "text-[10px] text-yellow-600" },
+              tx(t, "noProfileDescription", "⚠ no description"))
           : null,
       ),
       h("div", { className: "flex items-center gap-2" },
         h(Input, {
           value: draft,
           onChange: function (e) { setDraft(e.target.value); },
-          placeholder: "What is this profile good at?",
+          disabled: disabled,
+          placeholder: tx(t, "profileDescriptionPlaceholder", "What is this profile good at?"),
+          "aria-label": tx(t, "profileDescriptionFor", "Description for {name}",
+            { name: p.name }),
           className: "h-7 text-xs flex-1",
         }),
         h(Button, {
           onClick: function () { props.onSave(p.name, draft); },
           size: "sm",
-          disabled: !!busy || draft === (p.description || ""),
-          title: "Save the description above as user-authored",
-        }, busy === "save" ? "Saving…" : "Save"),
+          disabled: disabled || !!busy || draft === (p.description || ""),
+          title: tx(t, "saveProfileDescriptionHint",
+            "Save the description above as user-authored"),
+        }, busy === "save"
+          ? tx(t, "saving", "Saving…")
+          : tx(t, "save", "Save")),
         h(Button, {
           onClick: function () { props.onAuto(p.name, true); },
           size: "sm",
-          disabled: !!busy,
-          title: "Auto-generate a description from this profile's skills and model",
-        }, busy === "auto" ? "Generating…" : "⚗ Auto"),
+          disabled: disabled || !!busy,
+          title: tx(t, "autoGenerateProfileDescriptionHint",
+            "Auto-generate a description from this profile's skills and model"),
+        }, busy === "auto"
+          ? tx(t, "generating", "Generating…")
+          : tx(t, "autoGenerate", "⚗ Auto")),
       ),
     );
   }
@@ -2573,24 +3231,29 @@
         }, tx(t, "setPriority", "Set priority")),
       ),
       h("div", { className: "hermes-kanban-bulk-reassign",
-                 title: "Reassign selected tasks to a different Hermes profile. Pick a profile (or unassign) and click Apply." },
+                 title: tx(t, "bulkReassignHint", "Reassign selected tasks to an allowed Hermes profile, or unassign and park them.") },
         h(Select, Object.assign({
           value: assignee,
           className: "h-7 text-xs",
+          "aria-label": tx(t, "bulkAssignee", "Bulk assignee"),
         }, selectChangeHandler(setAssignee)),
-          h(SelectOption, { value: "" }, "— reassign —"),
-          h(SelectOption, { value: "__none__" }, "(unassign)"),
-          props.assignees.map(function (a) {
+          h(SelectOption, { value: "" }, tx(t, "chooseAssignment", "— choose assignment —")),
+          h(SelectOption, { value: ASSIGNEE_UNASSIGNED },
+            tx(t, "unassignAndPark", "Unassign / park")),
+          (props.effectiveAssignees || []).map(function (a) {
             return h(SelectOption, { key: a, value: a }, a);
           }),
         ),
         h(Button, {
           onClick: function () {
-            if (!assignee) return;
-            props.onApply({ assignee: assignee === "__none__" ? "" : assignee, reclaim_first: reclaimFirst });
+            if (!canSubmitAssignee(assignee, props.effectiveAssignees, true)) return;
+            props.onApply({
+              assignee: assignmentPatchValue(assignee),
+              reclaim_first: reclaimFirst,
+            });
             setAssignee("");
           },
-          disabled: !assignee,
+          disabled: !canSubmitAssignee(assignee, props.effectiveAssignees, true),
           size: "sm",
           title: "Apply the selected assignee to all selected tasks.",
         }, tx(t, "apply", "Apply")),
@@ -2810,6 +3473,7 @@
           onMoveSelected: props.onMoveSelected,
           onOpen: props.onOpen,
           onCreate: props.onCreate,
+          effectiveAssignees: props.effectiveAssignees,
           allTasks: props.allTasks,
         });
       }),
@@ -2920,11 +3584,13 @@
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
+        effectiveAssignees: props.effectiveAssignees,
         defaultWorkspaceKind: (props.boardMeta && props.boardMeta.default_workspace_kind) || "scratch",
         defaultWorkspacePath: (props.boardMeta && props.boardMeta.default_workdir) || "",
         onSubmit: function (body) {
-          props.onCreate(body).then(function () { setShowCreate(false); });
+          return props.onCreate(body);
         },
+        onSuccess: function () { setShowCreate(false); },
         onCancel: function () { setShowCreate(false); },
       }) : null,
       h("div", { className: "hermes-kanban-column-body" },
@@ -3164,7 +3830,7 @@
   function InlineCreate(props) {
     const { t } = useI18n();
     const [title, setTitle] = useState("");
-    const [assignee, setAssignee] = useState("");
+    const [assignee, setAssignee] = useState(ASSIGNEE_DISPATCHER);
     const [priority, setPriority] = useState(0);
     const [parent, setParent] = useState("");
     const [skills, setSkills] = useState("");
@@ -3182,13 +3848,35 @@
     // = backend default.
     const [goalMode, setGoalMode] = useState(false);
     const [goalMaxTurns, setGoalMaxTurns] = useState("");
+    const [submitting, setSubmitting] = useState(false);
+    const [submitError, setSubmitError] = useState(null);
+    const submitOwnerRef = useRef(createOperationOwner());
+    const effectiveAssignees = props.effectiveAssignees || [];
+    const controlledAssignee = normalizeCreateAssignee(assignee, effectiveAssignees);
+
+    useEffect(function () {
+      if (assignee !== controlledAssignee) setAssignee(controlledAssignee);
+    }, [assignee, controlledAssignee]);
+
+    useEffect(function () {
+      return function () { invalidateOperationOwner(submitOwnerRef.current); };
+    }, []);
 
     const submit = function () {
       const trimmed = title.trim();
-      if (!trimmed) return;
+      if (!trimmed) return Promise.resolve(null);
+      const operationToken = claimOwnedOperation(submitOwnerRef.current, {
+        kind: "create-task",
+      });
+      if (operationToken === null) return Promise.resolve(null);
+      setSubmitting(true);
+      setSubmitError(null);
+      const payloadAssignee = createTaskAssigneeValue(
+        assignee, props.effectiveAssignees || [],
+      );
       const body = {
         title: trimmed,
-        assignee: assignee.trim() || null,
+        assignee: payloadAssignee,
         priority: Number(priority) || 0,
         triage: props.columnName === "triage",
       };
@@ -3215,10 +3903,26 @@
         const gmt = parseInt(goalMaxTurns, 10);
         if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
       }
-      props.onSubmit(body);
-      setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
-      setWorkspaceKind(defaultWorkspaceKind); setWorkspacePath(defaultWorkspacePath);
-      setGoalMode(false); setGoalMaxTurns("");
+      return Promise.resolve().then(function () {
+        return props.onSubmit(body);
+      }).then(function (res) {
+        if (!settleInlineCreateSubmission(submitOwnerRef.current, operationToken, true)) {
+          return res;
+        }
+        setSubmitting(false);
+        setTitle(""); setAssignee(ASSIGNEE_DISPATCHER); setPriority(0); setParent(""); setSkills("");
+        setWorkspaceKind(defaultWorkspaceKind); setWorkspacePath(defaultWorkspacePath);
+        setGoalMode(false); setGoalMaxTurns("");
+        if (props.onSuccess) props.onSuccess(res);
+        return res;
+      }).catch(function (err) {
+        if (!ownsOperation(submitOwnerRef.current, operationToken)) return null;
+        settleInlineCreateSubmission(submitOwnerRef.current, operationToken, false);
+        setSubmitting(false);
+        setSubmitError(tx(t, "taskCreateFailed",
+          "Could not create task. Fix the problem and retry: ") + parseApiErrorMessage(err));
+        return null;
+      });
     };
 
     const showPathInput = workspaceKind !== "scratch";
@@ -3234,8 +3938,12 @@
 
     return h("div", {
       className: "hermes-kanban-dialog-backdrop",
-      onClick: function (e) { if (e.target === e.currentTarget) props.onCancel(); },
-      onKeyDown: function (e) { if (e.key === "Escape") props.onCancel(); },
+      onClick: function (e) {
+        if (!submitting && e.target === e.currentTarget) props.onCancel();
+      },
+      onKeyDown: function (e) {
+        if (!submitting && e.key === "Escape") props.onCancel();
+      },
     },
       h("form", {
         className: "hermes-kanban-dialog hermes-kanban-create-dialog",
@@ -3266,22 +3974,23 @@
               fieldLabel(props.columnName === "triage"
                 ? tx(t, "specifier", "specifier")
                 : tx(t, "assigneeLabel", "Assignee"),
-                tx(t, "assigneeLabelHint", "(blank = dispatcher picks)")),
-              h(Input, {
-                value: assignee,
-                onChange: function (e) { setAssignee(e.target.value); },
-                placeholder: props.columnName === "triage"
-                  ? tx(t, "specifier", "specifier")
-                  : tx(t, "assigneePlaceholder", "assignee"),
+                tx(t, "assigneeLabelHint", "(only profiles allowed on this board)")),
+              h(Select, Object.assign({
+                value: controlledAssignee,
                 className: "h-8 text-sm",
                 title: props.columnName === "triage"
-                  ? "Hermes profile that will spec this task (default: the dispatcher's configured specifier). Leave blank to let the dispatcher pick."
-                  : "Hermes profile to assign. Leave blank and the dispatcher will pick from available profiles when the task is Ready.",
-                style: { textTransform: "none" },
-                autoCapitalize: "none",
-                autoCorrect: "off",
-                spellCheck: false,
-              }),
+                  ? tx(t, "specifierSelectorHint", "Choose an allowed Hermes profile to spec this task, or leave it unassigned for the dispatcher to pick.")
+                  : tx(t, "assigneeSelectorHint", "Choose an allowed Hermes profile, or leave the task unassigned for the dispatcher to pick."),
+                "aria-label": props.columnName === "triage"
+                  ? tx(t, "specifier", "specifier")
+                  : tx(t, "assigneeLabel", "Assignee"),
+              }, selectChangeHandler(setAssignee)),
+                h(SelectOption, { value: ASSIGNEE_DISPATCHER },
+                  tx(t, "unassignedDispatcherPicks", "Unassigned — dispatcher picks")),
+                effectiveAssignees.map(function (name) {
+                  return h(SelectOption, { key: name, value: name }, name);
+                }),
+              ),
             ),
             h("div", { className: "flex flex-col gap-1 w-20" },
               fieldLabel(tx(t, "priority", "Priority")),
@@ -3374,17 +4083,24 @@
             }) : null,
           ),
         ),
+        submitError ? h("div", {
+          className: "text-xs text-destructive",
+          role: "alert",
+        }, submitError) : null,
         h("div", { className: "hermes-kanban-dialog-actions" },
           h(Button, {
             type: "button",
             onClick: props.onCancel,
             size: "sm",
+            disabled: submitting,
           }, tx(t, "cancel", "Cancel")),
           h(Button, {
             type: "submit",
             size: "sm",
-            disabled: !title.trim(),
-          }, tx(t, "create", "Create")),
+            disabled: submitting || !title.trim(),
+          }, submitting
+            ? tx(t, "creating", "Creating…")
+            : tx(t, "create", "Create")),
         ),
       ),
     );
@@ -3397,6 +4113,7 @@
   function TaskDrawer(props) {
     const { t } = useI18n();
     const [data, setData] = useState(null);
+    const [dataIdentity, setDataIdentity] = useState(null);
     const [loading, setLoading] = useState(true);
     const [err, setErr] = useState(null);
     // Surface PATCH failures (e.g. 409 "parent not done") right next to
@@ -3414,19 +4131,65 @@
     const [homeChannels, setHomeChannels] = useState([]);
     const [homeBusy, setHomeBusy] = useState({});
     const boardSlug = props.boardSlug;
+    const drawerIdentity = taskDrawerIdentity(boardSlug, props.taskId);
+    const taskRequestStateRef = useRef(createTaskRequestState(drawerIdentity));
+    const closeRef = useRef(null);
+    const drawerHeadingId = "kanban-task-drawer-heading-"
+      + String(boardSlug || "board").replace(/[^a-zA-Z0-9_-]/g, "-") + "-"
+      + String(props.taskId || "task").replace(/[^a-zA-Z0-9_-]/g, "-");
+
+    const captureTaskRequest = function () {
+      return {
+        board: boardSlug,
+        taskId: props.taskId,
+        identity: drawerIdentity,
+      };
+    };
+    const taskRequestIsCurrent = function (request) {
+      return isTaskIdentityActive(taskRequestStateRef.current, request.identity);
+    };
 
     const load = useCallback(function () {
-      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug))
-        .then(function (d) { setData(d); setErr(null); setPatchErr(null); })
-        .catch(function (e) { setErr(String(e.message || e)); })
-        .finally(function () { setLoading(false); });
-    }, [props.taskId, boardSlug]);
+      const request = captureTaskRequest();
+      const loadToken = beginTaskLoad(taskRequestStateRef.current, request.identity);
+      setData(null);
+      setDataIdentity(null);
+      setLoading(true);
+      setErr(null);
+      return SDK.fetchJSON(withBoard(
+        `${API}/tasks/${encodeURIComponent(request.taskId)}`, request.board,
+      )).then(function (d) {
+        if (!isTaskLoadCurrent(taskRequestStateRef.current, loadToken)) return null;
+        if (!d || !d.task
+            || taskDrawerIdentity(request.board, d.task.id) !== request.identity) {
+          setErr(tx(t, "taskIdentityMismatch",
+            "The task response did not match the open drawer. Close it and retry."));
+          return null;
+        }
+        setData(d);
+        setDataIdentity(request.identity);
+        setErr(null);
+        setPatchErr(null);
+        return d;
+      }).catch(function (e) {
+        if (!isTaskLoadCurrent(taskRequestStateRef.current, loadToken)) return null;
+        setErr(String(e.message || e));
+        return null;
+      }).finally(function () {
+        if (isTaskLoadCurrent(taskRequestStateRef.current, loadToken)) setLoading(false);
+      });
+    }, [props.taskId, boardSlug, t]);
 
     const loadHomeChannels = useCallback(function () {
-      const qs = new URLSearchParams({ task_id: props.taskId });
-      const url = withBoard(`${API}/home-channels?${qs}`, boardSlug);
+      const request = captureTaskRequest();
+      const qs = new URLSearchParams({ task_id: request.taskId });
+      const url = withBoard(`${API}/home-channels?${qs}`, request.board);
       return SDK.fetchJSON(url)
-        .then(function (d) { setHomeChannels(d.home_channels || []); })
+        .then(function (d) {
+          if (!taskRequestIsCurrent(request)) return null;
+          setHomeChannels(d.home_channels || []);
+          return d;
+        })
         .catch(function () { /* silent — endpoint optional on older gateways */ });
     }, [props.taskId, boardSlug]);
 
@@ -3436,23 +4199,43 @@
     useEffect(function () { load(); }, [load, props.eventTick]);
     useEffect(function () { loadHomeChannels(); }, [loadHomeChannels]);
     useEffect(function () {
-      function onKey(e) { if (e.key === "Escape" && !editing) props.onClose(); }
+      const requestState = taskRequestStateRef.current;
+      const closeDrawer = props.onClose;
+      const previousFocus = document.activeElement;
+      if (closeRef.current && typeof closeRef.current.focus === "function") {
+        closeRef.current.focus();
+      }
+      function onKey(e) { if (e.key === "Escape") closeDrawer(); }
       window.addEventListener("keydown", onKey);
-      return function () { window.removeEventListener("keydown", onKey); };
-    }, [props.onClose, editing]);
+      return function () {
+        window.removeEventListener("keydown", onKey);
+        deactivateTaskRequests(requestState);
+        if (previousFocus && typeof previousFocus.focus === "function") {
+          try { previousFocus.focus(); } catch (_e) { /* detached focus target */ }
+        }
+      };
+    }, [drawerIdentity]);
 
     const handleComment = function () {
       const body = newComment.trim();
-      if (!body) return;
-      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/comments`, boardSlug), {
+      const request = captureTaskRequest();
+      if (!body || !taskRequestIsCurrent(request)) return Promise.resolve(null);
+      return SDK.fetchJSON(withBoard(
+        `${API}/tasks/${encodeURIComponent(request.taskId)}/comments`, request.board,
+      ), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ body }),
       }).then(function () {
+        if (!taskRequestIsCurrent(request)) return null;
         setNewComment("");
         load();
         props.onRefresh();
-      }).catch(function (e) { setErr(String(e.message || e)); });
+        return null;
+      }).catch(function (e) {
+        if (taskRequestIsCurrent(request)) setErr(String(e.message || e));
+        return null;
+      });
     };
 
     // File upload uses raw fetch (not SDK.fetchJSON, which JSON-encodes)
@@ -3460,14 +4243,18 @@
     // cookie + bearer token, matching the rest of the dashboard.
     const handleUpload = function (fileList) {
       const files = Array.prototype.slice.call(fileList || []);
-      if (!files.length) return;
+      const request = captureTaskRequest();
+      if (!files.length || !taskRequestIsCurrent(request)) return Promise.resolve(null);
       setUploadBusy(true);
       setUploadErr(null);
-      const url = withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/attachments`, boardSlug);
+      const url = withBoard(
+        `${API}/tasks/${encodeURIComponent(request.taskId)}/attachments`, request.board,
+      );
       // Upload sequentially so a partial failure leaves a clear state.
       let chain = Promise.resolve();
       files.forEach(function (f) {
         chain = chain.then(function () {
+          if (!taskRequestIsCurrent(request)) return null;
           const fd = new FormData();
           fd.append("file", f, f.name);
           // SDK.authedFetch handles auth in BOTH modes (loopback token header /
@@ -3484,20 +4271,33 @@
             });
         });
       });
-      chain.then(function () {
+      return chain.then(function () {
+        if (!taskRequestIsCurrent(request)) return null;
         load();
         props.onRefresh();
+        return null;
       }).catch(function (e) {
-        setUploadErr(String(e.message || e));
+        if (taskRequestIsCurrent(request)) setUploadErr(String(e.message || e));
+        return null;
       }).finally(function () {
-        setUploadBusy(false);
+        if (taskRequestIsCurrent(request)) setUploadBusy(false);
       });
     };
 
     const handleDeleteAttachment = function (attachmentId) {
-      return SDK.fetchJSON(withBoard(`${API}/attachments/${attachmentId}`, boardSlug), { method: "DELETE" })
-        .then(function () { load(); props.onRefresh(); })
-        .catch(function (e) { setUploadErr(String(e.message || e)); });
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
+      return SDK.fetchJSON(withBoard(
+        `${API}/attachments/${attachmentId}`, request.board,
+      ), { method: "DELETE" }).then(function () {
+        if (!taskRequestIsCurrent(request)) return null;
+        load();
+        props.onRefresh();
+        return null;
+      }).catch(function (e) {
+        if (taskRequestIsCurrent(request)) setUploadErr(String(e.message || e));
+        return null;
+      });
     };
 
     // doPatch is invoked by the side-drawer's StatusActions (block / unblock
@@ -3515,6 +4315,8 @@
     //    site. The prompt body, validation copy, and requirement are
     //    unchanged from the pre-migration implementation.
     const doPatch = function (patch, opts) {
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
       if (opts && opts.confirm && props.requestDialog) {
         return props.requestDialog({
           kind: "confirm",
@@ -3533,15 +4335,28 @@
       return applyPatch(patch);
 
       function applyPatch(patch) {
+        if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
         const finalPatch = withCompletionSummary(patch);
         if (!finalPatch) return Promise.resolve();
         setPatchErr(null);
-        return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug), {
+        return SDK.fetchJSON(withBoard(
+          `${API}/tasks/${encodeURIComponent(request.taskId)}`, request.board,
+        ), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(finalPatch),
-        }).then(function () { load(); props.onRefresh(); })
-          .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
+        }).then(function () {
+          if (!taskRequestIsCurrent(request)) return null;
+          load();
+          props.onRefresh();
+          if (finalPatch.status === "archived" && props.onCountsRefresh) {
+            props.onCountsRefresh();
+          }
+          return null;
+        }).catch(function (e) {
+          if (taskRequestIsCurrent(request)) setPatchErr(parseApiErrorMessage(e));
+          return null;
+        });
       }
     };
 
@@ -3573,14 +4388,17 @@
     // comment — or fail with a human-readable reason that the UI
     // surfaces inline without treating it as an HTTP error).
     const doSpecify = function () {
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
       return SDK.fetchJSON(
-        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/specify`, boardSlug),
+        withBoard(`${API}/tasks/${encodeURIComponent(request.taskId)}/specify`, request.board),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
         }
       ).then(function (res) {
+        if (!taskRequestIsCurrent(request)) return res;
         load();
         props.onRefresh();
         return res;
@@ -3592,50 +4410,84 @@
     // Refreshes both the drawer (so the user sees the root flip to
     // todo) and the board (so the new children appear in the columns).
     const doDecompose = function () {
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
       return SDK.fetchJSON(
-        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/decompose`, boardSlug),
+        withBoard(`${API}/tasks/${encodeURIComponent(request.taskId)}/decompose`, request.board),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
         }
       ).then(function (res) {
+        if (!taskRequestIsCurrent(request)) return res;
         load();
         props.onRefresh();
+        if (props.onCountsRefresh) props.onCountsRefresh();
         return res;
       });
     };
 
     const addLink = function (parentId) {
-      return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
+      return SDK.fetchJSON(withBoard(`${API}/links`, request.board), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ parent_id: parentId, child_id: props.taskId }),
-      }).then(function () { load(); props.onRefresh(); })
-        .catch(function (e) { setErr(String(e.message || e)); });
+        body: JSON.stringify({ parent_id: parentId, child_id: request.taskId }),
+      }).then(function () {
+        if (!taskRequestIsCurrent(request)) return null;
+        load(); props.onRefresh(); return null;
+      }).catch(function (e) {
+        if (taskRequestIsCurrent(request)) setErr(String(e.message || e));
+        return null;
+      });
     };
     const removeLink = function (parentId) {
-      const qs = new URLSearchParams({ parent_id: parentId, child_id: props.taskId });
-      return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, boardSlug), { method: "DELETE" })
-        .then(function () { load(); props.onRefresh(); })
-        .catch(function (e) { setErr(String(e.message || e)); });
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
+      const qs = new URLSearchParams({ parent_id: parentId, child_id: request.taskId });
+      return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, request.board), { method: "DELETE" })
+        .then(function () {
+          if (!taskRequestIsCurrent(request)) return null;
+          load(); props.onRefresh(); return null;
+        }).catch(function (e) {
+          if (taskRequestIsCurrent(request)) setErr(String(e.message || e));
+          return null;
+        });
     };
     const addChild = function (childId) {
-      return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
+      return SDK.fetchJSON(withBoard(`${API}/links`, request.board), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ parent_id: props.taskId, child_id: childId }),
-      }).then(function () { load(); props.onRefresh(); })
-        .catch(function (e) { setErr(String(e.message || e)); });
+        body: JSON.stringify({ parent_id: request.taskId, child_id: childId }),
+      }).then(function () {
+        if (!taskRequestIsCurrent(request)) return null;
+        load(); props.onRefresh(); return null;
+      }).catch(function (e) {
+        if (taskRequestIsCurrent(request)) setErr(String(e.message || e));
+        return null;
+      });
     };
     const removeChild = function (childId) {
-      const qs = new URLSearchParams({ parent_id: props.taskId, child_id: childId });
-      return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, boardSlug), { method: "DELETE" })
-        .then(function () { load(); props.onRefresh(); })
-        .catch(function (e) { setErr(String(e.message || e)); });
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
+      const qs = new URLSearchParams({ parent_id: request.taskId, child_id: childId });
+      return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, request.board), { method: "DELETE" })
+        .then(function () {
+          if (!taskRequestIsCurrent(request)) return null;
+          load(); props.onRefresh(); return null;
+        }).catch(function (e) {
+          if (taskRequestIsCurrent(request)) setErr(String(e.message || e));
+          return null;
+        });
     };
 
     const toggleHomeSubscription = function (platform, currentlySubscribed) {
+      const request = captureTaskRequest();
+      if (!taskRequestIsCurrent(request)) return Promise.resolve(null);
       // Optimistic flip + busy flag to keep double-clicks idempotent.
       setHomeBusy(function (b) { return Object.assign({}, b, { [platform]: true }); });
       setHomeChannels(function (list) {
@@ -3647,12 +4499,16 @@
       });
       const method = currentlySubscribed ? "DELETE" : "POST";
       const url = withBoard(
-        `${API}/tasks/${encodeURIComponent(props.taskId)}/home-subscribe/${encodeURIComponent(platform)}`,
-        boardSlug,
+        `${API}/tasks/${encodeURIComponent(request.taskId)}/home-subscribe/${encodeURIComponent(platform)}`,
+        request.board,
       );
       return SDK.fetchJSON(url, { method: method })
-        .then(function () { return loadHomeChannels(); })
+        .then(function () {
+          if (!taskRequestIsCurrent(request)) return null;
+          return loadHomeChannels();
+        })
         .catch(function (e) {
+          if (!taskRequestIsCurrent(request)) return null;
           // Revert optimistic flip on failure.
           setHomeChannels(function (list) {
             return list.map(function (h) {
@@ -3662,8 +4518,10 @@
             });
           });
           setErr(String(e.message || e));
+          return null;
         })
         .finally(function () {
+          if (!taskRequestIsCurrent(request)) return;
           setHomeBusy(function (b) {
             const next = Object.assign({}, b);
             delete next[platform];
@@ -3672,14 +4530,22 @@
         });
     };
 
+    const displayedData = dataIdentity === drawerIdentity ? data : null;
     return h("div", { className: "hermes-kanban-drawer-shade", onClick: props.onClose },
       h("div", {
         className: "hermes-kanban-drawer",
+        role: "dialog",
+        "aria-modal": true,
+        "aria-labelledby": drawerHeadingId,
         onClick: function (e) { e.stopPropagation(); },
       },
         h("div", { className: "hermes-kanban-drawer-head" },
-          h("span", { className: "text-xs text-muted-foreground" }, props.taskId),
+          h("h2", {
+            id: drawerHeadingId,
+            className: "text-xs text-muted-foreground",
+          }, tx(t, "taskDrawerHeading", "Task {id}", { id: props.taskId })),
           h("button", {
+            ref: closeRef,
             type: "button",
             onClick: props.onClose,
             className: "hermes-kanban-drawer-close",
@@ -3689,11 +4555,11 @@
         loading ? h("div", { className: "p-4 text-sm text-muted-foreground" },
           tx(t, "loadingDetail", "Loading…")) :
         err ? h("div", { className: "p-4 text-sm text-destructive" }, err) :
-        data ? h(TaskDetail, {
-          data, editing, setEditing,
+        displayedData ? h(TaskDetail, {
+          data: displayedData, editing, setEditing,
           renderMarkdown: props.renderMarkdown,
           allTasks: props.allTasks,
-          assignees: props.assignees || [],
+          effectiveAssignees: props.effectiveAssignees || [],
           boardSlug: boardSlug,
           onPatch: doPatch,
           onSpecify: doSpecify,
@@ -3711,12 +4577,11 @@
           uploadBusy: uploadBusy,
           uploadErr: uploadErr,
           onOpenTask: function (taskId) {
-            props.onClose();
             if (props.onOpenTask) props.onOpenTask(taskId);
           },
-                    requestDialog: props.requestDialog,
+          requestDialog: props.requestDialog,
         }) : null,
-        data ? h("div", { className: "hermes-kanban-drawer-comment-foot" },
+        displayedData ? h("div", { className: "hermes-kanban-drawer-comment-foot" },
           h("div", {
             className: "hermes-kanban-comment-hint text-xs text-muted-foreground",
             title: tx(t, "commentHintTitle",
@@ -3894,7 +4759,11 @@
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
-        h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
+        h(AssigneeEditor, {
+          task: t,
+          effectiveAssignees: props.effectiveAssignees,
+          onPatch: props.onPatch,
+        }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         h(ModelEditor, { task: t, onPatch: props.onPatch }),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
@@ -3923,7 +4792,7 @@
       h(DiagnosticsSection, {
         task: t,
         boardSlug: props.boardSlug,
-        assignees: props.assignees,
+        effectiveAssignees: props.effectiveAssignees,
         diagnostics: t.diagnostics || [],
         onRefresh: props.onRefresh,
       }),
@@ -4238,8 +5107,11 @@
   function AssigneeEditor(props) {
     const { t } = useI18n();
     const [editing, setEditing] = useState(false);
-    const [v, setV] = useState(props.task.assignee || "");
-    useEffect(function () { setV(props.task.assignee || ""); }, [props.task.assignee]);
+    const [v, setV] = useState(props.task.assignee || ASSIGNEE_UNASSIGNED);
+    const effectiveAssignees = props.effectiveAssignees || [];
+    useEffect(function () {
+      setV(props.task.assignee || ASSIGNEE_UNASSIGNED);
+    }, [props.task.assignee]);
     if (!editing) {
       return h("div", { className: "hermes-kanban-meta-row" },
         h("span", { className: "hermes-kanban-meta-label" }, tx(t, "assignee", "Assignee")),
@@ -4251,24 +5123,40 @@
       );
     }
     const save = function () {
-      props.onPatch({ assignee: v.trim() || "" }).then(function () { setEditing(false); });
+      if (!canSubmitAssignee(v, effectiveAssignees, true)) return;
+      props.onPatch({ assignee: assignmentPatchValue(v) })
+        .then(function () { setEditing(false); });
     };
     return h("div", { className: "hermes-kanban-meta-row" },
       h("span", { className: "hermes-kanban-meta-label" }, tx(t, "assignee", "Assignee")),
-      h(Input, {
-        value: v, autoFocus: true,
-        onChange: function (e) { setV(e.target.value); },
-        onKeyDown: function (e) {
-          if (e.key === "Enter") { e.preventDefault(); save(); }
-          if (e.key === "Escape") setEditing(false);
-        },
-        placeholder: tx(t, "emptyAssignee", "(empty = unassign)"),
+      h(Select, Object.assign({
+        value: v,
         className: "h-7 text-xs flex-1",
-        style: { textTransform: "none" },
-        autoCapitalize: "none",
-        autoCorrect: "off",
-        spellCheck: false,
-      }),
+        "aria-label": tx(t, "assignee", "Assignee"),
+      }, selectChangeHandler(setV)),
+        h(SelectOption, { value: ASSIGNEE_UNASSIGNED },
+          tx(t, "unassignAndPark", "Unassign / park")),
+        props.task.assignee && effectiveAssignees.indexOf(props.task.assignee) < 0
+          ? h(SelectOption, { value: props.task.assignee, disabled: true },
+              tx(t, "historicalAssignee", "{name} (not allowed on this board)",
+                { name: props.task.assignee }))
+          : null,
+        effectiveAssignees.map(function (name) {
+          return h(SelectOption, { key: name, value: name }, name);
+        }),
+      ),
+      h(Button, {
+        onClick: save,
+        size: "sm",
+        disabled: !canSubmitAssignee(v, effectiveAssignees, true),
+      }, tx(t, "save", "Save")),
+      h(Button, {
+        onClick: function () {
+          setV(props.task.assignee || ASSIGNEE_UNASSIGNED);
+          setEditing(false);
+        },
+        size: "sm",
+      }, tx(t, "cancel", "Cancel")),
     );
   }
 
