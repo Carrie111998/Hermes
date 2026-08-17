@@ -14691,6 +14691,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata["slack_team_id"] = str(team_id)
         return metadata
 
+    def _thread_metadata_for_event(
+        self,
+        event: MessageEvent,
+        reply_to_message_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Build reply metadata while preserving event-scoped audit data."""
+        metadata = self._thread_metadata_for_source(
+            event.source,
+            reply_to_message_id,
+        )
+        event_metadata = getattr(event, "metadata", None)
+        correlation_id = (
+            event_metadata.get("telegram_delivery_correlation_id")
+            if isinstance(event_metadata, dict)
+            else None
+        )
+        if correlation_id:
+            metadata = dict(metadata) if metadata else {}
+            metadata["telegram_delivery_correlation_id"] = str(correlation_id)
+            correlation_ids = event_metadata.get("telegram_delivery_correlation_ids")
+            if isinstance(correlation_ids, (list, tuple)):
+                metadata["telegram_delivery_correlation_ids"] = [
+                    str(value) for value in correlation_ids if value
+                ]
+        return metadata
+
     def _thread_metadata_for_target(
         self,
         platform: Optional[Platform],
@@ -18800,11 +18826,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _progress_thread_id = _resolve_progress_thread_id(
             source.platform, source.thread_id, event_message_id,
         )
-        _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
-            if _progress_thread_id == source.thread_id
-            else {"thread_id": _progress_thread_id}
-        ) if _progress_thread_id else None
+        _progress_metadata = None
+        if _progress_thread_id:
+            _progress_metadata = self._thread_metadata_for_event(
+                event,
+                event_message_id,
+            )
+            if _progress_thread_id != source.thread_id:
+                _progress_metadata = dict(_progress_metadata or {})
+                _progress_metadata["thread_id"] = _progress_thread_id
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
@@ -19267,7 +19297,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+            _status_thread_metadata = (
+                self._thread_metadata_for_event(event, event_message_id)
+                if _progress_thread_id
+                else None
+            )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
