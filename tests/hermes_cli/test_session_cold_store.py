@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_cli.session_cold_store as cold_store
 from hermes_cli.session_cold_store import store_archived_lineage
 from hermes_state import SessionDB
 
@@ -31,6 +32,7 @@ def test_store_archived_compression_lineage_writes_terminal_id_revision(tmp_path
         assert result.revision_dir.parent.parent.name == "terminal"
         assert (result.revision_dir / "metadata.json").is_file()
         assert (result.revision_dir / "session.jsonl").is_file()
+        assert store_archived_lineage(db, "terminal", archive_root) == result
         assert db.get_session("root") is not None
         assert db.get_session("terminal") is not None
     finally:
@@ -97,5 +99,47 @@ def test_store_reads_raw_rows_without_flushing_and_preserves_system_prompt(
             for line in (result.revision_dir / "session.jsonl").read_text(encoding="utf-8").splitlines()
         ]
         assert any(record["kind"] == "system-prompt" for record in records)
+    finally:
+        db.close()
+
+
+def test_store_rejects_revisions_symlink_swap_before_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validated revision parent cannot be swapped to redirect transcript writes."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="sensitive transcript")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        real_mkdir = cold_store.os.mkdir
+        swapped = False
+
+        def racing_mkdir(
+            path: str | Path,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal swapped
+            if not swapped and Path(path).name.startswith(".staging-"):
+                revisions = next(archive_root.rglob("revisions"))
+                revisions.rename(revisions.with_name("revisions-displaced"))
+                revisions.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            real_mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(cold_store.os, "mkdir", racing_mkdir)
+
+        with pytest.raises(ValueError, match="unsafe archive parent path"):
+            store_archived_lineage(db, "terminal", archive_root)
+
+        assert swapped
+        assert not any(outside.iterdir())
     finally:
         db.close()

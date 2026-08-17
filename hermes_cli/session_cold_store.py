@@ -15,9 +15,9 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
+import secrets
 import sqlite3
-import tempfile
+import stat
 from typing import Any
 
 from hermes_state import SessionDB, resolved_max_export_messages
@@ -191,72 +191,182 @@ def _fingerprint(records: list[dict[str, Any]]) -> str:
     return sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _write_text_fsync(path: Path, text: str) -> None:
-    with path.open("w", encoding="utf-8") as output:
+def _directory_open_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    except AttributeError as exc:
+        raise OSError(errno.ENOTSUP, "cold store requires no-follow directory descriptors") from exc
+
+
+def _unsafe_archive_parent(path: Path, exc: OSError | None = None) -> ValueError:
+    error = ValueError(f"unsafe archive parent path: {path}")
+    if exc is not None:
+        error.__cause__ = exc
+    return error
+
+
+def _open_or_create_directory(parent_fd: int, name: str, path: Path) -> int:
+    flags = _directory_open_flags()
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise _unsafe_archive_parent(path, exc)
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise _unsafe_archive_parent(path, exc)
+        os.fsync(descriptor)
+        os.fsync(parent_fd)
+        return descriptor
+    except OSError as exc:
+        raise _unsafe_archive_parent(path, exc)
+
+
+def _open_revision_parent(
+    archive_root: Path, relative_parts: tuple[str, ...]
+) -> tuple[list[int], list[tuple[int, str, int, Path]]]:
+    """Open/create a no-follow chain from ``/`` through the revision parent."""
+    absolute_root = Path(os.path.abspath(os.fspath(archive_root)))
+    names = (*absolute_root.parts[1:], *relative_parts)
+    descriptors = [os.open(os.sep, _directory_open_flags())]
+    edges: list[tuple[int, str, int, Path]] = []
+    current_path = Path(os.sep)
+    try:
+        for name in names:
+            current_path /= name
+            descriptor = _open_or_create_directory(descriptors[-1], name, current_path)
+            edges.append((descriptors[-1], name, descriptor, current_path))
+            descriptors.append(descriptor)
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+    return descriptors, edges
+
+
+def _directory_entry_matches(parent_fd: int, name: str, descriptor: int) -> bool:
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    opened = os.fstat(descriptor)
+    return (
+        stat.S_ISDIR(entry.st_mode)
+        and entry.st_dev == opened.st_dev
+        and entry.st_ino == opened.st_ino
+    )
+
+
+def _validate_directory_chain(edges: list[tuple[int, str, int, Path]]) -> None:
+    for parent_fd, name, descriptor, path in edges:
+        if not _directory_entry_matches(parent_fd, name, descriptor):
+            raise _unsafe_archive_parent(path)
+
+
+def _write_text_fsync_at(directory_fd: int, name: str, text: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
         output.write(text)
         output.flush()
         os.fsync(output.fileno())
 
 
-def _fsync_dir(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+def _read_regular_text_at(directory_fd: int, name: str) -> str | None:
     try:
-        os.fsync(descriptor)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        return None
+    with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            return None
+        return source.read()
+
+
+def _valid_existing_revision_at(
+    revisions_fd: int,
+    revision_name: str,
+    terminal_id: str,
+    lineage: tuple[str, ...],
+    fingerprint: str,
+) -> bool | None:
+    try:
+        revision_fd = os.open(revision_name, _directory_open_flags(), dir_fd=revisions_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    try:
+        try:
+            metadata_text = _read_regular_text_at(revision_fd, "metadata.json")
+            payload_text = _read_regular_text_at(revision_fd, "session.jsonl")
+            if metadata_text is None or payload_text is None:
+                return False
+            metadata = json.loads(metadata_text)
+            records = [json.loads(line) for line in payload_text.splitlines()]
+            artifacts_fd = os.open("artifacts", _directory_open_flags(), dir_fd=revision_fd)
+            os.close(artifacts_fd)
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (
+            metadata.get("format") == _ARCHIVE_FORMAT
+            and metadata.get("terminal_id") == terminal_id
+            and metadata.get("physical_ids") == list(lineage)
+            and metadata.get("source_fingerprint") == fingerprint
+            and metadata.get("record_count") == len(records)
+            and _fingerprint(records) == fingerprint
+            and _directory_entry_matches(revisions_fd, revision_name, revision_fd)
+        )
     finally:
-        os.close(descriptor)
+        os.close(revision_fd)
 
 
-def _valid_existing_revision(revision_dir: Path, terminal_id: str, lineage: tuple[str, ...], fingerprint: str) -> bool:
-    if not revision_dir.is_dir() or revision_dir.is_symlink():
-        return False
-    metadata_path = revision_dir / "metadata.json"
-    payload_path = revision_dir / "session.jsonl"
-    if any(not path.is_file() or path.is_symlink() for path in (metadata_path, payload_path)):
-        return False
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        records = [json.loads(line) for line in payload_path.read_text(encoding="utf-8").splitlines()]
-    except (OSError, json.JSONDecodeError):
-        return False
-    return (
-        metadata.get("format") == _ARCHIVE_FORMAT
-        and metadata.get("terminal_id") == terminal_id
-        and metadata.get("physical_ids") == list(lineage)
-        and metadata.get("source_fingerprint") == fingerprint
-        and metadata.get("record_count") == len(records)
-        and _fingerprint(records) == fingerprint
-        and (revision_dir / "artifacts").is_dir()
-        and not (revision_dir / "artifacts").is_symlink()
-    )
-
-
-def _ensure_dir_tree_fsynced(path: Path) -> None:
-    """Create and validate every path component through the revision parent."""
-    chain: list[Path] = []
-    current = path
-    while True:
-        chain.append(current)
-        if current.parent == current:
-            break
-        current = current.parent
-    for directory in reversed(chain):
-        if directory.exists():
-            if not directory.is_dir() or directory.is_symlink():
-                raise ValueError(f"unsafe archive parent path: {directory}")
+def _create_staging_directory(revisions_fd: int) -> tuple[str, int]:
+    for _ in range(100):
+        name = f".staging-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=revisions_fd)
+        except FileExistsError:
             continue
         try:
-            directory.mkdir()
-        except FileExistsError:
+            descriptor = os.open(name, _directory_open_flags(), dir_fd=revisions_fd)
+        except BaseException:
+            try:
+                os.rmdir(name, dir_fd=revisions_fd)
+            except OSError:
+                pass
+            raise
+        if not _directory_entry_matches(revisions_fd, name, descriptor):
+            os.close(descriptor)
+            raise ValueError("unsafe cold-store staging directory")
+        return name, descriptor
+    raise FileExistsError("could not allocate cold-store staging directory")
+
+
+def _remove_staging_at(revisions_fd: int, name: str, staging_fd: int) -> None:
+    for member in ("metadata.json", "session.jsonl"):
+        try:
+            os.unlink(member, dir_fd=staging_fd)
+        except OSError:
             pass
-        if not directory.is_dir() or directory.is_symlink():
-            raise ValueError(f"unsafe archive parent path: {directory}")
-        _fsync_dir(directory)
-        _fsync_dir(directory.parent)
-
-
-def _remove_staging(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(path)
+    try:
+        os.rmdir("artifacts", dir_fd=staging_fd)
+    except OSError:
+        pass
+    if _directory_entry_matches(revisions_fd, name, staging_fd):
+        try:
+            os.rmdir(name, dir_fd=revisions_fd)
+        except OSError:
+            pass
 
 
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:
@@ -307,14 +417,35 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         / "revisions"
         / fingerprint
     )
-    if revision_dir.exists():
-        if _valid_existing_revision(revision_dir, terminal_id, lineage, fingerprint):
-            return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
-        raise ValueError("existing cold-store revision is invalid or mismatched")
-
-    _ensure_dir_tree_fsynced(revision_dir.parent)
-    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=revision_dir.parent))
+    revision_parent_parts = (
+        "sessions",
+        "ended",
+        f"{terminal_date:%Y}",
+        f"{terminal_date:%m}",
+        f"{terminal_date:%d}",
+        _safe_component(terminal_id),
+        "revisions",
+    )
+    descriptors, edges = _open_revision_parent(archive_root, revision_parent_parts)
+    revisions_fd = descriptors[-1]
+    staging_name: str | None = None
+    staging_fd = -1
+    published = False
     try:
+        existing = _valid_existing_revision_at(
+            revisions_fd,
+            fingerprint,
+            terminal_id,
+            lineage,
+            fingerprint,
+        )
+        if existing is True:
+            return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
+        if existing is False:
+            raise ValueError("existing cold-store revision is invalid or mismatched")
+
+        staging_name, staging_fd = _create_staging_directory(revisions_fd)
+        _validate_directory_chain(edges)
         metadata = {
             "format": _ARCHIVE_FORMAT,
             "terminal_id": terminal_id,
@@ -322,24 +453,50 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
             "source_fingerprint": fingerprint,
             "record_count": len(records),
         }
-        _write_text_fsync(staging / "metadata.json", json.dumps(metadata, sort_keys=True, indent=2) + "\n")
-        _write_text_fsync(
-            staging / "session.jsonl",
-            "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        _write_text_fsync_at(
+            staging_fd,
+            "metadata.json",
+            json.dumps(metadata, sort_keys=True, indent=2) + "\n",
         )
-        (staging / "artifacts").mkdir()
-        _fsync_dir(staging)
+        _write_text_fsync_at(
+            staging_fd,
+            "session.jsonl",
+            "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in records
+            ),
+        )
+        os.mkdir("artifacts", dir_fd=staging_fd)
+        os.fsync(staging_fd)
+        _validate_directory_chain(edges)
+        if not _directory_entry_matches(revisions_fd, staging_name, staging_fd):
+            raise ValueError("unsafe cold-store staging directory")
         try:
-            os.replace(staging, revision_dir)
+            os.rename(
+                staging_name,
+                fingerprint,
+                src_dir_fd=revisions_fd,
+                dst_dir_fd=revisions_fd,
+            )
         except OSError as exc:
             if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                 raise
-            if _valid_existing_revision(revision_dir, terminal_id, lineage, fingerprint):
-                _remove_staging(staging)
+            if _valid_existing_revision_at(
+                revisions_fd,
+                fingerprint,
+                terminal_id,
+                lineage,
+                fingerprint,
+            ):
                 return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
             raise
-        _fsync_dir(revision_dir.parent)
-    except BaseException:
-        _remove_staging(staging)
-        raise
+        published = True
+        os.fsync(revisions_fd)
+    finally:
+        if staging_fd >= 0:
+            if not published and staging_name is not None:
+                _remove_staging_at(revisions_fd, staging_name, staging_fd)
+            os.close(staging_fd)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
     return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
