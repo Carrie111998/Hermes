@@ -71,11 +71,12 @@ def test_ticker_calls_tick_at_least_once_then_stops():
     assert calls[0].get("sync") is False
 
 
-def test_desktop_ticker_calls_tick_then_stops():
+def test_desktop_ticker_calls_tick_then_stops(monkeypatch):
     """The desktop dashboard ticker loop calls cron.scheduler.tick and exits
     once the stop_event is set. Desktop has no live adapters, so it ticks with
-    no adapters/loop."""
+    no adapters/loop. Admission must succeed for the ticker body to run."""
     from hermes_cli.web_server import _start_desktop_cron_ticker
+    import hermes_cli.web_server as ws
 
     calls = []
     stop = threading.Event()
@@ -83,6 +84,13 @@ def test_desktop_ticker_calls_tick_then_stops():
     def fake_tick(*args, **kwargs):
         calls.append(kwargs)
         return 0
+
+    monkeypatch.setattr(ws, "_SCHEDULER_ROLE", "local-primary")
+    monkeypatch.setattr(ws, "_SSH_OWNER_NONCE", None)
+    monkeypatch.setattr(ws, "_canonical_gateway_is_live", lambda **k: False)
+    monkeypatch.setattr(ws, "_try_acquire_desktop_scheduler_lease", lambda: True)
+    monkeypatch.setattr(ws, "_release_desktop_scheduler_lease", lambda: None)
+    ws._desktop_scheduler_lease_fh = None
 
     with patch("cron.scheduler.tick", side_effect=fake_tick):
         t = threading.Thread(

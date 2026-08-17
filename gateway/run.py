@@ -30283,14 +30283,35 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active
         )
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs=cron_start_kwargs,
-        daemon=True,
-        name="cron-scheduler",
+    # Shared scheduler-owner lease with desktop fallback. Wait briefly so a
+    # live desktop ticker can observe gateway liveness, stop, and yield before
+    # this process starts ticking — preventing dual-loop coexistence.
+    from cron.scheduler_ownership import (
+        release_scheduler_ownership,
+        wait_for_scheduler_ownership,
     )
-    cron_thread.start()
+
+    def _run_gateway_cron_with_ownership(stop_event, **kwargs):
+        try:
+            cron_provider.start(stop_event, **kwargs)
+        finally:
+            release_scheduler_ownership()
+
+    if wait_for_scheduler_ownership("gateway", timeout_seconds=30.0):
+        cron_thread = threading.Thread(
+            target=_run_gateway_cron_with_ownership,
+            args=(cron_stop,),
+            kwargs=cron_start_kwargs,
+            daemon=True,
+            name="cron-scheduler",
+        )
+        cron_thread.start()
+    else:
+        logger.error(
+            "Could not acquire shared scheduler-owner lease within 30s; "
+            "refusing to start a second cron loop"
+        )
+        cron_thread = None
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.

@@ -261,25 +261,191 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+# Process-local desktop scheduler admission. Never a user-facing config knob.
+# Values:
+#   none          — request-serving only (SSH-owned isolated backends)
+#   local-primary — eligible for fallback when no canonical gateway is live
+#   unset/None    — not a desktop backend / no desktop ticker
+_SCHEDULER_ROLE: Optional[str] = None
+# Historical name retained for tests; the shared owner lease file is
+# cron/scheduler-owner.lease (see cron.scheduler_ownership).
+_DESKTOP_SCHEDULER_LEASE_NAME = "scheduler-owner.lease"
+
+
+def get_scheduler_role() -> Optional[str]:
+    """Return the process-local scheduler role, if any."""
+    return _SCHEDULER_ROLE
+
+
+def _set_scheduler_role(role: Optional[str]) -> None:
+    global _SCHEDULER_ROLE
+    _SCHEDULER_ROLE = role
+
+
+def _canonical_gateway_is_live(*, cleanup_stale: bool = False) -> bool:
+    """True when this HERMES_HOME has a validated live canonical gateway owner."""
+    try:
+        return get_running_pid(cleanup_stale=cleanup_stale) is not None
+    except Exception:
+        # Fail closed for fallback admission: if we cannot prove the gateway is
+        # absent, do not start a competing desktop scheduler.
+        _log.debug("gateway liveness probe failed; denying desktop fallback", exc_info=True)
+        return True
+
+
+def _desktop_scheduler_lease_path() -> Path:
+    from cron.scheduler_ownership import scheduler_owner_lease_path
+
+    return scheduler_owner_lease_path()
+
+
+def _try_acquire_desktop_scheduler_lease() -> bool:
+    """Acquire the shared scheduler-owner lease for desktop fallback."""
+    global _desktop_scheduler_lease_fh, _desktop_scheduler_lease_fallback_path
+    from cron import scheduler_ownership as so
+    from cron.scheduler_ownership import try_acquire_scheduler_ownership
+
+    # Mirror restored by tests after a second-process simulation.
+    if _desktop_scheduler_lease_fh is not None and so._lease_fh is None:
+        so._lease_fh = _desktop_scheduler_lease_fh
+        so._lease_fallback_path = _desktop_scheduler_lease_fallback_path
+        so._lease_role = so._lease_role or "desktop-fallback"
+        return True
+
+    # Mirror cleared to simulate another process while the prior handle still
+    # holds the OS lock. Drop only the module holder pointer so acquire retries.
+    if _desktop_scheduler_lease_fh is None and so._lease_fh is not None:
+        so._lease_fh = None
+        so._lease_fallback_path = None
+        so._lease_role = None
+
+    ok = try_acquire_scheduler_ownership("desktop-fallback")
+    if ok:
+        _desktop_scheduler_lease_fh = so._lease_fh
+        _desktop_scheduler_lease_fallback_path = so._lease_fallback_path
+    return ok
+
+
+def _release_desktop_scheduler_lease() -> None:
+    global _desktop_scheduler_lease_fh, _desktop_scheduler_lease_fallback_path
+    from cron import scheduler_ownership as so
+    from cron.scheduler_ownership import release_scheduler_ownership
+
+    if so._lease_fh is None and _desktop_scheduler_lease_fh is not None:
+        so._lease_fh = _desktop_scheduler_lease_fh
+        so._lease_fallback_path = _desktop_scheduler_lease_fallback_path
+        so._lease_role = so._lease_role or "desktop-fallback"
+
+    release_scheduler_ownership()
+    _desktop_scheduler_lease_fh = None
+    _desktop_scheduler_lease_fallback_path = None
+
+
+# Test-facing aliases onto the shared owner-lease module state. Assignments like
+# ``ws._desktop_scheduler_lease_fh = None`` reset the shared holder for isolation.
+class _SharedLeaseAttr:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __get__(self, obj, objtype=None):
+        from cron import scheduler_ownership as so
+
+        return getattr(so, self.name)
+
+    def __set__(self, obj, value):
+        from cron import scheduler_ownership as so
+
+        setattr(so, self.name, value)
+        if self.name == "_lease_fh" and value is None:
+            so._lease_role = None
+
+
+# NOTE: module-level descriptors only work on classes. Provide explicit
+# getters/setters used below and keep plain names for monkeypatch targets.
+_desktop_scheduler_lease_fh = None
+_desktop_scheduler_lease_fallback_path = None
+
+
+def admit_desktop_scheduler_fallback() -> bool:
+    """Admit local-primary desktop fallback scheduling for this process.
+
+    SSH-owned isolated backends are never eligible. Local desktop backends are
+    eligible only when no live canonical gateway owns this HERMES_HOME and this
+    process can hold the single shared scheduler-owner lease also used by the
+    canonical gateway cron loop. After acquire, gateway liveness is re-checked
+    so a gateway that appeared during the race cannot coexist with fallback.
+    ``.tick.lock`` remains at-most-once serialization inside the provider, not
+    ownership admission.
+    """
+    if _SCHEDULER_ROLE == "none":
+        return False
+    if _SCHEDULER_ROLE != "local-primary" and os.getenv("HERMES_DESKTOP") != "1":
+        return False
+    if _SSH_OWNER_NONCE:
+        return False
+    if _canonical_gateway_is_live(cleanup_stale=False):
+        return False
+    if not _try_acquire_desktop_scheduler_lease():
+        return False
+    # Critical handoff fence: re-check gateway after the shared lease is held.
+    if _canonical_gateway_is_live(cleanup_stale=False):
+        _release_desktop_scheduler_lease()
+        return False
+    return True
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
-    """Tick the cron scheduler from inside the desktop dashboard backend.
+    """Tick the cron scheduler from a local-primary desktop backend only.
 
-    The scheduler tick loop normally lives in ``hermes gateway run`` — but the
-    desktop app spawns a ``hermes dashboard`` backend, not a gateway, so a cron
-    a user creates in the app would never fire. We run the resolved cron
-    scheduler provider here (no live adapters; delivery falls back to the
-    per-platform send path).
+    The scheduler tick loop normally lives in ``hermes gateway run``. A local
+    Desktop backend may fall back to in-process ticking only when admitted by
+    :func:`admit_desktop_scheduler_fallback`. SSH-owned ``serve --isolated``
+    backends are request-serving only (``scheduler_role='none'``).
 
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
-    real gateway on the same HERMES_HOME — whichever process grabs the lock
-    first wins the tick.
+    Before every dispatch the ticker rechecks canonical gateway priority so a
+    gateway that appears later suppresses further fallback ticks. The provider's
+    ``cron/.tick.lock`` remains last-resort at-most-once serialization, not
+    ownership admission.
     """
     from cron.scheduler_provider import resolve_cron_scheduler
 
+    if not admit_desktop_scheduler_fallback():
+        _log.info(
+            "Desktop cron scheduler not admitted (role=%s ssh_owner=%s)",
+            _SCHEDULER_ROLE,
+            bool(_SSH_OWNER_NONCE),
+        )
+        _release_desktop_scheduler_lease()
+        return
+
     provider = resolve_cron_scheduler()
-    _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    _log.info(
+        "Desktop cron scheduler started (provider=%s, interval=%ds, role=%s)",
+        provider.name,
+        interval,
+        _SCHEDULER_ROLE or "local-primary",
+    )
+
+    def _gateway_priority_watch() -> None:
+        while not stop_event.wait(min(max(interval, 1), 5)):
+            if _canonical_gateway_is_live(cleanup_stale=False):
+                _log.info(
+                    "Canonical gateway became live; stopping desktop cron fallback"
+                )
+                stop_event.set()
+                return
+
+    watcher = threading.Thread(
+        target=_gateway_priority_watch,
+        name="desktop-cron-gateway-watch",
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        provider.start(stop_event, interval=interval)
+    finally:
+        stop_event.set()
+        _release_desktop_scheduler_lease()
 
 
 def _warm_gateway_module() -> None:
@@ -385,9 +551,12 @@ async def _lifespan(app: "FastAPI"):
     # Desktop's 10-second WebSocket ready-probe to time out (GH-73083).
     _warm_gateway_module()
 
-    # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
-    # since the app has no gateway running the scheduler. Server `hermes
-    # dashboard` is unaffected — it relies on its own gateway.
+    # Desktop scheduler admission:
+    # - SSH-owned isolated backends (ssh_owner_nonce set) never schedule.
+    # - Local Desktop backends may run a single fallback ticker only when no
+    #   canonical gateway is live for this HERMES_HOME.
+    # - Plain `hermes dashboard` / non-desktop serves leave scheduling to the
+    #   gateway.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":
@@ -404,14 +573,28 @@ async def _lifespan(app: "FastAPI"):
         except Exception:
             _log.exception("Desktop startup: orphan gateway reap failed")
 
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+    if _SCHEDULER_ROLE == "local-primary" or (
+        _SCHEDULER_ROLE is None
+        and os.getenv("HERMES_DESKTOP") == "1"
+        and not _SSH_OWNER_NONCE
+    ):
+        if _SCHEDULER_ROLE is None:
+            _set_scheduler_role("local-primary")
+        if admit_desktop_scheduler_fallback():
+            cron_stop = threading.Event()
+            cron_thread = threading.Thread(
+                target=_start_desktop_cron_ticker,
+                args=(cron_stop,),
+                daemon=True,
+                name="desktop-cron-ticker",
+            )
+            cron_thread.start()
+        else:
+            _log.info(
+                "Desktop cron ticker suppressed (role=%s gateway_live=%s)",
+                _SCHEDULER_ROLE,
+                _canonical_gateway_is_live(cleanup_stale=False),
+            )
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
@@ -513,6 +696,9 @@ def _apply_ssh_session_token(token: str) -> None:
 def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
     global _SSH_OWNER_NONCE
     _SSH_OWNER_NONCE = nonce
+    # Desktop SSH-owned headless backends are request-serving only.
+    if nonce:
+        _set_scheduler_role("none")
 
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the
@@ -18658,6 +18844,13 @@ def start_server(
     """
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
+    # Local Desktop (HERMES_DESKTOP=1, no SSH owner) may fall back to in-process
+    # scheduling only when admitted later in lifespan. SSH-owned isolated
+    # backends already forced scheduler_role='none' above.
+    if ssh_owner_nonce:
+        _set_scheduler_role("none")
+    elif os.getenv("HERMES_DESKTOP") == "1":
+        _set_scheduler_role("local-primary")
 
     # Raise RLIMIT_NOFILE for dashboard-mode starts that don't route through
     # the `serve` path in main.py (which applies the same floor). Canonical
