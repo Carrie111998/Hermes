@@ -235,6 +235,8 @@ agent:
 
 Now the agent can search the web, run commands, read and edit files, use skills, track steps in todos, and run scheduled checks — and nothing else. No vision, no image generation, no browser automation, no voice.
 
+Because the composition is exact, that list is the whole surface: tools like `delegation` (subagents) and `session_search` (recalling past sessions) are off unless you add them explicitly. A support agent that should hand escalations to a subagent or search prior ticket threads should list them here.
+
 ## Example: Research Analyst
 
 A second profile, built the same way, tuned for a different domain. Here is the shape of the difference:
