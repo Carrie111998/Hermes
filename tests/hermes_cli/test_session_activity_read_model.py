@@ -130,11 +130,15 @@ def test_session_activity_openapi_publishes_closed_response_schemas():
     activity_schema = schema["paths"]["/api/sessions/{session_id}/activity"][
         "get"
     ]["responses"]["200"]["content"]["application/json"]["schema"]
+    head_response = schema["paths"]["/api/sessions/{session_id}/activity"][
+        "head"
+    ]["responses"]["200"]
 
     assert capability_schema["$ref"].endswith(
         "/SessionActivityCapabilitiesResponse"
     )
     assert activity_schema["$ref"].endswith("/SessionActivityResponse")
+    assert "content" not in head_response
 
     components = schema["components"]["schemas"]
     activity = components["SessionActivityResponse"]
@@ -231,16 +235,19 @@ def test_session_activity_snapshot_is_bounded_sanitized_and_read_only(monkeypatc
 def test_session_activity_head_runs_same_authorized_read_without_body(monkeypatch):
     client = _client(monkeypatch)
 
+    get_response = client.get("/api/sessions/short/activity?limit=7")
     response = client.head("/api/sessions/short/activity?limit=7")
 
     assert response.status_code == 200
     assert response.content == b""
+    assert response.headers["content-length"] == get_response.headers["content-length"]
+    assert response.headers["content-type"] == get_response.headers["content-type"]
     assert response.headers["x-hermes-session-capabilities"] == (
         "sessions.activity.read_model.v1"
     )
-    assert _FakeSessionDB.opened == [(None, True)]
+    assert _FakeSessionDB.opened == [(None, True), (None, True)]
     assert _FakeSessionDB.message_call["limit"] == 7
-    assert _FakeSessionDB.closed == 1
+    assert _FakeSessionDB.closed == 2
 
 
 def test_session_activity_rejects_unknown_duplicate_and_out_of_range_query(monkeypatch):
@@ -289,6 +296,25 @@ def test_session_activity_redaction_failure_is_fail_closed(monkeypatch):
         "occurred_at": 300.0,
         "truncated": False,
     }
+
+
+def test_session_activity_redaction_preserves_no_secret_fragments():
+    secret = "ghp_" + ("A" * 24) + "TAIL"
+
+    message = session_routes._session_activity_message(
+        {
+            "id": 10,
+            "role": "assistant",
+            "content": f"token {secret}",
+            "timestamp": 301.0,
+        }
+    )
+
+    assert message is not None
+    assert secret not in message["content"]
+    assert secret[:6] not in message["content"]
+    assert secret[-4:] not in message["content"]
+    assert "«redacted:ghp_…»" in message["content"]
 
 
 @pytest.mark.parametrize(

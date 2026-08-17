@@ -179,6 +179,7 @@ def _session_activity_message(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         text = redact_sensitive_text(
             text,
             force=True,
+            file_read=True,
             redact_url_credentials=True,
         )
         text = _session_activity_redact_paths(text)
@@ -839,9 +840,10 @@ async def _session_activity_http_response(
     if model is None:
         raise HTTPException(status_code=404, detail="Session not found")
     headers = _session_activity_headers()
+    response = JSONResponse(model, headers=headers)
     if request.method == "HEAD":
-        return Response(status_code=200, headers=headers)
-    return JSONResponse(model, headers=headers)
+        return Response(status_code=response.status_code, headers=dict(response.headers))
+    return response
 
 
 @manage_router.get(
@@ -862,7 +864,10 @@ async def get_session_activity(
     )
 
 
-@manage_router.head("/api/sessions/{session_id}/activity")
+@manage_router.head(
+    "/api/sessions/{session_id}/activity",
+    response_class=Response,
+)
 async def head_session_activity(
     request: Request,
     session_id: str,
