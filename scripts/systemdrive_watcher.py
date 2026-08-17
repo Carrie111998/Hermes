@@ -41,7 +41,15 @@ JUNK_NAME = "%SystemDrive%"
 _LOG_REL = Path(".hermes") / "logs" / "systemdrive-watcher.jsonl"
 
 DEFAULT_SECS = 36000.0
-DEFAULT_SAMPLE_MS = 250
+# 100ms, not 250ms: measured on this machine, one sample() costs ~16.65ms with
+# ~1000 live processes, and that cost is NOT constant -- only NEW pids get
+# enriched, so it grows with process churn, and churn peaks during exactly the
+# runs this watcher is armed for. At a 250ms cadence a sampler captured only
+# 9 of 12 short-lived Python children (each living 350-514ms); at 50ms it
+# caught 12 of 12. 100ms costs roughly 17% of one core and stays comfortably
+# below that 350-514ms lifetime, leaving margin for churn-induced slowdown.
+# Cost was never the binding constraint here -- capture probability is.
+DEFAULT_SAMPLE_MS = 100
 DEFAULT_POLL_MS = 250
 DEFAULT_RING = 4000
 
@@ -181,6 +189,13 @@ class ProcessRing:
     2026-08-16 the watcher fired correctly but the writer had already exited,
     so a full snapshot named nobody. A creation history makes attribution
     independent of whether the writer is still alive at sighting time.
+
+    Thread-safety, precisely: ``sample()`` calls are serialized against each
+    other (via ``_sample_lock``), so ``_known``/``_primed`` are never read or
+    mutated by two callers at once. ``dump()`` and ``__len__()`` only ever
+    touch ``_entries`` under the separate, cheaper ``_lock``, so they are safe
+    to call concurrently from other threads -- including while a ``sample()``
+    call is in flight.
     """
 
     def __init__(self, capacity: int = DEFAULT_RING) -> None:
@@ -188,22 +203,53 @@ class ProcessRing:
         self._known: set = set()
         self._primed = False
         self._lock = threading.Lock()
+        # Serializes sample() end-to-end (see class docstring). Deliberately
+        # separate from `_lock`: enrichment takes tens of milliseconds, and
+        # `_lock` is what dump()/__len__() use, so holding it that long would
+        # block readers for no reason.
+        self._sample_lock = threading.Lock()
+        self._sample_errors = 0
 
     def sample(self) -> int:
-        """One diff pass. Returns how many creations were recorded."""
-        live = set(psutil.pids())
-        new = live - self._known
-        self._known = live
-        if not self._primed:
-            # The first pass is a baseline. Everything looks new, but nothing
-            # actually started inside our window; recording ~1000 entries here
-            # would bury the handful that matter.
-            self._primed = True
-            return 0
-        entries = [describe_pid(pid) for pid in sorted(new)]
-        with self._lock:
-            self._entries.extend(entries)
-        return len(entries)
+        """One diff pass. Returns how many creations were recorded.
+
+        Never raises: a diagnostic must never take down the run it observes.
+        Any failure here is swallowed and counted in ``_sample_errors``
+        instead (with a one-time stderr note on the first occurrence) so the
+        loop survives the entire run without spamming stderr on every tick.
+        """
+        with self._sample_lock:
+            try:
+                live = set(psutil.pids())
+                new = live - self._known
+                if not self._primed:
+                    # The first pass is a baseline. Everything looks new, but
+                    # nothing actually started inside our window; recording
+                    # ~1000 entries here would bury the handful that matter.
+                    self._primed = True
+                    self._known = live
+                    return 0
+                entries = [describe_pid(pid) for pid in sorted(new)]
+                # Commit `_known` only AFTER the entries are safely appended.
+                # If enrichment or the append below raised with `_known`
+                # already advanced to `live`, those pids would be marked
+                # "known" and the next sample() would never see them as new
+                # again -- the creations would be silently and permanently
+                # lost, with no retry. Advance `_known` last, once recording
+                # has actually succeeded.
+                with self._lock:
+                    self._entries.extend(entries)
+                self._known = live
+                return len(entries)
+            except Exception as exc:  # never take the observed run down
+                self._sample_errors += 1
+                if self._sample_errors == 1:
+                    print(
+                        f"  [junk-watcher] sample() failed (will keep counting"
+                        f" silently): {type(exc).__name__}: {exc}",
+                        file=sys.stderr, flush=True,
+                    )
+                return 0
 
     def dump(self) -> List[dict]:
         with self._lock:
