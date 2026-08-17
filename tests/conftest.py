@@ -879,10 +879,16 @@ def _ensure_current_event_loop(request):
 # these measurements:
 #
 #   • Cost. ``_scan_gateway_pids`` returned the developer's LIVE gateway PID
-#     [47164] in ~2–3 s per call (2026-08-15). ``addopts`` pins a 30 s per-test
-#     timeout that also covers fixture setup, and a test reaching the scan twice
-#     (``gateway_windows.stop()`` does) spent ~26 s of its 30 s budget there —
-#     one slow host away from a timeout that reads as a flake.
+#     [47164] in ~2–3 s per call standalone (2026-08-15), and 10–16 s per sweep
+#     inside a loaded suite (2026-08-17: 34.03 s/3 sweeps in test_cron.py,
+#     19.91 s/2 in test_gateway_windows.py, 15.62 s/1 in test_status.py).
+#     ``addopts`` pins a 30 s per-test timeout that also covers fixture setup,
+#     so one test reaching the scan twice (``gateway_windows.stop()`` does) can
+#     consume the whole budget. Not a projection: while measuring this guard, an
+#     UNGUARDED baseline run of test_cron.py was killed by pytest-timeout inside
+#     ``subprocess.communicate`` under the real sweep, never reaching
+#     ``sessionfinish``. Re-measuring this A/B therefore needs a raised
+#     ``--timeout`` on BOTH arms or the baseline cannot finish at all.
 #   • Determinism. The sweep finds whatever gateway happens to be running on the
 #     machine, so an unstubbed test passes or fails on host state. ``HERMES_HOME``
 #     is already tempdir-redirected by ``_hermetic_environment`` and

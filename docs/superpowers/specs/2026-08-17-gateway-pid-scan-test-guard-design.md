@@ -9,14 +9,22 @@
 
 `hermes_cli.gateway._scan_gateway_pids` is the one layer of the gateway PID lookup that
 reads the **host** process table. Measured 2026-08-15: it returned the developer's LIVE
-gateway PID `[47164]` in ~2-3 s per call.
+gateway PID `[47164]` in ~2-3 s per call *standalone*. Inside a loaded suite it is far
+worse — **10–16 s per sweep**, derived from the per-file sweep timings measured
+2026-08-17 (see Test plan): 34.03 s / 3 sweeps, 19.91 s / 2, 15.62 s / 1.
 
 Two independent problems, both real:
 
 1. **Cost.** `pyproject.toml` `addopts` pins a 30 s per-test timeout, and that cap covers
-   fixture setup. A single test that reaches the scan twice (`gateway_windows.stop()`
-   does) spent ~26 s of its 30 s budget there — one slow host away from a timeout that
-   reads as a flake.
+   fixture setup. At 10–16 s a sweep, a single test that reaches the scan twice
+   (`gateway_windows.stop()` does) can consume the entire budget. This is not a
+   projection: an unguarded baseline run of `test_cron.py` **was killed by pytest-timeout
+   inside `subprocess.communicate` under the real sweep** while measuring this change, and
+   never reached `sessionfinish`.
+
+   (The dropped commit put the two-call case at "~26 s of its 30 s budget". That specific
+   test was not re-measured here, so the figure is inherited, not confirmed — though
+   2 × the measured per-sweep range brackets it.)
 2. **Determinism.** The sweep finds whatever gateway happens to be running on the
    developer's box, so an unstubbed test's result depends on machine state. `HERMES_HOME`
    is already tempdir-redirected by `_hermetic_environment` and `_get_service_pids` is
