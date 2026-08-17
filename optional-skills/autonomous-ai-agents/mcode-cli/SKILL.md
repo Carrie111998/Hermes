@@ -46,6 +46,8 @@ second opinion.
    `mcode login --region cn`. For BYOK, configure a provider with
    `mcode provider` instead.
 4. Confirm the headless contract with `mcode exec --help`.
+5. Use the platform's Python launcher for the wrapper: normally `python3` on
+   Linux/macOS, or `py -3` / `python` on Windows.
 
 If npm blocks native install scripts, follow npm's prompt or reinstall with
 the narrow allow-list for `@minimax-ai/code` and `better-sqlite3`; do not
@@ -76,9 +78,10 @@ terminal(
 )
 ```
 
-The wrapper sends the prompt to `mcode exec --input - --input-format json`,
-requests `--output-format json`, validates the final `ExecResultV1`, writes one
-JSON object to stdout, and preserves MCode's nonzero exit code and stderr.
+The wrapper sends the prompt as UTF-8 JSON to
+`mcode exec --input - --input-format json`, requests `--output-format json`,
+validates the final `ExecResultV1`, writes one JSON object to stdout, and
+preserves MCode's nonzero exit code and stderr.
 
 ## Quick Reference
 
@@ -97,6 +100,9 @@ JSON object to stdout, and preserves MCode's nonzero exit code and stderr.
 
 `--session` and `--continue` are mutually exclusive. The wrapper defaults to
 `smart`; headless runs exit as blocked when an action still requires a human.
+The final statuses and public exit codes are `succeeded` (0), `failed`
+(3, 4, or 70 according to error category), `blocked` (5), `timeout` (6),
+`limit_exceeded` (7), and `cancelled` (130).
 
 ## Procedure
 
@@ -104,9 +110,11 @@ JSON object to stdout, and preserves MCode's nonzero exit code and stderr.
    delegating. Create any required branch or worktree first.
 2. Give MCode a concrete task, constraints, expected files, and focused
    verification commands. Do not hand it an ambiguous product decision.
-3. Choose a bounded inner `--timeout` and a slightly longer Hermes terminal
-   timeout. Use background execution with `notify_on_complete=true` for long
-   tasks, then inspect it with the `process` tool.
+3. Choose a bounded inner `--timeout` and set the Hermes terminal timeout at
+   least 30-60 seconds longer. The wrapper forwards MCode's run timeout; the
+   terminal timeout is the independent outer deadline. Use background execution
+   with `notify_on_complete=true` for long tasks, then inspect it with the
+   `process` tool.
 4. Read the JSON result. Treat `status: "succeeded"` as the worker's report,
    not proof that the change is correct.
 5. Inspect the actual diff and run the repository's required tests yourself.

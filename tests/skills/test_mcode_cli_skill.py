@@ -7,6 +7,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = (
     Path(__file__).resolve().parents[2]
@@ -90,7 +92,7 @@ def test_run_passes_prompt_over_stdin_and_emits_valid_result(tmp_path):
     stdout: list[str] = []
     stderr: list[str] = []
     exit_code = wrapper.run_mcode(
-        prompt="Fix the failing test; $(touch should-not-run)",
+        prompt="修复失败的测试；不要执行 $(touch should-not-run)",
         cwd=tmp_path,
         runner=fake_runner,
         which=lambda _command: "/tools/mcode.cmd",
@@ -102,12 +104,89 @@ def test_run_passes_prompt_over_stdin_and_emits_valid_result(tmp_path):
     assert captured["command"][0] == "/tools/mcode.cmd"
     assert captured["command"][-2:] == ["--permission", "smart"]
     assert json.loads(captured["input"]) == {
-        "prompt": "Fix the failing test; $(touch should-not-run)"
+        "prompt": "修复失败的测试；不要执行 $(touch should-not-run)"
     }
     assert captured["text"] is True
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "strict"
     assert captured["capture_output"] is True
     assert json.loads(stdout[0]) == _success_result("fixed")
     assert stderr == []
+
+
+@pytest.mark.parametrize(
+    ("status", "returncode"),
+    (("timeout", 6), ("limit_exceeded", 7), ("cancelled", 130)),
+)
+def test_run_accepts_all_exec_result_terminal_statuses(tmp_path, status, returncode):
+    wrapper = _load_module()
+    result = {**_success_result(), "status": status, "answer": None}
+
+    def fake_runner(command, **_kwargs):
+        return subprocess.CompletedProcess(command, returncode, json.dumps(result), "")
+
+    stdout: list[str] = []
+    stderr: list[str] = []
+    exit_code = wrapper.run_mcode(
+        prompt="Keep working",
+        cwd=tmp_path,
+        runner=fake_runner,
+        which=lambda _command: "/tools/mcode",
+        stdout=stdout.append,
+        stderr=stderr.append,
+    )
+
+    assert exit_code == returncode
+    assert json.loads(stdout[0]) == result
+    assert stderr == []
+
+
+def test_run_rejects_exec_result_without_duration(tmp_path):
+    wrapper = _load_module()
+    result = _success_result()
+    result.pop("durationMs")
+
+    def fake_runner(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, json.dumps(result), "")
+
+    stdout: list[str] = []
+    stderr: list[str] = []
+    exit_code = wrapper.run_mcode(
+        prompt="Keep working",
+        cwd=tmp_path,
+        runner=fake_runner,
+        which=lambda _command: "/tools/mcode",
+        stdout=stdout.append,
+        stderr=stderr.append,
+    )
+
+    assert exit_code == 1
+    assert stdout == []
+    assert stderr == ["mcode returned invalid ExecResultV1 JSON.\n"]
+
+
+@pytest.mark.parametrize("constant", ("NaN", "Infinity", "-Infinity"))
+def test_run_rejects_non_standard_json_constants(tmp_path, constant):
+    wrapper = _load_module()
+    raw_result = json.dumps(_success_result()).replace("12", constant, 1)
+
+    def fake_runner(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, raw_result, "")
+
+    stdout: list[str] = []
+    stderr: list[str] = []
+    exit_code = wrapper.run_mcode(
+        prompt="Keep working",
+        cwd=tmp_path,
+        runner=fake_runner,
+        which=lambda _command: "/tools/mcode",
+        stdout=stdout.append,
+        stderr=stderr.append,
+    )
+
+    assert exit_code == 1
+    assert stdout == []
+    assert stderr == ["mcode returned invalid ExecResultV1 JSON.\n"]
 
 
 def test_run_preserves_mcode_failure_and_diagnostics(tmp_path):

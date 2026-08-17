@@ -15,6 +15,14 @@ from typing import Callable, Sequence
 Writer = Callable[[str], object]
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 Which = Callable[[str], str | None]
+EXEC_RESULT_STATUSES = {
+    "succeeded",
+    "failed",
+    "blocked",
+    "timeout",
+    "cancelled",
+    "limit_exceeded",
+}
 
 
 def build_command(
@@ -56,6 +64,10 @@ def build_command(
     return command
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _is_exec_result(value: object) -> bool:
     if not isinstance(value, dict):
         return False
@@ -64,7 +76,9 @@ def _is_exec_result(value: object) -> bool:
         and value.get("type") == "exec.result"
         and isinstance(value.get("sessionId"), str)
         and isinstance(value.get("turnId"), str)
-        and value.get("status") in {"succeeded", "failed", "blocked", "cancelled"}
+        and isinstance(value.get("durationMs"), (int, float))
+        and not isinstance(value.get("durationMs"), bool)
+        and value.get("status") in EXEC_RESULT_STATUSES
     )
 
 
@@ -104,6 +118,8 @@ def run_mcode(
             command,
             input=json.dumps({"prompt": prompt}, ensure_ascii=False),
             text=True,
+            encoding="utf-8",
+            errors="strict",
             capture_output=True,
             check=False,
         )
@@ -118,8 +134,8 @@ def run_mcode(
         stderr(completed.stderr)
 
     try:
-        result = json.loads(completed.stdout)
-    except (json.JSONDecodeError, TypeError):
+        result = json.loads(completed.stdout, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, TypeError, ValueError):
         result = None
 
     if not _is_exec_result(result):
@@ -127,7 +143,7 @@ def run_mcode(
             stderr("mcode returned invalid ExecResultV1 JSON.\n")
         return completed.returncode or 1
 
-    stdout(f"{json.dumps(result, ensure_ascii=False)}\n")
+    stdout(f"{json.dumps(result, ensure_ascii=False, allow_nan=False)}\n")
     if completed.returncode:
         return completed.returncode
     return 0 if result["status"] == "succeeded" else 1
