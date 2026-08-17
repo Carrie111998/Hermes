@@ -126,7 +126,7 @@ LEGACY_AUTHOR_MAP = {
     "blueirobin02@gmail.com": "irresi",  # PR #59048 salvage (gateway: scope reset banners' session info to the serving profile; #59003)
     "jashlee+microsoft@microsoft.com": "s905060",  # PR #57943 salvage (photon: auto-reinstall stale sidecar node_modules when lockfile is newer than npm's install marker; #59169)
     "lohinth25@proton.me": "l0h1nth",  # PR #32210 salvage (mattermost: accept leading-space slash commands from mobile clients; #25184)
-    "roseycomanagement@roseyco.co.uk": "arnispiekus",  # REVIEW(F601): duplicate entries disagreed -- kept the last-wins value 'arnispiekus'; also seen as 'Roseyco-management' | PR #63581 salvage (telegram: require getUpdates progress before polling is healthy; #63243, #63766) | PR #63581 salvage (telegram: require getUpdates progress before polling is healthy; #63243)
+    "roseycomanagement@roseyco.co.uk": "arnispiekus",  # PR #63581 salvage (telegram: require getUpdates progress before polling is healthy; #63243, #63766) — commits carry the @Roseyco-management git identity (GitHub resolves this address to that account), but PR #63581 is @arnispiekus's and salvage PR #64361 credits it to "@arnispiekus / @Roseyco-management"; PR author wins, as for the bare-noreply/@hydraxman entry above
     "tim@iteachyouai.com": "tjp2021",  # PR #4097 salvage (copilot: per-turn x-initiator header so user prompts bill as premium requests; #3040)
     "39274208+falkoro@users.noreply.github.com": "falkoro",  # PRs #58519/#58520 salvage (config: env-ref-aware load_config cache invalidation; auxiliary: honor auxiliary.<task>.base_url/api_key with explicit provider arg)
     "3723267+kevinrajaram@users.noreply.github.com": "kevinrajaram",  # PR #3850 salvage (gateway: add POSIX system dirs to PATH so launchctl/systemctl resolve under UV's minimal-PATH bundled Python; #3849)
@@ -1027,7 +1027,7 @@ LEGACY_AUTHOR_MAP = {
     "tsuijinglei@gmail.com": "hiddenpuppy",
     "jerome@clawwork.ai": "HiddenPuppy",
     "jerome.benoit@sap.com": "jerome-benoit",
-    "wysie@users.noreply.github.com": "Wysie",  # REVIEW(F601): duplicate entries disagreed -- kept the last-wins value 'Wysie'; also seen as 'wysie'
+    "wysie@users.noreply.github.com": "wysie",  # canonical login is lowercase (GitHub /users/wysie); 'Wysie' was only a git display name
     "leoyuan0099@gmail.com": "keyuyuan",
     "bxzt2006@163.com": "Only-Code-A",
     "i@troy-y.org": "TroyMitchell911",
@@ -1156,7 +1156,7 @@ LEGACY_AUTHOR_MAP = {
     "chinmingcock@gmail.com": "ChimingLiu",
     "openclaw@sparklab.ai": "openclaw",
     "semihcvlk53@gmail.com": "Himess",
-    "erenkar950@gmail.com": "erenkarakus",  # REVIEW(F601): duplicate entries disagreed -- kept the last-wins value 'erenkarakus'; also seen as 'eren-karakus0'
+    "erenkar950@gmail.com": "eren-karakus0",  # GitHub resolves this address to @eren-karakus0 ("Muhammet Eren Karakuş"), the head-repo owner of PR #1560; 'erenkarakus' is an unrelated account (@ErenKarakus)
     "adavyasharma@gmail.com": "adavyas",
     "acaayush1111@gmail.com": "aayushchaudhary",
     "jason@outland.art": "jasonoutland",
@@ -1209,7 +1209,7 @@ LEGACY_AUTHOR_MAP = {
     "dgrieco@redhat.com": "DomGrieco",
     "dhicham.pro@gmail.com": "spideystreet",
     "dipp.who@gmail.com": "dippwho",
-    "don.rhm@gmail.com": "donrhmexe",  # REVIEW(F601): duplicate entries disagreed -- kept the last-wins value 'donrhmexe'; also seen as 'rahimsais'
+    "don.rhm@gmail.com": "donrhmexe",  # GitHub resolves this address to @donrhmexe; 'rahimsais' is a separate contributor, mapped from 40222899+rahimsais@users.noreply.github.com above
     "dorukardahan@hotmail.com": "dorukardahan",
     "dsocolobsky@gmail.com": "dsocolobsky",
     "dylan.socolobsky@lambdaclass.com": "dsocolobsky",
@@ -1516,7 +1516,7 @@ LEGACY_AUTHOR_MAP = {
     "88077783+jjjojoj@users.noreply.github.com": "jjjojoj",
     "valda@underscore.jp": "valda",
     "lling486@163.com": "M3RCUR2Y",
-    "buraysandro9@gmail.com": "ygd58",  # REVIEW(F601): duplicate entries disagreed -- kept the last-wins value 'ygd58'; also seen as 'buray'
+    "buraysandro9@gmail.com": "ygd58",  # GitHub resolves this address to @ygd58; 'buray' is that account's display name, not a login
     "ideathinklab01-source@users.noreply.github.com": "ideathinklab01-source",
     "27987889@qq.com": "zng8418",
     "daniuxie88@proton.me": "DaniuXie",

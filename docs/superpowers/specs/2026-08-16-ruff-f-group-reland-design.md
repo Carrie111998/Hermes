@@ -351,6 +351,9 @@ case-insensitive, so it is almost certainly cosmetic. The `roseyco` pair is the 
 one: both lines cite the **same PR #63581**, so one salvage entry was written twice with
 different handles — meaning one of the two attributions is simply wrong.
 
+(Closed the same day — see *Stage 3 addendum* at the end of this document. The paragraph
+and table above are left standing as the record of what the stage handed off.)
+
 **`hermes_cli/models.py` and `plugins/platforms/matrix/adapter.py` — redundant restatements.**
 The `_COPILOT_MODEL_ALIASES` entry mapped `anthropic/claude-sonnet-5` to `claude-sonnet-5`;
 unlike the `4-6`/`4.6` pairs around it, sonnet-5 has no minor version, so its dash and dot
@@ -364,3 +367,48 @@ second spelling is not extra coverage.
 **Verification.** `ruff check --isolated --select F601` over the tree returns clean, so F601
 is genuinely zero rather than suppressed by the sunset list. The list itself was re-derived
 from this tree and is exactly tight — no stale entry, no missing entry, no over-broad code.
+
+## Stage 3 addendum — the five attributions, resolved (2026-08-17)
+
+All five `REVIEW(F601)` markers in `scripts/release.py` are gone. None was resolved by
+picking the more plausible-looking string: each was decided against GitHub's own
+email→account resolution, read from `repos/NousResearch/hermes-agent/commits/<sha>` where
+`.author.login` is the account GitHub itself binds a commit's author email to (that binding
+requires the address to be verified on the account, so it cannot be spelled into existence
+from a local git config).
+
+| email | resolved to | was | evidence |
+|---|---|---|---|
+| `buraysandro9@gmail.com` | `ygd58` | `ygd58` (unchanged) | commit `08baf965` → `.author.login` `ygd58`; `users/ygd58` has display **name** "buray" — the loser was a name, never a login |
+| `don.rhm@gmail.com` | `donrhmexe` | `donrhmexe` (unchanged) | commit `f7e514d4` → `.author.login` `donrhmexe`; `rahimsais` is a separate contributor already keyed by `40222899+rahimsais@users.noreply.github.com` |
+| `erenkar950@gmail.com` | `eren-karakus0` | `erenkarakus` | commits `606f57a3` / `4c57a5b3` → `.author.login` `eren-karakus0`, whose profile name "Muhammet Eren Karakuş" matches the commit author; the merge of PR #1560 names head repo `eren-karakus0/…`. `users/erenkarakus` resolves to a **different** account (`ErenKarakus`) — the old value was a live mis-credit |
+| `roseycomanagement@roseyco.co.uk` | `arnispiekus` | `arnispiekus` (unchanged) | see below |
+| `wysie@users.noreply.github.com` | `wysie` | `Wysie` | `users/wysie` returns login `wysie`; `Wysie` was a git display name. Cosmetic as predicted, but the map stores logins |
+
+**Two values actually moved** (`erenkar950`, `wysie`); the other three markers described a
+disagreement whose last-wins side was already right. `ast.literal_eval` of
+`LEGACY_AUTHOR_MAP` before and after: same 1868 keys, exactly those two values changed, no
+duplicate literal keys.
+
+**The `roseyco` pair, which was the one that mattered.** It is not a copy-paste slip — both
+handles are real accounts and both are genuinely attached to the work. GitHub binds
+`roseycomanagement@roseyco.co.uk` to **@Roseyco-management**, and that account authored the
+two commits (it has exactly those two commits in the repo). But PR #63581 was opened by
+**@arnispiekus** from `arnispiekus:codex/hermes-rec10-polling-progress`, its body claims the
+change in the first person while explicitly fencing off the one commit it carries from
+another contributor (@SilentKnight87's `330a33da`, from #63247), and @arnispiekus has
+authored zero commits in the repo under their own identity. The maintainer's salvage
+PR #64361 credits the stack to "#63247 (@SilentKnight87) and #63581 (@arnispiekus /
+@Roseyco-management)" — naming both, and settling nothing on its own.
+
+The tie-break is this file's own established convention, not a coin flip: every
+`# PR #NNNNN salvage` entry credits the **PR author**, and the map already contains the
+identical shape decided that way — `"bryan@users.noreply.github.com": "hydraxman"`, annotated
+"regression-test commit authored under a bare-noreply local git identity; PR author is
+@hydraxman", where GitHub's own resolution of that address (`bryan`) was deliberately
+overridden. So `arnispiekus` stands, and the line now records the @Roseyco-management
+identity and PR #64361 rather than a `REVIEW` marker, so the ambiguity stays visible.
+
+**Verification.** `uvx ruff@0.15.12 check . --no-cache` exits 0 and
+`ruff check --isolated --select F601 .` is clean, so removing the markers did not reintroduce
+a duplicate key.
