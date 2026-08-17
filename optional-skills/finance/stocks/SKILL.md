@@ -71,7 +71,8 @@ Daily OHLCV plus stats (min, max, avg, total return %). Ranges: `1mo`,
 
 ### `compare SYMBOL1 SYMBOL2 [...]`
 
-Side-by-side: price, change%, 52-week performance.
+Side-by-side: price, change%, and `52w_range_position_pct` — where the
+price sits between the 52-week low (0%) and high (100%).
 
 ### `crypto SYMBOL [SYMBOL2 ...]`
 

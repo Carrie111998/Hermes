@@ -537,7 +537,7 @@ def cmd_compare(symbols: list[str]) -> None:
             "pe_ratio": None,
             "52w_high": None,
             "52w_low": None,
-            "52w_performance_pct": None,
+            "52w_range_position_pct": None,
         }
 
         # Chart data
@@ -565,25 +565,20 @@ def cmd_compare(symbols: list[str]) -> None:
             if entry["name"] is None and qs.get("short_name"):
                 entry["name"] = qs["short_name"]
 
-        # 52w performance: (current - 52w_low) / (52w_high - 52w_low)
+        # Where the price sits in its 52-week range:
+        #     (current - 52w_low) / (52w_high - 52w_low)
+        # 0% = at the low, 100% = at the high.  This is a POSITION, not a
+        # return -- above 100% just means the recorded high is stale.  It is
+        # deliberately not "percent above the low", which is unbounded and
+        # says nothing about how much room is left overhead, so it does not
+        # compare across the tickers this command puts side by side.
         try:
             price_f = float(entry["price"]) if entry["price"] else None
-            # REVIEW(F841): the comment above documents a range-relative metric
-            # using 52w_high, but the line below divides by low_f alone, so the
-            # parsed high is discarded.  Either the comment or the formula is
-            # wrong -- resolving that is a behaviour change, not a lint fix, so
-            # it is flagged here rather than guessed at.
-            #
-            # The parse itself is KEPT, deliberately: it sits inside this
-            # try/except, so a non-numeric 52w_high currently raises ValueError
-            # and suppresses the metric entirely.  Deleting the dead binding
-            # would start emitting a performance figure for rows whose high is
-            # unparseable -- a silent behaviour change on bad input.
-            float(entry["52w_high"]) if entry["52w_high"] else None
+            high_f = float(entry["52w_high"]) if entry["52w_high"] else None
             low_f = float(entry["52w_low"]) if entry["52w_low"] else None
-            if price_f and low_f and price_f > 0 and low_f > 0:
-                perf = ((price_f - low_f) / low_f) * 100
-                entry["52w_performance_pct"] = fmt_pct(perf)
+            if price_f and price_f > 0 and high_f and low_f and high_f > low_f > 0:
+                position = ((price_f - low_f) / (high_f - low_f)) * 100
+                entry["52w_range_position_pct"] = fmt_pct(position)
         except (ValueError, TypeError, ZeroDivisionError):
             pass
 
