@@ -666,7 +666,9 @@ class MemoryManager:
         try:
             signature = inspect.signature(provider.sync_turn)
         except (TypeError, ValueError):
-            return True
+            # Optional context must be opt-in. An uninspectable legacy
+            # callable may reject new keywords, dropping the whole sync.
+            return False
         params = list(signature.parameters.values())
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
             return True
@@ -678,7 +680,9 @@ class MemoryManager:
         try:
             signature = inspect.signature(provider.sync_turn)
         except (TypeError, ValueError):
-            return True
+            # Fail closed for optional transport when signature discovery is
+            # unavailable; the required legacy call remains fully usable.
+            return False
         params = list(signature.parameters.values())
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
             return True
@@ -718,15 +722,19 @@ class MemoryManager:
         if not clean_user_content:
             return
         user_content = clean_user_content
+        # The worker may run after the caller mutates its turn buffers. Freeze
+        # optional context at submission so providers observe one exact turn.
+        messages_snapshot = list(messages) if messages is not None else None
+        metadata_snapshot = dict(metadata) if metadata is not None else None
 
         def _run() -> None:
             for provider in providers:
                 try:
                     sync_kwargs: Dict[str, Any] = {"session_id": session_id}
-                    if messages is not None and self._provider_sync_accepts_messages(provider):
-                        sync_kwargs["messages"] = messages
-                    if metadata is not None and self._provider_sync_accepts_metadata(provider):
-                        sync_kwargs["metadata"] = metadata
+                    if messages_snapshot is not None and self._provider_sync_accepts_messages(provider):
+                        sync_kwargs["messages"] = messages_snapshot
+                    if metadata_snapshot is not None and self._provider_sync_accepts_metadata(provider):
+                        sync_kwargs["metadata"] = metadata_snapshot
                     provider.sync_turn(
                         user_content,
                         assistant_content,
