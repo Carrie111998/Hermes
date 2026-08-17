@@ -20,21 +20,13 @@ def test_research_modules_routes_and_evidence_copy_are_served():
     assert "based on verified sources" in components and "partly estimated" in components
 
 
-def test_mock_mode_research_handlers_are_wired():
-    """Mock mode must serve the same research contract as the real backend
-    (research-page-UI-guidelines.md §15, acceptance criterion §16.14)."""
+def test_production_webui_has_no_mock_runtime():
     _, client, _, _ = make_client()
-    handlers = client.get("/js/mocks/handlers.js").text
-    for key in (
-        "researchCampaigns.list", "researchCampaigns.create", "researchCampaigns.estimate",
-        "researchCampaigns.start", "researchCampaigns.metrics", "researchCampaigns.leads",
-        "research.configuration", "research.sectors", "research.modelProfiles",
-        "research.leadClaims", "dataSources.catalog", "dataSources.impact", "dataSources.purge",
-    ):
-        assert f"'{key}'" in handlers, key
-    # enable/disable now mutate the provider catalog instead of returning a no-op.
-    assert "setSourceState" in handlers
-    assert "DEFAULT_RESEARCH_CONFIG" in handlers
+    for path in ("/js/main.js", "/js/api.js", "/js/shell.js", "/js/real-state.js"):
+        text = client.get(path).text
+        assert "./mocks/" not in text
+        assert "config.mode" not in text
+    assert client.get("/js/mocks/handlers.js").status_code == 404
 
 
 def test_source_picker_is_catalog_driven_and_admin_copy_is_distinct():

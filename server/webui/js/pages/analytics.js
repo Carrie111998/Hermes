@@ -5,7 +5,7 @@ import {
   toast, tabs, fmt,
 } from '../ui.js';
 import { call } from '../api.js';
-import { db, subscribe } from '../mocks/db.js';
+import { db, subscribe } from '../state.js';
 import { countryName, exportCsv, productFor } from './_page-utils.js';
 
 export async function mount(root, ctx) {

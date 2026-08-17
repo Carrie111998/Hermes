@@ -1,13 +1,6 @@
-/* Mirror real API responses into the UI's existing shared view-model.
+/* Mirror real API responses into the UI's shared view-model. */
 
-   The original SPA was written around mocks/db.js. Phase 2 keeps that small
-   observable store as the page-level cache, but real responses replace (or
-   upsert into) the corresponding collections. MOCK_ROUTES continue to mutate
-   the same store through their handlers, so hybrid mode has one coherent
-   source of rendered state instead of real records mixed with Silverine seed
-   records. */
-
-import { db, emit } from './mocks/db.js';
+import { db, emit } from './state.js';
 
 const REAL_ONBOARDING_STEPS = new Set([
   'company-identity', 'positioning', 'products', 'internal-sales-data',

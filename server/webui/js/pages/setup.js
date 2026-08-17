@@ -6,7 +6,7 @@ import {
 } from '../ui.js';
 import { call } from '../api.js';
 import { startEmailOAuth } from '../oauth-popup.js';
-import { db } from '../mocks/db.js';
+import { db } from '../state.js';
 import { COUNTRY_NAMES } from '../catalog.js';
 import {
   countryOptions, countryName, languageOptions, SEND_MODES, waitForRun,

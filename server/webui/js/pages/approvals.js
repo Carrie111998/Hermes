@@ -4,7 +4,7 @@ import {
   el, pageHead, emptyState, button, toast, isApprovalActionable, QA_LABELS,
 } from '../ui.js';
 import { call } from '../api.js';
-import { db } from '../mocks/db.js';
+import { db } from '../state.js';
 import {
   campaignFor, contactFor, leadFor, waitForRun,
 } from './_page-utils.js';

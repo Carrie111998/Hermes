@@ -1,7 +1,7 @@
 /* Boot: wire auth, initialize tenant-safe state, build routes, start the router. */
 
 import { startRouter, navigate } from './router.js';
-import { reset, resetReal } from './mocks/db.js';
+import { resetReal } from './state.js';
 import { clearSession, getSession, homeRoute, isAuthed, updateSession } from './session.js';
 import { config } from './api.js';
 import { mountShell } from './shell.js';
@@ -69,8 +69,7 @@ config.beforeRequest = req => {
   };
 };
 
-if (config.mode === 'mock') await reset();
-else resetReal();
+resetReal();
 
 const appRoot = document.getElementById('app');
 

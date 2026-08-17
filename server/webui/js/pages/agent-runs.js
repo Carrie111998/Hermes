@@ -5,7 +5,7 @@
 
 import { el, card, badge, button, fmt, pageHead, emptyState, kv, toast } from '../ui.js';
 import { call } from '../api.js';
-import { subscribe } from '../mocks/db.js';
+import { subscribe } from '../state.js';
 import { evidenceTable } from './admin-documents.js';
 
 const RUN_TYPE_LABELS = {

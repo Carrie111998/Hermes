@@ -22,7 +22,7 @@ import { installDom, resetDom, byText } from './dom-shim.mjs';
 
 const dom = installDom();
 
-const { db, resetReal } = await import('../../../server/webui/js/mocks/db.js');
+const { db, resetReal } = await import('../../../server/webui/js/state.js');
 const { config } = await import('../../../server/webui/js/api.js');
 const admin = await import('../../../server/webui/js/pages/admin.js');
 
@@ -159,7 +159,6 @@ async function click(node) {
 beforeEach(() => {
   resetDom(dom);
   resetReal();
-  config.mode = 'real';
   config.authHeader = null;
 });
 

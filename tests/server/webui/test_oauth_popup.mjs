@@ -555,7 +555,7 @@ test('Setup mailbox picker starts Google OAuth and refreshes the mailbox on succ
   };
 
   try {
-    const { resetReal } = await import(webuiModules.url('mocks/db.js'));
+    const { resetReal } = await import(webuiModules.url('state.js'));
     const { mount } = await import(webuiModules.url('pages/setup.js'));
     resetReal();
     const root = new FakeNode('main');

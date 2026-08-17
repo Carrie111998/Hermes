@@ -8,7 +8,7 @@ import {
 } from './ui.js';
 import { navigate } from './router.js';
 import { call, config } from './api.js';
-import { db, resetReal, subscribe } from './mocks/db.js';
+import { db, resetReal, subscribe } from './state.js';
 import { getSession, clearSession } from './session.js';
 import { askHermes, isHermesAvailable } from './hermes-client.js';
 

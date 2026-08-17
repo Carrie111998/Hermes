@@ -6,15 +6,6 @@
    declared in `routes` below, so the UI is already wired for the
    real backend.
 
-   Backend modes (config.mode):
-     'mock'   — every route served by js/mocks/handlers.js.
-     'hybrid' — real interfaze-api backend, except the logical names
-                in MOCK_ROUTES (UI-extra routes the spec/backend does
-                not implement, plus shape-deferred ones). Default.
-     'real'   — everything hits the backend (no mock fallback).
-   A real 404 is NEVER silently served from mocks — a legitimate
-   "not found" must surface as an error, not as demo data.
-
    Real-backend contract notes (see server/WEBUI_CONNECTION_PRD.md):
      - Bearer auth via config.authHeader (set at boot from session.js).
      - Backend list endpoints return bare arrays; they are wrapped to
@@ -28,9 +19,7 @@ import { adaptRequest, adaptResponse, normalizeResponseTimestamps } from './adap
 import { syncRealResponse } from './real-state.js';
 
 export const config = {
-  mode: 'real',              // production/test default; mock mode must be explicit
   baseUrl: '/api/v1',
-  latencyMs: [120, 420],     // simulated mock latency range
   authHeader: null,          // () => string | null
   beforeRequest: null,       // (req) => req
   refreshAuth: null,         // async () => replacement Authorization value
@@ -354,31 +343,6 @@ export const routes = {
   'analytics.market':           ['GET',    '/analytics/market-intelligence'],
 };
 
-/* ---------------- Hybrid mode: routes that stay on mocks ----------------
-   Two admission reasons only (PRD §4):
-   - UI-EXTRA: the route is a frontend addition beyond PRODUCT.md §7 and has
-     no backend implementation.
-   - DEFERRED: the backend route exists but the request/response shape (or
-     transport) is not adapted yet; flipping it early would break the page.
-   Shrink this set as phases land; never add try-real-fallback-mock logic. */
-export const MOCK_ROUTES = new Set();
-
-/* ---------------- Mock plumbing ---------------- */
-let _mockHandlers = null;
-async function loadMockHandlers() {
-  if (!_mockHandlers) {
-    const mod = await import('./mocks/handlers.js');
-    _mockHandlers = mod.handlers;
-  }
-  return _mockHandlers;
-}
-
-function randomDelay() {
-  const [lo, hi] = config.latencyMs;
-  const ms = lo + Math.random() * (hi - lo);
-  return new Promise(res => setTimeout(res, ms));
-}
-
 function interpolate(template, params = {}) {
   return template.replace(/:([A-Za-z]+)/g, (_, key) => {
     if (params[key] == null) throw new ApiError(`Missing path param :${key} for ${template}`, 400);
@@ -409,17 +373,6 @@ function responseFilename(header, fallback) {
 export async function call(name, { params, query, body } = {}) {
   const decl = routes[name];
   if (!decl) throw new ApiError(`Unknown API route '${name}'`, 400);
-  const [method, template] = decl;
-
-  const useMock = config.mode === 'mock' || (config.mode === 'hybrid' && MOCK_ROUTES.has(name));
-  if (useMock) {
-    const handlers = await loadMockHandlers();
-    const handler = handlers[name];
-    if (!handler) throw new ApiError(`Mock handler missing for '${name}' (${method} ${template})`, 501);
-    await randomDelay();
-    return handler({ params: params || {}, query: query || {}, body: body || null });
-  }
-
   return realCall(name, { params, query, body });
 }
 

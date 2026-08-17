@@ -1,14 +1,14 @@
 /* Login page — full-screen, outside the app shell. */
 
 import { el, field, input, button, setBusy, setFieldError, toast, passwordField, modal } from '../ui.js';
-import { call, config } from '../api.js';
+import { call } from '../api.js';
 import { setSession } from '../session.js';
 import { logoNode, destroyShell } from '../shell.js';
 
 export function mount(root, ctx) {
   destroyShell(); // returning from a logged-in session — rebuild shell next time
 
-  const emailInput = input({ type: 'email', value: config.mode === 'mock' ? 'meltem@silverine.com.tr' : '', autocomplete: 'username', required: true });
+  const emailInput = input({ type: 'email', autocomplete: 'username', required: true });
   const { wrap: passWrap, input: passInput } = passwordField({ placeholder: '••••••••', required: true });
   const submitBtn = button('Sign in', { kind: 'primary lg', onClick: null });
   submitBtn.style.width = '100%';
@@ -42,10 +42,7 @@ export function mount(root, ctx) {
         } catch (err) {
           toast(err.message || 'Password reset could not be started', 'error');
         }
-      } }, 'Forgot password?')),
-    config.mode === 'mock'
-      ? el('div', { class: 'ifz-login-note' }, 'Demo environment — any credentials sign in to the Silverine workspace. Accounts are provisioned by your interfaze administrator.')
-      : null);
+      } }, 'Forgot password?')));
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();

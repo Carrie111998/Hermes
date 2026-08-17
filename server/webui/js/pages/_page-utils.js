@@ -3,7 +3,7 @@ import {
   blobDownload, csvDownload,
 } from '../ui.js';
 import { call } from '../api.js';
-import { db } from '../mocks/db.js';
+import { db } from '../state.js';
 import { COUNTRY_NAMES, LANGUAGES, BUYER_INDUSTRIES } from '../catalog.js';
 
 export const SEND_MODES = [

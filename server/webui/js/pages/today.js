@@ -3,8 +3,8 @@
 import {
   el, icon, button, fmt, isApprovalActionable, runSentence,
 } from '../ui.js';
-import { call, config } from '../api.js';
-import { db } from '../mocks/db.js';
+import { call } from '../api.js';
+import { db } from '../state.js';
 import { COUNTRY_NAMES } from '../catalog.js';
 import { hermesApi } from '../hermes-client.js';
 import { renderMiniMap } from './lead-map.js';
@@ -124,7 +124,6 @@ function latestActivityHeading() {
 }
 
 function workCapability(health) {
-  if (config.mode === 'mock') return true;
   return health?.agent_runs_enabled === true;
 }
 

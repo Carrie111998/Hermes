@@ -818,10 +818,9 @@ def test_phase4_promoted_routes_and_exports_are_tenant_safe():
     assert logs.status_code == 200 and len(logs.json()) <= 2
 
 
-def test_real_mode_has_no_mock_routes_or_tenant_seed():
+def test_real_webui_has_no_mock_routes_or_tenant_seed():
     source = (ROOT / "server" / "webui" / "js" / "api.js").read_text(encoding="utf-8")
-    assert "mode: 'real'" in source
-    assert "export const MOCK_ROUTES = new Set();" in source
+    assert "return realCall(name, { params, query, body });" in source
     assert "requestBody instanceof FormData" in source
 
     # Phase 5 folded the onboarding wizard into Setup; document upload moved with it.
@@ -835,7 +834,7 @@ def test_real_mode_has_no_mock_routes_or_tenant_seed():
     assert "call('exports.download'" in helpers
     main = (ROOT / "server" / "webui" / "js" / "main.js").read_text(encoding="utf-8")
     assert "'X-Company-ID': companyId" in main
-    assert "else resetReal()" in main
+    assert "resetReal();" in main
     assert "homeRoute(session)" in main
     assert "config.refreshAuth" in main
     state = (ROOT / "server" / "webui" / "js" / "real-state.js").read_text(encoding="utf-8")
