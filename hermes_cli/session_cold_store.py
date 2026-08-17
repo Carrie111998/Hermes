@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import errno
 from hashlib import sha256
 import json
 import os
@@ -324,7 +325,9 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         _fsync_dir(staging)
         try:
             os.replace(staging, revision_dir)
-        except FileExistsError:
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
             if _valid_existing_revision(revision_dir, terminal_id, lineage, fingerprint):
                 _remove_staging(staging)
                 return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
