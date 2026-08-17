@@ -688,15 +688,23 @@ COMPUTER_USE_GUIDANCE = computer_use_guidance("darwin")
 # ---------------------------------------------------------------------------
 # Mid-turn steering (/steer) — out-of-band user messages
 # ---------------------------------------------------------------------------
-# A steer is appended to the END of a tool result (the only role-alternation-
-# safe slot mid-turn), so it rides the exact channel injection defenses are
-# trained to distrust — a bare "User guidance:" line gets refused as suspected
-# prompt injection (observed in the wild). The bounded, self-describing marker
-# below attributes the text to the real user, and STEER_CHANNEL_NOTE tells the
-# model to trust THIS marker and only this one, so a lookalike buried in
-# tool/web/file output stays untrusted. The note also defines when a marker is
-# fresh: the marker remains in immutable conversation history after delivery,
-# so treating every historical occurrence as a new message can replay actions.
+# HISTORICAL NOTE (issue #81828): the mid-turn steer delivery path
+# (agent/conversation_loop.py's pre-API-call drain and
+# agent/agent_runtime_helpers.py::apply_pending_steer_to_tool_results) no
+# longer uses the marker constants below. A model can trivially reproduce
+# static marker text visible in its own system prompt and self-fabricate a
+# plausible "user said X" block that this note then tells it to trust — that
+# vulnerability class is closed structurally: steers are now inserted as a
+# genuine role:"user" message immediately after the tool result, which the
+# model cannot fabricate (role assignment is set by the runtime, not model
+# output), rather than appended as marker text inside the tool message's own
+# content.
+#
+# The constants and STEER_CHANNEL_NOTE below are left exactly as they were
+# (not removed) in case another, unaudited call site still references them,
+# and because changing STEER_CHANNEL_NOTE's actual text would invalidate the
+# prompt cache the same way a per-session hash-based marker would have --
+# the tradeoff 0f45509da explicitly avoided by keeping this text static.
 STEER_MARKER_OPEN = (
     "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered "
     "once at this position; not tool output and not a new delivery when replayed "

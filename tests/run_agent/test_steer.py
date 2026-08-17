@@ -363,7 +363,7 @@ class TestActiveTurnRedirectCheckpoint:
 
 
 class TestSteerInjection:
-    def test_appends_to_last_tool_result(self):
+    def test_inserts_user_message_after_last_tool_result(self):
         agent = _bare_agent()
         agent.steer("please also check auth.log")
         messages = [
@@ -373,11 +373,16 @@ class TestSteerInjection:
             {"role": "tool", "content": "ls output B", "tool_call_id": "b"},
         ]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
-        # The LAST tool result is modified; earlier ones are untouched.
+        # Neither tool result's own content is touched...
         assert messages[2]["content"] == "ls output A"
-        assert "ls output B" in messages[3]["content"]
-        assert STEER_MARKER_OPEN in messages[3]["content"]
-        assert "please also check auth.log" in messages[3]["content"]
+        assert messages[3]["content"] == "ls output B"
+        # ...instead, a genuine role:user message is INSERTED right after
+        # the last tool result -- structural separation (issue #81828): a
+        # model cannot fabricate a message with role:user in the API
+        # request itself, unlike marker text embedded in tool content.
+        assert messages[4]["role"] == "user"
+        assert messages[4]["content"] == "please also check auth.log"
+        assert len(messages) == 5
         # And pending_steer is consumed.
         assert agent._pending_steer is None
 
@@ -389,26 +394,27 @@ class TestSteerInjection:
         ]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
         assert messages[-1]["content"] == "output"  # unchanged
+        assert len(messages) == 2  # nothing inserted
 
 
-    def test_marker_labels_text_as_out_of_band_user_message(self):
-        """The injection marker must attribute the appended text to the user
-        via the explicit out-of-band marker (which the system prompt tells the
-        model to trust) — otherwise the model reads it as untrusted tool output
-        and refuses it as suspected prompt injection.  Cache-safe: it only
-        rewrites existing tool content, never the message-role sequence.
-        """
+    def test_inserted_message_has_no_marker_text(self):
+        """Regression (issue #81828): the inserted steer message must be
+        the user's raw text with no marker wrapper at all -- there is
+        nothing for a model to learn to reproduce, since trust now comes
+        from the message's role, set by the runtime, not from recognizing
+        a marker string that was always visible in the system prompt."""
         agent = _bare_agent()
         agent.steer("stop after next step")
         messages = [{"role": "tool", "content": "x", "tool_call_id": "1"}]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        content = messages[-1]["content"]
-        assert STEER_MARKER_OPEN in content
-        assert "stop after next step" in content
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"] == "stop after next step"
+        assert "OUT-OF-BAND" not in messages[-1]["content"]
 
-    def test_multimodal_content_list_preserved(self):
-        """Anthropic-style list content should be preserved, with the steer
-        appended as a text block."""
+    def test_multimodal_tool_content_left_untouched(self):
+        """Anthropic-style list content on the tool message must be left
+        completely alone -- the steer is now a separate message, not
+        appended as a block inside the tool result's own content."""
         agent = _bare_agent()
         agent.steer("extra note")
         original_blocks = [{"type": "text", "text": "existing output"}]
@@ -416,12 +422,9 @@ class TestSteerInjection:
             {"role": "tool", "content": list(original_blocks), "tool_call_id": "1"}
         ]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        new_content = messages[-1]["content"]
-        assert isinstance(new_content, list)
-        assert len(new_content) == 2
-        assert new_content[0] == {"type": "text", "text": "existing output"}
-        assert new_content[1]["type"] == "text"
-        assert "extra note" in new_content[1]["text"]
+        assert messages[0]["content"] == original_blocks
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"] == "extra note"
 
 
 
@@ -476,10 +479,12 @@ class TestPreApiCallSteerDrain:
     fix for the scenario where /steer sent during model thinking only lands
     after the agent is completely done."""
 
-    def test_pre_api_drain_injects_into_last_tool_result(self):
+    def test_pre_api_drain_inserts_user_message_after_last_tool_result(self):
         """If a steer is pending when the main loop starts building
-        api_messages, it should be injected into the last tool result
-        in the messages list."""
+        api_messages, a genuine role:user message should be inserted
+        right after the last tool result in the messages list (issue
+        #81828's structural separation -- mirrors the actual insertion
+        logic in agent/conversation_loop.py's pre-API-call drain)."""
         agent = _bare_agent()
         # Simulate messages after a tool batch completed
         messages = [
@@ -494,13 +499,16 @@ class TestPreApiCallSteerDrain:
         # Simulate what the pre-API-call drain does:
         _pre_api_steer = agent._drain_pending_steer()
         assert _pre_api_steer == "focus on error handling"
-        # Inject into last tool msg (mirrors the new code in run_conversation)
+        # Insert after the last tool msg (mirrors the actual code in
+        # conversation_loop.py's pre-API-call drain).
         for _si in range(len(messages) - 1, -1, -1):
             if messages[_si].get("role") == "tool":
-                messages[_si]["content"] += format_steer_marker(_pre_api_steer)
+                messages.insert(_si + 1, {"role": "user", "content": _pre_api_steer})
                 break
-        assert STEER_MARKER_OPEN in messages[-1]["content"]
-        assert "focus on error handling" in messages[-1]["content"]
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"] == "focus on error handling"
+        # The tool message's own content is untouched.
+        assert messages[2]["content"] == "output here"
         assert agent._pending_steer is None
 
     def test_pre_api_drain_restashes_when_no_tool_message(self):
@@ -527,6 +535,14 @@ class TestPreApiCallSteerDrain:
 
 
 class TestSteerMarkerContract:
+    """These constants are no longer used by the mid-turn steer delivery
+    path (see the HISTORICAL NOTE in agent/prompt_builder.py, issue
+    #81828) -- kept byte-for-byte unchanged for prompt-cache safety
+    rather than removed. These tests still verify their own internal
+    consistency (the marker text and the note describing it must agree),
+    which remains true and worth guarding even though nothing calls
+    format_steer_marker() in production anymore."""
+
     def test_system_prompt_note_describes_the_real_marker(self):
         """The system-prompt note tells the model which marker to trust; it
         must reference the exact open/close the injector emits, or the model

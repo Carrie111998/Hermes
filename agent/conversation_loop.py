@@ -1995,22 +1995,20 @@ def run_conversation(
             for _si in range(len(messages) - 1, -1, -1):
                 _sm = messages[_si]
                 if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-                    marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
-                    if isinstance(existing, str):
-                        _sm["content"] = existing + marker
-                    else:
-                        # Multimodal content blocks — append text block
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            _sm["content"] = blocks
-                        except Exception:
-                            pass
+                    # Structural separation (issue #81828): insert as a
+                    # genuine role:user message right after the tool
+                    # result, rather than appending STEER_MARKER text
+                    # inside the tool message's own content. A model can
+                    # trivially reproduce the static marker text (it's
+                    # visible in its own system prompt) and self-fabricate
+                    # a plausible "user said X" block that STEER_CHANNEL_NOTE
+                    # then tells it to trust -- but it cannot fabricate a
+                    # message with role:user in the API request itself;
+                    # that's set by the runtime, not model output.
+                    messages.insert(_si + 1, {"role": "user", "content": _pre_api_steer})
                     _injected = True
                     logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
+                        "Pre-API-call steer drain: inserted role:user message after tool msg at index %d",
                         _si,
                     )
                     break
