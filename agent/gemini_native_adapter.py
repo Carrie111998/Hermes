@@ -809,7 +809,7 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
         if isinstance(fc, dict) and fc.get("name"):
             name = str(fc["name"])
             try:
-                args_str = json.dumps(fc.get("args") or {}, ensure_ascii=False, sort_keys=True)
+                args_str = json.dumps(fc.get("args") or {}, ensure_ascii=False)
             except (TypeError, ValueError):
                 args_str = "{}"
             thought_signature = part.get("thoughtSignature") if isinstance(part.get("thoughtSignature"), str) else ""
