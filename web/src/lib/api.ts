@@ -2245,6 +2245,11 @@ export interface CronJobMutation {
   context_from?: string[] | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  response_contract?: {
+    required_patterns?: string[];
+    forbidden_patterns?: string[];
+    on_failure?: "fail";
+  } | null;
 }
 
 export interface CronJob {
@@ -2275,6 +2280,12 @@ export interface CronJob {
   last_status?: string | null;
   last_error?: string | null;
   last_delivery_error?: string | null;
+  last_response_contract_error?: string | null;
+  response_contract?: {
+    required_patterns?: string[];
+    forbidden_patterns?: string[];
+    on_failure?: "fail";
+  } | null;
 }
 
 export interface CronDeliveryTarget {

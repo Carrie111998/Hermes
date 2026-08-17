@@ -147,6 +147,7 @@ function emptyCronJobForm(): CronJobEditorState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
+    response_contract: "",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
 }
@@ -288,6 +289,17 @@ function CronAdvancedFields({
             value={form.workdir}
             onChange={(e) => update("workdir", e.target.value)}
             placeholder="/absolute/project/path"
+          />
+        </div>
+
+        <div className="grid gap-1">
+          <Label htmlFor={`${idPrefix}-response-contract`}>Response contract (JSON)</Label>
+          <textarea
+            id={`${idPrefix}-response-contract`}
+            className="flex min-h-[96px] w-full border border-border bg-background/40 px-3 py-2 text-xs font-courier shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30 focus-visible:border-foreground/25"
+            placeholder='{"required_patterns":["preview"],"forbidden_patterns":["error"]}'
+            value={form.response_contract}
+            onChange={(e) => update("response_contract", e.target.value)}
           />
         </div>
 
@@ -685,7 +697,13 @@ export default function CronPage() {
   }, [resourceProfile]);
 
   const handleCreate = async () => {
-    const payload = buildCronJobPayloadFromEditor(createForm);
+    let payload;
+    try {
+      payload = buildCronJobPayloadFromEditor(createForm);
+    } catch (e) {
+      showToast(`${t.config.failedToSave}: ${e}`, "error");
+      return;
+    }
     if (
       !payload.schedule ||
       (!payload.no_agent && !cronJobHasExecutionContent(payload))
@@ -713,7 +731,13 @@ export default function CronPage() {
 
   const handleEdit = async () => {
     if (!editJob) return;
-    const payload = buildCronJobPayloadFromEditor(editForm);
+    let payload;
+    try {
+      payload = buildCronJobPayloadFromEditor(editForm);
+    } catch (e) {
+      showToast(`${t.config.failedToSave}: ${e}`, "error");
+      return;
+    }
     if (
       !payload.schedule ||
       (!payload.no_agent && !cronJobHasExecutionContent(payload))

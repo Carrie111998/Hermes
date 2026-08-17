@@ -246,6 +246,26 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_response_contract_is_exposed_in_job_details(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Prepare the actual sleep calendar update.",
+                schedule="every 1h",
+                response_contract={
+                    "required_patterns": ["prepare_actual_sleep_calendar_update"],
+                    "forbidden_patterns": ["actual_sleep_context"],
+                },
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["response_contract"] == {
+            "required_pattern_count": 1,
+            "forbidden_pattern_count": 1,
+            "on_failure": "fail",
+        }
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

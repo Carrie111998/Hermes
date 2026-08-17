@@ -236,6 +236,58 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     assert "Failed to create job: boom" in out
 
 
+def test_cron_create_forwards_response_contract(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: captured.update(kwargs)
+        or {
+            "success": True,
+            "job_id": "job-1",
+            "name": "refresh docs",
+            "schedule": "every day",
+            "next_run_at": "tomorrow",
+        },
+    )
+    args = SimpleNamespace(
+        schedule="every day",
+        prompt="refresh docs",
+        name=None,
+        deliver=None,
+        repeat=None,
+        skill=None,
+        skills=None,
+        script=None,
+        workdir=None,
+        no_agent=False,
+        response_contract='{"required_patterns": ["preview"]}',
+    )
+
+    assert cron_cli.cron_create(args) == 0
+    assert captured["response_contract"] == {"required_patterns": ["preview"]}
+
+
+def test_cron_create_rejects_non_object_response_contract(monkeypatch, capsys):
+    monkeypatch.setattr(cron_cli, "_cron_api", lambda **kwargs: pytest.fail("must not run"))
+    args = SimpleNamespace(
+        schedule="every day",
+        prompt="refresh docs",
+        name=None,
+        deliver=None,
+        repeat=None,
+        skill=None,
+        skills=None,
+        script=None,
+        workdir=None,
+        no_agent=False,
+        response_contract="[]",
+    )
+
+    assert cron_cli.cron_create(args) == 1
+    assert "JSON object" in capsys.readouterr().out
+
+
 class TestCronRunBackgroundDispatch:
     """`hermes cron run` must not report 'failed' when the run was dispatched
     to the background delegation worker.

@@ -24,6 +24,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
+    response_contract: "",
     ...overrides,
   };
 }
@@ -68,7 +69,22 @@ describe("buildCronJobPayload", () => {
       context_from: null,
       enabled_toolsets: null,
       workdir: null,
+      response_contract: null,
     });
+  });
+
+  it("parses an editable response contract", () => {
+    const payload = buildCronJobPayload(
+      form({ response_contract: '{"required_patterns":["preview"]}' }),
+    );
+
+    expect(payload.response_contract).toEqual({ required_patterns: ["preview"] });
+  });
+
+  it("rejects a non-object response contract", () => {
+    expect(() => buildCronJobPayload(form({ response_contract: "[]" }))).toThrow(
+      "Response contract must be a JSON object",
+    );
   });
 });
 
@@ -96,6 +112,7 @@ describe("cronJobFormFromJob", () => {
       schedule_display: "every 1h",
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
+      response_contract: "",
     };
 
     expect(cronJobFormFromJob(job)).toMatchObject({
@@ -103,6 +120,16 @@ describe("cronJobFormFromJob", () => {
       context_from: "upstream-a\nupstream-b",
       enabled_toolsets: ["web"],
     });
+  });
+
+  it("formats a stored response contract for editing", () => {
+    const job: CronJob = {
+      id: "contract-job",
+      enabled: true,
+      response_contract: { required_patterns: ["preview"] },
+    };
+
+    expect(cronJobFormFromJob(job).response_contract).toContain("preview");
   });
 
   it("prefers one-shot run_at over the human display string", () => {

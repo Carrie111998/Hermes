@@ -277,6 +277,17 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
 
+    def test_empty_response_contract_clears_existing_contract(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Check server status",
+            schedule="every 1h",
+            response_contract={"required_patterns": ["done"]},
+        )
+
+        updated = update_job(job["id"], {"response_contract": {}})
+
+        assert updated["response_contract"] is None
+
 
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):
@@ -483,6 +494,32 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
+
+    def test_response_contract_failure_has_distinct_status_and_error(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Report",
+            schedule="every 1h",
+            response_contract={"required_patterns": ["prepare_actual_sleep_calendar_update"]},
+        )
+
+        mark_job_run(
+            job["id"],
+            success=False,
+            error="Response contract failed: required response content is missing",
+            response_contract_error="required response content is missing",
+            status="response_contract_failed",
+        )
+
+        updated = get_job(job["id"])
+        assert updated["response_contract"] == {
+            "required_patterns": ["prepare_actual_sleep_calendar_update"],
+            "forbidden_patterns": [],
+            "on_failure": "fail",
+        }
+        assert updated["last_status"] == "response_contract_failed"
+        assert updated["last_response_contract_error"] == (
+            "required response content is missing"
+        )
 
 
     def test_recurring_cron_not_disabled_when_croniter_missing(self, tmp_cron_dir, monkeypatch):

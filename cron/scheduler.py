@@ -468,6 +468,35 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+
+def _validate_response_contract(job: dict, response: str) -> Optional[str]:
+    contract = job.get("response_contract")
+    if contract is None:
+        return None
+    if not isinstance(contract, dict) or contract.get("on_failure", "fail") != "fail":
+        return "stored response contract is invalid"
+
+    required_patterns = contract.get("required_patterns", [])
+    forbidden_patterns = contract.get("forbidden_patterns", [])
+    if not isinstance(required_patterns, list) or not isinstance(forbidden_patterns, list):
+        return "stored response contract is invalid"
+    if not required_patterns and not forbidden_patterns:
+        return "stored response contract is invalid"
+    if any(
+        not isinstance(pattern, str) or not pattern.strip()
+        for pattern in [*required_patterns, *forbidden_patterns]
+    ):
+        return "stored response contract is invalid"
+
+    missing = [pattern for pattern in required_patterns if pattern not in response]
+    matched = [pattern for pattern in forbidden_patterns if pattern in response]
+    details = []
+    if missing:
+        details.append("required response content is missing")
+    if matched:
+        details.append("forbidden response content is present")
+    return "; ".join(details) or None
+
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
 # system prompt *instructs* the agent to emit "[SILENT]", and real agents often
@@ -6007,15 +6036,9 @@ def _run_one_job_body(
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         blocked_config = False
+        response_contract_error = None
         side_effect_ownership_lost = False
         try:
-            with _side_effect_fence() as owns_output:
-                if not owns_output:
-                    raise _FireClaimLostDuringSideEffect
-                output_file = save_job_output(job["id"], output)
-            if verbose:
-                logger.info("Output saved to: %s", output_file)
-
             # If the gateway shutdown killed this job's tool subprocess
             # mid-flight (#60432), the agent may still have produced a
             # plausible-looking final_response from the truncated output --
@@ -6030,9 +6053,24 @@ def _run_one_job_body(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            if success:
+                response_contract_error = _validate_response_contract(job, final_response)
+                if response_contract_error:
+                    success = False
+                    error = f"Response contract failed: {response_contract_error}"
+
+            if not response_contract_error:
+                with _side_effect_fence() as owns_output:
+                    if not owns_output:
+                        raise _FireClaimLostDuringSideEffect
+                    output_file = save_job_output(job["id"], output)
+                if verbose:
+                    logger.info("Output saved to: %s", output_file)
+
             # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
+            # If the agent responded with [SILENT], skip delivery. Failed jobs
+            # normally deliver a failure alert, except contract failures: their
+            # output is neither saved nor delivered.
             #
             # Exception: a run blocked by pre-dispatch config validation
             # (T1-26) alerts exactly ONCE — the silent marker means the
@@ -6087,6 +6125,8 @@ def _run_one_job_body(
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
+            if response_contract_error:
+                should_deliver = False
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
             unresolved_origin = False
@@ -6197,10 +6237,14 @@ def _run_one_job_body(
             return True
 
         mark_kwargs = {"delivery_error": delivery_error}
+        if response_contract_error:
+            mark_kwargs["response_contract_error"] = response_contract_error
         if fire_owner is not None:
             mark_kwargs["expected_fire_owner"] = fire_owner
         if blocked_config:
             mark_kwargs["status"] = "blocked_config"
+        elif response_contract_error:
+            mark_kwargs["status"] = "response_contract_failed"
         marked = mark_job_run(job["id"], success, error, **mark_kwargs)
         if fire_owner is not None and not marked:
             finish_execution(

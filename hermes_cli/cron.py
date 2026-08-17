@@ -48,6 +48,18 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+def _parse_response_contract(value: Optional[str]):
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--response-contract must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("--response-contract must be a JSON object")
+    return parsed
+
+
 def _active_cron_provider_name() -> str:
     """Name of the resolved cron scheduler provider ('builtin', 'chronos', …).
 
@@ -348,6 +360,14 @@ def cron_create(args):
     # raises GatewayLifecycleBlocked, the `cronjob` tool wrapper catches it and
     # returns it as result["error"], and the `if not result.get("success")`
     # branch below prints it in red and exits 1 — same UX as before.
+    try:
+        response_contract = _parse_response_contract(
+            getattr(args, "response_contract", None)
+        )
+    except ValueError as exc:
+        print(color(str(exc), Colors.RED))
+        return 1
+
     result = _cron_api(
         action="create",
         schedule=args.schedule,
@@ -364,6 +384,7 @@ def cron_create(args):
         no_agent=getattr(args, "no_agent", False) or None,
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
+        response_contract=response_contract,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -419,6 +440,14 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    try:
+        response_contract = _parse_response_contract(
+            getattr(args, "response_contract", None)
+        )
+    except ValueError as exc:
+        print(color(str(exc), Colors.RED))
+        return 1
+
     result = _cron_api(
         action="update",
         job_id=args.job_id,
@@ -435,6 +464,7 @@ def cron_edit(args):
         no_agent=getattr(args, "no_agent", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
+        response_contract=response_contract,
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

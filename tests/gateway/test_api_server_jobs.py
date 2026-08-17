@@ -122,6 +122,7 @@ class TestCreateJob:
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
+                    "response_contract": {"required_patterns": ["preview"]},
                 }, headers={
                     "X-Forwarded-For": "203.0.113.11",
                     "User-Agent": "cron-client",
@@ -138,6 +139,7 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+                assert call_kwargs["response_contract"] == {"required_patterns": ["preview"]}
 
 
     @pytest.mark.asyncio
@@ -167,6 +169,25 @@ class TestCreateJob:
                 assert data["scheduler_registered"] is False
                 assert data["retry_create"] is False
                 assert "private callback URL and token" not in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_invalid_response_contract(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create",
+                side_effect=ValueError("response_contract.required_patterns must be a list"),
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "response_contract": {"required_patterns": "preview"},
+                })
+
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["error"] == "response_contract.required_patterns must be a list"
 
 
     @pytest.mark.asyncio
@@ -230,6 +251,7 @@ class TestUpdateJob:
                     f"/api/jobs/{VALID_JOB_ID}",
                     json={
                         "name": "new-name",
+                        "response_contract": {"forbidden_patterns": ["unsafe"]},
                         "evil_field": "malicious",
                         "__proto__": "hack",
                     },
@@ -240,6 +262,24 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+                assert sanitized["response_contract"] == {"forbidden_patterns": ["unsafe"]}
+
+    @pytest.mark.asyncio
+    async def test_update_job_rejects_invalid_response_contract(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update",
+                side_effect=ValueError("response_contract requires required_patterns or forbidden_patterns"),
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"response_contract": {}},
+                )
+
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["error"] == "response_contract requires required_patterns or forbidden_patterns"
 
 
 # ---------------------------------------------------------------------------
@@ -497,4 +537,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-

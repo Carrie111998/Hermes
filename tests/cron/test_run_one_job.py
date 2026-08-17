@@ -78,6 +78,100 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+@pytest.mark.parametrize(
+    ("response_contract", "contract_error"),
+    [
+        (
+            {
+                "required_patterns": ["prepare_actual_sleep_calendar_update"],
+                "on_failure": "fail",
+            },
+            "required response content is missing",
+        ),
+        (
+            {"required_patterns": [123], "on_failure": "fail"},
+            "stored response contract is invalid",
+        ),
+        (
+            {"forbidden_patterns": ["Calendar update"], "on_failure": "fail"},
+            "forbidden response content is present",
+        ),
+    ],
+)
+def test_run_one_job_response_contract_failure_suppresses_delivery(
+    monkeypatch, response_contract, contract_error
+):
+    delivered = []
+    marked = []
+    finished = []
+
+    monkeypatch.setattr(s, "create_execution", lambda *_a, **_kw: {"id": "exec-contract"})
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda *_a, **_kw: (True, "raw output", "Calendar update prepared", None),
+    )
+    saved = []
+    monkeypatch.setattr(
+        s,
+        "save_job_output",
+        lambda jid, out: saved.append((jid, out)) or f"/tmp/{jid}.txt",
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, **_kw: delivered.append((job["id"], content)),
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "contract-job",
+            "name": "weekly plan",
+            "deliver": "telegram",
+            "response_contract": response_contract,
+        }
+    ) is True
+
+    assert delivered == []
+    assert saved == []
+    assert marked == [
+        (
+            (
+                "contract-job",
+                False,
+                f"Response contract failed: {contract_error}",
+            ),
+            {
+                "delivery_error": None,
+                "response_contract_error": contract_error,
+                "status": "response_contract_failed",
+            },
+        )
+    ]
+    assert finished == [
+        (
+            ("exec-contract",),
+            {
+                "success": False,
+                "error": f"Response contract failed: {contract_error}",
+                "delivery_outcome": "suppressed",
+            },
+        )
+    ]
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
@@ -292,5 +386,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
-

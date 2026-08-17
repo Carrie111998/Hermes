@@ -1563,6 +1563,55 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_response_contract(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None or value == {}:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("response_contract must be an object")
+
+    unknown_fields = set(value) - {"required_patterns", "forbidden_patterns", "on_failure"}
+    if unknown_fields:
+        raise ValueError(
+            "response_contract has unsupported field(s): "
+            + ", ".join(sorted(unknown_fields))
+        )
+
+    def _patterns(field: str) -> List[str]:
+        raw_patterns = value.get(field, [])
+        if not isinstance(raw_patterns, list):
+            raise ValueError(f"response_contract.{field} must be a list of strings")
+        if len(raw_patterns) > 32:
+            raise ValueError(f"response_contract.{field} cannot contain more than 32 patterns")
+        normalized = []
+        for pattern in raw_patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError(
+                    f"response_contract.{field} must contain non-empty strings"
+                )
+            if len(pattern) > 512:
+                raise ValueError(
+                    f"response_contract.{field} patterns cannot exceed 512 characters"
+                )
+            normalized.append(pattern.strip())
+        return normalized
+
+    required_patterns = _patterns("required_patterns")
+    forbidden_patterns = _patterns("forbidden_patterns")
+    if not required_patterns and not forbidden_patterns:
+        raise ValueError(
+            "response_contract requires required_patterns or forbidden_patterns"
+        )
+
+    on_failure = value.get("on_failure", "fail")
+    if on_failure != "fail":
+        raise ValueError("response_contract.on_failure must be 'fail'")
+    return {
+        "required_patterns": required_patterns,
+        "forbidden_patterns": forbidden_patterns,
+        "on_failure": "fail",
+    }
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1668,6 +1717,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    response_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1761,6 +1811,7 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_response_contract = _normalize_response_contract(response_contract)
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -1854,6 +1905,8 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "last_response_contract_error": None,
+        "response_contract": normalized_response_contract,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1970,6 +2023,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = updates[_mon_field]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
+
+            if "response_contract" in updates:
+                updates["response_contract"] = _normalize_response_contract(
+                    updates["response_contract"]
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
@@ -2167,6 +2225,7 @@ def mark_job_run(
     delivery_error: Optional[str] = None,
     status: Optional[str] = None,
     *,
+    response_contract_error: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
@@ -2178,6 +2237,7 @@ def mark_job_run(
             error,
             delivery_error,
             status=status,
+            response_contract_error=response_contract_error,
             expected_fire_owner=expected_fire_owner,
         )
 
@@ -2240,6 +2300,7 @@ def _mark_job_run_locked(
     delivery_error: Optional[str] = None,
     *,
     status: Optional[str] = None,
+    response_contract_error: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
 ) -> bool:
     """
@@ -2284,6 +2345,7 @@ def _mark_job_run_locked(
                     job.pop("drift_alerted", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                job["last_response_contract_error"] = response_contract_error
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None

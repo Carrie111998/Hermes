@@ -40,6 +40,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument(
+        "--response-contract",
+        help="JSON response contract with required_patterns, forbidden_patterns, and optional on_failure=fail.",
+    )
+    cron_create.add_argument(
         "--skill",
         dest="skills",
         action="append",
@@ -116,6 +120,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
+    cron_edit.add_argument(
+        "--response-contract",
+        help="Replace the response contract with JSON. Pass {} to clear it.",
+    )
     cron_edit.add_argument(
         "--skill",
         dest="skills",
