@@ -94,6 +94,45 @@ cron:
 
 Or: `hermes config set cron.preflight false`
 
+### Delivering a named profile's cron through Default
+
+A named profile in a multiplexed deployment may intentionally have no messaging
+credential of its own. To let its completed cron reports use Default's messaging
+identity without copying Default's token into the named profile, enable the
+outbound broker in **Default's** `config.yaml`:
+
+```yaml
+gateway:
+  multiplex_profiles: true
+
+cron:
+  broker_outbound_via_default: true
+  broker_outbound_platforms:
+    - discord
+```
+
+Or configure it from Default's CLI:
+
+```bash
+hermes config set cron.broker_outbound_via_default true
+hermes config set cron.broker_outbound_platforms '["discord"]'
+```
+
+A named profile's healthy local transport remains authoritative; the broker is
+used only when that profile has no connected transport for the target platform.
+Brokered delivery runs through a sanitized `hermes -p default send` subprocess,
+so Default's credential is never copied into the specialist process. Only
+platforms with a standalone send path can be brokered.
+
+:::warning Outbound authority
+`broker_outbound_platforms` is a platform-wide outbound authority grant. An
+allowed named-profile cron can send to any valid target on that platform. Keep
+the allowlist narrow, and prefer explicit numeric targets such as
+`discord:123456789012345678` for unattended jobs. Brokered notifications are
+one-way and do not create or mirror a continuation session into Default's chat
+history.
+:::
+
 ## Letting unpinned jobs track global defaults
 
 The model/provider drift guard is enabled by default. If your unpinned cron
