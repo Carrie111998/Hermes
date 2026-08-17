@@ -20,6 +20,7 @@ from hermes_constants import (
     hermes_managed_node_tree_present,
     iter_hermes_node_dirs,
     is_container,
+    node_executable_present,
     node_tool_runnable,
     parse_reasoning_effort,
     reset_hermes_home_override,
@@ -495,6 +496,95 @@ class TestNodeToolRunnable:
         monkeypatch.setenv("PATH", str(system_bin))
 
         assert find_node_executable("npm") == str(managed_npm)
+
+
+class TestNodeExecutablePresent:
+    """``node_executable_present`` answers "installed?" without spawning.
+
+    ``find_node_executable`` runs ``<binary> --version`` (10s budget) and the
+    WhatsApp adapter then ran a second ``node --version`` (60s budget) on top of
+    it.  Both fired from ``load_gateway_config()`` -> ``_apply_env_overrides()``
+    -> ``deps_probe()``, i.e. from ordinary unit tests, where pyproject caps a
+    test at 30s and ``--timeout-method=thread`` hard-exits the interpreter
+    instead of failing the test — voiding the whole file's results.  These tests
+    pin the spawn-free contract; the "no subprocess" one is the load-bearing
+    assertion, and it asserts on the *call*, never on elapsed wall-clock, which
+    would pass on the broken code whenever the box happened to be idle.
+
+    ``sys.platform`` is forced to ``win32`` so the file-presence branch is
+    exercised identically on POSIX runners (the alternative arm consults
+    ``os.access(X_OK)``, which is what the neighbouring managed-node tests do).
+    """
+
+    def _no_spawn(self, monkeypatch):
+        """Make any subprocess creation an immediate, attributable failure."""
+        import subprocess
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                "node_executable_present spawned a subprocess: %r" % (args,)
+            )
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        monkeypatch.setattr(subprocess, "Popen", _boom)
+        monkeypatch.setattr(hermes_constants, "node_tool_runnable", _boom)
+
+    def test_managed_node_present_is_detected_without_running_it(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        node_dir = home / "node"
+        node_dir.mkdir(parents=True)
+        (node_dir / "node.exe").write_text("MZ")
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        self._no_spawn(monkeypatch)
+
+        assert node_executable_present("node") is True
+
+    def test_managed_tree_present_without_node_does_not_fall_back_to_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Mirrors ``find_node_executable``: a managed tree suppresses PATH."""
+        home = tmp_path / "hermes"
+        node_dir = home / "node"
+        node_dir.mkdir(parents=True)
+        # A managed tree exists (npm is there) but the requested command is not.
+        (node_dir / "npm.cmd").write_text("@echo off\n")
+        system_bin = tmp_path / "system-bin"
+        system_bin.mkdir()
+        (system_bin / "node.exe").write_text("MZ")
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(system_bin))
+        self._no_spawn(monkeypatch)
+
+        assert node_executable_present("node") is False
+
+    def test_falls_back_to_path_when_no_managed_tree(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        home.mkdir()
+        system_bin = tmp_path / "system-bin"
+        system_bin.mkdir()
+        (system_bin / "node.exe").write_text("MZ")
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(system_bin))
+        self._no_spawn(monkeypatch)
+
+        assert node_executable_present("node") is True
+
+    def test_absent_everywhere_is_false(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        home.mkdir()
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(empty))
+        self._no_spawn(monkeypatch)
+
+        assert node_executable_present("node") is False
 
 
 class TestIsContainer:

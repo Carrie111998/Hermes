@@ -5120,6 +5120,34 @@ class TestNewEndpoints:
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
 
+        # ``POST /api/profiles`` calls ``profiles.seed_profile_skills()``, which
+        # spawns a REAL Python interpreter (``python -c "…sync_skills()"``)
+        # under a ``timeout=60`` budget — DOUBLE pyproject's ``--timeout=30``
+        # pytest cap.  ``--timeout-method=thread`` does not fail such a test;
+        # ``pytest_timeout`` calls ``os._exit(1)``, killing the interpreter and
+        # destroying the summary line, so the runner parses the whole file as
+        # "no tests ran" (the failure that hid all 469 tests here until
+        # 427bfa9b6f).  Measured 7.1s of pure subprocess per call on an idle
+        # box — and process spawn on this host has been measured at 8.2s / 9.6s
+        # / 21.3s while idle elsewhere, so under load a handful of these clears
+        # 30s easily.  None of the tests below are testing skill seeding.
+        #
+        # The three that ARE (``…_without_clone_seeds_bundled_skills``,
+        # ``…_builder_fields_model_mcp_and_keep_skills``, ``…_keep_skills_*``)
+        # install their own fake over this one: a test-body ``monkeypatch``
+        # applies after the fixture's and is undone first.
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(
+            profiles_mod,
+            "seed_profile_skills",
+            lambda profile_dir, quiet=False: {
+                "copied": [],
+                "updated": [],
+                "user_modified": [],
+            },
+        )
+
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
