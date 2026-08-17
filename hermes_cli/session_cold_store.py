@@ -55,10 +55,9 @@ def _connection(db: SessionDB) -> sqlite3.Connection:
 
 def _safe_component(value: str) -> str:
     raw = str(value or "")
-    safe = re.sub(r"[^A-Za-z0-9_-]", "_", raw.strip()).strip("._")[:96] or "session"
-    if raw == safe:
-        return safe
-    return f"{safe}_{sha256(raw.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}"
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", raw).strip("._")[:96] or "session"
+    digest = sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"{safe}_{digest}"
 
 
 def _rows(conn: sqlite3.Connection, query: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:

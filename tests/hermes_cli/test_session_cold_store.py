@@ -42,7 +42,7 @@ def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
             / f"{started:%Y}"
             / f"{started:%m}"
             / f"{started:%d}"
-            / "terminal"
+            / cold_store._safe_component("terminal")
         )
         assert result.snapshot_dir == expected_snapshot
         assert {path.name for path in result.snapshot_dir.iterdir()} == {
@@ -111,6 +111,13 @@ def test_store_keeps_distinct_ids_that_only_differ_by_trailing_space(
         ).read_text(encoding="utf-8")
     finally:
         db.close()
+
+
+def test_safe_component_reserves_the_hash_suffix_namespace() -> None:
+    """A generated component cannot collide with an already-safe literal ID."""
+    generated = cold_store._safe_component("foo ")
+
+    assert cold_store._safe_component(generated) != generated
 
 
 def test_store_rejects_a_compression_ancestor_when_a_tip_exists(tmp_path: Path) -> None:
@@ -267,14 +274,22 @@ def test_store_does_not_use_old_snapshot_after_replacement(tmp_path: Path) -> No
         replacement = store_archived_lineage(db, "terminal", archive_root)
 
         assert replacement.snapshot_dir == first.snapshot_dir == (
-            archive_root / "sessions" / "started" / "2026" / "01" / "02" / "terminal"
+            archive_root
+            / "sessions"
+            / "started"
+            / "2026"
+            / "01"
+            / "02"
+            / cold_store._safe_component("terminal")
         )
         current_metadata = json.loads(
             (replacement.snapshot_dir / "metadata.json").read_text(encoding="utf-8")
         )
         assert current_metadata["source_fingerprint"] == replacement.source_fingerprint
         assert current_metadata["source_fingerprint"] != first.source_fingerprint
-        assert list(archive_root.rglob("terminal")) == [replacement.snapshot_dir]
+        assert list(archive_root.rglob(cold_store._safe_component("terminal"))) == [
+            replacement.snapshot_dir
+        ]
         payloads = list(archive_root.rglob("session.jsonl"))
         assert payloads == [replacement.snapshot_dir / "session.jsonl"]
         assert "new payload marker" in payloads[0].read_text(encoding="utf-8")
