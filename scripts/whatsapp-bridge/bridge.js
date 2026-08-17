@@ -388,6 +388,23 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
+// Exponential reconnect backoff so a flapping WhatsApp connection (428/503
+// close loops) doesn't hammer reconnect at a flat 3s forever. 3s → 6s → 12s
+// → 24s → 48s → 60s (cap), each + up to 1s jitter; the counter resets on a
+// successful 'open'. 515 (server-requested restart) is benign — fast retry
+// and reset the backoff.
+let reconnectAttempt = 0;
+function reconnectDelayMs(reason) {
+  if (reason === 515) {
+    reconnectAttempt = 0;
+    return 1000;
+  }
+  const exp = Math.min(reconnectAttempt, 5);
+  const base = Math.min(60000, 3000 * 2 ** exp);
+  reconnectAttempt += 1;
+  return base + Math.floor(Math.random() * 1000);
+}
+
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
   try {
@@ -446,18 +463,20 @@ async function startSocket() {
         process.exit(1);
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
+        const delay = reconnectDelayMs(reason);
         emitPairEvent({ event: 'disconnected', reason });
         if (!PAIR_JSON) {
           if (reason === 515) {
             console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
           } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in ${(delay / 1000).toFixed(1)}s...`);
           }
         }
-        scheduleReconnect(reason === 515 ? 1000 : 3000);
+        scheduleReconnect(delay);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectAttempt = 0;
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
