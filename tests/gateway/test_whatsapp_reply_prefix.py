@@ -82,6 +82,19 @@ class TestAdapterInit:
         adapter = WhatsAppAdapter(config)
         assert adapter._reply_prefix == "Bot\\n"
 
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [(True, True), (False, False), ("yes", True), ("false", False)],
+    )
+    def test_read_receipt_boolean_coercion(self, configured, expected):
+        from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+        adapter = WhatsAppAdapter(
+            PlatformConfig(enabled=True, extra={"send_read_receipts": configured})
+        )
+
+        assert adapter._send_read_receipts is expected
+
 
 class TestReadReceiptPolicyOrdering:
     @pytest.mark.asyncio

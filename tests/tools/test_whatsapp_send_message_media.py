@@ -16,7 +16,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.config import Platform
 from plugins.platforms.whatsapp.adapter import _bridge_media_type, _standalone_send
+from tools.send_message_tool import _send_to_platform
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +172,33 @@ def test_standalone_oversight_blocks_non_home_before_http():
 
     with patch("aiohttp.ClientSession") as session:
         result = asyncio.run(_standalone_send(config, "15550002222", "contact"))
+
+    assert result["success"] is True
+    assert result["suppressed"] is True
+    assert result["reason"] == "oversight_outbound_policy"
+    session.assert_not_called()
+
+
+def test_send_message_path_surfaces_oversight_suppression():
+    config = SimpleNamespace(
+        token="",
+        extra={
+            "bridge_port": 3000,
+            "oversight_mode": True,
+            "respond_as_owner": False,
+        },
+        home_channel=SimpleNamespace(chat_id="15550001111@s.whatsapp.net"),
+    )
+
+    with patch("aiohttp.ClientSession") as session:
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.WHATSAPP,
+                config,
+                "15550002222",
+                "contact",
+            )
+        )
 
     assert result["success"] is True
     assert result["suppressed"] is True

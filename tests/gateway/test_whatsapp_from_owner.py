@@ -192,3 +192,21 @@ def test_documented_oversight_yaml_shape_loads_home_and_policy(monkeypatch, tmp_
     assert config.extra["forward_owner_messages"] is True
 
 
+def test_home_channel_only_does_not_enable_whatsapp(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("WHATSAPP_ENABLED", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        """whatsapp:
+  home_channel:
+    chat_id: "15550001111@s.whatsapp.net"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config().platforms[Platform.WHATSAPP]
+
+    assert config.enabled is False
+    assert config.home_channel is not None
+    assert config.home_channel.chat_id == "15550001111@s.whatsapp.net"
+
+

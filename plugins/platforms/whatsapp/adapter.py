@@ -486,10 +486,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._allow_from = self._coerce_allow_list(allow_raw)
         self._group_policy = str(config.extra.get("group_policy") or _wenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
-        read_receipts = config.extra.get("send_read_receipts", False)
-        self._send_read_receipts = (
-            read_receipts if isinstance(read_receipts, bool)
-            else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
+        self._send_read_receipts = _coerce_config_bool(
+            config.extra.get("send_read_receipts"), False
         )
         self._oversight_mode = self._coerce_bool_extra("oversight_mode", False)
         self._respond_as_owner = self._coerce_bool_extra("respond_as_owner", False)
