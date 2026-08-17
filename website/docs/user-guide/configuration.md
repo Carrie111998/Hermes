@@ -2017,6 +2017,7 @@ The final prompt is sent to the configured STT provider alongside the audio file
 voice:
   record_key: "ctrl+b"         # Push-to-talk key inside the CLI
   max_recording_seconds: 120    # Hard stop for long recordings
+  conversation_idle_timeout_seconds: 600 # Desktop continuous voice: close mic after no user speech (0 = disabled)
   auto_tts: false               # Enable spoken replies automatically when /voice on
   beep_enabled: true            # Play record start/stop beeps in CLI voice mode
   beep_volume: 0.3              # Beep amplitude (0.0-1.0); raise it on quiet systems / headphones
