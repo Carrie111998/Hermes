@@ -1077,6 +1077,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
+        if (
+            _profile_scoped_config_load()
+            and "thread_activity_indicator" not in self.config.extra
+        ):
+            self._thread_activity_indicator_enabled_value = (
+                self._thread_activity_indicator_enabled()
+            )
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
@@ -3359,7 +3366,28 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _thread_activity_indicator_enabled(self) -> bool:
         """Return whether opt-in thread-title activity is enabled."""
-        return os.getenv("DISCORD_THREAD_ACTIVITY_INDICATOR", "false").lower() in {
+        cached = getattr(self, "_thread_activity_indicator_enabled_value", None)
+        if isinstance(cached, bool):
+            return cached
+        extra = (
+            self.config.extra
+            if isinstance(getattr(self.config, "extra", None), dict)
+            else {}
+        )
+        if "thread_activity_indicator" in extra:
+            configured = extra["thread_activity_indicator"]
+            if isinstance(configured, bool):
+                return configured
+            raw = (
+                configured.strip().lower()
+                if isinstance(configured, str)
+                else str(configured).lower()
+            )
+        else:
+            raw = _scoped_gate_env(
+                "DISCORD_THREAD_ACTIVITY_INDICATOR", "false"
+            ).lower()
+        return raw in {
             "true",
             "1",
             "yes",
@@ -10678,13 +10706,26 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
-    if (
-        "thread_activity_indicator" in discord_cfg
-        and not os.getenv("DISCORD_THREAD_ACTIVITY_INDICATOR")
-    ):
-        os.environ["DISCORD_THREAD_ACTIVITY_INDICATOR"] = str(
-            discord_cfg["thread_activity_indicator"]
-        ).lower()
+    _missing = object()
+    thread_activity_cfg = (
+        discord_cfg["thread_activity_indicator"]
+        if "thread_activity_indicator" in discord_cfg
+        else platform_extra_cfg.get("thread_activity_indicator", _missing)
+    )
+    if thread_activity_cfg is _missing:
+        if _skip_env_bridge:
+            seeded_extra["thread_activity_indicator"] = False
+    else:
+        effective_thread_activity_cfg = thread_activity_cfg
+        if not _skip_env_bridge:
+            env_override = os.getenv("DISCORD_THREAD_ACTIVITY_INDICATOR")
+            if env_override:
+                effective_thread_activity_cfg = env_override
+            else:
+                os.environ["DISCORD_THREAD_ACTIVITY_INDICATOR"] = str(
+                    thread_activity_cfg
+                ).lower()
+        seeded_extra["thread_activity_indicator"] = effective_thread_activity_cfg
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
