@@ -33,11 +33,12 @@ export const config = {
 };
 
 export class ApiError extends Error {
-  constructor(message, status = 500, code = null) {
+  constructor(message, status = 500, code = null, details = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -112,6 +113,7 @@ export const routes = {
 
   // 7.7 Products
   'products.list':                ['GET',    '/products'],
+  'products.import':              ['POST',   '/products/import'],
   'products.create':              ['POST',   '/products'],
   'products.get':                 ['GET',    '/products/:productId'],
   'products.update':              ['PATCH',  '/products/:productId'],
@@ -441,7 +443,8 @@ async function realCall(name, { params, query, body, authOverride, authRetried =
   let payload = null;
   try { payload = await res.json(); } catch { /* non-JSON body */ }
   if (!res.ok) {
-    throw new ApiError(errorMessage(payload) || `${method} ${url} failed (${res.status})`, res.status, payload?.code);
+    throw new ApiError(errorMessage(payload) || `${method} ${url} failed (${res.status})`, res.status,
+      payload?.code, payload);
   }
   if (Array.isArray(payload)) payload = { items: payload, total: payload.length };
   const adapted = normalizeResponseTimestamps(

@@ -198,6 +198,17 @@ function showError(node, copy) {
   node.focus?.({ preventScroll: true });
 }
 
+function productImportError(error) {
+  const errors = error?.details?.detail?.errors || error?.details?.errors;
+  if (!Array.isArray(errors) || !errors.length) {
+    return "We couldn't import this catalog. Check the file and try again.";
+  }
+  return errors.map(({ row_number, field, message }) => {
+    const row = row_number ? `Row ${row_number}` : 'File';
+    return `${row} — ${String(field || 'file').replace(/_/g, ' ')}: ${message || 'Invalid value'}`;
+  }).join(' ');
+}
+
 function marketSelector(selected = [], { max = 0, onChange } = {}) {
   const values = new Set(selected.filter(Boolean));
   const picker = select([
@@ -750,6 +761,29 @@ export async function mount(root, ctx) {
       disabled: done,
     });
     const error = errorLine();
+    const catalogFile = input({ type: 'file', accept: '.csv,.json,application/json' });
+    const importError = errorLine();
+    const importCatalog = button('Import catalog', { icon: 'file', disabled: true });
+    catalogFile.addEventListener('change', () => {
+      importCatalog.disabled = !catalogFile.files?.[0];
+      importError.hidden = true;
+    });
+    importCatalog.addEventListener('click', async () => {
+      const selected = catalogFile.files?.[0];
+      if (!selected) return;
+      setBusy(importCatalog, true, 'Importing…');
+      const body = new FormData();
+      body.append('file', selected, selected.name || 'catalog.csv');
+      try {
+        const result = await call('products.import', { body });
+        state.products = itemsOf(result.products);
+        render();
+        toast(`${result.imported} ${result.imported === 1 ? 'product' : 'products'} imported.`, 'success');
+      } catch (caught) {
+        setBusy(importCatalog, false);
+        showError(importError, productImportError(caught));
+      }
+    });
     confirm.addEventListener('click', async () => {
       if (!state.products.length) {
         showError(error, 'Add at least one product before continuing.');
@@ -793,6 +827,10 @@ export async function mount(root, ctx) {
     return el('div', {},
       el('p', { class: 'ifz-setup-editor-intro' },
         'Keep this list focused on products you can actively export.'),
+      el('div', { class: 'ifz-setup-editor-actions' },
+        field('Import product catalog (CSV or JSON)', catalogFile),
+        importCatalog),
+      importError,
       list,
       error,
       el('div', { class: 'ifz-setup-editor-actions' },

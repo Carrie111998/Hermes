@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal
 from ..db import Database, json_dump, json_load, new_id, now
+from ..product_import import ProductImportConflict, ProductImportValidationError, import_products, parse_product_catalog
 from ..schemas import DataPatch
 
 
@@ -226,6 +227,24 @@ def create_product(body: ProductCreate, request: Request, principal: Principal =
             raise HTTPException(409, "A product with this name already exists") from exc
         raise
     return _product(request.app.state.db.one("SELECT * FROM products WHERE id=?", (product_id,)))
+
+
+@router.post("/products/import", status_code=201)
+async def import_product_catalog(
+    request: Request,
+    file: UploadFile = File(...),
+    principal: Principal = Depends(current_principal),
+    x_company_id: str | None = Header(default=None),
+):
+    """Add a customer-supplied CSV or JSON catalog without partial imports."""
+    try:
+        rows = parse_product_catalog(file.filename or "", await file.read())
+    except ProductImportValidationError as exc:
+        raise HTTPException(422, {"errors": exc.errors}) from exc
+    try:
+        return import_products(request.app.state.db, _scope(principal, x_company_id), rows)
+    except ProductImportConflict as exc:
+        raise HTTPException(409, {"errors": exc.errors}) from exc
 
 
 @router.get("/products/{product_id}")

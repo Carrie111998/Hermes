@@ -125,6 +125,7 @@ export function syncRealResponse(name, payload, { params = {}, query = {} } = {}
   else if (name === 'admin.errors') replaceAdmin('errors', payload);
   else if (name === 'admin.logs') replaceAdmin('logs', payload);
   else if (name === 'products.list') replace('products', payload);
+  else if (name === 'products.import') replace('products', { items: payload?.products || [] });
   else if (['products.create', 'products.get', 'products.update'].includes(name)) upsert('products', payload);
   else if (name === 'products.delete') remove('products', params.productId);
   else if (name === 'documents.list') replace('documents', payload);

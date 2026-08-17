@@ -392,6 +392,10 @@ export async function adaptResponse(name, payload, { realCall, body }) {
   if (name === 'contacts.list') return mapItems(payload, contact);
   if (['contacts.create', 'contacts.get', 'contacts.update'].includes(name)) return contact(payload);
   if (name === 'products.list') return mapItems(payload, product);
+  if (name === 'products.import') return {
+    ...(payload || {}),
+    products: (payload?.products || []).map(product),
+  };
   if (['products.create', 'products.get', 'products.update'].includes(name)) return product(payload);
   if (name === 'documents.list') return mapItems(payload, document);
   if (['documents.upload', 'documents.get', 'documents.processingStatus'].includes(name)) return document(payload);
