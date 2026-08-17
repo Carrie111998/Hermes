@@ -92,5 +92,5 @@ test('ActiveNowStrip renders above the roster, is a live region, and is click-ac
   // a list key; a `key:` prop leaves chips unkeyed (index identity).
   assert.match(source, /\}, bot\.name\)\s*\}\)\s*\]\s*\}\)\s*\}\s*\/\*\* Assign a bot to a group/s)
   assert.match(source, /jsx\(BotFace,\s*\{[\s\S]*?mood: 'work'/)
-  assert.match(source, /openBotCanonicalChat\(bot\.name, allMeta\[bot\.name\]\?\.chat\)/)
+  assert.match(source, /openBotCanonicalChat\(bot\.name, allMeta\[bot\.name\]\?\.chat, bot\.last_session\)/)
 })

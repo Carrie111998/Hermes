@@ -25,18 +25,23 @@ function loadCanonicalRecovery({ openSession, request }) {
   return { ...context.__canonical, saved }
 }
 
-test('regression: an empty session list clears a stale pin and creates a replacement', async () => {
+test('regression: a definitively-gone pin with no history clears and creates a replacement', async () => {
+  // New contract (hermes-agent#88200): the pin is verified through the
+  // backend's precise preferred_session resolver — NOT a paginated,
+  // hidden-excluding session.list window. preferred_session=null is the
+  // definitive "this session is gone"; with no previewed history to
+  // re-anchor on, recovery clears the pin and creates a fresh chat.
   const opened = []
   const runtime = loadCanonicalRecovery({
     openSession: async id => opened.push(id),
     request: async method => {
-      if (method === 'session.list') return { sessions: [] }
+      if (method === 'profiles.list') return { profiles: [{ name: 'ops', preferred_session: null }] }
       if (method === 'session.create') return { stored_session_id: 'replacement', session_id: 'replacement-runtime' }
       return {}
     }
   })
 
-  assert.equal(await runtime.openBotCanonicalChat('ops', 'stale-pin'), 'replacement')
+  assert.equal(await runtime.openBotCanonicalChat('ops', 'stale-pin', null), 'replacement')
   assert.deepEqual(opened, ['replacement'])
   assert.deepEqual(JSON.parse(JSON.stringify(runtime.saved)), [
     { name: 'ops', patch: { chat: null } },

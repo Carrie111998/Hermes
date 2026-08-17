@@ -123,7 +123,7 @@ test('sessions workspace: an in-flight open cannot restore selection after gatew
 })
 
 test('source contract: the primary bot click keeps canonical chat while Sessions is secondary', () => {
-  assert.match(pluginSource, /const open = async \(\) => \{[\s\S]*openBotCanonicalChat\(bot\.name, meta\?\.chat\)/)
+  assert.match(pluginSource, /const open = async \(\) => \{[\s\S]*openBotCanonicalChat\(bot\.name, meta\?\.chat, bot\.last_session\)/)
   assert.match(pluginSource, /openBotSessionsWorkspace\(bot\)[\s\S]*children: 'Sessions'/)
 })
 

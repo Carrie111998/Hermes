@@ -2031,13 +2031,32 @@ function PetTab({ image, onImage }) {
  *  Gates every SOUL.md protocol append below. */
 let serverInjectsProtocol = false
 
+/** Pins to resolve precisely on the next roster poll: {profile: chatId}.
+ *  The backend answers "what about THIS conversation" per entry
+ *  (preferred_session), so a row's preview can describe the same session its
+ *  click opens (hermes-agent#88200). Unknown params are ignored by older
+ *  gateways, which simply omit the field. */
+function preferredSessionIds(allMeta) {
+  const pins = {}
+  for (const [name, meta] of Object.entries(allMeta || {})) {
+    if (meta?.chat) {
+      pins[name] = meta.chat
+    }
+  }
+  return pins
+}
+
 function useRoster() {
   return useQuery({
     queryKey: ROSTER_KEY,
     queryFn: async () => {
       // Rich rows (last_session, ui_meta, has_avatar) come from the ACTIVE
       // gateway's profiles.list — unchanged single-source behavior.
-      const local = await host.request('profiles.list', {})
+      const pins = preferredSessionIds($botMeta.get())
+      const local = await host.request(
+        'profiles.list',
+        Object.keys(pins).length ? { preferred_session_ids: pins } : {}
+      )
       // Newer backends inject the teammate-messaging protocol into every
       // session's system prompt (agent.bot_mode_protocol) — SOUL.md must not
       // carry a second copy. Older gateways lack the flag: keep appending.
@@ -2218,39 +2237,94 @@ function createCanonicalChat(name) {
   return run
 }
 
-async function openBotCanonicalChat(name, pinned) {
-  let id = pinned
-
-  if (!id) {
+/** Open the bot's ONE forever chat and return the opened id (or the pin).
+ *
+ *  Identity rules (hermes-agent#88200 — the row must open the session its
+ *  preview describes):
+ *  - grandfather: no pin + existing history adopts the previewed session
+ *    (`history`, the roster's last_session for this bot) instead of minting
+ *    a new empty chat;
+ *  - a live pin is verified through the backend's precise preferred_session
+ *    resolver (hidden rows still resolve; compression lineages resolve to
+ *    the live tip) — never inferred from a paginated, hidden-excluding
+ *    session.list window, which misjudged real hidden pins as gone;
+ *  - transient lookup failures keep the pin: try the stored id as-is, and
+ *    only a rejected open enters recovery. */
+async function openBotCanonicalChat(name, pinned, history) {
+  if (!pinned) {
+    // Grandfather: adopt the conversation the row already previews.
+    const adoptId = history?.id
+    if (adoptId && typeof host.openSession === 'function') {
+      try {
+        await host.openSession(adoptId, { profile: name })
+        saveBotMeta(name, { chat: adoptId })
+        return adoptId
+      } catch {
+        // Adoption raced a vanishing session — fall through to creation.
+      }
+    }
     return createCanonicalChat(name)
   }
 
+  // Precise verification. An older gateway ignores the unknown param and
+  // omits the key — that reads as a lookup failure below, NOT as a missing
+  // session, so legacy backends keep the try-as-is escape hatch.
+  let preferred
+  let lookupFailed = false
   try {
-    const res = await host.request('session.list', { profile: name, limit: 100 })
-    const rows = res?.sessions ?? []
+    const res = await host.request('profiles.list', {
+      include_sessions: true,
+      preferred_session_ids: { [name]: pinned }
+    })
+    const row = (res?.profiles ?? []).find(p => p.name === name)
+    preferred = row?.preferred_session
+    if (preferred === undefined) {
+      lookupFailed = true
+    }
+  } catch {
+    lookupFailed = true
+  }
 
-    if (!rows.length) {
+  if (lookupFailed) {
+    // Transient gateway state (or an older backend): the pin is innocent
+    // until proven guilty — try it as-is, and only a rejected open clears.
+    try {
+      await host.openSession(pinned, { profile: name })
+      return pinned
+    } catch {
       saveBotMeta(name, { chat: null })
       return createCanonicalChat(name)
     }
+  }
 
-    if (!rows.some(session => session.id === id)) {
-      id = rows[0].id
-      saveBotMeta(name, { chat: id })
+  if (preferred) {
+    try {
+      await host.openSession(preferred.resolved_id || preferred.id, { profile: name })
+      return pinned
+    } catch (error) {
+      // The precise lookup JUST confirmed this session exists, so a failed
+      // open is transient (reconnect, backend restart). Clearing the pin or
+      // minting a replacement here would fork the bot's forever-chat on
+      // every hiccup — report and keep everything as it is.
+      host.notifyError?.(error, `Could not open ${name}'s chat — try again`)
+      return pinned
     }
-  } catch {
-    // Gateway hiccup — try the stored pin as-is.
   }
 
-  try {
-    await host.openSession(id, { profile: name })
-    return id
-  } catch {
-    // A rejected resume means the pin is unusable even if list recovery was
-    // inconclusive. Clear it first so a failed replacement can be retried.
-    saveBotMeta(name, { chat: null })
-    return createCanonicalChat(name)
+  // Definitively gone (db reset, or the lineage was rewritten past
+  // recovery): re-anchor on the previewed session when there is one.
+  const recoveryId = history?.id
+  if (recoveryId && typeof host.openSession === 'function') {
+    try {
+      await host.openSession(recoveryId, { profile: name })
+      saveBotMeta(name, { chat: recoveryId })
+      return recoveryId
+    } catch {
+      // Fall through to a fresh chat.
+    }
   }
+  saveBotMeta(name, { chat: null })
+  return createCanonicalChat(name)
 }
 
 function displayName(bot, meta) {
@@ -3043,11 +3117,16 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const unread = Boolean(useValue($botUnread)[bot.name])
   // WHO sent the last message (bot-to-bot DM vs human) — the full stored
   // history lives in the Sessions workspace (context menu), not inline.
-  const { fromBot } = previewKind(last?.preview)
+  // Preview identity must match click identity (#88200): when the backend
+  // resolved the pinned canonical chat, preview THAT session — not the
+  // profile's most recent (but unrelated) activity. Liveness checks above
+  // keep last_session semantics: any recent activity means the bot is alive.
+  const previewSession = bot.preferred_session || last
+  const { fromBot } = previewKind(previewSession?.preview)
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const displayPreview = fromBot
-    ? (last?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
-    : last?.preview || bot.description || 'No conversations yet — say hi'
+    ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
+    : previewSession?.preview || bot.description || 'No conversations yet — say hi'
 
   const warm = () => {
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
@@ -3106,7 +3185,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     }
 
     try {
-      const id = await openBotCanonicalChat(bot.name, meta?.chat)
+      const id = await openBotCanonicalChat(bot.name, meta?.chat, bot.last_session)
 
       if (id) {
         return
@@ -6285,7 +6364,7 @@ function BotsPane() {
             $botUnread.set(next)
           }
 
-          void openBotCanonicalChat(bot.name, allMeta[bot.name]?.chat).catch(() => {
+          void openBotCanonicalChat(bot.name, allMeta[bot.name]?.chat, bot.last_session).catch(() => {
             if (typeof host.newChat === 'function') {
               host.newChat(bot.name)
             }
