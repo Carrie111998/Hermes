@@ -3060,6 +3060,22 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
+            # Capture the live UI return address before spawning. Local process
+            # readers may emit output immediately, and the durable session key can
+            # rotate later during compression while this process keeps running.
+            try:
+                from gateway.session_context import get_session_env
+
+                origin_ui_session_id = get_session_env(
+                    "HERMES_UI_SESSION_ID", ""
+                ) or ""
+            except Exception as exc:
+                logger.debug(
+                    "Unable to capture the background process UI session: %s",
+                    exc,
+                )
+                origin_ui_session_id = ""
+
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
@@ -3073,6 +3089,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        origin_ui_session_id=origin_ui_session_id,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
                     )
@@ -3083,6 +3100,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        origin_ui_session_id=origin_ui_session_id,
                     )
 
                 result_data = {
@@ -3290,6 +3308,7 @@ def terminal_tool(
                             "session_id": proc_session.id,
                             "check_interval": 5,
                             "session_key": session_key,
+                            "origin_ui_session_id": origin_ui_session_id,
                             "platform": proc_session.watcher_platform,
                             "chat_id": proc_session.watcher_chat_id,
                             "user_id": proc_session.watcher_user_id,
