@@ -3,6 +3,10 @@
 import pytest
 from unittest.mock import patch
 
+# Calls resolve_copilot_token, which reaches exchange_copilot_token, so it opts
+# out of the autouse stub. Safe because the HTTP layer is stubbed beneath it.
+pytestmark = pytest.mark.real_provider_auth_probe
+
 
 class TestTokenValidation:
     """Token type validation."""

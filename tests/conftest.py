@@ -1203,42 +1203,96 @@ _LOCAL_SERVER_PROBE_ATTRS = {
 
 # Single-element list for the same reason as ``_PID_SCAN_ALLOW_REAL``: the
 # closures below mutate the same cell the fixture writes.
-_LOCAL_SERVER_PROBE_ALLOW_REAL = [False]
+# ── provider-auth probe guard ──────────────────────────────────────────────
+#
+# Same disease, different organ, and a worse prognosis: these reach the PUBLIC
+# INTERNET, not localhost.
+#
+#   hermes_cli/auth.py:653      detect_zai_endpoint
+#   hermes_cli/copilot_auth.py  exchange_copilot_token
+#
+# ``detect_zai_endpoint`` httpx.post()s a real ``{"messages":[{"role":"user",
+# "content":"ping"}]}`` completion to every entry of ZAI_ENDPOINTS x
+# probe_models at 8 s each; ``exchange_copilot_token`` GETs
+# api.github.com/copilot_internal/v2/token with whatever raw token it was
+# handed. A connect trace over tests/hermes_cli/test_api_key_providers.py
+# (2026-08-17, unmarked, no network stubs) recorded 19 outbound TLS connections
+# to 128.14.14.140/141, 122.10.144.213, 156.59.101.94 and 140.82.113.6.
+#
+# That makes an ordinary test run depend on someone else's uptime, leak the
+# fact of the run to two third parties, and — with a real key in the
+# environment — spend the developer's quota. The latency is only the symptom
+# people notice.
+#
+# Marker is SEPARATE from real_local_server_probe on purpose: a test that wants
+# the real local-server waterfall has no business also re-enabling live calls
+# to z.ai and GitHub.
+
+_REAL_PROVIDER_AUTH_PROBE_MARK = "real_provider_auth_probe"
 
 
-def _install_local_server_probe_guard(module):
-    """Replace each network-probing attr with a call-time dispatcher.
+def _copilot_exchange_unavailable(*_args, **_kwargs):
+    """Stub for ``exchange_copilot_token``.
 
-    Idempotent per attr, and per-attr fault isolated — one attr disappearing in
-    a refactor must not leave the others unguarded. Exceptions are swallowed so
-    a conftest bug cannot break imports for the whole suite; the canaries in
-    tests/test_live_system_guard_self_test.py are what turn a silent failure
-    here into one loud red test.
+    Raises rather than returning a sentinel because that IS the function's
+    documented contract — "Raises ``ValueError`` on failure" — and its return
+    type ``tuple[str, float, Optional[str]]`` has no in-band "no token" value.
     """
-    for attr, stub_factory in _LOCAL_SERVER_PROBE_ATTRS.items():
-        try:
-            real = getattr(module, attr, None)
-            if real is None or getattr(real, "_hermes_local_server_probe_guard", False):
+    raise ValueError(
+        "exchange_copilot_token is stubbed in tests (it calls api.github.com); "
+        "mark the test @pytest.mark.real_provider_auth_probe to opt out"
+    )
+
+
+class _NetworkProbeGuard:
+    """One arm-at-import / decide-at-call guard over a set of module attributes.
+
+    Parameterised because there is more than one family of network probe to
+    neutralise and they need INDEPENDENT opt-out markers. Same mechanism as the
+    gateway PID-scan guard above, and for the same reason — the target modules
+    are expensive to import, so the fixture must not touch them.
+
+    Doubles as its own ``sys.meta_path`` finder: ``find_spec`` returns None
+    after a single dict lookup for every module it does not target, so
+    unrelated imports keep paying only the ~646 ns/call that guard measured.
+    """
+
+    def __init__(self, marker, targets, tag):
+        self.marker = marker
+        self.targets = targets      # {module name: {attr: zero-arg stub}}
+        self.tag = tag              # attribute stamped on each wrapper
+        self.allow_real = [False]   # list so the closures share the cell
+
+    def install(self, module_name, module):
+        """Replace each probing attr with a call-time dispatcher.
+
+        Idempotent per attr, and per-attr fault isolated — one attr disappearing
+        in a refactor must not leave the others unguarded. Exceptions are
+        swallowed so a conftest bug cannot break imports for the whole suite;
+        the canaries in tests/test_live_system_guard_self_test.py are what turn
+        a silent failure here into one loud red test.
+        """
+        allow_real, tag = self.allow_real, self.tag
+        for attr, stub in self.targets.get(module_name, {}).items():
+            try:
+                real = getattr(module, attr, None)
+                if real is None or getattr(real, tag, False):
+                    continue
+
+                def _guarded(*args, _real=real, _stub=stub, **kwargs):
+                    if allow_real[0]:
+                        return _real(*args, **kwargs)
+                    return _stub()
+
+                # Deliberately NOT functools.wraps — see the PID-scan guard.
+                setattr(_guarded, tag, True)
+                _guarded._hermes_probe_real = real
+                setattr(module, attr, _guarded)
+            except Exception:
                 continue
 
-            def _guarded(*args, _real=real, _stub=stub_factory, **kwargs):
-                if _LOCAL_SERVER_PROBE_ALLOW_REAL[0]:
-                    return _real(*args, **kwargs)
-                return _stub()
-
-            # Deliberately NOT functools.wraps — see the PID-scan guard above.
-            _guarded._hermes_local_server_probe_guard = True
-            _guarded._hermes_local_server_probe_real = real
-            setattr(module, attr, _guarded)
-        except Exception:
-            continue
-
-
-class _LocalServerProbeGuardFinder:
-    """Patch ``agent.model_metadata`` the moment it is first imported."""
-
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != _LOCAL_SERVER_PROBE_TARGET_MODULE:
+        if fullname not in self.targets:
             return None
         try:
             for finder in sys.meta_path:
@@ -1249,15 +1303,46 @@ class _LocalServerProbeGuardFinder:
                     continue
                 _orig_exec = spec.loader.exec_module
 
-                def _patched_exec(module, _orig_exec=_orig_exec):
+                def _patched_exec(module, _orig_exec=_orig_exec, _name=fullname):
                     _orig_exec(module)
-                    _install_local_server_probe_guard(module)
+                    self.install(_name, module)
 
                 spec.loader.exec_module = _patched_exec
                 return spec
         except Exception:
             return None
         return None
+
+    def arm(self):
+        """Patch what is already imported, then catch every later first-import."""
+        for name in self.targets:
+            already = sys.modules.get(name)
+            if already is not None:
+                self.install(name, already)
+        sys.meta_path.insert(0, self)
+
+
+_LOCAL_SERVER_PROBE_GUARD = _NetworkProbeGuard(
+    marker=_REAL_LOCAL_SERVER_PROBE_MARK,
+    targets={_LOCAL_SERVER_PROBE_TARGET_MODULE: _LOCAL_SERVER_PROBE_ATTRS},
+    tag="_hermes_local_server_probe_guard",
+)
+
+_PROVIDER_AUTH_PROBE_GUARD = _NetworkProbeGuard(
+    marker=_REAL_PROVIDER_AUTH_PROBE_MARK,
+    targets={
+        "hermes_cli.auth": {
+            # Optional[Dict[str, str]]; None == "no endpoint accepted this key".
+            "detect_zai_endpoint": lambda: None,
+        },
+        "hermes_cli.copilot_auth": {
+            "exchange_copilot_token": _copilot_exchange_unavailable,
+        },
+    },
+    tag="_hermes_provider_auth_probe_guard",
+)
+
+_NETWORK_PROBE_GUARDS = (_LOCAL_SERVER_PROBE_GUARD, _PROVIDER_AUTH_PROBE_GUARD)
 
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
@@ -1273,6 +1358,13 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_REAL_LOCAL_SERVER_PROBE_MARK}: opt out of the autouse stub that "
         "neutralises agent.model_metadata's four network probes (for tests of "
         "the probes themselves, which stub httpx beneath them).",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{_REAL_PROVIDER_AUTH_PROBE_MARK}: opt out of the autouse stub that "
+        "neutralises hermes_cli.auth.detect_zai_endpoint and "
+        "hermes_cli.copilot_auth.exchange_copilot_token (for tests of those "
+        "probes, which stub the HTTP layer beneath them).",
     )
     config.addinivalue_line(
         "markers",
@@ -1296,11 +1388,9 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
             _install_pid_scan_guard(_already_imported, _guarded)
     sys.meta_path.insert(0, _PidScanGuardFinder())
 
-    # Same two-step for the local-server probes.
-    _mm_already_imported = sys.modules.get(_LOCAL_SERVER_PROBE_TARGET_MODULE)
-    if _mm_already_imported is not None:
-        _install_local_server_probe_guard(_mm_already_imported)
-    sys.meta_path.insert(0, _LocalServerProbeGuardFinder())
+    # Same two-step for every network-probe guard.
+    for _guard in _NETWORK_PROBE_GUARDS:
+        _guard.arm()
 
     # The pyproject addopts pin ``--timeout-method=signal`` relies on
     # ``signal.SIGALRM``, which does not exist on Windows — pytest-timeout
@@ -2257,27 +2347,32 @@ def _pid_scan_guard(request):
 
 
 @pytest.fixture(autouse=True)
-def _local_server_probe_guard(request):
-    """Choose whether this test may probe a local model server over the network.
+def _network_probe_guards(request):
+    """Choose whether this test may reach the network through a guarded probe.
 
-    The wrappers are installed at import time by
-    ``_LocalServerProbeGuardFinder``; this fixture only flips the flag they read
-    at call time. No import, no ``sys.modules`` lookup, no monkeypatch — so it
-    cannot regress tests/test_conftest_import_cost.py.
+    Covers both guards — ``real_local_server_probe`` (agent.model_metadata,
+    localhost) and ``real_provider_auth_probe`` (hermes_cli.auth /
+    copilot_auth, the public internet). They are independent: opting out of one
+    leaves the other stubbed, because wanting the real local-server waterfall
+    is no reason to also start calling z.ai and api.github.com for real.
 
-    Tests of the probes themselves opt out with
-    ``@pytest.mark.real_local_server_probe``. Those are already hermetic
-    because they stub ``httpx`` *beneath* the probe, so they never reach the
-    network either — the same shape as the ``real_gateway_pid_scan`` opt-outs,
-    which stub the process-table source beneath the scanner.
+    The wrappers are installed at import time by each guard's ``find_spec``;
+    this fixture only flips the flag they read at call time. No import, no
+    ``sys.modules`` lookup, no monkeypatch — so it cannot regress
+    tests/test_conftest_import_cost.py.
+
+    The opt-out tests are already hermetic: they stub the HTTP layer *beneath*
+    the probe, so they never reach the network either — the same shape as the
+    ``real_gateway_pid_scan`` opt-outs, which stub the process-table source
+    beneath the scanner.
     """
-    _LOCAL_SERVER_PROBE_ALLOW_REAL[0] = (
-        request.node.get_closest_marker(_REAL_LOCAL_SERVER_PROBE_MARK) is not None
-    )
+    for guard in _NETWORK_PROBE_GUARDS:
+        guard.allow_real[0] = request.node.get_closest_marker(guard.marker) is not None
     try:
         yield
     finally:
-        _LOCAL_SERVER_PROBE_ALLOW_REAL[0] = False
+        for guard in _NETWORK_PROBE_GUARDS:
+            guard.allow_real[0] = False
 
 
 @pytest.hookimpl(tryfirst=True)

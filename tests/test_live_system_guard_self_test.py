@@ -1077,3 +1077,88 @@ def test_real_dashboard_pid_scan_marker_restores_the_scanner(monkeypatch):
         "the real_dashboard_pid_scan marker did not restore the real scanner"
     )
     assert pids.scan_ok is True
+
+
+# ──────────────────── provider-auth probe guard ────────────────────
+#
+# Sibling canary for the second _NetworkProbeGuard. Where the local-server
+# guard is about latency against localhost, this one is about an unmarked test
+# calling the PUBLIC INTERNET: detect_zai_endpoint POSTs a real completion to
+# every z.ai endpoint it knows, and exchange_copilot_token GETs
+# api.github.com/copilot_internal/v2/token. A connect trace over
+# tests/hermes_cli/test_api_key_providers.py on 2026-08-17 recorded 19 outbound
+# TLS connections to 128.14.14.140/141, 122.10.144.213, 156.59.101.94 and
+# 140.82.113.6 before this guard existed.
+#
+# A silently-uninstalled guard here does not merely slow the suite down: it
+# leaks the fact of the run to two third parties and, with a real key in the
+# environment, spends the developer's quota. Hence a canary.
+
+
+def test_provider_auth_probes_are_stubbed_by_default():
+    """No unmarked test may call z.ai or api.github.com."""
+    import hermes_cli.auth as auth
+    import hermes_cli.copilot_auth as copilot_auth
+
+    for module, attr in (
+        (auth, "detect_zai_endpoint"),
+        (copilot_auth, "exchange_copilot_token"),
+    ):
+        assert getattr(getattr(module, attr), "_hermes_provider_auth_probe_guard", False), (
+            f"the provider-auth guard is not installed on {attr} — an unmarked "
+            "test can reach a third-party API"
+        )
+
+    started = time.perf_counter()
+    assert auth.detect_zai_endpoint("test-key-not-real") is None
+    # Raising IS this one's contract: its return type has no "no token" value.
+    with pytest.raises(ValueError, match="stubbed in tests"):
+        copilot_auth.exchange_copilot_token("ghu_not_a_real_token")
+    assert time.perf_counter() - started < 0.5, (
+        "the stub took long enough to have reached the network"
+    )
+
+
+@pytest.mark.real_local_server_probe
+def test_the_two_probe_markers_are_independent():
+    """Opting into the local-server probe must NOT unstub the internet calls.
+
+    The guards deliberately carry separate flags. Wanting the real localhost
+    waterfall is no reason to start calling z.ai for real, and a single shared
+    flag would silently grant both.
+    """
+    import hermes_cli.auth as auth
+
+    assert auth.detect_zai_endpoint("test-key-not-real") is None
+
+
+@pytest.mark.real_provider_auth_probe
+def test_real_provider_auth_probe_marker_restores_the_probe(monkeypatch):
+    """Tests of the probes themselves must still get the real implementation.
+
+    Asserts by BEHAVIOUR with the HTTP layer replaced one level beneath, for
+    the same reason as the gateway-scanner canary: the wrapper stays installed
+    under the marker and delegates at call time, so an identity check would be
+    both wrong and vacuous. No request leaves the machine — ``auth.httpx`` is
+    swapped for a namespace whose ``post`` returns a canned 200.
+    """
+    import types
+
+    import hermes_cli.auth as auth
+
+    class _Resp:
+        status_code = 200
+
+    posted = []
+
+    def _fake_post(url, **kwargs):
+        posted.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(auth, "httpx", types.SimpleNamespace(post=_fake_post))
+
+    result = auth.detect_zai_endpoint("test-key-not-real")
+    assert posted, "the real probe never issued a request"
+    assert result is not None and result["id"] == "global", (
+        "the real_provider_auth_probe marker did not restore the real probe"
+    )

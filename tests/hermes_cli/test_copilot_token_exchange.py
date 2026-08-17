@@ -8,6 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# This file tests the exchange itself, so it opts out of the autouse stub that
+# makes exchange_copilot_token raise for everyone else. Safe because every test
+# here stubs the HTTP layer beneath it — no request reaches api.github.com.
+pytestmark = pytest.mark.real_provider_auth_probe
+
 
 @pytest.fixture(autouse=True)
 def _clear_jwt_cache():
