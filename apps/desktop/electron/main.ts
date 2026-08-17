@@ -6179,6 +6179,34 @@ function installZoomShortcuts(window) {
   })
 }
 
+export function installReloadShortcut(window) {
+  // The application menu (which carries the reload/forceReload roles with
+  // their Cmd+R/Ctrl+R accelerators) is deliberately null on Windows/Linux
+  // (see buildApplicationMenu / setApplicationMenu(null) in app.whenReady).
+  // Without a fallback, Ctrl+R and F5 are unbound on those platforms — the
+  // only reload path left is restarting the whole app (#37917). Mirror the
+  // zoom-shortcut pattern: claim the chords in a before-input-event hook so
+  // the renderer never sees them, then reload the webContents directly.
+  window.webContents.on('before-input-event', (event, input) => {
+    if (window.isDestroyed()) {
+      return
+    }
+
+    const key = String(input.key || '').toLowerCase()
+
+    const isReloadChord =
+      (key === 'r' && (IS_MAC ? input.meta : input.control) && !input.alt && !input.shift) ||
+      (input.key === 'F5' && !input.control && !input.meta && !input.alt && !input.shift)
+
+    if (!isReloadChord) {
+      return
+    }
+
+    event.preventDefault()
+    window.webContents.reload()
+  })
+}
+
 function installContextMenu(window) {
   window.webContents.on('context-menu', (_event, params) => {
     const template = []
@@ -10456,6 +10484,7 @@ async function startHermes() {
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
+  installReloadShortcut(win)
 
   // Claim Ctrl/Cmd+F in the main process — on Pop!_OS / GNOME-based Linux
   // distros the Ctrl+F keydown does not reach the renderer's `view.findInPage`
