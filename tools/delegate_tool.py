@@ -2631,12 +2631,28 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+            # Inject agent skill_path as env var for skill_view filtering
+            _agent_skill_path = getattr(child, "_agent_skill_path", None)
+            _prev_skill_path = None
+            if _agent_skill_path:
+                _prev_skill_path = os.environ.get("HERMES_SKILL_PATH")
+                os.environ["HERMES_SKILL_PATH"] = str(_agent_skill_path)
+                from agent.agent_debug import log_env_inject
+                log_env_inject("HERMES_SKILL_PATH", str(_agent_skill_path))
+            try:
+                with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+            finally:
+                # Restore previous env
+                if _agent_skill_path:
+                    if _prev_skill_path is not None:
+                        os.environ["HERMES_SKILL_PATH"] = _prev_skill_path
+                    else:
+                        os.environ.pop("HERMES_SKILL_PATH", None)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3485,25 +3501,28 @@ def delegate_task(
     _agent_def = None
     if agent:
         try:
-            from agent.agent_registry import get_agent_registry
-            _agent_def = get_agent_registry().get_agent(agent)
+            from agent.agent_debug import log_delegate_start, log_registry_load, log_registry_lookup, log_error
+            log_delegate_start(agent or "", goal or "")
+            from agent.agent_registry import get_agent_registry, load_agents_from_config
+            from hermes_cli.config import load_config
+            registry = get_agent_registry()
+            # Always try to load if empty
+            if not registry.agents:
+                try:
+                    cfg = load_config()
+                    n = load_agents_from_config(cfg)
+                    log_registry_load("config", n, list(registry.agents.keys()))
+                except Exception as exc:
+                    log_error("config_load", str(exc))
+                from pathlib import Path
+                for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
+                    if d.exists():
+                        n = registry.load_from_directory(d)
+                        log_registry_load(str(d), n, list(registry.agents.keys()))
+            _agent_def = registry.get_agent(agent)
+            log_registry_lookup(agent or "", _agent_def is not None, len(registry.agents))
             if _agent_def is None:
-                # Try loading from default locations
-                registry = get_agent_registry()
-                if not registry._loaded:
-                    from pathlib import Path
-                    from hermes_cli.config import load_config
-                    try:
-                        cfg = load_config()
-                        registry.load_from_config(cfg)
-                    except Exception:
-                        pass
-                    for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
-                        if d.exists():
-                            registry.load_from_directory(d)
-                _agent_def = registry.get_agent(agent)
-            if _agent_def is None:
-                return tool_error(f"Agent '{agent}' not found in .hermes/agents/ or .agents/")
+                return tool_error(f"Agent '{agent}' not found. Registry has: {list(registry.agents.keys()) if registry.agents else 'empty'}")
         except Exception as exc:
             logger.debug("Failed to load agent '%s': %s", agent, exc)
             return tool_error(f"Failed to load agent '{agent}': {exc}")
@@ -3617,16 +3636,16 @@ def delegate_task(
         # Max tokens
         if _agent_def.max_tokens and _agent_def.max_tokens != 4096:
             creds["max_output_tokens"] = _agent_def.max_tokens
-        # Context length (via request_overrides)
-        if _agent_def.context_length and _agent_def.context_length > 0:
-            if "request_overrides" not in creds or not creds["request_overrides"]:
-                creds["request_overrides"] = {}
-            creds["request_overrides"]["context_length"] = _agent_def.context_length
         # Compression settings
         if _agent_def.compression_threshold > 0:
             creds["compression_threshold"] = _agent_def.compression_threshold
         if _agent_def.compression_target_ratio > 0:
             creds["compression_target_ratio"] = _agent_def.compression_target_ratio
+        # Skill path and skills filter
+        if _agent_def.skill_path:
+            creds["skill_path"] = _agent_def.skill_path
+        if _agent_def.skills:
+            creds["agent_skills"] = _agent_def.skills
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3659,6 +3678,12 @@ def delegate_task(
         if _agent_def and _agent_def.prompt:
             _agent_header = f"[Agent: {_agent_def.name}]\n{_agent_def.prompt}\n\n"
             _effective_context = _agent_header + (context or "")
+        # Add skill_path info to context
+        if _agent_def and _agent_def.skill_path:
+            _skill_info = f"[Skill path: {_agent_def.skill_path}]\n"
+            if _agent_def.skills:
+                _skill_info += f"[Skills: {', '.join(_agent_def.skills)}]\n"
+            _effective_context = _skill_info + (_effective_context or "")
         single_task: Dict[str, Any] = {"goal": goal, "context": _effective_context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
@@ -3803,6 +3828,14 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
+        # Attach agent skill_path for skill_view filtering
+        if _agent_def and _agent_def.skill_path:
+            try:
+                child._agent_skill_path = Path(_agent_def.skill_path)
+                from agent.agent_debug import log_skill_path as _log_sp
+                _log_sp(_agent_def.name, _agent_def.skill_path, _agent_def.skills)
+            except Exception:
+                logger.debug("Could not attach skill_path to child %d", i)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures

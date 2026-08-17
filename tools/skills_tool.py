@@ -152,7 +152,18 @@ def _skills_dir() -> Path:
     set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
     external patchers, but when it has not been patched, resolve from the live
     profile-scoped HERMES_HOME on every call.
+
+    If HERMES_SKILL_PATH is set (per-agent skill_path), use that instead.
     """
+    # Per-agent skill_path override (set by delegate_task)
+    agent_skill_path = os.environ.get("HERMES_SKILL_PATH", "").strip()
+    if agent_skill_path:
+        try:
+            from agent.agent_debug import _write as _dbg_write
+            _dbg_write(f"SKILL_DIR using HERMES_SKILL_PATH={agent_skill_path}")
+        except Exception:
+            pass
+        return Path(agent_skill_path)
     configured = Path(SKILLS_DIR)
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured

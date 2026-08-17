@@ -134,6 +134,7 @@ compression_threshold: 0.0   # 0 = inherit from config (e.g. 0.50 = compress at 
 compression_target_ratio: 0.0  # 0 = inherit from config (e.g. 0.20 = keep 20% as tail)
 tools: [read_file, search_files, terminal]
 skills: []
+skill_path:              # empty = default ~/.hermes/skills (e.g. ~/.hermes/skills/caveman)
 max_depth: 3
 timeout: 300
 ---

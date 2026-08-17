@@ -34,6 +34,7 @@ class AgentDefinition:
     # Capabilities
     tools: List[str] = field(default_factory=list)
     skills: List[str] = field(default_factory=list)
+    skill_path: str = ""  # empty = default ~/.hermes/skills
     disabled_toolsets: List[str] = field(default_factory=list)
     
     # Delegation
@@ -65,6 +66,7 @@ class AgentDefinition:
             "compression_target_ratio": self.compression_target_ratio,
             "tools": self.tools,
             "skills": self.skills,
+            "skill_path": self.skill_path,
             "disabled_toolsets": self.disabled_toolsets,
             "max_depth": self.max_depth,
             "timeout": self.timeout,
@@ -141,6 +143,7 @@ def parse_agent_file(file_path: Path) -> Optional[AgentDefinition]:
             skills = [s.strip() for s in skills.split(',')]
         elif not isinstance(skills, list):
             skills = []
+        skill_path = str(frontmatter.get('skill_path', ''))
         
         disabled_toolsets = frontmatter.get('disabled_toolsets', [])
         if isinstance(disabled_toolsets, str):
@@ -168,6 +171,7 @@ def parse_agent_file(file_path: Path) -> Optional[AgentDefinition]:
             compression_target_ratio=compression_target_ratio,
             tools=tools,
             skills=skills,
+            skill_path=skill_path,
             disabled_toolsets=disabled_toolsets,
             max_depth=max_depth,
             timeout=timeout,
