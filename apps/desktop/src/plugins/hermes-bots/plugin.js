@@ -5436,6 +5436,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   const [name, setName] = useState('')
   const [instruction, setInstruction] = useState('')
   const [sched, setSched] = useState(defaultScheduleState())
+  const [continuity, setContinuity] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const activeProfile = useValue(host.state.profile)
@@ -5445,6 +5446,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
     setName('')
     setInstruction('')
     setSched(defaultScheduleState())
+    setContinuity(false)
     setBusy(false)
     setError(null)
   }
@@ -5477,7 +5479,8 @@ function CreateRoutineDialog({ bot, open, onClose }) {
         schedule: schedule.trim(),
         prompt: routinePrompt(bot, title, task, activeProfile),
         ...(bot ? { profile: bot } : {}),
-        ...(repeatN ? { repeat: repeatN } : {})
+        ...(repeatN ? { repeat: repeatN } : {}),
+        ...(continuity ? { continuity: true } : {})
       })
       await invalidateRoutineOwner(bot)
       host.notify({ kind: 'success', message: `Cronjob "${title}" scheduled` })
@@ -5530,6 +5533,18 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               })
             ),
             labeled('When to run', jsx(SchedulePicker, { state: sched, setState: setSched })),
+            jsxs('label', {
+              className: 'flex items-center gap-2 text-xs text-(--ui-text-tertiary) cursor-pointer select-none',
+              children: [
+                jsx('input', {
+                  type: 'checkbox',
+                  className: 'accent-(--ui-accent)',
+                  checked: continuity,
+                  onChange: event => setContinuity(event.target.checked)
+                }),
+                'Continuity: each run sees the previous run\u2019s output (dedupe, continue where it left off)'
+              ]
+            }),
             error
               ? jsx('div', {
                   className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-accent)',
