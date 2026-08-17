@@ -35,6 +35,7 @@ from obs.oauth_llm import codex_structured_invoke
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from hermes_constants import get_default_hermes_root
 from obs import get_tracer
 
 from ._critic_prompts import (
@@ -68,14 +69,66 @@ _TRACER = get_tracer("hermes.critic")
 
 # Diego mandate 2026-04-24: ONLY gpt-5.5 via OAuth across the whole platform.
 DEFAULT_MODEL = os.environ.get("HERMES_CRITIC_MODEL", "gpt-5.5")
-HERMES = Path.home() / ".hermes"
-DIFF_REPORTS_DIR = HERMES / "profiles" / "matcher-shadow" / "workspace" / "diff-reports"
-ALLOWED_KNOBS_PATH = HERMES / "profiles" / "critic" / "allowed_knobs.json"
-CHANGELOG_PATH = HERMES / "profiles" / "critic" / "workspace" / "changelog.jsonl"
-REVERSALS_DIR = HERMES / "profiles" / "critic" / "workspace" / "reversals"
-RETROS_DIR = HERMES / "profiles" / "critic" / "workspace" / "retros"
-WHATSAPP_QUEUE = HERMES / "profiles" / "critic" / "workspace" / "whatsapp_queue.jsonl"
-PROPOSAL_MAILBOX = HERMES / "mailbox" / "main" / "inbox"
+# On-disk locations. FUNCTIONS, not module constants, and resolved through
+# get_default_hermes_root() rather than Path.home() -- same fix as graphs/jobflow.py,
+# and both halves are load-bearing:
+#
+#   * Path.home() BYPASSES the HERMES_HOME redirect tests/conftest.py installs.
+#   * A module-level constant binds at IMPORT time, and conftest sets HERMES_HOME
+#     in an autouse fixture that runs AFTER import -- so the right resolver in a
+#     constant would still snapshot the wrong root.
+#
+# get_default_hermes_root() and NOT get_hermes_home(): every path below is rooted
+# at ~/.hermes itself. get_hermes_home() returns <root>/profiles/<name>, which
+# would yield .../profiles/main/profiles/critic/... here.
+#
+# Production paths are unchanged; only tests move. Pinned by
+# tests/graphs/test_critic_paths.py.
+
+
+def _hermes() -> Path:
+    return get_default_hermes_root()
+
+
+def _critic_workspace() -> Path:
+    return _hermes() / "profiles" / "critic" / "workspace"
+
+
+def diff_reports_dir() -> Path:
+    return _hermes() / "profiles" / "matcher-shadow" / "workspace" / "diff-reports"
+
+
+def allowed_knobs_path() -> Path:
+    return _hermes() / "profiles" / "critic" / "allowed_knobs.json"
+
+
+def changelog_path() -> Path:
+    return _critic_workspace() / "changelog.jsonl"
+
+
+def reversals_dir() -> Path:
+    return _critic_workspace() / "reversals"
+
+
+def retros_dir() -> Path:
+    return _critic_workspace() / "retros"
+
+
+def whatsapp_queue_path() -> Path:
+    return _critic_workspace() / "whatsapp_queue.jsonl"
+
+
+def proposal_mailbox_path() -> Path:
+    return _hermes() / "mailbox" / "main" / "inbox"
+
+
+def skill_metadata_path(skill: str) -> Path:
+    """Confidence/telemetry file for one installed skill.
+
+    The only WRITE among these paths, and it was built inline inside a function
+    body rather than as a module constant -- invisible to a module-scope audit.
+    """
+    return _hermes() / "skills" / skill / "metadata.json"
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +230,12 @@ class CriticState(TypedDict, total=False):
 def _load_diff_reports(window_days: int) -> tuple[list, dict, list]:
     """Aggregate paired jobs from the most recent N days of diff reports.
     Returns (paired_jobs, summary_stats, files_used)."""
-    if not DIFF_REPORTS_DIR.exists():
+    reports_dir = diff_reports_dir()
+    if not reports_dir.exists():
         return [], {}, []
     cutoff = time.time() - (window_days * 86400)
     files = sorted(
-        [p for p in DIFF_REPORTS_DIR.glob("*.json") if p.stat().st_mtime >= cutoff],
+        [p for p in reports_dir.glob("*.json") if p.stat().st_mtime >= cutoff],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -334,7 +388,7 @@ def generate_proposals_node(state: CriticState) -> dict:
             return {"proposals_raw": []}
 
         try:
-            allowed_knobs = json.loads(ALLOWED_KNOBS_PATH.read_text(encoding="utf-8"))
+            allowed_knobs = json.loads(allowed_knobs_path().read_text(encoding="utf-8"))
         except Exception:
             allowed_knobs = {"knobs": [], "propose_only": []}
 
@@ -891,7 +945,7 @@ def _execute_skill_ranking(p: dict) -> tuple[bool, str, dict]:
     if not skill:
         return False, "no skill name parsed from specific_change", {}
 
-    metadata_path = Path.home() / ".hermes" / "skills" / skill / "metadata.json"
+    metadata_path = skill_metadata_path(skill)
     if not metadata_path.exists():
         return False, f"skill metadata not found at {metadata_path}", {}
 
@@ -938,13 +992,14 @@ def auto_apply_node(state: CriticState) -> dict:
     with _TRACER.start_as_current_span("critic.auto_apply") as span:
         applied = []
         errors = []
-        REVERSALS_DIR.mkdir(parents=True, exist_ok=True)
+        reversals = reversals_dir()
+        reversals.mkdir(parents=True, exist_ok=True)
         for p in state.get("proposals_classified") or []:
             if p.get("classification") != "auto_apply":
                 continue
             knob = p.get("allowed_knob_match")
             ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            reversal_path = REVERSALS_DIR / f"{ts}_{p['proposal_id']}.json"
+            reversal_path = reversals / f"{ts}_{p['proposal_id']}.json"
             try:
                 if knob == "skill.success_ranking":
                     executed, note, record = _execute_skill_ranking(p)
@@ -1048,8 +1103,10 @@ def emit_proposals_node(state: CriticState) -> dict:
         events_emitted = 0
         run_id = state.get("run_id") or uuid.uuid4().hex[:12]
         ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        PROPOSAL_MAILBOX.mkdir(parents=True, exist_ok=True)
-        WHATSAPP_QUEUE.parent.mkdir(parents=True, exist_ok=True)
+        mailbox = proposal_mailbox_path()
+        wa_queue = whatsapp_queue_path()
+        mailbox.mkdir(parents=True, exist_ok=True)
+        wa_queue.parent.mkdir(parents=True, exist_ok=True)
         for p in state.get("proposals_classified") or []:
             if p.get("classification") != "propose_only":
                 continue
@@ -1076,7 +1133,7 @@ def emit_proposals_node(state: CriticState) -> dict:
                 "correlation_id": f"critic-{run_id}",
                 "payload": payload,
             }
-            mailbox_path = PROPOSAL_MAILBOX / f"{ts}_{p['proposal_id']}_CRITIC_PROPOSAL_critic.json"
+            mailbox_path = mailbox / f"{ts}_{p['proposal_id']}_CRITIC_PROPOSAL_critic.json"
             mailbox_path.write_text(json.dumps(msg, indent=2, default=str), encoding="utf-8")
 
             wa_entry = {
@@ -1089,7 +1146,7 @@ def emit_proposals_node(state: CriticState) -> dict:
                 "mailbox_path": str(mailbox_path),
                 "replay_status": replay.get("status"),
             }
-            with open(WHATSAPP_QUEUE, "a", encoding="utf-8") as f:
+            with open(wa_queue, "a", encoding="utf-8") as f:
                 f.write(json.dumps(wa_entry, default=str) + "\n")
 
             # iter2: emit CRITIC_PROPOSAL event to the bus. Telegram notifier
@@ -1150,7 +1207,8 @@ def finalize_node(state: CriticState) -> dict:
         if empty_input:
             span.set_attribute("finalize.empty_input", True)
         else:
-            CHANGELOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            changelog = changelog_path()
+            changelog.parent.mkdir(parents=True, exist_ok=True)
             log_entry = {
                 "run_id": run_id,
                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1163,12 +1221,13 @@ def finalize_node(state: CriticState) -> dict:
                 "auto_apply_deferred_count": sum(1 for a in applied if not a.get("executed")),
                 "propose_only_count": len(emitted),
             }
-            with open(CHANGELOG_PATH, "a", encoding="utf-8") as f:
+            with open(changelog, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry, default=str) + "\n")
 
         # Retro markdown
-        RETROS_DIR.mkdir(parents=True, exist_ok=True)
-        retro_path = RETROS_DIR / f"{time.strftime('%Y-%m-%d')}_critic-graph_{run_id}.md"
+        retros = retros_dir()
+        retros.mkdir(parents=True, exist_ok=True)
+        retro_path = retros / f"{time.strftime('%Y-%m-%d')}_critic-graph_{run_id}.md"
         lines: list[str] = [
             f"# Critic retro (graph) — run {run_id}",
             "",

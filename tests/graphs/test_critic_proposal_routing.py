@@ -13,8 +13,12 @@ def test_propose_only_event_marks_user_decision_required(tmp_path, monkeypatch):
     whatsapp_queue = tmp_path / "whatsapp_queue.jsonl"
     captured = {}
 
-    monkeypatch.setattr(critic, "PROPOSAL_MAILBOX", mailbox)
-    monkeypatch.setattr(critic, "WHATSAPP_QUEUE", whatsapp_queue)
+    # Accessors, not constants: these paths became functions on 2026-08-17 so
+    # they resolve through get_default_hermes_root() at call time instead of
+    # snapshotting the real ~/.hermes at import. Patching the accessor keeps
+    # this test pinned to its own tmp paths, which it asserts on below.
+    monkeypatch.setattr(critic, "proposal_mailbox_path", lambda: mailbox)
+    monkeypatch.setattr(critic, "whatsapp_queue_path", lambda: whatsapp_queue)
 
     def capture_event(event_type_str, source, payload, priority=None):
         captured.update({
