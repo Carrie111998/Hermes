@@ -1,5 +1,6 @@
 """Tests for the dashboard-managed file browser API."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -330,7 +331,10 @@ def test_hosted_policy_locks_to_opt_data(monkeypatch):
         _restore_app_state(prev_auth_required, prev_bound_host)
         client.close()
 
-    assert str(policy.locked_root) == "/opt/data"
+    # Compare Paths, not strings. ``str(Path("/opt/data"))`` is ``\opt\data``
+    # on Windows, so a string assertion pins POSIX rendering and can never hold
+    # off-Linux -- it would fail even when the policy is exactly right.
+    assert policy.locked_root == Path("/opt/data")
     assert policy.can_change_path is False
 
 

@@ -2226,12 +2226,21 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     return value or None
 
 
-def _iter_home_target_platforms():
+def _iter_home_target_platforms(name_filter=None):
     """Iterate built-in + plugin platform names that expose a home channel.
 
     Used by the ``deliver=origin`` fallback when the job has no origin.
+
+    *name_filter* is an optional ``name -> bool`` predicate applied BEFORE a
+    deferred plugin platform is resolved. Resolving runs that plugin's loader,
+    which imports the adapter module and the whole vendor SDK behind it, so a
+    caller that already knows it will discard the name must be able to say so
+    up front rather than paying for an import it throws away. See
+    ``cron_delivery_targets``, which gates on the set of connected platforms.
     """
     for name in _HOME_TARGET_ENV_VARS:
+        if name_filter is not None and not name_filter(name):
+            continue
         yield name
     try:
         from hermes_cli.plugins import discover_plugins
@@ -2245,6 +2254,8 @@ def _iter_home_target_platforms():
             # yields the identical set: ``get()`` runs one loader, and a
             # built-in name is skipped without importing anything.
             if name in _HOME_TARGET_ENV_VARS:
+                continue
+            if name_filter is not None and not name_filter(name):
                 continue
             entry = platform_registry.get(name)
             if entry and entry.source == "plugin" and entry.cron_deliver_env_var:
@@ -2277,9 +2288,15 @@ def cron_delivery_targets() -> list[dict]:
         logger.debug("cron_delivery_targets: gateway config unavailable", exc_info=True)
         connected = set()
 
-    for name in _iter_home_target_platforms():
-        if name not in connected:
-            continue
+    # Gate on ``connected`` INSIDE the iterator, not after it yields. The
+    # membership test is name-only and already known here, but applying it
+    # afterwards meant every unconnected plugin platform was resolved -- and
+    # its vendor SDK imported -- purely to be discarded on the next line.
+    # Measured with only ``matrix`` connected: 26.5s and 72 extra module roots
+    # (microsoft_teams -> jwt -> cryptography -> bcrypt) for a one-item result.
+    # That is the same resolve-then-discard shape as the built-in pre-filter
+    # inside the iterator; see tests/cron/test_home_target_import_cost.py.
+    for name in _iter_home_target_platforms(name_filter=connected.__contains__):
         if not _is_known_delivery_platform(name):
             continue
         env_var = _resolve_home_env_var(name)

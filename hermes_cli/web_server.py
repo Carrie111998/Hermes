@@ -1945,7 +1945,15 @@ def _default_hermes_root_is_opt_data() -> bool:
         root = get_default_hermes_root().expanduser().resolve(strict=False)
     except (OSError, RuntimeError):
         root = Path(raw).expanduser().resolve(strict=False)
-    return root == _HOSTED_MANAGED_FILES_ROOT
+    # Compare like for like. ``root`` has been through ``resolve()``, so the
+    # constant must be too, or the check is asymmetric and silently answers
+    # "not hosted" for a root that IS /opt/data:
+    #   - Linux: a symlinked /opt/data (bind-mount style layouts) resolves to
+    #     its target, which never equals the bare constant -- so the managed
+    #     file browser would fail to lock and expose the whole container FS.
+    #   - Windows: a POSIX-rooted path anchors to the current drive, so
+    #     ``Path("/opt/data").resolve()`` is ``C:\opt\data``.
+    return root == _HOSTED_MANAGED_FILES_ROOT.resolve(strict=False)
 
 
 def _dashboard_local_update_managed_externally() -> bool:
@@ -8152,10 +8160,17 @@ def _messaging_env_info(key: str) -> dict[str, Any]:
     }
 
 
-def _gateway_platform_config(platform_id: str):
+def _gateway_platform_config(platform_id: str, config=None):
     from gateway.config import Platform, load_gateway_config
 
-    config = load_gateway_config()
+    # *config* lets a caller enumerating many platforms load the gateway config
+    # ONCE. ``load_gateway_config()`` is uncached and re-runs every enabled
+    # platform's dependency probe on each call — WhatsApp's shells out to
+    # ``node --version`` (60s budget, ~1s idle but far slower under load) — so
+    # calling it per platform multiplied one identical result by the size of
+    # the catalog. Passing ``None`` keeps the original load-it-myself behaviour.
+    if config is None:
+        config = load_gateway_config()
     platform = Platform(platform_id)
     platform_config = config.platforms.get(platform)
     return config, platform, platform_config
@@ -8166,6 +8181,7 @@ def _messaging_platform_payload(
     env_on_disk: dict[str, str],
     runtime: dict | None,
     scoped: bool = False,
+    gateway_config_shared=None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     runtime_platforms = runtime.get("platforms") if runtime else {}
@@ -8217,7 +8233,7 @@ def _messaging_platform_payload(
     else:
         try:
             gateway_config, platform, platform_config = _gateway_platform_config(
-                platform_id
+                platform_id, gateway_config_shared
             )
             enabled = bool(platform_config and platform_config.enabled)
             configured = bool(
@@ -9186,14 +9202,38 @@ async def get_messaging_platforms(profile: Optional[str] = None):
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
         runtime = read_runtime_status()
+        # Build the catalog BEFORE loading the gateway config, and keep that
+        # order. ``load_gateway_config()`` dynamically extends the ``Platform``
+        # enum with registered plugin platforms, and the catalog treats an enum
+        # member as a built-in — deriving its label from the id instead of
+        # reading the plugin entry's real label. Loading first therefore
+        # renames every plugin platform (e.g. "IRC (test)" -> "Ircfake").
+        catalog = _messaging_platform_catalog()
+        # One load for the whole catalog. The result does not depend on which
+        # platform is being rendered, but the call is uncached and re-probes
+        # every enabled platform's dependencies (WhatsApp spawns `node
+        # --version`), so doing it per entry paid that tax N times per request.
+        # Load inside the profile scope so it still resolves against the
+        # requested profile's HERMES_HOME. On failure fall back to None, which
+        # restores the previous per-entry behaviour: each payload retries the
+        # load itself and its own except-branch reports the platform as off.
+        try:
+            from gateway.config import load_gateway_config
+
+            shared_gateway_config = load_gateway_config()
+        except Exception:
+            _log.debug("messaging platforms: shared gateway config unavailable",
+                       exc_info=True)
+            shared_gateway_config = None
         return {
             "env_path": str(get_env_path()),
             "gateway_start_command": _gateway_display_command(profile, "start"),
             "platforms": [
                 _messaging_platform_payload(
-                    entry, env_on_disk, runtime, scoped=scoped_dir is not None
+                    entry, env_on_disk, runtime, scoped=scoped_dir is not None,
+                    gateway_config_shared=shared_gateway_config,
                 )
-                for entry in _messaging_platform_catalog()
+                for entry in catalog
             ]
         }
 

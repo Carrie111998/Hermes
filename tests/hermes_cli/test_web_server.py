@@ -21,6 +21,30 @@ from hermes_cli.config import (
 from tests._home_isolation import redirect_home
 
 
+# Raise the per-test cap for this file. ``pyproject.toml`` sets a global
+# ``--timeout=30 --timeout-method=thread``; the thread method does not fail one
+# test, it hard-exits the interpreter, which destroys the run's summary line.
+# ``scripts/run_tests_parallel.py`` then parses zero passed and zero failed and
+# reports the whole file under "no tests ran", silently discarding the results
+# of all 469 tests. That is what this file did on main: it contributed no
+# coverage at all while looking like a collection error.
+#
+# Nothing here is hung or broken -- a full run with timeouts off is 445 passed,
+# 24 skipped, 0 failed. These are endpoint tests that drive large module graphs
+# (plugin discovery, toolset resolution), so tens of seconds is their honest
+# cost, and it dilates several-fold under the parallel runner's load: measured
+# 8.2s solo -> over 30s at -j 4. After the resolve-then-discard fixes in
+# cron/scheduler.py and hermes_cli/web_server.py the file's slowest test is
+# 29.1s solo (was 144.9s), still close enough to 30s to trip under load.
+#
+# 300s matches tests/cron/test_home_target_import_cost.py and follows the same
+# reasoning scripts/run_tests_parallel.py used to raise its own per-file cap
+# from 300s to 1800s: the cap's job is bounding a hang, not policing slowness,
+# and the two failure modes are wildly asymmetric. Too loose costs one idle
+# worker; too tight silently deletes a whole file's results.
+pytestmark = pytest.mark.timeout(300)
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
