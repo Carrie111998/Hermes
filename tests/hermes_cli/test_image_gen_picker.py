@@ -6,6 +6,7 @@ Covers `_plugin_image_gen_providers`, `_visible_providers`, and
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -170,3 +171,226 @@ class TestConfigWriting:
         assert tools_config._is_provider_active(openai_row, config) is True
         assert tools_config._is_provider_active(nous_row, config) is False
 
+
+
+class TestProviderSetupSchemaPassthrough:
+    def test_rows_preserve_config_fields_and_readiness_check(self):
+        from hermes_cli import tools_config
+
+        fields = [
+            {
+                "key": "image_gen.external.endpoint",
+                "prompt": "Provider endpoint",
+                "required": True,
+            },
+        ]
+
+        def readiness_check(config, get_secret):
+            return "ready"
+
+        image_gen_registry.register_provider(
+            _FakeProvider(
+                "config-fields-provider",
+                schema={
+                    "name": "External Image Provider",
+                    "env_vars": [{"key": "EXTERNAL_IMAGE_KEY"}],
+                    "config_fields": fields,
+                    "readiness_check": readiness_check,
+                },
+            )
+        )
+
+        row = next(
+            row
+            for row in tools_config._plugin_image_gen_providers()
+            if row["image_gen_plugin_name"] == "config-fields-provider"
+        )
+
+        assert row["config_fields"] == fields
+        assert row["env_vars"] == [{"key": "EXTERNAL_IMAGE_KEY"}]
+        assert row["readiness_check"] is readiness_check
+
+
+class TestNonSecretProviderConfigFields:
+    def test_setup_writes_normalized_fields_to_active_profile(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli import tools_config
+        from hermes_cli.config import read_raw_config
+
+        profile_home = tmp_path / ".hermes" / "profiles" / "external"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        def normalize_endpoint(value):
+            if not value.startswith("https://"):
+                raise ValueError("Endpoint must use HTTPS.")
+            return value.rstrip("/")
+
+        image_gen_registry.register_provider(
+            _FakeProvider(
+                "external-provider",
+                schema={
+                    "name": "External Image Provider",
+                    "env_vars": [
+                        {
+                            "key": "EXTERNAL_IMAGE_KEY",
+                            "prompt": "External image API key",
+                            "password": True,
+                            "required": False,
+                        },
+                    ],
+                    "config_fields": [
+                        {
+                            "key": "image_gen.external.endpoint",
+                            "prompt": "Provider endpoint",
+                            "required": True,
+                            "normalize": normalize_endpoint,
+                        },
+                        {
+                            "key": "image_gen.external.deployment",
+                            "prompt": "Image deployment",
+                            "required": True,
+                        },
+                    ],
+                },
+            )
+        )
+        provider_row = next(
+            row
+            for row in tools_config._plugin_image_gen_providers()
+            if row.get("image_gen_plugin_name") == "external-provider"
+        )
+
+        prompts = []
+        values = iter([
+            "",                       # optional secret skipped
+            "http://invalid.example",  # rejected by normalize
+            "https://images.example/",
+            "image-deployment",
+        ])
+
+        def prompt(question, default=None, password=False):
+            prompts.append((question, default, password))
+            return next(values)
+
+        monkeypatch.setattr(tools_config, "_prompt", prompt)
+        monkeypatch.setattr(tools_config, "get_env_value", lambda key: None)
+        monkeypatch.setattr(
+            tools_config,
+            "save_env_value",
+            lambda *a, **kw: pytest.fail(
+                "config fields must not use credential storage"
+            ),
+        )
+
+        config = {}
+        tools_config._configure_provider(provider_row, config)
+        tools_config.save_config(config)
+
+        saved = read_raw_config()
+        assert saved["image_gen"]["external"] == {
+            "endpoint": "https://images.example",
+            "deployment": "image-deployment",
+        }
+        assert saved["image_gen"]["provider"] == "external-provider"
+        assert prompts[0][2] is True
+        assert all(password is False for _, _, password in prompts[1:])
+
+    def test_reconfigure_updates_fields_and_keeps_blank_existing_value(
+        self, monkeypatch
+    ):
+        from hermes_cli import tools_config
+
+        answers = iter(["https://new.example", "", "v2"])
+        prompts = []
+
+        def prompt(question, default=None, password=False):
+            prompts.append((question, default, password))
+            return next(answers)
+
+        monkeypatch.setattr(tools_config, "_prompt", prompt)
+
+        config = {
+            "image_gen": {
+                "provider": "external-provider",
+                "external": {
+                    "endpoint": "https://old.example",
+                    "deployment": "existing-deployment",
+                },
+            },
+        }
+        provider_row = {
+            "name": "External Image Provider",
+            "env_vars": [],
+            "config_fields": [
+                {"key": "image_gen.external.endpoint", "required": True},
+                {"key": "image_gen.external.deployment", "required": True},
+                {"key": "image_gen.external.api_version", "required": False},
+            ],
+            "image_gen_plugin_name": "external-provider",
+        }
+
+        tools_config._reconfigure_provider(provider_row, config)
+
+        external = config["image_gen"]["external"]
+        assert external["endpoint"] == "https://new.example"
+        assert external["deployment"] == "existing-deployment"
+        assert external["api_version"] == "v2"
+        assert all(password is False for _, _, password in prompts)
+
+
+def test_readiness_reports_needs_setup_until_required_fields_present(monkeypatch):
+    from hermes_cli import tools_config
+
+    credentials = {"EXTERNAL_IMAGE_KEY": None}
+    monkeypatch.setattr(
+        tools_config, "get_env_value", lambda key: credentials.get(key)
+    )
+
+    def readiness_check(config, get_secret):
+        return "ready" if get_secret("EXTERNAL_IMAGE_KEY") else "needs_auth"
+
+    provider = {
+        "env_vars": [{"key": "EXTERNAL_IMAGE_KEY", "required": False}],
+        "config_fields": [
+            {"key": "image_gen.external.endpoint", "required": True},
+        ],
+        "readiness_check": readiness_check,
+    }
+    configured = {"image_gen": {"external": {"endpoint": "https://images.example"}}}
+
+    assert tools_config.provider_readiness_status(provider, {}) == "needs_setup"
+    assert (
+        tools_config.provider_readiness_status(provider, configured) == "needs_auth"
+    )
+
+    credentials["EXTERNAL_IMAGE_KEY"] = "secret"
+    assert tools_config.provider_readiness_status(provider, configured) == "ready"
+
+
+def test_readiness_still_reports_needs_keys_for_required_secret(monkeypatch):
+    from hermes_cli import tools_config
+
+    monkeypatch.setattr(tools_config, "get_env_value", lambda key: None)
+
+    provider = {"env_vars": [{"key": "EXTERNAL_IMAGE_KEY"}]}
+
+    assert tools_config.provider_readiness_status(provider, {}) == "needs_keys"
+
+
+def test_readiness_fails_closed_on_invalid_readiness_callback(monkeypatch):
+    from hermes_cli import tools_config
+
+    monkeypatch.setattr(tools_config, "get_env_value", lambda key: "set")
+
+    provider = {
+        "env_vars": [],
+        "config_fields": [],
+        "readiness_check": lambda config, get_secret: "unknown-status",
+    }
+    assert tools_config.provider_readiness_status(provider, {}) == "needs_setup"
+
+    provider["readiness_check"] = lambda config, get_secret: 1 / 0
+    assert tools_config.provider_readiness_status(provider, {}) == "needs_setup"
