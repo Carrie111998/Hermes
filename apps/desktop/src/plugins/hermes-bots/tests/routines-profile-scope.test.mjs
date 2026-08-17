@@ -29,3 +29,10 @@ test('RoutineRow toggle and create forward the profile scope', () => {
   // create
   assert.match(source, /\.\.\.\(bot \? \{ profile: bot \} : \{\}\)/)
 })
+
+test('selectRoutineJobs shows legacy untagged jobs if no bot match exists', () => {
+  // selectRoutineJobs now includes a fallback path for [bot:*]-less jobs.
+  assert.match(source, /const byBot = all\.filter\(job => routineBot\(job\) === bot\)/)
+  assert.match(source, /const legacyJobs = all\.filter\(job => routineBot\(job\) === null\)/)
+  assert.match(source, /const jobs = byBot\.length > 0 \? byBot : legacyJobs/)
+})
