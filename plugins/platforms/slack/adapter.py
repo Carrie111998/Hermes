@@ -6676,10 +6676,7 @@ class SlackAdapter(BasePlatformAdapter):
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
-                from gateway.session import SessionSource
-
-                source = SessionSource(
-                    platform=Platform.SLACK,
+                source = self.build_source(
                     chat_id=str(channel_id or normalized_user_id),
                     # Interactive approval/confirmation authority must remain
                     # distinct from ordinary channel-message initiation.
@@ -7034,6 +7031,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Handle a clarify button click (a choice or "Other") from Block Kit."""
         await ack()
 
+        team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
         value = action.get("value", "")
         message = body.get("message", {})
@@ -7046,6 +7044,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id,
             channel_id=channel_id,
             user_name=user_name,
+            team_id=team_id,
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
@@ -7745,6 +7744,14 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id,
             )
             return
+        if not is_dm:
+            allowed_channels = self._slack_allowed_channels()
+            if allowed_channels and channel_id not in allowed_channels:
+                logger.info(
+                    "[Slack] Ignoring slash command from non-allowed channel: %s",
+                    channel_id,
+                )
+                return
         source = self.build_source(
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",

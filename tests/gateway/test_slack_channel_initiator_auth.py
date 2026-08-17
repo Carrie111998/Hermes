@@ -82,7 +82,7 @@ def test_channel_grant_does_not_authorize_bot_senders(runner):
 
 def test_multiplex_profile_uses_selected_adapter_policy(runner):
     runner._profile_adapters = {
-        "coder": {Platform.SLACK: _adapter("C_CODER")},
+        "coder": {Platform.SLACK: _adapter("C_CODER,C_SECOND")},
     }
 
     assert runner._is_user_authorized(
@@ -91,6 +91,9 @@ def test_multiplex_profile_uses_selected_adapter_policy(runner):
     assert runner._is_user_authorized(
         _source(chat_id="C_TEAM", profile="coder")
     ) is False
+    assert runner._is_user_authorized(
+        _source(chat_id="C_SECOND", profile="coder")
+    ) is True
 
 
 def test_missing_multiplex_adapter_fails_closed(runner):
