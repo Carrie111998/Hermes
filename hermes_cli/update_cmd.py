@@ -4654,6 +4654,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(
                     "✗ Authentication failed — check your git credentials or SSH key."
                 )
+            elif "fork bomb" in stderr.lower():
+                # A Git-for-Windows trampoline launcher (the small bin\git.exe /
+                # cmd\git.exe shim, ~46KB) that fails to re-exec the real
+                # git-core binary refuses every git call with this guard
+                # instead of running it (#87876) — it's a broken PATH entry,
+                # not a network or filesystem problem. Every OTHER git
+                # failure in this update flow already falls back to the ZIP
+                # download path on Windows (via the CalledProcessError
+                # handler below, which never shells out to git); give the
+                # fetch step, which reports its error instead of raising,
+                # the same fallback rather than a bare exit.
+                print("✗ The 'git' on PATH is a broken launcher (trampoline):")
+                print(f"  {stderr.splitlines()[0]}" if stderr else "")
+                if _m()._is_windows():
+                    print("→ Falling back to ZIP download...")
+                    print()
+                    _update_via_zip(
+                        args,
+                        had_desktop_app_before_update=had_desktop_app_before_update,
+                    )
+                    return
+                print(
+                    "  Fix PATH so it resolves the real git binary (e.g. "
+                    "the git-core dir under your Git install), then retry."
+                )
             else:
                 print("✗ Failed to fetch updates from origin.")
                 if stderr:

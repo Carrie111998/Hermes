@@ -974,6 +974,88 @@ class TestNodeRuntimeNpmResolution:
         assert desktop_builds == [True]
 
 
+class TestFetchForkBombFallback:
+    """A Git-for-Windows trampoline launcher that fails to re-exec git-core
+    refuses every git call with a "BUG (fork bomb)" guard instead of running
+    it (#87876). Unlike other git failures in this update flow — which raise
+    and are already caught by the CalledProcessError handler that falls back
+    to the ZIP download path on Windows — the initial ``git fetch`` reports
+    its failure via returncode, so it needs its own fallback."""
+
+    def _patch_common(self, hm, update_cmd, monkeypatch, project_root, *, windows):
+        monkeypatch.setattr(hm, "PROJECT_ROOT", project_root)
+        monkeypatch.setattr(hm, "_is_windows", lambda: windows)
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+        monkeypatch.setattr(hm, "_get_origin_url", lambda *_args: "")
+        monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
+        monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
+
+    @staticmethod
+    def _fake_run(command, **_kwargs):
+        joined = " ".join(str(c) for c in command)
+        if "fetch" in joined and "origin" in joined:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr="BUG (fork bomb): tried to spawn itself, check your PATH\n",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    def test_falls_back_to_zip_on_windows(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        project_root = tmp_path / "hermes-agent"
+        (project_root / ".git").mkdir(parents=True)
+        self._patch_common(hm, update_cmd, monkeypatch, project_root, windows=True)
+
+        zip_calls = []
+        monkeypatch.setattr(
+            update_cmd, "_update_via_zip", lambda *a, **kw: zip_calls.append(kw)
+        )
+
+        with (
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch("subprocess.run", side_effect=self._fake_run),
+        ):
+            update_cmd._cmd_update_impl(
+                SimpleNamespace(yes=True, force=True, force_venv=True, branch=None),
+                gateway_mode=False,
+            )
+
+        assert len(zip_calls) == 1
+        out = capsys.readouterr().out
+        assert "broken launcher" in out.lower()
+        assert "Falling back to ZIP download" in out
+
+    def test_non_windows_exits_with_trampoline_message(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        project_root = tmp_path / "hermes-agent"
+        (project_root / ".git").mkdir(parents=True)
+        self._patch_common(hm, update_cmd, monkeypatch, project_root, windows=False)
+
+        with (
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch("subprocess.run", side_effect=self._fake_run),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._cmd_update_impl(
+                    SimpleNamespace(yes=True, force=True, force_venv=True, branch=None),
+                    gateway_mode=False,
+                )
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        # Distinct from the generic "Failed to fetch updates from origin"
+        # message — the trampoline case gets actionable guidance instead.
+        assert "broken launcher" in out.lower()
+        assert "Failed to fetch updates from origin" not in out
+
+
 class TestUpdateNodeDependencies:
     """Unit tests for _update_node_dependencies — issue #43564.
 
