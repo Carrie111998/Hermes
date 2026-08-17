@@ -10,8 +10,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from tests.symlink_support import requires_symlinks, symlinks_supported
 
 
