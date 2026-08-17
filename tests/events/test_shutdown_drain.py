@@ -174,6 +174,33 @@ def test_shutdown_drains_while_the_bus_is_still_open(bus, monkeypatch):
     assert seen["bus_open"] is True
 
 
+def test_shutdown_calls_subscriber_shutdown_after_the_drain_and_before_close(bus, monkeypatch):
+    """CronStaleMonitor stages its shutdown attribution on poll() and emits it
+    in shutdown() — the last moment before the process exits. That only works
+    if the drain runs FIRST (so the GATEWAY_STOPPED has been seen) and the bus
+    is still open when shutdown() emits."""
+    trace = []
+
+    class Lifecycle(FakeSubscriber):
+        def poll(self):
+            trace.append(("poll", gi._bus is not None))
+            return super().poll()
+
+        def shutdown(self):
+            trace.append(("shutdown", gi._bus is not None))
+
+    sub = Lifecycle("cron-stale-monitor", [EventType.GATEWAY_STOPPED])
+    monkeypatch.setattr(gi, "_registry", _registry(sub))
+    monkeypatch.setattr(gi, "_bus", bus)
+    monkeypatch.setattr(gi, "_subscriber_thread", None)
+    monkeypatch.setattr(gi, "_applier_thread", None)
+
+    gi.shutdown()
+
+    assert [step for step, _ in trace] == ["poll", "shutdown"]
+    assert all(bus_open for _, bus_open in trace), "bus closed before shutdown()"
+
+
 def test_shutdown_drains_only_after_the_poll_thread_is_joined(bus, monkeypatch):
     """Two threads polling one subscriber would race its in-memory maps."""
     observed = {}
@@ -205,9 +232,22 @@ def test_shutdown_drains_only_after_the_poll_thread_is_joined(bus, monkeypatch):
 # End to end: the behaviour the drain exists for
 # ---------------------------------------------------------------------------
 
-def test_cron_stale_monitor_attributes_the_killed_run_during_the_drain(bus):
-    """Production shape: a cron is in flight, the gateway stops, and the
-    attribution lands before this process dies — not on a 60s coin flip."""
+def _wire_gateway(monkeypatch, bus, *subs):
+    monkeypatch.setattr(gi, "_registry", _registry(*subs))
+    monkeypatch.setattr(gi, "_bus", bus)
+    monkeypatch.setattr(gi, "_subscriber_thread", None)
+    monkeypatch.setattr(gi, "_applier_thread", None)
+
+
+def test_cron_stale_monitor_attributes_the_killed_run_during_teardown(bus, monkeypatch):
+    """Production shape, through the real shutdown() sequence: a cron is in
+    flight, the gateway stops, and the attribution lands before this process
+    dies — not on a 60s coin flip.
+
+    Both halves matter and neither works alone: the DRAIN is what makes the
+    monitor see the GATEWAY_STOPPED at all, and shutdown_all() is what flushes
+    the staged report at the last moment.
+    """
     monitor = CronStaleMonitor(bus)
 
     started_id = bus.emit(
@@ -226,7 +266,8 @@ def test_cron_stale_monitor_attributes_the_killed_run_during_the_drain(bus):
         },
     )
 
-    gi._drain_subscribers_for_shutdown(_registry(monitor))
+    _wire_gateway(monkeypatch, bus, monitor)
+    gi.shutdown()
 
     stale = [e for e in bus.query() if e.event_type == EventType.CRON_STALE]
     assert len(stale) == 1, "the shutdown-killed run was not attributed"
@@ -235,3 +276,44 @@ def test_cron_stale_monitor_attributes_the_killed_run_during_the_drain(bus):
     assert stale[0].payload["exit_reason"] == "restart"
     assert stale[0].payload["cron_started_event_id"] == started_id
     assert stale[0].priority == Priority.NORMAL
+
+
+def test_a_run_that_lands_during_teardown_is_not_reported_killed(bus, monkeypatch):
+    """The 2026-08-17 false positive, at the integration level.
+
+    gateway/run.py snapshots the in-flight ids EARLY in its stop path, so a run
+    that is merely unfinished at that instant can still complete while the
+    gateway tears down — jobflow-researcher did, 35s after being reported
+    killed. The drain must deliver BOTH events before anything is emitted.
+    """
+    monitor = CronStaleMonitor(bus)
+
+    started_id = bus.emit(
+        event_type=EventType.CRON_STARTED,
+        source="jobflow-researcher",
+        payload={"job_id": "785bd746431b", "job_name": "jobflow-researcher"},
+    )
+    monitor.poll()
+
+    bus.emit(
+        event_type=EventType.GATEWAY_STOPPED,
+        source="gateway",
+        payload={
+            "exit_reason": "graceful",
+            "inflight_cron_correlation_ids": [started_id],
+        },
+    )
+    # ...and the run lands anyway, while the gateway is still tearing down.
+    bus.emit(
+        event_type=EventType.CRON_COMPLETED,
+        source="jobflow-researcher",
+        payload={"job_id": "785bd746431b", "job_name": "jobflow-researcher"},
+    )
+
+    _wire_gateway(monkeypatch, bus, monitor)
+    gi.shutdown()
+
+    stale = [e for e in bus.query() if e.event_type == EventType.CRON_STALE]
+    assert stale == [], (
+        "a run that completed during teardown was reported shutdown-killed"
+    )

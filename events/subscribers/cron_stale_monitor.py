@@ -23,7 +23,7 @@ failure, because nothing refreshes it once the thread is gone.
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
@@ -77,6 +77,11 @@ class CronStaleMonitor(BaseSubscriber):
         # open runs: an entry is dropped on the terminal event, on a fresh
         # start of the same job, and on shutdown resolution.
         self._started_event_ids: Dict[str, str] = {}
+        # Shutdown attributions staged by _resolve_gateway_stopped and emitted
+        # by shutdown(). Bounded by the number of runs one shutdown reports,
+        # and drained on flush. See _resolve_gateway_stopped for why the report
+        # cannot be made at the moment the shutdown event is seen.
+        self._pending_shutdown: List[Dict[str, Any]] = []
         # One alert per ticker outage; cleared when the heartbeat goes fresh
         # again so a SECOND outage still alerts.
         self._ticker_alerted: bool = False
@@ -97,24 +102,42 @@ class CronStaleMonitor(BaseSubscriber):
         for eid in [k for k, v in self._started_event_ids.items() if v == job_id]:
             self._started_event_ids.pop(eid, None)
 
+    def _drop_pending_shutdown_for(self, job_id: str) -> None:
+        """Cancel a staged attribution because the run reached a terminal event.
+
+        The gateway takes its in-flight snapshot EARLY in teardown, so a run
+        that is merely *unfinished* at that instant can still land while the
+        gateway drains. Once it does, it was not killed by the shutdown.
+        """
+        self._pending_shutdown = [
+            p for p in self._pending_shutdown if p["job_id"] != job_id
+        ]
+
     def _resolve_gateway_stopped(self, event: Event) -> None:
-        """Close the runs this shutdown killed, attributed as such.
+        """STAGE the runs this shutdown may have killed; do not report yet.
 
         ``gateway/run.py`` stamps GATEWAY_STOPPED with the cron_started
-        event_ids of everything still in flight (``cron/inflight.py``). Each
-        one that we are still tracking is reported ONCE, immediately, with
-        ``scope="gateway_stopped"`` — mirroring the ``scope="ticker"`` idiom in
-        ``_check_ticker_stale`` — and removed from ``_open_jobs`` so the
-        generic HIGH-priority wedge alert never fires for it.
+        event_ids of everything still in flight (``cron/inflight.py``), and it
+        takes that snapshot EARLY in ``_stop_impl_body`` — before the gateway
+        drains its work. It has to stay there: a teardown force-killed past
+        ``_TASKKILL_TIMEOUT_S`` would otherwise emit no GATEWAY_STOPPED at all.
 
-        Priority is NORMAL, not HIGH: a run stopped by a deliberate restart is
-        explained, so it belongs in the record rather than in the paging tier.
+        So "in flight when the stop began" is a weaker claim than "killed by
+        the stop", and reporting on sight gets it wrong for any run that
+        finishes while the gateway tears down. Production, 2026-08-17:
+        jobflow-researcher was reported killed at 05:31:30 and emitted
+        cron_completed at 05:32:05. The report is therefore staged here and
+        flushed in :meth:`shutdown` — the last moment before the process
+        exits, and the first at which the answer is final.
+
+        The SUPPRESSION is not deferred, only the report: the entry leaves
+        ``_open_jobs`` now, so the generic HIGH wedge alert cannot fire for it
+        in the polls between here and the flush.
         """
         raw = event.payload.get("inflight_cron_correlation_ids") or []
         if not isinstance(raw, (list, tuple)):
             return
         exit_reason = event.payload.get("exit_reason")
-        now = datetime.now(timezone.utc)
 
         for correlation_id in raw:
             job_id = self._started_event_ids.pop(correlation_id, None)
@@ -125,8 +148,31 @@ class CronStaleMonitor(BaseSubscriber):
             if entry is None:
                 continue
             started_at, job_name = entry
+            self._pending_shutdown.append({
+                "job_id": job_id,
+                "job_name": job_name,
+                "started_at": started_at,
+                "exit_reason": exit_reason,
+                "gateway_stopped_event_id": event.event_id,
+                "cron_started_event_id": correlation_id,
+            })
+
+    def _flush_pending_shutdown(self) -> None:
+        """Report the staged runs that never reached a terminal event.
+
+        Drains the queue first, so a second call (or a failed emit) cannot
+        double-report.
+        """
+        pending, self._pending_shutdown = self._pending_shutdown, []
+        if not pending:
+            return
+        now = datetime.now(timezone.utc)
+        for record in pending:
+            job_id = record["job_id"]
+            job_name = record["job_name"]
+            exit_reason = record["exit_reason"]
             try:
-                age = (now - started_at).total_seconds()
+                age = (now - record["started_at"]).total_seconds()
             except (TypeError, ValueError):
                 age = 0.0
             try:
@@ -139,8 +185,8 @@ class CronStaleMonitor(BaseSubscriber):
                         "scope": "gateway_stopped",
                         "exit_reason": exit_reason,
                         "age_seconds": int(age),
-                        "gateway_stopped_event_id": event.event_id,
-                        "cron_started_event_id": correlation_id,
+                        "gateway_stopped_event_id": record["gateway_stopped_event_id"],
+                        "cron_started_event_id": record["cron_started_event_id"],
                     },
                     priority=Priority.NORMAL,
                 )
@@ -154,6 +200,15 @@ class CronStaleMonitor(BaseSubscriber):
                     "CronStaleMonitor: failed to emit gateway_stopped "
                     "cron_stale for %s", job_id,
                 )
+
+    def shutdown(self) -> None:
+        """Flush staged shutdown attributions — the last moment they are true.
+
+        ``events/gateway_integration.py:shutdown()`` drains subscribers first
+        and closes the bus afterwards, so by the time this runs every terminal
+        event the teardown produced has been handled and the bus is still open.
+        """
+        self._flush_pending_shutdown()
 
     def handle(self, event: Event) -> None:
         # BEFORE the job_id guard: GATEWAY_STOPPED carries no job_id, so
@@ -180,12 +235,17 @@ class CronStaleMonitor(BaseSubscriber):
             self._alerted.discard(job_id)
             # A fresh run supersedes any earlier correlation id for this job.
             self._forget_started_ids_for(job_id)
+            self._drop_pending_shutdown_for(job_id)
             self._started_event_ids[event.event_id] = job_id
         elif event.event_type in (EventType.CRON_COMPLETED, EventType.CRON_FAILED):
             self._open_jobs.pop(job_id, None)
             self._alerted.discard(job_id)
             # It finished on its own, so a later shutdown did not kill it.
             self._forget_started_ids_for(job_id)
+            # ...and neither did an EARLIER one whose report is still staged:
+            # the gateway's snapshot is taken before it drains, so this run was
+            # in flight then and landed anyway.
+            self._drop_pending_shutdown_for(job_id)
 
     def poll(self) -> int:
         count = super().poll()

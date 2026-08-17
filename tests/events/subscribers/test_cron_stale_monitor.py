@@ -391,9 +391,10 @@ class TestGatewayStoppedResolution:
         mon = _monitor(bus)
 
         mon.poll()
+        mon.shutdown()  # the flush point — see TestShutdownAttributionTiming
 
         evts = _stale_events(bus)
-        assert len(evts) == 1, "the killed run must be reported once, immediately"
+        assert len(evts) == 1, "the killed run must be reported exactly once"
         payload = evts[0].payload
         assert payload["job_id"] == "nightly-audit"
         assert payload["scope"] == "gateway_stopped", (
@@ -413,6 +414,7 @@ class TestGatewayStoppedResolution:
         mon = _monitor(bus)
 
         mon.poll()
+        mon.shutdown()
 
         evts = _stale_events(bus)
         assert len(evts) == 1
@@ -429,6 +431,7 @@ class TestGatewayStoppedResolution:
 
         mon.poll()
         mon.poll()  # a second sweep must not produce the generic alert
+        mon.shutdown()
 
         evts = _stale_events(bus)
         assert len(evts) == 1, f"expected exactly one report, got {[e.payload for e in evts]}"
@@ -445,6 +448,7 @@ class TestGatewayStoppedResolution:
 
         mon = _monitor(bus)
         mon.poll()
+        mon.shutdown()
 
         assert len(_stale_events(bus)) == 1
 
@@ -496,9 +500,122 @@ class TestGatewayStoppedResolution:
         mon = _monitor(bus)
 
         mon.poll()
+        mon.shutdown()
 
         evts = _stale_events(bus)
         assert len(evts) == 1
         assert evts[0].payload["job_id"] == "job-killed"
         assert "job-killed" not in mon._open_jobs
         assert "job-still-running" in mon._open_jobs
+
+
+# =========================================================================
+# Snapshot timing (2026-08-17)
+#
+# gateway/run.py takes the inflight snapshot EARLY in _stop_impl_body, before
+# the gateway drains its in-flight work — and it has to stay there, because a
+# teardown that gets force-killed past _TASKKILL_TIMEOUT_S would otherwise emit
+# no GATEWAY_STOPPED at all. So "in flight when the stop began" is NOT the same
+# claim as "killed by the stop": a run can still finish while the gateway tears
+# down. Production, 2026-08-17: jobflow-researcher was reported killed at
+# 05:31:30 and emitted cron_completed at 05:32:05, 35s later.
+#
+# The monitor therefore STAGES the attribution when it sees the shutdown and
+# emits at shutdown() — the last moment before the process exits, and the first
+# moment the answer is final.
+# =========================================================================
+
+class TestShutdownAttributionTiming:
+    def test_attribution_is_deferred_to_shutdown(self, bus):
+        started_id = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+        assert _stale_events(bus) == [], (
+            "attributing at poll time asserts the run is dead while the "
+            "gateway is still draining it"
+        )
+
+        mon.shutdown()
+
+        evts = _stale_events(bus)
+        assert len(evts) == 1
+        assert evts[0].payload["scope"] == "gateway_stopped"
+        assert evts[0].payload["job_id"] == "job-killed"
+
+    def test_a_run_that_finishes_during_teardown_is_not_reported_killed(self, bus):
+        """The defect this exists to fix. The terminal event arrives in a LATER
+        poll than the shutdown event, which is exactly how it happened live."""
+        started_id = _emit_started(bus, "job-finishes-late")
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()  # sees the shutdown; the run is still going
+
+        bus.emit(
+            event_type=EventType.CRON_COMPLETED,
+            source="scheduler",
+            payload={"job_id": "job-finishes-late", "job_name": "job-finishes-late"},
+        )
+        mon.poll()  # the run lands before teardown finishes
+        mon.shutdown()
+
+        assert _stale_events(bus) == [], (
+            "a run that completed during teardown was reported shutdown-killed"
+        )
+
+    def test_a_run_still_going_at_the_last_moment_is_reported(self, bus):
+        """The other half: deferring must not turn into never reporting."""
+        started_id = _emit_started(bus, "job-truly-killed")
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+        mon.poll()
+        mon.shutdown()
+
+        evts = _stale_events(bus)
+        assert len(evts) == 1
+        assert evts[0].payload["job_id"] == "job-truly-killed"
+
+    def test_the_generic_wedge_alert_is_suppressed_from_the_moment_it_is_seen(self, bus):
+        """Suppression must NOT wait for shutdown(): between seeing the
+        shutdown and the process exiting there are more polls, and the run is
+        already past its threshold."""
+        old = datetime.now(timezone.utc) - timedelta(seconds=99999)
+        started_id = _emit_started(bus, "long-job", started_at=old)
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+        mon.poll()
+
+        # Deferring the ATTRIBUTION must not defer the SUPPRESSION: the run is
+        # already 99999s old, so a single unsuppressed _check_stale would page.
+        generic = [e for e in _stale_events(bus)
+                   if e.payload.get("scope") != "gateway_stopped"]
+        assert generic == [], f"the generic HIGH wedge alert leaked: {generic}"
+        assert "long-job" not in mon._open_jobs
+
+    def test_flushing_twice_reports_once(self, bus):
+        started_id = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+        mon.shutdown()
+        mon.shutdown()
+
+        assert len(_stale_events(bus)) == 1
+
+    def test_shutdown_without_a_gateway_stopped_reports_nothing(self, bus):
+        """An ordinary in-process restart (startup() calls shutdown() when a bus
+        already exists) must not invent attributions for healthy open runs."""
+        _emit_started(bus, "job-running")
+        mon = _monitor(bus)
+
+        mon.poll()
+        mon.shutdown()
+
+        assert _stale_events(bus) == []
