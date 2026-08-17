@@ -35,6 +35,64 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── importorskip husk guard ────────────────────────────────────────────────
+# ``pytest.importorskip`` treats "the import worked" as "the package is
+# usable". A distribution whose FILES were deleted but whose DIRECTORIES
+# survive is imported by Python as an implicit PEP-420 namespace package: the
+# import SUCCEEDS, with ``__file__ = None`` and nothing inside. pytest cannot
+# see this — it explicitly suppresses the very ImportWarning that would reveal
+# it ("ignore ImportWarnings that might happen because of existing directories
+# with the same name we're trying to import but without a __init__.py",
+# _pytest/outcomes.py) — and ``minversion`` is the only built-in escape.
+#
+# Cost of not guarding it, measured on 2026-08-17: a gutted numpy left 8 empty
+# dirs in site-packages with no dist-info. ``importorskip("numpy")`` passed, so
+# 8 tests that should have SKIPPED failed instead — and worse, the husk then sat
+# in ``sys.modules`` where ``_pytest.python_api._as_numpy_array`` finds it
+# ("and numpy is already imported") and calls ``np.isscalar``, so every
+# ``pytest.approx`` for the rest of the session raised. That took down 14 more
+# tests across four files with no numpy in them: 22 failures, one broken install.
+#
+# Wrapped once here — like ``sqlite3.connect`` below — so every call site in the
+# suite is covered without editing any of them.
+_real_importorskip = pytest.importorskip
+
+
+def _is_empty_namespace_package(mod: object) -> bool:
+    """True for a directory-only husk: a namespace package exposing nothing.
+
+    A *legitimate* PEP-420 namespace package also has ``__file__ is None``, so
+    that test alone would produce false positives. Require in addition that the
+    module exposes no public attribute at all — a working package always
+    exposes something, and a husk never does.
+    """
+    if getattr(mod, "__file__", None) is not None:
+        return False
+    if getattr(mod, "__path__", None) is None:
+        return False
+    return not [name for name in dir(mod) if not name.startswith("_")]
+
+
+def _importorskip_rejecting_husks(modname, *args, **kwargs):
+    mod = _real_importorskip(modname, *args, **kwargs)
+    if _is_empty_namespace_package(mod):
+        # Drop it from sys.modules, or pytest.approx (and anything else that
+        # feature-detects via sys.modules) keeps finding the husk all session.
+        for name in [modname, *[m for m in sys.modules if m.startswith(f"{modname}.")]]:
+            sys.modules.pop(name, None)
+        pytest.skip(
+            f"{modname!r} resolved to an empty namespace package at "
+            f"{getattr(mod, '__path__', None)} — the distribution is partially "
+            "uninstalled, not installed. Reinstall it, or delete the leftover "
+            "directory so the import fails cleanly.",
+            allow_module_level=True,
+        )
+    return mod
+
+
+pytest.importorskip = _importorskip_rejecting_husks
+
+
 # ── sqlite-connection tripwire (feeds pytest_runtest_teardown) ──────────────
 # ``sqlite3.connect`` is wrapped once, here, so the teardown hook below knows
 # whether a test could have left a cycle-held connection behind — see that
