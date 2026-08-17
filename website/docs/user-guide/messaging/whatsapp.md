@@ -185,6 +185,35 @@ whatsapp:
 
 When `send_read_receipts` is `true`, the adapter marks policy-accepted inbound messages as read after DM/group/mention filtering passes. Rejected messages (e.g., from non-allowlisted senders) are not marked read. Disabled by default for privacy. Changing this setting automatically restarts the bridge subprocess on the next connection.
 
+### Oversight mode
+
+Use oversight mode when Hermes should observe private chats but must only send
+generated replies and gateway notices to the owner's home chat:
+
+```yaml
+whatsapp:
+  enabled: true
+  oversight_mode: true
+  forward_owner_messages: true
+  home_channel:
+    chat_id: "15550001111@s.whatsapp.net"
+    name: "Owner"
+  dm_policy: open
+  allow_from: ["*"]
+  group_policy: disabled
+```
+
+The outbound guard is enforced by the WhatsApp adapter, after agent and gateway
+policy hooks. Text, media, polls, locations, edits, and typing indicators are
+silently suppressed for every non-home chat, including busy and system notices.
+If `home_channel.chat_id` is missing, oversight mode fails closed and suppresses
+all adapter-generated outbound traffic. Inbound messages are still available to
+plugins for storage or owner alerts.
+
+Set `respond_as_owner: true` under `whatsapp` only when Hermes is explicitly
+authorized to send to contacts. This disables the oversight outbound guard; it
+should not be enabled for observation-only profiles.
+
 ---
 
 ## Message Formatting & Delivery

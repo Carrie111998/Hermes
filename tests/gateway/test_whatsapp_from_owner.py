@@ -13,12 +13,14 @@ trusts the payload.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
-from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+from gateway.config import Platform, PlatformConfig, load_gateway_config
+from plugins.platforms.whatsapp.adapter import WhatsAppAdapter, _apply_yaml_config
 
 
 @pytest.fixture(autouse=True)
@@ -91,5 +93,134 @@ def test_from_owner_does_not_double_prefix_when_already_tagged():
     assert event is not None
     assert event.metadata.get("whatsapp_from_owner") is True
     assert event.text == "[owner reply] already tagged"
+
+
+def _oversight_adapter(*, home="15550001111", respond_as_owner=False):
+    adapter = _make_adapter()
+    adapter._oversight_mode = True
+    adapter._oversight_home_channel = home
+    adapter._respond_as_owner = respond_as_owner
+    adapter._running = True
+    adapter._http_session = MagicMock()
+    return adapter
+
+
+def test_oversight_blocks_owner_forwarded_contact_reply_before_transport():
+    adapter = _oversight_adapter()
+
+    result = asyncio.run(
+        adapter.send("15550002222@s.whatsapp.net", "busy/system/agent reply")
+    )
+
+    assert result.success is True
+    assert result.raw_response == {
+        "suppressed": True,
+        "reason": "oversight_outbound_policy",
+    }
+    adapter._http_session.post.assert_not_called()
+
+
+def test_oversight_allows_home_chat_with_equivalent_jid_shape():
+    adapter = _oversight_adapter(home="+1 (555) 000-1111")
+
+    assert adapter._oversight_allows_outbound("15550001111@s.whatsapp.net") is True
+
+
+def test_oversight_allows_home_chat_lid_alias(monkeypatch, tmp_path):
+    mapping_dir = tmp_path / "whatsapp" / "session"
+    mapping_dir.mkdir(parents=True)
+    (mapping_dir / "lid-mapping-999999999999999.json").write_text(
+        json.dumps("15550001111@s.whatsapp.net"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _oversight_adapter(home="15550001111@s.whatsapp.net")
+
+    assert adapter._oversight_allows_outbound("999999999999999@lid") is True
+
+
+def test_oversight_without_home_channel_fails_closed():
+    adapter = _oversight_adapter(home="")
+
+    assert adapter._oversight_allows_outbound("15550002222@s.whatsapp.net") is False
+
+
+def test_oversight_explicit_respond_as_owner_allows_contact_outbound():
+    adapter = _oversight_adapter(respond_as_owner=True)
+
+    assert adapter._oversight_allows_outbound("15550002222@s.whatsapp.net") is True
+
+
+def test_oversight_yaml_options_seed_adapter_extra(monkeypatch):
+    for name in (
+        "WHATSAPP_REQUIRE_MENTION",
+        "WHATSAPP_MENTION_PATTERNS",
+        "WHATSAPP_FREE_RESPONSE_CHATS",
+        "WHATSAPP_DM_POLICY",
+        "WHATSAPP_ALLOWED_USERS",
+        "WHATSAPP_GROUP_POLICY",
+        "WHATSAPP_GROUP_ALLOWED_USERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    seeded = _apply_yaml_config(
+        {},
+        {
+            "oversight_mode": True,
+            "respond_as_owner": False,
+            "forward_owner_messages": True,
+        },
+    )
+
+    assert seeded == {
+        "oversight_mode": True,
+        "respond_as_owner": False,
+        "forward_owner_messages": True,
+    }
+
+
+def test_documented_oversight_yaml_shape_loads_home_and_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name in tuple(os.environ):
+        if name.startswith("WHATSAPP_"):
+            monkeypatch.delenv(name, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        """whatsapp:
+  enabled: true
+  oversight_mode: true
+  respond_as_owner: false
+  forward_owner_messages: true
+  home_channel:
+    chat_id: "15550001111@s.whatsapp.net"
+    name: "Owner"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config().platforms[Platform.WHATSAPP]
+
+    assert config.home_channel is not None
+    assert config.home_channel.chat_id == "15550001111@s.whatsapp.net"
+    assert config.extra["oversight_mode"] is True
+    assert config.extra["respond_as_owner"] is False
+    assert config.extra["forward_owner_messages"] is True
+
+
+def test_home_channel_only_does_not_enable_whatsapp(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("WHATSAPP_ENABLED", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        """whatsapp:
+  home_channel:
+    chat_id: "15550001111@s.whatsapp.net"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config().platforms[Platform.WHATSAPP]
+
+    assert config.enabled is False
+    assert config.home_channel is not None
+    assert config.home_channel.chat_id == "15550001111@s.whatsapp.net"
 
 

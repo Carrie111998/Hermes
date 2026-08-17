@@ -9,6 +9,7 @@ Covers two layers:
 """
 
 import asyncio
+import json
 import os
 import tempfile
 from types import SimpleNamespace
@@ -16,7 +17,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.config import Platform
 from plugins.platforms.whatsapp.adapter import _bridge_media_type, _standalone_send
+from tools.send_message_tool import _handle_send, _send_to_platform
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +92,7 @@ def _session_with(responses):
 
 
 def _pconfig():
-    return SimpleNamespace(token="", extra={"bridge_port": 3000})
+    return SimpleNamespace(token="", extra={"bridge_port": 3000}, home_channel=None)
 
 
 def _tmpfile(suffix):
@@ -155,3 +158,112 @@ def test_missing_captioned_file_falls_back_to_text():
     assert len(calls) == 1
     assert calls[0][0].endswith("/send")
     assert calls[0][1]["message"] == "floor plan"
+
+
+def test_standalone_oversight_blocks_non_home_before_http():
+    config = SimpleNamespace(
+        token="",
+        extra={
+            "bridge_port": 3000,
+            "oversight_mode": True,
+            "respond_as_owner": False,
+        },
+        home_channel=SimpleNamespace(chat_id="15550001111@s.whatsapp.net"),
+    )
+
+    with patch("aiohttp.ClientSession") as session:
+        result = asyncio.run(_standalone_send(config, "15550002222", "contact"))
+
+    assert result["success"] is True
+    assert result["suppressed"] is True
+    assert result["reason"] == "oversight_outbound_policy"
+    session.assert_not_called()
+
+
+def test_send_message_path_surfaces_oversight_suppression():
+    config = SimpleNamespace(
+        token="",
+        extra={
+            "bridge_port": 3000,
+            "oversight_mode": True,
+            "respond_as_owner": False,
+        },
+        home_channel=SimpleNamespace(chat_id="15550001111@s.whatsapp.net"),
+    )
+
+    with patch("aiohttp.ClientSession") as session:
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.WHATSAPP,
+                config,
+                "15550002222",
+                "contact",
+            )
+        )
+
+    assert result["success"] is True
+    assert result["suppressed"] is True
+    assert result["reason"] == "oversight_outbound_policy"
+    session.assert_not_called()
+
+
+def test_suppressed_send_is_not_mirrored_as_delivered():
+    config = SimpleNamespace(
+        platforms={
+            Platform.WHATSAPP: SimpleNamespace(
+                enabled=True,
+                token="",
+                extra={},
+                home_channel=None,
+            )
+        }
+    )
+    suppressed = {
+        "success": True,
+        "suppressed": True,
+        "reason": "oversight_outbound_policy",
+    }
+
+    with patch("gateway.config.load_gateway_config", return_value=config), patch(
+        "tools.send_message_tool._send_to_platform",
+        new=AsyncMock(return_value=suppressed),
+    ), patch("gateway.mirror.mirror_to_session") as mirror:
+        result = json.loads(
+            _handle_send(
+                {
+                    "target": "whatsapp:+15550002222",
+                    "message": "contact",
+                }
+            )
+        )
+
+    assert result == suppressed
+    mirror.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "respond_as_owner"),
+    [
+        ("15550001111@s.whatsapp.net", False),
+        ("15550002222@s.whatsapp.net", True),
+    ],
+)
+def test_standalone_oversight_allows_home_or_explicit_owner_response(
+    chat_id, respond_as_owner
+):
+    config = SimpleNamespace(
+        token="",
+        extra={
+            "bridge_port": 3000,
+            "oversight_mode": True,
+            "respond_as_owner": respond_as_owner,
+        },
+        home_channel=SimpleNamespace(chat_id="15550001111@s.whatsapp.net"),
+    )
+    session_ctx, calls = _session_with([_resp(200, {"messageId": "m1"})])
+
+    with patch("aiohttp.ClientSession", return_value=session_ctx):
+        result = asyncio.run(_standalone_send(config, chat_id, "allowed"))
+
+    assert result["success"] is True
+    assert len(calls) == 1

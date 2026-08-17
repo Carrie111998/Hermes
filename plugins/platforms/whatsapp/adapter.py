@@ -62,6 +62,53 @@ logger = logging.getLogger(__name__)
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
+def _coerce_config_bool(value: Any, default: bool = False) -> bool:
+    """Coerce a config boolean without treating ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _oversight_target_allowed(
+    chat_id: str,
+    *,
+    oversight_mode: bool,
+    respond_as_owner: bool,
+    home_channel: str,
+    adapter_name: str,
+) -> bool:
+    """Enforce the oversight no-contact boundary for every bridge sender."""
+    if not oversight_mode or respond_as_owner:
+        return True
+    home = str(home_channel or "").strip()
+    if not home:
+        logger.error(
+            "[%s] Blocking WhatsApp outbound in oversight mode: no home channel configured",
+            adapter_name,
+        )
+        return False
+    target_jid = to_whatsapp_jid(chat_id)
+    home_jid = to_whatsapp_jid(home)
+    individual_domains = {"s.whatsapp.net", "lid"}
+    target_domain = target_jid.rpartition("@")[2].lower()
+    home_domain = home_jid.rpartition("@")[2].lower()
+    if target_domain in individual_domains and home_domain in individual_domains:
+        allowed = (
+            canonical_whatsapp_identifier(target_jid)
+            == canonical_whatsapp_identifier(home_jid)
+        )
+    else:
+        allowed = target_jid == home_jid
+    if not allowed:
+        logger.warning(
+            "[%s] Blocking WhatsApp outbound to non-home chat in oversight mode",
+            adapter_name,
+        )
+    return allowed
+
+
 def _listener_pids_on_port(port: int) -> list:
     """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
 
@@ -285,7 +332,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
-from gateway.whatsapp_identity import to_whatsapp_jid
+from gateway.whatsapp_identity import canonical_whatsapp_identifier, to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -450,10 +497,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._allow_from = self._coerce_allow_list(allow_raw)
         self._group_policy = str(config.extra.get("group_policy") or _wenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
-        read_receipts = config.extra.get("send_read_receipts", False)
-        self._send_read_receipts = (
-            read_receipts if isinstance(read_receipts, bool)
-            else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
+        self._send_read_receipts = _coerce_config_bool(
+            config.extra.get("send_read_receipts"), False
+        )
+        self._oversight_mode = self._coerce_bool_extra("oversight_mode", False)
+        self._respond_as_owner = self._coerce_bool_extra("respond_as_owner", False)
+        self._oversight_home_channel = (
+            str(config.home_channel.chat_id).strip()
+            if config.home_channel and config.home_channel.chat_id
+            else ""
         )
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
@@ -505,6 +557,29 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not math.isfinite(parsed) or parsed < 0:
             return float(default)
         return parsed
+
+    def _coerce_bool_extra(self, key: str, default: bool) -> bool:
+        """Read a boolean adapter option without treating ``"false"`` as true."""
+        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        return _coerce_config_bool(value, default)
+
+    def _oversight_allows_outbound(self, chat_id: str) -> bool:
+        """Enforce the oversight no-contact boundary at the transport edge."""
+        return _oversight_target_allowed(
+            chat_id,
+            oversight_mode=getattr(self, "_oversight_mode", False),
+            respond_as_owner=getattr(self, "_respond_as_owner", False),
+            home_channel=getattr(self, "_oversight_home_channel", ""),
+            adapter_name=self.name,
+        )
+
+    def _oversight_blocked_result(self) -> SendResult:
+        """Represent an intentional policy drop as handled, not retryable failure."""
+        return SendResult(
+            success=True,
+            message_id=None,
+            raw_response={"suppressed": True, "reason": "oversight_outbound_policy"},
+        )
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
@@ -719,6 +794,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 _v = _wenv(_key)
                 if _v:
                     bridge_env[_key] = _v
+            if (
+                not _wenv("WHATSAPP_FORWARD_OWNER_MESSAGES")
+                and "forward_owner_messages" in self.config.extra
+            ):
+                bridge_env["WHATSAPP_FORWARD_OWNER_MESSAGES"] = (
+                    "true"
+                    if self._coerce_bool_extra("forward_owner_messages", False)
+                    else "false"
+                )
             # Pass the profile-aware cache directories so the bridge writes
             # media where the Python side reads it.  Without these the bridge
             # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges
@@ -935,6 +1019,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         Formats markdown for WhatsApp, splits long messages into chunks
         that preserve code block boundaries, and sends each chunk sequentially.
         """
+        if not self._oversight_allows_outbound(chat_id):
+            return self._oversight_blocked_result()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1001,6 +1087,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
+        if not self._oversight_allows_outbound(chat_id):
+            return self._oversight_blocked_result()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1034,6 +1122,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
+        if not self._oversight_allows_outbound(chat_id):
+            return self._oversight_blocked_result()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1088,6 +1178,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         remain gateway-owned and add text fallback plus explicit confirmation
         semantics before approval prompts are ever mapped onto polls.
         """
+        if not self._oversight_allows_outbound(chat_id):
+            return self._oversight_blocked_result()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1172,6 +1264,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a native WhatsApp location pin via the Baileys bridge."""
+        if not self._oversight_allows_outbound(chat_id):
+            return self._oversight_blocked_result()
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1277,6 +1371,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        if not self._oversight_allows_outbound(chat_id):
+            return
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -1370,6 +1466,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         key = data.get("readReceiptKey")
         if not isinstance(key, dict):
+            return
+        chat_id = data.get("chatId") or key.get("remoteJid") or ""
+        if not self._oversight_allows_outbound(str(chat_id)):
             return
         try:
             import aiohttp
@@ -1714,6 +1813,22 @@ async def _standalone_send(
     ``/send`` message beforehand.
     """
     extra = getattr(pconfig, "extra", {}) or {}
+    home = getattr(getattr(pconfig, "home_channel", None), "chat_id", "")
+    if not _oversight_target_allowed(
+        chat_id,
+        oversight_mode=_coerce_config_bool(extra.get("oversight_mode")),
+        respond_as_owner=_coerce_config_bool(extra.get("respond_as_owner")),
+        home_channel=home,
+        adapter_name="Whatsapp",
+    ):
+        return {
+            "success": True,
+            "platform": "whatsapp",
+            "chat_id": to_whatsapp_jid(chat_id),
+            "message_id": None,
+            "suppressed": True,
+            "reason": "oversight_outbound_policy",
+        }
     try:
         import aiohttp
     except ImportError:
@@ -1848,7 +1963,8 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
 
     Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
     whatsapp_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+    take precedence over YAML. Non-secret oversight policy stays in
+    ``PlatformConfig.extra`` instead of being mirrored into environment vars.
     """
     import json as _json
     if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
@@ -1874,7 +1990,11 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
-    return None
+    seeded: Dict[str, Any] = {}
+    for key in ("oversight_mode", "respond_as_owner", "forward_owner_messages"):
+        if key in whatsapp_cfg:
+            seeded[key] = whatsapp_cfg[key]
+    return seeded or None
 
 
 def _is_connected(config) -> bool:

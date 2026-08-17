@@ -1668,6 +1668,7 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
+                has_home_channel = isinstance(platform_cfg.get("home_channel"), dict)
                 # Bridge top-level port/host/secret into extra for platforms
                 # whose adapters read these from config.extra (webhook,
                 # msgraph_webhook, api_server).  Without this, YAML like:
@@ -1699,9 +1700,18 @@ def load_gateway_config() -> GatewayConfig:
                             if isinstance(ov_data, dict)
                         }
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
-                if not bridged and not enabled_was_explicit and not has_channel_overrides:
+                if (
+                    not bridged
+                    and not enabled_was_explicit
+                    and not has_channel_overrides
+                    and not has_home_channel
+                ):
                     continue
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
+                if has_home_channel:
+                    home_channel = dict(platform_cfg["home_channel"])
+                    home_channel.setdefault("platform", plat.value)
+                    plat_data["home_channel"] = home_channel
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
                     # Mark the explicit enable/disable so the registry-driven

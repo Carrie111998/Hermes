@@ -505,7 +505,12 @@ def _handle_send(args):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
         # Mirror the sent message into the target's gateway session
-        if isinstance(result, dict) and result.get("success") and mirror_text:
+        if (
+            isinstance(result, dict)
+            and result.get("success")
+            and not result.get("suppressed")
+            and mirror_text
+        ):
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env

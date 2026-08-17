@@ -82,6 +82,19 @@ class TestAdapterInit:
         adapter = WhatsAppAdapter(config)
         assert adapter._reply_prefix == "Bot\\n"
 
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [(True, True), (False, False), ("yes", True), ("false", False)],
+    )
+    def test_read_receipt_boolean_coercion(self, configured, expected):
+        from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+        adapter = WhatsAppAdapter(
+            PlatformConfig(enabled=True, extra={"send_read_receipts": configured})
+        )
+
+        assert adapter._send_read_receipts is expected
+
 
 class TestReadReceiptPolicyOrdering:
     @pytest.mark.asyncio
@@ -106,6 +119,36 @@ class TestReadReceiptPolicyOrdering:
 
         assert session.post.call_args.kwargs["json"] == {"key": key}
         assert session.post.call_args.args[0].endswith("/read")
+
+    @pytest.mark.asyncio
+    async def test_oversight_blocks_contact_receipt_before_bridge(self):
+        from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+        adapter = WhatsAppAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "send_read_receipts": True,
+                    "oversight_mode": True,
+                    "respond_as_owner": False,
+                },
+                home_channel=SimpleNamespace(
+                    platform=Platform.WHATSAPP,
+                    chat_id="15550001111@s.whatsapp.net",
+                ),
+            )
+        )
+        session = MagicMock()
+        adapter._http_session = session
+        key = {
+            "id": "incoming-1",
+            "remoteJid": "15550002222@s.whatsapp.net",
+            "fromMe": False,
+        }
+
+        await adapter._send_read_receipt({"readReceiptKey": key})
+
+        session.post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
