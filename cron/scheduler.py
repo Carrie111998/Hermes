@@ -63,6 +63,17 @@ from agent.delegation_context import (
 
 logger = logging.getLogger(__name__)
 
+_VALID_PAYLOAD_TYPES = frozenset({"text/markdown", "text/html"})
+_DEFAULT_PAYLOAD_TYPE = "text/markdown"
+
+
+def _extract_payload_type(job: dict) -> str:
+    """Extract the declared payload_type from a cron job config, coercing invalid values to the default."""
+    value = job.get("payload_type", _DEFAULT_PAYLOAD_TYPE)
+    if value in _VALID_PAYLOAD_TYPES:
+        return value
+    return _DEFAULT_PAYLOAD_TYPE
+
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's timeout.
@@ -2788,6 +2799,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    "payload_type": _extract_payload_type(job),
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
@@ -2802,7 +2814,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = {"job_id": job["id"], "payload_type": _extract_payload_type(job)}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
@@ -3055,7 +3067,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, payload_type=_extract_payload_type(job))
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3084,7 +3096,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, payload_type=_extract_payload_type(job)))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
