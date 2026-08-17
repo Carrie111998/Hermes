@@ -695,6 +695,18 @@ class GatewaySlashCommandsMixin:
                 user_config = _load_gateway_config()
             except Exception:
                 user_config = {}
+        if not route_resolved:
+            try:
+                model_name, runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                    user_config=user_config,
+                )
+                provider_name = _clean_str(runtime.get("provider"))
+                base_url = _clean_str(runtime.get("base_url"))
+                route_resolved = bool(model_name and provider_name)
+            except Exception:
+                logger.debug("Status route resolution failed", exc_info=True)
         if not model_name:
             model_name = _resolve_gateway_model(user_config)
         if not provider_name:
