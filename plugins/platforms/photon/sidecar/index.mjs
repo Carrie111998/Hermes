@@ -66,7 +66,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
-import { chooseSendFormat } from "./send-format.mjs";
+import { patchSpectrumMarkdown } from "./patch-spectrum-url-markdown.mjs";
 import {
   classifyProbeRejection,
   shouldProbe,
@@ -286,6 +286,12 @@ try {
   if (patchResult.patched) {
     console.error(
       `photon-sidecar: spectrum mixed attachment patch applied: ${patchResult.file}`
+    );
+  }
+  const urlPatchResult = patchSpectrumMarkdown();
+  if (urlPatchResult.patched) {
+    console.error(
+      `photon-sidecar: spectrum styled-send data-detection patch applied: ${urlPatchResult.file}`
     );
   }
 } catch (e) {
@@ -1022,16 +1028,14 @@ const server = http.createServer(async (req, res) => {
       const space = await resolveSpace(spaceId);
       // iMessage renders markdown natively; spectrum-ts degrades it to
       // readable plain text on platforms that don't.
-      // spectrumMarkdown() enables enableDataDetection in the underlying
-      // iMessage API, which can 500 on messages containing raw URLs.
-      // Plain-text URLs are auto-linked by iMessage, so route markdown
-      // messages that contain URLs through spectrumText while preserving
-      // spectrumMarkdown for URL-free markdown. The decision lives in
-      // send-format.mjs so tests can exercise it directly.
+      // Markdown messages containing raw URLs used to 500: the styled send
+      // path (formatting ranges) defaults server-side data detection ON, and
+      // a URL in the text trips it. patch-spectrum-url-markdown.mjs now
+      // disables data detection at the provider, so URL-bearing markdown
+      // sends as one styled message with the URL embedded — no plain-text
+      // downgrade needed.
       const builder =
-        chooseSendFormat(format, text) === "markdown"
-          ? spectrumMarkdown(text)
-          : spectrumText(text);
+        format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
       const result = await space.send(builder);
       return ok(res, { messageId: result?.id || null });
     }
