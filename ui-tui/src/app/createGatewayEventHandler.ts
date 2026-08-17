@@ -823,7 +823,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           const rest = names.length > 3 ? `, +${names.length - 3} more` : ''
 
           const line =
-            `ⓘ ${names.length} tools unavailable (missing config/deps): ${shown}${rest}. ` +
+            `ⓘ ${names.length} ${names.length === 1 ? 'tool' : 'tools'} unavailable (missing config/deps): ${shown}${rest}. ` +
             'Run `hermes tools` to configure.'
 
           return [...prev, { kind: 'event', role: 'system', text: line }]

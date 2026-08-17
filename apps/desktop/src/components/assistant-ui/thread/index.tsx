@@ -126,7 +126,7 @@ export const Thread = memo(function Thread({
   const unavailableNames = sessionId ? (toolsUnavailableMap[sessionId] ?? []) : []
 
   const unavailableLine = unavailableNames.length
-    ? `ⓘ ${unavailableNames.length} tools unavailable (missing config/deps): ${unavailableNames.slice(0, 3).join(', ')}${unavailableNames.length > 3 ? `, +${unavailableNames.length - 3} more` : ''}. Run \`hermes tools\` to configure.`
+    ? `ⓘ ${unavailableNames.length} ${unavailableNames.length === 1 ? 'tool' : 'tools'} unavailable (missing config/deps): ${unavailableNames.slice(0, 3).join(', ')}${unavailableNames.length > 3 ? `, +${unavailableNames.length - 3} more` : ''}. Run \`hermes tools\` to configure.`
     : ''
 
   const hasBranchInNewChat = Boolean(onBranchInNewChat)

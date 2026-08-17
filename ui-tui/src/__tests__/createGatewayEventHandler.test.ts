@@ -789,6 +789,17 @@ describe('createGatewayEventHandler', () => {
     )
   })
 
+  it('uses singular wording when exactly one tool is unavailable', () => {
+    const appended: Msg[] = [{ kind: 'intro', role: 'system', text: '' }]
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { names: ['tts_speak'] }, type: 'tools.unavailable' } as any)
+
+    expect(appended[1]?.text).toBe(
+      'ⓘ 1 tool unavailable (missing config/deps): tts_speak. Run `hermes tools` to configure.'
+    )
+  })
+
   it('does not surface the notice when a non-intro item already exists', () => {
     // A single pre-existing system item (e.g. a setup panel) makes the
     // transcript non-fresh even though the history length is still small.
@@ -797,7 +808,9 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({ payload: { names: ['browser_navigate'] }, type: 'tools.unavailable' } as any)
 
-    expect(appended.some(msg => msg.text.includes('tools unavailable'))).toBe(false)
+    // Match the notice regardless of singular/plural wording (the line reads
+    // "1 tool unavailable" for a single name, "N tools unavailable" otherwise).
+    expect(appended.some(msg => /\d+ tools? unavailable/.test(msg.text ?? ''))).toBe(false)
   })
 
   it('does not surface unavailable tools into an in-progress session', () => {
@@ -808,6 +821,8 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { text: 'existing reply' }, type: 'message.complete' } as any)
     onEvent({ payload: { names: ['browser_navigate'] }, type: 'tools.unavailable' } as any)
 
+    // Regex (not a 'tools unavailable' substring) so the assertion survives
+    // the singular "1 tool unavailable" wording.
     expect(appended.some(msg => /\d+ tools? unavailable/.test(msg.text ?? ''))).toBe(false)
   })
 

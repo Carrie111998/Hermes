@@ -1540,7 +1540,7 @@ def init_agent(
         if len(_unavailable) > 3:
             _shown += f", +{len(_unavailable) - 3} more"
         print(
-            f"ⓘ {len(_unavailable)} tools unavailable (missing config/deps): {_shown}. "
+            f"ⓘ {len(_unavailable)} {'tool' if len(_unavailable) == 1 else 'tools'} unavailable (missing config/deps): {_shown}. "
             "Run `hermes tools` to configure."
         )
 
