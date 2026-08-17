@@ -298,29 +298,73 @@ FILE_ACTION_RENAMED_NEW_NAME = 5
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
+_NOTIFY_HEADER_FORMAT = "<III"
+_NOTIFY_HEADER_SIZE = struct.calcsize(_NOTIFY_HEADER_FORMAT)
+
+
 def parse_notifications(buf: bytes, nbytes: int):
     """Walk a FILE_NOTIFY_INFORMATION chain.
 
     Layout: NextEntryOffset (DWORD), Action (DWORD), FileNameLength (DWORD,
     in BYTES not characters), FileName (WCHAR[]). Treating FileNameLength as
     a character count is the classic way to get this wrong.
+
+    Bounded against ``nbytes`` -- not just the buffer's physical size. The
+    physical buffer is a fixed 64KB scratch area REUSED across calls, so a
+    corrupted or hostile ``FileNameLength`` that claims to extend past the
+    declared valid region would otherwise decode stale bytes left over from
+    a PREVIOUS call's notification as if they were real (reproduced: 1350
+    characters decoded from a buffer whose ``nbytes`` was 16).
     """
     offset = 0
-    while offset + 12 <= nbytes:
-        next_off, action, name_len = struct.unpack_from("<III", buf, offset)
-        start = offset + 12
-        name = buf[start:start + name_len].decode("utf-16-le", "replace")
+    while offset + _NOTIFY_HEADER_SIZE <= nbytes:
+        next_off, action, name_len = struct.unpack_from(_NOTIFY_HEADER_FORMAT, buf, offset)
+        start = offset + _NOTIFY_HEADER_SIZE
+        end = start + name_len
+        if end > nbytes:
+            # This record claims to extend past the declared valid region.
+            # Stop rather than decode bytes ReadDirectoryChangesW never
+            # actually wrote on this call.
+            break
+        name = buf[start:end].decode("utf-16-le", "replace")
         yield action, name
         if next_off == 0:
             break
         offset += next_off
 
 
+def _configure_kernel32(kernel32) -> None:
+    """Pin argtypes/restype for every Win32 call this module makes.
+
+    No live bug today -- but this module hands raw handle ints across
+    threads and object boundaries, and without declared prototypes ctypes
+    guesses marshalling from the Python values it happens to be given. A
+    future edit that passes a plain int where a pointer-sized value is
+    expected (or vice versa) would mis-marshal silently on 64-bit Windows
+    instead of failing loudly at the boundary.
+    """
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.ReadDirectoryChangesW.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int,
+        ctypes.c_uint32, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    kernel32.ReadDirectoryChangesW.restype = ctypes.c_int
+    kernel32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.CancelIoEx.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+
 def _open_directory_handle(root: Path):
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = ctypes.c_void_p
+    _configure_kernel32(kernel32)
     handle = kernel32.CreateFileW(
-        ctypes.c_wchar_p(str(root)),
+        str(root),
         FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         None,
@@ -329,22 +373,91 @@ def _open_directory_handle(root: Path):
         None,
     )
     if not handle or handle == _INVALID_HANDLE_VALUE:
-        raise OSError(ctypes.get_last_error(), f"CreateFileW failed for {root}")
+        err = ctypes.get_last_error()
+        # ctypes.WinError() turns the bare code into the human-readable
+        # Win32 message -- for a diagnostic tool, that text IS the product.
+        raise OSError(err, f"CreateFileW failed for {root}: {ctypes.WinError(err)}")
     return kernel32, handle
 
 
-def watch_readdirchanges(root: Path, on_hit, stop: threading.Event, handles: list) -> None:
+class _HandleOwner:
+    """Exactly one owner ever closes this Win32 handle.
+
+    Two independent code paths reach for the same handle: the watch thread
+    closes it in its own ``finally`` (whatever the exit reason -- a hit, a
+    cancellation, or a failure), and ``run()``'s shutdown loop cancels it to
+    unblock a thread that may still be parked inside the kernel call. Both
+    are routed through this object's ``_lock`` + ``_closed`` flag, so
+    "closed" and "may still be operated on" are mutually exclusive. A raw
+    handle VALUE can be reused by the OS the instant it is closed; gating
+    every operation behind the flag means neither path can ever issue a
+    Win32 call against a value that might by then name something else.
+    """
+
+    def __init__(self, kernel32, handle) -> None:
+        self.kernel32 = kernel32
+        self.handle = handle
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def cancel(self) -> None:
+        """Best-effort CancelIoEx; a silent no-op once already closed."""
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self.kernel32.CancelIoEx(ctypes.c_void_p(self.handle), None)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """Close exactly once. Safe to call more than once."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+            except Exception:
+                pass
+
+
+def _run_watch_thread(log: Path, root: Path, backend: str, target, *args) -> None:
+    """Ensure a watch thread's death is always RECORDED, never silent.
+
+    Python's default thread excepthook only prints to stderr, and a killed
+    or terminal-losing run (the whole reason ``write_record`` writes at the
+    moment of the event -- see its docstring) cannot rely on stderr
+    surviving. Any exception that escapes ``target`` is caught here and
+    turned into a durable log record naming the root and the cause before
+    the thread actually exits, so "the thread died" is something a reader
+    of the log can SEE, never something they have to infer from a watch
+    that just stopped producing records.
+    """
+    try:
+        target(*args)
+    except BaseException as exc:  # a dead thread must never be silent
+        write_record(
+            log, "watch_thread_error", root=str(root), backend=backend,
+            cause=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def watch_readdirchanges(
+    root: Path, on_hit, stop: threading.Event, owner: "_HandleOwner", log: Path,
+) -> None:
     """Block on ReadDirectoryChangesW until %SystemDrive% is created.
 
     Detection latency drops from the poll interval (up to 1.5s in the
     2026-08-16 prototype) to roughly the kernel's notification latency.
 
-    ``handles`` collects the open handle so the owner can CancelIoEx it at
-    shutdown. The thread is a daemon, so a still-blocked call can never hold
-    up interpreter exit either way.
+    ``owner`` wraps the SAME handle whose successful ``CreateFileW`` is what
+    decided this root got the fast backend (see ``Watcher._start_backends``)
+    -- there is no second, independent open here that could diverge from
+    that decision. That is what makes the backend named in an ``armed``
+    record true by construction rather than merely hoped for.
     """
-    kernel32, handle = _open_directory_handle(root)
-    handles.append((kernel32, handle))
+    kernel32, handle = owner.kernel32, owner.handle
     buf = ctypes.create_string_buffer(64 * 1024)
     returned = ctypes.c_ulong(0)
     try:
@@ -354,7 +467,31 @@ def watch_readdirchanges(root: Path, on_hit, stop: threading.Event, handles: lis
                 FILE_NOTIFY_CHANGE_DIR_NAME, ctypes.byref(returned), None, None,
             )
             if not ok:
-                return  # cancelled or handle closed
+                if stop.is_set():
+                    # run()'s shutdown sets _stop BEFORE calling
+                    # owner.cancel() (see run()), so a cancellation-driven
+                    # failure is always observed with stop already set --
+                    # this is the clean-shutdown case, not an error.
+                    return
+                err = ctypes.get_last_error()
+                write_record(
+                    log, "watch_thread_error", root=str(root),
+                    backend="readdirectorychanges",
+                    cause=f"ReadDirectoryChangesW failed: {ctypes.WinError(err)}",
+                )
+                return
+            if returned.value == 0:
+                # Documented signal: TRUE + 0 bytes means the kernel's
+                # change buffer overflowed and events were DROPPED. Left
+                # alone this is indistinguishable from "nothing happened
+                # yet" -- dropped events must never look like silence.
+                write_record(
+                    log, "watch_buffer_overflow", root=str(root),
+                    backend="readdirectorychanges",
+                    note="ReadDirectoryChangesW overflowed; events may "
+                         "have been dropped, watch continues",
+                )
+                continue
             for action, name in parse_notifications(buf.raw, returned.value):
                 if name == JUNK_NAME and action in (
                     FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME
@@ -362,10 +499,7 @@ def watch_readdirchanges(root: Path, on_hit, stop: threading.Event, handles: lis
                     on_hit(root, "readdirectorychanges")
                     return
     finally:
-        try:
-            kernel32.CloseHandle(ctypes.c_void_p(handle))
-        except Exception:
-            pass
+        owner.close()
 
 
 class Watcher:
@@ -404,8 +538,14 @@ class Watcher:
         self._lock = threading.Lock()
         self._hit_roots: set = set()
         self.sightings = 0
-        # Open ReadDirectoryChangesW handles, so run() can CancelIoEx them at
-        # shutdown instead of leaving a watch thread blocked in the kernel.
+        # Open ReadDirectoryChangesW handles, as _HandleOwner instances, so
+        # run() can cancel them at shutdown instead of leaving a watch
+        # thread blocked in the kernel. Appended in _start_backends BEFORE
+        # the owning thread starts (not from inside the thread), so a
+        # thread that dies before its first loop iteration still leaves its
+        # handle discoverable here. Closing is exclusively _HandleOwner's
+        # job -- see its docstring for why cancel()/close() are safe no-ops
+        # against each other regardless of ordering.
         self._handles: list = []
 
     def record_preexisting(self) -> None:
@@ -574,35 +714,50 @@ class Watcher:
         A root that cannot be opened for a directory watch is DOWNGRADED to
         polling and the downgrade is recorded -- a run must never be able to
         claim a fast watch it did not get.
+
+        The handle is opened EXACTLY ONCE per root, here. Its successful
+        open is what decides ``chosen[root] = "readdirectorychanges"``, and
+        that SAME handle (via ``_HandleOwner``) is what gets handed to the
+        thread that actually runs the watch -- there is no throwaway
+        probe-then-reopen, so there is no second, independent open whose
+        failure could leave the ``armed`` claim and reality diverging.
         """
         chosen = {}
         for root in self.roots:
             use_fast = sys.platform == "win32" and not self.force_polling
+            owner = None
             if use_fast:
                 try:
-                    # Probe openability, then close immediately -- the watch
-                    # thread opens its own handle.
-                    probe_k32, probe_handle = _open_directory_handle(root)
-                    probe_k32.CloseHandle(ctypes.c_void_p(probe_handle))
+                    owner = _HandleOwner(*_open_directory_handle(root))
                 except OSError as exc:
                     write_record(
                         self.log, "backend_downgrade", root=str(root),
-                        reason=repr(exc),
+                        reason=str(exc),
                         note="could not open a directory handle; falling back to polling",
                     )
                     use_fast = False
             if use_fast:
                 chosen[str(root)] = "readdirectorychanges"
+                # Registered before the thread starts -- see the comment on
+                # self._handles in __init__.
+                self._handles.append(owner)
                 threading.Thread(
-                    target=watch_readdirchanges,
-                    args=(root, self.on_hit, self._stop, self._handles),
+                    target=_run_watch_thread,
+                    args=(
+                        self.log, root, "readdirectorychanges",
+                        watch_readdirchanges,
+                        root, self.on_hit, self._stop, owner, self.log,
+                    ),
                     daemon=True,
                 ).start()
             else:
                 chosen[str(root)] = "polling"
                 threading.Thread(
-                    target=watch_polling,
-                    args=(root, self.on_hit, self._stop, self._poll_s),
+                    target=_run_watch_thread,
+                    args=(
+                        self.log, root, "polling", watch_polling,
+                        root, self.on_hit, self._stop, self._poll_s,
+                    ),
                     daemon=True,
                 ).start()
         return chosen
@@ -627,11 +782,8 @@ class Watcher:
         while not self._stop.is_set() and time.monotonic() < deadline:
             self._stop.wait(0.2)
         self._stop.set()
-        for kernel32, handle in self._handles:
-            try:
-                kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
-            except Exception:
-                pass
+        for owner in self._handles:
+            owner.cancel()
         watched = round(time.monotonic() - started, 1)
         write_record(
             self.log, "done",

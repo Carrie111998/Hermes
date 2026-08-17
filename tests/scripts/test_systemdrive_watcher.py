@@ -7,6 +7,7 @@ writer it was built for reproduced from a plain SEQUENTIAL pytest run.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
@@ -371,6 +372,8 @@ import pytest
 
 from scripts.systemdrive_watcher import (
     FILE_ACTION_ADDED,
+    _HandleOwner,
+    _open_directory_handle,
     parse_notifications,
     watch_readdirchanges,
 )
@@ -399,9 +402,23 @@ def test_parse_notifications_walks_the_chain():
 
 
 def test_parse_notifications_stops_at_the_declared_length():
-    buf = _notification(FILE_ACTION_ADDED, JUNK_NAME) + b"\x00" * 64
-    entries = list(parse_notifications(buf, len(_notification(FILE_ACTION_ADDED, JUNK_NAME))))
-    assert entries == [(FILE_ACTION_ADDED, JUNK_NAME)]
+    """Regression for review finding 7: the original version of this test
+    built one notification with next_offset=0 plus trailing zero bytes. The
+    next_off == 0 terminator ends the walk on its own -- that test would
+    have passed even with the nbytes bound deleted entirely.
+
+    This version proves the nbytes bound itself does the work: the buffer is
+    the module's REUSED 64KB scratch area, so `stale` here stands in for a
+    previous call's leftover notification. The header declares a name far
+    longer than the bytes ReadDirectoryChangesW actually returned this call
+    (`nbytes`); without the bound, parse_notifications would slice into
+    `stale` and decode it as if it were part of the real notification.
+    """
+    stale = _notification(FILE_ACTION_ADDED, "PREVIOUS-CALL-LEFTOVER-DATA")
+    honest_header = struct.pack("<III", 0, FILE_ACTION_ADDED, 4000)
+    buf = honest_header + stale
+    nbytes = 12  # only the header is within the declared valid region
+    assert list(parse_notifications(buf, nbytes)) == []
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="ReadDirectoryChangesW is Win32-only")
@@ -409,9 +426,11 @@ def test_readdirchanges_detects_a_created_directory(tmp_path: Path):
     """End-to-end proof the fast backend actually fires."""
     hits = []
     stop = threading.Event()
+    log = tmp_path / "w.jsonl"
+    owner = _HandleOwner(*_open_directory_handle(tmp_path.resolve()))
     thread = threading.Thread(
         target=watch_readdirchanges,
-        args=(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, []),
+        args=(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, owner, log),
         daemon=True,
     )
     thread.start()
@@ -424,11 +443,25 @@ def test_readdirchanges_detects_a_created_directory(tmp_path: Path):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32-only")
 def test_readdirchanges_ignores_unrelated_directories(tmp_path: Path):
+    """Regression for review finding 8: the original version of this test
+    called `stop.set()` with no filesystem event and no CancelIoEx. A
+    `threading.Event` cannot interrupt a thread blocked inside
+    ReadDirectoryChangesW (verified: the thread was still alive 4s after
+    stop.set()), so that version leaked a permanently-blocked thread and
+    handle for the rest of the pytest process.
+
+    This version releases the watch for real via `owner.cancel()` (the only
+    thing that actually unblocks the kernel call) and proves the thread
+    actually exits -- which exercises real cancellation, previously
+    untested.
+    """
     hits = []
     stop = threading.Event()
+    log = tmp_path / "w.jsonl"
+    owner = _HandleOwner(*_open_directory_handle(tmp_path.resolve()))
     thread = threading.Thread(
         target=watch_readdirchanges,
-        args=(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, []),
+        args=(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, owner, log),
         daemon=True,
     )
     thread.start()
@@ -436,7 +469,15 @@ def test_readdirchanges_ignores_unrelated_directories(tmp_path: Path):
     (tmp_path / "unrelated").mkdir()
     time.sleep(0.5)
     stop.set()
+    owner.cancel()  # actually releases the thread blocked in the kernel call
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "watch thread survived cancellation"
     assert not hits
+    # A clean, stop-driven cancellation must not be logged as an error --
+    # nothing at all should have been written to the log.
+    assert not log.exists() or not [
+        r for r in _rows(log) if r["event"] == "watch_thread_error"
+    ]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32-only")
@@ -449,6 +490,129 @@ def test_watcher_records_the_backend_it_actually_got(tmp_path: Path):
     watcher.run()
     armed = [r for r in _rows(log) if r["event"] == "armed"][0]
     assert armed["backend_by_root"][str(root.resolve())] == "readdirectorychanges"
+
+
+def test_backend_downgrade_is_recorded_and_armed_agrees(tmp_path: Path, monkeypatch):
+    """Coverage for the CRITICAL fix (finding 1/1b).
+
+    Before the fix, `_start_backends` validated a root with a throwaway
+    probe-then-close, recorded the fast backend, and only THEN let the
+    watch thread open its own, second handle outside any try/finally. If
+    that second open failed (TOCTOU), the thread died silently, no
+    `backend_downgrade` was recorded, and `armed` still claimed the fast
+    backend for a root that was never actually watched -- a fabricated
+    clean negative.
+
+    This test forces `_open_directory_handle` to fail and asserts BOTH
+    halves of the fix agree: a `backend_downgrade` record is written AND
+    `armed.backend_by_root` reports "polling" for that root. It fails
+    against the pre-fix code (which never calls `_open_directory_handle`
+    from `_start_backends` in a way this monkeypatch would intercept before
+    already having claimed the fast backend).
+    """
+    import scripts.systemdrive_watcher as w
+
+    def boom(root):
+        raise OSError(5, f"Access is denied: {root}")
+
+    monkeypatch.setattr(w, "_open_directory_handle", boom)
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    watcher = w.Watcher([root], log=log, secs=0.2, poll_ms=20, sample_ms=20)
+    watcher.run()
+
+    rows = _rows(log)
+    downgrades = [r for r in rows if r["event"] == "backend_downgrade"]
+    assert len(downgrades) == 1
+    assert downgrades[0]["root"] == str(root.resolve())
+    armed = [r for r in rows if r["event"] == "armed"][0]
+    assert armed["backend_by_root"][str(root.resolve())] == "polling", (
+        "the armed claim and the backend_downgrade record must agree"
+    )
+
+
+class _FakeKernel32:
+    """Minimal stand-in for kernel32 so watch_readdirchanges's response
+    handling can be unit tested without a real filesystem watch or real
+    Win32 handle churn.
+
+    ``responses`` is a list of ``(ok, returned_bytes, last_error_or_None)``
+    consumed one per ReadDirectoryChangesW call.
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    def ReadDirectoryChangesW(self, handle, buf, size, watch_subtree, filt,
+                               returned_ref, overlapped, completion):
+        ok, value, err = self._responses.pop(0)
+        returned_ref._obj.value = value
+        if err is not None:
+            ctypes.set_last_error(err)
+        return 1 if ok else 0
+
+    def CloseHandle(self, handle):
+        return 1
+
+    def CancelIoEx(self, handle, overlapped):
+        return 1
+
+
+def test_watch_readdirchanges_records_buffer_overflow_and_continues(tmp_path: Path):
+    """Coverage for finding 3: ReadDirectoryChangesW returning TRUE with
+    returned==0 is the documented overflow signal -- events were DROPPED.
+    Left alone that is indistinguishable from "nothing happened yet". It
+    must be recorded, and the watch must keep running rather than treat it
+    as fatal.
+    """
+    fake = _FakeKernel32([
+        (True, 0, None),   # overflow
+        (True, 0, None),   # overflow again
+        (False, 0, None),  # then the loop notices stop is set (below) and exits cleanly
+    ])
+    owner = _HandleOwner(fake, 12345)
+    stop = threading.Event()
+    log = tmp_path / "w.jsonl"
+    hits = []
+    calls = {"n": 0}
+    real_read = fake.ReadDirectoryChangesW
+
+    def counting_read(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            stop.set()  # simulate run()'s shutdown having already fired
+        return real_read(*args, **kwargs)
+
+    fake.ReadDirectoryChangesW = counting_read
+
+    watch_readdirchanges(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, owner, log)
+
+    rows = _rows(log)
+    overflow_rows = [r for r in rows if r["event"] == "watch_buffer_overflow"]
+    assert len(overflow_rows) == 2
+    assert not hits, "an overflow must never be mistaken for a hit"
+    assert not [r for r in rows if r["event"] == "watch_thread_error"], (
+        "a clean, stop-driven exit must not be logged as an abnormal failure"
+    )
+
+
+def test_watch_readdirchanges_records_an_unexplained_failure(tmp_path: Path):
+    """Coverage for finding 6: ok=False WITHOUT stop being set is a genuine
+    mid-run failure, not a clean CancelIoEx-driven shutdown, and the two
+    must not be treated identically.
+    """
+    fake = _FakeKernel32([(False, 0, 6)])  # ERROR_INVALID_HANDLE; stop never set
+    owner = _HandleOwner(fake, 12345)
+    stop = threading.Event()
+    log = tmp_path / "w.jsonl"
+
+    watch_readdirchanges(tmp_path.resolve(), lambda r, b: None, stop, owner, log)
+
+    errors = [r for r in _rows(log) if r["event"] == "watch_thread_error"]
+    assert len(errors) == 1
+    assert errors[0]["root"] == str(tmp_path.resolve())
+    assert errors[0]["backend"] == "readdirectorychanges"
 
 
 def test_force_polling_is_reflected_in_the_armed_record(tmp_path: Path):
