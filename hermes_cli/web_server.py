@@ -773,6 +773,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "computer_use": "agent",
+    # Relay exposes one disabled-by-default egress control; keep it with
+    # security settings instead of creating a one-field dashboard tab.
+    "relay": "security",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
