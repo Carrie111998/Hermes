@@ -2307,6 +2307,17 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _normalize_sandbox(value: Any, default: bool) -> bool:
+    """Coerce a sandbox flag from any caller surface to a bool.
+
+    Single owner of sandbox truthiness: ``None`` falls back to *default*
+    (top-level default False; per-task default is the normalized top-level
+    value), string values use the shared truthy parser so a model-emitted
+    ``"false"`` behaves correctly.
+    """
+    return is_truthy_value(value, default=default)
+
+
 def _register_child_sandbox_overrides(
     child_task_id: str,
     parent_task_id: Optional[str] = None,
@@ -2395,6 +2406,11 @@ def _seed_child_terminal_env(
     on backends that cannot isolate — the spawn site must propagate it, not
     swallow it: an explicit ``sandbox=True`` that silently lands in the
     parent's filesystem is a false isolation guarantee.
+
+    The seeded cwd is not a stale record: the fresh container's working
+    directory is derived from it (``get_session_cwd(task_id)`` feeds the
+    container's ``-w``), so the record and the container state agree by
+    construction.
     """
     from tools.terminal_tool import (
         get_session_cwd,
@@ -3607,7 +3623,7 @@ def delegate_task(
     # Per-subagent terminal sandbox isolation (issue #4271). Per-task
     # `sandbox` beats the top-level value; both default to False (children
     # share the parent's sandbox, the documented contract).
-    sandbox = is_truthy_value(sandbox, default=False) if sandbox is not None else False
+    sandbox = _normalize_sandbox(sandbox, False)
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -3708,7 +3724,7 @@ def delegate_task(
     # Fail fast BEFORE spawning any child: sandbox=True on local/ssh/vercel
     # cannot be honored, and silently ignoring it would hand the caller a
     # false isolation guarantee (shared filesystem/env blast radius).
-    if sandbox or any(is_truthy_value(t.get("sandbox", False)) for t in task_list):
+    if sandbox or any(_normalize_sandbox(t.get("sandbox"), False) for t in task_list):
         from tools.terminal_tool import _get_env_config as _terminal_env_config
 
         _env_type = _terminal_env_config().get("env_type", "local")
@@ -3867,7 +3883,7 @@ def delegate_task(
                 _t["goal"],
                 child,
                 parent_agent,
-                sandbox=is_truthy_value(_t.get("sandbox"), default=sandbox),
+                sandbox=_normalize_sandbox(_t.get("sandbox"), sandbox),
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
@@ -3893,7 +3909,7 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
-                        sandbox=is_truthy_value(t.get("sandbox"), default=sandbox),
+                        sandbox=_normalize_sandbox(t.get("sandbox"), sandbox),
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,

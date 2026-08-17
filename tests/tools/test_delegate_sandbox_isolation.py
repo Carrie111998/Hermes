@@ -127,6 +127,14 @@ class TestRegisterChildSandboxOverrides:
             "daytona_image": "hermes-daytona",
         }
 
+    def test_singularity_registers_singularity_image(self, monkeypatch):
+        _set_backend(monkeypatch, "singularity", "docker://hermes-singularity")
+        _register_child_sandbox_overrides("subagent-1")
+        assert terminal_tool._task_env_overrides["subagent-1"] == {
+            "env_type": "singularity",
+            "singularity_image": "docker://hermes-singularity",
+        }
+
     def test_local_backend_raises(self, monkeypatch):
         _set_backend(monkeypatch, "local")
         with pytest.raises(ValueError, match="container terminal backend"):
