@@ -51,6 +51,30 @@ def test_store_rejects_a_compression_ancestor_when_a_tip_exists(tmp_path: Path) 
             store_archived_lineage(db, "root", tmp_path / "archive")
     finally:
         db.close()
+
+
+def test_store_keeps_a_compression_child_with_an_inherited_old_delegate_marker(tmp_path: Path) -> None:
+    """Inherited markers are not forks unless they name the direct parent."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("root", source="cli")
+        db.end_session("root", "compression")
+        db.create_session(
+            "terminal",
+            source="cli",
+            parent_session_id="root",
+            model_config={"_delegate_from": "older-delegate-parent"},
+        )
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        result = store_archived_lineage(db, "terminal", tmp_path / "archive")
+
+        assert result.physical_ids == ("root", "terminal")
+    finally:
+        db.close()
+
+
 def test_store_reads_raw_rows_without_flushing_and_preserves_system_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

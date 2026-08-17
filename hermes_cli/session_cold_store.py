@@ -59,15 +59,23 @@ def _session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None
 
 
 def _is_explicit_fork(row: dict[str, Any]) -> bool:
+    if row.get("source") == "tool":
+        return True
     raw_config = row.get("model_config")
+    if not raw_config:
+        return False
     try:
-        config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config or {}
-    except json.JSONDecodeError:
-        return True
+        config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+    except (TypeError, json.JSONDecodeError):
+        return False
     if not isinstance(config, dict):
-        return True
+        return False
     parent_id = row.get("parent_session_id")
-    return bool(config.get("_branched_from") or config.get("_delegate_from")) and bool(parent_id)
+    branched = config.get("_branched_from")
+    delegated = config.get("_delegate_from")
+    if parent_id:
+        return branched == parent_id or delegated == parent_id
+    return branched is not None or delegated is not None
 
 
 def _raw_compression_lineage(conn: sqlite3.Connection, terminal_id: str) -> tuple[str, ...]:
@@ -195,15 +203,17 @@ def _valid_existing_revision(revision_dir: Path, terminal_id: str, lineage: tupl
     )
 
 
-def _fsync_created_parents(archive_root: Path, revision_parent: Path) -> None:
-    """Fsync each directory created between archive root and the revision parent."""
-    current = revision_parent
-    parents: list[Path] = []
-    while current != archive_root:
-        parents.append(current)
+def _ensure_dir_tree_fsynced(path: Path) -> None:
+    """Create a directory chain and fsync every new entry plus its parent."""
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
         current = current.parent
-    for directory in reversed(parents):
+    for directory in reversed(missing):
+        directory.mkdir()
         _fsync_dir(directory)
+        _fsync_dir(directory.parent)
 
 
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:
@@ -258,9 +268,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
             return StoredLineage(terminal_id, lineage, fingerprint, revision_dir)
         raise ValueError("existing cold-store revision is invalid or mismatched")
 
-    archive_root.mkdir(parents=True, exist_ok=True)
-    revision_dir.parent.mkdir(parents=True, exist_ok=True)
-    _fsync_created_parents(archive_root, revision_dir.parent)
+    _ensure_dir_tree_fsynced(revision_dir.parent)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=revision_dir.parent))
     try:
         metadata = {
