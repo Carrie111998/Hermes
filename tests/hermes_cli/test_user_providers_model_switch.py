@@ -180,6 +180,76 @@ def test_list_authenticated_providers_uses_live_models_for_user_provider(monkeyp
     assert user_prov["total_models"] == 2
 
 
+def test_live_discovery_resolves_key_from_hermes_env_file(monkeypatch):
+    """Named providers must use Hermes env resolution, not only os.environ."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.delenv("ZENMUX_TEST_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda key: "env-file-secret" if key == "ZENMUX_TEST_KEY" else None,
+    )
+
+    calls = []
+
+    def fake_fetch_api_models(api_key, base_url):
+        calls.append((api_key, base_url))
+        return ["provider/model-a", "provider/model-b"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fake_fetch_api_models)
+
+    providers = list_authenticated_providers(
+        current_provider="zenmux",
+        user_providers={
+            "zenmux": {
+                "name": "ZenMux",
+                "base_url": "https://zenmux.ai/api/v1",
+                "key_env": "ZENMUX_TEST_KEY",
+                "discover_models": True,
+            }
+        },
+        custom_providers=[],
+        max_models=50,
+    )
+
+    zenmux = next(p for p in providers if p["slug"] == "zenmux")
+    assert calls == [("env-file-secret", "https://zenmux.ai/api/v1")]
+    assert zenmux["models"] == ["provider/model-a", "provider/model-b"]
+    assert zenmux["total_models"] == 2
+
+
+def test_live_discovery_skips_missing_key_without_leak_or_exception(monkeypatch):
+    """Missing credentials must leave discovery empty and fail closed."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.delenv("MISSING_TEST_KEY", raising=False)
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: None)
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models",
+        lambda api_key, base_url: calls.append((api_key, base_url)) or ["unexpected"],
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="missing-provider",
+        user_providers={
+            "missing-provider": {
+                "name": "Missing Provider",
+                "base_url": "https://example.test/v1",
+                "key_env": "MISSING_TEST_KEY",
+                "discover_models": True,
+            }
+        },
+        custom_providers=[],
+        max_models=50,
+    )
+
+    provider = next(p for p in providers if p["slug"] == "missing-provider")
+    assert calls == []
+    assert provider["models"] == []
+    assert provider["total_models"] == 0
+
+
 def test_list_authenticated_providers_dict_models_without_default_model(monkeypatch):
     """Dict-format ``models:`` without a ``default_model`` must still expose
     every dict key, not collapse to an empty list."""

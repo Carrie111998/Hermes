@@ -1204,6 +1204,7 @@ def list_authenticated_providers(
     not block on fresh Portal/account checks every time.
     """
     import os
+    from hermes_cli.config import get_env_value
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
         fetch_models_dev,
@@ -1716,7 +1717,8 @@ def list_authenticated_providers(
             api_key = str(ep_cfg.get("api_key", "") or "").strip()
             if not api_key:
                 key_env = str(ep_cfg.get("key_env", "") or "").strip()
-                api_key = os.environ.get(key_env, "").strip() if key_env else ""
+                api_key = get_env_value(key_env) or ""
+                api_key = api_key.strip() if key_env else ""
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
@@ -1782,7 +1784,7 @@ def list_authenticated_providers(
             inline_api_key = (entry.get("api_key") or "").strip()
             key_env = (entry.get("key_env") or "").strip()
             api_key = inline_api_key or (
-                os.environ.get(key_env, "").strip() if key_env else ""
+                (get_env_value(key_env) or "").strip() if key_env else ""
             )
             api_mode = str(
                 entry.get("api_mode")

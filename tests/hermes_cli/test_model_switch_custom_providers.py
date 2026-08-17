@@ -669,6 +669,41 @@ def test_custom_providers_discover_models_false_keeps_explicit_subset(monkeypatc
     assert gateway_prov["total_models"] == 2
 
 
+def test_custom_provider_discovery_resolves_key_from_hermes_env_file(monkeypatch):
+    """Saved custom providers must honor Hermes-managed external env files."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.delenv("CUSTOM_TEST_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda key: "env-file-secret" if key == "CUSTOM_TEST_KEY" else None,
+    )
+    calls = []
+
+    def fake_fetch_api_models(api_key, base_url):
+        calls.append((api_key, base_url))
+        return ["provider/model-a", "provider/model-b"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fake_fetch_api_models)
+    providers = list_authenticated_providers(
+        current_provider="custom:zenmux",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "ZenMux",
+                "base_url": "https://zenmux.ai/api/v1",
+                "key_env": "CUSTOM_TEST_KEY",
+                "discover_models": True,
+            }
+        ],
+        max_models=50,
+    )
+
+    zenmux = next(p for p in providers if p["name"] == "ZenMux")
+    assert calls == [("env-file-secret", "https://zenmux.ai/api/v1")]
+    assert zenmux["models"] == ["provider/model-a", "provider/model-b"]
+
+
 def test_custom_providers_discover_models_false_string_is_normalised(monkeypatch):
     """String ``discover_models: "false"`` (hand-edited / env-style configs)
     must be treated as a disable, same as the boolean ``False`` and section 3.
