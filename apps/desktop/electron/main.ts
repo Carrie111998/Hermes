@@ -235,6 +235,7 @@ import {
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 import { selectPoolEvictions } from './pool-eviction'
+import { assertPoolRuntimeInstalled } from './pool-runtime-guard'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
@@ -9898,7 +9899,16 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
-  const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  const resolvedPoolBackend = resolveHermesBackend(backendArgs)
+
+  // A pool backend is a SECONDARY source (a background profile, or a row in
+  // the connections registry). Enumerating the agent roster must never start
+  // a first-run platform install -- the same rule hermes:window:openInTerminal
+  // already follows. Report the unresolved runtime instead; the roster catches
+  // this per-source and renders an unreachable row.
+  assertPoolRuntimeInstalled(resolvedPoolBackend)
+
+  const backend = await ensureRuntime(resolvedPoolBackend)
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
