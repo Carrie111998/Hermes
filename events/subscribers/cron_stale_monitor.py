@@ -19,6 +19,13 @@ That is precisely how the 2026-08-11 outage ran 5h08m — the gateway process
 alive and this subscriber polling beside it — with zero of 69 cron jobs
 running.  The ticker heartbeat file is the one signal that survives that
 failure, because nothing refreshes it once the thread is gone.
+
+Three checks, on three clocks.  ``_check_stale`` and ``_check_ticker_stale``
+run per poll, on this process's own state.  The third runs ONCE, in
+``startup()``: it rebuilds the shutdown attributions a force-killed
+predecessor never got to write, by querying the bus rather than by handling
+events.  That one needs no in-memory state at all, which is exactly why it
+works where ``handle()`` cannot.
 """
 
 import logging
