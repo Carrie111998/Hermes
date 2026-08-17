@@ -11956,24 +11956,37 @@ def _read_worker_run_log_tail(
     return the task-level tail. This keeps legacy/custom-spawn logs from being
     misattributed to a run that did not write them.
     """
-    if run_id is None:
+    if run_id is None or tail_bytes <= 0:
         return None
     path = worker_log_path(task_id, board=board)
+    marker = _worker_run_log_marker(run_id)
+    marker_overlap = b""
     try:
-        data = path.read_bytes()
+        with path.open("rb") as log_f:
+            while chunk := log_f.read(64 * 1024):
+                scan = marker_overlap + chunk
+                marker_at = scan.find(marker)
+                if marker_at >= 0:
+                    marker_end = (
+                        log_f.tell() - len(chunk) - len(marker_overlap)
+                        + marker_at + len(marker)
+                    )
+                    break
+                marker_overlap = scan[-(len(marker) - 1):]
+            else:
+                return None
+
+            log_f.seek(0, os.SEEK_END)
+            log_end = log_f.tell()
+            output_size = log_end - marker_end
+            if output_size <= 0:
+                return None
+            log_f.seek(max(marker_end, log_end - tail_bytes))
+            run_output = log_f.read(min(output_size, tail_bytes))
     except OSError:
         return None
 
-    marker = _worker_run_log_marker(run_id)
-    marker_at = data.find(marker)
-    if marker_at < 0:
-        return None
-    run_output = data[marker_at + len(marker):]
-    if not run_output:
-        return None
-
-    if len(run_output) > tail_bytes:
-        run_output = run_output[-tail_bytes:]
+    if output_size > tail_bytes:
         newline = run_output.find(b"\n")
         if newline >= 0:
             run_output = run_output[newline + 1:]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import io
 import os
 import sqlite3
 import subprocess
@@ -327,6 +328,30 @@ def test_crash_log_tail_excludes_previous_run_output(
     )
 
     assert payload["worker_log_tail"] == "current-run failure\n"
+
+
+def test_crash_log_tail_reads_incrementally_and_handles_split_marker(
+    kanban_home, monkeypatch,
+):
+    run_id = 42
+    marker = kb._worker_run_log_marker(run_id)
+    prior = b"p" * (64 * 1024 - len(marker) // 2)
+    current = b"x" * (64 * 1024) + b"\ncurrent failure\n"
+    log_bytes = prior + marker + current
+    read_sizes = []
+
+    class GuardedLog(io.BytesIO):
+        def read(self, size=-1):
+            read_sizes.append(size)
+            assert 0 < size <= 64 * 1024
+            return super().read(size)
+
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: GuardedLog(log_bytes))
+
+    tail = kb._read_worker_run_log_tail("task", run_id, tail_bytes=64)
+
+    assert tail == "current failure\n"
+    assert len(read_sizes) >= 3
 
 
 
