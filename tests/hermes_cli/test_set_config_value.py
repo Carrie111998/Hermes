@@ -11,6 +11,7 @@ from hermes_cli.config import (
     config_command,
     cron_model_drift_guard_enabled,
     set_config_value,
+    unset_config_value,
 )
 
 
@@ -284,6 +285,99 @@ class TestListNavigation:
         assert isinstance(allowlist, list)
         assert allowlist[0] == {"name": "alice", "role": "admin"}
         assert allowlist[1] == {"name": "bob", "role": "admin"}
+
+
+# ---------------------------------------------------------------------------
+# Bracket index syntax — regression tests for #87689
+# ---------------------------------------------------------------------------
+
+class TestBracketIndexRejection:
+    """hermes config set/unset must reject bracket index syntax ('name[N]')
+    with a clear error instead of silently writing a literal junk key next
+    to the real list.  Before #87689, `hooks.pre_llm_call[1].command`
+    reported `✓ Set` and created a top-level `pre_llm_call[1]` key that is
+    completely inert at runtime — the operator's hook never fired.
+    """
+
+    HOOKS_CONFIG = (
+        "hooks:\n"
+        "  pre_llm_call:\n"
+        "    - command: existing.py\n"
+        "      timeout: 3\n"
+    )
+
+    def _write_config(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(self.HOOKS_CONFIG)
+
+    def test_bracket_index_set_is_rejected_with_clear_error(
+        self, _isolated_hermes_home, capsys
+    ):
+        self._write_config(_isolated_hermes_home)
+
+        with pytest.raises(SystemExit) as exc:
+            set_config_value("hooks.pre_llm_call[1].command", "/path/new.py")
+        assert exc.value.code == 1
+
+        err = capsys.readouterr().err
+        assert "bracket index syntax" in err
+        assert "hooks.pre_llm_call[1].command" in err
+        assert "hooks.pre_llm_call.1.command" in err  # points at supported syntax
+
+    def test_bracket_index_set_writes_no_junk_key(self, _isolated_hermes_home):
+        """The rejected write must not create a literal 'pre_llm_call[1]' key."""
+        self._write_config(_isolated_hermes_home)
+
+        with pytest.raises(SystemExit):
+            set_config_value("hooks.pre_llm_call[1].command", "/path/new.py")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        # The real list is untouched and no junk sibling key was added.
+        assert reloaded == {
+            "hooks": {
+                "pre_llm_call": [{"command": "existing.py", "timeout": 3}],
+            }
+        }
+        assert "pre_llm_call[1]" not in reloaded["hooks"]
+
+    def test_dotted_numeric_index_still_works(self, _isolated_hermes_home):
+        """The supported numeric dotted-path form must keep working."""
+        self._write_config(_isolated_hermes_home)
+
+        set_config_value("hooks.pre_llm_call.0.command", "/path/new.py")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["hooks"]["pre_llm_call"][0]["command"] == "/path/new.py"
+        assert reloaded["hooks"]["pre_llm_call"][0]["timeout"] == 3
+        assert "pre_llm_call[1]" not in reloaded["hooks"]
+
+    def test_bracket_index_unset_is_rejected(self, _isolated_hermes_home, capsys):
+        self._write_config(_isolated_hermes_home)
+
+        with pytest.raises(SystemExit) as exc:
+            unset_config_value("hooks.pre_llm_call[1].command")
+        assert exc.value.code == 1
+
+        err = capsys.readouterr().err
+        assert "bracket index syntax" in err
+        assert "hooks.pre_llm_call[1].command" in err
+
+    def test_nested_helper_rejects_bracket_segments(self):
+        """_set_nested/_unset_nested raise for programmatic callers too."""
+        from hermes_cli.config import _set_nested, _unset_nested
+
+        cfg = {
+            "hooks": {
+                "pre_llm_call": [{"command": "existing.py", "timeout": 3}],
+            }
+        }
+        with pytest.raises(ValueError, match="bracket index syntax"):
+            _set_nested(cfg, "hooks.pre_llm_call[1].command", "new.py")
+        with pytest.raises(ValueError, match="bracket index syntax"):
+            _unset_nested(cfg, "hooks.pre_llm_call[1].command")
+        # No junk key was created by the failed calls.
+        assert "pre_llm_call[1]" not in cfg["hooks"]
 
 
 # ---------------------------------------------------------------------------
