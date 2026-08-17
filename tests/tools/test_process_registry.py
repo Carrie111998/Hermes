@@ -1117,6 +1117,74 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
+class TestBackgroundExitSignalNote:
+    """Background-process completion notifications must explain lethal
+    signal exits (SIGKILL/OOM, SIGSEGV, SIGBUS, ...), not just SIGTERM.
+
+    204302bd64 added terminal_tool._interpret_signal_exit() and wired it
+    into the FOREGROUND terminal_tool exit-code report, but
+    format_process_notification -- the shared formatter for background/
+    detached process completions -- kept its own, much older check that
+    only recognized SIGTERM (-15 / 143). A background process killed by
+    the OOM killer (137/-9) or crashing with SIGSEGV (139/-11) reached the
+    model as a bare "(exit code 137)" with no explanation.
+    """
+
+    def _evt(self, exit_code):
+        return {
+            "type": "completion",
+            "session_id": "proc_test",
+            "command": "some-command",
+            "exit_code": exit_code,
+            "output": "",
+        }
+
+    def test_sigkill_oom_int_exit_code_gets_note(self):
+        text = format_process_notification(self._evt(-9))
+        assert "(exit code -9)." in text
+        assert "SIGKILL" in text
+        assert "OOM" in text
+
+    def test_sigkill_shell_convention_137_gets_note(self):
+        text = format_process_notification(self._evt(137))
+        assert "(exit code 137)." in text
+        assert "SIGKILL" in text
+
+    def test_sigsegv_string_exit_code_gets_note(self):
+        """exit_code can arrive as a numeric string depending on the producer."""
+        text = format_process_notification(self._evt("-11"))
+        assert "(exit code -11)." in text
+        assert "SIGSEGV" in text
+
+    def test_sigterm_still_recognized(self):
+        """Regression guard: SIGTERM (the one signal the old check covered)
+        must not be lost in the rewrite."""
+        text = format_process_notification(self._evt(-15))
+        assert "SIGTERM" in text
+
+    def test_clean_exit_gets_no_signal_note(self):
+        text = format_process_notification(self._evt(0))
+        assert "SIGTERM" not in text
+        assert "SIGKILL" not in text
+        assert "completed normally" in text
+
+    def test_ordinary_nonzero_exit_gets_no_signal_note(self):
+        """exit_code=1 (e.g. grep 'no matches') is not a signal death."""
+        text = format_process_notification(self._evt(1))
+        assert "SIGTERM" not in text
+        assert "SIGKILL" not in text
+
+    def test_unknown_placeholder_exit_code_gets_no_signal_note(self):
+        evt = {
+            "type": "completion", "session_id": "proc_test",
+            "command": "cmd", "exit_code": "?", "output": "",
+        }
+        text = format_process_notification(evt)
+        assert "(exit code ?)." in text
+        assert "SIGTERM" not in text
+        assert "SIGKILL" not in text
+
+
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
     event = {
         "type": "completion",
