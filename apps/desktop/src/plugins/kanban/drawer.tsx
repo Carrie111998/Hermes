@@ -38,6 +38,8 @@ import {
   fetchProfiles,
   fetchTask,
   logKey,
+  openAttachmentFile,
+  canOpenAttachments,
   patchTask,
   PROFILES_KEY,
   reassignTask,
@@ -454,12 +456,30 @@ function AttachmentsSection({
     >
       {attachments.length > 0 ? (
         <ul className="flex flex-col gap-1">
-          {attachments.map(attachment => (
-            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
-              <Codicon name="file" size="0.75rem" />
-              {attachment.filename}
-            </li>
-          ))}
+          {attachments.map(attachment =>
+            attachment.stored_path ? (
+              <li key={attachment.id}>
+                <Button
+                  aria-label={`${k.openAttachment}: ${attachment.filename}`}
+                  className="h-auto w-full justify-start gap-1.5 px-1 text-[0.75rem] font-normal text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
+                  disabled={!canOpenAttachments()}
+                  onClick={() => void openAttachmentFile(attachment.stored_path)}
+                  size="sm"
+                  title={`${k.openAttachment}: ${attachment.filename}`}
+                  type="button"
+                  variant="ghost"
+                >
+                  <Codicon name="open-external" size="0.75rem" />
+                  <span className="truncate">{attachment.filename}</span>
+                </Button>
+              </li>
+            ) : (
+              <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
+                <Codicon name="file" size="0.75rem" />
+                {attachment.filename}
+              </li>
+            )
+          )}
         </ul>
       ) : (
         <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noAttachments}</p>
