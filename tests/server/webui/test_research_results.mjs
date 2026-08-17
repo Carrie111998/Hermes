@@ -61,6 +61,18 @@ function responseFor(url) {
   throw new Error(`unstubbed request: ${url}`);
 }
 
+function activeResultPair() {
+  return [
+    ...responseFor('/api/v1/research-campaigns/rc_1/results?view=active'),
+    {
+      id: 'result_second', organization_id: 'org_3', company_name: 'Beacon AT',
+      verdict: 'review', fit_score: 67, evidence_confidence: .71,
+      country: 'AT', buyer_role: 'Importer', source_count: 1,
+      reasons: ['priority_band_b'], conflicting_claims: [], missing_evidence: ['second_source'],
+    },
+  ];
+}
+
 test('Rejected results are fetched only after the Rejected tab is selected', async () => {
   const requests = [];
   globalThis.fetch = async url => {
@@ -277,6 +289,156 @@ test('a late claim response cannot replace evidence loaded for the visible campa
   assert.match(detail, /Campaign B company/);
   assert.match(detail, /Visible B claim/);
   assert.doesNotMatch(detail, /Late A claim/);
+  dispose?.();
+});
+
+test('an earlier A claim success cannot overwrite a newer A selection after A to B to A', async () => {
+  const firstAClaim = deferred();
+  let aClaimRequests = 0;
+  globalThis.fetch = async url => {
+    if (url === '/api/v1/research-campaigns/rc_1/results?view=active') {
+      return Response.json(activeResultPair());
+    }
+    if (url === '/api/v1/research/results/result_active/claims') {
+      aClaimRequests += 1;
+      if (aClaimRequests === 1) return firstAClaim.promise;
+      return Response.json([{
+        id: 'fresh_a', field: 'market_note', value: 'Fresh A evidence',
+        status: 'observed', confidence: .9, evidence: [],
+      }]);
+    }
+    if (url === '/api/v1/research/results/result_second/claims') return Response.json([]);
+    return Response.json(responseFor(url));
+  };
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('main');
+  dom.document.body.append(root);
+
+  const mounting = mount(root, { query: {}, params: {}, navigate() {} });
+  await nextTurn();
+  await nextTurn();
+  root.querySelector('button[aria-label="Inspect evidence for Beacon AT"]').click();
+  await nextTurn();
+  root.querySelector('button[aria-label="Inspect evidence for Atlas DE"]').click();
+  await nextTurn();
+  assert.match(root.querySelector('.ifz-results-detail').textContent, /Fresh A evidence/);
+
+  firstAClaim.resolve(Response.json([{
+    id: 'late_a', field: 'market_note', value: 'Late A evidence',
+    status: 'observed', confidence: .4, evidence: [],
+  }]));
+  const dispose = await mounting;
+  await nextTurn();
+
+  const detail = root.querySelector('.ifz-results-detail').textContent;
+  assert.match(detail, /Fresh A evidence/);
+  assert.doesNotMatch(detail, /Late A evidence/);
+  dispose?.();
+});
+
+test('an earlier A claim error cannot replace a newer A selection after A to B to A', async () => {
+  const firstAClaim = deferred();
+  let aClaimRequests = 0;
+  globalThis.fetch = async url => {
+    if (url === '/api/v1/research-campaigns/rc_1/results?view=active') {
+      return Response.json(activeResultPair());
+    }
+    if (url === '/api/v1/research/results/result_active/claims') {
+      aClaimRequests += 1;
+      if (aClaimRequests === 1) return firstAClaim.promise;
+      return Response.json([{
+        id: 'fresh_a', field: 'market_note', value: 'Fresh A evidence',
+        status: 'observed', confidence: .9, evidence: [],
+      }]);
+    }
+    if (url === '/api/v1/research/results/result_second/claims') return Response.json([]);
+    return Response.json(responseFor(url));
+  };
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('main');
+  dom.document.body.append(root);
+
+  const mounting = mount(root, { query: {}, params: {}, navigate() {} });
+  await nextTurn();
+  await nextTurn();
+  root.querySelector('button[aria-label="Inspect evidence for Beacon AT"]').click();
+  await nextTurn();
+  root.querySelector('button[aria-label="Inspect evidence for Atlas DE"]').click();
+  await nextTurn();
+  assert.match(root.querySelector('.ifz-results-detail').textContent, /Fresh A evidence/);
+
+  firstAClaim.reject(new Error('late A failure'));
+  const dispose = await mounting;
+  await nextTurn();
+
+  const detail = root.querySelector('.ifz-results-detail').textContent;
+  assert.match(detail, /Fresh A evidence/);
+  assert.doesNotMatch(detail, /Evidence could not be loaded/);
+  dispose?.();
+});
+
+test('an export completion is silent after the selected result changes', async () => {
+  const lateExport = deferred();
+  globalThis.fetch = async (url, init = {}) => {
+    if (url === '/api/v1/research-campaigns/rc_1/results?view=active') {
+      return Response.json(activeResultPair());
+    }
+    if (url === '/api/v1/research/results/result_second/claims') return Response.json([]);
+    if (url === '/api/v1/research-campaigns/rc_1/export?view=active' && init.method === 'POST') {
+      return lateExport.promise;
+    }
+    return Response.json(responseFor(url));
+  };
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('main');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, params: {}, navigate() {} });
+  byText(root, 'button', 'Export active').click();
+  root.querySelector('button[aria-label="Inspect evidence for Beacon AT"]').click();
+  await nextTurn();
+  lateExport.resolve(new Response('id,verdict\nresult_active,strong_fit\n', {
+    status: 200,
+    headers: { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="stale-active.csv"' },
+  }));
+  await nextTurn();
+  await nextTurn();
+
+  assert.match(root.querySelector('.ifz-results-detail').textContent, /Beacon AT/);
+  assert.equal(dom.document.body.querySelector('a[download="stale-active.csv"]'), null);
+  assert.doesNotMatch(dom.document.body.querySelector('.ifz-toasts')?.textContent || '', /Downloaded/);
+  dispose?.();
+});
+
+test('an export error is silent after the selected result changes', async () => {
+  const lateExport = deferred();
+  globalThis.fetch = async (url, init = {}) => {
+    if (url === '/api/v1/research-campaigns/rc_1/results?view=active') {
+      return Response.json(activeResultPair());
+    }
+    if (url === '/api/v1/research/results/result_second/claims') return Response.json([]);
+    if (url === '/api/v1/research-campaigns/rc_1/export?view=active' && init.method === 'POST') {
+      return lateExport.promise;
+    }
+    return Response.json(responseFor(url));
+  };
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('main');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, params: {}, navigate() {} });
+  byText(root, 'button', 'Export active').click();
+  root.querySelector('button[aria-label="Inspect evidence for Beacon AT"]').click();
+  await nextTurn();
+  lateExport.reject(new Error('late export failure'));
+  await nextTurn();
+  await nextTurn();
+
+  assert.match(root.querySelector('.ifz-results-detail').textContent, /Beacon AT/);
+  assert.doesNotMatch(
+    dom.document.body.querySelector('.ifz-toasts')?.textContent || '',
+    /could not be prepared/,
+  );
   dispose?.();
 });
 

@@ -270,6 +270,7 @@ export async function mount(root, ctx) {
   }
 
   function chooseResult(result) {
+    state.contextVersion += 1;
     state.selected[state.view] = result.id;
     render();
     void loadClaims(result);
