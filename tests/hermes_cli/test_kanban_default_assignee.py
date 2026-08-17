@@ -7,6 +7,7 @@ the task is skipped (existing behavior preserved).
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 
@@ -15,18 +16,24 @@ import pytest
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB, then remove it.
+
+    The cross-test isolation this fixture provides never depended on keeping
+    the directory -- monkeypatch's HERMES_HOME restore is what does that, and
+    it happens either way. Keeping it only meant one dir per test accumulating
+    in %TEMP% forever.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
-    monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    yield kanban_db, test_home
-    # Cleanup is best-effort; tempfile dir survives but pytest isolation
-    # gives each test its own monkeypatched HERMES_HOME so no cross-test
-    # contamination.
+    try:
+        monkeypatch.setenv("HERMES_HOME", test_home)
+        # Force-reimport so the fresh HERMES_HOME is picked up.
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+                del sys.modules[mod]
+        from hermes_cli import kanban_db
+        yield kanban_db, test_home
+    finally:
+        shutil.rmtree(test_home, ignore_errors=True)
 
 
 def _fake_spawn(*args, **kwargs):

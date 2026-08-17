@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import tempfile
 
@@ -17,14 +18,22 @@ import pytest
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB, then remove it.
+
+    monkeypatch unsets HERMES_HOME for us but cannot touch the directory --
+    mkdtemp hands back a path nothing owns. Without the finally below this
+    fixture left one dir per test on disk forever.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
-    os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
-    monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+    try:
+        os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", test_home)
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+                del sys.modules[mod]
+        yield test_home
+    finally:
+        shutil.rmtree(test_home, ignore_errors=True)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
