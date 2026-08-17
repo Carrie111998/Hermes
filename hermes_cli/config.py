@@ -1420,6 +1420,14 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Optional Relay argument-proposal boundary. Disabled for every surface
+    # by default; Relay never becomes a model tool and never owns dispatch.
+    "relay": {
+        "tool_execution": {
+            "enabled": False,
+        },
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio.

@@ -1354,6 +1354,15 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+    _relay_cfg = _agent_cfg.get("relay", {}) if isinstance(_agent_cfg, dict) else {}
+    _relay_tool_cfg = _relay_cfg.get("tool_execution", {}) if isinstance(_relay_cfg, dict) else {}
+    # Immutable per-agent snapshot. Relay remains disabled unless the
+    # explicit config.yaml gate is enabled; no behavioral env override exists.
+    agent._relay_tool_execution_enabled = bool(
+        _relay_tool_cfg.get("enabled", False)
+        if isinstance(_relay_tool_cfg, dict)
+        else False
+    )
     try:
         # Gateway and cron turns have no operator continuously watching the
         # tool loop. Keep the interactive CLI/TUI soft-warning default, but

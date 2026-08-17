@@ -19,6 +19,7 @@ import os
 import random
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent.display import (
@@ -50,6 +51,96 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ToolExecutionOutcome:
+    """Result plus final args, with tuple-unpack compatibility for callers."""
+
+    result: Any
+    args: dict
+    blocked: bool = False
+
+    def __iter__(self):
+        yield self.result
+        yield self.args
+
+
+def _begin_tool_execution(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict[str, Any],
+    effective_task_id: str,
+    tool_call_id: str,
+    display_index: int | None = None,
+) -> None:
+    """Explicit start transition seam for the shared executor."""
+    del agent, function_name, function_args, effective_task_id, tool_call_id, display_index
+
+
+def _dispatch_final_tool_hook(
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    agent,
+    tool_call_id: str,
+    relay_enabled: bool,
+) -> tuple[dict, str | None]:
+    """Apply final hooks, preserving the disabled path's legacy hook seam."""
+    if not relay_enabled:
+        try:
+            from hermes_cli.plugins import resolve_pre_tool_block
+
+            return function_args, resolve_pre_tool_block(
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                middleware_trace=[],
+            )
+        except Exception:
+            return function_args, "pre_tool_call hook failed"
+
+    # Relay-enabled turns use the single dispatch point so final-argument
+    # modifications and block/approval decisions share one hook invocation.
+    try:
+        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+
+        block_message, modified_args = _dispatch_pre_tool_call_hooks(
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            middleware_trace=[],
+        )
+    except Exception:
+        return function_args, "pre_tool_call hook failed"
+    if isinstance(modified_args, dict):
+        function_args = modified_args
+    if block_message is not None and not isinstance(block_message, str):
+        return function_args, "pre_tool_call returned an invalid block"
+    return function_args, block_message
+
+
+def _edit_approval_block(function_name: str, function_args: dict) -> str | None:
+    """Run edit approval before checkpointing post-relay arguments."""
+    try:
+        from acp_adapter.edit_approval import maybe_require_edit_approval
+
+        block_message = maybe_require_edit_approval(function_name, function_args)
+    except Exception:
+        return "approval guard failed"
+    if block_message is not None and not isinstance(block_message, str):
+        return "approval guard returned an invalid block"
+    return block_message
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -272,6 +363,9 @@ def _apply_tool_request_middleware_for_agent(
     effective_task_id: str,
     tool_call_id: str,
 ) -> tuple[dict, list[dict[str, Any]]]:
+    from agent import relay_tools
+    relay_enabled = bool(getattr(agent, "_relay_tool_execution_enabled", False))
+
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
 
@@ -285,8 +379,27 @@ def _apply_tool_request_middleware_for_agent(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
         payload = result.payload if isinstance(result.payload, dict) else function_args
-        return payload, list(result.trace)
+        trace = list(result.trace)
+        _relay_result, relay_args = relay_tools.execute(
+            function_name,
+            payload,
+            lambda candidate: candidate,
+            session_id=getattr(agent, "session_id", "") or "",
+            task_id=effective_task_id or "",
+            tool_call_id=tool_call_id or "",
+            enabled=relay_enabled,
+            phase="prepare",
+        )
+        if not isinstance(relay_args, dict):
+            raise relay_tools.RelayBlockedError("candidate_not_object")
+        if relay_enabled:
+            trace.append({"source": "relay", "reason": "candidate_validated"})
+        return relay_args, trace
+    except relay_tools.RelayBlockedError:
+        raise
     except Exception as exc:
+        if relay_enabled:
+            raise relay_tools.RelayBlockedError("relay_boundary_error") from exc
         logger.debug("tool_request middleware error: %s", exc)
         return function_args, []
 
@@ -308,19 +421,53 @@ def _run_agent_tool_execution_middleware(
         return execute(observed_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
+    from agent import relay_tools
 
-    result = run_tool_execution_middleware(
-        function_name,
-        function_args,
-        _execute,
-        original_args=function_args,
-        task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
-        tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-    )
-    return result, observed_args
+    callback_called = False
+
+    def _single_fire(next_args: dict) -> Any:
+        nonlocal callback_called
+        if callback_called:
+            raise RuntimeError("Hermes tool execution callback invoked more than once")
+        callback_called = True
+        _begin_tool_execution(
+            agent,
+            function_name=function_name,
+            function_args=next_args if isinstance(next_args, dict) else function_args,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+        )
+        return _execute(next_args)
+
+    def _relay_dispatch(next_args: dict) -> Any:
+        return relay_tools.execute(
+            function_name,
+            next_args if isinstance(next_args, dict) else function_args,
+            _single_fire,
+            session_id=getattr(agent, "session_id", "") or "",
+            task_id=effective_task_id or "",
+            tool_call_id=tool_call_id or "",
+            enabled=bool(getattr(agent, "_relay_tool_execution_enabled", False)),
+            phase="dispatch",
+            prevalidated=True,
+        )[0]
+
+    try:
+        result = run_tool_execution_middleware(
+            function_name,
+            function_args,
+            _relay_dispatch,
+            original_args=function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+    except relay_tools.RelayBlockedError as exc:
+        result = json.dumps({"error": f"Relay blocked: {exc.reason}"}, ensure_ascii=False)
+        return ToolExecutionOutcome(result, observed_args, True)
+    return ToolExecutionOutcome(result, observed_args)
 
 
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
@@ -420,20 +567,42 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
+        relay_block_reason = None
+        try:
+            function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
+        except Exception as exc:
+            from agent.relay_tools import RelayBlockedError
+            if not isinstance(exc, RelayBlockedError):
+                raise
+            relay_block_reason = exc.reason
+            middleware_trace = [{"source": "relay", "reason": exc.reason, "blocked": True}]
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
-        if _ts_scope_block is not None:
+        if relay_block_reason is not None:
+            block_result = json.dumps({"error": f"Relay blocked: {relay_block_reason}"}, ensure_ascii=False)
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="relay_egress_block",
+                error_message=relay_block_reason,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
             _emit_terminal_post_tool_call(
@@ -449,20 +618,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
+            function_args, block_message = _dispatch_final_tool_hook(
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                agent=agent,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                relay_enabled=bool(getattr(agent, "_relay_tool_execution_enabled", False)),
+            )
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -1097,35 +1260,40 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
+        relay_block_reason = None
+        try:
+            function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
+        except Exception as exc:
+            from agent.relay_tools import RelayBlockedError
+            if not isinstance(exc, RelayBlockedError):
+                raise
+            relay_block_reason = exc.reason
+            middleware_trace = [{"source": "relay", "reason": exc.reason, "blocked": True}]
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
         _block_error_type = "plugin_block"
-        if _ts_scope_block is not None:
+        if relay_block_reason is not None:
+            _block_msg = f"Relay blocked: {relay_block_reason}"
+            _block_error_type = "relay_egress_block"
+        elif _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                _block_msg = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                pass
+            function_args, _block_msg = _dispatch_final_tool_hook(
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                agent=agent,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                relay_enabled=bool(getattr(agent, "_relay_tool_execution_enabled", False)),
+            )
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
