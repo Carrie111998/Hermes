@@ -34,8 +34,8 @@ def _insert_evidence(connection, evidence_id, run_id, *, derived_from=None):
     connection.execute(
         "INSERT INTO evidence_records "
         "(id, research_run_id, source_type, retrieval_method, retrieved_at, "
-        "content_hash, derived_from_evidence_id, created_by_agent, metadata_json) "
-        "VALUES (?, ?, 'OTHER', 'OTHER', 1, ?, ?, 'agent', '{}')",
+        "content_hash, derived_from_evidence_id, created_by_agent, metadata_json, created_at) "
+        "VALUES (?, ?, 'OTHER', 'OTHER', 1, ?, ?, 'agent', '{}', 1)",
         (evidence_id, run_id, evidence_id * 64, derived_from),
     )
 
@@ -49,19 +49,18 @@ def test_fresh_schema_has_evidence_fabric_objects_and_v27(tmp_path):
     assert {"research_runs", "evidence_records", "claims", "claim_evidence_links"} <= objects
     assert {"ux_evidence_exact_uri_hash", "ux_evidence_exact_raw_hash"} <= objects
     with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
         assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 27
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
 def test_v26_database_upgrades_idempotently_without_losing_existing_rows(tmp_path):
     db_path = tmp_path / "state.db"
+    with SessionDB(db_path):
+        pass
     with sqlite3.connect(db_path) as connection:
-        connection.executescript(
-            "CREATE TABLE schema_version(version INTEGER NOT NULL);"
-            "INSERT INTO schema_version VALUES (26);"
-            "CREATE TABLE sessions(id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL);"
-        )
-        connection.execute("INSERT INTO sessions VALUES ('legacy', 'test', 1)")
+        connection.execute("UPDATE schema_version SET version = 26")
+        connection.execute("INSERT INTO sessions (id, source, started_at) VALUES ('legacy', 'test', 1)")
 
     with SessionDB(db_path):
         pass
@@ -69,7 +68,9 @@ def test_v26_database_upgrades_idempotently_without_losing_existing_rows(tmp_pat
         pass
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("SELECT * FROM sessions").fetchone() == ("legacy", "test", 1.0)
+        assert connection.execute(
+            "SELECT id, source, started_at FROM sessions WHERE id = 'legacy'"
+        ).fetchone() == ("legacy", "test", 1.0)
         assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 27
         assert connection.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'research_runs'"
@@ -102,31 +103,31 @@ def test_evidence_identity_indexes_reject_exact_uri_and_raw_duplicates(tmp_path)
         connection.execute(
             "INSERT INTO evidence_records "
             "(id, research_run_id, source_type, retrieval_method, canonical_uri, "
-            "retrieved_at, content_hash, created_by_agent, metadata_json) "
-            "VALUES ('uri-1', 'run', 'WEB_PAGE', 'DIRECT_HTTP', 'https://example.test/', 1, ?, 'agent', '{}')",
+            "retrieved_at, content_hash, created_by_agent, metadata_json, created_at) "
+            "VALUES ('uri-1', 'run', 'WEB_PAGE', 'DIRECT_HTTP', 'https://example.test/', 1, ?, 'agent', '{}', 1)",
             ("h" * 64,),
         )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO evidence_records "
                 "(id, research_run_id, source_type, retrieval_method, canonical_uri, "
-                "retrieved_at, content_hash, created_by_agent, metadata_json) "
-                "VALUES ('uri-2', 'run', 'WEB_PAGE', 'DIRECT_HTTP', 'https://example.test/', 1, ?, 'agent', '{}')",
+                "retrieved_at, content_hash, created_by_agent, metadata_json, created_at) "
+                "VALUES ('uri-2', 'run', 'WEB_PAGE', 'DIRECT_HTTP', 'https://example.test/', 1, ?, 'agent', '{}', 1)",
                 ("h" * 64,),
             )
         connection.execute(
             "INSERT INTO evidence_records "
             "(id, research_run_id, source_type, retrieval_method, raw_reference, "
-            "retrieved_at, content_hash, created_by_agent, metadata_json) "
-            "VALUES ('raw-1', 'run', 'FILE', 'FILE_READ', 'artifact:one', 1, ?, 'agent', '{}')",
+            "retrieved_at, content_hash, created_by_agent, metadata_json, created_at) "
+            "VALUES ('raw-1', 'run', 'FILE', 'FILE_READ', 'artifact:one', 1, ?, 'agent', '{}', 1)",
             ("r" * 64,),
         )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO evidence_records "
                 "(id, research_run_id, source_type, retrieval_method, raw_reference, "
-                "retrieved_at, content_hash, created_by_agent, metadata_json) "
-                "VALUES ('raw-2', 'run', 'FILE', 'FILE_READ', 'artifact:one', 1, ?, 'agent', '{}')",
+                "retrieved_at, content_hash, created_by_agent, metadata_json, created_at) "
+                "VALUES ('raw-2', 'run', 'FILE', 'FILE_READ', 'artifact:one', 1, ?, 'agent', '{}', 1)",
                 ("r" * 64,),
             )
     finally:
