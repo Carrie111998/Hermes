@@ -411,17 +411,19 @@ class SmsAdapter(BasePlatformAdapter):
 
 
 def _strip_markdown_for_sms(message: str) -> str:
-    """Strip markdown — SMS renders it as literal characters."""
-    message = re.sub(r"\*\*(.+?)\*\*", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"\*(.+?)\*", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"__(.+?)__", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"_(.+?)_", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"```[a-z]*\n?", "", message)
-    message = re.sub(r"`(.+?)`", r"\1", message)
-    message = re.sub(r"^#{1,6}\s+", "", message, flags=re.MULTILINE)
-    message = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", message)
-    message = re.sub(r"\n{3,}", "\n\n", message)
-    return message.strip()
+    """Strip markdown — SMS renders it as literal characters.
+
+    Delegates to ``gateway.platforms.helpers.strip_markdown``, the same helper
+    ``SmsAdapter.format_message`` uses, so the standalone (out-of-process) and
+    in-process send paths render identically.
+
+    This body used to be an inlined copy of the pre-dedup ``_strip_markdown()``
+    that helpers.py replaced. The copy called ``re.sub()`` in a module that
+    never imports ``re``, so it raised ``NameError`` on every standalone SMS
+    send; its regexes were also the older ones that lacked the word-boundary
+    guards around ``_``/``__`` and so mangled snake_case identifiers.
+    """
+    return strip_markdown(message)
 
 
 async def _standalone_send(

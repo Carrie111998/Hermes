@@ -561,3 +561,118 @@ class TestWebhookSignatureEnforcement:
         request = self._mock_request(oversized, content_length=None)
         resp = await adapter._handle_webhook(request)
         assert resp.status == 413
+
+
+# ── Standalone (out-of-process) markdown stripping ──────────────────
+
+class _RecordingFormData:
+    """Stand-in for aiohttp.FormData that records the fields Twilio would get."""
+
+    def __init__(self):
+        self.fields = {}
+
+    def add_field(self, name, value, **kwargs):
+        self.fields[name] = value
+
+
+class _FakeResponse:
+    status = 201
+
+    async def json(self):
+        return {"sid": "SM_fake_123"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    last_data = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def post(self, url, data=None, headers=None, **kwargs):
+        _FakeSession.last_data = data
+        return _FakeResponse()
+
+
+class TestSmsStandaloneMarkdownStripping:
+    """Regression for the F821 NameError in _strip_markdown_for_sms.
+
+    The plugin-migration copy of this helper called ``re.sub()`` 13 times in a
+    module that never imports ``re``. The call site sits *outside* the
+    ``try/except`` in ``_standalone_send``, so every out-of-process SMS send
+    raised ``NameError: name 're' is not defined`` before reaching Twilio.
+
+    These tests drive the real stripping path rather than asserting on imports.
+    """
+
+    def test_strip_markdown_for_sms_returns_plain_text(self):
+        from plugins.platforms.sms.adapter import _strip_markdown_for_sms
+
+        out = _strip_markdown_for_sms("**bold** and *ital* and `code`")
+        assert out == "bold and ital and code"
+
+    def test_strip_markdown_for_sms_handles_headings_and_links(self):
+        from plugins.platforms.sms.adapter import _strip_markdown_for_sms
+
+        out = _strip_markdown_for_sms("# Title\nsee [docs](https://example.com)")
+        assert out == "Title\nsee docs"
+
+    def test_strip_markdown_for_sms_preserves_snake_case_identifiers(self):
+        """Underscore stripping must not mangle identifiers.
+
+        The shared helper guards ``__``/``_`` with word boundaries; the stale
+        inline copy did not and turned ``send_message_tool`` into
+        ``sendmessagetool``.
+        """
+        from plugins.platforms.sms.adapter import _strip_markdown_for_sms
+
+        assert _strip_markdown_for_sms("call send_message_tool now") == (
+            "call send_message_tool now"
+        )
+
+    def test_strip_markdown_for_sms_matches_in_process_format_message(self):
+        """Standalone and in-process SMS paths must render identically."""
+        from plugins.platforms.sms.adapter import SmsAdapter, _strip_markdown_for_sms
+
+        adapter = object.__new__(SmsAdapter)
+        adapter.config = PlatformConfig(enabled=True, api_key="tok")
+        adapter._platform = Platform.SMS
+        sample = "**b** _i_ `c`\n# H\n[l](https://e.com)\nkeep_this_name"
+        assert _strip_markdown_for_sms(sample) == adapter.format_message(sample)
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_strips_markdown_in_twilio_body(self):
+        """The Body posted to Twilio is stripped — and no NameError escapes."""
+        import aiohttp
+
+        from plugins.platforms.sms.adapter import _standalone_send
+
+        env = {
+            "TWILIO_ACCOUNT_SID": "ACtest123",
+            "TWILIO_PHONE_NUMBER": "+15551234567",
+        }
+        _FakeSession.last_data = None
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(aiohttp, "ClientSession", _FakeSession), \
+                patch.object(aiohttp, "FormData", _RecordingFormData), \
+                patch.object(aiohttp, "ClientTimeout", lambda **kw: None):
+            result = await _standalone_send(
+                PlatformConfig(enabled=True, api_key="token_abc"),
+                "+15559876543",
+                "**urgent** see `logs`",
+            )
+
+        assert result.get("success") is True, result
+        assert _FakeSession.last_data is not None, "Twilio POST was never issued"
+        assert _FakeSession.last_data.fields["Body"] == "urgent see logs"

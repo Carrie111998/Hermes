@@ -167,3 +167,98 @@ def test_should_process_message_dm_phone_allowlist_lid_sender():
         "mentionedIds": [],
     }
     assert adapter._should_process_message(data) is True
+
+
+# ------------------------------------- strict WHATSAPP_ALLOWED_USERS backstop
+
+def _strict_adapter(session_dir):
+    """Adapter stub for the strict-allowlist backstop path.
+
+    ``_expand_whatsapp_strict_aliases`` reads ``self._session_path`` directly
+    rather than going through ``gateway.whatsapp_identity``, so this path needs
+    its own coverage.
+    """
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter.platform = Platform.WHATSAPP
+    adapter._session_path = session_dir
+    return adapter
+
+
+def _write_strict_mapping(session_dir, phone=PHONE, lid=LID):
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / f"lid-mapping-{phone}.json").write_text(
+        json.dumps(lid), encoding="utf-8"
+    )
+    (session_dir / f"lid-mapping-{lid}_reverse.json").write_text(
+        json.dumps(phone), encoding="utf-8"
+    )
+
+
+def test_strict_alias_expansion_resolves_lid_to_phone(tmp_path):
+    """Regression for the F821 NameError on bare ``json`` in the adapter.
+
+    ``json.loads`` inside ``_expand_whatsapp_strict_aliases`` sat in a
+    ``try/except Exception``, so the NameError was swallowed and every
+    ``lid-mapping-*.json`` file was silently skipped — the expansion returned
+    only the seed identifier.
+    """
+    session = tmp_path / "session"
+    _write_strict_mapping(session)
+    adapter = _strict_adapter(session)
+
+    assert adapter._expand_whatsapp_strict_aliases(f"{LID}@lid") == {LID, PHONE}
+
+
+def test_strict_alias_expansion_resolves_phone_to_lid(tmp_path):
+    session = tmp_path / "session"
+    _write_strict_mapping(session)
+    adapter = _strict_adapter(session)
+
+    assert adapter._expand_whatsapp_strict_aliases(
+        f"{PHONE}@s.whatsapp.net"
+    ) == {PHONE, LID}
+
+
+def test_strict_allowlist_does_not_drop_phone_allowlisted_lid_sender(tmp_path, monkeypatch):
+    """The security backstop must not drop an allowlisted user's own message.
+
+    With alias expansion broken, a sender delivered in LID form never matched a
+    phone-form ``WHATSAPP_ALLOWED_USERS`` entry, so the backstop added after the
+    2026-04-19 allowlist leak silently dropped legitimate inbound DMs.
+    """
+    session = tmp_path / "session"
+    _write_strict_mapping(session)
+    adapter = _strict_adapter(session)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", PHONE)
+
+    blocked = adapter._is_sender_blocked_by_strict_allowlist(
+        {"senderId": f"{LID}@lid"}, f"{LID}@lid"
+    )
+    assert blocked is False
+
+
+def test_strict_allowlist_still_drops_unlisted_sender(tmp_path, monkeypatch):
+    """The backstop must keep blocking senders that resolve to nothing allowed."""
+    session = tmp_path / "session"
+    _write_strict_mapping(session)
+    adapter = _strict_adapter(session)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", PHONE)
+
+    blocked = adapter._is_sender_blocked_by_strict_allowlist(
+        {"senderId": "99999999999999@lid"}, "99999999999999@lid"
+    )
+    assert blocked is True
+
+
+def test_strict_alias_expansion_survives_corrupt_mapping_file(tmp_path):
+    """A malformed mapping file is skipped without taking down expansion."""
+    session = tmp_path / "session"
+    session.mkdir(parents=True, exist_ok=True)
+    (session / f"lid-mapping-{LID}_reverse.json").write_text(
+        "{not valid json", encoding="utf-8"
+    )
+    adapter = _strict_adapter(session)
+
+    assert adapter._expand_whatsapp_strict_aliases(f"{LID}@lid") == {LID}
