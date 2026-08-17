@@ -703,6 +703,8 @@ export interface Translations {
       sshHermesPathPlaceholder: string
       sshRemoteProfileTitle: string
       sshRemoteProfileDesc: string
+      sshTokenReuseUnavailableTitle: string
+      sshTokenReuseUnavailableDesc: string
       sshTestConnection: string
       sshConnect: string
       sshButtonsHint: string

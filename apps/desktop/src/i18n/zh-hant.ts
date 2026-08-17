@@ -797,6 +797,9 @@ export const zhHant = defineLocale({
       sshHermesPathPlaceholder: '自動偵測',
       sshRemoteProfileTitle: '遠端設定檔（選用）',
       sshRemoteProfileDesc: '遠端主機上的設定檔名稱。留空 = 使用 Desktop 設定檔名稱。',
+      sshTokenReuseUnavailableTitle: '無法重複使用連線',
+      sshTokenReuseUnavailableDesc:
+        '此裝置上找不到作業系統金鑰圈服務，因此每次 SSH 連線核發的儀表板 token 無法安全儲存，也不會被儲存。每次啟動都會開啟新連線，而不是重複使用上一個連線。請安裝或啟用 GNOME Keyring 或 KWallet 以還原重複使用功能。',
       sshTestConnection: '測試 SSH',
       sshConnect: '連線',
       sshButtonsHint: '「儲存」會在下次啟動時生效，「連線」則立即重新連線。',

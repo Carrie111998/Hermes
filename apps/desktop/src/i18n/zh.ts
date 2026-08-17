@@ -1027,6 +1027,9 @@ export const zh: Translations = {
       sshHermesPathPlaceholder: '自动检测',
       sshRemoteProfileTitle: '远程配置文件（可选）',
       sshRemoteProfileDesc: '远程主机上的配置文件名称。留空 = 使用 Desktop 配置文件名称。',
+      sshTokenReuseUnavailableTitle: '连接复用不可用',
+      sshTokenReuseUnavailableDesc:
+        '此设备上未找到操作系统密钥环服务，因此每次 SSH 连接颁发的仪表板 token 无法安全存储，不会被保存。每次启动都会打开一个新连接，而不是复用上一个连接。请安装或启用 GNOME Keyring 或 KWallet 以恢复复用。',
       sshTestConnection: '测试 SSH',
       sshConnect: '连接',
       sshButtonsHint: '“保存”将在下次启动时生效，“连接”则立即重新连接。',

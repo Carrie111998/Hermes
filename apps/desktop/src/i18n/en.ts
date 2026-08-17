@@ -826,6 +826,9 @@ export const en: Translations = {
       sshHermesPathPlaceholder: 'auto-detect',
       sshRemoteProfileTitle: 'Remote profile (optional)',
       sshRemoteProfileDesc: 'Profile name on the remote host. Blank = use the Desktop profile name.',
+      sshTokenReuseUnavailableTitle: 'Connection reuse unavailable',
+      sshTokenReuseUnavailableDesc:
+        'No OS keyring service was found on this machine, so the dashboard token issued by each SSH connection cannot be stored securely and is not saved. Every launch opens a fresh connection instead of reusing the last one. Install or enable GNOME Keyring or KWallet to restore reuse.',
       sshTestConnection: 'Test SSH',
       sshConnect: 'Connect',
       sshButtonsHint: 'Save applies on the next launch. Connect reconnects now.',

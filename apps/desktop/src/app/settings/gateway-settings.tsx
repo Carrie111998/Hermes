@@ -1508,6 +1508,21 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
               title={g.sshRemoteProfileTitle}
             />
           ) : null}
+
+          {/* SSH connections persist a dashboard token issued at connect time so
+              the next launch can reuse it instead of re-spawning. That persist
+              silently no-ops on a keyring-less machine (same secureTokenStorage
+              signal the remote-mode plain-text banner above reads) — let the
+              user know reuse is degraded rather than leaving it unexplained. */}
+          {state.secureTokenStorage === false ? (
+            <div className="mt-2 flex items-start gap-2 rounded-xl border border-border/60 bg-muted/40 px-3 py-2.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+              <AlertCircle className="mt-0.5 size-4 shrink-0" />
+              <div>
+                <div className="font-medium">{g.sshTokenReuseUnavailableTitle}</div>
+                <div className="mt-1 leading-5">{g.sshTokenReuseUnavailableDesc}</div>
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
