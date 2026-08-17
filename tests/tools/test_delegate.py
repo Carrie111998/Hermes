@@ -430,7 +430,7 @@ class TestDelegateTask(unittest.TestCase):
             "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
         }
         parent = _make_mock_parent()
-        result = json.loads(delegate_task(
+        json.loads(delegate_task(
             goal="This should be ignored",
             tasks=[{"goal": "Actual task"}],
             parent_agent=parent,

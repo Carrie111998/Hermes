@@ -95,7 +95,6 @@ def test_get_status_does_not_block_event_loop():
     from anyio import from_thread, to_thread
 
     results: dict[str, float] = {}
-    errors: list[str] = []
 
     async def _run():
         transport = httpx.ASGITransport(app=web_server_mod.app)

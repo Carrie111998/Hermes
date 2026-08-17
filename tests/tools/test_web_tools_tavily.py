@@ -38,7 +38,7 @@ class TestTavilyRequest:
         with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test-key"}):
             with patch("tools.web_tools.httpx.post", return_value=mock_response) as mock_post:
                 from tools.web_tools import _tavily_request
-                result = _tavily_request("search", {"query": "hello"})
+                _tavily_request("search", {"query": "hello"})
 
                 mock_post.assert_called_once()
                 call_kwargs = mock_post.call_args

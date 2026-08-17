@@ -4,7 +4,6 @@ Tests the _handle_background_command handler (run a prompt in a separate
 background session) across gateway messenger platforms.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -88,7 +87,6 @@ class TestHandleBackgroundCommand:
 
         # Patch asyncio.create_task to capture the coroutine
         created_tasks = []
-        original_create_task = asyncio.create_task
 
         def capture_task(coro, *args, **kwargs):
             # Close the coroutine to avoid warnings

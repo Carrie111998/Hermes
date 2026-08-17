@@ -1171,9 +1171,6 @@ class TestBuildApprovalText:
         text = build_approval_text(req)
         # Preview is truncated to 300 chars; 1000 "x"s would still push the
         # body past 300, but the inline preview specifically must be capped.
-        preview_line = [
-            line for line in text.split("\n") if line.startswith("```")
-        ]
         # 2 backtick fences; the content line in between is separate.
         xs_in_preview = sum(line.count("x") for line in text.split("\n") if line and "```" not in line)
         assert xs_in_preview <= 301  # 300 xs + one-off tolerance

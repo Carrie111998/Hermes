@@ -600,7 +600,7 @@ class TestCodeExpiry:
     def test_expired_codes_cleaned_up(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()
-            code = store.generate_code("telegram", "user1")
+            store.generate_code("telegram", "user1")
 
             # Manually expire all pending entries
             pending = store._load_json(store._pending_path("telegram"))
@@ -714,7 +714,6 @@ class TestUnreadablePairingFile:
             '{"o9cq80fake@im.wechat": {"user_name": "x", "approved_at": 0}}'
         )
 
-        real_open = builtins.open
 
         def fake_read_text(self, *a, **kw):
             # Path.read_text uses Path.open internally; raise PermissionError

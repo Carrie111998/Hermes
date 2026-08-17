@@ -165,7 +165,7 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     session_key = runner._session_key_for_source(source)
     # No approval registered.
 
-    handled = asyncio.run(
+    asyncio.run(
         runner._handle_active_session_busy_message(_make_event("yes"), session_key)
     )
 
@@ -185,7 +185,7 @@ def test_unrelated_text_with_pending_approval_falls_through():
     runner, adapter = _make_runner()
     session_key, entry = _register_blocking_approval(runner)
 
-    handled = asyncio.run(
+    asyncio.run(
         runner._handle_active_session_busy_message(
             _make_event("what files are here?"), session_key
         )

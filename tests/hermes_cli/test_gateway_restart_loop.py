@@ -204,7 +204,7 @@ class TestCronCreateLifecycleBlock:
             profile=None,
             no_agent=False,
         )
-        rc = cron_command(args)
+        cron_command(args)
         # The lifecycle guard passes (no gateway command in prompt).
         # The API rejects it for "requires prompt or skill" → rc 1, but
         # the error message is about prompt/skill, NOT about "Blocked".

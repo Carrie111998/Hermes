@@ -1489,6 +1489,6 @@ class TestMkdtempOSErrorNoSpace:
              patch("tools.tirith_security._is_install_failed_on_disk",
                    return_value=False), \
              patch("tools.tirith_security._mark_install_failed") as mock_mark:
-            result = _resolve_tirith_path("tirith")
+            _resolve_tirith_path("tirith")
             assert _tirith_mod._resolved_path is _INSTALL_FAILED
             mock_mark.assert_called_once_with("no_space")

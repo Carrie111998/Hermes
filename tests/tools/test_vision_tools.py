@@ -409,7 +409,7 @@ class TestErrorLoggingExcInfo:
                     raise PermissionError("no permission")
 
                 with patch.object(Path, "unlink", failing_unlink):
-                    result = await vision_analyze_tool(data_url, "describe", "test/model")
+                    await vision_analyze_tool(data_url, "describe", "test/model")
 
             warning_records = [
                 r
@@ -929,7 +929,6 @@ class TestResizeImageForVision:
         raw = base64.b64decode(b64data)
         from io import BytesIO
         resized = Image.open(BytesIO(raw))
-        original_ratio = 8000 / 200  # 40:1
         resized_ratio = resized.width / resized.height if resized.height > 0 else 0
         # Allow some tolerance (floor clamping), but ratio should stay above 10:1
         # With independent halving, ratio would collapse to ~1:1. Proportional
@@ -958,7 +957,6 @@ class TestResizeImageForVision:
         header, b64data = result.split(",", 1)
         raw = base64.b64decode(b64data)
         resized = Image.open(BytesIO(raw))
-        original_ratio = 6000 / 200  # 30:1 (h/w)
         resized_ratio = resized.height / resized.width if resized.width > 0 else 0
         assert resized_ratio > 5, (
             f"Aspect ratio collapsed: {resized.width}x{resized.height} "

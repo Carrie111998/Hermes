@@ -75,7 +75,7 @@ class TestReapOrphanedBrowserSessions:
         """
         from tools.browser_tool import _reap_orphaned_browser_sessions
 
-        d = _make_socket_dir(fake_tmpdir, "h_orphan12345", pid=12345)
+        _make_socket_dir(fake_tmpdir, "h_orphan12345", pid=12345)
 
         kill_calls = []
 

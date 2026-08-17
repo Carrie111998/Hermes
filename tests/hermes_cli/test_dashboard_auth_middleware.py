@@ -336,7 +336,7 @@ def test_callback_without_pkce_cookie_returns_400(gated_app):
 
 def test_callback_state_mismatch_returns_400(gated_app):
     # Walk through /auth/login first to plant the PKCE cookie.
-    r1 = gated_app.get("/auth/login?provider=stub", follow_redirects=False)
+    gated_app.get("/auth/login?provider=stub", follow_redirects=False)
     # ...then pretend the IDP returned a different state.
     r2 = gated_app.get(
         "/auth/callback?code=stub_code&state=WRONG",

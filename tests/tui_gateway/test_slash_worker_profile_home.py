@@ -20,7 +20,7 @@ def test_slash_worker_accepts_profile_home():
             from tui_gateway.server import _SlashWorker
             
             # Test initialization with profile_home
-            worker = _SlashWorker(
+            _SlashWorker(
                 session_key="test_key",
                 model="test-model",
                 profile_home="/home/luke/.hermes/profiles/work"
@@ -47,7 +47,7 @@ def test_slash_worker_without_profile_home():
             from tui_gateway.server import _SlashWorker
             
             # Test initialization without profile_home (backward compatible)
-            worker = _SlashWorker(
+            _SlashWorker(
                 session_key="test_key",
                 model="test-model"
             )
@@ -77,7 +77,7 @@ def test_slash_worker_with_none_profile_home():
             from tui_gateway.server import _SlashWorker
             
             # Test initialization with explicit None
-            worker = _SlashWorker(
+            _SlashWorker(
                 session_key="test_key",
                 model="test-model",
                 profile_home=None
@@ -107,7 +107,7 @@ def test_slash_worker_inherits_argv_correctly():
             from tui_gateway.server import _SlashWorker
             
             # Test that argv is correct
-            worker = _SlashWorker(
+            _SlashWorker(
                 session_key="my_session",
                 model="gpt-4"
             )

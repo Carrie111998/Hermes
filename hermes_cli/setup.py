@@ -766,12 +766,6 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     config.clear()
     config.update(_refreshed)
 
-    # Derive the selected provider for downstream steps (vision setup).
-    selected_provider = None
-    _m = config.get("model")
-    if isinstance(_m, dict):
-        selected_provider = _m.get("provider")
-
     # Credential rotation, vision-backend selection, and TTS provider are no
     # longer prompted here. They have safe defaults (rotation off, vision
     # auto-detected from the main provider, TTS = Edge) and are configurable

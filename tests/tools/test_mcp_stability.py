@@ -647,7 +647,6 @@ class TestMCPInitialConnectionRetry:
             server = MCPServerTask("test-retry")
 
             # Track calls via patching the method on the class
-            original_run_stdio = MCPServerTask._run_stdio
 
             async def fake_run_stdio(self_inner, config):
                 nonlocal call_count

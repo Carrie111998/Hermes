@@ -506,7 +506,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        ws_client = SimpleNamespace()
+        SimpleNamespace()
 
         with (
             patch("plugins.platforms.feishu.adapter.FEISHU_AVAILABLE", True),

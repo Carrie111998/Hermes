@@ -90,7 +90,6 @@ class TestFallbackCredentialIsolation:
 
         # Simulate: after fallback activation, provider is now openrouter
         fb_provider = "openrouter"
-        fb_model = "openrouter/auto"
 
         # The isolation code from _try_activate_fallback:
         pool = getattr(agent, "_credential_pool", None)

@@ -197,7 +197,6 @@ def test_gui_skip_build_requires_existing_packaged_app(tmp_path, monkeypatch, ca
 
 def test_gui_skip_build_launches_existing_packaged_app_without_npm(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
-    desktop_dir = root / "apps" / "desktop"
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     packaged_exe = _make_packaged_executable(root, monkeypatch)
 
@@ -268,7 +267,6 @@ def test_gui_linux_skips_fixup_when_already_configured(tmp_path, monkeypatch):
     # the expected values directly.
     import stat as stat_mod
     fake_stat = type("s", (), {"st_uid": 0, "st_mode": 0o4755 | stat_mod.S_IFREG})()
-    sandbox_lstat_orig = type(sandbox).lstat
     monkeypatch.setattr(type(sandbox), "lstat", lambda self: fake_stat)
 
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
@@ -363,7 +361,6 @@ def test_gui_is_known_builtin_for_plugin_gating(argv):
 def test_desktop_build_stamp_skips_build_when_up_to_date(tmp_path, monkeypatch):
     """When the stamp matches and the artifact exists, build is skipped entirely."""
     root = _make_desktop_tree(tmp_path)
-    desktop_dir = root / "apps" / "desktop"
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     _make_packaged_executable(root, monkeypatch)
 
@@ -387,7 +384,6 @@ def test_desktop_build_stamp_skips_build_when_up_to_date(tmp_path, monkeypatch):
 def test_desktop_force_build_overrides_stamp(tmp_path, monkeypatch):
     """--force-build forces a rebuild even when the stamp says up-to-date."""
     root = _make_desktop_tree(tmp_path)
-    desktop_dir = root / "apps" / "desktop"
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     _make_packaged_executable(root, monkeypatch)
 

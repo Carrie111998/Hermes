@@ -229,7 +229,6 @@ class TestIRCAdapterMessageParsing:
 
         # Mock handle_message to capture the event
         dispatched = []
-        original_dispatch = adapter._dispatch_message
 
         async def capture_dispatch(**kwargs):
             dispatched.append(kwargs)
@@ -672,7 +671,7 @@ class TestIRCStandaloneSend:
 
         # A bare \r in message content tries to inject a NICK command.
         # Our control-char stripper must blank \r so the line stays one PRIVMSG.
-        result = await _standalone_send(
+        await _standalone_send(
             PlatformConfig(enabled=True, extra={}),
             "#cron",
             "hello\rNICK eviltwin",

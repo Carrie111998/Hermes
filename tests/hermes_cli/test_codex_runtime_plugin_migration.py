@@ -200,7 +200,6 @@ class TestTomlValueFormatter:
         crash), the temp file must be cleaned up. Otherwise repeated
         failed migrations would pile up .config.toml.* files."""
         from pathlib import Path as _Path
-        original_replace = _Path.replace
 
         def failing_replace(self, target):
             raise OSError("simulated disk full")

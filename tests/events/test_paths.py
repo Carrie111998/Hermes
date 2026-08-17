@@ -36,7 +36,6 @@ def test_all_paths_anchored_at_canonical_root(tmp_path):
 
 
 def test_paths_ignore_profile_scoping(tmp_path, monkeypatch):
-    root = tmp_path
     profile = tmp_path / "profiles" / "main"
     profile.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile))

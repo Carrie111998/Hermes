@@ -4466,7 +4466,6 @@ def _run_job_impl(
             evidence_refs=(_ACTIVITY_EVIDENCE["empty_prompt"],),
         )
         return True, "", SILENT_MARKER, None
-    origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     # Inference is about to start, so this run now crosses the wake/prompt

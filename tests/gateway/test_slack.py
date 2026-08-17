@@ -1122,7 +1122,7 @@ class TestSendDocument:
         )
 
         # Should fall back to base class (text message)
-        result = await adapter.send_document(
+        await adapter.send_document(
             chat_id="C123",
             file_path=str(test_file),
         )
@@ -1265,7 +1265,7 @@ class TestSendVideo:
         )
 
         # Should fall back to base class (text message)
-        result = await adapter.send_video(
+        await adapter.send_video(
             chat_id="C123",
             video_path=str(video),
         )

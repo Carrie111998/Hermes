@@ -111,7 +111,7 @@ class TestToggleYoloIsSessionScoped:
         """``/yolo`` toggled in one session must not bypass approvals in
         another session — mirrors the gateway-side invariant."""
         cli_a = _make_stand_in(session_id="session-yolo-a")
-        cli_b = _make_stand_in(session_id="session-yolo-b")
+        _make_stand_in(session_id="session-yolo-b")
 
         try:
             with patch("cli._cprint"):

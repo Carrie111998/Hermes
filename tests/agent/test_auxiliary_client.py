@@ -2101,7 +2101,7 @@ class TestCallLlmPaymentFallback:
                     return_value=("auto", "xiaomi/mimo-v2-pro", None, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
                     return_value=(fallback_client, "fallback-model", "openrouter")):
-            result = call_llm(
+            call_llm(
                 task="session_search",
                 messages=[{"role": "user", "content": "hello"}],
             )
@@ -2436,7 +2436,7 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._try_main_fallback_chain",
                    return_value=(main_chain_client, "inclusionai/ring-2.6-1t:free", "openrouter")) as mock_main_chain, \
              patch("agent.auxiliary_client._try_payment_fallback") as mock_builtin_chain:
-            result = call_llm(
+            call_llm(
                 task="title_generation",
                 messages=[{"role": "user", "content": "hello"}],
             )
@@ -2470,7 +2470,7 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(chain_client, "gpt-4o-mini", "fallback_chain[0](openai)")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
                    side_effect=main_called):
-            result = call_llm(
+            call_llm(
                 task="vision",
                 messages=[{"role": "user", "content": "hello"}],
             )
@@ -2499,7 +2499,7 @@ class TestAuxiliaryFallbackLayering:
                    return_value=(None, None, "")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
                    return_value=(main_client, "claude-sonnet-4", "main-agent(openrouter)")):
-            result = call_llm(
+            call_llm(
                 task="vision",
                 messages=[{"role": "user", "content": "hello"}],
             )
@@ -2532,7 +2532,7 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._try_configured_fallback_chain",
                    return_value=(fallback_client, "deepseek-v4-pro", "fallback_chain[0](opencode-go)")) as mock_chain, \
              patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
-            result = call_llm(
+            call_llm(
                 task="kanban_decomposer",
                 messages=[{"role": "user", "content": "decompose this"}],
             )

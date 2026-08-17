@@ -76,7 +76,7 @@ class TestBrowserCleanup:
 
         with (
             patch("tools.browser_tool._is_camofox_mode", return_value=True),
-            patch("tools.browser_tool._maybe_stop_recording") as mock_stop,
+            patch("tools.browser_tool._maybe_stop_recording"),
             patch(
                 "tools.browser_tool._run_browser_command",
                 return_value={"success": True},
@@ -104,7 +104,7 @@ class TestBrowserCleanup:
 
         with (
             patch("tools.browser_tool._is_camofox_mode", return_value=True),
-            patch("tools.browser_tool._maybe_stop_recording") as mock_stop,
+            patch("tools.browser_tool._maybe_stop_recording"),
             patch(
                 "tools.browser_tool._run_browser_command",
                 return_value={"success": True},

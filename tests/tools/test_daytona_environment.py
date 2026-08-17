@@ -332,15 +332,15 @@ class TestResourceConversion:
         return daytona_sdk.Resources.call_args.kwargs
 
     def test_memory_converted_to_gib(self, make_env, daytona_sdk):
-        env = make_env(memory=5120)
+        make_env(memory=5120)
         assert self._get_resources_kwargs(daytona_sdk)["memory"] == 5
 
     def test_disk_converted_to_gib(self, make_env, daytona_sdk):
-        env = make_env(disk=10240)
+        make_env(disk=10240)
         assert self._get_resources_kwargs(daytona_sdk)["disk"] == 10
 
     def test_small_values_clamped_to_1(self, make_env, daytona_sdk):
-        env = make_env(memory=100, disk=100)
+        make_env(memory=100, disk=100)
         kw = self._get_resources_kwargs(daytona_sdk)
         assert kw["memory"] == 1
         assert kw["disk"] == 1

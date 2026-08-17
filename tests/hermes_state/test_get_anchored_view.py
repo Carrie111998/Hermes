@@ -126,7 +126,7 @@ class TestEmptyContentFilter:
         # Another empty assistant near the end
         db.append_message("s1", role="assistant", content="", tool_calls=[{"id": "t2", "function": {"name": "y", "arguments": "{}"}}])
         # Prose closer
-        closer = db.append_message("s1", role="assistant", content="Final decision: ship it.")
+        db.append_message("s1", role="assistant", content="Final decision: ship it.")
 
         # Anchor mid-session
         view = db.get_anchored_view("s1", opener + 15, window=2, bookend=3)

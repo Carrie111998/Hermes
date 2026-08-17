@@ -272,7 +272,6 @@ def test_poll_token_error_raises():
 
 def test_poll_token_timeout_raises():
     # expired_in is a small duration (treated as seconds from now, already expired)
-    expired_in = 1  # 1 second from now
     # Make sleep a no-op and time.time advance quickly by using a small deadline
     # We use a duration-style expired_in (small enough to not be a unix timestamp)
     # duration mode: deadline = time.time() + max(1, expired_in)
@@ -293,7 +292,7 @@ def test_poll_token_timeout_raises():
     client.post.return_value = pending_resp
 
     import hermes_cli.auth as auth_module
-    with patch.object(auth_module, "time") as mock_time_mod:
+    with patch.object(auth_module, "time"):
         # We need to patch the 'time' module used inside _minimax_poll_token
         # The function imports 'import time as _time' locally.
         # Patch time.sleep and time.time in the auth module's local scope.
