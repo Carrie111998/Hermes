@@ -594,7 +594,12 @@ def _prepare_cron_failure_alert(job: dict, error: str | None) -> str | None:
         last_notified = float(previous.get("last_notified", 0) or 0) if same else 0
     except (TypeError, ValueError):
         last_notified = 0
-    should_notify = not same or not last_notified or now - last_notified >= _CRON_FAILURE_ALERT_INTERVAL_SECONDS
+    should_notify = (
+        not same
+        or bool(previous.get("pending"))
+        or not last_notified
+        or now - last_notified >= _CRON_FAILURE_ALERT_INTERVAL_SECONDS
+    )
     if not should_notify:
         suppressed += 1
     state = {
@@ -602,7 +607,9 @@ def _prepare_cron_failure_alert(job: dict, error: str | None) -> str | None:
         "consecutive": consecutive,
         "suppressed": suppressed,
         "last_notified": now if should_notify else last_notified,
+        "pending": should_notify,
     }
+    job["failure_alert"] = state
     try:
         update_job(job["id"], {"failure_alert": state})
     except Exception:
@@ -617,6 +624,21 @@ def _prepare_cron_failure_alert(job: dict, error: str | None) -> str | None:
     return message
 
 
+def _confirm_cron_failure_alert(job: dict) -> None:
+    """Mark a failure alert delivered after the transport confirms success."""
+    state = job.get("failure_alert")
+    if not isinstance(state, dict) or not state.get("pending"):
+        return
+    state = dict(state)
+    state["last_notified"] = time.time()
+    state["pending"] = False
+    job["failure_alert"] = state
+    try:
+        update_job(job["id"], {"failure_alert": state})
+    except Exception:
+        logger.debug("Could not confirm failure-alert state for %s", job.get("id"), exc_info=True)
+
+
 def _cron_recovery_notice(job: dict) -> str | None:
     """Return a one-time recovery notice when a job becomes healthy again."""
     state = job.get("failure_alert")
@@ -626,6 +648,17 @@ def _cron_recovery_notice(job: dict) -> str | None:
         f"✅ Cron '{job.get('name') or job.get('id')}' recovered after "
         f"{int(state.get('consecutive', 0))} consecutive failure(s)."
     )
+
+
+def _cron_failure_backoff_enabled() -> bool:
+    """Respect the existing ``cron.preflight: false`` compatibility opt-out."""
+    try:
+        from hermes_cli.config import read_user_config_raw
+        path = _get_hermes_home() / "config.yaml"
+        cfg = read_user_config_raw(path) if path.exists() else {}
+        return _cron_preflight_enabled(cfg)
+    except Exception:
+        return True
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -6922,7 +6955,11 @@ def _run_one_job_body(
             # operator was already told on a previous tick, so re-delivering
             # the same alert every tick would be spam (#73506 alert-once
             # shape).
-            recovery_notice = _cron_recovery_notice(job) if success else None
+            recovery_notice = (
+                _cron_recovery_notice(job)
+                if success and _cron_failure_backoff_enabled()
+                else None
+            )
             blocked_config_silent = (
                 bool(error) and BLOCKED_CONFIG_SILENT_MARKER in str(error)
             )
@@ -6975,6 +7012,8 @@ def _run_one_job_body(
                         if deliver_content:
                             deliver_content += _failure_streak_nudge(job)
                     else:
+                        # Preserve the documented preflight opt-out: repeated
+                        # failures continue to alert on every run.
                         deliver_content = (
                             _summarize_cron_failure_for_delivery(job, error)
                             + _failure_streak_nudge(job)
@@ -7019,6 +7058,13 @@ def _run_one_job_body(
                             adapters=adapters,
                             loop=loop,
                         )
+                        if (
+                            not delivery_error
+                            and not success
+                            and not drift_skip
+                            and _cron_failure_backoff_enabled()
+                        ):
+                            _confirm_cron_failure_alert(job)
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
                         raise
@@ -7162,6 +7208,8 @@ def _run_one_job_body(
                         adapters=adapters,
                         loop=loop,
                     )
+                    if not delivery_error and failure_alert:
+                        _confirm_cron_failure_alert(job)
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
                 logger.error(
