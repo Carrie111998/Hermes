@@ -135,7 +135,7 @@ describe('session.info transcript scope', () => {
       { profile: 'other', runtime: 'remote:ssh:other:workstation' }
     )
 
-    expect(sessionStates.get(ACTIVE_SID)).toMatchObject({
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
       cwd: '/other/project',
       profile: 'design',
       runtime: 'remote:ssh:design:workstation'
