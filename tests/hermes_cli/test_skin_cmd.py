@@ -119,6 +119,43 @@ def test_set_does_not_rebuild_an_invalid_existing_builtin_fork(contents, capsys)
     assert "default-custom" in capsys.readouterr().err
 
 
+def test_set_does_not_rewrite_a_non_mapping_colors_fork(capsys):
+    fork = _skins() / "default-custom.yaml"
+    fork.write_text("colors: []\n", encoding="utf-8")
+    _activate("default")
+    config_before = (get_hermes_home() / "config.yaml").read_text()
+
+    assert skin_cmd._skin_set("ui_tool", "#00FFFF", None) == 1
+    assert fork.read_text(encoding="utf-8") == "colors: []\n"
+    assert (get_hermes_home() / "config.yaml").read_text() == config_before
+    err = capsys.readouterr().err
+    assert "non-mapping colors section" in err
+    assert "default-custom.yaml" in err
+
+
+def test_set_does_not_rewrite_a_non_mapping_colors_user_skin(capsys):
+    skin = _skins() / "oasis.yaml"
+    skin.write_text("colors: []\n", encoding="utf-8")
+    _activate("oasis")
+    config_before = (get_hermes_home() / "config.yaml").read_text()
+
+    assert skin_cmd._skin_set("ui_tool", "#00FFFF", None) == 1
+    assert skin.read_text(encoding="utf-8") == "colors: []\n"
+    assert (get_hermes_home() / "config.yaml").read_text() == config_before
+    assert "non-mapping colors section" in capsys.readouterr().err
+
+
+def test_set_still_bootstraps_a_fork_without_a_colors_section():
+    fork = _skins() / "default-custom.yaml"
+    fork.write_text("name: default-custom\n", encoding="utf-8")
+    _activate("default")
+
+    assert skin_cmd._skin_set("ui_tool", "#00FFFF", None) == 0
+
+    data = yaml.safe_load(fork.read_text(encoding="utf-8"))
+    assert data["colors"] == {"ui_tool": "#00FFFF"}
+
+
 def test_set_rejects_non_hex():
     _activate("default")
     assert skin_cmd._skin_set("ui_tool", "teal", None) == 1

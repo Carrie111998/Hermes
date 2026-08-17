@@ -83,6 +83,12 @@ def _skin_set(key: str, value: str, skin: str | None) -> int:
                 "tool_prefix": resolved.tool_prefix,
             }
 
+    if isinstance(data, dict) and "colors" in data and not isinstance(data["colors"], dict):
+        print(
+            f"✗ skin file {display_hermes_home()}/skins/{path.name} has a non-mapping colors section",
+            file=sys.stderr,
+        )
+        return 1
     if not isinstance(data.get("colors"), dict):
         data["colors"] = {}
     data["colors"][key] = value
