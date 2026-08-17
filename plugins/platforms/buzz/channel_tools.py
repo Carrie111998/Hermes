@@ -14,6 +14,9 @@ from .adapter import (
     _resolve_private_key,
 )
 
+_CHANNEL_TYPES = ("stream", "forum")
+_VISIBILITIES = ("open", "private")
+
 
 def _result(**payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False)
@@ -50,7 +53,11 @@ async def buzz_channels(args: dict | None = None, **_: Any) -> str:
         if not name:
             return _result(ok=False, error="name is required for create")
         channel_type = str(values.get("channel_type") or "stream").strip().lower()
+        if channel_type not in _CHANNEL_TYPES:
+            return _result(ok=False, error="channel_type must be stream or forum")
         visibility = str(values.get("visibility") or "private").strip().lower()
+        if visibility not in _VISIBILITIES:
+            return _result(ok=False, error="visibility must be open or private")
         cli_args = [
             "channels",
             "create",
@@ -75,6 +82,8 @@ async def buzz_channels(args: dict | None = None, **_: Any) -> str:
         cli_args = ["channels", "list", "--limit", str(limit)]
         visibility = str(values.get("visibility") or "").strip().lower()
         if visibility:
+            if visibility not in _VISIBILITIES:
+                return _result(ok=False, error="visibility must be open or private")
             cli_args.extend(["--visibility", visibility])
         if values.get("member_only") is True:
             cli_args.append("--member")
@@ -124,12 +133,12 @@ _SCHEMA = {
                 },
                 "channel_type": {
                     "type": "string",
-                    "enum": ["stream", "forum"],
+                    "enum": list(_CHANNEL_TYPES),
                     "description": "Channel type for create. Defaults to stream.",
                 },
                 "visibility": {
                     "type": "string",
-                    "enum": ["open", "private"],
+                    "enum": list(_VISIBILITIES),
                     "description": "Visibility for create or list filtering. Create defaults to private.",
                 },
                 "description": {
