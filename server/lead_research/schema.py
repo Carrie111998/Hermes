@@ -56,9 +56,35 @@ CREATE TABLE IF NOT EXISTS research_issues (
     organization_id TEXT, issue_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
     data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
+-- Candidate corpora are service-only shared inputs.  They deliberately have
+-- no company_id: a later campaign may evaluate them, but importing a corpus
+-- cannot create a tenant lead, organization, research row, or evidence.
+CREATE TABLE IF NOT EXISTS candidate_datasets (
+    dataset_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    raw_hash TEXT NOT NULL,
+    imported_at REAL NOT NULL,
+    record_count INTEGER NOT NULL,
+    PRIMARY KEY(dataset_id, version)
+);
+CREATE TABLE IF NOT EXISTS candidate_records (
+    dataset_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    country TEXT NOT NULL,
+    domain TEXT,
+    data TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(dataset_id, version, source_record_id),
+    FOREIGN KEY(dataset_id, version) REFERENCES candidate_datasets(dataset_id, version)
+);
 CREATE INDEX IF NOT EXISTS ix_research_campaigns_tenant ON research_campaigns(company_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS ix_research_sources_tenant ON dataset_definitions(company_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
 CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(company_id, campaign_id, source_id);
+CREATE INDEX IF NOT EXISTS ix_candidate_records_country ON candidate_records(country, dataset_id, version);
+CREATE INDEX IF NOT EXISTS ix_candidate_records_name ON candidate_records(normalized_name);
 """

@@ -107,7 +107,8 @@ class PostgresDatabase:
     # no RLS, or credential tables that are world-readable — both silent.
     REQUIRED_MIGRATIONS = ("001_initial", "002_chat_sessions", "003_lead_research",
                            "004_lead_research_rls", "005_auth_table_rls",
-                           "006_message_supersession", "007_document_artifacts")
+                           "006_message_supersession", "007_document_artifacts",
+                           "008_candidate_corpus")
 
     def _assert_migrations_applied(self) -> None:
         try:
@@ -186,4 +187,3 @@ def create_database(settings):
         return PostgresDatabase(settings.database_url)
     from .db import Database
     return Database(settings.database_path)
-

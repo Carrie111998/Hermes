@@ -15,6 +15,7 @@ from .markets import no_research_markets
 from .postgres import create_database
 from .provisioning import provision_demo_account
 from .run_types import REGISTRY
+from .lead_research.candidates import CandidateRepository
 
 
 def _market_gate(company: str, payload: dict) -> None:
@@ -97,6 +98,10 @@ def main(argv=None) -> None:
     provision.add_argument("--email", required=True)
     provision.add_argument("--password-file", type=Path, required=True)
     provision.add_argument("--profile", type=Path, required=True)
+    candidates = sub.add_parser("import-candidates", help="Import a private service-only candidate corpus")
+    candidates.add_argument("--dataset-id", required=True)
+    candidates.add_argument("--version", required=True)
+    candidates.add_argument("--file", type=Path, required=True)
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -124,6 +129,26 @@ def main(argv=None) -> None:
                 company_profile=company_profile,
                 onboarding_sources=onboarding_sources,
             ))
+        finally:
+            close = getattr(db, "close", None)
+            if close:
+                close()
+        return
+
+    if args.command == "import-candidates":
+        settings = Settings.load()
+        db = create_database(settings)
+        try:
+            report = CandidateRepository(db).import_file(
+                args.dataset_id, args.version, args.file.name, args.file.read_bytes(),
+            )
+            # Candidate rows are intentionally never echoed to stdout.
+            print(json.dumps({
+                "dataset_id": report.dataset_id,
+                "version": report.version,
+                "count": report.record_count,
+                "raw_hash": report.raw_hash,
+            }, ensure_ascii=False))
         finally:
             close = getattr(db, "close", None)
             if close:
