@@ -553,6 +553,120 @@ class TestSaveAndLoadRoundtrip:
         assert config_path.exists()
         assert "openrouter" in config_path.read_text(encoding="utf-8")
 
+    # ── comment preservation on full-document writes ──────────────────────
+    #
+    # Every full-document write site (agent/onboarding.py mark_seen,
+    # gateway/slash_commands.py x7, doctor --fix, tui_gateway, telegram and
+    # yuanbao auto-sethome) does the same thing: yaml.safe_load the WHOLE file,
+    # mutate one nested value, hand the plain dict back here. safe_load drops
+    # comments, so the dump could not re-emit them and every such write silently
+    # deleted the user's annotations. Observed 2026-08-17 on the live
+    # profiles/main/config.yaml: mark_seen(TOOL_PROGRESS_FLAG) fired and took two
+    # load-bearing comment blocks under `sessions:` with it.
+    #
+    # save_config_value() never had this problem — cli.py routes it through
+    # utils.atomic_roundtrip_yaml_update, which is ruamel round-trip. These pin
+    # the same guarantee for the full-document path.
+
+    def test_atomic_config_write_preserves_comments(self, tmp_path):
+        """A full-document write must not delete the user's comments."""
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "agent:\n"
+            "  # keep me: explains why the value below is what it is\n"
+            "  max_turns: 90\n"
+            "sessions:\n"
+            "  # INERT: both live callers hardcode vacuum=False\n"
+            "  vacuum_after_prune: true\n",
+            encoding="utf-8",
+        )
+
+        # Exactly what mark_seen() does: safe_load, mutate one leaf, write back.
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        data["agent"]["max_turns"] = 120
+        atomic_config_write(config_path, data)
+
+        written = config_path.read_text(encoding="utf-8")
+        assert "keep me: explains why" in written, "comment was destroyed"
+        assert "INERT: both live callers" in written, "comment was destroyed"
+        assert yaml.safe_load(written)["agent"]["max_turns"] == 120
+
+    def test_atomic_config_write_still_applies_intentional_deletions(self, tmp_path):
+        """Preserving comments must not resurrect keys the caller removed.
+
+        ``save_config``'s contract is explicit that full-document replacement
+        callers rely on omission meaning deletion ("intentional deletions
+        survive"). A naive merge-onto-existing to recover comments would break
+        exactly that, and would do it silently.
+        """
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "agent:\n  # a comment\n  max_turns: 90\n  doomed: true\ngone: 1\n",
+            encoding="utf-8",
+        )
+
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        del data["agent"]["doomed"]
+        del data["gone"]
+        atomic_config_write(config_path, data)
+
+        reloaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert "doomed" not in reloaded["agent"], "deleted key was resurrected"
+        assert "gone" not in reloaded, "deleted top-level key was resurrected"
+        assert "# a comment" in config_path.read_text(encoding="utf-8")
+
+    def test_atomic_config_write_result_matches_the_data_it_was_given(self, tmp_path):
+        """The written document must parse back to exactly the input dict.
+
+        This is the invariant that makes comment preservation safe to turn on
+        everywhere: whatever is done to retain formatting, the resulting YAML
+        must still be the caller's data and nothing else.
+        """
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "agent:\n  # c\n  max_turns: 90\n  nested:\n    a: 1\n    b: 2\n"
+            "listy:\n  - one\n  - two\n",
+            encoding="utf-8",
+        )
+
+        data = {
+            "agent": {"max_turns": 5, "nested": {"b": 3, "c": 4}, "added": True},
+            "listy": ["only"],
+            "brand_new": {"deep": {"deeper": "x"}},
+        }
+        atomic_config_write(config_path, data)
+
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == data
+
+    def test_atomic_config_write_falls_back_when_roundtrip_cannot_parse(self, tmp_path):
+        """A file ruamel refuses must still be writable.
+
+        ruamel's round-trip loader raises DuplicateKeyError on a duplicate
+        mapping key, and the live profiles/main/config.yaml carried two
+        top-level ``session_bridge:`` blocks until 2026-08-17. Comment
+        preservation is a nicety; completing the write is not, so an
+        unparseable existing file must degrade to the plain dump rather than
+        raise.
+        """
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "agent:\n  max_turns: 1\nagent:\n  max_turns: 2\n", encoding="utf-8"
+        )
+
+        atomic_config_write(config_path, {"agent": {"max_turns": 99}})
+
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == {
+            "agent": {"max_turns": 99}
+        }
+
     def test_save_config_normalizes_legacy_root_level_max_turns(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             save_config({"model": "test/custom-model", "max_turns": 37})

@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -7279,7 +7280,100 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
 
     with _CONFIG_LOCK, _config_file_lock(config_path):
         require_readable_config_before_write(config_path)
+        if _roundtrip_config_write(config_path, data, **kwargs):
+            return
         atomic_yaml_write(config_path, data, **kwargs)
+
+
+def _reconcile_into_roundtrip(target: Any, source: Mapping[str, Any]) -> None:
+    """Make ``target`` equal ``source`` while keeping ``target``'s formatting.
+
+    ``target`` is a ruamel ``CommentedMap`` loaded from disk, so it still
+    carries the comments, quote styles and key order the caller's plain dict
+    lost to ``yaml.safe_load``. Updating it in place re-attaches all of that to
+    the surviving keys.
+
+    Deletion is the half that is easy to get wrong: a plain merge would
+    resurrect anything the caller deliberately removed, and ``save_config``'s
+    contract depends on omission meaning deletion ("full-document replacement
+    callers must leave [merge_existing] False so intentional deletions
+    survive"). So keys absent from ``source`` are dropped, not kept.
+
+    Only mappings recurse. Lists are replaced wholesale — there is no
+    positional identity to merge on, and guessing would silently reorder or
+    duplicate entries.
+    """
+    for key in [k for k in target if k not in source]:
+        del target[key]
+    for key, value in source.items():
+        existing = target.get(key)
+        if isinstance(value, Mapping) and _is_roundtrip_map(existing):
+            _reconcile_into_roundtrip(existing, value)
+        else:
+            target[key] = value
+
+
+def _is_roundtrip_map(value: Any) -> bool:
+    try:
+        from ruamel.yaml.comments import CommentedMap
+    except Exception:
+        return False
+    return isinstance(value, CommentedMap)
+
+
+def _roundtrip_config_write(config_path: Path, data: Any, **kwargs: Any) -> bool:
+    """Write ``data`` through ruamel so comments survive. False ⇒ not written.
+
+    Every full-document write site hands us a plain dict that came from
+    ``yaml.safe_load``, which discards comments — so the dump could not re-emit
+    them and each such write silently deleted the user's annotations. The
+    comments still exist in the file on disk at the moment of writing, so
+    reloading it here in round-trip mode recovers them; see
+    :func:`_reconcile_into_roundtrip` for how the caller's data is applied on
+    top without resurrecting deleted keys.
+
+    Returns False (caller falls back to the plain dump) rather than raising,
+    whenever the round trip cannot be done faithfully:
+
+    * ``sort_keys``/``default_flow_style``/``extra_content`` were requested —
+      those ask for a specific reformatting that contradicts preserving the
+      file's existing shape.
+    * The file does not exist yet, or is empty: nothing to preserve.
+    * ``data`` is not a mapping.
+    * ruamel refuses the document. This one is not hypothetical — its
+      round-trip loader raises ``DuplicateKeyError``, and the live
+      ``profiles/main/config.yaml`` carried two top-level ``session_bridge:``
+      blocks until 2026-08-17.
+
+    Preserving comments is a nicety; completing the write is not. Any failure
+    here must degrade to the existing behaviour, never break a config write.
+    """
+    if kwargs.get("sort_keys") or kwargs.get("default_flow_style") or kwargs.get("extra_content"):
+        return False
+    if not isinstance(data, Mapping):
+        return False
+    try:
+        if not config_path.exists() or not config_path.stat().st_size:
+            return False
+        from ruamel.yaml.comments import CommentedMap
+
+        from utils import atomic_roundtrip_yaml_dump, build_roundtrip_yaml
+
+        yaml_rt = build_roundtrip_yaml()
+        with config_path.open("r", encoding="utf-8") as handle:
+            existing = yaml_rt.load(handle)
+        if not isinstance(existing, CommentedMap):
+            return False
+        _reconcile_into_roundtrip(existing, data)
+        atomic_roundtrip_yaml_dump(config_path, existing, yaml_rt=yaml_rt)
+        return True
+    except Exception:
+        logger.debug(
+            "config: round-trip write failed for %s; falling back to plain dump",
+            config_path,
+            exc_info=True,
+        )
+        return False
 
 
 def load_config() -> Dict[str, Any]:

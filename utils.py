@@ -330,6 +330,67 @@ def atomic_yaml_write(
         raise
 
 
+def build_roundtrip_yaml() -> Any:
+    """Return the shared ruamel round-trip YAML handle.
+
+    One definition so every comment-preserving write emits identical
+    formatting — otherwise a file touched by two different call sites churns
+    quoting and indentation back and forth on alternate writes.
+    """
+    from ruamel.yaml import YAML
+
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    return yaml_rt
+
+
+def atomic_roundtrip_yaml_dump(
+    path: Union[str, Path],
+    document: Any,
+    *,
+    yaml_rt: Any = None,
+) -> None:
+    """Atomically write an already-built ruamel document.
+
+    Extracted from :func:`atomic_roundtrip_yaml_update` so the full-document
+    config path (``hermes_cli.config.atomic_config_write``) reuses this exact
+    write sequence rather than duplicating it. Same temp file + fsync + atomic
+    replace, and the same mode/owner restoration and symlink handling as
+    :func:`atomic_yaml_write` — those are load-bearing (GitHub #16743), so
+    there must not be a second, subtly different copy of them.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if yaml_rt is None:
+        yaml_rt = build_roundtrip_yaml()
+
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(document, f)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        _restore_file_mode(real_path_obj, original_mode)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_roundtrip_yaml_update(
     path: Union[str, Path],
     key_path: str,
@@ -342,17 +403,10 @@ def atomic_roundtrip_yaml_update(
     should survive a single setting mutation.  Writes still use the same temp
     file + fsync + atomic replace pattern.
     """
-    from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    yaml_rt = YAML(typ="rt")
-    yaml_rt.preserve_quotes = True
-    yaml_rt.allow_unicode = True
-    yaml_rt.default_flow_style = False
-    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    yaml_rt = build_roundtrip_yaml()
 
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
@@ -373,28 +427,7 @@ def atomic_roundtrip_yaml_update(
         current = next_value
     current[keys[-1]] = value
 
-    original_mode = _preserve_file_mode(path)
-    original_owner = _preserve_file_owner(path)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.stem}_",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml_rt.dump(config, f)
-            f.flush()
-            os.fsync(f.fileno())
-        real_path = atomic_replace(tmp_path, path)
-        real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_roundtrip_yaml_dump(path, config, yaml_rt=yaml_rt)
 
 
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────
