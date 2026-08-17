@@ -170,6 +170,25 @@ class TestCreateJob:
                 assert data["retry_create"] is False
                 assert "private callback URL and token" not in data["error"]
 
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_invalid_response_contract(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create",
+                side_effect=ValueError("response_contract.required_patterns must be a list"),
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "response_contract": {"required_patterns": "preview"},
+                })
+
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["error"] == "response_contract.required_patterns must be a list"
+
 
     @pytest.mark.asyncio
     async def test_create_job_prompt_too_long(self, adapter):
@@ -244,6 +263,23 @@ class TestUpdateJob:
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
                 assert sanitized["response_contract"] == {"forbidden_patterns": ["unsafe"]}
+
+    @pytest.mark.asyncio
+    async def test_update_job_rejects_invalid_response_contract(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update",
+                side_effect=ValueError("response_contract requires required_patterns or forbidden_patterns"),
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"response_contract": {}},
+                )
+
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["error"] == "response_contract requires required_patterns or forbidden_patterns"
 
 
 # ---------------------------------------------------------------------------

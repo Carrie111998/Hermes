@@ -5744,6 +5744,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"job": job})
         except _CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
+        except ValueError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -5801,6 +5803,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
