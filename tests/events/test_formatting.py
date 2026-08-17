@@ -969,3 +969,101 @@ def test_resource_pressure_body_without_a_band_still_renders():
     body = resource_pressure_body(payload)
     assert "phys_high" in body
     assert "None" not in body
+
+
+class TestCronStaleBody:
+    """CRON_STALE carries four distinct meanings on one event type.
+
+    Before this body existed every one of them fell through
+    ``_format_payload``'s generic fallback and reached Telegram as a raw
+    ``key: value`` splat — including correlation UUIDs no operator can act
+    on, and with ``scope`` (the field that carries the whole meaning) buried
+    mid-list. A genuine wedge and a restart casualty read almost identically.
+    """
+
+    def test_generic_wedge_reads_as_a_stuck_job(self):
+        from events.formatting import cron_stale_body
+        body = cron_stale_body({
+            "job_id": "9a68c6219ff3", "job_name": "jobflow-tracker-weekly",
+            "age_seconds": 1213, "threshold_seconds": 1200,
+        })
+        assert "jobflow-tracker-weekly" in body
+        assert "20m 13s" in body
+        assert "threshold 20m" in body
+        assert "{" not in body and "[" not in body
+
+    def test_ticker_scope_says_the_scheduler_itself_is_dead(self):
+        """The __ticker__ sentinel is not a job. Rendering it as one ('job
+        __ticker__ is stuck') hides that NO cron can fire at all."""
+        from events.formatting import cron_stale_body
+        body = cron_stale_body({
+            "job_id": "__ticker__", "job_name": "cron-ticker",
+            "scope": "ticker", "age_seconds": 327, "threshold_seconds": 300,
+        })
+        assert "scheduler" in body.lower()
+        assert "__ticker__" not in body
+        assert "5m 27s" in body
+
+    def test_gateway_stopped_names_the_shutdown_and_how_far_in(self):
+        from events.formatting import cron_stale_body
+        body = cron_stale_body({
+            "job_id": "9823bee8f270", "job_name": "postgres-sync",
+            "scope": "gateway_stopped", "exit_reason": "graceful",
+            "age_seconds": 43,
+            "gateway_stopped_event_id": "d5854c62-53be-41d7-99a9-0e9e7a9b15dd",
+            "cron_started_event_id": "558ceef6-f710-4d14-8a07-537cdc06a5d5",
+        })
+        assert "postgres-sync" in body
+        assert "gateway shutdown" in body
+        assert "graceful" in body
+        assert "43s" in body
+
+    def test_gateway_stopped_body_drops_the_correlation_uuids(self):
+        """They are the dedupe key, not operator-actionable detail (cf. the
+        SECRET_DETECTED finding_hash precedent)."""
+        from events.formatting import cron_stale_body
+        body = cron_stale_body({
+            "job_name": "postgres-sync", "scope": "gateway_stopped",
+            "exit_reason": "graceful", "age_seconds": 43,
+            "gateway_stopped_event_id": "d5854c62-53be-41d7-99a9-0e9e7a9b15dd",
+            "cron_started_event_id": "558ceef6-f710-4d14-8a07-537cdc06a5d5",
+        })
+        assert "d5854c62" not in body
+        assert "558ceef6" not in body
+
+    def test_owner_exited_does_not_claim_how_far_into_the_run_it_died(self):
+        """The ledger path omits age_seconds on purpose: it cannot tell how
+        far in the kill landed, only that the owner died. The body must not
+        invent '0s into the run' from the missing field."""
+        from events.formatting import cron_stale_body
+        body = cron_stale_body({
+            "job_id": "1c34e737bb39", "job_name": "jobflow-scout",
+            "scope": "owner_exited", "execution_id": "e-991",
+            "ran_at": "2026-08-17T13:00:05-04:00",
+        })
+        assert "jobflow-scout" in body
+        assert "unknown" in body.lower()
+        assert "into the run" not in body
+        assert "0s" not in body
+        assert "e-991" not in body
+
+    def test_owner_exited_renders_the_local_ran_at_stamp_as_utc(self):
+        """ran_at is stamped by the executions ledger in LOCAL wall-clock
+        (-04:00 here) while every other timestamp on the bus is UTC. Handing
+        it to _short_time unconverted prints the local hour under a 'UTC'
+        label — 13:00 UTC for a run that started at 17:00 UTC."""
+        from events.formatting import cron_stale_body
+        body = cron_stale_body({
+            "job_name": "jobflow-scout", "scope": "owner_exited",
+            "ran_at": "2026-08-17T13:00:05-04:00",
+        })
+        assert "17:00 UTC" in body
+        assert "13:00 UTC" not in body
+
+    def test_unparseable_ran_at_degrades_instead_of_raising(self):
+        from events.formatting import cron_stale_body
+        body = cron_stale_body({
+            "job_name": "jobflow-scout", "scope": "owner_exited",
+            "ran_at": "not-a-timestamp",
+        })
+        assert "jobflow-scout" in body

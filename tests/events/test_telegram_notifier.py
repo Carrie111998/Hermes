@@ -2598,3 +2598,75 @@ class TestResourcePressureSeverityBands:
         assert len(sent) == 2
         assert "SEVERE" in sent[0].upper()
         assert "IMMINENT" in sent[1].upper()
+
+
+class TestCronStaleBody:
+    """CRON_STALE had no `_format_payload` branch, so all four of its scopes
+    reached Telegram through the generic `f"{k}: {v}"` fallback — the same
+    defect SR-408 fixed for SECRET_DETECTED. The wedge alert (something is
+    stuck NOW) and a restart casualty (informational) were near-identical,
+    and two correlation UUIDs rode along in every shutdown attribution.
+    """
+
+    def _notifier(self, bus, topics_config, verbosity_config):
+        return TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+
+    def test_gateway_stopped_is_routed_to_the_cron_stale_body(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.CRON_STALE, "cron-stale-monitor",
+            {
+                "job_id": "9823bee8f270", "job_name": "postgres-sync",
+                "scope": "gateway_stopped", "exit_reason": "graceful",
+                "age_seconds": 43,
+                "gateway_stopped_event_id": "d5854c62-53be-41d7-99a9-0e9e7a9b15dd",
+                "cron_started_event_id": "558ceef6-f710-4d14-8a07-537cdc06a5d5",
+            },
+        )
+        body = notifier._format_payload(event)
+        assert "cut short by a gateway shutdown (graceful) 43s" in body
+        # The generic fallback's fingerprints must be gone.
+        assert "scope: gateway_stopped" not in body
+        assert "d5854c62" not in body
+
+    def test_owner_exited_reads_differently_from_gateway_stopped(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The asymmetry is the point: the shutdown attribution knows what
+        killed the run and how far in; the ledger backstop knows only that
+        the owner died. Flattening them would erase the distinction the two
+        successor paths exist to draw."""
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.CRON_STALE, "cron-recovery",
+            {
+                "job_id": "1c34e737bb39", "job_name": "jobflow-scout",
+                "scope": "owner_exited", "execution_id": "e-991",
+                "ran_at": "2026-08-17T13:00:05-04:00",
+            },
+        )
+        body = notifier._format_payload(event)
+        assert "owner exited before recording an outcome" in body
+        assert "unknown" in body
+        assert "gateway shutdown" not in body
+        assert "into the run" not in body
+        assert "e-991" not in body
+
+    def test_the_wedge_alert_still_reads_as_a_stuck_job(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The scope-less original must not regress into a restart excuse —
+        it is the only one of the four that means "stuck right now"."""
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.CRON_STALE, "cron-stale-monitor",
+            {"job_id": "9a68c6219ff3", "job_name": "jobflow-tracker-weekly",
+             "age_seconds": 1213, "threshold_seconds": 1200},
+        )
+        body = notifier._format_payload(event)
+        assert "jobflow-tracker-weekly has been running 20m 13s" in body
+        assert "shutdown" not in body and "owner exited" not in body
