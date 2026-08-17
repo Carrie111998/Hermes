@@ -1205,6 +1205,21 @@ _JUNK_PROBE_ENV = "HERMES_TEST_JUNK_PROBE"
 # Backstop only: the stop-file is the normal shutdown path. This bounds an
 # orphaned watcher if the runner is killed outright.
 _WATCHER_ORPHAN_BUDGET_SECS = 6 * 3600
+# How long _stop_junk_watcher() waits for the watcher's OWN graceful exit
+# (via the stop-file) before giving up and force-terminating it. Reconciled
+# 2026-08-17 against systemdrive_watcher.DEFAULT_LIVE_SWEEP_SECS (30s): this
+# used to be a bare 15, which is LESS than the watcher's own live-sweep
+# budget, so a sighting late in the run could get force-terminated mid-sweep
+# on the graceful-shutdown path too, not just on a hard kill. That is much
+# less catastrophic than it used to be -- the watcher now writes the raw
+# ring to its snapshot file BEFORE the sweep starts (see on_hit()'s
+# CRITICAL 1 fix), so a force-terminate here only costs the best-effort
+# SIGHTING_LIVE enrichment, never the ring. We still raise this to
+# DEFAULT_LIVE_SWEEP_SECS + 5 (matching the watcher's own internal
+# `_await_in_flight_sweeps` grace period) so that in the common case the
+# runner does not needlessly truncate a sweep that was about to finish on
+# its own.
+_WATCHER_STOP_GRACE_SECS = 35
 
 _watcher_proc: "subprocess.Popen | None" = None
 _watcher_stop_file: "Path | None" = None
@@ -1257,12 +1272,35 @@ def _stop_junk_watcher() -> None:
     NEGATIVE -- instead of being killed before it can report.
     """
     proc, stop_file = _watcher_proc, _watcher_stop_file
-    if proc is None or proc.poll() is not None:
+    if proc is None:
+        return
+    exit_code = proc.poll()
+    if exit_code is not None:
+        # SUPPORTING 6: the sidecar died on its own sometime during the run
+        # -- possibly seconds into a multi-hour run -- and the only prior
+        # evidence of the watcher's existence was "watcher process spawned"
+        # at startup. Silence here would leave a crashed watcher
+        # indistinguishable from a healthy one that simply had nothing to
+        # report, which is exactly the kind of fabricated-clean-negative
+        # this whole instrument exists to eliminate.
+        print(
+            f"  [junk-probe] watcher process (pid {proc.pid}) had ALREADY "
+            f"exited (code {exit_code}) by the time the stop signal was "
+            f"sent; its 'done' record (the NEGATIVE) is likely missing. "
+            "Treat this run as UNWATCHED from whenever the crash happened -- "
+            "check the watcher's JSONL log for its last record.",
+            file=sys.stderr,
+        )
+        try:
+            if stop_file is not None:
+                stop_file.unlink()
+        except OSError:
+            pass
         return
     try:
         if stop_file is not None:
             stop_file.touch()
-        proc.wait(timeout=15)
+        proc.wait(timeout=_WATCHER_STOP_GRACE_SECS)
     except OSError as exc:
         print(
             f"  [junk-probe] could not signal the watcher via its stop-file "
@@ -1276,9 +1314,10 @@ def _stop_junk_watcher() -> None:
             pass
     except subprocess.TimeoutExpired:
         print(
-            "  [junk-probe] watcher did not exit within 15s of the stop "
-            "signal; force-terminating it. Its 'done' record (the "
-            "NEGATIVE) will therefore be missing from this run.",
+            f"  [junk-probe] watcher did not exit within "
+            f"{_WATCHER_STOP_GRACE_SECS}s of the stop signal; "
+            "force-terminating it. Its 'done' record (the NEGATIVE) will "
+            "therefore be missing from this run.",
             file=sys.stderr,
         )
         try:

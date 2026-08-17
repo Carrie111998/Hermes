@@ -55,6 +55,13 @@ DEFAULT_SECS = 36000.0
 DEFAULT_SAMPLE_MS = 100
 DEFAULT_POLL_MS = 250
 DEFAULT_RING = 4000
+# Time budget for on_hit()'s best-effort live-process sweep -- see
+# Watcher.__init__ and on_hit() for why this is 30s and what still survives
+# if a run is killed before it completes. Named here (rather than left as a
+# bare literal on the Watcher signature) so run_tests_parallel.py's shutdown
+# grace period can be reasoned about against the SAME number instead of an
+# independently-chosen constant that could drift out of sync.
+DEFAULT_LIVE_SWEEP_SECS = 30.0
 
 
 def log_path() -> Path:
@@ -422,7 +429,9 @@ class _HandleOwner:
                 pass
 
 
-def _run_watch_thread(log: Path, root: Path, backend: str, target, *args) -> None:
+def _run_watch_thread(
+    log: Path, root: Path, backend: str, target, *args, on_degradation=None,
+) -> None:
     """Ensure a watch thread's death is always RECORDED, never silent.
 
     Python's default thread excepthook only prints to stderr, and a killed
@@ -433,18 +442,31 @@ def _run_watch_thread(log: Path, root: Path, backend: str, target, *args) -> Non
     the thread actually exits, so "the thread died" is something a reader
     of the log can SEE, never something they have to infer from a watch
     that just stopped producing records.
+
+    ``on_degradation``, if given, is called with the written record. This is
+    how ``Watcher.run()`` learns a thread died WITHOUT re-parsing its own
+    JSONL log -- see ``Watcher._record_degradation`` and CRITICAL 2: a
+    ``done`` NEGATIVE must never be printed when a watch thread is known to
+    have died, because that means part of the watch may not have been
+    running at all.
     """
     try:
         target(*args)
     except BaseException as exc:  # a dead thread must never be silent
-        write_record(
+        record = write_record(
             log, "watch_thread_error", root=str(root), backend=backend,
             cause=f"{type(exc).__name__}: {exc}",
         )
+        if on_degradation is not None:
+            try:
+                on_degradation(record)
+            except Exception:
+                pass
 
 
 def watch_readdirchanges(
     root: Path, on_hit, stop: threading.Event, owner: "_HandleOwner", log: Path,
+    on_degradation=None,
 ) -> None:
     """Block on ReadDirectoryChangesW until %SystemDrive% is created.
 
@@ -474,23 +496,33 @@ def watch_readdirchanges(
                     # this is the clean-shutdown case, not an error.
                     return
                 err = ctypes.get_last_error()
-                write_record(
+                record = write_record(
                     log, "watch_thread_error", root=str(root),
                     backend="readdirectorychanges",
                     cause=f"ReadDirectoryChangesW failed: {ctypes.WinError(err)}",
                 )
+                if on_degradation is not None:
+                    try:
+                        on_degradation(record)
+                    except Exception:
+                        pass
                 return
             if returned.value == 0:
                 # Documented signal: TRUE + 0 bytes means the kernel's
                 # change buffer overflowed and events were DROPPED. Left
                 # alone this is indistinguishable from "nothing happened
                 # yet" -- dropped events must never look like silence.
-                write_record(
+                record = write_record(
                     log, "watch_buffer_overflow", root=str(root),
                     backend="readdirectorychanges",
                     note="ReadDirectoryChangesW overflowed; events may "
                          "have been dropped, watch continues",
                 )
+                if on_degradation is not None:
+                    try:
+                        on_degradation(record)
+                    except Exception:
+                        pass
                 continue
             for action, name in parse_notifications(buf.raw, returned.value):
                 if name == JUNK_NAME and action in (
@@ -515,7 +547,7 @@ class Watcher:
         secs: float = DEFAULT_SECS,
         stop_file: "Path | None" = None,
         force_polling: bool = False,
-        live_sweep_secs: float = 30.0,
+        live_sweep_secs: float = DEFAULT_LIVE_SWEEP_SECS,
     ) -> None:
         self.roots = [Path(r).resolve() for r in roots]
         self.log = log or log_path()
@@ -538,6 +570,24 @@ class Watcher:
         self._lock = threading.Lock()
         self._hit_roots: set = set()
         self.sightings = 0
+        # CRITICAL 2 state: what run() must consult before it is allowed to
+        # print a NEGATIVE. A root latched via record_preexisting() can
+        # NEVER produce a SIGHTING (see that method), so "sightings == 0"
+        # alone cannot mean "nothing happened" -- these fields are what let
+        # run() tell the difference between a genuine clean negative and a
+        # watch that was compromised or blind to a known tree. All three are
+        # written to ONLY through _record_degradation / record_preexisting /
+        # on_hit, all of which hold self._lock, so run() reads them after
+        # self._stop.set() with no other writer still able to mutate them.
+        self._preexisting_roots: set = set()
+        self._thread_error_count = 0
+        self._buffer_overflow_count = 0
+        # SUPPORTING 4 state: lets run() know whether an on_hit() live sweep
+        # is still in flight before it returns -- see _await_in_flight_sweeps
+        # and on_hit(). Starts "idle" (set) because no sweep is running yet.
+        self._sweep_count = 0
+        self._sweep_idle = threading.Event()
+        self._sweep_idle.set()
         # Open ReadDirectoryChangesW handles, as _HandleOwner instances, so
         # run() can cancel them at shutdown instead of leaving a watch
         # thread blocked in the kernel. Appended in _start_backends BEFORE
@@ -563,28 +613,69 @@ class Watcher:
             if present:
                 with self._lock:
                     self._hit_roots.add(str(root))
+                    self._preexisting_roots.add(str(root))
                 write_record(
                     self.log, "preexisting", root=str(root), path=str(target),
                     note="present before the watch started - cannot attribute; "
                          "delete it and re-run to make this root usable",
                 )
 
+    def _record_degradation(self, record: dict) -> None:
+        """Bump the counters run() consults before it may print a NEGATIVE.
+
+        Called by _run_watch_thread / watch_readdirchanges whenever a thread
+        dies or a change-buffer overflow is recorded -- see CRITICAL 2.
+        Counts only, not the records themselves: an overflow can in
+        principle repeat for the whole run, and the durable copy already
+        lives in the JSONL log written by write_record, so there is no need
+        to also hold every record in memory for a multi-hour watch.
+        """
+        event = record.get("event")
+        with self._lock:
+            if event == "watch_thread_error":
+                self._thread_error_count += 1
+            elif event == "watch_buffer_overflow":
+                self._buffer_overflow_count += 1
+
+    def _write_snapshot(self, path: Path, data: dict) -> "Path | None":
+        """Write the sidecar snapshot atomically (temp file + ``os.replace``).
+
+        SUPPORTING 4: ``Path.write_text`` is not atomic -- a process killed
+        mid-write leaves a truncated file that a hunter's blind ``json.load``
+        will choke on, exactly when a partial file is likeliest to be all
+        that is left. Writing to a same-directory temp file and replacing it
+        means the path is always either the previous complete write or the
+        new complete write, never a partial one.
+        """
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+            tmp.write_text(
+                json.dumps(data, indent=2, default=str), encoding="utf-8",
+            )
+            os.replace(tmp, path)
+            return path
+        except OSError:
+            return None
+
     def on_hit(self, root: Path, backend: str) -> None:
         """Record the first absent->present transition for ``root``.
 
-        Ordering is the whole point, and it is now two stages:
+        Ordering is the whole point, and it is now THREE stages (CRITICAL 1
+        added the middle one):
 
-        1. Dump the ring buffer (already in memory, instant) and write the
-           durable SIGHTING record IMMEDIATELY -- before any live-table
-           enumeration.
+        1. Dump the ring buffer (already in memory, instant), write it to
+           the sidecar snapshot file ON DISK, and write the durable SIGHTING
+           record -- all before any live-table enumeration.
         2. Only THEN enumerate the live process table (bounded by
-           ``self.live_sweep_secs``) and write a second, best-effort
-           SIGHTING_LIVE record.
+           ``self.live_sweep_secs``), re-write the sidecar snapshot with the
+           live data added, and write a second, best-effort SIGHTING_LIVE
+           record.
 
-        Why the live sweep must come AFTER the write, not before: measured
-        on this box, ``describe_pid()`` costs ~204ms per process against
-        ~968 live processes, so a full sweep takes 60-200 SECONDS (this is
-        not a Python-loop-overhead problem -- ``psutil.Process.ppid()`` and
+        Why the live sweep must come AFTER stage 1, not before: measured on
+        this box, ``describe_pid()`` costs ~204ms per process against ~968
+        live processes, so a full sweep takes 60-200 SECONDS (this is not a
+        Python-loop-overhead problem -- ``psutil.Process.ppid()`` and
         ``.create_time()`` each force a fresh full-table snapshot per call on
         Windows, making the sweep effectively quadratic; batching via
         ``psutil.process_iter(attrs=[...])`` was measured too and gave NO
@@ -592,10 +683,26 @@ class Watcher:
         path). This class of run gets killed, timed out, or loses its
         terminal -- that is the entire reason ``write_record`` exists to
         write at the moment of the event rather than at exit (see its
-        docstring). If the live sweep ran BEFORE the SIGHTING write, a kill
-        during those 60-200s would destroy the only copy of the sighting
-        itself, reproducing exactly the failure this watcher exists to
-        prevent. Do NOT reorder the live enumeration above the write below.
+        docstring). If the live sweep ran BEFORE stage 1, a kill during
+        those 60-200s would destroy the only copy of the sighting itself,
+        reproducing exactly the failure this watcher exists to prevent. Do
+        NOT reorder the live enumeration above stage 1.
+
+        CRITICAL 1: the raw ring (with ``cmdline``) used to reach disk only
+        as part of the SIGHTING_LIVE write, i.e. AFTER the live sweep. A run
+        killed during the sweep destroyed the ring entirely -- and measured
+        (2026-08-17, see the design doc's capture-rate table) the raw ring's
+        ``cmdline`` was, in the trials where ``ring_cwd_matches`` came up
+        empty, the ONLY place the writer's identity survived at all. The
+        ring is now written to the sidecar snapshot, via the atomic
+        ``_write_snapshot``, and the SIGHTING record's ``snapshot_file``
+        points at it, BEFORE the live sweep starts. Invariants this
+        guarantees: (a) the raw ring is on disk before the sweep begins; (b)
+        a run killed during the sweep still has it, because the write
+        already completed and ``os.replace`` makes it atomic; (c) the
+        ``snapshot_file`` path the SIGHTING record hands a hunter always
+        names a file that exists at the moment SIGHTING is written, not one
+        that might not exist yet if the sweep never finishes.
 
         Ancestry (the ring + eventually the live table) is the perishable
         part; the directory on disk is not -- which is why the ring dump
@@ -610,6 +717,13 @@ class Watcher:
 
         ring = self._ring.dump()                      # in memory, instant
 
+        snapshot: "Path | None" = self.log.with_name(
+            f"systemdrive-sighting-{datetime.now():%Y%m%d-%H%M%S-%f}.json"
+        )
+        # CRITICAL 1: durable BEFORE the SIGHTING write, and well before the
+        # live sweep -- see the docstring above.
+        snapshot = self._write_snapshot(snapshot, {"ring": ring, "live": None})
+
         # Durable the moment we know -- see the docstring above for why this
         # write must precede the live sweep rather than follow it.
         write_record(
@@ -623,6 +737,10 @@ class Watcher:
             watcher_has_systemdrive="SYSTEMDRIVE" in os.environ,
             ring_cwd_matches=[e for e in ring if cwd_matches(e, root)],
             ring_size=len(ring),
+            # CRITICAL 1: the raw ring (with cmdlines) is ALREADY on disk at
+            # this path -- a reader of a killed run does not need
+            # SIGHTING_LIVE to reach it. See _write_snapshot above.
+            snapshot_file=str(snapshot) if snapshot else None,
             # A reader of a killed run's log needs to be able to tell "the
             # live sweep never got to run" apart from "it ran and found
             # nothing". This field is that signal; SIGHTING_LIVE supersedes
@@ -630,32 +748,35 @@ class Watcher:
             live_sweep="pending",
         )
 
-        live, live_total, live_truncated, live_elapsed = self._live_sweep()
-
-        snapshot: "Path | None" = self.log.with_name(
-            f"systemdrive-sighting-{datetime.now():%Y%m%d-%H%M%S-%f}.json"
-        )
+        # SUPPORTING 4: mark a sweep as in-flight so run() can wait for it
+        # (bounded) or record its abandonment instead of silently dropping
+        # it via sys.exit() -- see _await_in_flight_sweeps.
+        with self._lock:
+            self._sweep_count += 1
+            self._sweep_idle.clear()
         try:
-            snapshot.parent.mkdir(parents=True, exist_ok=True)
-            snapshot.write_text(
-                json.dumps({"ring": ring, "live": live}, indent=2, default=str),
-                encoding="utf-8",
-            )
-        except OSError:
-            snapshot = None
+            live, live_total, live_truncated, live_elapsed = self._live_sweep()
 
-        write_record(
-            self.log, "SIGHTING_LIVE",
-            root=key,
-            live_cwd_matches=[e for e in live if cwd_matches(e, root)],
-            live_process_count=len(live),
-            # Never report a partial sweep as complete -- these three fields
-            # make truncation unmistakable rather than silent.
-            live_process_total=live_total,
-            live_sweep_truncated=live_truncated,
-            live_sweep_secs=round(live_elapsed, 3),
-            snapshot_file=str(snapshot) if snapshot else None,
-        )
+            if snapshot is not None:
+                snapshot = self._write_snapshot(snapshot, {"ring": ring, "live": live})
+
+            write_record(
+                self.log, "SIGHTING_LIVE",
+                root=key,
+                live_cwd_matches=[e for e in live if cwd_matches(e, root)],
+                live_process_count=len(live),
+                # Never report a partial sweep as complete -- these three fields
+                # make truncation unmistakable rather than silent.
+                live_process_total=live_total,
+                live_sweep_truncated=live_truncated,
+                live_sweep_secs=round(live_elapsed, 3),
+                snapshot_file=str(snapshot) if snapshot else None,
+            )
+        finally:
+            with self._lock:
+                self._sweep_count -= 1
+                if self._sweep_count == 0:
+                    self._sweep_idle.set()
 
     def _live_sweep(self) -> "tuple[List[dict], int, bool, float]":
         """Enumerate the live process table, bounded by ``live_sweep_secs``.
@@ -746,8 +867,15 @@ class Watcher:
                     args=(
                         self.log, root, "readdirectorychanges",
                         watch_readdirchanges,
+                        # Forwarded into watch_readdirchanges(..., on_degradation)
+                        # -- CRITICAL 2 needs to know about an overflow or a
+                        # ReadDirectoryChangesW failure the moment it happens.
                         root, self.on_hit, self._stop, owner, self.log,
+                        self._record_degradation,
                     ),
+                    # Forwarded into _run_watch_thread's OWN except-handler --
+                    # a thread that dies for any other reason must also count.
+                    kwargs={"on_degradation": self._record_degradation},
                     daemon=True,
                 ).start()
             else:
@@ -758,9 +886,63 @@ class Watcher:
                         self.log, root, "polling", watch_polling,
                         root, self.on_hit, self._stop, self._poll_s,
                     ),
+                    kwargs={"on_degradation": self._record_degradation},
                     daemon=True,
                 ).start()
         return chosen
+
+    def _systemdrive_present_now(self) -> "list[str]":
+        """Which watched roots have a %SystemDrive% child on disk RIGHT NOW.
+
+        ``exists()`` only -- never walk or delete the tree (see the module
+        docstring). This is the disk-truth half of CRITICAL 2: a run whose
+        in-memory ``sightings`` counter is 0 must not be allowed to claim a
+        clean NEGATIVE while the tree is sitting right there.
+        """
+        present = []
+        for root in self.roots:
+            try:
+                if (root / JUNK_NAME).exists():
+                    present.append(str(root))
+            except OSError:
+                continue
+        return present
+
+    def _await_in_flight_sweeps(self) -> None:
+        """Wait, bounded, for any in-progress on_hit() live sweep.
+
+        SUPPORTING 4: without this, run() can return while a sweep is still
+        running on a watch thread; main() then calls sys.exit(), daemon
+        threads are killed outright, and the SIGHTING_LIVE record plus the
+        live half of the snapshot enrichment are lost with nothing recording
+        that they were abandoned.
+
+        Bounded rather than unconditional: the sweep itself is already
+        bounded by ``self.live_sweep_secs``, so a wait of
+        ``live_sweep_secs`` plus a small buffer for the write that follows
+        should always be enough in practice. If it is not, the abandonment
+        is RECORDED via ``sweep_abandoned`` rather than silently dropped --
+        and even then the SIGHTING record and the pre-sweep ring snapshot
+        (CRITICAL 1) are already durable regardless, so what is actually at
+        risk here is strictly the best-effort live-table enrichment.
+        """
+        grace = self.live_sweep_secs + 5.0
+        if self._sweep_idle.wait(timeout=grace):
+            return
+        with self._lock:
+            in_flight = self._sweep_count
+        write_record(
+            self.log, "sweep_abandoned",
+            in_flight=in_flight,
+            grace_secs=grace,
+            note=(
+                f"{in_flight} live-sweep enrichment(s) still running after "
+                f"{grace}s grace at shutdown; their SIGHTING_LIVE record and "
+                "the live half of the snapshot may be lost. The SIGHTING "
+                "record and the pre-sweep ring snapshot are already durable "
+                "regardless (see CRITICAL 1)."
+            ),
+        )
 
     def run(self) -> int:
         """Watch until the deadline, the stop-file, or a stop() call."""
@@ -784,17 +966,70 @@ class Watcher:
         self._stop.set()
         for owner in self._handles:
             owner.cancel()
+        # SUPPORTING 4: give any in-flight live sweep a bounded chance to
+        # finish (or record its own abandonment) before we decide what the
+        # `done` note may honestly claim.
+        self._await_in_flight_sweeps()
         watched = round(time.monotonic() - started, 1)
+
+        # CRITICAL 2: a NEGATIVE must be earned, not merely defaulted to
+        # because `self.sightings == 0`. Checked below, in order: is the
+        # tree actually sitting on disk right now; was any root latched as
+        # preexisting (which can NEVER produce a SIGHTING even though the
+        # tree is genuinely there -- see record_preexisting); did a watch
+        # thread die; was a buffer overflow recorded (the documented signal
+        # that creation events were DROPPED). Any one of these means the
+        # watch was compromised and a clean negative would be a fabrication.
+        present_roots = self._systemdrive_present_now()
+        with self._lock:
+            thread_errors = self._thread_error_count
+            overflows = self._buffer_overflow_count
+        preexisting = sorted(self._preexisting_roots)
+
+        if self.sightings:
+            note = "see SIGHTING record(s)"
+        else:
+            blockers = []
+            if present_roots:
+                blockers.append(
+                    f"%SystemDrive% is present on disk under {present_roots} "
+                    "right now but produced no SIGHTING"
+                )
+            if preexisting:
+                blockers.append(
+                    f"root(s) {preexisting} were preexisting at arm time and "
+                    "are latched -- they can never produce a SIGHTING"
+                )
+            if thread_errors:
+                blockers.append(
+                    f"{thread_errors} watch thread(s) died during this run"
+                )
+            if overflows:
+                blockers.append(
+                    f"{overflows} buffer overflow(s) were recorded -- "
+                    "creation events may have been dropped"
+                )
+            if blockers:
+                note = (
+                    "UNKNOWN - a clean NEGATIVE cannot be claimed: "
+                    + "; ".join(blockers)
+                )
+            else:
+                note = (
+                    f"NEGATIVE - watched {len(self.roots)} root(s) for {watched}s, "
+                    "no %SystemDrive% appeared"
+                )
+
         write_record(
             self.log, "done",
             sightings=self.sightings,
             roots=[str(r) for r in self.roots],
             watched_secs=watched,
-            note=(
-                f"NEGATIVE - watched {len(self.roots)} root(s) for {watched}s, "
-                "no %SystemDrive% appeared"
-                if not self.sightings else "see SIGHTING record(s)"
-            ),
+            note=note,
+            systemdrive_present_on_disk=present_roots,
+            watch_thread_errors=thread_errors,
+            watch_buffer_overflows=overflows,
+            preexisting_roots=preexisting,
         )
         return 0
 

@@ -182,15 +182,44 @@ Ordering is the whole point. Perishable data first, then **durability**, then th
 best-effort enrichment:
 
 1. Dump the ring buffer (already in memory — no syscalls).
-2. **Append the `SIGHTING` JSONL record immediately.** Everything perishable is already
-   in hand at this point, and step 3 can take minutes.
-3. Enumerate live processes under a time budget and partition by `cwd`.
-4. Write the sidecar snapshot JSON and the `SIGHTING_LIVE` record.
+2. **Write the ring to the sidecar snapshot JSON immediately, atomically (temp file +
+   replace).** This is the raw evidence — `cmdline` included — and it must exist on disk
+   before anything else happens.
+3. **Append the `SIGHTING` JSONL record**, naming that snapshot file. Everything
+   perishable is already durable at this point, and step 4 can take minutes.
+4. Enumerate live processes under a time budget and partition by `cwd`.
+5. Re-write the sidecar snapshot JSON with the live data added, and write the
+   `SIGHTING_LIVE` record.
 
-**Steps 2 and 3 were originally the other way round.** That is a correctness bug, not a
-preference: it left the durable record trailing a 60–200 s enumeration in a design whose
-premise is that the run gets killed. See the record-format note below for the
-measurements that forced the change.
+**Steps 2–3 and 4 were originally the other way round — corrected twice.** The first
+correction (2026-08-16) moved the durable `SIGHTING` record ahead of the live
+enumeration; that is a correctness bug, not a preference, because it left the durable
+record trailing a 60–200 s enumeration in a design whose premise is that the run gets
+killed. See the record-format note below for the measurements that forced that change.
+
+**The second correction (2026-08-17, CRITICAL finding from a whole-branch review) did
+the same thing to the ring itself.** Even after the first fix, the raw ring — the array
+of `{pid, cmdline, cwd, ...}` entries, as opposed to the *filtered* `ring_cwd_matches`
+list carried on the `SIGHTING` record — only ever reached disk as part of the
+`SIGHTING_LIVE` write, i.e. *after* the live sweep. A run killed during that sweep (the
+runner's own `_stop_junk_watcher` waits only up to its stop-signal grace period before
+force-terminating the sidecar) destroyed the ring entirely, and 2026-08-17 measurement
+(see "Sampler cadence and end-to-end capture rate" below) found this was not a rare
+edge case: in the trials where `ring_cwd_matches` came up empty, the raw ring's
+`cmdline` was the *only* place the writer's identity survived. Losing it on a kill
+during the sweep destroyed exactly the artifact the whole design exists to produce. Now
+the ring reaches the sidecar snapshot file — atomically — in step 2, before the
+`SIGHTING` record is even written, so:
+
+- the raw ring, with `cmdline`, is on disk before the live sweep starts;
+- a run killed during the sweep still has it, because `os.replace` makes the write
+  atomic — the file is always the last complete write, never a torn one;
+- the `snapshot_file` path carried on the `SIGHTING` record itself always names a file
+  that already exists at the moment a hunter reads that record, rather than one that
+  might not exist yet if the sweep never finishes.
+
+The sweep, when it does complete, re-writes the same snapshot file (still atomically)
+with the live table added — see `SIGHTING_LIVE` below.
 
 **The `cwd` discriminator.** The established mechanism *requires* the writer to have
 the watched root as its working directory. So both the live enumeration and the ring
@@ -223,9 +252,25 @@ recorded as `preexisting` and blames nobody.
   manual plumbing to drift out of sync.
 - Graceful stop: the runner touches a stop-file at end of run. The watcher's sampler
   loop checks it each cadence and shuts down through the normal path, so the `done`
-  record — the negative — is emitted. The runner waits briefly, then terminates.
-  The watcher also self-limits via `--secs`, so an orphaned sidecar cannot outlive
-  the run indefinitely.
+  record — the negative — is emitted. The runner waits (`_WATCHER_STOP_GRACE_SECS`, see
+  below), then terminates. The watcher also self-limits via `--secs`, so an orphaned
+  sidecar cannot outlive the run indefinitely.
+
+  **Stop-grace reconciled against the watcher's live-sweep budget — 2026-08-17.** This
+  wait used to be a bare 15s, which is *less* than the watcher's own
+  `DEFAULT_LIVE_SWEEP_SECS` (30s) — a sighting late in the run could get
+  force-terminated mid-sweep even on this graceful path, not only on a hard kill. Since
+  the CRITICAL 1 fix above makes a mid-sweep kill non-catastrophic (the ring is already
+  durable before the sweep starts), this is no longer a correctness bug — but it is
+  still wasteful to needlessly truncate a sweep that was about to finish on its own. The
+  wait is now `_WATCHER_STOP_GRACE_SECS = 35`, i.e. `DEFAULT_LIVE_SWEEP_SECS + 5`,
+  matching the watcher's own internal `_await_in_flight_sweeps` grace period.
+- **A sidecar that dies mid-run is now reported, not silent — 2026-08-17.** Previously
+  `_stop_junk_watcher` returned silently whenever `proc.poll() is not None` at shutdown
+  time, which is also true of a watcher that *crashed* seconds into a multi-hour run —
+  the only prior evidence of its existence was "watcher process spawned" at startup. It
+  now prints the sidecar's exit code and tells the operator to treat the run as
+  unwatched from the crash point onward.
 - `-h` / `--help` added to `OUR_FLAGS`.
 - The inline argv-splitting block is lifted to a module-level `_split_argv(argv)`.
 
@@ -271,15 +316,43 @@ Every record carries `event`, `at` (ISO-8601 seconds), `watcher_pid`.
 
 - **`armed`** — `roots`, `backend_by_root`, `sample_ms`, `poll_ms`, `ring_capacity`,
   `watcher_has_systemdrive`, `watcher_cwd`.
-- **`preexisting`** — `root`, `path`, `note` (explicitly: cannot attribute).
+- **`preexisting`** — `root`, `path`, `note` (explicitly: cannot attribute). The root is
+  also latched into `_hit_roots`, so it can **never** produce a `SIGHTING` later in the
+  same run — `done` must account for this (see below).
 - **`backend_downgrade`** — `root`, `reason`, `note`. Emitted when a root cannot
   be opened for a directory watch and falls back to polling, so a degraded watch is
   never mistaken for a fast one.
+- **`watch_thread_error`** — `root`, `backend`, `cause`. A watch thread died —
+  either a `ReadDirectoryChangesW` call failed outright, or an unexpected exception
+  escaped the thread's target function entirely. Documented here because a hunter who
+  does not know to grep for it will read a subsequent `done` NEGATIVE at face value, not
+  realizing part of the watch may not have been running. `done` now refuses to claim a
+  clean negative while any of these were recorded this run (CRITICAL 2, below).
+- **`watch_buffer_overflow`** — `root`, `backend`, `note`. `ReadDirectoryChangesW`
+  returned `TRUE` with zero bytes — the documented Win32 signal that its internal change
+  buffer overflowed and **creation events were dropped**. The watch keeps running (this
+  is not fatal), but it means the watch may have missed the very event it exists to
+  catch. Also gates `done`'s NEGATIVE (CRITICAL 2).
 - **`SIGHTING`** — `root`, `path`, `backend`, `watcher_has_systemdrive`,
-  `ring_cwd_matches`, `ring_size`. Written **immediately** after the ring dump and
-  before any live enumeration, and marks that live data is still pending.
-- **`SIGHTING_LIVE`** — `live_cwd_matches`, `live_process_count`, `snapshot_file`,
-  plus explicit sweep-coverage fields (examined / total / truncated / elapsed).
+  `ring_cwd_matches`, `ring_size`, `snapshot_file`. Written **immediately** after the
+  ring is dumped and durably written to the sidecar snapshot named by `snapshot_file`
+  (see the `_on_sighting()` section above), and before any live enumeration; marks that
+  live data is still pending. **`snapshot_file` already exists and is readable at the
+  moment this record is written** — it is not a promise of something the live sweep will
+  produce later, only a promise of something the live sweep will later *add to*.
+- **`SIGHTING_LIVE`** — `live_cwd_matches`, `live_process_count`, `snapshot_file` (the
+  same file, now re-written atomically with the live table added), plus explicit
+  sweep-coverage fields (examined / total / truncated / elapsed). Best-effort: if the run
+  is killed or the sweep is otherwise abandoned before this is written, the `SIGHTING`
+  record and the ring half of the snapshot are unaffected — only this enrichment is
+  lost, and a `sweep_abandoned` record (below) says so when `run()` itself notices.
+- **`sweep_abandoned`** — `in_flight`, `grace_secs`, `note`. Written by `run()` if, after
+  the watch stops (deadline, stop-file, or `stop()`), one or more `on_hit()` live sweeps
+  are still running after a bounded grace period (`live_sweep_secs + 5s`). Without this,
+  `run()` could return with a sweep still in flight; the caller (`main()`) then calls
+  `sys.exit()`, which kills the daemon thread outright and silently drops its
+  `SIGHTING_LIVE` record and the live half of its snapshot. This record is what makes
+  that abandonment visible instead of silent.
 
 **Why these are two records and not one — corrected 2026-08-16 after measurement.**
 The original design put a single `SIGHTING` record *after* the live enumeration. On
@@ -297,11 +370,43 @@ durable in milliseconds and demotes the live table to best-effort enrichment.
 The live sweep is time-budgeted (`live_sweep_secs`, default 30 s) and reports its own
 coverage. A partial sweep that presented itself as complete would be a silent cap —
 which this project treats as a defect, not a convenience.
-- **`done`** — `sightings`, `roots`, `watched_secs`, and a `note` that states the
-  negative in words when `sightings == 0`.
+
+- **`done`** — `sightings`, `roots`, `watched_secs`, `systemdrive_present_on_disk`,
+  `watch_thread_errors`, `watch_buffer_overflows`, `preexisting_roots`, and a `note`.
+
+  **A NEGATIVE must be earned — corrected 2026-08-17 (CRITICAL finding from a
+  whole-branch review).** The original `note` was derived from `sightings == 0` alone,
+  with no other check. Reproduced twice against the unfixed code: a `%SystemDrive%` tree
+  physically present in the watched root still produced `note: "NEGATIVE - ... no
+  %SystemDrive% appeared"`, and so did a run whose watch thread had died
+  (`watch_thread_error` recorded) before the tree later appeared. Both are exactly the
+  fabricated clean negative this whole design exists to prevent — a human reading
+  `sightings: 0` plus a NEGATIVE note has no reason to go check the JSONL for anything
+  else.
+
+  `done` now checks, before it may write a NEGATIVE:
+  - **the filesystem, right now** (`root / JUNK_NAME).exists()` per watched root —
+    `exists()` only, never a walk; if the tree is sitting there and `sightings == 0`,
+    something is wrong with detection, not with the world;
+  - **`preexisting_roots`** — a root latched via `preexisting` at arm time can *never*
+    produce a `SIGHTING`, so its presence must not be silently absorbed into a clean
+    negative for the *other* roots;
+  - **`watch_thread_errors`** — a died thread means part of the watch may not have been
+    running at all;
+  - **`watch_buffer_overflows`** — the documented signal that creation events were
+    dropped.
+
+  If any of these fire, `sightings == 0` still produces a `note` — but it says
+  `"UNKNOWN - a clean NEGATIVE cannot be claimed: <reasons>"` rather than `"NEGATIVE"`,
+  naming every reason found. Only when none of them fire does `note` say `"NEGATIVE -
+  watched <n> root(s) for <secs>s, no %SystemDrive% appeared"`. When `sightings > 0` the
+  note is unchanged (`"see SIGHTING record(s)"`).
 
 The full live table and full ring buffer go to a sidecar
-`systemdrive-sighting-<ts>.json` so the JSONL stays greppable.
+`systemdrive-sighting-<ts>.json` so the JSONL stays greppable. Written atomically (temp
+file + `os.replace`) — see the `_on_sighting()` section above for why a torn write here
+would be the worst possible failure mode for a file a hunter reads with a blind
+`json.load()`.
 
 ## Error handling
 
@@ -327,7 +432,17 @@ convention for script tests):
 - **JSONL is written at sighting time** — assert the record is on disk *before* any
   teardown runs, since that is requirement 4 and the easiest to regress;
 - the `ReadDirectoryChangesW` backend end-to-end: create a `%SystemDrive%` directory in
-  a tmpdir and assert the callback fires. Windows-gated.
+  a tmpdir and assert the callback fires. Windows-gated;
+- **`run()`-level integration coverage — added 2026-08-17 (CRITICAL finding).** Every
+  test above exercises a backend against a bare lambda, or calls `on_hit()` directly;
+  nothing drove `run()` itself, through a real backend thread, to a real `SIGHTING`. That
+  gap meant replacing `on_hit` with a no-op lambda in both thread-arg tuples inside
+  `_start_backends` (i.e. fully disconnecting detection from recording) still passed the
+  whole suite. `test_run_drives_a_real_sighting_end_to_end` arms a real `Watcher` on a
+  tmpdir with the polling backend, creates the `%SystemDrive%` child, and asserts a real
+  `SIGHTING` record appears, its `snapshot_file` exists on disk with readable ring
+  content, and `done` does not claim a clean negative. Falsified against the disconnected
+  mutation above and confirmed to fail before being kept.
 
 `tests/test_run_tests_parallel.py`:
 
@@ -433,13 +548,19 @@ shortcut, and the raw ring is the evidence. But do not conclude from the 0/8 tha
 discriminator is broken — measured against the real writer shape it is the thing that
 turns ~1000 processes into a shortlist, exactly as designed.
 
-**Guidance for a future hunter:** read the whole `ring` array from the sidecar
-snapshot (or the ring dump attached to `SIGHTING`), matching on `cmdline` substrings,
-not just `ring_cwd_matches`. `ring_cwd_matches` is a convenience shortlist, not the
-complete evidence. If the ring shows nothing at all for the sighting window (the 1/8
-total-miss case above), the documented fallback is what actually found the first
-writer: bisecting a deterministic reproducer, not staring harder at a process
-snapshot.
+**Guidance for a future hunter — corrected 2026-08-17.** Read the whole `ring` array
+from the sidecar snapshot file named by the `SIGHTING` record's `snapshot_file` field,
+matching on `cmdline` substrings, not just `ring_cwd_matches`. `ring_cwd_matches` is a
+convenience shortlist carried directly on `SIGHTING`, not the complete evidence — the
+complete evidence is always the sidecar file. (There is no ring dump attached inline to
+`SIGHTING` itself, and there never has been; an earlier version of this guidance implied
+otherwise. What changed 2026-08-17 is that the sidecar file is now guaranteed to exist,
+with the ring already in it, **at the moment `SIGHTING` is written** — see the
+`_on_sighting()` section above — rather than only after the live sweep completes, which
+could take minutes or never happen at all if the run is killed first.) If the ring shows
+nothing at all for the sighting window (the 1/8 total-miss case above), the documented
+fallback is what actually found the first writer: bisecting a deterministic reproducer,
+not staring harder at a process snapshot.
 
 ### Residual tradeoff
 

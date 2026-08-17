@@ -633,6 +633,66 @@ def test_watch_readdirchanges_records_an_unexplained_failure(tmp_path: Path):
     assert errors[0]["backend"] == "readdirectorychanges"
 
 
+def test_run_drives_a_real_sighting_end_to_end(tmp_path: Path):
+    """CRITICAL 3: prove the WIRING, not just the pieces in isolation.
+
+    Every other test here exercises a backend against a bare lambda, or
+    calls on_hit() directly. Nothing drove run() itself -- through a real
+    backend thread -- to a real SIGHTING. That gap let a disconnected
+    `on_hit` (swap it for `lambda r, b: None` in both thread-arg tuples
+    inside `_start_backends`) pass the entire suite: 34/34 green with
+    detection completely unplugged from recording. See the task brief's
+    CRITICAL 3 falsification instructions -- this test was proven to FAIL
+    against that exact mutation before being kept.
+
+    Asserts the three things a hunter actually depends on:
+    1. a SIGHTING record is produced by run() itself (not by calling on_hit
+       directly);
+    2. the CRITICAL 1 ring snapshot artifact it names is really on disk with
+       readable content;
+    3. `done` does not claim a clean NEGATIVE over a real sighting.
+    """
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    stop_file = tmp_path / "stop"
+    watcher = Watcher(
+        [root], log=log, secs=30, poll_ms=20, sample_ms=20,
+        stop_file=stop_file, force_polling=True, live_sweep_secs=0.5,
+    )
+    thread = threading.Thread(target=watcher.run, daemon=True)
+    thread.start()
+    time.sleep(0.2)  # let the polling backend arm
+    (root / JUNK_NAME).mkdir()
+
+    # Wait for the real SIGHTING rather than guessing a sleep duration, then
+    # ask the watcher to stop through its normal path so run() returns
+    # quickly instead of riding out the 30s `secs` budget.
+    deadline = time.monotonic() + 5
+    sighted = False
+    while time.monotonic() < deadline:
+        if log.exists() and any(r["event"] == "SIGHTING" for r in _rows(log)):
+            sighted = True
+            break
+        time.sleep(0.02)
+    stop_file.touch()
+    thread.join(timeout=15)
+
+    assert not thread.is_alive(), "run() did not return after the stop signal"
+    assert sighted, "run() never drove a real SIGHTING -- detection is disconnected from recording"
+
+    rows = _rows(log)
+    sightings = [r for r in rows if r["event"] == "SIGHTING"]
+    assert len(sightings) == 1
+    snapshot_path = Path(sightings[0]["snapshot_file"])
+    assert snapshot_path.exists(), "CRITICAL 1's ring snapshot artifact must exist on disk"
+    snapshot_data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert "ring" in snapshot_data
+
+    done = [r for r in rows if r["event"] == "done"][0]
+    assert "NEGATIVE" not in done["note"], "a real sighting must never be reported as a clean negative"
+
+
 def test_force_polling_is_reflected_in_the_armed_record(tmp_path: Path):
     log = tmp_path / "w.jsonl"
     root = tmp_path / "root"
