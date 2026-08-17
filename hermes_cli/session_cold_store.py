@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 import errno
 from hashlib import sha256
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -198,6 +199,32 @@ def _fingerprint(records: list[dict[str, Any]]) -> str:
         for record in records
     )
     return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_sqlite_values(records: list[dict[str, Any]]) -> None:
+    """Reject SQLite values that archive format v1 cannot represent."""
+    for record in records:
+        kind = str(record["kind"])
+        for column, value in record["row"].items():
+            location = f"{kind}.{column}"
+            if isinstance(value, bytes):
+                raise ValueError(
+                    "cold store v1 does not support SQLite BLOB/bytes values "
+                    f"at {location}"
+                )
+            if value is None or isinstance(value, (str, int)):
+                continue
+            if isinstance(value, float):
+                if isfinite(value):
+                    continue
+                raise ValueError(
+                    "cold store v1 requires finite SQLite numeric values "
+                    f"at {location}"
+                )
+            raise ValueError(
+                f"cold store v1 does not support SQLite value type "
+                f"{type(value).__name__} at {location}"
+            )
 
 
 def _directory_open_flags() -> int:
@@ -450,6 +477,7 @@ def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
 
     _enforce_message_limit(conn, lineage)
     records = _records(conn, lineage)
+    _validate_sqlite_values(records)
     return _StorePlan(
         terminal_id=terminal_id,
         physical_ids=lineage,

@@ -202,6 +202,62 @@ def test_cold_store_dry_run_creates_nothing_and_does_not_prompt(
     assert _lineage_rows() == before
 
 
+@pytest.mark.parametrize("execution_flag", ["--yes", "--dry-run"])
+def test_cold_store_cli_reports_unsupported_blob_without_writing(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    execution_flag: str,
+) -> None:
+    db = SessionDB()
+    try:
+        db.create_session("blob-session", source="cli")
+        message_id = db.append_message(
+            "blob-session", role="user", content="placeholder"
+        )
+        assert db._conn is not None
+        db._conn.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (b"future-blob", message_id),
+        )
+        db.end_session("blob-session", "completed")
+        assert db.set_session_archived("blob-session", True)
+    finally:
+        db.close()
+    archive_root = session_home.parent / "cold-root"
+    before = _lineage_rows()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-store",
+        str(archive_root),
+        "--session-id",
+        "blob-session",
+        execution_flag,
+    )
+
+    assert code == 1
+    assert err == ""
+    assert (
+        "cold store v1 does not support SQLite BLOB/bytes values at message.content"
+        in out
+    )
+    assert not archive_root.exists()
+    assert _lineage_rows() == before == [("blob-session", 1)]
+
+    db = SessionDB()
+    try:
+        assert db._conn is not None
+        row = db._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ?", ("blob-session",)
+        ).fetchone()
+        assert row is not None and row["content"] == b"future-blob"
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize(
     ("session_id", "extra_session"),
     [

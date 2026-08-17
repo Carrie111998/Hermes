@@ -9,7 +9,7 @@ import signal
 import pytest
 
 import hermes_cli.session_cold_store as cold_store
-from hermes_cli.session_cold_store import store_archived_lineage
+from hermes_cli.session_cold_store import plan_archived_lineage, store_archived_lineage
 from hermes_state import SessionDB
 
 
@@ -56,6 +56,48 @@ def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
         assert store_archived_lineage(db, "terminal", archive_root) == result
         assert db.get_session("root") is not None
         assert db.get_session("terminal") is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("operation", ["store", "preflight"])
+def test_store_rejects_blob_message_content_before_writing(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    """Archive v1 fails closed on SQLite BLOBs without changing its source."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        message_id = db.append_message("terminal", role="user", content="placeholder")
+        assert db._conn is not None
+        db._conn.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (b"future-blob", message_id),
+        )
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        with pytest.raises(
+            ValueError,
+            match=r"cold store v1 does not support SQLite BLOB/bytes values.*message\.content",
+        ):
+            if operation == "store":
+                store_archived_lineage(db, "terminal", archive_root)
+            else:
+                plan_archived_lineage(db, "terminal")
+
+        assert not archive_root.exists()
+        assert db._conn is not None
+        session = db._conn.execute(
+            "SELECT archived FROM sessions WHERE id = ?", ("terminal",)
+        ).fetchone()
+        message = db._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ?", ("terminal",)
+        ).fetchone()
+        assert session is not None and session["archived"] == 1
+        assert message is not None and message["content"] == b"future-blob"
     finally:
         db.close()
 
