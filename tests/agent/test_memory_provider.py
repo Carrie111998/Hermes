@@ -98,8 +98,21 @@ class MessagesMemoryProvider(FakeMemoryProvider):
 class TurnMetadataMemoryProvider(FakeMemoryProvider):
     """Provider that opts into completed-turn provenance metadata."""
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", metadata=None):
+    def __init__(self, name="external"):
+        super().__init__(name=name)
+        self.synced_messages = []
+
+    def sync_turn(
+        self,
+        user_content,
+        assistant_content,
+        *,
+        session_id="",
+        messages=None,
+        metadata=None,
+    ):
         self.synced_turns.append((user_content, assistant_content, session_id, metadata))
+        self.synced_messages.append(messages)
 
 
 class BlockingPrefetchProvider(FakeMemoryProvider):
@@ -279,21 +292,31 @@ class TestMemoryManager:
 
         assert provider.synced_turns == [("user", "assistant")]
 
-    def test_sync_all_snapshots_metadata_before_background_execution(self):
+    def test_sync_all_deeply_snapshots_optional_context_before_background_execution(self):
         mgr = MemoryManager()
         provider = TurnMetadataMemoryProvider()
         mgr.add_provider(provider)
         blocker = threading.Event()
         mgr._submit_background(lambda: blocker.wait(timeout=2))
-        metadata = {"platform": "telegram", "chat_id": "original"}
+        messages = [{"role": "user", "content": {"text": "original"}}]
+        metadata = {"platform": "telegram", "scope": {"chat_id": "original"}}
 
-        mgr.sync_all("user", "assistant", metadata=metadata)
-        metadata["chat_id"] = "mutated"
+        mgr.sync_all("user", "assistant", messages=messages, metadata=metadata)
+        messages[0]["content"]["text"] = "mutated"
+        metadata["scope"]["chat_id"] = "mutated"
         blocker.set()
         assert mgr.flush_pending(timeout=2)
 
         assert provider.synced_turns == [
-            ("user", "assistant", "", {"platform": "telegram", "chat_id": "original"}),
+            (
+                "user",
+                "assistant",
+                "",
+                {"platform": "telegram", "scope": {"chat_id": "original"}},
+            ),
+        ]
+        assert provider.synced_messages == [
+            [{"role": "user", "content": {"text": "original"}}],
         ]
 
     # -- Tool routing -------------------------------------------------------

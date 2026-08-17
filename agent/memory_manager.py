@@ -25,10 +25,11 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import copy
+import inspect
 import json
 import logging
 import re
-import inspect
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
@@ -724,8 +725,8 @@ class MemoryManager:
         user_content = clean_user_content
         # The worker may run after the caller mutates its turn buffers. Freeze
         # optional context at submission so providers observe one exact turn.
-        messages_snapshot = list(messages) if messages is not None else None
-        metadata_snapshot = dict(metadata) if metadata is not None else None
+        messages_snapshot = copy.deepcopy(messages) if messages is not None else None
+        metadata_snapshot = copy.deepcopy(metadata) if metadata is not None else None
 
         def _run() -> None:
             for provider in providers:
