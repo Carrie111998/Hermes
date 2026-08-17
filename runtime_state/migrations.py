@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 from typing import Optional, Union
+import os
 
 from runtime_state.retry_config import (
     DEFAULT_RETRY_CONFIG,
@@ -20,6 +21,7 @@ from runtime_state.schema import (
     SCHEMA_VERSION,
     STATE_TABLES,
 )
+from runtime_state.locking import MaintenanceLock
 
 
 class RuntimeStateSchemaError(RuntimeError):
@@ -68,9 +70,17 @@ class RuntimeStateDB:
         self,
         db_path: Union[str, Path],
         retry_config: RetryConfig = DEFAULT_RETRY_CONFIG,
+        *,
+        writer_epoch: Optional[int] = None,
+        key_custody=None,
     ) -> None:
         self.db_path = Path(db_path)
         self.retry_config = retry_config
+        self.writer_epoch = int(
+            os.environ.get("HERMES_RUNTIME_WRITER_EPOCH", "0")
+            if writer_epoch is None else writer_epoch
+        )
+        self.key_custody = key_custody
         self._conn: Optional[sqlite3.Connection] = None
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,7 +90,27 @@ class RuntimeStateDB:
                 str(self.db_path), isolation_level=None, check_same_thread=False
             )
             self._configure_connection()
-            self._apply_or_validate(on_disk)
+            from runtime_state.journal import (
+                ensure_journal_schema,
+                register_connection,
+                startup_transition,
+            )
+
+            with MaintenanceLock(
+                self.db_path.with_name(self.db_path.name + ".maintenance.lock"),
+                exclusive=True,
+            ):
+                self._apply_or_validate(on_disk)
+                self._conn.execute("BEGIN IMMEDIATE")
+                ensure_journal_schema(self._conn)
+                self._conn.commit()
+            register_connection(
+                self._conn,
+                self.db_path,
+                writer_epoch=self.writer_epoch,
+                key_custody=self.key_custody,
+            )
+            startup_transition(self._conn, writer_epoch=self.writer_epoch)
         except Exception:
             if self._conn is not None:
                 self._conn.close()
@@ -260,6 +290,9 @@ class RuntimeStateDB:
 
     def close(self) -> None:
         if self._conn is not None:
+            from runtime_state.journal import unregister_connection
+
+            unregister_connection(self._conn)
             self._conn.close()
             self._conn = None
 
