@@ -5,6 +5,7 @@ dragged/pasted absolute paths from being mistaken for slash commands."""
 import pytest
 
 from cli import _detect_file_drop
+from tests.symlink_support import requires_symlinks
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +187,7 @@ class TestEdgeCases:
         assert result is not None
         assert result["is_image"] is False
 
+    @requires_symlinks
     def test_symlink_to_file(self, tmp_image, tmp_path):
         link = tmp_path / "link.png"
         link.symlink_to(tmp_image)

@@ -26,6 +26,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from tests.symlink_support import requires_symlinks
 from utils import (
     atomic_json_write,
     atomic_replace,
@@ -43,6 +44,7 @@ def _write_tmp(dir_: Path, content: str) -> Path:
     return tmp
 
 
+@requires_symlinks
 def test_atomic_replace_preserves_symlink(tmp_path: Path) -> None:
     real = tmp_path / "real.yaml"
     link = tmp_path / "link.yaml"
@@ -100,6 +102,7 @@ def test_atomic_replace_accepts_pathlike_and_str(tmp_path: Path) -> None:
 # ─── atomic_json_write / atomic_yaml_write wiring ──────────────────────────
 
 
+@requires_symlinks
 def test_atomic_json_write_preserves_symlink(tmp_path: Path) -> None:
     real = tmp_path / "real.json"
     link = tmp_path / "link.json"
@@ -113,6 +116,7 @@ def test_atomic_json_write_preserves_symlink(tmp_path: Path) -> None:
     assert loaded == {"hello": "world"}
 
 
+@requires_symlinks
 def test_atomic_yaml_write_preserves_symlink(tmp_path: Path) -> None:
     real = tmp_path / "real.yaml"
     link = tmp_path / "link.yaml"
@@ -220,6 +224,7 @@ def test_atomic_roundtrip_yaml_update_restores_owner(
 # ─── Broken-symlink edge case ─────────────────────────────────────────────
 
 
+@requires_symlinks
 def test_atomic_replace_broken_symlink_creates_target(tmp_path: Path) -> None:
     """A symlink pointing at a missing file: the write should create the
     real target (resolving via realpath) rather than leaving the dangling
@@ -260,6 +265,7 @@ def test_atomic_replace_copy_fallback(
     assert not tmp.exists()
 
 
+@requires_symlinks
 def test_atomic_replace_copy_fallback_preserves_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
