@@ -448,3 +448,18 @@ def test_sanitize_is_a_fixpoint_over_the_wedge_transcript():
         once = sanitize_api_messages(_wedge_transcript(text))
         twice = sanitize_api_messages([dict(m) for m in once])
         assert once == twice, f"sanitizer not idempotent for content={text!r}"
+
+        surviving_call_ids = {
+            call.get("id")
+            for m in once
+            if m.get("role") == "assistant"
+            for call in (m.get("tool_calls") or [])
+        }
+        orphaned = [
+            m
+            for m in once
+            if m.get("role") == "tool" and m.get("tool_call_id") not in surviving_call_ids
+        ]
+        assert not orphaned, (
+            f"dedup left orphaned tool result(s) with no matching call: {orphaned!r}"
+        )

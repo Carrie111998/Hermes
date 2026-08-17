@@ -3506,8 +3506,10 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         # content, which is a second, independent 400 ("messages must have
         # non-empty content"). So re-run both invariant passes over the deduped
         # list instead: cheap (only on the rare dedup path), idempotent, and it
-        # covers any future pass inserted before this return — not just this
-        # one. Order matters: drop the empty arrays first so the content healer
+        # covers both of those invariants no matter where above they were
+        # broken. It does NOT cover every possible future pass — a new pass
+        # inserted before this return would need the same re-run treatment.
+        # Order matters: drop the empty arrays first so the content healer
         # sees the turn as genuinely payload-less and substitutes a placeholder.
         messages = drop_empty_tool_calls_arrays(messages)
         messages = repair_empty_non_final_messages(messages)
