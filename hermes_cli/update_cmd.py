@@ -874,6 +874,30 @@ def _update_complete_message(pre_version: str | None) -> str:
     return "✓ Update complete!"
 
 
+def _preload_post_update_imports() -> None:
+    """Import the post-swap cleanup chains BEFORE the working tree is swapped.
+
+    After the swap, this process mixes ``sys.modules`` entries loaded from
+    the old revision with modules freshly imported from the new tree. A
+    post-swap import that walks into a new-revision file while an earlier
+    link of its chain (e.g. ``hermes_cli.config``) is already cached from
+    the old revision dies with ``ImportError`` — the new file may expect
+    symbols the old cache lacks (#88371: the dashboard-cleanup step's
+    ``gateway.status`` import pulled in the new ``gateway.session`` → … →
+    ``hermes_cli.auth``, which wanted a symbol the old cached
+    ``hermes_cli.config`` never had, crashing after ``✓ Update complete!``).
+
+    Importing the chains the post-update steps use up front keeps every
+    import after the swap served from ``sys.modules``, so the whole process
+    stays on one coherent revision. Best-effort: a pre-load failure must
+    never block the update itself.
+    """
+    try:
+        import gateway.status  # noqa: F401 — dashboard/serve cleanup (_pid_exists)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("post-update module preload failed: %s", exc)
+
+
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     """Update Hermes Agent by downloading a ZIP archive.
 
@@ -881,6 +905,10 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     drivers causing 'Invalid argument' errors on file creation).
     """
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
+
+    # Load the post-swap cleanup chains while the on-disk tree still matches
+    # this process's imports (#88371).
+    _preload_post_update_imports()
 
     import tempfile
     import zipfile
@@ -4445,6 +4473,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # prove which optional backends the user had activated.
     active_lazy_features = _m()._capture_active_lazy_features()
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
+
+    # Load the post-swap cleanup chains while the on-disk tree still matches
+    # this process's imports (#88371).
+    _preload_post_update_imports()
 
     # Snapshot the pre-update version before any code is pulled so the
     # completion line can report the transition (prime-agent#630 port).
