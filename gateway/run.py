@@ -1935,7 +1935,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, base_url_hostname, is_truthy_value
+from utils import (
+    atomic_json_write,
+    is_truthy_value,
+    positive_output_token_cap as _positive_output_token_cap,
+    sanitized_loopback_endpoint,
+)
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -2667,6 +2672,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -2706,24 +2712,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()
-    max_tokens = None
-    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
-    if _env_mt:
-        try:
-            max_tokens = int(_env_mt)
-        except (ValueError, TypeError):
-            max_tokens = None
-    elif isinstance(model_cfg, dict):
-        mt = model_cfg.get("max_tokens")
-        if isinstance(mt, int):
-            max_tokens = mt
+    max_tokens = _positive_output_token_cap(os.environ.get("HERMES_MAX_TOKENS"))
+    if max_tokens is None and isinstance(model_cfg, dict):
+        max_tokens = _positive_output_token_cap(model_cfg.get("max_tokens"))
     # Fall back to a per-provider output cap (custom_providers max_output_tokens)
     # only when the documented global model.max_tokens isn't set, so the global
     # key always wins.
     if max_tokens is None:
-        _runtime_mot = runtime.get("max_output_tokens")
-        if isinstance(_runtime_mot, int) and _runtime_mot > 0:
-            max_tokens = _runtime_mot
+        max_tokens = _positive_output_token_cap(runtime.get("max_output_tokens"))
 
     return {
         "api_key": runtime.get("api_key"),
@@ -2743,12 +2739,20 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
+        _get_model_config,
     )
     try:
         runtime = resolve_runtime_provider(requested=provider)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
+    model_cfg = _get_model_config()
+    max_tokens = _positive_output_token_cap(os.environ.get("HERMES_MAX_TOKENS"))
+    if max_tokens is None and isinstance(model_cfg, dict):
+        max_tokens = _positive_output_token_cap(model_cfg.get("max_tokens"))
+    if max_tokens is None:
+        max_tokens = _positive_output_token_cap(runtime.get("max_output_tokens"))
     return {
+        "model": runtime.get("model"),
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -2757,6 +2761,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": max_tokens,
     }
 
 
@@ -20472,10 +20477,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(source)
+        return self._format_session_info(source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -20487,6 +20492,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         model = _resolve_gateway_model()
         config_context_length = None
         provider = None
+        display_provider = None
         base_url = None
         api_key = None
         custom_provs = None
@@ -20519,10 +20525,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Resolve runtime credentials for probing
+        # Resolve the same route the next turn will use. A channel override
+        # must be reflected in /new before any agent has been constructed.
         try:
-            runtime = _resolve_runtime_agent_kwargs()
+            if source is not None:
+                model, runtime = self._resolve_session_agent_runtime(source=source)
+            else:
+                runtime = _resolve_runtime_agent_kwargs()
             provider = runtime.get("provider") or provider
+            display_provider = runtime.get("requested_provider") or provider
             base_url = runtime.get("base_url") or base_url
             api_key = runtime.get("api_key")
         except Exception:
@@ -20585,13 +20596,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         lines = [
             f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
+            f"◆ Provider: {display_provider or provider or 'openrouter'}",
             f"◆ Context: {ctx_display} tokens ({ctx_source})",
         ]
 
-        # Show endpoint for local/custom setups
-        if base_url and base_url_hostname(base_url) in ("localhost", "127.0.0.1", "0.0.0.0"):
-            lines.append(f"◆ Endpoint: {base_url}")
+        endpoint = sanitized_loopback_endpoint(base_url)
+        if endpoint:
+            lines.append(f"◆ Endpoint: {endpoint}")
 
         return "\n".join(lines)
 
