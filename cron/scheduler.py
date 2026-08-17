@@ -1938,6 +1938,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                policy_suppressed = False
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -2038,6 +2039,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+                            policy_suppressed = bool(
+                                isinstance(send_raw_response, dict)
+                                and send_raw_response.get("suppressed")
+                            )
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -2084,7 +2089,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
-                if adapter_ok and not timed_out and media_files:
+                if adapter_ok and not policy_suppressed and not timed_out and media_files:
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
@@ -2111,7 +2116,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     logger.warning("Job '%s': %s", job["id"], msg)
                     delivery_errors.append(msg)
 
-                if adapter_ok:
+                if adapter_ok and policy_suppressed:
+                    logger.info(
+                        "Job '%s': delivery to %s:%s suppressed by platform policy",
+                        job["id"], platform_name, chat_id,
+                    )
+                    delivered = True
+                elif adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
                     # Seed the thread session only now that delivery into it
@@ -2238,6 +2249,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                continue
+
+            if result and result.get("suppressed"):
+                logger.info(
+                    "Job '%s': delivery to %s:%s suppressed by platform policy",
+                    job["id"], platform_name, chat_id,
+                )
+                delivered = True
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)

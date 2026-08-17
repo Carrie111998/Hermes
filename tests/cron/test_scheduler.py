@@ -1478,6 +1478,103 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         standalone_send.assert_awaited_once()
 
 
+class TestDeliverResultPolicySuppression:
+    @staticmethod
+    def _config(platform):
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        config = MagicMock()
+        config.platforms = {platform: pconfig}
+        return config
+
+    @staticmethod
+    def _job():
+        return {
+            "id": "suppressed-job",
+            "deliver": "origin",
+            "attach_to_session": True,
+            "origin": {
+                "platform": "whatsapp",
+                "chat_id": "15550002222@s.whatsapp.net",
+            },
+        }
+
+    def test_standalone_suppression_is_not_mirrored_or_retried(self):
+        from gateway.config import Platform
+
+        standalone_send = AsyncMock(
+            return_value={
+                "success": True,
+                "suppressed": True,
+                "reason": "oversight_outbound_policy",
+            }
+        )
+        with patch(
+            "gateway.config.load_gateway_config",
+            return_value=self._config(Platform.WHATSAPP),
+        ), patch(
+            "cron.scheduler.load_config",
+            return_value={"cron": {"wrap_response": False}},
+        ), patch(
+            "tools.send_message_tool._send_to_platform",
+            new=standalone_send,
+        ), patch("gateway.mirror.mirror_to_session") as mirror:
+            result = _deliver_result(self._job(), "scheduled result")
+
+        assert result is None
+        standalone_send.assert_awaited_once()
+        mirror.assert_not_called()
+
+    def test_live_suppression_is_not_mirrored_or_retried(self):
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        adapter = AsyncMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        send_result = SendResult(
+            success=True,
+            raw_response={
+                "suppressed": True,
+                "reason": "oversight_outbound_policy",
+            },
+        )
+        completed_future = Future()
+        completed_future.set_result(send_result)
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return completed_future
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        with patch(
+            "gateway.config.load_gateway_config",
+            return_value=self._config(Platform.WHATSAPP),
+        ), patch(
+            "cron.scheduler.load_config",
+            return_value={"cron": {"wrap_response": False}},
+        ), patch(
+            "asyncio.run_coroutine_threadsafe",
+            side_effect=fake_run_coro,
+        ), patch(
+            "tools.send_message_tool._send_to_platform",
+            new=standalone_send,
+        ), patch("gateway.mirror.mirror_to_session") as mirror:
+            result = _deliver_result(
+                self._job(),
+                "scheduled result",
+                adapters={Platform.WHATSAPP: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_not_awaited()
+        mirror.assert_not_called()
+
+
 class TestDeliverOriginUnresolvableIsLocal:
     """Regression for #43014.
 
