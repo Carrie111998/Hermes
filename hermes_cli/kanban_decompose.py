@@ -181,14 +181,8 @@ def _large_refactor_signals(title: str, body: str) -> list[str]:
     has_large_prompt = token_estimate > _LARGE_REFACTOR_TOKEN_THRESHOLD
     if not (has_broad_file_scope or has_large_prompt):
         return signals
-    # "move" by itself is common in ordinary task prose (for example, moving a
-    # meeting or memory). Treat it as a large-refactor signal only when paired
-    # with a genuine breadth signal.
-    high_confidence_keywords = [kw for kw in keyword_hits if kw != "move"]
-    if "move" in keyword_hits:
-        high_confidence_keywords.append("move")
-    if high_confidence_keywords:
-        signals.append("keywords=" + ",".join(high_confidence_keywords[:5]))
+    if keyword_hits:
+        signals.append("keywords=" + ",".join(keyword_hits[:5]))
     if has_broad_file_scope:
         signals.append(f"file_refs={len(file_refs)}")
     if has_large_prompt:
