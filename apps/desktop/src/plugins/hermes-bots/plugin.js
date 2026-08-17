@@ -5074,10 +5074,18 @@ async function invalidateRoutineOwner(profile) {
 function selectRoutineJobs(data, error, lastJobs, bot) {
   const live = Array.isArray(data?.jobs) ? data.jobs : null
   const all = live ?? (error ? lastJobs : [])
+  const byBot = all.filter(job => routineBot(job) === bot)
+  const legacyJobs = all.filter(job => routineBot(job) === null)
+
+  // For older/legacy cron stores where entries were created before profile-scoped,
+  // names can be missing the [bot:*] prefix. If no bot-specific jobs are found
+  // for this bot but legacy entries exist, show those to avoid an empty pane.
+  const jobs = byBot.length > 0 ? byBot : legacyJobs
+
   return {
     live,
     all,
-    jobs: all.filter(job => routineBot(job) === bot)
+    jobs
   }
 }
 
