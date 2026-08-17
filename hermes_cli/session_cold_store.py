@@ -231,13 +231,19 @@ def _valid_existing_revision(revision_dir: Path, terminal_id: str, lineage: tupl
 
 
 def _ensure_dir_tree_fsynced(path: Path) -> None:
-    """Create a directory chain and fsync every new entry plus its parent."""
-    missing: list[Path] = []
+    """Create and validate every path component through the revision parent."""
+    chain: list[Path] = []
     current = path
-    while not current.exists():
-        missing.append(current)
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
         current = current.parent
-    for directory in reversed(missing):
+    for directory in reversed(chain):
+        if directory.exists():
+            if not directory.is_dir() or directory.is_symlink():
+                raise ValueError(f"unsafe archive parent path: {directory}")
+            continue
         try:
             directory.mkdir()
         except FileExistsError:
