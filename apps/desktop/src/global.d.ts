@@ -151,6 +151,14 @@ declare global {
         pickDefaultProjectDir: () => Promise<{ canceled: boolean; dir: null | string }>
         setDefaultProjectDir: (dir: null | string) => Promise<{ dir: null | string }>
       }
+      // Custom intro image for the new-session welcome screen. `dataUrl` is
+      // null when no image is configured / readable — renderer falls back to
+      // the default wordmark in that case.
+      introImage: {
+        get: () => Promise<{ imagePath: null | string; dataUrl: null | string; error: null | string }>
+        set: (imagePath: null | string) => Promise<{ imagePath: null | string }>
+        pick: () => Promise<{ canceled: boolean; imagePath: null | string }>
+      }
       zoom?: {
         get: () => Promise<{ level: number; percent: number }>
         setPercent: (percent: number) => void

@@ -132,10 +132,19 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),
   sanitizeWorkspaceCwd: cwd => ipcRenderer.invoke('hermes:workspace:sanitize', cwd),
   settings: {
-    getDefaultProjectDir: () => ipcRenderer.invoke('hermes:setting:defaultProjectDir:get'),
-    setDefaultProjectDir: dir => ipcRenderer.invoke('hermes:setting:defaultProjectDir:set', dir),
-    pickDefaultProjectDir: () => ipcRenderer.invoke('hermes:setting:defaultProjectDir:pick')
-  },
+      getDefaultProjectDir: () => ipcRenderer.invoke('hermes:setting:defaultProjectDir:get'),
+      setDefaultProjectDir: dir => ipcRenderer.invoke('hermes:setting:defaultProjectDir:set'),
+      pickDefaultProjectDir: () => ipcRenderer.invoke('hermes:setting:defaultProjectDir:pick')
+    },
+    introImage: {
+      // Custom image rendered in place of the HERMES AGENT wordmark on the
+      // new-session welcome screen. `dataUrl` is null when no image is
+      // configured, the file is missing, or the extension is unsupported —
+      // the renderer falls back to the wordmark in that case.
+      get: () => ipcRenderer.invoke('hermes:intro-image:get'),
+      set: imagePath => ipcRenderer.invoke('hermes:intro-image:set', imagePath),
+      pick: () => ipcRenderer.invoke('hermes:intro-image:pick')
+    },
   zoom: {
     // Current zoom of this window, as { level, percent }.
     get: () => ipcRenderer.invoke('hermes:zoom:get'),

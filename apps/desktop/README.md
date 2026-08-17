@@ -38,6 +38,34 @@ Prebuilt installers are built and distributed via [the Hermes Desktop website.](
 
 ---
 
+## Customization
+
+### Intro image
+
+Replace the `HERMES AGENT` wordmark on the new-session welcome screen with
+any image (PNG, JPG, GIF, WebP, or SVG). The path is persisted to Electron's
+`userData/intro-image.json` so it survives self-updates.
+
+Via the Electron bridge (callable from DevTools while the app is open):
+
+```js
+await window.hermesDesktop.introImage.pick()        // opens a file picker
+await window.hermesDesktop.introImage.set('/abs/path/hero.png')
+await window.hermesDesktop.introImage.set(null)     // clear → fall back to wordmark
+```
+
+Or set the path manually by writing `userData/intro-image.json`:
+
+```json
+{ "imagePath": "/Users/you/Pictures/hero.png" }
+```
+
+`~` is expanded, the file is read via the hardened path resolver (sensitive
+files like `.env` are blocked), and the image is capped at 5 MB. Missing or
+unreadable files silently fall back to the wordmark.
+
+---
+
 ## Updating
 
 The app checks for updates in the background and offers a one-click update when one is ready. You can also update any time from the CLI:

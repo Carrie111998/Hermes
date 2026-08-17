@@ -1,4 +1,4 @@
-import { type CSSProperties, useState } from 'react'
+import { type CSSProperties, useEffect, useState } from 'react'
 
 import { capitalize, normalize } from '@/lib/text'
 
@@ -156,9 +156,46 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
   return pickCopy(copies, seed)
 }
 
+// Custom intro image (Electron userData setting). Resolved once on mount;
+// `null` means "render the wordmark as usual." The fetch is best-effort —
+// a missing bridge, thrown error, or null result keeps the wordmark intact.
+function useIntroImageDataUrl(): string | null {
+  const [dataUrl, setDataUrl] = useState<string | null>(null)
+
+  useEffect(() => {
+    const bridge = window.hermesDesktop?.introImage
+
+    if (!bridge) {
+      return
+    }
+
+    let cancelled = false
+
+    bridge
+      .get()
+      .then(result => {
+        if (!cancelled) {
+          setDataUrl(result?.dataUrl ?? null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDataUrl(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  return dataUrl
+}
+
 export function Intro({ personality, seed }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
   const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+  const imageDataUrl = useIntroImageDataUrl()
 
   return (
     <div
@@ -166,16 +203,25 @@ export function Intro({ personality, seed }: IntroProps) {
       data-slot="aui_intro"
     >
       <div className="w-full min-w-0">
-        <p
-          aria-label={WORDMARK}
-          className="fit-text mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
-          style={{ '--fit-min': '2.75rem' } as CSSProperties}
-        >
-          <span>
-            <span>{WORDMARK}</span>
-          </span>
-          <span aria-hidden="true">{WORDMARK}</span>
-        </p>
+        {imageDataUrl ? (
+          <img
+            alt="Custom intro image"
+            className="mx-auto mb-1 block max-h-40 max-w-[calc(100%-1rem)] select-none object-contain"
+            draggable={false}
+            src={imageDataUrl}
+          />
+        ) : (
+          <p
+            aria-label={WORDMARK}
+            className="fit-text mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
+            style={{ '--fit-min': '2.75rem' } as CSSProperties}
+          >
+            <span>
+              <span>{WORDMARK}</span>
+            </span>
+            <span aria-hidden="true">{WORDMARK}</span>
+          </p>
+        )}
 
         <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>
       </div>

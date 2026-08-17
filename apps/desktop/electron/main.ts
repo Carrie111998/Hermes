@@ -133,6 +133,7 @@ import {
   resolveTimeoutMs,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
+import { resolveIntroImage, writeIntroImageConfig } from './intro-image'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -10668,6 +10669,34 @@ ipcMain.handle('hermes:setting:defaultProjectDir:pick', async () => {
   }
 
   return { canceled: false, dir: result.filePaths[0] }
+})
+
+// Custom intro image for the new-session welcome screen. Stored under
+// userData (same convention as project-dir.json) so it survives self-updates.
+// Renderer calls `introImage.get()` on mount; if `dataUrl` is null it falls
+// back to the default wordmark.
+ipcMain.handle('hermes:intro-image:get', async () => resolveIntroImage(app.getPath('userData')))
+
+ipcMain.handle('hermes:intro-image:set', async (_event, imagePath) => {
+  const next = typeof imagePath === 'string' && imagePath.trim() ? imagePath.trim() : null
+
+  return writeIntroImageConfig(app.getPath('userData'), next)
+})
+
+ipcMain.handle('hermes:intro-image:pick', async () => {
+  const result = await dialog.showOpenDialog({
+    title: 'Choose intro image',
+    properties: ['openFile'],
+    filters: [
+      { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] }
+    ]
+  })
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { canceled: true, imagePath: null }
+  }
+
+  return { canceled: false, imagePath: result.filePaths[0] }
 })
 
 ipcMain.handle('hermes:fetchLinkTitle', (_event, url) => fetchLinkTitle(url))
