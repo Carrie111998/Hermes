@@ -20,9 +20,10 @@ import os
 import random
 import sqlite3
 import sys
-import tempfile
 import time
 from pathlib import Path
+
+from _temphome import temp_home
 
 NUM_WORKERS = 10
 NUM_TASKS = 500
@@ -185,7 +186,11 @@ def reclaimer_loop(hermes_home: str, result_file: str) -> None:
 
 
 def main():
-    home = tempfile.mkdtemp(prefix="hermes_mixed_stress_")
+    with temp_home("hermes_mixed_stress_") as home:
+        _run_mixed_stress(home)
+
+
+def _run_mixed_stress(home):
     print(f"HERMES_HOME = {home}")
 
     os.environ["HERMES_HOME"] = home

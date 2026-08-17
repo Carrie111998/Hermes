@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import time
 
 WT = str(Path(__file__).resolve().parents[2])
@@ -25,6 +24,7 @@ IS_WINDOWS = os.name == "nt"
 
 if WT not in sys.path:
     sys.path.insert(0, WT)
+from _temphome import temp_home  # noqa: E402
 from tests.timeout_budget import scaled  # noqa: E402
 
 # The CLI the spawned workers must use. Passing this explicitly is what
@@ -72,7 +72,11 @@ def make_spawn_fn(home: str):
 
 
 def main():
-    home = tempfile.mkdtemp(prefix="hermes_e2e_")
+    with temp_home("hermes_e2e_") as home:
+        _run_e2e(home)
+
+
+def _run_e2e(home):
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
     sys.path.insert(0, WT)

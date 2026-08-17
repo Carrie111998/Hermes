@@ -29,6 +29,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _temphome import cleanup_home, keep_for_debugging
+
 WT = str(Path(__file__).resolve().parents[2])
 NUM_SEQUENCES = 500
 OPS_PER_SEQUENCE = 100
@@ -259,9 +261,15 @@ def main():
                 if not assert_invariants(conn, kb, ops_log):
                     total_violations += 1
                     print(f"  sequence {seq_idx} (seed={seed}) failed at op {i}")
+                    # The seed replays the op sequence, but the db this
+                    # sequence built is the thing you actually want to open.
+                    keep_for_debugging(home)
                     break
         finally:
+            # conn.close() first: on Windows an open handle keeps kanban.db
+            # locked and the directory cannot be removed.
             conn.close()
+            cleanup_home(home)
 
         if seq_idx % 10 == 0:
             print(f"  seq {seq_idx:3d}: {total_ops} ops so far, {total_violations} violations")
