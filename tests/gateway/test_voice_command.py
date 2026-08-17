@@ -246,6 +246,22 @@ class TestHandleVoiceCommand:
         assert adapter._auto_tts_disabled_chats == set()
         assert adapter._auto_tts_enabled_chats == {"123"}
 
+    def test_timeout_cleanup_resolves_secondary_profile_adapter(self, runner):
+        from gateway.config import Platform
+
+        primary = SimpleNamespace(_auto_tts_disabled_chats=set())
+        secondary = SimpleNamespace(_auto_tts_disabled_chats=set())
+        runner.adapters[Platform.DISCORD] = primary
+        runner._profile_adapters = {
+            "work": {Platform.DISCORD: secondary},
+        }
+
+        runner._handle_voice_timeout_cleanup("123", profile="work")
+
+        assert runner._voice_mode == {"work:discord:123": "off"}
+        assert primary._auto_tts_disabled_chats == set()
+        assert secondary._auto_tts_disabled_chats == {"123"}
+
 
     @pytest.mark.asyncio
     async def test_platform_isolation(self, runner):

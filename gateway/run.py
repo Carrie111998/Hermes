@@ -21433,7 +21433,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ] = "off"
         self._save_voice_modes()
         if adapter is None:
-            adapter = self.adapters.get(Platform.DISCORD)
+            profile_name = str(profile or "").strip()
+            if profile_name and profile_name != self._active_profile_name():
+                profile_adapters = getattr(self, "_profile_adapters", {}).get(
+                    profile_name,
+                    {},
+                )
+                adapter = profile_adapters.get(Platform.DISCORD)
+            else:
+                adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
