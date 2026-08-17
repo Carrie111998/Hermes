@@ -248,8 +248,10 @@ class TestUnifiedCronjobTool:
 
     def test_create_surfaces_scheduler_readiness_warning(self, monkeypatch):
         warning = (
-            "Gateway is not running — this job will NOT fire automatically. "
-            "Start it with `hermes gateway install`; check with `hermes cron status`."
+            "Gateway is not running — jobs won't fire automatically. "
+            "Start it with `hermes gateway install` "
+            "(`sudo hermes gateway install --system` on Linux servers); "
+            "check with `hermes cron status`."
         )
         monkeypatch.setattr(
             "tools.cronjob_tools._scheduler_readiness_warning",
@@ -288,7 +290,7 @@ class TestUnifiedCronjobTool:
 
         assert created["success"] is True
         assert "scheduler_warning" not in created
-        assert "will NOT fire automatically" not in created["message"]
+        assert "won't fire automatically" not in created["message"]
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
