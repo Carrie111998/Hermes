@@ -160,7 +160,7 @@ def aux_probe_mode():
     finally:
         _aux_probe_state.active = prev
 
-from agent.credential_pool import load_pool
+from agent.credential_pool import load_pool, BILLING_QUOTA_SIGNALS
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -4082,14 +4082,7 @@ def _is_payment_error(exc: Exception) -> bool:
             "model_not_supported_on_free_tier",
             "not available on the free tier",
             "requires a subscription", "upgrade for access",
-            "upgrade for higher limits", "reached your session usage limit",
-            # Daily / monthly / weekly quota exhaustion keywords
-            "quota exceeded", "quota_exceeded",
-            "too many tokens per day", "daily limit",
-            "tokens per day", "daily quota",
-            "resource exhausted",  # Vertex AI / gRPC quota errors
-            "weekly usage limit", "weekly limit",  # OpenCode Go weekly subscription cap
-        )):
+        ) + tuple(BILLING_QUOTA_SIGNALS)):
             return True
     return False
 

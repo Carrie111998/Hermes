@@ -16,6 +16,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from agent.credential_pool import BILLING_QUOTA_SIGNALS
+
 logger = logging.getLogger(__name__)
 
 
@@ -216,20 +218,9 @@ _USAGE_LIMIT_PATTERNS = [
 #
 # Mirrors the keywords already recognised by
 # ``auxiliary_client._is_payment_error`` so the classifier and the auxiliary
-# client agree on the verdict.
-_429_BILLING_SIGNALS = [
-    "weekly usage limit",
-    "weekly limit",
-    "upgrade for higher limits",
-    "reached your session usage limit",
-    "quota exceeded",
-    "quota_exceeded",
-    "resource exhausted",
-    "too many tokens per day",
-    "daily limit",
-    "tokens per day",
-    "daily quota",
-]
+# client agree on the verdict.  Both paths import the shared
+# ``BILLING_QUOTA_SIGNALS`` constant from ``credential_pool`` to prevent drift.
+_429_BILLING_SIGNALS = BILLING_QUOTA_SIGNALS
 
 # Patterns confirming usage limit is transient (not billing)
 _USAGE_LIMIT_TRANSIENT_SIGNALS = [
