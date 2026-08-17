@@ -1330,15 +1330,28 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
 
 
 @contextlib.contextmanager
-def _cross_process_init_lock(path: Path):
-    """Serialize first-connect WAL/schema/integrity setup across processes.
+def _cross_process_init_lock(path: Path, section: str = "init"):
+    """Serialize the first-connect probe/schema sections across processes.
 
     ``_INIT_LOCK`` only protects threads inside one Python process. During a
     dispatcher burst, many worker processes can all hit a fresh/legacy board at
     once and each process has an empty ``_INITIALIZED_PATHS`` cache. This file
-    lock keeps header validation, integrity probing, WAL activation, and
-    additive migrations single-file/single-writer across the whole host while
-    leaving normal post-init DB usage concurrent under SQLite WAL.
+    lock keeps header validation, integrity probing, and additive migrations
+    single-file/single-writer across the whole host while leaving normal
+    post-init DB usage concurrent under SQLite WAL.
+
+    ``section`` names which of :func:`connect`'s two protected sections is
+    being guarded (``"probe"`` or ``"schema"``); it only appears in the
+    timeout WARNING, so a blown budget says *where* it was blown.
+
+    Keep the sections narrow. Per-connection setup — opening the SQLite
+    connection and running the WAL/pragma probe — deliberately runs OUTSIDE
+    this lock: on a hot board that probe is the statement that attaches the
+    ``-shm`` and takes the first read lock, so it queues behind live writers
+    for 1-2s per process. Holding the init lock across it made each process
+    pay for all its predecessors, which is what turned the bounded acquire
+    below into a fallback that fired on healthy queues rather than wedged
+    holders. See the block comment in :func:`connect`.
 
     The acquire is **bounded** (issue #36644): the original bare blocking
     ``flock(LOCK_EX)`` had no timeout, so a single process stalled inside the
@@ -1357,8 +1370,9 @@ def _cross_process_init_lock(path: Path):
     lock_path = path.with_name(path.name + ".init.lock")
     handle = lock_path.open("a+b")
     acquired = False
+    started = time.monotonic()
     try:
-        deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
+        deadline = started + _INIT_LOCK_TIMEOUT_SECONDS
         if _IS_WINDOWS:
             import msvcrt
 
@@ -1388,11 +1402,14 @@ def _cross_process_init_lock(path: Path):
                     time.sleep(_INIT_LOCK_POLL_SECONDS)
         if not acquired:
             _log.warning(
-                "kanban init lock for %s not acquired within %.0fs — proceeding "
-                "without the cross-process lock (in-process lock + idempotent "
-                "init are the correctness backstop). A stuck holder is no longer "
-                "able to block this connect indefinitely (#36644).",
-                lock_path, _INIT_LOCK_TIMEOUT_SECONDS,
+                "kanban init lock for %s (%s section) not acquired within %.0fs "
+                "— proceeding without the cross-process lock (in-process lock + "
+                "idempotent init are the correctness backstop). A stuck holder is "
+                "no longer able to block this connect indefinitely (#36644). The "
+                "sections this lock covers are sub-second even with a dozen "
+                "processes first-connecting at once, so reaching this timeout "
+                "means a holder is wedged, not merely queued.",
+                lock_path, section, _INIT_LOCK_TIMEOUT_SECONDS,
             )
         yield
     finally:
@@ -1737,7 +1754,20 @@ def connect(
             raise
         return conn
 
-    with _cross_process_init_lock(path):
+    # The cross-process lock is held over the two sections that genuinely need
+    # host-wide serialization — the read-only corruption probes and the schema
+    # DDL — and NOT over the per-connection setup between them. Opening the
+    # connection and running the WAL/pragma probe costs 1-2s per process on a
+    # hot board (it is the first statement to attach the -shm and take a read
+    # lock, so it queues behind live writers), and holding the init lock across
+    # it made every first-connecting process pay for its predecessors: with 12
+    # workers first-connecting at once the serialized total reached 16s against
+    # a 10s budget, so the "not acquired within 10s" fallback fired routinely
+    # under ordinary contention. Per-connection setup needs no cross-process
+    # exclusion — the in-process _INIT_LOCK below still orders same-process
+    # threads — so it runs outside, which drops the serialized total to under
+    # a second and makes a blown budget mean what it says: a wedged holder.
+    with _cross_process_init_lock(path, "probe"):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         _validate_sqlite_header(path)
@@ -1745,44 +1775,46 @@ def connect(
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         _guard_existing_db_is_healthy(path)
-        resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
-        try:
-            conn.row_factory = sqlite3.Row
-            with _INIT_LOCK:
-                # WAL activation can take an exclusive lock while SQLite creates the
-                # sidecar files for a fresh database. Keep it in the same process-local
-                # critical section as schema initialization so concurrent gateway
-                # startup threads do not race before _INITIALIZED_PATHS is populated.
-                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one WARNING so kanban stays usable there.
-                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                # crash window that can leave a b-tree page header torn.
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                conn.execute("PRAGMA foreign_keys=ON")
-                # Zero freed pages so a later torn write cannot expose stale
-                # cell content; persisted in the DB header for new DBs.
-                conn.execute("PRAGMA secure_delete=ON")
-                # Surface corrupt cells as read errors instead of silent
-                # wrong-data returns.
-                conn.execute("PRAGMA cell_size_check=ON")
-                needs_init = resolved not in _INITIALIZED_PATHS
-                if needs_init:
-                    # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                    # migrations. Cached so subsequent connect() calls in the same
-                    # process are cheap. The lock prevents same-process dispatcher
-                    # threads from racing through the additive ALTER TABLE pass with
-                    # stale PRAGMA snapshots during gateway startup.
+
+    conn = _sqlite_connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        with _INIT_LOCK:
+            # WAL activation can take an exclusive lock while SQLite creates the
+            # sidecar files for a fresh database. Keep it in the same process-local
+            # critical section as schema initialization so concurrent gateway
+            # startup threads do not race before _INITIALIZED_PATHS is populated.
+            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
+            # falls back to DELETE with one WARNING so kanban stays usable there.
+            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
+            from hermes_state import apply_wal_with_fallback
+            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+            # FULL (was NORMAL): fsync before each checkpoint to narrow the
+            # crash window that can leave a b-tree page header torn.
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA wal_autocheckpoint=100")
+            conn.execute("PRAGMA foreign_keys=ON")
+            # Zero freed pages so a later torn write cannot expose stale
+            # cell content; persisted in the DB header for new DBs.
+            conn.execute("PRAGMA secure_delete=ON")
+            # Surface corrupt cells as read errors instead of silent
+            # wrong-data returns.
+            conn.execute("PRAGMA cell_size_check=ON")
+            needs_init = resolved not in _INITIALIZED_PATHS
+            if needs_init:
+                # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
+                # migrations. Cached so subsequent connect() calls in the same
+                # process are cheap. _INIT_LOCK prevents same-process dispatcher
+                # threads from racing through the additive ALTER TABLE pass with
+                # stale PRAGMA snapshots during gateway startup; the cross-process
+                # lock does the same for other processes on this host.
+                with _cross_process_init_lock(path, "schema"):
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
-                    _INITIALIZED_PATHS.add(resolved)
-        except Exception:
-            conn.close()
-            raise
+                _INITIALIZED_PATHS.add(resolved)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 

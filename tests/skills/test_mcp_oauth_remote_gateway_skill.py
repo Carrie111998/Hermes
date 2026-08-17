@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -168,11 +169,19 @@ def test_refresh_fixed_write_persists_atomically(tmp_path):
     refreshed = json.dumps({"access_token": "at-new", "token_type": "Bearer",
                             "expires_in": 7200, "scope": "read write",
                             "refresh_token": "rt-rotated"}).encode()
-    out, _ = _run_main(
-        mod, tokens_dir,
-        ["stripe", "--token-endpoint", "https://as.example.com/token", "--write"],
-        [_init_revoked_error(), FakeResponse(200, refreshed), FakeResponse(200, _init_ok_body())],
-    )
+    chmod_calls: list[tuple[str, int]] = []
+    real_chmod = os.chmod
+
+    def _spy_chmod(path, mode, *a, **kw):
+        chmod_calls.append((str(path), mode))
+        return real_chmod(path, mode, *a, **kw)
+
+    with patch.object(mod.os, "chmod", _spy_chmod):
+        out, _ = _run_main(
+            mod, tokens_dir,
+            ["stripe", "--token-endpoint", "https://as.example.com/token", "--write"],
+            [_init_revoked_error(), FakeResponse(200, refreshed), FakeResponse(200, _init_ok_body())],
+        )
     assert "BRANCH=REFRESH_FIXED" in out
     on_disk = json.loads((tokens_dir / "stripe.json").read_text())
     assert on_disk["access_token"] == "at-new"
@@ -180,8 +189,17 @@ def test_refresh_fixed_write_persists_atomically(tmp_path):
     assert on_disk["scope"] == "read write"
     assert on_disk["expires_at"] > 0
     assert not (tokens_dir / "stripe.json.tmp").exists()  # atomic replace, no leftover
-    mode = (tokens_dir / "stripe.json").stat().st_mode & 0o777
-    assert mode == 0o600
+
+    # The 0600 must be applied to the .tmp file BEFORE os.replace, so the token
+    # is never briefly readable at its final path. Asserting the call (rather
+    # than only the resulting mode) is also the portable half of this check:
+    # on Windows os.chmod cannot clear the group/other read bits at all.
+    assert (str(tokens_dir / "stripe.json.tmp"), 0o600) in chmod_calls
+    if not sys.platform.startswith("win"):
+        # POSIX mode bits are not enforced on Windows -- st_mode stays 0o666
+        # there no matter what chmod was handed.
+        mode = (tokens_dir / "stripe.json").stat().st_mode & 0o777
+        assert mode == 0o600
 
 
 def test_session_revoked_branch(tmp_path):

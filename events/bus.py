@@ -450,6 +450,66 @@ class EventBus:
                                r["event_id"], e)
         return events
 
+    def event_with_rowid(self, event_id: str) -> Optional[tuple]:
+        """``(rowid, Event)`` for one event id, or None.
+
+        A primary-key seek. Callers that need to search *forward* from a known
+        event — CronStaleMonitor resolving a shutdown's in-flight correlation
+        ids — need the rowid as the window floor, which ``query()`` cannot
+        give them.
+        """
+        row = self._get_conn().execute(
+            "SELECT rowid AS _rowid, * FROM events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return (row["_rowid"], self._row_to_event(row))
+        except ValueError as e:
+            logger.warning("event_with_rowid: unparseable event %s: %s", event_id, e)
+            return None
+
+    def first_event_for_job(
+        self,
+        job_id: str,
+        event_types: List[EventType],
+        after_rowid: int,
+        through_rowid: int,
+    ) -> Optional[Event]:
+        """Earliest event of ``event_types`` carrying ``job_id``, in the window.
+
+        Window is ``after_rowid < rowid <= through_rowid`` — the same half-open
+        lower / closed upper convention as ``query_rowid_range``, and an INTEGER
+        PRIMARY KEY seek for the same reason.
+
+        Reads ``json_extract(payload, '$.job_id')`` and NOT the ``job_id``
+        COLUMN: no producer populates that column. Measured on the live bus
+        2026-08-17 — 0 of 25,449 ``cron_started`` rows and 0 of 24,964
+        ``cron_completed`` rows had it set — so a column filter here would
+        silently match nothing forever.
+        """
+        if not event_types:
+            return None
+        placeholders = ",".join("?" for _ in event_types)
+        row = self._get_conn().execute(
+            f"SELECT * FROM events "
+            f"WHERE rowid > ? AND rowid <= ? "
+            f"  AND event_type IN ({placeholders}) "
+            f"  AND json_extract(payload, '$.job_id') = ? "
+            f"ORDER BY rowid ASC LIMIT 1",
+            (after_rowid, through_rowid,
+             *[t.type_string for t in event_types], job_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return self._row_to_event(row)
+        except ValueError as e:
+            logger.warning("first_event_for_job: skipping unparseable event %s: %s",
+                           row["event_id"], e)
+            return None
+
     def min_rowid_since(self, timestamp: str) -> Optional[int]:
         """Smallest rowid whose ``timestamp >= ?`` (or None).
 

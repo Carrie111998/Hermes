@@ -19,10 +19,17 @@ That is precisely how the 2026-08-11 outage ran 5h08m — the gateway process
 alive and this subscriber polling beside it — with zero of 69 cron jobs
 running.  The ticker heartbeat file is the one signal that survives that
 failure, because nothing refreshes it once the thread is gone.
+
+Three checks, on three clocks.  ``_check_stale`` and ``_check_ticker_stale``
+run per poll, on this process's own state.  The third runs ONCE, in
+``startup()``: it rebuilds the shutdown attributions a force-killed
+predecessor never got to write, by querying the bus rather than by handling
+events.  That one needs no in-memory state at all, which is exactly why it
+works where ``handle()`` cannot.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from events.bus import EventBus
@@ -53,6 +60,18 @@ class CronStaleMonitor(BaseSubscriber):
     # ~/.hermes/notifications/cron_stale_thresholds.json and are injected
     # via the constructor by gateway_integration.
     STALE_THRESHOLD_SECONDS: int = 1200
+
+    # How far back a fresh gateway looks for shutdowns it must still attribute
+    # (see startup()). Bounded on purpose: event_bus.db is hundreds of MB and
+    # cron events dominate it, so an unbounded sweep would scan the whole bus
+    # on every boot. 24h covers an overnight outage and every ordinary restart
+    # gap; anything older is reported as excluded rather than dropped silently.
+    ATTRIBUTION_HORIZON_SECONDS: int = 86_400
+
+    # How far past the horizon to look when counting what the horizon excluded.
+    # Also bounded — the point is to tell the operator "N shutdowns were too old
+    # to examine", not to enumerate the entire history of the box.
+    HORIZON_REPORT_WINDOW_SECONDS: int = 7 * 86_400
 
     # How stale the ticker heartbeat may get before we call the scheduler dead.
     # The in-process ticker beats once per loop iteration at interval=60s, so
@@ -208,6 +227,198 @@ class CronStaleMonitor(BaseSubscriber):
                     "CronStaleMonitor: failed to emit gateway_stopped "
                     "cron_stale for %s", job_id,
                 )
+
+    # ------------------------------------------------------------------
+    # Successor-side reconstruction
+    # ------------------------------------------------------------------
+
+    def startup(self) -> None:
+        """Rebuild shutdown attributions the previous gateway never recorded.
+
+        ``_flush_pending_shutdown`` only runs on a GRACEFUL teardown. A gateway
+        force-killed past ``gateway/status.py``'s ``_TASKKILL_TIMEOUT_S``, or
+        cut down by the shutdown watchdog's ``exit_code=1``, reaches neither
+        ``_drain_subscribers_for_shutdown()`` nor ``shutdown_all()`` — the
+        staged reports die with the process and nothing is recorded for runs
+        that genuinely WERE killed. The 2026-08-12 census found six shutdowns
+        started that day and three completed, so this is about half of them.
+
+        The successor cannot recover them from ``handle()``: it learns
+        correlation ids only from CRON_STARTED events as it sees them, and the
+        cursor seed is INSERT OR IGNORE, so a restart never replays the rows
+        that built the map (production 2026-08-17 04:12:03Z — every id missed
+        an empty map and nothing was emitted).
+
+        Every input is durable in the bus, so this is a query. Evaluated after
+        the fact it is strictly BETTER than the in-process path, not a
+        fallback: the answer is already final, so it needs no deferral and has
+        no race. The in-process staging is kept as the fast path because it
+        covers the one case this cannot — a graceful stop that no successor
+        ever follows.
+
+        Never raises: ``startup_all()`` runs inline in gateway boot.
+        """
+        try:
+            self._reconstruct_shutdown_attributions()
+        except Exception:
+            logger.exception(
+                "CronStaleMonitor: shutdown-attribution reconstruction failed",
+            )
+
+    def _already_attributed(self, since: str) -> Set[Tuple[str, str]]:
+        """``(gateway_stopped_event_id, cron_started_event_id)`` pairs on the bus.
+
+        The dedupe key is entirely inside the CRON_STALE payload already, so
+        "did somebody report this?" is a bus query rather than new state — which
+        is also what makes this pass idempotent without a watermark. On a
+        graceful shutdown the predecessor's flush wrote the row before it died;
+        this is what stops the successor reporting it a second time.
+        """
+        pairs: Set[Tuple[str, str]] = set()
+        for event in self.bus.query(event_type=EventType.CRON_STALE, since=since):
+            payload = event.payload
+            if payload.get("scope") != "gateway_stopped":
+                continue
+            stopped_id = payload.get("gateway_stopped_event_id")
+            started_id = payload.get("cron_started_event_id")
+            if stopped_id and started_id:
+                pairs.add((stopped_id, started_id))
+        return pairs
+
+    @staticmethod
+    def _age_at_shutdown(started_ts: str, stopped_ts: str) -> int:
+        """Seconds into the run when the shutdown landed.
+
+        NOT measured against now: reconstruction happens an arbitrary time
+        later — the box may have been off for hours — so `now` would report the
+        DOWNTIME instead of the run. cf. 2a4ece2c07, which fixed exactly this
+        for the in-process path.
+        """
+        try:
+            started = datetime.fromisoformat(started_ts)
+            stopped = datetime.fromisoformat(stopped_ts)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, int((stopped - started).total_seconds()))
+
+    def _reconstruct_shutdown_attributions(self) -> None:
+        now = datetime.now(timezone.utc)
+        horizon = (now - timedelta(seconds=self.ATTRIBUTION_HORIZON_SECONDS)).isoformat()
+        report_floor = (
+            now - timedelta(seconds=self.HORIZON_REPORT_WINDOW_SECONDS)
+        ).isoformat()
+
+        # One query for both the work set and the exclusion report: gateway
+        # shutdowns are rare (28 rows all-time on the live bus), so a week of
+        # them is cheaper than a second round trip.
+        recent = self.bus.query(
+            event_type=EventType.GATEWAY_STOPPED, since=report_floor,
+        )
+        in_horizon = [e for e in recent if e.timestamp >= horizon]
+        excluded = len(recent) - len(in_horizon)
+        if excluded:
+            logger.info(
+                "CronStaleMonitor: %d gateway shutdown(s) in the last %dd are "
+                "older than the %ds attribution horizon and were not examined",
+                excluded,
+                self.HORIZON_REPORT_WINDOW_SECONDS // 86_400,
+                self.ATTRIBUTION_HORIZON_SECONDS,
+            )
+        if not in_horizon:
+            return
+
+        reported = self._already_attributed(horizon)
+        # Snapshot the head BEFORE reading: a cron_started landing mid-pass is
+        # then simply outside every window rather than half-visible.
+        head = self.bus.head_rowid()
+        emitted = already = landed = unresolved = 0
+
+        for stopped in in_horizon:
+            raw = stopped.payload.get("inflight_cron_correlation_ids") or []
+            if not isinstance(raw, (list, tuple)):
+                logger.warning(
+                    "CronStaleMonitor: %s carries a non-list "
+                    "inflight_cron_correlation_ids (%s) — skipped",
+                    stopped.event_id, type(raw).__name__,
+                )
+                continue
+            exit_reason = stopped.payload.get("exit_reason")
+
+            for correlation_id in raw:
+                if (stopped.event_id, correlation_id) in reported:
+                    already += 1
+                    continue
+                resolved = self.bus.event_with_rowid(correlation_id)
+                if resolved is None:
+                    # Retention evicted the row, or the id came from another
+                    # bus. Nothing to attribute it to.
+                    unresolved += 1
+                    continue
+                started_rowid, started = resolved
+                job_id = started.payload.get("job_id")
+                if started.event_type != EventType.CRON_STARTED or not job_id:
+                    unresolved += 1
+                    continue
+
+                # The FIRST of these three after the run began decides it: a
+                # terminal event means the run landed (the snapshot is taken
+                # early in teardown, so a listed run can still finish), while a
+                # newer CRON_STARTED means a later boot re-ran the job — that
+                # run's completion belongs to IT, not to this one.
+                outcome = self.bus.first_event_for_job(
+                    job_id,
+                    [EventType.CRON_STARTED, EventType.CRON_COMPLETED,
+                     EventType.CRON_FAILED],
+                    after_rowid=started_rowid,
+                    through_rowid=head,
+                )
+                if outcome is not None and outcome.event_type in (
+                    EventType.CRON_COMPLETED, EventType.CRON_FAILED,
+                ):
+                    landed += 1
+                    continue
+
+                job_name = (
+                    started.payload.get("job_name") or started.source or job_id
+                )
+                age = self._age_at_shutdown(started.timestamp, stopped.timestamp)
+                try:
+                    self.bus.emit(
+                        event_type=EventType.CRON_STALE,
+                        source="cron-stale-monitor",
+                        payload={
+                            "job_id": job_id,
+                            "job_name": job_name,
+                            "scope": "gateway_stopped",
+                            "exit_reason": exit_reason,
+                            "age_seconds": age,
+                            "gateway_stopped_event_id": stopped.event_id,
+                            "cron_started_event_id": correlation_id,
+                        },
+                        priority=Priority.NORMAL,
+                    )
+                except Exception:
+                    logger.exception(
+                        "CronStaleMonitor: failed to emit reconstructed "
+                        "gateway_stopped cron_stale for %s", job_id,
+                    )
+                    continue
+                emitted += 1
+                logger.info(
+                    "CronStaleMonitor: %s (%s) was cut short by a gateway "
+                    "shutdown (%s) after %ds — reconstructed from the bus, "
+                    "the previous gateway never recorded it",
+                    job_name, job_id, exit_reason, age,
+                )
+
+        log = logger.info if emitted else logger.debug
+        log(
+            "CronStaleMonitor: examined %d gateway shutdown(s) within the "
+            "%ds horizon — %d reconstructed, %d already reported, %d had "
+            "landed, %d unresolvable",
+            len(in_horizon), self.ATTRIBUTION_HORIZON_SECONDS,
+            emitted, already, landed, unresolved,
+        )
 
     def shutdown(self) -> None:
         """Flush staged shutdown attributions — the last moment they are true.

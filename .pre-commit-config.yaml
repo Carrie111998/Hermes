@@ -28,8 +28,18 @@ repos:
   # Deliberately NO --fix: a pre-commit hook that rewrites source during a
   # commit hides the change from the diff the author is reviewing, and the
   # F841 autofix in particular can delete side-effecting statements.
+  #
+  # The RULES stay in sync via ruff.toml. The ruff BINARIES are aligned by
+  # hand, and as of 2026-08-17 all THREE sit on 0.15.12:
+  #   1. this hook's `rev:` below (pre-commit's own isolated env)
+  #   2. both lint.yml jobs -- `uv tool install ruff==0.15.12` (:53, :147)
+  #   3. the local CLI -- `python -m pip install "ruff==0.15.12"`, which is
+  #      also what events/producers/ruff_gate_probe.py shells out to every
+  #      15 minutes, so drift there desyncs the alarm from this gate
+  # Nothing ENFORCES the equality -- no test asserts it -- so a bump is a
+  # three-file commit or it is a drift. Change all three together.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12 # keep in step with the local ruff and the CI job
+    rev: v0.15.12 # the ruff pre-commit runs -- see the version note above
     hooks:
       - id: ruff-check
         name: ruff (Pyflakes F group + PLW1514)

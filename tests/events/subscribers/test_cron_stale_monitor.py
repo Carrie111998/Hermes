@@ -660,3 +660,354 @@ class TestShutdownAttributionTiming:
             f"(run was {BACKDATE_SECONDS}s old when the shutdown was seen, "
             f"staged within {staged_within:.2f}s)"
         )
+
+
+# =========================================================================
+# Successor-side reconstruction (2026-08-17)
+#
+# The staged report above is flushed in shutdown(), which only runs on a
+# GRACEFUL teardown. A gateway force-killed past _TASKKILL_TIMEOUT_S, or cut
+# down by the shutdown watchdog's exit_code=1, never reaches it: the staged
+# reports die with the process and NOTHING is recorded for runs that genuinely
+# were killed. The 2026-08-12 census found six shutdowns started that day and
+# three completed — about half.
+#
+# The successor cannot recover them by handling the predecessor's
+# GATEWAY_STOPPED, because _started_event_ids is per-process and the cursor
+# seed is INSERT OR IGNORE — a restart never replays the CRON_STARTED rows that
+# built the map. Production, 2026-08-17 04:12:03Z: the successor handled it and
+# emitted nothing, every correlation id missing from an empty map.
+#
+# So the successor rebuilds the attribution from the bus in startup(), where
+# every input is durable and the answer is already final.
+# =========================================================================
+
+def _emit_completed(bus, job_id: str, event_type=None) -> str:
+    return bus.emit(
+        event_type=event_type or EventType.CRON_COMPLETED,
+        source="scheduler",
+        payload={"job_id": job_id, "job_name": job_id},
+    )
+
+
+def _backdate(bus, event_id: str, when: datetime) -> None:
+    """Rewrite one stored row's timestamp; rowid order is untouched."""
+    import sqlite3
+    conn = sqlite3.connect(str(bus.db_path))
+    conn.execute(
+        "UPDATE events SET timestamp = ? WHERE event_id = ?",
+        (when.isoformat(), event_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _rowid_of(bus, event_id: str) -> int:
+    import sqlite3
+    conn = sqlite3.connect(str(bus.db_path))
+    try:
+        return conn.execute(
+            "SELECT rowid FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _cursor_of(bus, subscriber_id: str) -> int:
+    import sqlite3
+    conn = sqlite3.connect(str(bus.db_path))
+    try:
+        row = conn.execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            (subscriber_id,),
+        ).fetchone()
+        return -1 if row is None else row[0]
+    finally:
+        conn.close()
+
+
+def _set_cursor(bus, subscriber_id: str, rowid: int) -> None:
+    bus._execute(
+        "INSERT OR REPLACE INTO subscriber_cursors "
+        "(subscriber_id, last_rowid, updated_at) VALUES (?, ?, datetime('now'))",
+        (subscriber_id, rowid),
+    )
+
+
+def _successor(bus):
+    """A monitor as a NEW gateway process builds it.
+
+    Deliberately NOT ``_monitor()``: the successor's in-memory state is empty
+    and its cursor is whatever the predecessor left, which is the entire reason
+    handle() cannot resolve these correlation ids.
+    """
+    return CronStaleMonitor(bus)
+
+
+def _shutdown_stales(bus):
+    return [e for e in _stale_events(bus)
+            if e.payload.get("scope") == "gateway_stopped"]
+
+
+class TestStartupShutdownReconstruction:
+    def test_reports_a_run_whose_gateway_was_force_killed(self, bus):
+        """The gap itself: no predecessor flush ever happened."""
+        from events.schema import Priority
+
+        started_id = _emit_started(bus, "job-killed")
+        stopped_id = _emit_gateway_stopped(
+            bus, [started_id], exit_reason="force_kill",
+        )
+
+        mon = _successor(bus)
+        mon.startup()
+
+        evts = _shutdown_stales(bus)
+        assert len(evts) == 1, (
+            "a run the shutdown killed went unrecorded because the process "
+            "died before shutdown() could flush it"
+        )
+        payload = evts[0].payload
+        assert payload["job_id"] == "job-killed"
+        assert payload["job_name"] == "job-killed"
+        assert payload["exit_reason"] == "force_kill"
+        assert payload["cron_started_event_id"] == started_id
+        assert payload["gateway_stopped_event_id"] == stopped_id
+        assert evts[0].priority == Priority.NORMAL, (
+            "a deliberate kill is explained, not paged"
+        )
+
+    def test_handling_alone_cannot_do_it_which_is_why_startup_exists(self, bus):
+        """Reproduces production 2026-08-17 04:12:03Z.
+
+        The predecessor consumed the cron_started (its cursor advanced past it)
+        and died before the gateway_stopped, so the successor's poll() sees the
+        shutdown against an empty _started_event_ids map. Nothing is emitted.
+        This is the motivation, and it must stay true: the fix is a startup
+        query, NOT a cursor rewind that would replay the CRON_STARTED rows.
+        """
+        started_id = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [started_id])
+
+        mon = _successor(bus)
+        _set_cursor(bus, mon.subscriber_id, _rowid_of(bus, started_id))
+
+        mon.poll()
+        mon.shutdown()
+
+        assert _shutdown_stales(bus) == []
+        assert mon._started_event_ids == {}
+
+    def test_does_not_double_report_what_the_predecessor_flushed(self, bus):
+        """One shutdown, two killed runs, one already reported by the
+        predecessor's graceful flush. The successor must add exactly the
+        missing one."""
+        killed_a = _emit_started(bus, "job-a")
+        killed_b = _emit_started(bus, "job-b")
+
+        # The predecessor saw the shutdown and flushed — but only for job-a
+        # (it was force-killed partway through, or job-b's correlation id was
+        # not in its map). Emitted through the real path, not hand-rolled.
+        pred = _monitor(bus)
+        pred.poll()
+        _emit_gateway_stopped(bus, [killed_a, killed_b])
+        pred.poll()
+        pred._pending_shutdown = [
+            p for p in pred._pending_shutdown if p["job_id"] == "job-a"
+        ]
+        pred.shutdown()
+        assert [e.payload["job_id"] for e in _shutdown_stales(bus)] == ["job-a"]
+
+        mon = _successor(bus)
+        mon.startup()
+
+        reported = sorted(e.payload["job_id"] for e in _shutdown_stales(bus))
+        assert reported == ["job-a", "job-b"], (
+            f"expected job-a kept and job-b added, got {reported}"
+        )
+
+    def test_running_twice_reports_once(self, bus):
+        """Every boot re-examines the horizon; the bus dedupe is what keeps it
+        idempotent, since no watermark is persisted."""
+        started_id = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [started_id])
+
+        _successor(bus).startup()
+        _successor(bus).startup()
+
+        assert len(_shutdown_stales(bus)) == 1
+
+    def test_a_run_that_landed_during_teardown_is_not_reported(self, bus):
+        """The early snapshot lists runs that can still finish. Evaluated after
+        the fact the answer is already known — no deferral needed."""
+        landed = _emit_started(bus, "job-finishes-late")
+        killed = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [landed, killed])
+        # cron_completed lands AFTER the gateway_stopped row, exactly as it did
+        # live (05:31:30 report, 05:32:05 completion).
+        _emit_completed(bus, "job-finishes-late")
+
+        mon = _successor(bus)
+        mon.startup()
+
+        assert [e.payload["job_id"] for e in _shutdown_stales(bus)] == ["job-killed"]
+
+    def test_a_failed_run_also_counts_as_landed(self, bus):
+        landed = _emit_started(bus, "job-failed-late")
+        killed = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [landed, killed])
+        _emit_completed(bus, "job-failed-late", event_type=EventType.CRON_FAILED)
+
+        _successor(bus).startup()
+
+        assert [e.payload["job_id"] for e in _shutdown_stales(bus)] == ["job-killed"]
+
+    def test_a_later_rerun_is_not_the_killed_runs_completion(self, bus):
+        """A boot between the shutdown and this pass can re-run the same job.
+        That run's terminal event belongs to IT, not to the killed run — so the
+        outcome search must stop at the next cron_started for the job."""
+        killed = _emit_started(bus, "job-x")
+        _emit_gateway_stopped(bus, [killed])
+        _emit_started(bus, "job-x")          # the successor's own re-run
+        _emit_completed(bus, "job-x")        # ...which finished fine
+
+        mon = _successor(bus)
+        mon.startup()
+
+        evts = _shutdown_stales(bus)
+        assert len(evts) == 1, (
+            "the re-run's completion was mistaken for the killed run finishing"
+        )
+        assert evts[0].payload["cron_started_event_id"] == killed
+
+    def test_age_is_measured_against_the_shutdown_not_now(self, bus):
+        """age_seconds means "how far into the run did the shutdown land".
+
+        Reconstruction happens an arbitrary time later — the gateway may have
+        been down for hours — so measuring against now would report the
+        DOWNTIME, not the run. cf. 2a4ece2c07, which fixed exactly this for the
+        in-process path.
+        """
+        base = datetime.now(timezone.utc)
+        started_id = _emit_started(bus, "job-killed",
+                                   started_at=base - timedelta(seconds=900))
+        stopped_id = _emit_gateway_stopped(bus, [started_id])
+        _backdate(bus, stopped_id, base - timedelta(seconds=300))
+
+        mon = _successor(bus)
+        mon.startup()
+
+        evts = _shutdown_stales(bus)
+        assert len(evts) == 1
+        assert evts[0].payload["age_seconds"] == 600, (
+            f"expected 900-300=600s into the run, got "
+            f"{evts[0].payload['age_seconds']}s"
+        )
+
+    def test_shutdowns_older_than_the_horizon_are_skipped_and_logged(self, bus, caplog):
+        """The bus is hundreds of MB and cron events dominate it. The lookback
+        is bounded — but what the bound drops is logged, not swallowed."""
+        import logging
+
+        base = datetime.now(timezone.utc)
+        old_start = _emit_started(bus, "job-ancient",
+                                  started_at=base - timedelta(days=3, seconds=60))
+        old_stop = _emit_gateway_stopped(bus, [old_start])
+        _backdate(bus, old_stop, base - timedelta(days=3))
+
+        fresh_start = _emit_started(bus, "job-recent")
+        _emit_gateway_stopped(bus, [fresh_start])
+
+        mon = _successor(bus)
+        with caplog.at_level(logging.INFO,
+                             logger="events.subscribers.cron_stale_monitor"):
+            mon.startup()
+
+        assert [e.payload["job_id"] for e in _shutdown_stales(bus)] == ["job-recent"]
+        assert any("horizon" in r.getMessage() for r in caplog.records), (
+            f"the excluded shutdown was dropped silently: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_an_unresolvable_correlation_id_is_skipped(self, bus):
+        """Retention can evict the cron_started row. Skip that id, keep going."""
+        killed = _emit_started(bus, "job-known")
+        _emit_gateway_stopped(bus, ["evt-evicted-by-retention", killed])
+
+        mon = _successor(bus)
+        mon.startup()
+
+        assert [e.payload["job_id"] for e in _shutdown_stales(bus)] == ["job-known"]
+
+    def test_only_the_listed_ids_are_attributed(self, bus):
+        """A restart gap means open runs the ticker never finished for
+        unrelated reasons. Only what the payload lists was killed by THIS
+        shutdown."""
+        killed = _emit_started(bus, "job-killed")
+        _emit_started(bus, "job-open-for-other-reasons")
+        _emit_gateway_stopped(bus, [killed])
+
+        _successor(bus).startup()
+
+        assert [e.payload["job_id"] for e in _shutdown_stales(bus)] == ["job-killed"]
+
+    def test_a_malformed_inflight_list_is_skipped(self, bus):
+        killed = _emit_started(bus, "job-killed")
+        bus.emit(
+            event_type=EventType.GATEWAY_STOPPED,
+            source="gateway",
+            payload={"exit_reason": "graceful",
+                     "inflight_cron_correlation_ids": "not-a-list"},
+        )
+        bus.emit(
+            event_type=EventType.GATEWAY_STOPPED,
+            source="gateway",
+            payload={"exit_reason": "graceful"},  # key absent
+        )
+        _emit_gateway_stopped(bus, [killed])
+
+        _successor(bus).startup()
+
+        assert [e.payload["job_id"] for e in _shutdown_stales(bus)] == ["job-killed"]
+
+    def test_startup_does_not_move_the_cursor_or_fire_handlers(self, bus):
+        """ADR-0018: replaying history re-fires every handler and is the
+        scanner flood the INSERT OR IGNORE seed exists to prevent. The
+        reconstruction is a TARGETED query, never a cursor rewind."""
+        started_id = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [started_id])
+
+        mon = _successor(bus)
+        _set_cursor(bus, mon.subscriber_id, 0)
+
+        mon.startup()
+
+        assert _cursor_of(bus, mon.subscriber_id) == 0, "the cursor was rewound/advanced"
+        assert mon._open_jobs == {}, "startup() consumed events through handle()"
+        assert mon._started_event_ids == {}
+        assert mon._pending_shutdown == []
+
+    def test_a_failing_bus_query_does_not_break_startup(self, bus, monkeypatch):
+        """startup_all() runs inline in gateway boot — this may never block it."""
+        started_id = _emit_started(bus, "job-killed")
+        _emit_gateway_stopped(bus, [started_id])
+
+        mon = _successor(bus)
+
+        def _boom(*a, **kw):
+            raise RuntimeError("bus unavailable")
+
+        monkeypatch.setattr(bus, "query", _boom)
+
+        mon.startup()  # must not raise
+
+        # Read the bus directly: query() is the thing that is broken.
+        import sqlite3
+        conn = sqlite3.connect(str(bus.db_path))
+        try:
+            emitted = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'cron_stale'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert emitted == 0

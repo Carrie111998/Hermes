@@ -50,7 +50,12 @@ jobs:
       - name: Install ruff + ty
         uses: ./.github/actions/retry
         with:
-          command: uv tool install ruff && uv tool install ty
+          # ruff is PINNED and must equal .pre-commit-config.yaml's
+          # ruff-pre-commit rev and the local CLI -- see the ruff-blocking job
+          # below for why all three move together. ty is deliberately left
+          # floating: this job is advisory, and ty has no second enforcer to
+          # disagree with.
+          command: uv tool install ruff==0.15.12 && uv tool install ty
 
       - name: Determine base ref
         id: base
@@ -144,7 +149,14 @@ jobs:
       - name: Install ruff
         uses: ./.github/actions/retry
         with:
-          command: uv tool install ruff
+          # PINNED, and the pin is load-bearing: three separate ruff binaries
+          # enforce this one rule set -- this job, the pre-commit hook
+          # (.pre-commit-config.yaml `rev:`), and the local CLI that
+          # events/producers/ruff_gate_probe.py shells out to every 15 minutes.
+          # Unpinned, this job silently drifts to whatever ruff released today
+          # and can disagree with the other two about the same tree. Bump all
+          # three in one commit or not at all.
+          command: uv tool install ruff==0.15.12
 
       - name: ruff check .
         # No --exit-zero, no || true. Exit code propagates to the job,
