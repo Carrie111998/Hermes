@@ -27,8 +27,10 @@ create table if not exists candidate_records (
 
 create index if not exists ix_candidate_records_country
   on candidate_records(country, dataset_id, version);
-create index if not exists ix_candidate_records_name
-  on candidate_records(normalized_name);
+create unique index if not exists ux_candidate_records_domain
+  on candidate_records(dataset_id, version, domain) where domain is not null;
+create unique index if not exists ux_candidate_records_normalized_name_country
+  on candidate_records(dataset_id, version, normalized_name, country);
 
 -- No policies are intentionally created.  With RLS enabled this is deny-all
 -- for anon/authenticated, while the server's database role retains access.

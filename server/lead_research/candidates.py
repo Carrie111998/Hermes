@@ -93,13 +93,11 @@ def _as_list(value: Any, field: str, row_number: int) -> list[str]:
     )
 
 
-def _normalize_url(value: Any, field: str, row_number: int, *, allow_bare_domain: bool = False) -> str | None:
+def _normalize_url(value: Any, field: str, row_number: int) -> str | None:
     text = _clean(value)
     if text is None:
         return None
     parsed = urlparse(text)
-    if allow_bare_domain and not parsed.scheme and not parsed.netloc:
-        parsed = urlparse(f"https://{text}")
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise CandidateImportValidationError(f"row {row_number}: {field} must be an http or https URL")
     hostname = parsed.hostname.lower().rstrip(".").removeprefix("www.")
@@ -129,23 +127,27 @@ def _read_rows(filename: str, content: bytes) -> list[tuple[int, dict[str, Any]]
         if not reader.fieldnames:
             raise CandidateImportValidationError("CSV must include a header row")
         return [(number, dict(row)) for number, row in enumerate(reader, start=2)]
-    if suffix != "json":
-        raise CandidateImportValidationError("only .csv and .json candidate corpora are supported")
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise CandidateImportValidationError("file is not valid JSON") from exc
-    rows = payload.get("candidates") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        raise CandidateImportValidationError("JSON must be an object containing a candidates array")
-    if any(not isinstance(row, dict) for row in rows):
-        raise CandidateImportValidationError("each candidate must be an object")
-    return list(enumerate(rows, start=1))
+    if suffix == "json":
+        raise CandidateImportValidationError("candidate corpora must use JSON Lines (.jsonl), not .json")
+    if suffix != "jsonl":
+        raise CandidateImportValidationError("only .csv and JSON Lines (.jsonl) candidate corpora are supported")
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for row_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            raise CandidateImportValidationError(f"JSON Lines row {row_number} is blank")
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CandidateImportValidationError(f"JSON Lines row {row_number} is not valid JSON") from exc
+        if not isinstance(row, dict):
+            raise CandidateImportValidationError(f"JSON Lines row {row_number} must be an object")
+        rows.append((row_number, row))
+    return rows
 
 
 def _candidate_from_row(source: dict[str, Any], row_number: int) -> CandidateRecord:
-    source_record_id = _clean(_source_value(source, "source_record_id", "record_id", "id"))
-    company_name = _clean(_source_value(source, "company_name", "name", "legal_name"))
+    source_record_id = _clean(source.get("source_record_id"))
+    company_name = _clean(source.get("company_name"))
     country = _clean(source.get("country"))
     if not source_record_id:
         raise CandidateImportValidationError(f"row {row_number}: source_record_id is required")
@@ -154,19 +156,14 @@ def _candidate_from_row(source: dict[str, Any], row_number: int) -> CandidateRec
     country = country.upper() if country else None
     if country not in ISO_ALPHA_2:
         raise CandidateImportValidationError(f"row {row_number}: country must use an ISO alpha-2 code")
-    website = _source_value(source, "website", "url")
-    domain_value = website if website is not None else source.get("domain")
-    domain = _normalize_url(
-        domain_value, "website" if website is not None else "domain", row_number,
-        allow_bare_domain=website is None,
-    )
+    domain = _normalize_url(source.get("domain"), "domain", row_number)
     aliases = _as_list(source.get("aliases"), "aliases", row_number)
     categories = _as_list(_source_value(source, "categories", "category"), "categories", row_number)
     buyer_types = _as_list(_source_value(source, "buyer_types", "buyer_type"), "buyer_types", row_number)
     provenance_url = _provenance_url(source.get("provenance_url"), row_number)
     known = {
-        "source_record_id", "record_id", "id", "company_name", "name", "legal_name", "country",
-        "website", "url", "domain", "aliases", "categories", "category", "buyer_types", "buyer_type",
+        "source_record_id", "company_name", "country", "domain", "aliases", "categories", "category",
+        "buyer_types", "buyer_type",
         "provenance_url",
     }
     data = {key: value for key, value in source.items() if key not in known}
@@ -189,13 +186,34 @@ def _parse_rows(filename: str, content: bytes) -> list[CandidateRecord]:
     candidates = [_candidate_from_row(source, row_number) for row_number, source in rows]
     seen_ids: set[str] = set()
     duplicate_ids: set[str] = set()
+    seen_domains: set[str] = set()
+    duplicate_domains: set[str] = set()
+    seen_names: set[tuple[str, str]] = set()
+    duplicate_names: set[tuple[str, str]] = set()
     for record in candidates:
         if record.source_record_id in seen_ids:
             duplicate_ids.add(record.source_record_id)
         seen_ids.add(record.source_record_id)
+        if record.domain:
+            if record.domain in seen_domains:
+                duplicate_domains.add(record.domain)
+            seen_domains.add(record.domain)
+        identity = (record.normalized_name, record.country)
+        if identity in seen_names:
+            duplicate_names.add(identity)
+        seen_names.add(identity)
     if duplicate_ids:
         raise CandidateImportConflict(
             "Duplicate source_record_id in candidate corpus: " + ", ".join(sorted(duplicate_ids))
+        )
+    if duplicate_domains:
+        raise CandidateImportConflict(
+            "Duplicate normalized domain in candidate corpus: " + ", ".join(sorted(duplicate_domains))
+        )
+    if duplicate_names:
+        raise CandidateImportConflict(
+            "Duplicate normalized company_name and country in candidate corpus: "
+            + ", ".join(f"{name} ({country})" for name, country in sorted(duplicate_names))
         )
     return candidates
 

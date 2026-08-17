@@ -28,7 +28,7 @@ def db(tmp_path):
 @pytest.fixture()
 def candidate_csv():
     return (
-        b"source_record_id,company_name,country,website,aliases,categories,buyer_types,provenance_url\n"
+        b"source_record_id,company_name,country,domain,aliases,categories,buyer_types,provenance_url\n"
         b"atlas-1,Atlas Kitchens GmbH,de,HTTPS://WWW.Atlas.Example/path,Atlas;Atlas Kitchen,"
         b"Kitchen appliances;Built-in ovens,importer;distributor,https://registry.example/atlas-1\n"
         b"north-2,Northstar Retail,FR,https://northstar.example,Northstar,"
@@ -54,7 +54,7 @@ def test_candidate_import_never_creates_tenant_leads(db, candidate_csv):
     "field,value,message",
     [
         ("country", "XX", "ISO alpha-2"),
-        ("website", "ftp://atlas.example", "http or https URL"),
+        ("domain", "ftp://atlas.example", "http or https URL"),
         ("provenance_url", "not a url", "http or https URL"),
     ],
 )
@@ -146,3 +146,91 @@ def test_candidate_import_cli_emits_only_corpus_identity(monkeypatch, tmp_path, 
         "count": 2,
         "raw_hash": hashlib.sha256(candidate_csv).hexdigest(),
     }
+
+
+def test_jsonl_candidate_corpus_imports_each_utf8_json_line(db):
+    """Treating JSONL as one JSON object would discard valid source rows."""
+    payload = b"\n".join([
+        b'{"source_record_id":"atlas-1","company_name":"Atlas Kitchens GmbH","country":"DE",'
+        b'"domain":"https://atlas.example","categories":["Built-in ovens"]}',
+        b'{"source_record_id":"north-2","company_name":"Northstar Retail","country":"FR",'
+        b'"domain":"https://northstar.example","categories":["Refrigerators"]}',
+    ]) + b"\n"
+
+    report = CandidateRepository(db).import_file("kitchen-appliances", "2026-09", "candidates.jsonl", payload)
+
+    assert report.imported == 2
+    assert [record.source_record_id for record in CandidateRepository(db).select(
+        countries=[], product_terms=[], limit=10,
+    )] == ["atlas-1", "north-2"]
+
+
+def test_json_candidate_payload_is_rejected_without_writes(db):
+    """Accepting a JSON envelope would violate the JSON Lines import contract."""
+    payload = b'{"candidates":[{"source_record_id":"atlas-1","company_name":"Atlas","country":"DE"}]}'
+
+    with pytest.raises(CandidateImportValidationError, match="JSON Lines"):
+        CandidateRepository(db).import_file("kitchen-appliances", "2026-09", "candidates.json", payload)
+
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_datasets")["n"] == 0
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_records")["n"] == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["source_record_id", "company_name"],
+)
+def test_import_requires_canonical_identity_fields(db, field):
+    """Alias keys would make source identity depend on undocumented input shape."""
+    row = {"source_record_id": "atlas-1", "company_name": "Atlas", "country": "DE"}
+    value = row.pop(field)
+    row[{"source_record_id": "id", "company_name": "name"}[field]] = value
+
+    with pytest.raises(CandidateImportValidationError, match=field):
+        CandidateRepository(db).import_file(
+            "kitchen-appliances", "2026-09", "candidates.jsonl", json.dumps(row).encode() + b"\n",
+        )
+
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_datasets")["n"] == 0
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_records")["n"] == 0
+
+
+@pytest.mark.parametrize(
+    "second,reason",
+    [
+        (
+            {"source_record_id": "atlas-2", "company_name": "Other Atlas", "country": "FR",
+             "domain": "https://ATLAS.example/elsewhere"},
+            "Duplicate normalized domain",
+        ),
+        (
+            {"source_record_id": "atlas-2", "company_name": " atlas kitchens ", "country": "DE",
+             "domain": "https://other.example"},
+            "Duplicate normalized company_name and country",
+        ),
+    ],
+)
+def test_duplicate_normalized_candidate_identity_rejects_entire_file(db, second, reason):
+    """Identity collisions must not leave a partially imported shared corpus."""
+    first = {
+        "source_record_id": "atlas-1", "company_name": "Atlas Kitchens", "country": "DE",
+        "domain": "https://www.atlas.example",
+    }
+    payload = (json.dumps(first) + "\n" + json.dumps(second) + "\n").encode()
+
+    with pytest.raises(CandidateImportConflict, match=reason):
+        CandidateRepository(db).import_file("kitchen-appliances", "2026-09", "candidates.jsonl", payload)
+
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_datasets")["n"] == 0
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_records")["n"] == 0
+
+
+def test_bare_domain_is_rejected_without_writes(db):
+    """A bare hostname cannot establish validated HTTP(S) provenance."""
+    payload = b'{"source_record_id":"atlas-1","company_name":"Atlas","country":"DE","domain":"atlas.example"}\n'
+
+    with pytest.raises(CandidateImportValidationError, match="http or https URL"):
+        CandidateRepository(db).import_file("kitchen-appliances", "2026-09", "candidates.jsonl", payload)
+
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_datasets")["n"] == 0
+    assert db.one("SELECT COUNT(*) AS n FROM candidate_records")["n"] == 0

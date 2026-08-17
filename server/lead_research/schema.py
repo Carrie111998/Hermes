@@ -86,5 +86,8 @@ CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(compa
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
 CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_candidate_records_country ON candidate_records(country, dataset_id, version);
-CREATE INDEX IF NOT EXISTS ix_candidate_records_name ON candidate_records(normalized_name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_candidate_records_domain
+    ON candidate_records(dataset_id, version, domain) WHERE domain IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_candidate_records_normalized_name_country
+    ON candidate_records(dataset_id, version, normalized_name, country);
 """
