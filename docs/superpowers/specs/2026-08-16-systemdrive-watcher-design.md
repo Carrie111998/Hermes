@@ -76,6 +76,39 @@ These are not negotiable; they encode failures already paid for.
 6. **Never deletes or walks the tree.** The file sizes and version counters inside it
    are the evidence.
 
+## ⚠ SUPERSEDED IN PART, 2026-08-17 — read this before trusting the rationale below
+
+**The hunt this instrument was built for is CLOSED.** Both writers were found and
+fixed on `main`: `run_secret_cli` (`ba920d1b5e` / `c3b8083116`) and
+`scripts/run_tests.sh`'s `env -i` `CLEAN_ENV` (`3bc7442b9b`). Neither was found by
+this watcher.
+
+**And the ring buffer — the centrepiece of everything below — is largely redundant on
+this box.** Windows Security **4688 process-creation auditing is enabled here, with
+command-line capture and ~2 days retention** (verified 2026-08-17). Every sighting in
+the hunt was attributable straight from that log. The entire premise of the ring
+buffer is that *ancestry is perishable*; it is not perishable when the OS already
+recorded it. **Check 4688 first for any "what process did X" question** — and do not
+pre-filter narrowly, since a filtered pass over the 18:29:34 window returned "no
+matches" while the unfiltered dump exposed the chain immediately.
+
+What still holds its value: **detection**. Sub-millisecond `ReadDirectoryChangesW`
+firing, a durable record written at the moment of the event, and a `done` record that
+refuses to claim a clean NEGATIVE it has not earned. 4688 tells you *what ran*; it
+does not tell you *that a directory appeared* or hand you an unambiguous negative.
+
+**The joke at this design's expense, worth keeping:** on 2026-08-17 01:39:37 the
+watcher *itself* wrote a `%SystemDrive%` tree into a worktree root — a session ran it
+under `env -i` with an allowlist byte-for-byte identical to the pre-fix `CLEAN_ENV`,
+using the MSIX python. It reproduced the exact condition it exists to detect, and its
+CWD was the worktree root while it watched a different directory, so the artifact
+landed where its own watch could not see it. Two rules follow: give any probe
+`SYSTEMDRIVE` or pin its `cwd` outside the repo, and remember that **a watcher's CWD
+is part of its blast radius**.
+
+Everything below is preserved as the design record. Read it as history, not as
+current guidance on how to attribute a writer.
+
 ## Known limitation this design must attack
 
 The 2026-08-16 prototype (`scratchpad/junk_watcher.py`) fired correctly but **the
