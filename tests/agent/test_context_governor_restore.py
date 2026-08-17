@@ -1247,6 +1247,143 @@ def test_host_todo_snapshot_does_not_block_recursive_llm_checkpoint():
     assert engine.last_error is None
 
 
+def test_host_alternation_repair_is_bound_into_the_receipt_projection():
+    """The finalized receipt must describe the host-repaired transcript.
+
+    Regression: compact-v2 emits compacted tool-result notes as consecutive
+    assistant messages (inline notes, not provider tool results), which
+    Hermes' conversation loop merges in memory immediately after
+    ``compress()`` returns. If the receipt bound the un-repaired transcript,
+    the next compaction's child input no longer exactly prefixes the stored
+    parent and the Rust recursive-lineage check rejects it — deterministic
+    compaction became one-shot per session (every later attempt failed and
+    the LLM checkpoint could never reach its generation boundary).
+    """
+    config = {
+        "context": {
+            "governor": {
+                "summary_mode": "llm",
+                "checkpoint_strategy": "off",
+            }
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=config):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    _bind_fixture(engine)
+    engine._target_tokens = lambda current_tokens: 900
+    parent_projection = None
+    generation = 0
+
+    def compact_response(gen: int) -> dict:
+        return {
+            "receipt": {
+                "schema": "ContextCompactionReceiptV2",
+                "receipt_id": f"ctxr_{gen:032x}",
+                "session_id": "hermes-session",
+                "generation": gen,
+                "original_approx_tokens": 1000,
+                "compacted_approx_tokens": 500,
+                "token_savings_estimate": 500,
+                "original_transcript_blake3": "a" * 64,
+                "compacted_transcript_blake3": "b" * 64,
+                "original_transcript_sha256": "c" * 64,
+                "compacted_transcript_sha256": "d" * 64,
+            },
+            "allocation_plan": {"summary_id": None, "items": [], "summarized_item_ids": []},
+            "compacted_messages": [
+                {"role": "user", "content": "keep me"},
+                {"role": "assistant", "content": "[Tool result call_a]: first"},
+                {"role": "assistant", "content": "[Tool result call_b]: second"},
+                {"role": "assistant", "content": "[Tool result call_c]: third"},
+                {"role": "user", "content": "start"},
+            ],
+        }
+
+    def run_json(args, payload):
+        nonlocal generation, parent_projection
+        if args[:3] == ["compact-v2", "--dir", str(engine.store_dir)]:
+            incoming = payload["messages"]
+            if (
+                parent_projection is not None
+                and incoming[: len(parent_projection)] != parent_projection
+            ):
+                raise RuntimeError(
+                    "parent compacted transcript is not the exact child-input prefix"
+                )
+            generation += 1
+            return compact_response(generation)
+        if args[:3] == ["search", "--dir", str(engine.store_dir)]:
+            return []
+        if args and args[0] == "finalize-v2":
+            response = copy.deepcopy(payload["candidate"])
+            response["compacted_messages"] = copy.deepcopy(
+                payload["compacted_messages"]
+            )
+            parent_projection = response["compacted_messages"]
+            tokens = sum(
+                max(1, len(str(message.get("content", ""))) // 4)
+                for message in parent_projection
+            )
+            response["receipt"]["compacted_approx_tokens"] = tokens
+            response["receipt"]["token_savings_estimate"] = 1000 - tokens
+            return response
+        if args[:3] == ["prepare-v2", "--dir", str(engine.store_dir)]:
+            receipt = payload["receipt"]
+            return {
+                "schema": "PendingReceiptInfoV2",
+                "receipt_id": receipt["receipt_id"],
+                "session_id": receipt["session_id"],
+                "generation": receipt["generation"],
+                "created_utc": "2026-08-16T00:00:00Z",
+                "pending_path": f"/tmp/{receipt['receipt_id']}.json",
+                "expected_compacted_message_count": len(payload["compacted_messages"]),
+                "expected_compacted_transcript_blake3": receipt[
+                    "compacted_transcript_blake3"
+                ],
+                "expected_compacted_transcript_sha256": receipt[
+                    "compacted_transcript_sha256"
+                ],
+                "expected_compacted_messages": copy.deepcopy(
+                    payload["compacted_messages"]
+                ),
+                "verified": True,
+            }
+        if args[:3] == ["activate-v2", "--dir", str(engine.store_dir)]:
+            return {
+                "schema": "ReceiptActivationResultV2",
+                "receipt_id": payload["receipt_id"],
+                "activated": True,
+                "verified": True,
+            }
+        raise AssertionError(f"unexpected command: {args}")
+
+    engine._run_json = run_json
+    first = engine.compress(
+        [{"role": "user", "content": "start"}], current_tokens=100
+    )
+    engine.commit_pending_compression(first)
+
+    # The finalized projection must already be the host-repaired form: the
+    # receipt carries no consecutive-assistant run, so the host's own repair
+    # after compress() is a no-op and the live transcript matches the parent.
+    roles = [m.get("role") for m in parent_projection]
+    assert all(
+        roles[i] != "assistant" or roles[i + 1] != "assistant"
+        for i in range(len(roles) - 1)
+    ), f"receipt projection still has consecutive assistants: {roles}"
+    assert repair_message_sequence(None, first) == 0
+
+    # Grow the session exactly as the host does (its repair is now a no-op)
+    # and compact again: the child must chain onto the stored parent.
+    second = engine.compress(
+        first + [{"role": "user", "content": "next"}], current_tokens=100
+    )
+    engine.commit_pending_compression(second)
+
+    assert engine.last_error is None
+    assert generation == 2
+
+
 def test_governor_projection_roundtrips_through_session_store(tmp_path):
     """Receipt projection fields must survive Hermes' durable in-place rewrite."""
     db = SessionDB(db_path=tmp_path / "state.db")

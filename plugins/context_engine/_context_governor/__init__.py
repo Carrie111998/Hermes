@@ -1143,7 +1143,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 target_tokens=target_tokens,
             )
             metrics["llm_call_reason"] = checkpoint_reason
-            response_finalized = False
             llm_checkpoint_applied = False
             pending_previous_summary: str | None = None
             if checkpoint:
@@ -1182,9 +1181,13 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                             and not isinstance(candidate_tokens, bool)
                             and candidate_tokens <= target_tokens
                         ):
-                            response = candidate_response
+                            # The candidate receipt serves only the
+                            # token-budget check below. The authoritative
+                            # binding happens once, after host-equivalent
+                            # alternation repair (see finalize below), so the
+                            # receipt describes the exact transcript the host
+                            # persists.
                             compacted = candidate
-                            response_finalized = True
                             llm_checkpoint_applied = True
                             pending_previous_summary = self._summary_message_content(
                                 candidate
@@ -1216,8 +1219,16 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # Sanitation and the audited LLM checkpoint can both mutate the
             # emitted transcript. Rebind hashes/counts to that final adapter
             # output before persistence; never store the stale core response.
-            if not response_finalized:
-                response = self._finalize_response(response, compacted)
+            # The host repairs role-alternation in memory immediately after
+            # compress() returns. Apply the same repair BEFORE finalize so
+            # the receipt describes the exact transcript the host persists;
+            # otherwise the next compaction's input no longer exactly
+            # prefixes the stored parent and recursive lineage rejects it —
+            # which made deterministic compaction one-shot per session.
+            compacted = self._repair_for_host_alternation(compacted)
+            compacted = self._ensure_latest_user_last(source_messages, compacted)
+            compacted = self._preserve_multimodal_tail(source_messages, compacted)
+            response = self._finalize_response(response, compacted)
             finalized_messages = response.get("compacted_messages")
             if not isinstance(finalized_messages, list):
                 raise ValueError("finalize returned no compacted_messages list")
@@ -1839,6 +1850,45 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "context-governor: added %d stub tool result(s)", len(missing_results)
             )
 
+        return messages
+
+    def _repair_for_host_alternation(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Apply the host's role-alternation repair before receipt finalize.
+
+        compact-v2 deliberately emits compacted tool-result notes as
+        ``assistant`` messages (they are inline notes, not provider tool
+        results), which can leave consecutive-assistant runs. Hermes'
+        conversation loop repairs those in memory immediately after
+        ``compress()`` returns. If the receipt instead describes the
+        un-repaired transcript, the next compaction's child input no longer
+        exactly prefixes the stored parent compacted transcript and the
+        Rust recursive-lineage check rejects it — which made deterministic
+        compaction effectively one-shot per session (every later attempt
+        failed, and the LLM checkpoint could never reach its generation
+        boundary). Running the identical repair here, before finalize,
+        binds the receipt to the exact transcript the host persists.
+        """
+        if not messages:
+            return messages
+        try:
+            from agent.agent_runtime_helpers import repair_message_sequence
+
+            repairs = repair_message_sequence(None, messages)
+        except Exception as exc:
+            logger.warning(
+                "context-governor: host alternation repair unavailable (%s); "
+                "receipt may diverge from the live transcript",
+                exc,
+            )
+            return messages
+        if repairs:
+            logger.info(
+                "context-governor: applied host-equivalent alternation repair "
+                "(%d merge/drop) before receipt finalize",
+                repairs,
+            )
         return messages
 
     def _preserve_multimodal_tail(
