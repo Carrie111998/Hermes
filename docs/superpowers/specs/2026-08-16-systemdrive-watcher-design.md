@@ -91,6 +91,26 @@ Two latency sources, and the second was probably the larger:
 Design consequence: **detection latency and snapshot latency must both collapse, and
 even then attribution must not depend on the writer still being alive.**
 
+### Measured outcome (2026-08-16, on this box)
+
+| | Prototype | Built | Result |
+|---|---|---|---|
+| Detection latency | ≤1.5 s poll | `ReadDirectoryChangesW` | **0.4–2.7 ms, median 0.7 ms** (6 trials) — ~2000× |
+| Sighting record durable | after a full process snapshot | after the ring dump | **~ms**; verified durable at 311 ms while `on_hit` ran to 571 ms |
+| Attribution of an exited writer | impossible | ring buffer at 100 ms | captures the ~440 ms process class |
+
+**The snapshot mitigation needs a caveat, because the naive reading is wrong.**
+Replacing the PowerShell spawn removed a fixed ~0.5–1 s cost, but psutil is *not* cheap
+at full-table scale on Windows: `describe_pid` costs ~204 ms per process against ~968
+processes, because `ppid()` and `create_time()` each take a fresh full-table snapshot
+per call. A complete sweep is 60–200 s, and `process_iter(attrs=…)` is no faster
+(112.87 s / 919 processes), so the cost cannot be optimised away. That measurement is
+what forced the sighting record to be split — see the record formats below.
+
+The **ring buffer is unaffected** by this: it enriches only newly-appeared PIDs, so its
+cost tracks process *churn* rather than process *count*. That asymmetry is the reason
+the backward-looking design is affordable at all.
+
 ## Decisions
 
 | Decision | Choice |

@@ -504,11 +504,29 @@ def test_backend_downgrade_is_recorded_and_armed_agrees(tmp_path: Path, monkeypa
     clean negative.
 
     This test forces `_open_directory_handle` to fail and asserts BOTH
-    halves of the fix agree: a `backend_downgrade` record is written AND
-    `armed.backend_by_root` reports "polling" for that root. It fails
-    against the pre-fix code (which never calls `_open_directory_handle`
-    from `_start_backends` in a way this monkeypatch would intercept before
-    already having claimed the fast backend).
+    halves agree: a `backend_downgrade` record is written AND
+    `armed.backend_by_root` reports "polling" for that root.
+
+    HONEST LIMIT -- do not cite this test as what catches the original bug.
+    It passes against the PRE-FIX code too. Its monkeypatch fails EVERY
+    call, which the old throwaway probe caught just as correctly as the
+    current single open does. The real bug was TOCTOU-shaped -- first open
+    succeeds, second fails -- and that shape is no longer expressible,
+    because there is now exactly ONE `_open_directory_handle` call site and
+    the handle it returns is the one the watch thread uses.
+
+    So the invariant is guaranteed by ARCHITECTURE, not by this test. What
+    this test actually defends is the downgrade-and-agree behaviour: that a
+    root which cannot get the fast backend is recorded as downgraded and is
+    honestly reported as "polling" rather than being claimed as fast. If
+    someone ever reintroduces a second open, THIS TEST WILL NOT CATCH IT --
+    verify the single call site instead:
+
+        grep -n "_open_directory_handle(" scripts/systemdrive_watcher.py
+
+    Expect exactly TWO lines: the `def` itself, and one call inside
+    `_start_backends` feeding `_HandleOwner`. A third line means a second
+    open has crept back in and the lying-`armed`-record bug is live again.
     """
     import scripts.systemdrive_watcher as w
 
