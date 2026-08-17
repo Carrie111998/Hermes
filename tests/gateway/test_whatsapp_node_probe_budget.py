@@ -77,3 +77,52 @@ def test_nonzero_exit_still_reports_missing(monkeypatch):
     )
 
     assert wa.check_whatsapp_requirements() is False
+
+
+# ── The enablement path must never reach the probe above ────────────────────
+#
+# That 60s budget is DOUBLE pyproject's global ``--timeout=30`` pytest cap, and
+# ``--timeout-method=thread`` does not fail the test — ``pytest_timeout`` calls
+# ``os._exit(1)``, killing the interpreter and destroying the summary line, so
+# the runner parses the whole file as "no tests ran" (exactly the failure mode
+# that hid all 469 ``tests/hermes_cli/test_web_server.py`` tests until
+# 427bfa9b6f).  Ordinary unit tests reach it through
+# ``load_gateway_config()`` -> ``_apply_env_overrides()`` ->
+# ``deps_probe = entry.deps_available_fn or entry.check_fn`` — and
+# ``tests/conftest.py``'s live-system guard does not stop it: that guard blocks
+# package installs, remote-installer pipes and ``hermes update``, not a node
+# version probe.  So the platform supplies a ``deps_available_fn`` that answers
+# from the filesystem, and the spawning ``check_fn`` is left to ``connect()``.
+
+
+def test_deps_probe_spawns_nothing(monkeypatch):
+    """The enablement probe must not create a process, ever."""
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "whatsapp_deps_available spawned a subprocess: %r" % (args,)
+        )
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+
+    assert wa.whatsapp_deps_available() in (True, False)
+
+
+def test_registration_prefers_the_spawn_free_deps_probe():
+    """``deps_available_fn`` is what config-load calls; it must be the cheap one.
+
+    ``gateway/config.py`` falls back to ``check_fn`` only when
+    ``deps_available_fn`` is None, so dropping this kwarg silently reinstates
+    the 60s ``node --version`` spawn on every ``load_gateway_config()``.
+    """
+    captured = {}
+
+    class _Ctx:
+        def register_platform(self, **kwargs):
+            captured.update(kwargs)
+
+    wa.register(_Ctx())
+
+    assert captured["deps_available_fn"] is wa.whatsapp_deps_available
+    assert captured["deps_available_fn"] is not wa.check_whatsapp_requirements
+    assert captured["check_fn"] is wa.check_whatsapp_requirements

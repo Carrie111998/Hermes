@@ -35,6 +35,7 @@ from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (
     find_node_executable,
     get_hermes_dir,
+    node_executable_present,
     with_hermes_node_path,
 )
 
@@ -459,6 +460,17 @@ def _file_content_hash(path: Path) -> str:
 # is not bounded by a few seconds under load (netstat measured 8.2s / 9.6s /
 # 21.3s while idle).  A budget the probe routinely overruns turns a healthy
 # Node into "not installed" — see the TimeoutExpired branch below.
+#
+# This budget is DOUBLE pyproject's global `--timeout=30` pytest cap, and
+# `--timeout-method=thread` hard-exits the interpreter rather than failing the
+# test, destroying the run's summary line (the runner then reports the whole
+# file as "no tests ran").  That was survivable only because nothing in the
+# enablement path may reach this function any more: `deps_available_fn` below
+# answers "is Node installed?" from the filesystem, so `load_gateway_config()`
+# -> `_apply_env_overrides()` -> `deps_probe()` no longer spawns anything.  The
+# 60s budget now applies only to `connect()`, which is a genuine pre-spawn
+# runnability check and is stubbed by every unit test that reaches it.  Do not
+# reintroduce this probe into a per-config-load code path.
 _NODE_PROBE_TIMEOUT_S = 60
 
 
@@ -500,6 +512,25 @@ def _reset_env_fatal_attempts() -> None:
     """
     global _env_fatal_attempts
     _env_fatal_attempts = 0
+
+
+def whatsapp_deps_available() -> bool:
+    """Cheap "is the Node.js runtime installed?" probe — spawns nothing.
+
+    Registered as the platform's ``deps_available_fn``, which is what
+    ``gateway/config.py::_apply_env_overrides``, ``hermes_cli/gateway.py`` and
+    ``hermes_cli/status.py`` prefer over ``check_fn`` when they only need to
+    decide enablement.  ``check_whatsapp_requirements`` below is the ``check_fn``
+    and shells out to ``node --version`` under a 60s budget; running that on
+    every ``load_gateway_config()`` put a live host probe — with a budget twice
+    pytest's 30s cap — inside ordinary unit tests, where a single slow spawn
+    hard-exits the interpreter and voids the whole file's results.
+
+    Same shape as the fix already applied to the pip-installing ``check_fn``
+    sweep documented at ``gateway/config.py::_apply_env_overrides``: enablement
+    asks "are the deps installed?", not "load them now".
+    """
+    return node_executable_present("node")
 
 
 def check_whatsapp_requirements() -> bool:
@@ -2411,6 +2442,7 @@ def register(ctx) -> None:
         label="WhatsApp",
         adapter_factory=_build_adapter,
         check_fn=check_whatsapp_requirements,
+        deps_available_fn=whatsapp_deps_available,
         is_connected=_is_connected,
         required_env=["WHATSAPP_ENABLED"],
         install_hint="WhatsApp requires a Node.js bridge — see the WhatsApp messaging docs",

@@ -654,6 +654,42 @@ def find_node_executable(command: str) -> str | None:
     return find_node_executable_on_path(command)
 
 
+def node_executable_present(command: str) -> bool:
+    """Return True when *command* (node/npm/npx) is installed, without running it.
+
+    :func:`find_node_executable` answers a stricter question -- "give me a
+    binary I can spawn right now" -- and pays for it by *executing*
+    ``<binary> --version`` through :func:`node_tool_runnable`. That is correct
+    for callers about to spawn the binary, but it is the wrong price for
+    callers that only need "are this platform's dependencies installed?".
+    Process creation on this host is not bounded by a few seconds under load,
+    and enablement asks that question on every ``load_gateway_config()`` --
+    including the synchronous ``GET /api/status`` readiness probe and every
+    ordinary unit test that loads a gateway config.
+
+    Presence on disk *is* the installation check; whether the binary actually
+    runs is settled at spawn time by the code that spawns it. The WhatsApp
+    adapter's own probe already reasons this way -- see the ``TimeoutExpired``
+    branch of ``check_whatsapp_requirements``, which treats an overrun probe as
+    "present" precisely because resolution already proved installation.
+
+    Precedence mirrors :func:`find_node_executable` exactly: a Hermes-managed
+    binary wins, and when a managed tree exists we do NOT fall back to a system
+    Node on PATH.
+    """
+    names = _candidate_node_command_names(command)
+    for directory in iter_hermes_node_dirs():
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file() and (
+                sys.platform == "win32" or os.access(candidate, os.X_OK)
+            ):
+                return True
+    if hermes_managed_node_tree_present():
+        return False
+    return find_node_executable_on_path(command) is not None
+
+
 def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
     """Return *env* with Hermes-managed Node directories prepended to PATH."""
     merged = dict(os.environ if env is None else env)

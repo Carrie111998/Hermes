@@ -477,6 +477,210 @@ def test_ticker_survives_startup_recover_interrupted_failure():
     assert len(calls) >= 1, "ticker never ticked after a failing recover_interrupted()"
 
 
+def test_recover_interrupted_emits_cron_stale_for_each_recovered_run(tmp_path):
+    """A run whose owner died without reporting must still reach the event bus.
+
+    CronStaleMonitor's shutdown attribution only fires when the dying gateway
+    emits GATEWAY_STOPPED *and* survives long enough for
+    ``events/gateway_integration.py:shutdown()`` to flush the staged reports.
+    On Windows neither is guaranteed: ``hermes gateway stop`` gives the gateway
+    ``_windows_stop_drain_timeout()`` (clamped to 30s at
+    ``hermes_cli/gateway_windows.py:1593``) and then force-kills the PID, while
+    the flush lives in ``start_gateway()``'s teardown tail — far past the drain.
+    A cron mid-LLM-call routinely needs longer than 30s, so the kill lands first
+    and the staged CRON_STALE dies with the process. The 2026-08-12 census had 3
+    of 6 shutdowns emitting no GATEWAY_STOPPED at all.
+
+    The successor already reconstructs those runs: the execution ledger is
+    liveness-verified and ``recover_interrupted_execution_records()`` flips each
+    abandoned row to ``unknown`` under a status-guarded UPDATE, so it reports
+    each run exactly once no matter how many times recovery runs. That verdict
+    was reaching jobs.json and nothing else. Carry it to the bus too.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+    from events.bus import EventBus
+    from events.schema import EventType, Priority
+
+    bus = EventBus(db_path=tmp_path / "events.db")
+    record = {
+        "id": "exec-1",
+        "job_id": "jobflow-scout",
+        "claimed_at": "2026-08-17T17:00:00+00:00",
+        "started_at": "2026-08-17T17:00:05+00:00",
+        "error": "owner exited before a durable terminal state",
+    }
+
+    with patch("cron.executions.recover_interrupted_execution_records",
+               return_value=[record]), \
+         patch("cron.jobs.mark_job_interrupted", return_value=True), \
+         patch("events.gateway_integration.get_bus", return_value=bus):
+        recovered = InProcessCronScheduler().recover_interrupted()
+
+    assert recovered == 1, "the ledger recovery itself must still be reported"
+
+    stale = bus.query(event_type=EventType.CRON_STALE)
+    assert len(stale) == 1, (
+        "the recovered run must reach the event bus — this is the only path "
+        "that survives a force-kill past the drain"
+    )
+    payload = stale[0].payload
+    assert payload["job_id"] == "jobflow-scout"
+    assert payload["scope"] == "owner_exited", (
+        "must be distinguishable from both the graceful 'gateway_stopped' "
+        "attribution and the generic wedge alert — the owner died without "
+        "saying why, which is a weaker claim than either"
+    )
+    assert payload["execution_id"] == "exec-1"
+    assert stale[0].priority == Priority.NORMAL, (
+        "an interrupted run explained by a restart is not a wedge emergency; "
+        "mirrors the gateway_stopped attribution's priority"
+    )
+
+
+def test_recover_interrupted_survives_an_unavailable_event_bus(tmp_path):
+    """The ledger verdict must land even when the bus cannot take the event.
+
+    ``recover_interrupted()`` runs on the cron ticker's startup path, where a
+    raised exception costs the gateway its entire scheduler (the 2026-08-11
+    5h08m outage). The bus is best-effort here: recovery is already durable in
+    the ledger and jobs.json before the emit is attempted.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    record = {
+        "id": "exec-2",
+        "job_id": "postgres-sync",
+        "claimed_at": "2026-08-17T17:00:00+00:00",
+        "started_at": None,
+        "error": None,
+    }
+    marked = []
+
+    with patch("cron.executions.recover_interrupted_execution_records",
+               return_value=[record]), \
+         patch("cron.jobs.mark_job_interrupted",
+               side_effect=lambda *a, **k: marked.append(a) or True), \
+         patch("events.gateway_integration.get_bus", return_value=None):
+        recovered = InProcessCronScheduler().recover_interrupted()
+
+    assert recovered == 1
+    assert marked, "jobs.json must still be stamped when the bus is absent"
+
+
+def _emit_shutdown_attribution(bus, job_id, *, at=None):
+    """Emit the CRON_STALE that CronStaleMonitor's reconstruction would write.
+
+    ``at`` backdates the stored row, mirroring ``_emit_started`` in
+    tests/events/subscribers/test_cron_stale_monitor.py.
+    """
+    from events.schema import EventType, Priority
+
+    eid = bus.emit(
+        event_type=EventType.CRON_STALE,
+        source="cron-stale-monitor",
+        payload={"job_id": job_id, "job_name": job_id, "scope": "gateway_stopped",
+                 "age_seconds": 12, "gateway_stopped_event_id": "gs-1",
+                 "cron_started_event_id": "cs-1"},
+        priority=Priority.NORMAL,
+    )
+    if at is not None:
+        import sqlite3
+        conn = sqlite3.connect(str(bus.db_path))
+        conn.execute("UPDATE events SET timestamp = ? WHERE event_id = ?", (at, eid))
+        conn.commit()
+        conn.close()
+    return eid
+
+
+def test_a_run_already_attributed_by_the_shutdown_reconstruction_is_not_reported_twice(tmp_path):
+    """The ledger path must stand down when the bus path already reported.
+
+    main's ``517cc56c97`` rebuilds shutdown attributions in
+    ``CronStaleMonitor.startup()``, which the gateway runs BEFORE the cron
+    ticker starts (``runner.start()`` at gateway/run.py:23733 vs
+    ``cron_thread.start()`` at :23818). So on any force-kill that still managed
+    to emit GATEWAY_STOPPED — the common case, since the in-flight snapshot is
+    taken early in ``_stop_impl_body``, before the drain — that pass has already
+    emitted a ``scope='gateway_stopped'`` report by the time recovery runs here.
+    Emitting again would give the operator two CRON_STALE events for one run,
+    deterministically rather than occasionally.
+
+    The ledger path exists for the deaths that pass CANNOT see: a crash, an OOM,
+    a power-off, or a kill landing before the GATEWAY_STOPPED emit.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+    from events.bus import EventBus
+    from events.schema import EventType
+
+    bus = EventBus(db_path=tmp_path / "events.db")
+    _emit_shutdown_attribution(bus, "jobflow-scout")
+
+    record = {
+        "id": "exec-1", "job_id": "jobflow-scout",
+        "claimed_at": "2026-08-17T13:00:00-04:00",
+        "started_at": "2026-08-17T13:00:05-04:00",
+        "error": "owner exited before a durable terminal state",
+    }
+
+    with patch("cron.executions.recover_interrupted_execution_records",
+               return_value=[record]), \
+         patch("cron.jobs.mark_job_interrupted", return_value=True), \
+         patch("events.gateway_integration.get_bus", return_value=bus):
+        InProcessCronScheduler().recover_interrupted()
+
+    owner_exited = [e for e in bus.query(event_type=EventType.CRON_STALE)
+                    if e.payload.get("scope") == "owner_exited"]
+    assert owner_exited == [], (
+        "this run was already attributed by the shutdown reconstruction — a "
+        "second report is a duplicate, not extra coverage"
+    )
+
+
+def test_an_attribution_for_an_earlier_run_of_the_same_job_does_not_suppress_a_later_one(tmp_path):
+    """The dedupe window is bounded by THIS run's start, in UTC.
+
+    Pins a timezone trap. The execution ledger stamps LOCAL wall-clock with a
+    local offset (``cron/executions.py`` uses ``hermes_time.now()``, which
+    returns ``datetime.now().astimezone()`` — ``-04:00`` on this box), while
+    every bus row is ``datetime.now(timezone.utc).isoformat()`` (``+00:00``,
+    events/schema.py:589). ``EventBus.query(since=...)`` compares those as
+    STRINGS, so passing ``ran_at`` through unconverted widens the window by the
+    UTC offset — four hours here — and an attribution belonging to an EARLIER
+    run of the same job silently swallows this one's report.
+
+    Here the earlier attribution is at 14:00Z and this run started at
+    12:00-04:00 = 16:00Z. Compared correctly the attribution predates the run
+    and is irrelevant; compared as raw strings ``"…T14:00:00+00:00" >=
+    "…T12:00:00-04:00"`` matches and wrongly suppresses.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+    from events.bus import EventBus
+    from events.schema import EventType
+
+    bus = EventBus(db_path=tmp_path / "events.db")
+    _emit_shutdown_attribution(bus, "jobflow-scout", at="2026-08-17T14:00:00+00:00")
+
+    record = {
+        "id": "exec-2", "job_id": "jobflow-scout",
+        "claimed_at": "2026-08-17T12:00:00-04:00",
+        "started_at": "2026-08-17T12:00:00-04:00",
+        "error": None,
+    }
+
+    with patch("cron.executions.recover_interrupted_execution_records",
+               return_value=[record]), \
+         patch("cron.jobs.mark_job_interrupted", return_value=True), \
+         patch("events.gateway_integration.get_bus", return_value=bus):
+        InProcessCronScheduler().recover_interrupted()
+
+    owner_exited = [e for e in bus.query(event_type=EventType.CRON_STALE)
+                    if e.payload.get("scope") == "owner_exited"]
+    assert len(owner_exited) == 1, (
+        "the earlier run's attribution predates this run and must not suppress "
+        "it — the window floor is this run's start converted to UTC"
+    )
+
+
 def test_ticker_records_heartbeat_each_iteration():
     """The loop records a liveness heartbeat on start and after each tick,
     bumping the success marker only on a clean tick."""
