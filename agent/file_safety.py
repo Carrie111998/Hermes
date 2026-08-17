@@ -129,6 +129,53 @@ def build_write_approval_paths(home: str) -> set[str]:
     }
 
 
+def _classify_git_state_write(resolved: str) -> bool:
+    """Return True if ``resolved`` is a git-managed control path that the
+    generic file tools must not rewrite.
+
+    Walks up the path components looking for a ``.git`` directory. If one is
+    found, the write is denied unless the target is one of the user-owned
+    paths inside a git dir that are safe (and legitimate) for the agent to
+    edit:
+
+      * ``.git/config``          — repository configuration (user-owned)
+      * ``.git/hooks/<any>``     — local hook scripts (user-owned)
+      * ``.git/info/exclude``    — per-repo ignore rules (user-owned)
+      * ``.git/description``     — repo description (user-owned)
+
+    Everything else under a ``.git`` directory (HEAD, index, refs/, objects/,
+    logs/, packed-refs, ORIG_HEAD, FETCH_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD,
+    REBASE_HEAD, COMMIT_EDITMSG, shallow, info/* other than exclude, ...) is
+    git-managed state that a misdirected write silently corrupts.
+
+    Note: ``resolved`` must already be ``os.path.realpath()``-expanded so a
+    symlink that points into a git dir cannot bypass the check.
+    """
+    parts = resolved.split(os.sep)
+    for i, part in enumerate(parts):
+        if part != ".git":
+            continue
+        # Found the git dir component. The target is anything after it.
+        rest = parts[i + 1:]
+        if not rest:
+            # Writing the `.git` dir itself is never legitimate.
+            return True
+        # The first segment inside `.git` decides allow vs deny.
+        head = rest[0]
+        if head in ("config", "description"):
+            return False
+        if head == "hooks":
+            # `.git/hooks/*` is user-owned; the hooks dir itself is fine.
+            return False
+        if head == "info":
+            # Only `.git/info/exclude` is user-owned; deny info/* else.
+            # Allow (return False) only for exactly ["info", "exclude"].
+            return rest != ["info", "exclude"]
+        # Everything else under `.git/` is git-managed state.
+        return True
+    return False
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
@@ -183,6 +230,21 @@ def _classify_write_denial(path: str) -> Optional[str]:
                 return "credential"
         except Exception:
             pass
+
+    # Git-managed state guard: never let the generic file tools rewrite
+    # git's own control files (HEAD, index, refs/, objects/, logs/,
+    # packed-refs, ORIG_HEAD, FETCH_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD,
+    # REBASE_HEAD, COMMIT_EDITMSG, shallow, info/ except exclude, ...).
+    # A single misdirected write to `.git/HEAD` replaces the branch identity
+    # and turns a healthy checkout into an apparently empty one (same
+    # silent-corruption shape as the #78565 worktree-pointer guard). This
+    # closes the .git-directory case that the pointer-file guard cannot.
+    #
+    # User-owned paths inside a `.git` dir stay writable: `.git/config`,
+    # `.git/hooks/*`, `.git/info/exclude`, `.git/description`.
+    _git_state_denial = _classify_git_state_write(resolved)
+    if _git_state_denial:
+        return "credential"
 
     safe_roots = get_safe_write_roots()
     if safe_roots:
