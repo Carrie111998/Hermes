@@ -5,10 +5,11 @@
 # no warning, no error -- so pyproject.toml must carry no [tool.ruff] table at
 # all.  tests/test_lint_config.py asserts that, and asserts the select below.
 #
-# The reason for the split: the per-file-ignores sunset list at the bottom is
-# several hundred lines and would more than double pyproject.toml, putting a
-# large churning diff in the file that also holds dependencies, pytest markers
-# and build config.  This file's whole purpose is to shrink to nothing.
+# The split was originally made to keep the per-file-ignores sunset list -- 544
+# entries at its peak -- out of pyproject.toml, which also holds dependencies,
+# pytest markers and build config.  That list is now GONE (stage 6, 2026-08-17),
+# so the file is small; it stays separate because moving the config back would
+# re-create the silent-shadowing hazard above for no gain.
 #
 # Design: docs/superpowers/specs/2026-08-16-ruff-f-group-reland-design.md
 
@@ -36,19 +37,19 @@ preview = true  # required for PLW1514 (unspecified-encoding) -- preview rule
 select = ["F", "PLW1514"]
 
 [lint.per-file-ignores]
-# --- Permanent exemptions -------------------------------------------------
+# PERMANENT exemptions.  These are NOT backlog -- they are standing decisions.
+#
+# The F-group sunset list that used to sit below this block is GONE: stages 2-5
+# burned it down from 544 entries to zero (2026-08-17) and stage 6 deleted the
+# block.  Every F rule is now clean tree-wide and gated in EVERY file with no
+# exemption anywhere, so a new F finding is a hard failure repo-wide.
+#
+# Do NOT add an F code to this table to unblock a commit -- fix the finding.
+# tests/test_lint_config.py asserts that no F code appears here at all.
+#
 # Tests can intentionally exercise locale-encoding edge cases.
 "tests/**" = ["PLW1514"]
 # Skills and plugins are partially user-authored -- their own conventions.
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
-
-# --- F-group sunset list --------------------------------------------------
-# EMPTY.  Stages 2-5 burned it down from 544 entries to zero (2026-08-17).
-#
-# Every F rule is now clean tree-wide and gated in EVERY file with no exemption
-# anywhere: a new F finding is a hard failure repo-wide.  Do not re-add an entry
-# here to unblock a commit.
-#
-# When this block is empty, delete it and the marker comments with it.

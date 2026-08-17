@@ -20,7 +20,9 @@ These tests ensure:
      in ruff 0.15.x)
   4. The config lives in ruff.toml and pyproject.toml has no shadowing
      ``[tool.ruff]`` table
-  5. The F-group sunset list stays per-rule and free of stale entries
+  5. ``per-file-ignores`` exempts NO F code anywhere — the sunset list that
+     carried the re-land is burned down and deleted, so any F exemption is a
+     regression rather than remaining backlog
 
 If someone removes any of these, CI stops enforcing UTF-8-explicit
 opens and the F group, and we're back to the original traps.
@@ -112,31 +114,58 @@ class TestRuffConfig:
         )
 
 
-class TestFGroupSunsetList:
-    """The per-file-ignores list is temporary scaffolding for the F re-land.
+def _is_pyflakes_code(code: str) -> bool:
+    """True for a Pyflakes "F" selector: bare ``F`` or ``F`` + digits.
 
-    It names the files that offended when enforcement was switched back on
-    (2026-08-16) and is append-never, shrink-only.  These tests keep it honest
-    while it burns down.  When it is empty, delete the block — and these two
-    tests with it.
+    Deliberately NOT ``code.startswith("F")`` — ruff has several unrelated
+    groups whose prefixes begin with F (FA, FBT, FIX, FLY, FURB), and treating
+    ``FURB101`` as a Pyflakes code would make this guard reject a legitimate,
+    unrelated exemption.
+    """
+    return code == "F" or (code[:1] == "F" and code[1:].isdigit())
+
+
+class TestPerFileIgnores:
+    """per-file-ignores must contain NO F-group exemption, anywhere.
+
+    From 2026-08-16 to 2026-08-17 this table also carried a *sunset list*: 544
+    per-rule entries naming every file that offended when F enforcement was
+    switched back on, append-never and shrink-only.  Stages 2-5 burned it to
+    zero and stage 6 deleted the block, so the only entries left are the four
+    permanent PLW1514 exemptions.
+
+    That makes a much stronger assertion available than the two tests this
+    class replaces (no blanket ``"F"``, no stale entry): not "the exemptions
+    are well-formed" but "there are no F exemptions at all".  Anything else is
+    a regression — the burn-down is finished, and a file that cannot pass the
+    F group is a bug to fix, not a line to add here.
     """
 
     @staticmethod
     def _ignores() -> dict[str, list[str]]:
         return _load_ruff_config().get("lint", {}).get("per-file-ignores", {})
 
-    def test_never_blanket_exempts_the_f_group(self):
-        """Entries must name specific rules, never the whole ``F`` group.
-
-        The list is per-rule on purpose: a file exempted for F401 stays gated
-        on F821.  A bare ``"F"`` entry would turn the whole group off for that
-        file and hide new bugs behind old ones.
-        """
-        blanket = sorted(p for p, codes in self._ignores().items() if "F" in codes)
-        assert not blanket, (
-            f"per-file-ignores entries blanket-exempt the whole F group: "
-            f"{blanket}.  List the specific rules instead (e.g. "
-            '["F401", "F841"]), so the other F rules keep checking these files.'
+    def test_no_f_code_is_exempted_anywhere(self):
+        """No entry may exempt any F code — specific, or the bare group."""
+        offenders = sorted(
+            (path, sorted(c for c in codes if _is_pyflakes_code(c)))
+            for path, codes in self._ignores().items()
+            if any(_is_pyflakes_code(c) for c in codes)
+        )
+        assert not offenders, (
+            f"ruff.toml per-file-ignores exempts F-group rules for "
+            f"{len(offenders)} path(s): {offenders}.\n\n"
+            "The F-group sunset list was burned down to zero and deleted in "
+            "stage 6 (2026-08-17).  F is now clean tree-wide and gated in "
+            "EVERY file, so re-adding an exemption here silently reopens the "
+            "hole the whole re-land existed to close — and it reopens it for "
+            "every rule you list, not just the one that failed.\n\n"
+            "Fix the finding instead.  If a suppression is genuinely correct "
+            "(a deliberate re-export, a PEP 562 __getattr__ __all__), use a "
+            "line-level `# noqa: <code>` with a comment at the site, which "
+            "stays visible in the file and cannot mask a future real bug "
+            "elsewhere in it — that is how gateway/platforms/__init__.py "
+            "handles its F822."
         )
 
     def test_has_no_stale_entries(self):
