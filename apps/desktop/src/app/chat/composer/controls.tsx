@@ -316,6 +316,7 @@ function WakeWordButton({ disabled, pausedForVoice = false }: { disabled: boolea
   return (
     <Tip label={tooltip}>
       <Button
+        aria-busy={wake.pending || undefined}
         aria-label={label}
         aria-pressed={wake.listening && !pausedForVoice}
         className={cn(
@@ -332,7 +333,13 @@ function WakeWordButton({ disabled, pausedForVoice = false }: { disabled: boolea
         type="button"
         variant="ghost"
       >
-        {wake.listening && !pausedForVoice ? <Ear className={iconSize.sm} /> : <EarOff className={iconSize.sm} />}
+        {wake.pending ? (
+          <Loader2 className={cn('animate-spin', iconSize.sm)} />
+        ) : wake.listening && !pausedForVoice ? (
+          <Ear className={iconSize.sm} />
+        ) : (
+          <EarOff className={iconSize.sm} />
+        )}
       </Button>
     </Tip>
   )
