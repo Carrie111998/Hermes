@@ -166,6 +166,11 @@ def _make_hindsight_provider():
     provider._session_turns = ["turn-1", "turn-2"]
     provider._turn_counter = 2
     provider._turn_index = 2
+    # Retain watermark — set unconditionally by __init__ (and updated on
+    # every retain) so the buffer-flush path knows which turns have already
+    # been persisted. Seeded here gate-consistent with a provider that has
+    # not yet retained anything.
+    provider._last_retained_turn_count = 0
     # Attrs read by _build_metadata / _build_retain_kwargs when the
     # buffer-flush path on session switch fires. Empty strings keep the
     # metadata minimal but well-formed.

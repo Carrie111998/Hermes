@@ -1212,6 +1212,59 @@ class TestUpdateModeAppendCapability:
 
 
 # ---------------------------------------------------------------------------
+
+class TestSessionSwitchBufferFlushNoReship:
+    """The session-switch flush must also respect the append watermark:
+    once a boundary retain persisted turns 1..N, a later switch must only
+    flush the partial block since the boundary — re-shipping the whole
+    buffer would duplicate already-retained turns in the document (same
+    data-loss/dup class as shutdown)."""
+
+    @staticmethod
+    def _force_append(monkeypatch):
+        from plugins.memory.hindsight import (
+            _append_capability_cache,
+            _append_capability_lock,
+        )
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+
+    def test_switch_flush_does_not_reship_retained_turns(
+        self, provider_with_config, monkeypatch
+    ):
+        self._force_append(monkeypatch)
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        client = p._client
+
+        # Turn 3 hits the boundary -> retain dispatched, watermark advances.
+        p.sync_turn("t1-user", "t1-asst")
+        p.sync_turn("t2-user", "t2-asst")
+        p.sync_turn("t3-user", "t3-asst")
+        p._retain_queue.join()
+        assert client.aretain_batch.call_count == 1
+
+        # One more buffered turn, then a session switch.
+        p.sync_turn("t4-user", "t4-asst")
+        p.on_session_switch(
+            "new-sid", parent_session_id="test-session", reset=True
+        )
+        p._retain_queue.join()
+
+        # Exactly one extra aretain_batch, carrying ONLY the partial block.
+        assert client.aretain_batch.call_count == 2
+        last_kw = client.aretain_batch.call_args_list[-1].kwargs
+        flat = json.dumps(last_kw["items"][0]["content"])
+        assert "t4-user" in flat
+        assert "t1-user" not in flat
+        assert "t2-user" not in flat
+        assert "t3-user" not in flat
+
+
+# ---------------------------------------------------------------------------
 # System prompt tests
 # ---------------------------------------------------------------------------
 
