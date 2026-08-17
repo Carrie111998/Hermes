@@ -7198,7 +7198,19 @@ def _run_one_job_body(
             )
             unresolved_origin = False
             try:
-                failure_alert = _prepare_cron_failure_alert(job, _err_text)
+                drift_skip_error = "[drift_skip" in _err_text.lower()
+                if drift_skip_error:
+                    _drift_text = re.sub(
+                        r"\[drift_skip[^\]]*\]\s*", "", _err_text
+                    ).strip()
+                    failure_alert = (
+                        f"⚠️ Cron '{job.get('name') or job['id']}' skipped: "
+                        f"{_drift_text}"
+                    )
+                elif _cron_failure_backoff_enabled():
+                    failure_alert = _prepare_cron_failure_alert(job, _err_text)
+                else:
+                    failure_alert = _summarize_cron_failure_for_delivery(job, _err_text)
                 if failure_alert:
                     failure_alert += _failure_streak_nudge(job)
                     delivery_attempted = True
@@ -7208,7 +7220,11 @@ def _run_one_job_body(
                         adapters=adapters,
                         loop=loop,
                     )
-                    if not delivery_error and failure_alert:
+                    if (
+                        not delivery_error
+                        and not drift_skip_error
+                        and _cron_failure_backoff_enabled()
+                    ):
                         _confirm_cron_failure_alert(job)
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
