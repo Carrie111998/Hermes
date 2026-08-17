@@ -258,6 +258,12 @@ class TestWebServerEndpoints:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_health_includes_hsts_header(self):
+        response = self.client.get("/api/health")
+
+        assert response.status_code == 200
+        assert response.headers["strict-transport-security"] == "max-age=86400"
+
     @pytest.mark.requires_wal
     def test_get_sessions_poll_preserves_pending_wal(self):
         """Repeated GET-only polls must not checkpoint another writer's WAL."""
