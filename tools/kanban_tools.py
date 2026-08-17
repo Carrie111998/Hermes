@@ -2307,7 +2307,7 @@ KANBAN_CREATE_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["title"],  # assignee optional when triage=true,
+        "required": ["title"],  # assignee optional when triage=true
     },
 }
 

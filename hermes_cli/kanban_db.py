@@ -11151,11 +11151,16 @@ def list_profiles_on_disk() -> list[str]:
     Includes:
     - named profiles under ``<default-root>/profiles/<name>/config.yaml``
 
-    Does **not** inject the implicit root name ``default``. Root Hermes
-    (``~/.hermes`` without ``-p``) remains for CLI/dashboard, but it is not a
-    house kanban worker — blank/default assignees resolve to
-    ``kanban.default_assignee`` (ada). Only list ``default`` if a real
-    ``profiles/default/config.yaml`` pack exists (house does not).
+    Does **not** inject the implicit root name ``default``. The unprofiled
+    Hermes root (``~/.hermes`` without ``-p``) is still how the CLI and
+    dashboard run, but it is not a Kanban worker profile. Unassigned
+    **ready** work is filled by ``kanban.default_assignee`` at dispatch.
+    ``default`` appears in assignee pickers / ``hermes kanban assignees``
+    only when a real ``profiles/default/config.yaml`` exists.
+
+    Tasks already assigned to the name ``default`` still dispatch
+    (``hermes -p default``). They just no longer appear in the picker
+    unless that pack exists.
 
     Reads profile paths directly so this module has no import dependency on
     ``hermes_cli.profiles`` (which pulls in a large chunk of the CLI startup
