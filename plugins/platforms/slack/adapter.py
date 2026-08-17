@@ -7098,25 +7098,45 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Escape the Slack mrkdwn control chars (&, <, >) so a question
             # containing them renders literally instead of as markup/mentions.
-            # Section text caps at 3000 chars — budget the question so the
-            # wrapper never pushes the block over the limit (overflow →
-            # invalid_blocks → no buttons).
+            # Section text caps at 3000 chars — budget the numbered list so
+            # the block never overflows (overflow → invalid_blocks → no
+            # buttons). Each choice gets an equal share of the remaining
+            # budget and is truncated with an explicit ellipsis.
             q = (question or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            body = f"❓ {q}"
+            choice_texts = [
+                str(c).strip() or f"Option {i + 1}"
+                for i, c in enumerate(choices)
+            ]
+            prefix = f"❓ {q}\n\n"
             budget = 3000 - len("...")
+            per_choice_cap = max(24, (budget - len(prefix)) // max(1, len(choice_texts)))
+
+            def _numbered_line(i: int, text: str) -> str:
+                if len(text) > per_choice_cap:
+                    text = text[: max(1, per_choice_cap - 1)] + "…"
+                return f"{i}. {text}"
+
+            body = prefix + "\n".join(
+                _numbered_line(i + 1, t) for i, t in enumerate(choice_texts)
+            )
             if len(body) > budget:
                 body = body[:budget] + "..."
 
-            # One button per choice + a free-text "Other" button.  Slack caps
-            # an actions block at 5 elements; the clarify tool caps choices at
-            # 4 (+ Other = 5) so this is normally one block, but chunk anyway
-            # so a larger choice list degrades gracefully instead of 400ing.
+            # One SHORT button per choice + a free-text "Other" button. The
+            # full choice text lives in the numbered section body above —
+            # Slack mobile ellipsizes button labels so aggressively that
+            # shared-prefix choices were indistinguishable when the label
+            # carried the whole option (#88579); a numeric label always fits.
+            # ``value`` keeps the ``clarify_id|idx`` contract, so selection
+            # semantics are unchanged.  Slack caps an actions block at 5
+            # elements; the clarify tool caps choices at 4 (+ Other = 5) so
+            # this is normally one block, but chunk anyway so a larger choice
+            # list degrades gracefully instead of 400ing.
             elements = []
             for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
                 elements.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": str(idx + 1), "emoji": True},
                     "action_id": f"hermes_clarify_choice_{idx}",
                     "value": f"{clarify_id}|{idx}",
                 })

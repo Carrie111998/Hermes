@@ -116,6 +116,10 @@ class TestSlackSendClarify:
         blocks = kwargs["blocks"]
         assert blocks[0]["type"] == "section"
         assert "Which environment?" in blocks[0]["text"]["text"]
+        # Full choice text lives in the numbered body (#88579) — mobile
+        # ellipsizes button labels, so the buttons carry only the number.
+        assert "1. staging" in blocks[0]["text"]["text"]
+        assert "2. production" in blocks[0]["text"]["text"]
         assert blocks[1]["type"] == "actions"
         elements = blocks[1]["elements"]
         # 2 choices + Other
@@ -124,7 +128,8 @@ class TestSlackSendClarify:
         assert elements[0]["value"] == "cid1|0"
         assert elements[1]["action_id"] == "hermes_clarify_choice_1"
         assert elements[1]["value"] == "cid1|1"
-        assert elements[0]["text"]["text"] == "staging"
+        assert elements[0]["text"]["text"] == "1"
+        assert elements[1]["text"]["text"] == "2"
         # Final button is the free-text "Other"
         assert elements[2]["action_id"] == "hermes_clarify_other"
         assert elements[2]["value"] == "cid1|other"
@@ -132,6 +137,68 @@ class TestSlackSendClarify:
             if block["type"] == "actions":
                 action_ids = [element["action_id"] for element in block["elements"]]
                 assert len(action_ids) == len(set(action_ids))
+
+    @pytest.mark.asyncio
+    async def test_long_shared_prefix_choices_readable_on_mobile(self):
+        """#88579 — long shared-prefix options must stay distinguishable.
+
+        Slack mobile truncates button labels early, so four options that all
+        start the same way rendered as four identical "prefix…" buttons. The
+        numbered body carries every complete choice; the buttons are short
+        numeric labels whose values still resolve to the right index.
+        """
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        shared = "Deploy the payment-service stack to"
+        choices = [
+            f"{shared} the staging environment with the canary config",
+            f"{shared} the staging environment with the full rollout config",
+            f"{shared} production behind the feature flag",
+            f"{shared} production with an immediate rollback plan",
+        ]
+        result = await adapter.send_clarify(
+            chat_id="C1",
+            question="Which deployment?",
+            choices=choices,
+            clarify_id="cid2",
+            session_key="sk1",
+        )
+        assert result.success is True
+
+        kwargs = mock_client.chat_postMessage.call_args[1]
+        blocks = kwargs["blocks"]
+        body = blocks[0]["text"]["text"]
+        # Every complete choice is present, numbered.
+        for i, choice in enumerate(choices, start=1):
+            assert f"{i}. {choice}" in body
+        # Section stays within Slack's 3000-char block limit.
+        assert len(body) <= 3000
+        # Buttons are short numeric labels; values keep the idx contract.
+        elements = blocks[1]["elements"]
+        assert [e["text"]["text"] for e in elements[:4]] == ["1", "2", "3", "4"]
+        for idx in range(4):
+            assert elements[idx]["action_id"] == f"hermes_clarify_choice_{idx}"
+            assert elements[idx]["value"] == f"cid2|{idx}"
+
+    @pytest.mark.asyncio
+    async def test_huge_choices_are_truncated_within_block_budget(self):
+        """Explicit overflow behavior: each choice is truncated with an
+        ellipsis so the numbered body never exceeds the 3000-char cap."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        huge = ["x" * 2000, "y" * 2000, "z" * 2000]
+        result = await adapter.send_clarify(
+            chat_id="C1", question="Pick", choices=huge,
+            clarify_id="cid3", session_key="sk1",
+        )
+        assert result.success is True
+        body = mock_client.chat_postMessage.call_args[1]["blocks"][0]["text"]["text"]
+        assert len(body) <= 3000
+        assert body.endswith("…") or body.endswith("...")
 
 
     @pytest.mark.asyncio
