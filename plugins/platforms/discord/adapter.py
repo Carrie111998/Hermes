@@ -3412,6 +3412,30 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
+    async def _fetch_thread_for_activity(self, thread_id: str) -> Optional[Any]:
+        """Fetch authoritative thread state instead of trusting Discord's cache."""
+        if not self._client:
+            return None
+        thread_type = getattr(discord, "Thread", ())
+        try:
+            thread = await self._client.fetch_channel(int(thread_id))
+            return thread if isinstance(thread, thread_type) else None
+        except Exception:
+            logger.debug(
+                "[%s] Failed to fetch Discord thread %s for activity indicator",
+                self.name,
+                thread_id,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    async def _edit_discord_thread(thread: Any, *, name: str, reason: str) -> Any:
+        """Return discord.py's updated Thread, falling back for compatible fakes."""
+        updated = await thread.edit(name=name, reason=reason)
+        thread_type = getattr(discord, "Thread", ())
+        return updated if isinstance(updated, thread_type) else thread
+
     async def _start_thread_activity(self, event: MessageEvent) -> None:
         if not self._thread_activity_indicator_enabled():
             return
@@ -3434,7 +3458,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 base_title,
             )
             try:
-                await thread.edit(name=active_title, reason="Hermes processing activity")
+                updated_thread = await self._edit_discord_thread(
+                    thread,
+                    name=active_title,
+                    reason="Hermes processing activity",
+                )
             except Exception:
                 logger.debug(
                     "[%s] Failed to mark Discord thread %s active",
@@ -3443,10 +3471,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 return
+            display_title = str(
+                getattr(updated_thread, "name", active_title) or active_title
+            ).strip()
             self._thread_activity_states[thread_id] = {
                 "active_count": 1,
                 "base_title": base_title,
-                "display_title": active_title,
+                "display_title": display_title,
                 "failed": False,
             }
 
@@ -3458,7 +3489,6 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id = str(getattr(event.source, "thread_id", "") or "")
         if not thread_id:
             return
-        thread = await self._thread_for_activity_event(event)
         async with self._thread_activity_lock:
             state = self._thread_activity_states.get(thread_id)
             if state is None:
@@ -3468,6 +3498,7 @@ class DiscordAdapter(BasePlatformAdapter):
             state["active_count"] -= 1
             if state["active_count"] > 0:
                 return
+            thread = await self._fetch_thread_for_activity(thread_id)
             if thread is None:
                 self._thread_activity_states.pop(thread_id, None)
                 return
@@ -3482,7 +3513,11 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             try:
                 if current_title == state["display_title"] and current_title != target_title:
-                    await thread.edit(name=target_title, reason="Hermes processing activity")
+                    await self._edit_discord_thread(
+                        thread,
+                        name=target_title,
+                        reason="Hermes processing activity",
+                    )
             except Exception:
                 logger.debug(
                     "[%s] Failed to finalize Discord thread %s activity indicator",
@@ -7498,9 +7533,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         try:
-            thread = self._client.get_channel(thread_id_int)
-            if thread is None:
+            if only_if_current_name is not None:
                 thread = await self._client.fetch_channel(thread_id_int)
+            else:
+                thread = self._client.get_channel(thread_id_int)
+                if thread is None:
+                    thread = await self._client.fetch_channel(thread_id_int)
         except Exception:
             logger.debug("[%s] Failed to resolve Discord thread %s for rename", self.name, thread_id, exc_info=True)
             return False
@@ -7519,10 +7557,15 @@ class DiscordAdapter(BasePlatformAdapter):
         if edit is None:
             return False
         try:
-            await edit(name=cleaned, reason="Hermes semantic session title")
+            updated_thread = await self._edit_discord_thread(
+                thread,
+                name=cleaned,
+                reason="Hermes semantic session title",
+            )
+            updated_name = getattr(updated_thread, "name", cleaned)
             logger.info(
-                "[%s] Renamed Discord thread %s from %r to %r",
-                self.name, thread_id, current_name, cleaned,
+                "[%s] Renamed Discord thread %s from %r to %r (returned %r)",
+                self.name, thread_id, current_name, cleaned, updated_name,
             )
             return True
         except Exception:

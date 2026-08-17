@@ -102,12 +102,42 @@ def _activity_thread(adapter, title="Investigate flaky build"):
 
     thread.edit = AsyncMock(side_effect=edit)
     adapter._client.get_channel = lambda _id: thread
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     raw_message = SimpleNamespace(
         channel=thread,
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
     )
     return thread, raw_message
+
+
+def _distinct_return_activity_thread(adapter, title="Investigate flaky build"):
+    """Model discord.py Thread.edit returning a fresh, authoritative object."""
+    thread_type = sys.modules["discord"].Thread
+    server = SimpleNamespace(name=title, edits=[])
+
+    def make_thread(name):
+        thread = thread_type()
+        thread.id = 123
+        thread.name = name
+
+        async def edit(*, name, reason):
+            server.name = name
+            server.edits.append(name)
+            return make_thread(name)
+
+        thread.edit = AsyncMock(side_effect=edit)
+        return thread
+
+    cached_thread = make_thread(title)
+    adapter._client.get_channel = lambda _id: cached_thread
+    adapter._client.fetch_channel = AsyncMock(side_effect=lambda _id: make_thread(server.name))
+    raw_message = SimpleNamespace(
+        channel=cached_thread,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    return cached_thread, raw_message, server
 
 
 @pytest.mark.asyncio
@@ -178,6 +208,7 @@ async def test_thread_activity_indicator_marks_start_and_restores_on_success(ada
 
     thread.edit = AsyncMock(side_effect=edit)
     adapter._client.get_channel = lambda _id: thread
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     raw_message = SimpleNamespace(
         channel=thread,
         add_reaction=AsyncMock(),
@@ -204,6 +235,7 @@ async def test_thread_activity_indicator_marks_failure(adapter, monkeypatch):
 
     thread.edit = AsyncMock(side_effect=edit)
     adapter._client.get_channel = lambda _id: thread
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     event = _make_thread_event(
         "6",
         SimpleNamespace(
@@ -231,6 +263,7 @@ async def test_thread_activity_indicator_waits_for_concurrent_turns_and_keeps_fa
 
     thread.edit = AsyncMock(side_effect=edit)
     adapter._client.get_channel = lambda _id: thread
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     raw_message = SimpleNamespace(
         channel=thread,
         add_reaction=AsyncMock(),
@@ -261,6 +294,7 @@ async def test_semantic_thread_rename_updates_active_base_title(adapter, monkeyp
 
     thread.edit = AsyncMock(side_effect=edit)
     adapter._client.get_channel = lambda _id: thread
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     event = _make_thread_event(
         "10",
         SimpleNamespace(
@@ -281,6 +315,70 @@ async def test_semantic_thread_rename_updates_active_base_title(adapter, monkeyp
     assert thread.name == "⏳ Stable build"
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     assert thread.name == "Stable build"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome, expected_title",
+    [
+        (ProcessingOutcome.SUCCESS, "Investigate flaky build"),
+        (ProcessingOutcome.CANCELLED, "Investigate flaky build"),
+        (ProcessingOutcome.FAILURE, "⛔ Investigate flaky build"),
+    ],
+)
+async def test_thread_activity_indicator_finalizes_when_edit_returns_distinct_thread(
+    adapter, monkeypatch, outcome, expected_title
+):
+    monkeypatch.setenv("DISCORD_THREAD_ACTIVITY_INDICATOR", "true")
+    cached_thread, raw_message, server = _distinct_return_activity_thread(adapter)
+    event = _make_thread_event("distinct-final", raw_message)
+
+    await adapter.on_processing_start(event)
+    assert cached_thread.name == "Investigate flaky build"
+    assert server.name == "⏳ Investigate flaky build"
+
+    await adapter.on_processing_complete(event, outcome)
+
+    assert server.name == expected_title
+    assert server.edits == ["⏳ Investigate flaky build", expected_title]
+
+
+@pytest.mark.asyncio
+async def test_semantic_thread_rename_uses_distinct_edit_result(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_THREAD_ACTIVITY_INDICATOR", "true")
+    cached_thread, raw_message, server = _distinct_return_activity_thread(adapter)
+    event = _make_thread_event("distinct-semantic", raw_message)
+
+    await adapter.on_processing_start(event)
+    assert cached_thread.name == "Investigate flaky build"
+
+    assert await adapter.rename_thread(
+        "123",
+        "Stable build",
+        only_if_current_name="Investigate flaky build",
+    ) is True
+    assert server.name == "⏳ Stable build"
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    assert server.name == "Stable build"
+
+
+@pytest.mark.asyncio
+async def test_thread_activity_indicator_fetches_before_preserving_human_rename(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_THREAD_ACTIVITY_INDICATOR", "true")
+    cached_thread, raw_message, server = _distinct_return_activity_thread(adapter)
+    event = _make_thread_event("distinct-human", raw_message)
+
+    await adapter.on_processing_start(event)
+    cached_thread.name = "⏳ Investigate flaky build"
+    server.name = "Human-chosen title"
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert server.name == "Human-chosen title"
+    assert server.edits == ["⏳ Investigate flaky build"]
 
 
 @pytest.mark.asyncio
@@ -395,6 +493,7 @@ async def test_thread_activity_indicator_recovers_stale_prefix(adapter, monkeypa
 
     thread.edit = AsyncMock(side_effect=edit)
     adapter._client.get_channel = lambda _id: thread
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     event = _make_thread_event(
         "7",
         SimpleNamespace(
