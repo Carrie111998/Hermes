@@ -15649,12 +15649,19 @@ def main():
         cmd_chat(args)
         return
 
-    # Execute the command
+    # Execute the command. Return the handler's shell-style status so the
+    # ``console_scripts`` wrapper (``sys.exit(main())``) turns a failed
+    # command into a non-zero process exit. Discarding it made every
+    # failure invisible to subprocess callers: tests/stress/_fake_worker.py
+    # wraps each CLI call in ``subprocess.run(..., check=True)``, so a
+    # zero exit turned `kanban heartbeat`/`complete` failures into silent
+    # no-ops. Handlers return int or None only (audited across every
+    # ``func=`` target), so this can never feed sys.exit a printable object.
     if hasattr(args, "func"):
-        args.func(args)
-    else:
-        parser.print_help()
+        return args.func(args)
+    parser.print_help()
+    return None
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

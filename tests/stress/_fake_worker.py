@@ -12,13 +12,30 @@ import subprocess
 import time
 
 
+def _cli():
+    """Argv prefix for the hermes CLI.
+
+    The spawner passes ``HERMES_CLI_CMD`` (a JSON list) so the worker
+    provably runs the CLI of the tree under test. Relying on a bare
+    ``hermes`` from PATH would silently exercise whatever hermes happens
+    to be installed on the host — on Windows that is exactly what
+    happened, because the POSIX ``#!/bin/sh`` shim this test used to
+    write is not executable there.
+    """
+    raw = os.environ.get("HERMES_CLI_CMD")
+    if raw:
+        return json.loads(raw)
+    return ["hermes"]
+
+
 def main():
     tid = os.environ["HERMES_KANBAN_TASK"]
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "")
+    cli = _cli()
 
     # Announce via CLI (goes through real argparse + init_db + etc)
     subprocess.run(
-        ["hermes", "kanban", "heartbeat", tid, "--note", "started"],
+        [*cli, "kanban", "heartbeat", tid, "--note", "started"],
         check=True, capture_output=True,
     )
 
@@ -26,14 +43,14 @@ def main():
     for i in range(3):
         time.sleep(0.3)
         subprocess.run(
-            ["hermes", "kanban", "heartbeat", tid, "--note", f"progress {i+1}/3"],
+            [*cli, "kanban", "heartbeat", tid, "--note", f"progress {i+1}/3"],
             check=True, capture_output=True,
         )
 
     # Complete with structured handoff
     subprocess.run(
         [
-            "hermes", "kanban", "complete", tid,
+            *cli, "kanban", "complete", tid,
             "--summary", f"real-subprocess worker finished {tid}",
             "--metadata", json.dumps({
                 "workspace": workspace,

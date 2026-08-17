@@ -32,9 +32,27 @@ from pathlib import Path
 _THIS = Path(__file__).resolve()
 WT = _THIS.parents[2] if _THIS.parent.name == "stress" else Path.cwd()
 
+if str(WT) not in sys.path:
+    sys.path.insert(0, str(WT))
+from tests.timeout_budget import scaled  # noqa: E402
+
 FAILURES: list[str] = []
 SKIPS: list[str] = []
 _REGISTERED: list = []
+
+
+class _Skip(Exception):
+    """Raised by a scenario that cannot run in this environment.
+
+    A skip is not a failure: the module contract (see the docstring at the
+    top) is that the script exits 0 iff every scenario passed or was
+    cleanly skipped *with a reason*.
+    """
+
+
+def skip(reason: str):
+    """Abort the current scenario as a clean, reasoned skip."""
+    raise _Skip(reason)
 
 
 def scenario(name):
@@ -57,6 +75,9 @@ def scenario(name):
             try:
                 fn(home, kb)
                 print(f"  ✔ {name}")
+            except _Skip as e:
+                SKIPS.append(f"{name}: {e}")
+                print(f"  ↷ SKIP: {e}")
             except AssertionError as e:
                 msg = f"{name}: {e}"
                 FAILURES.append(msg)
@@ -457,6 +478,14 @@ def _(home, kb):
     """Dispatching a task whose workspace can't be resolved should go
     through the spawn-failure circuit breaker, not crash."""
     kb.init_db()
+    # The dispatcher refuses to spawn for an assignee with no profile
+    # directory and buckets the task as ``skipped_nonspawnable`` — it never
+    # reaches workspace resolution at all. Without this the scenario is
+    # vacuous: the task sits in 'ready' for the wrong reason and the
+    # assertion below can never observe the circuit breaker. HERMES_HOME is
+    # this scenario's own temp dir, so creating the profile stays hermetic.
+    from hermes_cli.profiles import get_profile_dir
+    get_profile_dir("w").mkdir(parents=True, exist_ok=True)
     conn = kb.connect()
     try:
         tid = kb.create_task(
@@ -475,9 +504,12 @@ def _(home, kb):
         print(f"  after 1 tick with nonexistent workspace: status={task.status}")
         if task.status == "ready":
             # Expected path: workspace failure led to release
-            spawn_failures = task.spawn_failures
-            print(f"  spawn_failures counter: {spawn_failures}")
-            assert spawn_failures >= 1, "spawn_failures counter didn't increment"
+            # The column/field was renamed spawn_failures ->
+            # consecutive_failures (see the legacy migration in
+            # hermes_cli/kanban_db.py); Task exposes only the new name.
+            failures = task.consecutive_failures
+            print(f"  consecutive_failures counter: {failures}")
+            assert failures >= 1, "consecutive_failures counter didn't increment"
         elif task.status == "running":
             # Workspace not checked before spawn — the worker would hit
             # the bad path itself. Defensible for `dir:` workspaces that
@@ -588,8 +620,21 @@ def _(home, kb):
     real = tempfile.mkdtemp(prefix="hermes_real_")
     link1 = real + "_link1"
     link2 = real + "_link2"
-    os.symlink(real, link1)
-    os.symlink(real, link2)
+    try:
+        os.symlink(real, link1)
+        os.symlink(real, link2)
+    except OSError as e:
+        # Windows only grants SeCreateSymbolicLinkPrivilege to elevated
+        # processes or when Developer Mode is on; unprivileged runs get
+        # WinError 1314. That is an environment limitation, not a kernel
+        # defect, so skip rather than fail.
+        for p in (link1, link2):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        shutil.rmtree(real, ignore_errors=True)
+        skip(f"cannot create symlinks here ({e.__class__.__name__}: {e})")
     try:
         os.environ["HERMES_HOME"] = link1
         os.environ["HOME"] = link1
@@ -737,11 +782,26 @@ def _(home, kb):
     # Fire the gun
     with open(barrier, "w") as f:
         f.write("go")
+    # Incidental safety net, not the assertion (tests/timeout_budget.py
+    # rule 2). The children do ~6s of work but each pays a full spawn:
+    # a fresh interpreter plus a re-import of this module. Measured at
+    # ~16s wall on Windows, which silently blew the old hardcoded 10s
+    # and surfaced as the useless "only 1 workers finished".
+    deadline = time.monotonic() + scaled(90)
     for p in procs:
-        p.join(timeout=10)
+        p.join(timeout=max(1.0, deadline - time.monotonic()))
+    stragglers = [(i, p) for i, p in enumerate(procs) if p.is_alive()]
+    codes = [p.exitcode for p in procs]
+    for _, p in stragglers:
+        p.terminate()
 
     tids = [open(r).read().strip() for r in results if os.path.exists(r)]
-    assert len(tids) == 2, f"only {len(tids)} workers finished"
+    assert not stragglers, (
+        f"workers still running after {scaled(90):.0f}s: "
+        f"{[i for i, _ in stragglers]} (exitcodes={codes})"
+    )
+    assert all(c == 0 for c in codes), f"worker exitcodes={codes}"
+    assert len(tids) == 2, f"only {len(tids)} workers finished (exitcodes={codes})"
     assert tids[0] == tids[1], (
         f"idempotency key race produced two different tasks: {tids}"
     )
@@ -937,8 +997,16 @@ def _(home, kb):
 
 @scenario("parent_in_different_status_states")
 def _(home, kb):
-    """recompute_ready promotes a todo child only if ALL parents are
-    in 'done'. Verify against parents in every non-done state."""
+    """recompute_ready promotes a todo child only once ALL parents are
+    settled — 'done' or 'archived'. Verify against every other state.
+
+    'archived' counts as settled deliberately: archiving a parent means
+    the work is cancelled, and children must not stay blocked forever on
+    a parent that will never complete. Both enforcement points agree —
+    recompute_ready's parent gate and claim_task's structural invariant
+    each test ``status IN ('done', 'archived')`` — so a child of an
+    archived parent is promoted AND stays claimable.
+    """
     kb.init_db()
     conn = kb.connect()
     try:
@@ -961,8 +1029,8 @@ def _(home, kb):
             (p_running, "todo"),
             (p_blocked, "todo"),
             (p_triage, "todo"),
-            (p_archived, "todo"),  # archived != done!
-            (p_done, "ready"),     # only done parent unblocks child
+            (p_archived, "ready"),  # archived == settled, unblocks child
+            (p_done, "ready"),      # done parent unblocks child
         ]:
             child = kb.create_task(
                 conn, title=f"child-of-{parent}", assignee="w", parents=[parent],
@@ -1050,6 +1118,10 @@ def main():
     print(f"  Ran:      {len(_REGISTERED)}")
     print(f"  Failures: {len(FAILURES)}")
     print(f"  Skips:    {len(SKIPS)}")
+    if SKIPS:
+        print()
+        for s in SKIPS:
+            print(f"  ↷ {s}")
     if FAILURES:
         print()
         for f in FAILURES:
