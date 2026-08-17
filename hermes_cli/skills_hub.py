@@ -123,33 +123,31 @@ def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
 
 
 def _resolve_source_meta_and_bundle(identifier: str, sources):
-    """Resolve metadata and bundle for a specific identifier."""
-    meta = None
-    bundle = None
-    matched_source = None
+    """Resolve metadata and bundle for a specific identifier.
 
+    Both MUST come from the same source: the first source whose ``inspect``
+    resolves the identifier anchors the lookup, and only that source's
+    ``fetch`` is consulted for the payload. The previous loop let metadata
+    from one source be joined to a bundle another source served under the
+    bare skill name, so a fully-qualified skills.sh identifier could render
+    a third party's SKILL.md behind the legitimate repo URL while the
+    provenance check passed (#88020). A failed fetch now yields
+    ``bundle=None`` — callers already fail closed on that (install refuses
+    instead of installing mismatched content).
+    """
     for src in sources:
-        if meta is None:
-            try:
-                meta = src.inspect(identifier)
-                if meta:
-                    matched_source = src
-            except Exception:
-                meta = None
+        try:
+            meta = src.inspect(identifier)
+        except Exception:
+            meta = None
+        if not meta:
+            continue
         try:
             bundle = src.fetch(identifier)
         except Exception:
             bundle = None
-        if bundle:
-            matched_source = src
-            if meta is None:
-                try:
-                    meta = src.inspect(identifier)
-                except Exception:
-                    meta = None
-            break
-
-    return meta, bundle, matched_source
+        return meta, bundle, src
+    return None, None, None
 
 
 def _derive_category_from_install_path(install_path: str) -> str:
