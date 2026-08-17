@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 
@@ -689,6 +689,90 @@ def code_drift_body(p: dict) -> str:
                 "then restart the gateway."
             )
     return "\n".join(lines)
+
+
+def _utc_short_time(iso_ts) -> str:
+    """``HH:MM UTC``, actually CONVERTED. Empty string if unparseable.
+
+    Distinct from :func:`_short_time`, which formats the stamp in whatever
+    offset it already carries while labelling the result "UTC". That is safe
+    for bus timestamps — every one is ``datetime.now(timezone.utc)`` — but
+    not for ``ran_at``, which the executions ledger stamps in LOCAL
+    wall-clock via ``hermes_time.now()``. Unconverted, a run that began at
+    17:00 UTC prints as "13:00 UTC" on this box.
+    """
+    if not iso_ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if dt.tzinfo is None:
+        # A naive stamp lost its offset upstream; it was local when written.
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc).strftime("%H:%M UTC")
+
+
+def cron_stale_body(p: dict) -> str:
+    """Plain-language CRON_STALE body, keyed on ``scope``.
+
+    One event type carries four different claims, and only ``scope``
+    separates them. Without this branch all four reached Telegram through
+    ``_format_payload``'s generic ``key: value`` fallback, which buried
+    ``scope`` mid-list and splatted correlation UUIDs no operator can act on
+    (the same defect the SECRET_DETECTED branch fixed for ``finding_hash``).
+    A genuine wedge and a restart casualty then read almost identically.
+
+    The four, in descending severity:
+
+    - ``ticker`` — the SCHEDULER is gone; no job can fire at all. The
+      ``__ticker__`` job_id is a sentinel, so rendering it as a stuck job
+      would hide a total outage behind one job's name.
+    - (no scope) — the original wedge alert: a real job started and never
+      finished. The only one that means "something is stuck right now".
+    - ``gateway_stopped`` — a shutdown cut the run short. Attributed to a
+      SPECIFIC shutdown, so it can say which one and how far in.
+    - ``owner_exited`` — the ledger found the run's owner dead without a
+      terminal state. It cannot say what killed it or how far in, so this
+      body must not imply either. See the deliberate absence of
+      ``age_seconds`` in ``CronScheduler._emit_interrupted_cron_stale``.
+    """
+    p = p or {}
+    scope = p.get("scope")
+    job_name = p.get("job_name") or p.get("job_id") or "?"
+
+    if scope == "ticker":
+        return (
+            "The cron SCHEDULER is not running — no job can fire until the "
+            "gateway is restarted.\n"
+            f"Ticker heartbeat {format_duration(p.get('age_seconds', 0))} old "
+            f"(threshold {format_duration(p.get('threshold_seconds', 0))})."
+        )
+
+    if scope == "gateway_stopped":
+        reason = p.get("exit_reason") or "reason not recorded"
+        return (
+            f"{job_name} was cut short by a gateway shutdown ({reason}) "
+            f"{format_duration(p.get('age_seconds', 0))} into the run.\n"
+            "Whether its side effects completed is not recorded."
+        )
+
+    if scope == "owner_exited":
+        # No duration: the ledger knows only that the owner died, not when
+        # the kill landed. now-minus-ran_at would silently bill however long
+        # the box was down to the run.
+        when = _utc_short_time(p.get("ran_at"))
+        return (
+            f"{job_name}'s owner exited before recording an outcome — "
+            "whether the run finished is unknown."
+            + (f"\nStarted {when}." if when else "")
+        )
+
+    return (
+        f"{job_name} has been running "
+        f"{format_duration(p.get('age_seconds', 0))} with no result "
+        f"(threshold {format_duration(p.get('threshold_seconds', 0))})."
+    )
 
 
 def boot_summary_body(payload: dict, *, max_listed: int = 5) -> str:

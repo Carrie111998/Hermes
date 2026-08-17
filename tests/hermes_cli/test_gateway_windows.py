@@ -1367,3 +1367,70 @@ def test_cli_entrypoint_label_survives_into_boot_reason(
     monkeypatch.setattr(_sys, "argv", ["hermes", "gateway", "run"])
     monkeypatch.setenv(gateway_diag.SPAWN_SITE_ENV, child_env[gateway_diag.SPAWN_SITE_ENV])
     assert GatewayRunner._detect_boot_reason(None) == expected_boot_reason
+
+
+class TestWindowsStopDrainTimeout:
+    """The grace period the stopper gives a gateway before it force-kills it.
+
+    2026-08-17: this was ``min(configured, 30.0)``, which silently halved this
+    box's configured 60s drain. The gateway was therefore *structurally*
+    guaranteed to be shot mid-drain whenever an in-flight cron needed more
+    than 30s — which a live LLM turn routinely does. 3 of 3 teardowns with
+    crons in flight died at shutdown phase 1; 0 of 2 without any did.
+    """
+
+    @staticmethod
+    def _configured(monkeypatch, value):
+        monkeypatch.setattr(
+            gateway, "_get_restart_drain_timeout", lambda: value, raising=False
+        )
+
+    def test_grace_outlasts_the_drain_budget_the_gateway_is_told_it_has(
+        self, monkeypatch
+    ):
+        """A gateway granted less than its own drain budget dies mid-drain.
+
+        ``agent.restart_drain_timeout`` is handed to the gateway's phase-2
+        drain (``gateway/run.py``), so a stopper that gives less than that can
+        never let the drain finish.
+        """
+        self._configured(monkeypatch, 60.0)
+
+        assert gateway_windows._windows_stop_drain_timeout() > 60.0
+
+    def test_grace_outlasts_the_internal_shutdown_watchdog_leash(self, monkeypatch):
+        """The LOUD killer must win the race against the silent one.
+
+        ``gateway/shutdown_watchdog.py`` force-exits at ``drain + 60s`` after
+        logging CRITICAL and writing an all-thread dump. The external
+        ``taskkill`` leaves no trace at all. If the stopper fires first the
+        watchdog is unreachable and a genuine wedge is undiagnosable — which
+        is why "Shutdown watchdog fired" appears zero times on this box.
+        """
+        from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+
+        self._configured(monkeypatch, 60.0)
+
+        assert gateway_windows._windows_stop_drain_timeout() > (
+            resolve_shutdown_watchdog_delay(60.0)
+        )
+
+    def test_grace_is_still_bounded_for_an_absurd_configured_drain(
+        self, monkeypatch
+    ):
+        """``stop`` must not wedge forever; the ceiling only has to be sane."""
+        self._configured(monkeypatch, 86400.0)
+
+        assert gateway_windows._windows_stop_drain_timeout() <= 600.0
+
+    def test_grace_survives_an_unreadable_config(self, monkeypatch):
+        """A broken config must not produce a zero-or-negative grace period."""
+
+        def _boom():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(
+            gateway, "_get_restart_drain_timeout", _boom, raising=False
+        )
+
+        assert gateway_windows._windows_stop_drain_timeout() >= 1.0

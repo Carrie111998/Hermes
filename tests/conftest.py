@@ -35,6 +35,64 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── importorskip husk guard ────────────────────────────────────────────────
+# ``pytest.importorskip`` treats "the import worked" as "the package is
+# usable". A distribution whose FILES were deleted but whose DIRECTORIES
+# survive is imported by Python as an implicit PEP-420 namespace package: the
+# import SUCCEEDS, with ``__file__ = None`` and nothing inside. pytest cannot
+# see this — it explicitly suppresses the very ImportWarning that would reveal
+# it ("ignore ImportWarnings that might happen because of existing directories
+# with the same name we're trying to import but without a __init__.py",
+# _pytest/outcomes.py) — and ``minversion`` is the only built-in escape.
+#
+# Cost of not guarding it, measured on 2026-08-17: a gutted numpy left 8 empty
+# dirs in site-packages with no dist-info. ``importorskip("numpy")`` passed, so
+# 8 tests that should have SKIPPED failed instead — and worse, the husk then sat
+# in ``sys.modules`` where ``_pytest.python_api._as_numpy_array`` finds it
+# ("and numpy is already imported") and calls ``np.isscalar``, so every
+# ``pytest.approx`` for the rest of the session raised. That took down 14 more
+# tests across four files with no numpy in them: 22 failures, one broken install.
+#
+# Wrapped once here — like ``sqlite3.connect`` below — so every call site in the
+# suite is covered without editing any of them.
+_real_importorskip = pytest.importorskip
+
+
+def _is_empty_namespace_package(mod: object) -> bool:
+    """True for a directory-only husk: a namespace package exposing nothing.
+
+    A *legitimate* PEP-420 namespace package also has ``__file__ is None``, so
+    that test alone would produce false positives. Require in addition that the
+    module exposes no public attribute at all — a working package always
+    exposes something, and a husk never does.
+    """
+    if getattr(mod, "__file__", None) is not None:
+        return False
+    if getattr(mod, "__path__", None) is None:
+        return False
+    return not [name for name in dir(mod) if not name.startswith("_")]
+
+
+def _importorskip_rejecting_husks(modname, *args, **kwargs):
+    mod = _real_importorskip(modname, *args, **kwargs)
+    if _is_empty_namespace_package(mod):
+        # Drop it from sys.modules, or pytest.approx (and anything else that
+        # feature-detects via sys.modules) keeps finding the husk all session.
+        for name in [modname, *[m for m in sys.modules if m.startswith(f"{modname}.")]]:
+            sys.modules.pop(name, None)
+        pytest.skip(
+            f"{modname!r} resolved to an empty namespace package at "
+            f"{getattr(mod, '__path__', None)} — the distribution is partially "
+            "uninstalled, not installed. Reinstall it, or delete the leftover "
+            "directory so the import fails cleanly.",
+            allow_module_level=True,
+        )
+    return mod
+
+
+pytest.importorskip = _importorskip_rejecting_husks
+
+
 # ── sqlite-connection tripwire (feeds pytest_runtest_teardown) ──────────────
 # ``sqlite3.connect`` is wrapped once, here, so the teardown hook below knows
 # whether a test could have left a cycle-held connection behind — see that
@@ -1009,6 +1067,130 @@ class _PidScanGuardFinder:
         return None
 
 
+# ── local-server probe guard: arm at import, decide at call ────────────────
+#
+# ``agent.model_metadata`` reaches the NETWORK to work out what model server is
+# answering at ``base_url``. ``detect_local_server_type`` walks a five-endpoint
+# waterfall (/api/v1/models, /api/tags, /v1/props, /props, /version) inside an
+# ``httpx.Client(timeout=2.0)``, and ``_query_local_context_length`` opens its
+# own ``timeout=3.0`` client on top of that.
+#
+# Where a closed port refuses instantly this is free, and therefore invisible.
+# It is not free everywhere. Measured on this developer's box 2026-08-17: a
+# closed local port returns its RST after ~2.02 s, not immediately (listening
+# ports answer in ~0.001 s; 4000/11434/1234/8000/8080/54321 all take ~2.02 s,
+# via 127.0.0.1 as well as localhost — so it is NOT the IPv6 dual-stack penalty
+# ``_localhost_to_ipv4`` already guards). Every probe therefore burns its full
+# ceiling: ~10 s per ``detect_local_server_type`` call, which puts a single test
+# over the 30 s pytest-timeout cap.
+#
+# The failure that produced is worth stating, because it does not look like a
+# network problem from the outside: pytest-timeout kills the process mid-file,
+# so no summary line is printed, so the parallel runner buckets the file under
+# "no tests ran (collection/import error …)". On 2026-08-17 that was 10 files —
+# every one of which collected and ran fine, and none of which had an import
+# error. ``tests/run_agent/test_streaming.py`` collected 53 tests and ran 172 s
+# before it was killed.
+#
+# Stubbing to ``None`` is not a lie. ``None`` is exactly what both functions
+# return on a machine with no local model server, which is what CI is and what
+# the affected tests all assume — e.g.
+# ``tests/run_agent/test_invalid_context_length_warning.py`` patches
+# ``get_model_context_length`` intending to be offline, and simply misses this
+# second path.
+#
+# Same arm-at-import / decide-at-call split as the gateway PID-scan guard
+# above, for the same two reasons: ``agent.model_metadata`` is one of the
+# expensive imports that guard's note measures (3.6 s / 463 modules), so the
+# fixture must not import it; and test files import it inside function bodies
+# as often as at module scope, so a ``sys.modules`` lookup at fixture setup
+# would leave the common case unarmed.
+
+_REAL_LOCAL_SERVER_PROBE_MARK = "real_local_server_probe"
+
+_LOCAL_SERVER_PROBE_TARGET_MODULE = "agent.model_metadata"
+
+# attr -> FACTORY for what the stub returns. Every value is in-contract "could
+# not determine", which is the honest answer for a host with no local server.
+#
+# Factories, not constants, because ``fetch_endpoint_model_metadata`` returns a
+# dict: handing every caller the same object would let one test's mutation
+# leak into the next.
+#
+# This list was derived by TRACING, not by reading — a plugin wrapping
+# ``socket.socket.connect`` during
+# tests/run_agent/test_invalid_context_length_warning.py. Stubbing only the
+# first two left 20.3 s of connects across 11 attempts still happening, via
+# ``fetch_endpoint_model_metadata`` (model_metadata.py:1050) and
+# ``_query_ollama_api_show_uncached`` (:1653). If a new probe is added to
+# ``agent.model_metadata``, re-run that trace rather than assuming this list is
+# still complete.
+_LOCAL_SERVER_PROBE_ATTRS = {
+    "detect_local_server_type": lambda: None,       # Optional[str]
+    "_query_local_context_length": lambda: None,    # Optional[int]
+    "_query_ollama_api_show": lambda: None,         # Optional[int]
+    "fetch_endpoint_model_metadata": lambda: {},    # Dict[str, Dict[str, Any]]
+}
+
+# Single-element list for the same reason as ``_PID_SCAN_ALLOW_REAL``: the
+# closures below mutate the same cell the fixture writes.
+_LOCAL_SERVER_PROBE_ALLOW_REAL = [False]
+
+
+def _install_local_server_probe_guard(module):
+    """Replace each network-probing attr with a call-time dispatcher.
+
+    Idempotent per attr, and per-attr fault isolated — one attr disappearing in
+    a refactor must not leave the others unguarded. Exceptions are swallowed so
+    a conftest bug cannot break imports for the whole suite; the canaries in
+    tests/test_live_system_guard_self_test.py are what turn a silent failure
+    here into one loud red test.
+    """
+    for attr, stub_factory in _LOCAL_SERVER_PROBE_ATTRS.items():
+        try:
+            real = getattr(module, attr, None)
+            if real is None or getattr(real, "_hermes_local_server_probe_guard", False):
+                continue
+
+            def _guarded(*args, _real=real, _stub=stub_factory, **kwargs):
+                if _LOCAL_SERVER_PROBE_ALLOW_REAL[0]:
+                    return _real(*args, **kwargs)
+                return _stub()
+
+            # Deliberately NOT functools.wraps — see the PID-scan guard above.
+            _guarded._hermes_local_server_probe_guard = True
+            _guarded._hermes_local_server_probe_real = real
+            setattr(module, attr, _guarded)
+        except Exception:
+            continue
+
+
+class _LocalServerProbeGuardFinder:
+    """Patch ``agent.model_metadata`` the moment it is first imported."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _LOCAL_SERVER_PROBE_TARGET_MODULE:
+            return None
+        try:
+            for finder in sys.meta_path:
+                if finder is self:
+                    continue
+                spec = finder.find_spec(fullname, path, target)
+                if spec is None or spec.loader is None:
+                    continue
+                _orig_exec = spec.loader.exec_module
+
+                def _patched_exec(module, _orig_exec=_orig_exec):
+                    _orig_exec(module)
+                    _install_local_server_probe_guard(module)
+
+                spec.loader.exec_module = _patched_exec
+                return spec
+        except Exception:
+            return None
+        return None
+
+
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
     config.addinivalue_line(
@@ -1016,6 +1198,12 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
         "(only for tests that genuinely need real os.kill / subprocess "
         "behaviour — e.g. PTY tests that signal their own child).",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{_REAL_LOCAL_SERVER_PROBE_MARK}: opt out of the autouse stub that "
+        "neutralises agent.model_metadata's four network probes (for tests of "
+        "the probes themselves, which stub httpx beneath them).",
     )
     config.addinivalue_line(
         "markers",
@@ -1031,6 +1219,12 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     if _already_imported is not None:
         _install_pid_scan_guard(_already_imported)
     sys.meta_path.insert(0, _PidScanGuardFinder())
+
+    # Same two-step for the local-server probes.
+    _mm_already_imported = sys.modules.get(_LOCAL_SERVER_PROBE_TARGET_MODULE)
+    if _mm_already_imported is not None:
+        _install_local_server_probe_guard(_mm_already_imported)
+    sys.meta_path.insert(0, _LocalServerProbeGuardFinder())
 
     # The pyproject addopts pin ``--timeout-method=signal`` relies on
     # ``signal.SIGALRM``, which does not exist on Windows — pytest-timeout
@@ -1973,6 +2167,30 @@ def _gateway_pid_scan_guard(request):
         yield
     finally:
         _PID_SCAN_ALLOW_REAL[0] = False
+
+
+@pytest.fixture(autouse=True)
+def _local_server_probe_guard(request):
+    """Choose whether this test may probe a local model server over the network.
+
+    The wrappers are installed at import time by
+    ``_LocalServerProbeGuardFinder``; this fixture only flips the flag they read
+    at call time. No import, no ``sys.modules`` lookup, no monkeypatch — so it
+    cannot regress tests/test_conftest_import_cost.py.
+
+    Tests of the probes themselves opt out with
+    ``@pytest.mark.real_local_server_probe``. Those are already hermetic
+    because they stub ``httpx`` *beneath* the probe, so they never reach the
+    network either — the same shape as the ``real_gateway_pid_scan`` opt-outs,
+    which stub the process-table source beneath the scanner.
+    """
+    _LOCAL_SERVER_PROBE_ALLOW_REAL[0] = (
+        request.node.get_closest_marker(_REAL_LOCAL_SERVER_PROBE_MARK) is not None
+    )
+    try:
+        yield
+    finally:
+        _LOCAL_SERVER_PROBE_ALLOW_REAL[0] = False
 
 
 @pytest.hookimpl(tryfirst=True)

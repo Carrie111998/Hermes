@@ -1580,17 +1580,62 @@ def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
     return False
 
 
+# How far past the internal shutdown watchdog's leash the external stopper
+# waits before force-killing. Only has to cover the watchdog's own exit path
+# (it logs CRITICAL and writes a dump, then exits) — this is a tiebreak, not
+# a second grace period.
+_STOP_ESCALATION_MARGIN_S = 10.0
+# Absolute ceiling on that wait. ``hermes gateway stop`` is interactive and
+# must terminate even if someone configures an absurd drain timeout.
+_STOP_GRACE_CEILING_S = 300.0
+
+
 def _windows_stop_drain_timeout() -> float:
-    """Return a bounded Windows gateway stop grace period."""
+    """Return a bounded Windows gateway stop grace period.
+
+    This must OUTLAST the dying gateway's own shutdown budget, so it is
+    DERIVED from that budget rather than picked independently.  Until
+    2026-08-17 it was ``min(configured, 30.0)``, and the three budgets
+    governing a teardown were misordered:
+
+        granted by this function  30s  <  agent.restart_drain_timeout  60s
+                                       <  shutdown watchdog leash     120s
+
+    So the gateway was force-killed at 30s while its phase-2 drain believed
+    it had 60 — structurally guaranteed to die mid-drain whenever an
+    in-flight cron needed longer, which a live LLM turn routinely does.  The
+    census over the whole of ``gateway.log`` found 10 of 29 stops killed that
+    way; restricted to the stops with a trustworthy in-flight signal, 3 of 3
+    with crons running died at shutdown phase 1 and 0 of 2 without did.  It
+    also made ``gateway/shutdown_watchdog.py`` unreachable, so the one killer
+    that logs CRITICAL and writes an all-thread dump could never fire and a
+    genuine wedge left no diagnosis at all.
+
+    Ordering the grace period *past* the watchdog leash restores the intended
+    escalation: drain, then the loud internal force-exit, and ``taskkill``
+    only as the last resort it was written to be.  Deriving it keeps that
+    ordering true if either budget is retuned later.
+
+    The cost is a longer worst-case restart, but it is paid only where it
+    buys something: ``_drain_gateway_pid`` polls until the PID exits, so a
+    teardown that finishes in 2s still returns in 2s.
+    """
     try:
         from hermes_cli.gateway import _get_restart_drain_timeout
 
         configured = float(_get_restart_drain_timeout() or 30.0)
     except Exception:
         configured = 30.0
-    # Windows CLI stop must not wedge forever. Give the gateway a real
-    # graceful-drain window, then escalate to the known PID.
-    return max(1.0, min(configured, 30.0))
+    try:
+        from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+
+        leash = float(resolve_shutdown_watchdog_delay(configured))
+    except Exception:
+        # Mirrors resolve_shutdown_watchdog_delay's own drain + grace.
+        leash = configured + 60.0
+    # Windows CLI stop must not wedge forever: give the watchdog room to fire
+    # and be seen, then escalate to the known PID regardless.
+    return max(1.0, min(leash + _STOP_ESCALATION_MARGIN_S, _STOP_GRACE_CEILING_S))
 
 
 def _force_terminate_known_gateway_pids(pids: list[int]) -> int:

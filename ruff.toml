@@ -15,6 +15,26 @@
 
 preview = true  # required for PLW1514 (unspecified-encoding) -- preview rule
 
+# The ONE place the ruff binary version is declared. ruff enforces this itself:
+# a binary whose version does not match refuses to load this config and exits 2,
+# so every caller is pinned by the file they already share -- the pre-commit
+# hook, both lint.yml jobs, the repo .venv, and the 15-minute whole-tree alarm
+# in events/producers/ruff_gate_probe.py.
+#
+# This exists because the equality used to be maintained BY HAND across four
+# declaration sites with nothing asserting it, and it had already drifted: on
+# 2026-08-17 the hook, CI and the PATH CLI were aligned on 0.15.12 while
+# pyproject.toml's dev extra still said 0.15.10 -- and the repo .venv, installed
+# FROM that extra, was really running 0.15.10. The alarm resolves ruff off PATH,
+# so which version it linted with depended on whether a session had the venv
+# activated. Two gates disagreeing about the same tree is precisely the failure
+# the whole-tree probe exists to prevent, one level down.
+#
+# Bumping ruff means changing this line, pyproject.toml's dev extra, the
+# ruff-pre-commit `rev:`, and both `uv tool install` lines in lint.yml together
+# -- tests/test_lint_config.py::TestRuffVersionPins fails until they agree.
+required-version = "==0.15.12"
+
 [lint]
 # Pyflakes "F" group, enforced project-wide (CI blocking job + pre-commit hook).
 #

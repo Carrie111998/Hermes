@@ -487,6 +487,13 @@ class TelegramNotifier(BaseSubscriber):
         if et == EventType.CRON_FAILED:
             return f"Error: {p.get('error', 'Unknown')}\nConsecutive failures: {p.get('consecutive_errors', 0)}"
 
+        if et == EventType.CRON_STALE:
+            # Four meanings on one event type, separated only by `scope`.
+            # The generic fallback buried it mid-list and splatted the
+            # correlation UUIDs — cf. the SECRET_DETECTED branch below.
+            from events.formatting import cron_stale_body
+            return cron_stale_body(p)
+
         if et == EventType.JOB_DISCOVERED:
             return f"Title: {p.get('title', '?')}\nCompany: {p.get('company', '?')}\nSource: {p.get('source', '?')}"
 
