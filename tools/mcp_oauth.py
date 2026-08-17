@@ -493,6 +493,17 @@ class HermesTokenStorage:
             return None
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
+        """Persist *tokens*, preserving a refresh token the response omitted.
+
+        .. note::
+           ``tokens`` MAY BE MUTATED. When the incoming token carries no
+           ``refresh_token`` and one is already stored, it is assigned onto
+           ``tokens`` before serialization. This is deliberate: the MCP SDK
+           passes the same object it holds as ``context.current_tokens``, so
+           the assignment is what keeps the *live* provider able to refresh —
+           see the comment below. Callers that need an unmutated instance
+           should pass a copy.
+        """
         # Per RFC 6749 §6, when a client uses ``grant_type=refresh_token``,
         # the authorization server MAY rotate the refresh token (return a new
         # one) OR keep the existing one (return no refresh_token field in the
@@ -532,7 +543,26 @@ class HermesTokenStorage:
         # running provider and the file, because ``payload`` is derived
         # afterwards.
         if not tokens.refresh_token:
-            previous = await self.get_tokens()
+            # Never let reading the previous token block persisting the new
+            # one. ``get_tokens`` tolerates a missing file and a schema-invalid
+            # payload, but not every shape: ``_read_json`` returns whatever
+            # ``json.loads`` produced, so a file holding a JSON list, or a
+            # string ``expires_at``, raises before the ``model_validate``
+            # guard. Without this catch a damaged token file would fail the
+            # write and leave the SDK believing it had persisted a token it
+            # had not — strictly worse than the pre-carry-forward behaviour,
+            # which simply overwrote.
+            try:
+                previous = await self.get_tokens()
+            except Exception as exc:  # noqa: BLE001 — persistence must not fail.
+                logger.warning(
+                    "OAuth tokens for %s: could not read the stored token to "
+                    "preserve its refresh_token (%s); writing the new token "
+                    "without carry-forward",
+                    self._server_name,
+                    exc,
+                )
+                previous = None
             if previous is not None and previous.refresh_token:
                 tokens.refresh_token = previous.refresh_token
                 logger.debug(

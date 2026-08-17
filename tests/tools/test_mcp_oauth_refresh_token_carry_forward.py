@@ -249,3 +249,51 @@ class TestRefreshTokenCarryForward:
         assert beta_token.refresh_token is None
         assert "refresh_token" not in _stored(tmp_path, "beta")
         assert _stored(tmp_path, "alpha")["refresh_token"] == "alpha-refresh"
+
+
+class TestCarryForwardDegradesGracefully:
+    """A damaged previous token file must not block persisting a good new one.
+
+    The carry-forward reads the stored token before writing. ``get_tokens``
+    tolerates a missing file and a schema-invalid payload, but not every shape:
+    ``_read_json`` returns whatever ``json.loads`` produced, so a file holding a
+    JSON list, or a string ``expires_at``, raises out of ``get_tokens`` before
+    the ``model_validate`` guard. Refresh must still land in that case —
+    degrading to the previous overwrite behaviour is strictly better than
+    failing the write and leaving the SDK believing it persisted a token.
+    """
+
+    def _seed(self, tmp_path, payload: str, server: str = "srv") -> None:
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir(parents=True, exist_ok=True)
+        (token_dir / f"{server}.json").write_text(payload)
+
+    @pytest.mark.parametrize(
+        "payload,label",
+        [
+            ('[1, 2, 3]', "json list instead of an object"),
+            ('"just-a-string"', "json string instead of an object"),
+            ('{"access_token": "a", "expires_at": "not-a-number"}', "non-numeric expires_at"),
+        ],
+    )
+    def test_damaged_previous_file_still_persists_the_new_token(
+        self, tmp_path, monkeypatch, payload, label
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from mcp.shared.auth import OAuthToken
+        from tools.mcp_oauth import HermesTokenStorage
+
+        self._seed(tmp_path, payload)
+        storage = HermesTokenStorage("srv")
+
+        asyncio.run(
+            storage.set_tokens(
+                OAuthToken(access_token="fresh", token_type="Bearer", expires_in=3600)
+            )
+        )
+
+        on_disk = _stored(tmp_path)
+        assert on_disk["access_token"] == "fresh", (
+            f"a {label} in the stored file must not prevent the refreshed access "
+            "token from being written"
+        )
