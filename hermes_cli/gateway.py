@@ -58,6 +58,7 @@ from hermes_cli.config import (
     save_env_value,
     write_platform_config_field,
 )
+from hermes_cli.install_root import installed_package_root
 
 # display_hermes_home is imported lazily at call sites to avoid ImportError
 # when hermes_constants is cached from a pre-update version during `hermes update`.
@@ -837,6 +838,19 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             # a failed respawn is worse still — keep the gateway coming back.
             respawn_cwd = ""
             respawn_env_overlay = {}
+
+    # Pin the respawn's cwd even where the Windows rewrite doesn't apply. The
+    # respawned command is ``<python> -m hermes_cli.main ... gateway run
+    # --replace``, and ``-m`` puts the cwd on ``sys.path[0]`` — ahead of the
+    # editable-install finder, which setuptools appends to ``sys.meta_path``. So
+    # inheriting an agent worktree's cwd here respawns the gateway onto that
+    # worktree's code, which is the 2026-08-17 wrong-module-root failure reached
+    # through the manual/fallback path instead of ``gateway restart``.
+    if not respawn_cwd:
+        try:
+            respawn_cwd = str(installed_package_root())
+        except Exception:
+            respawn_cwd = ""
 
     # Serialized as JSON literals embedded in the watcher source so the
     # inner respawn can apply cwd= / env= without extra argv plumbing.
@@ -4160,6 +4174,10 @@ def _spawn_detached_gateway() -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
+                # NOT the caller's cwd: ``-m hermes_cli.main`` resolves the
+                # package from ``sys.path[0]`` == cwd, so a launch from an agent
+                # worktree would run that worktree's code (2026-08-17).
+                cwd=str(installed_package_root()),
                 # Inherit the ambient environment, plus the spawn-site stamp the
                 # child echoes into its gateway.start diag record. Without it
                 # this path would report a null site, which is supposed to mean

@@ -7,6 +7,7 @@ import pytest
 
 import hermes_cli.gateway as gateway
 import hermes_cli.gateway_windows as gateway_windows
+import hermes_cli.install_root as install_root
 import hermes_cli.setup as setup
 
 
@@ -104,30 +105,64 @@ def test_build_gateway_argv_uses_base_pythonw_for_uv_venv_launcher(monkeypatch, 
     monkeypatch.setattr(gateway, "_profile_arg", lambda hermes_home: "")
     monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(hermes_home))
 
+    # The install root, not HERMES_HOME and not `__file__`: see
+    # TestSpawnPinsTheInstalledCheckoutNotTheCallerCwd.
+    monkeypatch.setattr(
+        gateway_windows, "find_installed_package_root", lambda: project
+    )
+    monkeypatch.setattr(gateway_windows, "installed_package_root", lambda: project)
+
     argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
 
     assert argv[:3] == [str(base_pythonw), "-m", "hermes_cli.main"]
-    assert cwd == str(hermes_home.resolve())
+    assert cwd == str(project)
     assert env_overlay["VIRTUAL_ENV"] == str(project / "venv")
     assert str(project) in env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
     assert str(site_packages) in env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
 
 
 class TestStableWindowsGatewayWorkingDir:
+    def test_installed_checkout_beats_hermes_home(self, tmp_path, monkeypatch):
+        """HERMES_HOME is a stable anchor but the WRONG one.
+
+        `python -m` makes cwd sys.path[0], so the cwd a gateway is spawned with
+        decides which copy of the source tree it imports. That has to be the
+        checkout the venv was installed from.
+        """
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        checkout = tmp_path / "agent-src"
+        monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: home)
+        monkeypatch.setattr(
+            gateway_windows, "find_installed_package_root", lambda: checkout
+        )
+
+        assert gateway_windows._stable_gateway_working_dir(
+            tmp_path / "worktree"
+        ) == str(checkout)
+
     def test_stable_gateway_working_dir_uses_hermes_home(self, tmp_path, monkeypatch):
+        """With no install record, HERMES_HOME still beats a transient checkout.
+
+        A Scheduled Task / Startup entry whose `cd /d` names a deleted worktree
+        fails before Python loads, so the on-boot self-heal never runs.
+        """
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: home)
+        monkeypatch.setattr(gateway_windows, "find_installed_package_root", lambda: None)
         assert gateway_windows._stable_gateway_working_dir(tmp_path / "checkout") == str(home.resolve())
 
     def test_stable_gateway_working_dir_falls_back_to_project_root(self, tmp_path, monkeypatch):
         missing = tmp_path / "missing" / ".hermes"
         project = tmp_path / "checkout"
         monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: missing)
+        monkeypatch.setattr(gateway_windows, "find_installed_package_root", lambda: None)
         assert gateway_windows._stable_gateway_working_dir(project) == str(project)
 
 
 def test_write_task_script_anchors_cmd_cd_at_hermes_home(monkeypatch, tmp_path):
+    """No install record → HERMES_HOME, not a checkout that may be transient."""
     project = tmp_path / "project"
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
@@ -136,6 +171,7 @@ def test_write_task_script_anchors_cmd_cd_at_hermes_home(monkeypatch, tmp_path):
     python_exe.write_text("", encoding="utf-8")
     script_path = tmp_path / "gateway.cmd"
 
+    monkeypatch.setattr(gateway_windows, "find_installed_package_root", lambda: None)
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(gateway, "PROJECT_ROOT", project)
     monkeypatch.setattr(gateway, "get_python_path", lambda: str(python_exe))
@@ -1367,6 +1403,143 @@ def test_cli_entrypoint_label_survives_into_boot_reason(
     monkeypatch.setattr(_sys, "argv", ["hermes", "gateway", "run"])
     monkeypatch.setenv(gateway_diag.SPAWN_SITE_ENV, child_env[gateway_diag.SPAWN_SITE_ENV])
     assert GatewayRunner._detect_boot_reason(None) == expected_boot_reason
+
+
+# ── which checkout the spawned gateway actually runs ─────────────────────────
+#
+# 2026-08-17 (observed live): `hermes gateway restart` launched from an agent
+# worktree deployed THAT worktree. `python -m hermes_cli.main` puts the caller's
+# cwd on sys.path[0], so `hermes_cli` resolved from the worktree, `PROJECT_ROOT`
+# (derived from `__file__`) became the worktree, and the spawn handed the new
+# gateway that root as its cwd/PYTHONPATH. Proof was gateway.pid's argv[0]:
+#   ...\.claude\worktrees\wizardly-pasteur-947fe1\hermes_cli\main.py
+# The worktree was ~10 commits behind main and is reaper-deletable (the module
+# root can be removed from under the running gateway), yet every health check
+# passed — a worktree is a real checkout. Agent sessions almost always run from
+# one, so this is the DEFAULT hazard on this box, not an edge case.
+
+
+class _FakeEditableFinder:
+    """Stand-in for setuptools' generated ``__editable___*_finder``."""
+
+    def __init__(self, mapping: dict[str, str]) -> None:
+        self.MAPPING = mapping
+
+    def find_spec(self, fullname, path=None, target=None):
+        return None
+
+
+class TestSpawnPinsTheInstalledCheckoutNotTheCallerCwd:
+    @staticmethod
+    def _arrange(monkeypatch, tmp_path) -> tuple[Path, Path]:
+        """Editable install at <checkout>, but this process runs the worktree."""
+        checkout = tmp_path / "agent-src"
+        worktree = checkout / ".claude" / "worktrees" / "wizardly-pasteur-947fe1"
+        for root in (checkout, worktree):
+            (root / "hermes_cli").mkdir(parents=True)
+            (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+        scripts = checkout / ".venv" / "Scripts"
+        scripts.mkdir(parents=True)
+        for name in ("python.exe", "pythonw.exe"):
+            (scripts / name).write_text("", encoding="utf-8")
+        hermes_home = tmp_path / "hermes-home" / "profiles" / "main"
+        hermes_home.mkdir(parents=True)
+
+        monkeypatch.setattr(gateway_windows.sys, "platform", "win32")
+        monkeypatch.chdir(worktree)
+        monkeypatch.setattr(gateway, "PROJECT_ROOT", worktree)
+        monkeypatch.setattr(
+            gateway, "get_python_path", lambda: str(scripts / "python.exe")
+        )
+        monkeypatch.setattr(gateway, "_profile_arg", lambda *a, **k: "")
+        monkeypatch.setattr(
+            "hermes_cli.config.get_hermes_home", lambda: str(hermes_home)
+        )
+        monkeypatch.setattr(install_root, "_running_package_root", lambda: worktree)
+        monkeypatch.setattr(
+            install_root.sys,
+            "meta_path",
+            [
+                _FakeEditableFinder({"hermes_cli": str(checkout / "hermes_cli")}),
+                *(f for f in install_root.sys.meta_path
+                  if install_root._finder_mapping(f) is None),
+            ],
+        )
+        return checkout, worktree
+
+    def test_build_gateway_argv_returns_the_checkout_as_working_dir(
+        self, monkeypatch, tmp_path
+    ):
+        checkout, worktree = self._arrange(monkeypatch, tmp_path)
+
+        _argv, working_dir, env_overlay = gateway_windows._build_gateway_argv()
+
+        assert working_dir == str(checkout)
+        pythonpath = env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
+        assert pythonpath[0] == str(checkout)
+        assert str(worktree) not in pythonpath
+
+    def test_spawn_detached_popen_gets_the_checkout_as_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        """Assert on the ARGUMENT handed to Popen, not on a live spawn."""
+        checkout, worktree = self._arrange(monkeypatch, tmp_path)
+        captured: dict[str, object] = {}
+
+        class _FakePopen:
+            pid = 4242
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured.update(kwargs)
+
+        monkeypatch.setattr(gateway_windows.subprocess, "Popen", _FakePopen)
+        monkeypatch.setattr(gateway_windows, "windows_detach_flags", lambda: 0)
+
+        assert gateway_windows._spawn_detached(reason="cli:restart") == 4242
+
+        assert captured["cwd"] == str(checkout)
+        pythonpath = captured["env"]["PYTHONPATH"].split(gateway_windows.os.pathsep)
+        assert pythonpath[0] == str(checkout)
+        assert str(worktree) not in pythonpath
+
+    def test_replace_respawn_spec_is_pinned_too(self, monkeypatch, tmp_path):
+        """`gateway run --replace` respawns must not inherit the worktree either."""
+        checkout, worktree = self._arrange(monkeypatch, tmp_path)
+        argv = [
+            str(checkout / ".venv" / "Scripts" / "python.exe"),
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+            "--replace",
+        ]
+
+        _new_argv, working_dir, env_overlay = (
+            gateway_windows.windowless_gateway_restart_spec(argv)
+        )
+
+        assert working_dir == str(checkout)
+        pythonpath = env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
+        assert pythonpath[0] == str(checkout)
+        assert str(worktree) not in pythonpath
+
+    def test_task_script_cd_and_pythonpath_are_the_checkout(
+        self, monkeypatch, tmp_path
+    ):
+        """The Scheduled Task / Startup wrapper is generated from a worktree too."""
+        checkout, worktree = self._arrange(monkeypatch, tmp_path)
+        script_path = tmp_path / "gateway.cmd"
+        monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: script_path)
+
+        gateway_windows._write_task_script()
+        content = script_path.read_text(encoding="utf-8")
+
+        assert f"cd /d {gateway_windows._quote_cmd_script_arg(str(checkout))}" in content
+        assert f'set "PYTHONPATH={checkout};' in content
+        assert str(worktree) not in content
+        # The generated wrapper outlives every worktree it could be written from.
+        assert ".claude" not in content, "a worktree path leaked into the launcher"
 
 
 class TestWindowsStopDrainTimeout:
