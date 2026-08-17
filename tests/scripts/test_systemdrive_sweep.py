@@ -34,6 +34,30 @@ from scripts.systemdrive_sweep import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_log(tmp_path, monkeypatch):
+    """Redirect the DEFAULT log path for every test in this module.
+
+    Caught by actually running the registered scheduled task: three real
+    sightings had been appended to ~/.hermes/logs/systemdrive-sweep.jsonl, all
+    of them pytest fixture dirs under pytest-of-diego. `main()` falls back to
+    log_path() when no --log is given, and two tests called it that way.
+
+    That is worse than ordinary test pollution. This log is FORENSIC -- its
+    whole job is to tell a future reader "a junk tree really appeared here".
+    Test fixtures in it are fabricated evidence, and they are indistinguishable
+    from the real thing at 3am six months from now.
+
+    Autouse rather than per-test --no-log on purpose: a test that forgets the
+    flag must not be able to reach the real path. Tests that assert ON the log
+    still pass an explicit --log and are unaffected by this redirect.
+    """
+    monkeypatch.setattr(
+        "scripts.systemdrive_sweep.log_path",
+        lambda: tmp_path / "redirected" / "systemdrive-sweep.jsonl",
+    )
+
+
 def _make_checkout(tmp_path: Path, worktrees: tuple[str, ...] = ()) -> Path:
     """A fake shared checkout, optionally with .claude/worktrees siblings."""
     root = tmp_path / "agent-src"
@@ -389,3 +413,33 @@ def test_append_log_is_a_no_op_for_an_empty_sighting_list(tmp_path):
     log = tmp_path / "sweep.jsonl"
     append_log(log, [], now=time.time())
     assert not log.exists()
+
+
+def test_main_without_an_explicit_log_uses_the_default_path(tmp_path):
+    """Pins the fallback that leaked into the real log.
+
+    main() resolves log_path() when --log is absent. The autouse fixture above
+    redirects that, so this asserts the FALLBACK IS TAKEN (rather than silently
+    writing nowhere) while proving it lands on the redirected path and not on
+    ~/.hermes/logs/. Without this, someone could "fix" a future pollution bug by
+    deleting the fallback and no test would notice.
+    """
+    root = _make_checkout(tmp_path)
+    _plant(root)
+
+    assert main([str(root)]) == 1
+
+    redirected = tmp_path / "redirected" / "systemdrive-sweep.jsonl"
+    assert redirected.exists(), "main() did not use log_path() as its fallback"
+    assert json.loads(redirected.read_text(encoding="utf-8").strip())["path"] == str(
+        root / JUNK_NAME
+    )
+
+
+def test_no_log_suppresses_the_record_entirely(tmp_path):
+    root = _make_checkout(tmp_path)
+    _plant(root)
+
+    assert main([str(root), "--no-log"]) == 1
+
+    assert not (tmp_path / "redirected" / "systemdrive-sweep.jsonl").exists()
