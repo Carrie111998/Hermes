@@ -55,15 +55,15 @@
 | HERMES-MONITORING-001 | BLOCKED | No merge/deployment/readiness inference from current gateway evidence. |
 | ARCH-002 | MERGED_DEPLOYED | PR #29 merge `3e9fd48d...`; 24 focused tests passed; CI `31937692260` PASS; AGY + Claude Opus implementation review PASS; immutable DGX release active. |
 | ARCH-003 | MERGED_DEPLOYED | PR #30; merge `e8cdfd1e...`; implementation review consensus PASS; CI run `31981532693` PASS after retrying an unrelated pre-existing stream-consumer slice; immutable DGX release active with rollback metadata. |
-| ARCH-004 | DESIGN_REVIEW_PASS | Identical metadata-only packet SHA-256 `224b81eaaa19a236f8e886536c35c4d89e2a508867b8e7135c711411b57937f7`; authenticated DGX `.hermes` Claude Haiku and dedicated DGX `.hermes` AGY `1.1.13` PASS with no corrections; next write and review the implementation plan. |
+| ARCH-004 | IMPLEMENTATION_REVIEW_PASS | Ticket design packet `224b81eaaa19a236f8e886536c35c4d89e2a508867b8e7135c711411b57937f7` and implementation-plan packet `5c833b287e7f8437f683300e1eeeb236356f585dd34c8a9cfadab02769eabd59`; authenticated DGX `.hermes` Claude Haiku and dedicated DGX `.hermes` AGY `1.1.13` both PASS with no corrections; next gate is separately authorized source implementation. |
 
 ## Current next lane
 
-**ARCH-004 implementation planning** is the next core lane. The ticket design
-and identical-packet Claude + AGY review gate are complete with PASS. Next write
-the implementation plan and route that plan through its own independent review
-before any source change. Do not implement, migrate, deploy, or modify DGX
-until implementation authorization and its review gate are complete.
+**ARCH-004 source implementation** is the next core lane. The ticket design and
+implementation-plan identical-packet Claude + AGY review gates are complete
+with PASS. Source implementation still requires separate authorization; after
+that, implementation tests and implementation cross-review remain separate
+gates. Do not migrate, deploy, or modify DGX from this planning result.
 
 ## Runtime and deployment boundary
 

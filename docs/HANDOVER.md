@@ -20,11 +20,11 @@ The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`
 
 ## 2. Goal and roadmap
 
-- **Current goal:** preserve the merged ARCH-002/ARCH-003 runtime-state contracts, keep Telegram service/inbound/outbound gates separate, and prepare ARCH-004 implementation review.
+- **Current goal:** preserve the merged ARCH-002/ARCH-003 runtime-state contracts, keep Telegram service/inbound/outbound gates separate, and move ARCH-004 from implementation-plan review to separately authorized source implementation.
 - **Completed and deployed:** ARCH-002, PR #29, merge `3e9fd48dc28b7df186c780992351ef01febaa070`; and ARCH-003, PR #30, merge `e8cdfd1e65191b68423afd7e12248d3c6e728e00`. Both have implementation-review consensus, latest-head CI, immutable DGX release, rollback metadata, and post-deploy service evidence.
 - **Telegram runtime:** the gateway recovered from a transient startup timeout through its bounded retry path. Post-recovery logs show repeated qualifying empty `telegram_polling_progress` events; user-visible delivery remains a separate gate.
 - **Deferred/blocked:** HERMES-MONITORING-001 remains BLOCKED. Telegram user-visible delivery is not claimed from service or polling health.
-- **Active ticket:** ARCH-004 redaction and SQLite/WAL safeguards has passed design review consensus; implementation remains separately unauthorized.
+- **Active ticket:** ARCH-004 redaction and SQLite/WAL safeguards has passed both design review and implementation-plan review consensus; source implementation remains separately unauthorized.
 
 ## 3. Verified runtime and deployment state
 
@@ -63,7 +63,7 @@ The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`
 - **HERMES-CALENDAR-GUARD-001:** merged/deployed; actual DGX guard naming/effective unit remains a separate documentation hygiene concern.
 - **HERMES-MONITORING-001:** BLOCKED; do not infer readiness from gateway health.
 - **ARCH-003:** `MERGED_DEPLOYED`; PR #30, implementation commit `9b777c0b1`, merge `e8cdfd1e...`; focused Windows dependency test `29 passed`; canonical runner ARCH-003 tests `24 passed` with its gateway integration collection limited by the borrowed KLIB venv missing PyYAML; authenticated AGY and fresh authenticated WSL Claude implementation reviews both `PASS`; CI run `31981532693` passed after retrying an unrelated pre-existing stream-consumer slice; immutable release and runtime health verified on DGX.
-- **ARCH-004:** `DESIGN_REVIEW_PASS`; ticket plan `docs/plans/2026-08-17-arch-004-ticket-design.md`; identical metadata-only packet SHA-256 `224b81eaaa19a236f8e886536c35c4d89e2a508867b8e7135c711411b57937f7`; authenticated DGX `.hermes` Claude Haiku and dedicated DGX `.hermes` AGY `1.1.13` both returned `PASS` with correction set none. Next action is a separately authorized implementation plan/review; no source, migration, merge, or deployment evidence exists yet.
+- **ARCH-004:** `IMPLEMENTATION_REVIEW_PASS`; ticket design `docs/plans/2026-08-17-arch-004-ticket-design.md`; implementation plan `docs/plans/2026-08-17-arch-004-implementation.md`; final identical metadata-only implementation packet SHA-256 `5c833b287e7f8437f683300e1eeeb236356f585dd34c8a9cfadab02769eabd59`; authenticated DGX `.hermes` Claude Haiku and dedicated DGX `.hermes` AGY `1.1.13` both returned `PASS` with correction set none. Next action is separately authorized source implementation; no source, migration, CI, merge, or deployment evidence exists yet.
 
 ### Gate rule
 
@@ -75,6 +75,6 @@ Ticket design, implementation, tests, independent review, reconciliation, CI, me
 2. Verify repository root, remote, branch, HEAD, GitHub main code baseline, DGX hostname, service, release marker, and rollback release.
 3. Preserve the primary dirty worktree and DGX live source checkout; do not reset, clean, or overwrite either.
 4. Keep reviewer packets metadata-only; never send source, secrets, tokens, absolute paths, message bodies, or generated evidence text.
-5. For ARCH-004, the design gate is PASS; write and independently review the implementation plan before implementation, and do not infer implementation authorization from the design PASS or ARCH-003 deployment.
+5. For ARCH-004, design and implementation-plan review gates are PASS; source implementation still requires separate authorization, and no implementation/CI/merge/deploy evidence may be inferred from either review or ARCH-003 deployment.
 6. Keep ARCH-002, ARCH-003, and Telegram delivery evidence separate.
 7. Refresh this handover only with verified facts and the exact next action.
