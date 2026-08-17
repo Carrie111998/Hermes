@@ -122,6 +122,32 @@ class TestV2Parsing:
         # plugin still loads
         assert mgr._plugins["modern"].enabled or mgr._plugins["modern"].error
 
+    def test_config_fields_list_normalizes_to_config_schema(self, hermes_home):
+        _write_plugin(
+            hermes_home / "plugins", "voice-plugin",
+            manifest_extra={
+                "manifest_version": 2,
+                "config_fields": [
+                    {
+                        "key": "stt.voice_plugin.model",
+                        "label": "Model",
+                        "type": "select",
+                        "options": ["small", "large"],
+                    },
+                ],
+            },
+        )
+        _enable(hermes_home, ["voice-plugin"])
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        assert mgr._plugins["voice-plugin"].manifest.config_schema == {
+            "stt.voice_plugin.model": {
+                "label": "Model",
+                "type": "select",
+                "options": ["small", "large"],
+            },
+        }
+
     def test_unknown_field_in_v2_warns_but_loads(self, hermes_home, caplog):
         _write_plugin(
             hermes_home / "plugins", "modern",
