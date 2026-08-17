@@ -20,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   readLockfile,
   READY_RE,
+  remoteCliProfile,
   remotePidAlive,
   remoteSupportsSshOwnership,
   scrapeReadyPort,
@@ -253,6 +254,25 @@ test('metadata and process proof transport failures remain indeterminate', async
   )
 })
 
+test('pidIsOurDashboard treats a dead pid as FOREIGN instead of a transport error', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const { execFileSync } = await import('node:child_process')
+
+  const ssh = {
+    calls: [] as string[],
+    async exec(cmd: string) {
+      this.calls.push(cmd)
+
+      return execFileSync('bash', ['-lc', cmd], { encoding: 'utf8' })
+    }
+  }
+
+  assert.equal(await pidIsOurDashboard(ssh, 2_147_483_647, SPAWN_NONCE, '/x/hermes'), false)
+})
+
 test('pidIsOurDashboard requires the exact serve ownership nonce', async () => {
   const ours = `/x/hermes serve --isolated --ssh-owner-nonce ${SPAWN_NONCE}`
   assert.equal(await pidIsOurDashboard(fakeSsh([[/print\("OWNED"/, 'OWNED\n']]), 5, SPAWN_NONCE, '/x/hermes'), true)
@@ -312,6 +332,31 @@ test('buildSpawnCommand always uses serve (legacy dashboard path removed)', () =
   assert.doesNotMatch(cmd, /dashboard/)
   assert.doesNotMatch(cmd, /--skip-build/)
   assert.match(cmd, /setsid/)
+})
+
+test('remoteCliProfile accepts Hermes profile ids and drops desktop composite keys', () => {
+  assert.equal(remoteCliProfile('writer_2'), 'writer_2')
+  assert.equal(remoteCliProfile('default'), 'default')
+  assert.equal(remoteCliProfile('  coder '), 'coder')
+  assert.equal(remoteCliProfile(''), '')
+  assert.equal(remoteCliProfile('conn:yun3d::default'), '')
+  assert.equal(remoteCliProfile('conn:homelab::research'), '')
+})
+
+test('buildSpawnCommand never passes a desktop composite scope as --profile', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'conn:yun3d::default', {
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+  })
+
+  assert.doesNotMatch(cmd, /--profile/)
+  assert.doesNotMatch(cmd, /conn:yun3d/)
+  assert.match(cmd, /serve --isolated/)
+})
+
+test('buildSpawnCommand still pins a valid remote profile name', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'writer_2', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
+  assert.match(cmd, /--profile/)
+  assert.match(cmd, /writer_2/)
 })
 
 test('spawnRemoteDashboard returns exact ownership artifacts', async () => {

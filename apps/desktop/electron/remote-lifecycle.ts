@@ -362,6 +362,17 @@ async function remotePidAlive(ssh, pid) {
   }
 }
 
+// Mirrors hermes_cli.profiles._PROFILE_ID_RE / desktop PROFILE_NAME_RE.
+// Desktop routing keys (`conn:<id>::<profile>`) are valid pool/ownership ids
+// and invalid remote --profile values — omit the flag rather than spawn-fail.
+const REMOTE_CLI_PROFILE_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+
+function remoteCliProfile(profile) {
+  const value = String(profile ?? '').trim()
+
+  return REMOTE_CLI_PROFILE_RE.test(value) ? value : ''
+}
+
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
 async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
@@ -379,7 +390,11 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
       'except OSError:\n' +
-      ' line=subprocess.check_output(["ps","-o","command=","-p",str(pid)],text=True).strip()\n' +
+      ' try:\n' +
+      '  line=subprocess.check_output(["ps","-o","command=","-p",str(pid)],text=True).strip()\n' +
+      ' except Exception:\n' +
+      '  print("FOREIGN")\n' +
+      '  raise SystemExit\n' +
       ' args=shlex.split(line)\n' +
       'ok=False\n' +
       'try:\n' +
@@ -441,7 +456,8 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
 // fd-detachment is already handled by </dev/null + redirect + &).
 function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const hermes = expandRemotePath(hermesPath)
-  const profileArgs = profile ? `--profile ${shq(profile)} ` : ''
+  const cliProfile = remoteCliProfile(profile)
+  const profileArgs = cliProfile ? `--profile ${shq(cliProfile)} ` : ''
   const logPath = expandRemotePath(opts.logPath)
   const tokenFilePath = opts.tokenFilePath
   const tokenArg = tokenFilePath ? ` --ssh-session-token-file ${expandRemotePath(tokenFilePath)}` : ''
@@ -893,6 +909,7 @@ export {
   readLockfile,
   READY_RE,
   REMOTE_LOCK_DIR,
+  remoteCliProfile,
   remotePidAlive,
   remoteSupportsSshOwnership,
   removeLockfile,
