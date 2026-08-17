@@ -7827,14 +7827,18 @@ def cmd_gui(args: argparse.Namespace):
 
     packaged_executable = _desktop_packaged_executable(desktop_dir)
 
-    if source_mode or not skip_build:
-        npm = _resolve_node_runtime_npm()
-        if not npm:
-            print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
-            print("Install Node.js, then run:  hermes gui")
-            sys.exit(1)
-    else:
-        npm = None
+    # A source-mode run needs npm no matter what: the launch itself is
+    # `npm exec -- electron .`, so even --skip-build cannot avoid it.
+    #
+    # A packaged run never uses npm to LAUNCH — it execs the packed binary — so
+    # its npm requirement belongs to the BUILD, and is resolved lazily below,
+    # after the content stamp has decided a build is actually going to run.
+    # Demanding it up front made an up-to-date packaged app refuse to start on
+    # any PATH without npm, which is exactly what a cold application-menu
+    # launch looks like: the XDG/systemd session PATH has no login-shell
+    # additions, so a Homebrew/Linuxbrew Node is invisible to it and the app
+    # exits 1 without a window, having had no build work to do (#88004).
+    npm = _require_node_runtime_npm() if source_mode else None
 
     if skip_build:
         if source_mode:
@@ -7868,6 +7872,8 @@ def cmd_gui(args: argparse.Namespace):
             build_label = "source build" if source_mode else "packaged app"
             print(f"✓ Desktop {build_label} is up to date (content stamp matches)")
         else:
+            if npm is None:
+                npm = _require_node_runtime_npm(packaged_executable)
             print("→ Installing desktop workspace dependencies...")
             # Put the Hermes-managed Node on PATH so npm's child scripts (which
             # shell out to bare `node`, e.g. electron-winstaller's
@@ -9634,6 +9640,25 @@ def _is_windows_npm_path(npm_path: str) -> bool:
         or low.startswith("/mnt/")
         or "\\" in npm_path
     )
+
+
+def _require_node_runtime_npm(packaged_executable: Path | None = None) -> str:
+    """Resolve npm or exit 1 with the install hint. Never returns ``None``.
+
+    ``packaged_executable`` is the already-built app, when there is one. Its
+    presence changes the advice rather than the outcome: npm is still needed to
+    REBUILD, but the user has a launchable app right now and does not have to
+    install a Node toolchain to get a window back.
+    """
+    npm = _resolve_node_runtime_npm()
+    if npm:
+        return npm
+    print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
+    print("Install Node.js, then run:  hermes gui")
+    if packaged_executable is not None:
+        print("Or launch the existing app without rebuilding:  hermes desktop --skip-build")
+        print(f"  ({packaged_executable})")
+    sys.exit(1)
 
 
 def _resolve_node_runtime_npm() -> str | None:

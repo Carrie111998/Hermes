@@ -132,6 +132,91 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
 
 
+def test_gui_launches_up_to_date_packaged_app_without_npm(tmp_path, monkeypatch):
+    """Regression (#88004): an up-to-date packaged app must launch on a PATH
+    with no npm at all.
+
+    This is what a cold application-menu launch looks like on Linux — the
+    XDG/systemd session PATH has none of the login shell's additions, so a
+    Homebrew/Linuxbrew Node is simply not there. The packaged app is launched by
+    exec'ing the packed binary and never shells out to npm, and the content
+    stamp says there is no build to run, so npm must not be consulted at all.
+    Before the fix it was resolved before the stamp was ever read and the
+    process exited 1 without a window.
+    """
+    root = _make_desktop_tree(tmp_path)
+    desktop_dir = root / "apps" / "desktop"
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value=None) as mock_npm, \
+         patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._run_npm_install_deterministic") as mock_install, \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
+         patch("hermes_cli.main._register_linux_desktop_entry"), \
+         patch("hermes_cli.main.subprocess.run", side_effect=[launch_ok]) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 0
+    assert mock_run.call_args_list[0].args[0] == [str(packaged_exe)]
+    mock_install.assert_not_called()
+    # Not merely "did not exit on it": the lookup never happens, which is what
+    # makes the launch independent of the session PATH rather than lucky.
+    mock_npm.assert_not_called()
+    assert desktop_dir.exists()
+
+
+def test_gui_still_requires_npm_when_a_packaged_build_must_run(tmp_path, monkeypatch, capsys):
+    """The npm requirement moves, it does not go away.
+
+    A stale content stamp means a real ``npm ci`` + ``npm run pack``, so a
+    missing npm still has to fail loudly there. It should also say that the
+    already-packaged app can be launched as-is, or a menu user with no Node
+    toolchain reads the message as unrecoverable.
+    """
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value=None), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._run_npm_install_deterministic") as mock_install, \
+         patch("hermes_cli.main._register_linux_desktop_entry"), \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 1
+    mock_install.assert_not_called()
+    out = capsys.readouterr().out
+    assert "npm was not found on PATH" in out
+    assert "--skip-build" in out
+    assert str(packaged_exe) in out
+
+
+def test_gui_source_mode_requires_npm_even_with_skip_build(tmp_path, monkeypatch):
+    """A source-mode launch IS ``npm exec -- electron .``.
+
+    So npm stays a hard, up-front requirement there even when --skip-build
+    means no build runs — the packaged path is the only one that can launch
+    without it. Pinned separately because the fix narrowed the up-front gate,
+    and narrowing it one branch too far would strand source mode with
+    ``npm = None`` all the way into the launch call.
+    """
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value=None) as mock_npm, \
+         patch("hermes_cli.main._register_linux_desktop_entry"), \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(source=True, skip_build=True))
+
+    assert exc.value.code == 1
+    mock_npm.assert_called_once()
+
+
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
     """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
     shell out to bare ``node``. When Desktop is launched from the updater chain
