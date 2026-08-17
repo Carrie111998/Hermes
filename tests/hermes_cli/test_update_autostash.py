@@ -138,6 +138,7 @@ def _make_update_side_effect(
     merge_base_exists=True,
     update_ref_fails=False,
     pre_pull_sha_unavailable=False,
+    existing_rescue_refs=None,
 ):
     """Build a subprocess.run side_effect for cmd_update tests.
 
@@ -154,6 +155,10 @@ def _make_update_side_effect(
     to resolve HEAD before the pull (empty rev-parse output) — the rescue-ref
     guard requires a truthy ``pre_pull_sha`` and must degrade gracefully
     without one.
+
+    ``existing_rescue_refs`` simulates the refs already present under
+    ``refs/hermes-update-backups/orphan-<branch>-*`` (oldest first) so the
+    ``_prune_orphan_rescue_refs`` cleanup pass has something to trim.
     """
     recorded = []
     head_sha_calls = []
@@ -191,6 +196,11 @@ def _make_update_side_effect(
             return SimpleNamespace(
                 stdout="", stderr="fatal: Not a valid commit name origin/main\n", returncode=1
             )
+        if "for-each-ref" in joined:
+            refs = existing_rescue_refs or []
+            return SimpleNamespace(stdout="\n".join(refs) + ("\n" if refs else ""), stderr="", returncode=0)
+        if "update-ref" in joined and "-d" in cmd:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "update-ref" in joined:
             if update_ref_fails:
                 return SimpleNamespace(
@@ -283,10 +293,58 @@ def test_cmd_update_orphan_history_backs_up_before_reset(monkeypatch, tmp_path, 
     assert update_ref_calls[0][update_ref_calls[0].index("update-ref") + 2] == (
         "1111111111111111111111111111111111111beef"
     )
+    # Ref name carries the pre-pull SHA, not just a second-resolution
+    # timestamp, so two updates racing within the same second don't collide.
+    assert ref_name.endswith("-111111111111")
 
     out = capsys.readouterr().out
     assert "orphan divergence" in out
     assert ref_name in out
+
+
+def test_cmd_update_orphan_rescue_ref_write_failure_message_is_honest(monkeypatch, tmp_path, capsys):
+    """When ``git update-ref`` fails, the printed message must not claim a
+    backup exists — it should say the write was attempted and failed."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=False, update_ref_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    out = capsys.readouterr().out
+    assert "orphan divergence" in out
+    assert "backup write failed" in out
+    assert "backed up current HEAD" not in out
+
+
+def test_cmd_update_orphan_rescue_refs_pruned_beyond_keep_limit(monkeypatch, tmp_path, capsys):
+    """Old orphan rescue refs beyond the retention limit are deleted so a
+    repeatedly corrupted install doesn't pin unbounded objects against gc."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    stale_refs = [
+        f"refs/hermes-update-backups/orphan-main-2026010{i}-000000-abc"
+        for i in range(1, hermes_main._ORPHAN_RESCUE_REFS_TO_KEEP + 3)
+    ]
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=False, existing_rescue_refs=stale_refs,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    delete_calls = [
+        c for c in recorded
+        if "update-ref" in " ".join(str(x) for x in c) and "-d" in c
+    ]
+    assert len(delete_calls) == len(stale_refs) - hermes_main._ORPHAN_RESCUE_REFS_TO_KEEP
+    deleted_refs = {c[c.index("-d") + 1] for c in delete_calls}
+    assert deleted_refs == set(stale_refs[: len(stale_refs) - hermes_main._ORPHAN_RESCUE_REFS_TO_KEEP])
 
 
 def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, capsys):
