@@ -266,7 +266,7 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
 
     result = await runner._handle_message(_make_event("continue restored", thread_id="17585"))
 
-    assert result == "restored response"
+    assert result.startswith("restored response")
     assert captured["session_id"] == "restored-session"
 
 

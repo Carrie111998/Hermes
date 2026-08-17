@@ -1,8 +1,9 @@
 """Gateway runtime-metadata footer.
 
 Renders a compact footer showing runtime state (model, context %, cwd, session ID,
-and Telegram topic) and appends it to the FINAL message of an agent turn when
-enabled.  Off by default to keep replies minimal.
+and Telegram thread) and appends it to the FINAL message of an agent turn when
+enabled. Telegram identity fields can be rendered as a blockquote. Off by default
+to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
 
@@ -14,13 +15,12 @@ Config (``~/.hermes/config.yaml``)::
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
 and any gateway platform.
-
 The footer is appended to the final response text in ``gateway/run.py`` right
 before returning the response to the adapter send path — so it only lands on
 the final message a user sees, not on tool-progress updates or streaming
-partials.  When streaming is on and the final text has already been delivered
-piecemeal, the footer is sent as a separate trailing message via
-``send_trailing_footer()``.
+partials. When an editable streaming final message is available, the Gateway
+edits that message in place; otherwise it uses the adapter's trailing-send
+fallback.
 """
 
 from __future__ import annotations
@@ -97,6 +97,7 @@ def format_runtime_footer(
     cwd: Optional[str] = None,
     session_id: Optional[str] = None,
     telegram_topic: Optional[str] = None,
+    blockquote: bool = False,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer, or return "" if no fields have data.
@@ -131,9 +132,14 @@ def format_runtime_footer(
 
     if not parts:
         return ""
-    if any(field in _LABEL_FIELDS for field in field_list):
-        return "\n".join(parts)
-    return _SEP.join(parts)
+    rendered = (
+        "\n".join(parts)
+        if any(field in _LABEL_FIELDS for field in field_list)
+        else _SEP.join(parts)
+    )
+    if blockquote:
+        return "\n".join(f"> {line}" if line else ">" for line in rendered.splitlines())
+    return rendered
 
 
 def build_footer_line(
@@ -146,6 +152,7 @@ def build_footer_line(
     cwd: Optional[str] = None,
     session_id: Optional[str] = None,
     telegram_topic: Optional[str] = None,
+    blockquote: bool = False,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -163,5 +170,6 @@ def build_footer_line(
         cwd=cwd,
         session_id=session_id,
         telegram_topic=telegram_topic,
+        blockquote=blockquote,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

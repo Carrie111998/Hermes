@@ -157,6 +157,24 @@ _GATEWAY_SECRET_PATTERNS = (
 )
 
 
+async def _append_footer_to_streamed_message(
+    stream_consumer: Any,
+    response: str,
+    footer_line: str,
+) -> bool:
+    """Append the footer by editing the already-delivered final message."""
+    message_id = getattr(stream_consumer, "message_id", None)
+    edit_message = getattr(stream_consumer, "_edit_message", None)
+    if not message_id or not callable(edit_message) or not response or not footer_line:
+        return False
+    await edit_message(
+        message_id=message_id,
+        content=f"{response}\n\n{footer_line}",
+        finalize=True,
+    )
+    return True
+
+
 def _ensure_windows_gateway_venv_imports() -> None:
     """Make detached Windows gateway runs see the Hermes venv packages.
 
@@ -12336,6 +12354,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and getattr(source, "thread_id", None) is not None
                         else None
                     ),
+                    blockquote=_platform_config_key(source.platform) == "telegram",
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -12696,21 +12715,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
+                # Append the footer to the already-delivered final message when
+                # streaming exposed its editable message handle.  This keeps the
+                # footer in the same Telegram message instead of creating a
+                # separate trailing bubble.
                 if _footer_line:
                     try:
-                        _foot_adapter = self._adapter_for_source(source)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
-                                source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
+                        _footer_stream = agent_result.get("stream_consumer")
+                        _edited_existing = await _append_footer_to_streamed_message(
+                            _footer_stream,
+                            response,
+                            _footer_line,
+                        )
+                        if not _edited_existing:
+                            _foot_adapter = self._adapter_for_source(source)
+                            if _foot_adapter:
+                                await _foot_adapter.send(
+                                    source.chat_id,
+                                    _footer_line,
+                                    metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                )
                     except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
+                        logger.debug("trailing footer delivery failed: %s", _e)
                 return None
 
             return response
@@ -17606,6 +17632,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "stream_consumer": _stream_consumer,
         }
 
     # ------------------------------------------------------------------
@@ -20012,6 +20039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "stream_consumer": stream_consumer_holder[0],
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default

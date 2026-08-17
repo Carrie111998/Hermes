@@ -14,6 +14,7 @@ from gateway.runtime_footer import (
     format_runtime_footer,
     resolve_footer_config,
 )
+from gateway.run import _append_footer_to_streamed_message
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +175,48 @@ def test_format_footer_dual_telegram_context_uses_exact_two_line_format():
     assert out == "Session: sid-42\nTelegram thread: 227617"
 
 
+def test_format_footer_dual_telegram_context_uses_blockquote_format():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        session_id="sid-42",
+        telegram_topic="227617",
+        fields=("session_id", "telegram_topic"),
+        blockquote=True,
+    )
+    assert out == "> Session: sid-42\n> Telegram thread: 227617"
+
+
+@pytest.mark.asyncio
+async def test_stream_footer_edits_existing_final_message():
+    class FakeStreamConsumer:
+        message_id = "message-42"
+
+        def __init__(self):
+            self.edits = []
+
+        async def _edit_message(self, **kwargs):
+            self.edits.append(kwargs)
+
+    stream = FakeStreamConsumer()
+    edited = await _append_footer_to_streamed_message(
+        stream,
+        "Final answer",
+        "> Session: sid-42\n> Telegram thread: 227617",
+    )
+
+    assert edited is True
+    assert stream.edits == [{
+        "message_id": "message-42",
+        "content": (
+            "Final answer\n\n> Session: sid-42\n> Telegram thread: 227617"
+        ),
+        "finalize": True,
+    }]
+
+
 def test_format_footer_unknown_field_silently_ignored():
     out = format_runtime_footer(
         model="openai/gpt-5.4",
@@ -302,8 +345,9 @@ def test_build_footer_returns_dual_telegram_context_when_configured():
         cwd="",
         session_id="sid-42",
         telegram_topic="227617",
+        blockquote=True,
     )
-    assert out == "Session: sid-42\nTelegram thread: 227617"
+    assert out == "> Session: sid-42\n> Telegram thread: 227617"
 
 
 def test_build_footer_per_platform_off_suppresses():
