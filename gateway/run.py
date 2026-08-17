@@ -5993,7 +5993,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _disp_cmds is not None and isinstance(_disp_cmds, list):
                 self._DISPATCHER_FORWARD_COMMANDS = frozenset(_disp_cmds)
         else:
-            # No dispatcher configured — disable forwarding entirely.
+            # No dispatcher configured -- disable forwarding entirely.
             self._DISPATCHER_FORWARD_COMMANDS = frozenset()
 
         # Track running agents per session for interrupt support
