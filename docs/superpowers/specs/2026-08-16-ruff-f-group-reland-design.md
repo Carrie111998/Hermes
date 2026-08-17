@@ -136,13 +136,42 @@ independently landable and independently abandonable.
 | 4 | F401, F541 | 544 | 383 | 172 |
 | 5 | F841 | 348 | 172 | 0 |
 
-**Stage 2 — the real bugs.** One is a live crash: `plugins/platforms/sms/adapter.py` calls
-`re.sub()` thirteen times with `re` never imported (16 of the 43 F821). That file lands as
-its own commit, first. `plugins/platforms/whatsapp/adapter.py` has the matching bug — bare
-`json.loads` where the module imports `import json as _json`. F822 is an undefined name in
-`gateway/platforms/__init__.py`'s `__all__`. Each F821 is graded individually: most of the
-remainder are annotation-only under `from __future__ import annotations` and are harmless,
-so the count is not 43 latent crashes.
+**Stage 2 — the real bugs.** A prior triage (2026-08-16, worktree `sharp-payne-a1fb61`,
+MemPalace `agent-src/decisions`) already graded all 43 F821 **by execution**, not by
+reading ruff output, and found 19 hits across 5 files that are live defects. Those
+findings are adopted here rather than re-derived:
+
+1. `plugins/platforms/sms/adapter.py:415-423` — `re.sub()` x13 in
+   `_strip_markdown_for_sms`, `re` never imported. Confirmed `NameError` by executing the
+   AST-extracted function. Fires on **every outbound SMS containing markdown**. Lands as
+   its own commit, first.
+2. `plugins/platforms/whatsapp/adapter.py:724,875` — bare `json.loads` with `json` unbound
+   at module scope. **The 2026-08-11 record that the module "imports `import json as
+   _json`" is wrong and was corrected by that triage:** the import sits at line 2347,
+   *inside a function*, under a different name, so it never binds module-scope `json`.
+   Both call sites are inside `try:/except Exception:`, so the `NameError` is **swallowed**
+   — a silent behaviour bug, not a crash. JSON mention-patterns never parse (they always
+   fall through to line/comma splitting) and every `lid-mapping-*.json` is silently skipped.
+3. `plugins/google_meet/cli.py:97` — `except Exception as e:` defines a closure referencing
+   `e`, invoked later via argparse dispatch. Python deletes the except-name at clause exit.
+   Same class as the `graphs/jobflow.py` finding: an error path that itself errors.
+4. `tests/tools/test_file_ops_cwd_tracking.py:33` — `os.name` with no `import os`. This
+   **closes an open baseline question**: the 5 `TestShellFileOpsCwdTracking` failures
+   recorded as unexplained in `tests-tools-windows-baseline.md` are all this `NameError`,
+   proven by a serial re-run. A real regression with a one-line fix, not a timeout.
+5. `tests/gateway/test_shutdown_watchdog.py:54` — `raise _ExitCalled(code)`, a class defined
+   nowhere in the file or any conftest.
+
+The remaining ~19 F821 across 13 files are runtime-safe annotation gaps (quoted, or under
+`from __future__ import annotations`); they only break `typing.get_type_hints()` and take
+one-line `TYPE_CHECKING` imports. So the count is not 43 latent crashes. The last 5 are the
+godmode exec-injected globals, already permanently exempted in Stage 1.
+
+F822 is an undefined name in `gateway/platforms/__init__.py`'s `__all__`. For F811, note
+`hermes_cli/runtime_provider.py:799` redefines `has_named_custom_provider`
+**byte-identically** to line 592 — a copy-paste artifact, so **delete** the second def
+rather than rename it. Diff both segments before un-shadowing anything: a duplicate class
+is as likely to be a copy-paste artifact as lost coverage.
 
 **Stage 3 — F601.** 90 of 94 are in `scripts/release.py`, a contributor email-to-handle
 attribution dict with repeated keys. Dedupe where both values agree. **Any key whose two
@@ -207,3 +236,8 @@ entries remain in `per-file-ignores`, land, and update the agent-memory record
 - Any rule group beyond `F` and the existing `PLW1514`.
 - Pinning the CI ruff version (offered, declined, recorded above).
 - Reformatting, or any edit not required to clear a finding.
+- **"Fixing" the `Invalid # noqa directive on run_agent.py:107` warning.** It is prose —
+  the comment describes ``# noqa: F401`` re-exports and ruff parses the literal sequence
+  inside the sentence. There is no malformed directive. The 2026-08-15 audit and the
+  2026-08-16 triage both examined it and recorded **do not fix**; that decision stands.
+  The warning rides along on every ruff run and should be left alone.
