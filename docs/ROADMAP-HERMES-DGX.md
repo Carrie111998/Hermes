@@ -17,19 +17,19 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| `main` runtime code baseline | `e8cdfd1e65191b68423afd7e12248d3c6e728e00` | ARCH-003 merged via PR #30; later handover/roadmap commits are documentation-only. |
+| `main` runtime code baseline | `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea` | ARCH-004 merged via PR #33; later handover/roadmap commits are documentation-only. |
 | Primary laptop checkout | `D:/PROJECT/Hermes`, `ticket/hermes-auth-001`, HEAD `c192e863d8dc9df98c2bd9d066ce49bc4f9cb3e8` | Dirty audit checkout; preserve all pre-existing changes and untracked files. |
 | DGX live source checkout | `/home/cwliao/.hermes/hermes-agent`, clean HEAD `1c14d2b9df29da845fb2a56b2fbe12cf8ee507cb` | Deployment input only; do not reset or edit as active runtime source. |
-| DGX active release | `/home/cwliao/.hermes/releases/v2026.8.17-hermes-arch-003-e8cdfd1e` | Immutable runtime snapshot selected by drop-in `35-hermes-arch-003-e8cdfd1e.conf`. |
-| Gateway service | `active/running`, MainPID `1419906`, `NRestarts=0`, `ExecMainStatus=0` | Service/process health PASS at verification time; effective path matches ARCH-003 release. |
-| Rollback | `v2026.8.16-hermes-telegram-inbound-178c9be1` and prior drop-in retained | Rollback evidence remains available; no prior release was deleted. |
+| DGX active release | `/home/cwliao/.hermes/releases/v2026.8.17-hermes-arch-004-e2f94e26` | Immutable runtime snapshot selected by drop-in `36-hermes-arch-004-e2f94e26.conf`; marker matches merge `e2f94e26...`. |
+| Gateway service | `active/running`, MainPID `1654068`, `NRestarts=0`, `ExecMainStatus=0` | Service/process health PASS after ARCH-004 restart and bounded post-start check; effective path matches ARCH-004 release. |
+| Rollback | ARCH-003 release/drop-in and earlier Telegram/ARCH-002 releases retained | Rollback evidence remains available under `/home/cwliao/.hermes/deploy-backups/hermes-arch-004-e2f94e26`; no prior release was deleted. |
 
 ## Core engineering order
 
 1. CI-BASELINE-001 — restore blocking Python CI while preserving behavior. **Complete.**
 2. ARCH-002 — extend the runtime-state contract. **Merged, deployed, and runtime marker verified.**
 3. ARCH-003 — audit/replay integration after the shared state boundary is stable. **Merged, deployed, and runtime marker verified.**
-4. ARCH-004 — redaction and SQLite/WAL safeguards after the preceding contracts are accepted.
+4. ARCH-004 — redaction and SQLite/WAL safeguards. **Merged, deployed, and runtime marker verified.**
 
 ## Product priority
 
@@ -55,23 +55,32 @@
 | HERMES-MONITORING-001 | BLOCKED | No merge/deployment/readiness inference from current gateway evidence. |
 | ARCH-002 | MERGED_DEPLOYED | PR #29 merge `3e9fd48d...`; 24 focused tests passed; CI `31937692260` PASS; AGY + Claude Opus implementation review PASS; immutable DGX release active. |
 | ARCH-003 | MERGED_DEPLOYED | PR #30; merge `e8cdfd1e...`; implementation review consensus PASS; CI run `31981532693` PASS after retrying an unrelated pre-existing stream-consumer slice; immutable DGX release active with rollback metadata. |
-| ARCH-004 | IMPLEMENTATION_REVIEW_PASS | Ticket design packet `224b81eaaa19a236f8e886536c35c4d89e2a508867b8e7135c711411b57937f7` and implementation-plan packet `5c833b287e7f8437f683300e1eeeb236356f585dd34c8a9cfadab02769eabd59`; authenticated DGX `.hermes` Claude Haiku and dedicated DGX `.hermes` AGY `1.1.13` both PASS with no corrections; next gate is separately authorized source implementation. |
+| ARCH-004 | MERGED_DEPLOYED | PR #33; implementation commit `650a34808`; merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`; focused tests `32 passed`, compileall PASS; required CI run `31990198398` PASS; Claude + active DGX `.hermes` AGY implementation review PASS with no corrections; immutable DGX release active with rollback metadata. |
+| HERMES-TELEGRAM-DELIVERY-VERIFICATION-001 | NEXT_GATE | Repo-local verification gate because GitHub Issues are disabled. Prove an approved user-visible Telegram response/delivery path with metadata-only evidence; do not substitute service health, polling progress, `getMe`, `getWebhookInfo`, or empty `getUpdates`. |
 
 ## Current next lane
 
-**ARCH-004 source implementation** is the next core lane. The ticket design and
-implementation-plan identical-packet Claude + AGY review gates are complete
-with PASS. Source implementation still requires separate authorization; after
-that, implementation tests and implementation cross-review remain separate
-gates. Do not migrate, deploy, or modify DGX from this planning result.
+**HERMES-TELEGRAM-DELIVERY-VERIFICATION-001** is the next lane. Establish
+real user-visible Telegram response/delivery evidence through an approved test
+path, recording only metadata needed to correlate the attempt and outcome.
+Polling progress, gateway health, token-protected API probes, and empty update
+batches remain supporting evidence only and cannot close this gate. No new
+runtime implementation or DGX mutation is authorized by this roadmap entry.
 
 ## Runtime and deployment boundary
 
-The active release is selected through the ARCH-003 drop-in while the prior
-Telegram-inbound release remains intact for rollback. The service restarted
-successfully and stayed active with zero restarts. Telegram general API
-reachability and token-protected `getMe`/`getWebhookInfo` probes returned
-success; the gateway later recorded repeated empty `getUpdates` progress after
-a transient startup timeout. This is inbound polling evidence, not
-user-visible delivery evidence. No Telegram credentials, allowlists, webhook
-state, or TLS verification were changed during the ARCH-003 deployment.
+The active release is selected through the ARCH-004 drop-in while the prior
+ARCH-003 and Telegram releases remain intact for rollback. The service
+restarted successfully and stayed active with zero restarts. The gateway has
+historical evidence of API reachability and repeated empty `getUpdates`
+progress after transient startup recovery, but this is inbound polling
+evidence, not user-visible delivery evidence. No Telegram credentials,
+allowlists, webhook state, or TLS verification were changed during the
+ARCH-004 deployment.
+
+## Ticket inventory note
+
+GitHub Issues are disabled. The only open PR is PR #21, the HERMES-UPDATE-001
+DGX upstream update plan, with required checks passing; it remains open and is
+not part of the ARCH-004 runtime deployment. Repo-local plans and this roadmap
+remain the authoritative ticket inventory until that planning PR is resolved.
