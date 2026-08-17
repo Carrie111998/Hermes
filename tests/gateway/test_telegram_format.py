@@ -256,6 +256,24 @@ class TestFormatMessageLinks:
         result = adapter.format_message(text)
         assert r"[\[16\]](https://example.com/source)" in result
 
+    def test_numbered_citation_inside_fenced_code_is_not_linked(self):
+        text = (
+            "```text\n[16]\n```\nClaim [16].\n\n"
+            "## Sources\n[16] https://example.com/source"
+        )
+        result = _link_citations_to_sources(text)
+        assert "```text\n[16]\n```" in result
+        assert "Claim [[16]](https://example.com/source)." in result
+
+    def test_plain_sources_word_does_not_start_bibliography(self):
+        text = "Sources\nClaim [16].\n[16] https://example.com/source"
+        assert _link_citations_to_sources(text) == text
+
+    def test_source_url_with_underscore_is_preserved(self, adapter):
+        text = "Claim [16].\n\nSources:\n[16] https://example.com/some_page"
+        result = adapter.format_message(text)
+        assert r"[\[16\]](https://example.com/some_page)" in result
+
 
 # =========================================================================
 # format_message - BUG: italic regex spans newlines

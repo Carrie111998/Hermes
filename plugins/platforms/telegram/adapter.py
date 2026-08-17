@@ -504,8 +504,15 @@ def _citation_source_urls(content: str) -> tuple[Optional[int], dict[str, str]]:
     lines = content.splitlines()
     source_start = None
     for index, line in enumerate(lines):
-        normalized = line.strip().strip("*#_ ").rstrip(":").strip("*#_ ").strip().lower()
-        if normalized in {"sources", "источники"}:
+        stripped = line.strip()
+        heading_match = re.fullmatch(
+            r"(?:#{1,6}\s+(sources|источники):?"
+            r"|(?:\*\*|__)(sources|источники):?(?:\*\*|__)"
+            r"|(sources|источники):)",
+            stripped,
+            re.IGNORECASE,
+        )
+        if heading_match:
             source_start = index
             break
     if source_start is None:
@@ -551,7 +558,7 @@ def _link_citations_to_sources(content: str) -> str:
         return f"[[{number}]]({url})" if url else match.group(0)
 
     def replace_outside_code(text: str) -> str:
-        parts = re.split(r"(```[\\s\\S]*?```|`[^`]+`)", text)
+        parts = re.split(r"(```[\s\S]*?```|`[^`]+`)", text)
         for index in range(0, len(parts), 2):
             parts[index] = re.sub(r"\[(\d+)\](?!\()", replace, parts[index])
         return "".join(parts)
