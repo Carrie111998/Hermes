@@ -4462,6 +4462,21 @@ class AIAgent:
 
         REASONING_SCRATCHPAD tags are converted to <think> blocks for consistency.
         Overwritten after each turn so it always reflects the latest state.
+
+        SECURITY (Phase 9 / B3): this is the largest credential-persistence
+        surface in Hermes -- 1514 session_*.json files, ~400 MB, and growing.
+        The whole entry is redacted before serialization, covering ``messages``
+        and also ``system_prompt`` and ``tools``, which carry credentials just
+        as readily and were not named in the original incident brief.
+
+        Unlike the request dumps, content is NOT projected away: these files
+        exist to be read back by a human reconstructing what an agent did, and
+        dropping the conversation would defeat their purpose. Redaction is
+        therefore the only defense here, which means the residual limit is
+        real -- an opaque credential in no known format, sitting in ordinary
+        conversation text, still lands on disk. Closing that requires not
+        reading credentials into agent context in the first place; the
+        historical corpus is Phase E's problem.
         """
         messages = messages or self._session_messages
         if not messages:
@@ -4505,6 +4520,12 @@ class AIAgent:
                 "message_count": len(cleaned),
                 "messages": cleaned,
             }
+
+            # SECURITY: redaction seam. Must stay above atomic_json_write --
+            # redact_object copies rather than mutating, so the agent's live
+            # in-memory conversation state is unaffected and only the on-disk
+            # copy is redacted.
+            entry = redact_object(entry)
 
             atomic_json_write(
                 self.session_log_file,
