@@ -49,17 +49,28 @@ export function resolveConnectionMode(connection: HermesConnection | null | unde
  * ~10 call sites, so a new session/prompt path announces correctly by
  * construction instead of by remembering to.
  *
- * An explicit param already on `params` wins (nothing sets one today; this
- * keeps the helper from silently overriding a deliberate caller). An unknown
- * mode adds no key at all, which leaves any previously-announced value intact
- * on the backend rather than clearing it during a reconnect window.
+ * `connection_mode` is a RESERVED, renderer-owned field: whatever the caller
+ * put there is discarded and the live resolved mode is written in its place.
+ * The plugin SDK's `host.request` reaches this same door, so honouring a
+ * caller value would let a plugin driving a live REMOTE session announce
+ * `local` and have the backend hand its skills and MCP context paths as though
+ * they were on the user's machine — the exact spoof the field exists to
+ * prevent. Only the renderer can see the descriptor, so only the renderer may
+ * answer.
+ *
+ * An unresolved mode announces an explicit `null` rather than omitting the
+ * key. Omitting it means "leave the stored value alone" to the backend
+ * (`_remember_connection_mode`), so a `local` announced before a reconnect
+ * would survive into turns that can no longer prove it — and "unknown must
+ * never be guessed as local" is the whole safety rule here.
+ * `normalize_desktop_connection_mode(None)` is `None`, so this clears it.
  */
 export function withConnectionMode(
   method: string,
   params: Record<string, unknown>,
   mode: HermesConnectionMode | null
 ): Record<string, unknown> {
-  if (!mode || !CONNECTION_MODE_METHODS.has(method) || 'connection_mode' in params) {
+  if (!CONNECTION_MODE_METHODS.has(method)) {
     return params
   }
 
