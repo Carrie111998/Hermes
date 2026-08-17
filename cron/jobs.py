@@ -819,6 +819,7 @@ def _configured_tz_name() -> str:
 
         return get_timezone_name() or ""
     except Exception:
+        logger.debug("Failed to resolve configured Hermes timezone", exc_info=True)
         return ""
 
 
