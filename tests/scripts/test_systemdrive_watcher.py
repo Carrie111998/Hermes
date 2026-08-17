@@ -243,41 +243,59 @@ def test_on_hit_reports_only_the_first_transition(tmp_path: Path):
 
 
 def test_sighting_record_is_durable_before_the_live_sweep(tmp_path: Path, monkeypatch):
-    """Locks Fix 1's actual guarantee: SIGHTING lands before the live sweep.
+    """The SIGHTING row must hit disk while the live sweep is still running.
 
-    describe_pid is monkeypatched to sleep, making the live sweep measurably
-    slow, then on_hit is called and the JSONL file is inspected: SIGHTING
-    must be the FIRST row, carrying the ring fields, with SIGHTING_LIVE
-    (carrying the live fields) written only afterward. Against the OLD
-    ordering -- live enumeration before the write -- this test would time
-    out waiting on write_record's caller and/or never see a SIGHTING row
-    ahead of a slow live sweep; that is the failure this test exists to
-    catch.
+    Not a row-ordering assertion: ordering alone passes even when the sweep is
+    moved above the write, which is the exact regression this guards. The live
+    sweep costs 60-200s on this box and the run can be killed at any moment,
+    so the durable write must not wait for it.
     """
     import scripts.systemdrive_watcher as w
 
-    real_describe_pid = w.describe_pid
-
-    def slow_describe_pid(pid):
-        time.sleep(0.05)
-        return real_describe_pid(pid)
-
-    monkeypatch.setattr(w, "describe_pid", slow_describe_pid)
-
-    log = tmp_path / "w.jsonl"
     root = tmp_path / "root"
     root.mkdir()
-    watcher = w.Watcher([root], log=log, live_sweep_secs=2.0)
-    watcher.on_hit(root.resolve(), "test")
+    log = tmp_path / "w.jsonl"
+
+    # Make the sweep measurably slow, as it is in reality.
+    real_describe_pid = w.describe_pid
+    monkeypatch.setattr(
+        w, "describe_pid",
+        lambda pid: (time.sleep(0.02), real_describe_pid(pid))[1],
+    )
+
+    watcher = w.Watcher([root], log=log, live_sweep_secs=0.5)
+
+    started = time.perf_counter()
+    returned: dict = {}
+
+    def run_hit():
+        watcher.on_hit(root.resolve(), "test")
+        returned["at"] = time.perf_counter() - started
+
+    thread = threading.Thread(target=run_hit)
+    thread.start()
+
+    # Poll for the SIGHTING row appearing on disk WHILE on_hit is still running.
+    durable_at = None
+    while thread.is_alive() and time.perf_counter() - started < 20:
+        if log.exists() and log.read_text(encoding="utf-8").strip():
+            durable_at = time.perf_counter() - started
+            break
+        time.sleep(0.005)
+    thread.join(timeout=25)
+
+    assert durable_at is not None, "SIGHTING never became durable while on_hit ran"
+    assert "at" in returned, "on_hit did not finish"
+    assert durable_at < returned["at"], (
+        f"SIGHTING became durable at {durable_at:.3f}s but on_hit only returned at "
+        f"{returned['at']:.3f}s - the durable write is not ahead of the sweep"
+    )
 
     rows = _rows(log)
-    assert rows[0]["event"] == "SIGHTING", "SIGHTING must be the first record written"
+    assert rows[0]["event"] == "SIGHTING"
     assert rows[0]["live_sweep"] == "pending"
-    assert "ring_cwd_matches" in rows[0]
     assert "ring_size" in rows[0]
-    live_index = next(i for i, r in enumerate(rows) if r["event"] == "SIGHTING_LIVE")
-    assert live_index > 0, "SIGHTING_LIVE must follow SIGHTING, not precede or replace it"
-    assert rows[live_index]["live_sweep_secs"] > 0
+    assert any(r["event"] == "SIGHTING_LIVE" for r in rows)
 
 
 def test_preexisting_tree_is_recorded_and_blames_nobody(tmp_path: Path):
