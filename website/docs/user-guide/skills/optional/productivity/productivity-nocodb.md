@@ -181,7 +181,6 @@ scripts/nocodb.sh record:list MyBase Tasks 1 25 \
 
 ## Pitfalls
 
-- **`nc` is netcat.** Always invoke `scripts/nocodb.sh`.
 - **Plain `and`/`or` in filters.** Must be `~and` / `~or` / `~not`.
 - **`record:create` wraps fields.** Payload is `{"fields":{…}}`; `record:update`
   takes the bare object `{…}`. Mixing them up returns a 400.
