@@ -4414,11 +4414,13 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
-    configured_model = str(cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
-    configured_base_url = str(cfg.get("base_url") or "").strip() or None
-    configured_api_key = str(cfg.get("api_key") or "").strip() or None
-    configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+    # Read from delegation sub-config, not top-level
+    deleg_cfg = cfg.get("delegation", {})
+    configured_model = str(deleg_cfg.get("model") or "").strip() or None
+    configured_provider = str(deleg_cfg.get("provider") or "").strip() or None
+    configured_base_url = str(deleg_cfg.get("base_url") or "").strip() or None
+    configured_api_key = str(deleg_cfg.get("api_key") or "").strip() or None
+    configured_api_mode = str(deleg_cfg.get("api_mode") or "").strip().lower() or None
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
