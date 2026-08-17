@@ -1574,6 +1574,62 @@ class TestDeliverResultPolicySuppression:
         standalone_send.assert_not_awaited()
         mirror.assert_not_called()
 
+    def test_live_media_only_suppression_is_not_mirrored_or_retried(
+        self, tmp_path, monkeypatch
+    ):
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        media_path = tmp_path / "image.png"
+        media_path.write_bytes(b"image")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (tmp_path,),
+        )
+        adapter = AsyncMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        send_result = SendResult(
+            success=True,
+            raw_response={
+                "suppressed": True,
+                "reason": "oversight_outbound_policy",
+            },
+        )
+        completed_future = Future()
+        completed_future.set_result(send_result)
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return completed_future
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        with patch(
+            "gateway.config.load_gateway_config",
+            return_value=self._config(Platform.WHATSAPP),
+        ), patch(
+            "cron.scheduler.load_config",
+            return_value={"cron": {"wrap_response": False}},
+        ), patch(
+            "asyncio.run_coroutine_threadsafe",
+            side_effect=fake_run_coro,
+        ), patch(
+            "tools.send_message_tool._send_to_platform",
+            new=standalone_send,
+        ), patch("gateway.mirror.mirror_to_session") as mirror:
+            result = _deliver_result(
+                self._job(),
+                f"MEDIA:{media_path}",
+                adapters={Platform.WHATSAPP: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_not_awaited()
+        mirror.assert_not_called()
+
 
 class TestDeliverOriginUnresolvableIsLocal:
     """Regression for #43014.

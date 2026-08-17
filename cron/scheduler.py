@@ -1477,7 +1477,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+) -> bool:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -1510,7 +1510,7 @@ def _send_media_via_adapter(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
                 )
-                return
+                return False
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
@@ -1521,8 +1521,12 @@ def _send_media_via_adapter(
                     "Job '%s': media send failed for %s: %s",
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
+            raw_response = getattr(result, "raw_response", None)
+            if isinstance(raw_response, dict) and raw_response.get("suppressed"):
+                return True
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+    return False
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -2099,7 +2103,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_suppressed = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -2108,6 +2112,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    if media_suppressed:
+                        policy_suppressed = True
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
