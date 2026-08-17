@@ -111,17 +111,13 @@ _USER_BOUNDARY_END_REASONS = (
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
-# Bound on waiting for the stream consumer's final-delivery attempt before
-# the gateway decides whether to send its own "final" response. The base
-# timeout keeps the common (no flood control) case fast; when the consumer
-# reports a final-delivery attempt still in flight (GatewayStreamConsumer.
-# final_delivery_in_progress), the wait extends up to the max — Telegram
-# flood control can mandate retry_after waits of 30-90s, and abandoning the
-# wait early lets the gateway race a send that's still in progress (#gateway
-# final-send flood race, 2026-08-05 incident: duplicate 4070-char message
-# after a 37s Telegram flood-control retry outlived the old 5s wait).
+# Initial wait for the stream consumer before the gateway decides whether to
+# send its own "final" response. If the consumer has entered a final-delivery
+# attempt, that attempt becomes the single writer and is awaited to completion:
+# platform adapters own their retry/timeout policy, and an arbitrary second
+# gateway ceiling only reintroduces the duplicate-send race when RetryAfter is
+# longer than that ceiling.
 _STREAM_FINAL_WAIT_BASE_TIMEOUT_SECONDS = 5.0
-_STREAM_FINAL_WAIT_MAX_TIMEOUT_SECONDS = 90.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -6422,15 +6418,16 @@ async def _await_stream_task_before_final_decision(stream_task, stream_consumer)
     """Wait for the stream consumer's task before any duplicate-send decision.
 
     A flat short timeout here races an in-flight platform flood-control
-    retry: Telegram can mandate a ``retry_after`` wait of 30-90s on the
+    retry: Telegram can mandate a ``retry_after`` wait of several minutes on the
     consumer's final send/edit, and giving up early leaves
     ``final_response_sent`` / ``final_content_delivered`` False (the attempt
     hasn't resolved yet) — the caller then sends its own "final" response,
     and if the abandoned send still reaches the platform, the user gets a
-    duplicate. Extend the wait, bounded, only while the consumer reports an
-    active final-delivery attempt (``final_delivery_in_progress``); never
-    treat "in flight" itself as delivered — only a completed send sets the
-    flags the caller checks afterward.
+    duplicate. Once the consumer reports an active final-delivery attempt
+    (``final_delivery_in_progress``), it is the single writer: wait for that
+    platform call to settle under the adapter's own retry/timeout policy.
+    Never treat "in flight" itself as delivered — only a completed send sets
+    the flags the caller checks afterward.
 
     Uses ``asyncio.wait`` rather than ``asyncio.wait_for``: the latter
     cancels the awaited task on timeout and waits for it to fully unwind
@@ -6449,13 +6446,12 @@ async def _await_stream_task_before_final_decision(stream_task, stream_consumer)
     if stream_consumer is not None and getattr(
         stream_consumer, "final_delivery_in_progress", False,
     ):
-        remaining = (
-            _STREAM_FINAL_WAIT_MAX_TIMEOUT_SECONDS
-            - _STREAM_FINAL_WAIT_BASE_TIMEOUT_SECONDS
-        )
-        done, _ = await asyncio.wait({stream_task}, timeout=remaining)
-        if stream_task in done:
-            return
+        # No gateway-level total ceiling here. The platform adapter already
+        # owns bounded retries and request timeouts. Starting a second writer
+        # while its first final send is still alive cannot improve delivery;
+        # under flood control it deterministically schedules a duplicate.
+        await asyncio.wait({stream_task})
+        return
     stream_task.cancel()
     try:
         await stream_task

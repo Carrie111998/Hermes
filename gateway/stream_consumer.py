@@ -268,8 +268,8 @@ class GatewayStreamConsumer:
         # True for the duration of the got_done final-delivery attempt below
         # (send/edit calls that may block on a platform flood-control retry).
         # The gateway's duplicate-send decision waits on this instead of
-        # abandoning an in-flight send after a flat short timeout — see
-        # ``final_delivery_in_progress`` (#gateway-final-send-flood-race).
+        # abandoning an in-flight send after a flat short timeout; see the
+        # ``final_delivery_in_progress`` property and the gateway wait helper.
         self._final_delivery_in_progress = False
         # Exact cleaned payload of the turn-final delivery that set the flags
         # above.  The gateway compares this against the completed
@@ -378,9 +378,9 @@ class GatewayStreamConsumer:
     def final_delivery_in_progress(self) -> bool:
         """True while a final-delivery send/edit attempt is still unresolved.
 
-        A platform flood-control retry can hold this send for tens of
-        seconds. Callers deciding whether to send their own duplicate
-        "final" response must wait this out (bounded) rather than checking
+        A platform flood-control retry can hold this send for minutes.
+        Callers deciding whether to send their own duplicate "final"
+        response must let the adapter-owned attempt settle rather than checking
         ``final_response_sent`` / ``final_content_delivered`` while they are
         still guaranteed False because the attempt hasn't returned yet.
         """

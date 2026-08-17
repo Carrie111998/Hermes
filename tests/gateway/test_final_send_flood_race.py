@@ -27,10 +27,10 @@ after being locally cancelled/abandoned, the user got the answer twice.
 
 The fix (``gateway/run.py``: ``_await_stream_task_before_final_decision``;
 ``gateway/stream_consumer.py``: ``GatewayStreamConsumer.
-final_delivery_in_progress``) extends the wait, bounded, whenever the
-consumer reports a final-delivery attempt still in flight, instead of
-racing a fixed short timeout against an arbitrarily long platform-mandated
-retry.
+final_delivery_in_progress``) makes an active final-delivery attempt the
+single writer and waits for it to settle under the platform adapter's own
+retry/timeout policy. That avoids racing any gateway-level total ceiling
+against an arbitrarily long platform-mandated retry.
 
 Determinism: the mocked flood-controlled ``send()`` does not sleep for a
 fixed duration and race that duration against a scaled timeout (that was
@@ -43,8 +43,7 @@ the moment the send is genuinely in flight), lets the gateway's *base*
 timeout genuinely elapse (a single one-sided sleep, safe because nothing
 else is racing it — the send cannot complete on its own), and only then
 sets ``send_release``. Resolution after that point is driven by the event
-loop waking the extended ``wait_for`` on task completion, not by more
-sleeping.
+loop waking the single-writer wait on task completion, not by more sleeping.
 """
 
 import asyncio
@@ -89,6 +88,7 @@ class FloodyFallbackAdapter(BasePlatformAdapter):
         self._next_id = 0
         self.send_started = asyncio.Event()
         self.send_release = asyncio.Event()
+        self.delivery_outcomes = [True]
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -104,23 +104,42 @@ class FloodyFallbackAdapter(BasePlatformAdapter):
         async def _deliver():
             self.send_started.set()
             await self.send_release.wait()
+            success = self.delivery_outcomes.pop(0) if self.delivery_outcomes else True
+            if not success:
+                return SendResult(success=False, error="final delivery failed")
             message_id = self._mint_id()
-            self.sent.append({"chat_id": chat_id, "content": content, "message_id": message_id})
+            self.sent.append({
+                "chat_id": chat_id,
+                "content": content,
+                "message_id": message_id,
+            })
             return SendResult(success=True, message_id=message_id)
 
         return await asyncio.shield(_deliver())
 
     async def edit_message(
-        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None,
+        self,
+        chat_id,
+        message_id,
+        content,
+        *,
+        finalize: bool = False,
+        metadata=None,
     ) -> SendResult:
         if not finalize:
-            self.edits.append(
-                {"chat_id": chat_id, "message_id": message_id, "content": content, "finalize": finalize}
-            )
+            self.edits.append({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": finalize,
+            })
             return SendResult(success=True, message_id=message_id)
-        self.edits.append(
-            {"chat_id": chat_id, "message_id": message_id, "content": content, "finalize": True}
-        )
+        self.edits.append({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "content": content,
+            "finalize": True,
+        })
         return SendResult(
             success=False,
             error="Flood control exceeded. Retry in 37 seconds",
@@ -143,13 +162,16 @@ class FloodyFallbackAdapter(BasePlatformAdapter):
     def visible_full_response_messages(self):
         """Messages still visible in the chat carrying the exact final text."""
         return [
-            m for m in self.sent
+            m
+            for m in self.sent
             if m["content"] == FULL_RESPONSE and m["message_id"] not in self.deleted
         ]
 
 
 def _make_consumer(adapter):
-    consumer = GatewayStreamConsumer(adapter, "chat-1", StreamConsumerConfig(cursor=" ▉"))
+    consumer = GatewayStreamConsumer(
+        adapter, "chat-1", StreamConsumerConfig(cursor=" ▉")
+    )
     # Streaming already showed the complete answer (a real preview message
     # exists and matches the final text exactly) — only the cosmetic
     # finalize edit is left to run. Setting this up directly (rather than
@@ -183,10 +205,19 @@ async def _legacy_wait_then_decide(stream_task, base_timeout: float):
             pass
 
 
-async def _run_flood_race(monkeypatch, *, base_timeout: float, max_timeout: float):
+async def _run_flood_race(
+    monkeypatch,
+    *,
+    base_timeout: float,
+    max_timeout: float,
+    release_delay: float | None = None,
+    delivery_outcomes: list[bool] | None = None,
+):
     gateway_run = importlib.import_module("gateway.run")
 
     adapter = FloodyFallbackAdapter()
+    if delivery_outcomes is not None:
+        adapter.delivery_outcomes = list(delivery_outcomes)
     consumer = _make_consumer(adapter)
     stream_task = asyncio.create_task(consumer.run())
 
@@ -196,26 +227,39 @@ async def _run_flood_race(monkeypatch, *, base_timeout: float, max_timeout: floa
 
     helper = getattr(gateway_run, "_await_stream_task_before_final_decision", None)
     if helper is not None:
-        monkeypatch.setattr(gateway_run, "_STREAM_FINAL_WAIT_BASE_TIMEOUT_SECONDS", base_timeout)
-        monkeypatch.setattr(gateway_run, "_STREAM_FINAL_WAIT_MAX_TIMEOUT_SECONDS", max_timeout)
+        monkeypatch.setattr(
+            gateway_run, "_STREAM_FINAL_WAIT_BASE_TIMEOUT_SECONDS", base_timeout
+        )
+        if hasattr(gateway_run, "_STREAM_FINAL_WAIT_MAX_TIMEOUT_SECONDS"):
+            monkeypatch.setattr(
+                gateway_run,
+                "_STREAM_FINAL_WAIT_MAX_TIMEOUT_SECONDS",
+                max_timeout,
+            )
         decision_task = asyncio.create_task(helper(stream_task, consumer))
     else:
-        decision_task = asyncio.create_task(_legacy_wait_then_decide(stream_task, base_timeout))
+        decision_task = asyncio.create_task(
+            _legacy_wait_then_decide(stream_task, base_timeout)
+        )
 
-    # One-sided wait: guarantees the base timeout has genuinely elapsed.
-    # Nothing races this — the send cannot complete on its own, it is
-    # blocked on send_release, which we haven't set yet.
-    await asyncio.sleep(base_timeout + 0.05)
+    # One-sided wait: by default release just after the base timeout.  Tests
+    # can keep the send blocked beyond the former helper maximum to model a
+    # real Telegram RetryAfter longer than that hard-coded ceiling.
+    if release_delay is None:
+        release_delay = base_timeout + 0.05
+    await asyncio.sleep(release_delay)
 
     # Now let the "flood-controlled" send resolve. Fixed code is still
-    # inside its extended wait at this point (bounded by max_timeout) and
-    # will observe completion via the event loop, not more sleeping.
+    # awaiting the active single writer and will observe completion via the
+    # event loop, not by racing another total timeout.
     # Unpatched code has already given up and moved on.
     adapter.send_release.set()
 
     await decision_task
 
-    already_confirmed = bool(consumer.final_response_sent or consumer.final_content_delivered)
+    already_confirmed = bool(
+        consumer.final_response_sent or consumer.final_content_delivered
+    )
     if not already_confirmed:
         # Mimic the real outer caller: it only performs its own "normal
         # final send" when the gateway did not confirm streamed delivery —
@@ -238,7 +282,9 @@ async def test_flood_controlled_finalize_delivers_final_response_once(monkeypatc
     the moment the gateway decides whether to send its own final response.
     """
     adapter, already_confirmed = await _run_flood_race(
-        monkeypatch, base_timeout=0.05, max_timeout=1.0,
+        monkeypatch,
+        base_timeout=0.05,
+        max_timeout=1.0,
     )
 
     visible = adapter.visible_full_response_messages()
@@ -250,3 +296,65 @@ async def test_flood_controlled_finalize_delivers_final_response_once(monkeypatc
         "gateway did not wait for the in-flight fallback send to resolve "
         "before deciding whether to send its own duplicate final response"
     )
+
+
+@pytest.mark.asyncio
+async def test_retry_after_longer_than_wait_ceiling_still_delivers_once(monkeypatch):
+    """A platform RetryAfter longer than the helper's fixed total wait must
+    not turn one in-flight final delivery back into two visible messages."""
+    adapter, already_confirmed = await _run_flood_race(
+        monkeypatch,
+        base_timeout=0.05,
+        max_timeout=0.10,
+        release_delay=0.15,
+    )
+
+    visible = adapter.visible_full_response_messages()
+    assert len(visible) == 1, (
+        f"final response visible in {len(visible)} separate messages "
+        f"after the wait ceiling expired: {visible!r}; all sends={adapter.sent!r}"
+    )
+    assert already_confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_failed_inflight_final_still_falls_back_once(monkeypatch):
+    """Waiting for the single writer must not treat an in-flight attempt as
+    delivered: after that attempt fails, the normal final path still runs."""
+    adapter, already_confirmed = await _run_flood_race(
+        monkeypatch,
+        base_timeout=0.05,
+        max_timeout=0.10,
+        release_delay=0.15,
+        delivery_outcomes=[False, True],
+    )
+
+    visible = adapter.visible_full_response_messages()
+    assert len(visible) == 1
+    assert already_confirmed is False
+
+
+@pytest.mark.asyncio
+async def test_non_final_stalled_consumer_is_still_cancelled(monkeypatch):
+    """Only an active final-delivery attempt becomes the single writer."""
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run,
+        "_STREAM_FINAL_WAIT_BASE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    blocker = asyncio.Event()
+    stream_task = asyncio.create_task(blocker.wait())
+
+    class _IdleConsumer:
+        final_delivery_in_progress = False
+
+    await asyncio.wait_for(
+        gateway_run._await_stream_task_before_final_decision(
+            stream_task,
+            _IdleConsumer(),
+        ),
+        timeout=0.25,
+    )
+
+    assert stream_task.cancelled()
