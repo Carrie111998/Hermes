@@ -182,7 +182,7 @@ class TestBuildOAuthAuth:
 
     def test_pre_registered_client_id_stored(self, tmp_path, monkeypatch):
         try:
-            from mcp.client.auth import OAuthClientProvider
+            from mcp.client.auth import OAuthClientProvider  # noqa: F401 - availability probe; the import IS the test
         except ImportError:
             pytest.skip("MCP SDK auth not available")
 
@@ -202,7 +202,7 @@ class TestBuildOAuthAuth:
 
     def test_scope_passed_through(self, tmp_path, monkeypatch):
         try:
-            from mcp.client.auth import OAuthClientProvider
+            from mcp.client.auth import OAuthClientProvider  # noqa: F401 - availability probe; the import IS the test
         except ImportError:
             pytest.skip("MCP SDK auth not available")
 
@@ -464,7 +464,7 @@ class TestOAuthPortSharing:
         mod._oauth_port = None
 
         try:
-            from mcp.client.auth import OAuthClientProvider
+            from mcp.client.auth import OAuthClientProvider  # noqa: F401 - availability probe; the import IS the test
         except ImportError:
             pytest.skip("MCP SDK auth not available")
 

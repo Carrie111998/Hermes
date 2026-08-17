@@ -1,7 +1,6 @@
 """Tests for events.schema — Event dataclass, EventType enum, Priority enum."""
 
 import json
-from datetime import datetime, timezone
 
 from events.schema import Event, EventType, Priority
 

@@ -125,7 +125,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     kb = isolated_kanban_home_with_profiles
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        ids = [kb.create_task(conn, title=f"a{i}", assignee="alpha") for i in range(3)]
+        [kb.create_task(conn, title=f"a{i}", assignee="alpha") for i in range(3)]
 
     # First tick: cap=1, only 1 alpha dispatched
     with kb.connect_closing() as conn:

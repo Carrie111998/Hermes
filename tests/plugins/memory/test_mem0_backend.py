@@ -4,7 +4,6 @@ import copy
 import pytest
 
 from plugins.memory.mem0._backend import (
-    Mem0Backend,
     PlatformBackend,
     OSSBackend,
     SelfHostedBackend,
@@ -47,7 +46,7 @@ class TestPlatformBackend:
 
     def test_search_forwards_params(self):
         backend, client = self._make()
-        result = backend.search("test query", filters={"user_id": "u1"}, top_k=5)
+        backend.search("test query", filters={"user_id": "u1"}, top_k=5)
         assert client.calls[0][0] == "search"
         assert client.calls[0][1] == "test query"
         assert client.calls[0][2]["filters"] == {"user_id": "u1"}
@@ -72,7 +71,7 @@ class TestPlatformBackend:
     def test_add_forwards_kwargs(self):
         backend, client = self._make()
         msgs = [{"role": "user", "content": "hi"}]
-        result = backend.add(msgs, user_id="u1", agent_id="hermes", infer=False)
+        backend.add(msgs, user_id="u1", agent_id="hermes", infer=False)
         call = client.calls[0]
         assert call[2]["user_id"] == "u1"
         assert call[2]["infer"] is False

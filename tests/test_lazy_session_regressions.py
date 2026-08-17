@@ -156,7 +156,6 @@ class TestSyncSessionKeyAfterAutoCompress:
 
         # Track if _sync_session_key_after_compress was called
         sync_calls = []
-        original_sync = server._sync_session_key_after_compress
 
         def _tracking_sync(sid, sess, **kwargs):
             sync_calls.append((sid, sess.get("session_key")))

@@ -7,7 +7,6 @@ These assert the toggle sets the instance flag, persists to config.yaml,
 and that the clamp gate honours the flag.
 """
 
-import os
 
 import yaml
 

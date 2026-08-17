@@ -2413,7 +2413,7 @@ class TestStalePortalBaseUrlMigration:
         assert nous["portal_base_url"] == DEFAULT_NOUS_PORTAL_URL
 
     def test_ignores_other_providers(self, tmp_path, monkeypatch):
-        from hermes_cli.auth import _load_auth_store, DEFAULT_NOUS_PORTAL_URL
+        from hermes_cli.auth import _load_auth_store
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         auth_file = tmp_path / "auth.json"

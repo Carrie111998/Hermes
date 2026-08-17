@@ -22,7 +22,6 @@ If this test ever regresses, expect the Telegram ``#watchdog_alerts``
 topic to start receiving ~2x cluster events for the same incident again.
 """
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest

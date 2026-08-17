@@ -737,11 +737,9 @@ class TestConvertToPng:
             dest.write_bytes(FAKE_PNG)
             return MagicMock(returncode=0)
 
+        # Force ImportError for Pillow
         with patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
             with patch("hermes_cli.clipboard.subprocess.run", side_effect=fake_run):
-                # Force ImportError for Pillow
-                import hermes_cli.clipboard as cb
-                original = cb._convert_to_png
 
                 def patched_convert(path):
                     # Skip Pillow, go straight to ImageMagick

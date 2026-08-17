@@ -1293,6 +1293,15 @@ def _run_post_setup(post_setup_key: str):
             )
             if result.returncode == 0:
                 _print_success("    Node.js dependencies installed")
+                # agent_browser_runnable() caches "does this binary run" for
+                # the process lifetime (it spawns, and callers probe it in a
+                # loop). This install is the one thing that can change that
+                # answer, so drop the cached verdict AFTER it succeeds —
+                # clearing beforehand would just let a probe mid-install
+                # re-cache the stale "not installed" result.
+                from hermes_constants import agent_browser_runnable
+
+                agent_browser_runnable.cache_clear()
             else:
                 from hermes_constants import display_hermes_home
                 _print_warning(f"    npm install failed - run manually: cd {display_hermes_home()}/hermes-agent && npm install --workspaces=false")

@@ -3,7 +3,6 @@ import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from gateway.config import PlatformConfig
 

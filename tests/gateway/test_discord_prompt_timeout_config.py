@@ -12,7 +12,6 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 
 def _ensure_discord_mock():

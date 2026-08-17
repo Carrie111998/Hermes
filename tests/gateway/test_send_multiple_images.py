@@ -349,7 +349,7 @@ from plugins.platforms.mattermost.adapter import MattermostAdapter  # noqa: E402
 class TestMattermostMultiImage:
     @pytest.fixture
     def adapter(self):
-        config = PlatformConfig(enabled=True, token="fake")
+        PlatformConfig(enabled=True, token="fake")
         # Minimal construction via object.__new__ to avoid full setup
         a = object.__new__(MattermostAdapter)
         a._base_url = "https://mm.example.com"

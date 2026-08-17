@@ -5,7 +5,6 @@ A match blocks unconditionally â€” BEFORE the --yolo / /yolo / mode=off bypass â
 making it the user-editable counterpart to the code-shipped hardline floor.
 """
 
-import os
 
 import pytest
 

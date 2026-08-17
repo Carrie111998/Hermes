@@ -2603,7 +2603,7 @@ def write_characterization_report(
         temporary.unlink()
     except RuntimeError:
         raise
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError):
         raise RuntimeError("unsafe_characterization_report:write_failed") from None
     finally:
         if descriptor >= 0:

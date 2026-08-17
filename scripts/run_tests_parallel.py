@@ -1006,7 +1006,7 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
         return {}
     try:
         return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError) as e:
+    except (json.JSONDecodeError, OSError):
         print("[ERROR] Failed to load json durations file! {e}")
         return {}
 

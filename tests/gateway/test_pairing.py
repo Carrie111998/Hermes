@@ -600,7 +600,7 @@ class TestCodeExpiry:
     def test_expired_codes_cleaned_up(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()
-            code = store.generate_code("telegram", "user1")
+            store.generate_code("telegram", "user1")
 
             # Manually expire all pending entries
             pending = store._load_json(store._pending_path("telegram"))
@@ -707,14 +707,11 @@ class TestListAndClear:
 class TestUnreadablePairingFile:
     def test_permission_error_logs_warning_and_returns_empty(self, tmp_path, caplog):
         import logging
-        import builtins
 
         approved_path = tmp_path / "weixin-approved.json"
         approved_path.write_text(
             '{"o9cq80fake@im.wechat": {"user_name": "x", "approved_at": 0}}'
         )
-
-        real_open = builtins.open
 
         def fake_read_text(self, *a, **kw):
             # Path.read_text uses Path.open internally; raise PermissionError
@@ -775,7 +772,6 @@ class TestProfileScopedStorage:
     def test_default_store_uses_global_dir(self, tmp_path, monkeypatch):
         """PairingStore() (no profile) keeps the legacy global path so the
         ``hermes pairing`` CLI continues to work without a profile context."""
-        from hermes_constants import get_hermes_home
         monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
         # Re-import PAIRING_DIR (it's a module-level constant resolved at
         # import time) so the test exercises the right path. We patch it
@@ -789,7 +785,6 @@ class TestProfileScopedStorage:
     def test_profile_store_uses_profiles_subdir(self, tmp_path, monkeypatch):
         """PairingStore(profile="yangyang") puts files under
         <HERMES_HOME>/profiles/yangyang/pairing/."""
-        from hermes_constants import get_hermes_home
         monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
         store = PairingStore(profile="yangyang")
         assert store.profile == "yangyang"
@@ -802,7 +797,6 @@ class TestProfileScopedStorage:
     def test_profile_approval_does_not_leak_to_global(self, tmp_path, monkeypatch):
         """Approving in a profile-scoped store must not appear in the global
         store — and vice versa. This is the whole point of the fix."""
-        from hermes_constants import get_hermes_home
         monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             global_store = PairingStore()
@@ -822,7 +816,6 @@ class TestProfileScopedStorage:
     def test_profile_uses_distinct_rate_limit_file(self, tmp_path, monkeypatch):
         """Rate-limit state is per-profile, not shared globally — otherwise
         one profile's flood would lock out the other profile's users."""
-        from hermes_constants import get_hermes_home
         monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             global_store = PairingStore()

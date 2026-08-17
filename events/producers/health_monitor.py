@@ -51,7 +51,6 @@ class GatewayHealthMonitor:
         try:
             import requests
             from hermes_constants import get_hermes_home
-            import json as _json
 
             # Read bridge port from config
             config_path = get_hermes_home() / "config.yaml"

@@ -6,7 +6,6 @@ source.  This is the universal funnel — every cron-driven agent run flows
 through on_job_completed.
 """
 
-from pathlib import Path
 
 import pytest
 

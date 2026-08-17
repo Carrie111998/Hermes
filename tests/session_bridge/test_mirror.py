@@ -1176,7 +1176,7 @@ def test_exact_manual_authority_is_never_downgraded_by_automatic_replay(db):
 def test_exact_replay_with_tampered_authority_rolls_back_recovery(db):
     store = SessionBridgeStore(db, clock=lambda: NOW)
     store.upsert_projection(_projection())
-    job = enqueue_mirror_job(
+    enqueue_mirror_job(
         store,
         "claude:source-1",
         Provider.CODEX,
@@ -1486,7 +1486,7 @@ def test_failure_callback_rejects_forged_claim_snapshot_without_mutation(
 ):
     store = SessionBridgeStore(db, clock=lambda: NOW)
     store.upsert_projection(_projection())
-    job = enqueue_mirror_job(
+    enqueue_mirror_job(
         store,
         "claude:source-1",
         Provider.CODEX,
@@ -1515,7 +1515,7 @@ def test_failure_callback_rejects_forged_claim_snapshot_without_mutation(
 def test_stale_failure_callback_after_retry_is_rejected_without_mutation(db):
     store = SessionBridgeStore(db, clock=lambda: NOW)
     store.upsert_projection(_projection())
-    job = enqueue_mirror_job(
+    enqueue_mirror_job(
         store,
         "claude:source-1",
         Provider.CODEX,

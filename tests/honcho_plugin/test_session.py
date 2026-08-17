@@ -1495,7 +1495,7 @@ class TestDialecticDepth:
         provider._session_key = "test"
         provider._base_context_cache = "existing context"
 
-        result = provider._run_dialectic_depth("test query")
+        provider._run_dialectic_depth("test query")
         # Only 1 call because pass 0 had sufficient signal
         assert provider._manager.dialectic_query.call_count == 1
 

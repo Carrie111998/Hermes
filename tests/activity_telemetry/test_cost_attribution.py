@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-import pytest
 
 from activity_telemetry.recorder import ActivityRecorder
 from activity_telemetry.store import ActivityStore

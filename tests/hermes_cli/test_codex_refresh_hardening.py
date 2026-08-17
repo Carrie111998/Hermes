@@ -19,7 +19,6 @@ import json
 import logging
 import time
 
-import pytest
 
 from hermes_cli.auth import (
     AuthError,

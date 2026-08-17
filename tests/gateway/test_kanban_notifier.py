@@ -93,7 +93,7 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
-    tid = _create_completed_subscription()
+    _create_completed_subscription()
 
     adapter1 = RecordingAdapter()
     adapter2 = RecordingAdapter()

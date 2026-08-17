@@ -13,7 +13,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from hermes_constants import get_hermes_home
+# Unused in this module, but tests/plugins/memory/test_mem0_setup.py patches
+# "plugins.memory.mem0._setup.get_hermes_home" -- the name has to be bound here.
+from hermes_constants import get_hermes_home  # noqa: F401
+
 
 from ._oss_providers import (
     LLM_PROVIDERS,

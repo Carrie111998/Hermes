@@ -1007,7 +1007,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     def _build() -> "Honcho":
         # Lazy dependency failures fall through to the canonical import error.
         try:
-            from tools.lazy_deps import FeatureUnavailable, ensure as _lazy_ensure
+            from tools.lazy_deps import FeatureUnavailable, ensure as _lazy_ensure  # noqa: F401 - availability probe; the import IS the test
             _lazy_ensure("memory.honcho", prompt=False)
         except ImportError:
             # lazy_deps module missing — fall through to the raw import below.

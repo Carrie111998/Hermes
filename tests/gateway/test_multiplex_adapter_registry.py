@@ -790,7 +790,6 @@ class TestFeishuPortBindingConditional:
     @pytest.mark.asyncio
     async def test_feishu_websocket_mode_not_rejected(self, monkeypatch):
         """Feishu in websocket mode (the default) should NOT raise MultiplexConfigError."""
-        from gateway.run import MultiplexConfigError
         from gateway.config import GatewayConfig, Platform, PlatformConfig
 
         runner = GatewayRunner.__new__(GatewayRunner)

@@ -12,9 +12,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
 
-from gateway.config import Platform
 
 
 def _build_adapter(monkeypatch, env: dict[str, str], extra: dict | None = None):

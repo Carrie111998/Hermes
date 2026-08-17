@@ -9,7 +9,6 @@ build helper assembles a server when the SDK is present.
 from __future__ import annotations
 
 import inspect
-from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
     _signature_from_schema,

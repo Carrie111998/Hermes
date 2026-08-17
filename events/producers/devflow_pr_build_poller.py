@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from events.bus import EventBus
 from events.paths import _root

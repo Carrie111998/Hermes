@@ -23,7 +23,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import cli as cli_mod
 from cli import HermesCLI
 
 

@@ -1133,7 +1133,6 @@ def test_heartbeat_extends_claim(kanban_home):
         t = kb.create_task(conn, title="x", assignee="a")
         claimer = "host:hb"
         kb.claim_task(conn, t, claimer=claimer, ttl_seconds=60)
-        original = kb.get_task(conn, t).claim_expires
         # Rewind then heartbeat.
         conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (0, t))
         ok = kb.heartbeat_claim(conn, t, claimer=claimer, ttl_seconds=3600)
@@ -1737,7 +1736,7 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
         c = kb.create_task(conn, title="c", assignee="bob", parents=[p])
         # Finish parent outside dispatch; promotion happens inside.
         kb.complete_task(conn, p)
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
     # Spawned c (a was already done when dispatch was called).
     assert len(spawns) == 1
     assert spawns[0][0] == c
@@ -3986,8 +3985,8 @@ def test_dispatch_review_counts_toward_max_spawn(
 
     with kb.connect() as conn:
         # Create 2 ready tasks + 1 review task, max_spawn=2
-        t1 = kb.create_task(conn, title="ready 1", assignee="alice")
-        t2 = kb.create_task(conn, title="ready 2", assignee="bob")
+        kb.create_task(conn, title="ready 1", assignee="alice")
+        kb.create_task(conn, title="ready 2", assignee="bob")
         t3 = kb.create_task(conn, title="review", assignee="alice")
         _set_task_status(conn, t3, "review")
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)

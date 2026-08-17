@@ -1001,7 +1001,7 @@ def test_sidebar_thread_verifier_rejects_wrong_authenticated_lineage(
 
 
 def test_sidebar_thread_verifier_rejects_invalid_signature() -> None:
-    valid = encode_bridge_marker(_sidebar_expected(), SECRET)
+    encode_bridge_marker(_sidebar_expected(), SECRET)
     invalid = encode_bridge_marker(_sidebar_expected(), b"different-secret")
     read = _codex_read(
         turns=[

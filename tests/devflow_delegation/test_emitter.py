@@ -1,7 +1,6 @@
 import json
 
-from devflow_delegation.emitter import DelegationEmitter, DelegationResult
-from events.bus import EventBus
+from devflow_delegation.emitter import DelegationEmitter
 from tests.devflow_delegation.conftest import make_delegate_kwargs
 
 

@@ -1,7 +1,6 @@
 """Tests for the Fix A native-Postgres pre-flight reader (fail-soft I/O glue)."""
 from __future__ import annotations
 
-import pytest
 
 from intent_applier.job_state_reader import NativePgJobStateReader, build_default_reader
 

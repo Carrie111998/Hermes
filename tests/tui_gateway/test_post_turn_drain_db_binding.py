@@ -38,7 +38,6 @@ import types
 
 import pytest
 
-import tools.async_delegation as ad
 from tui_gateway import server
 
 

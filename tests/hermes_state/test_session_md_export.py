@@ -1,4 +1,3 @@
-import time
 
 import hermes_state
 from hermes_state import SessionDB

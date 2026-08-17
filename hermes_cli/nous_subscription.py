@@ -17,7 +17,10 @@ from utils import is_truthy_value
 from tools.tool_backend_helpers import (
     fal_key_is_configured,
     has_direct_modal_credentials,
-    managed_nous_tools_enabled,
+    # Unused here, but patched as
+    # "hermes_cli.nous_subscription.managed_nous_tools_enabled" by
+    # tests/cli/test_cli_provider_resolution.py and tests/hermes_cli/test_tools_config.py.
+    managed_nous_tools_enabled,  # noqa: F401
     normalize_browser_cloud_provider,
     normalize_modal_mode,
     resolve_modal_backend_state,
@@ -376,7 +379,6 @@ def get_nous_subscription_features(
     # Per-capability overrides: if set, they determine which backend is active for
     # search/extract independently of web.backend.
     web_search_backend = str(web_cfg.get("search_backend") or "").strip().lower()
-    web_extract_backend = str(web_cfg.get("extract_backend") or "").strip().lower()
     tts_provider = str(tts_cfg.get("provider") or "edge").strip().lower()
     # STT default is "local" (faster-whisper) per DEFAULT_CONFIG, which
     # requires `pip install faster-whisper`. For Nous subscribers we'd

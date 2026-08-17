@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 from typing import Callable, Dict, Tuple
 
-from events.bus import EventBus
 from events.schema import Event, EventType, Priority
 from events.subscribers.base import BaseSubscriber
 

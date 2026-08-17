@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from events.bus import EventBus
-from events.schema import Event, EventType, Priority
+from events.schema import Event, EventType
 from events.subscribers import memory_writer as mw
 from events.subscribers.memory_writer import MemoryWriter, MEMORY_ROUTING
 

@@ -375,7 +375,7 @@ class TestFallbackTransportInit:
             max_keepalive_connections=10,
             keepalive_expiry=30.0,
         )
-        transport = tnet.TelegramFallbackTransport(
+        tnet.TelegramFallbackTransport(
             ["149.154.167.220"], limits=custom_limits
         )
 

@@ -3,7 +3,7 @@
 import pytest
 
 from events.bus import EventBus
-from events.schema import EventType, Priority
+from events.schema import EventType
 from events.producers.health_monitor import GatewayHealthMonitor
 
 

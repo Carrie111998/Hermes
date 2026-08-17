@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 import session_bridge.coordinator as coordinator_module
-from session_bridge.claude_adapter import PlaceholderCreationError, PlaceholderResult
+from session_bridge.claude_adapter import PlaceholderResult
 from session_bridge.config import BridgeConfig
 from session_bridge.coordinator import (
     ContinueRequest,

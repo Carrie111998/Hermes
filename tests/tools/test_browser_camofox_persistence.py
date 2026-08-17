@@ -332,7 +332,7 @@ class TestVncUrlDiscovery:
     def test_vnc_url_only_probed_once(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         health_resp = _mock_response(json_data={"ok": True, "vncPort": 6080})
-        with patch("tools.browser_camofox.requests.get", return_value=health_resp) as mock_get:
+        with patch("tools.browser_camofox.requests.get", return_value=health_resp):
             check_camofox_available()
             check_camofox_available()
         # Second call still hits /health for availability but doesn't re-parse vncPort

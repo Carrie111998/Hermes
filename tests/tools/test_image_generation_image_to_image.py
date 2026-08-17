@@ -14,7 +14,7 @@ tool routes to a provider's edit endpoint when ``image_url`` /
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pytest
 import yaml

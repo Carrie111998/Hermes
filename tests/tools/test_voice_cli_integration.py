@@ -184,8 +184,8 @@ class TestStreamingTTSActivation:
         use_streaming_tts = False
         try:
             from tools.tts_tool import (
-                _load_tts_config as _load_tts_cfg,
-                _get_provider as _get_prov,
+                _load_tts_config as _load_tts_cfg,  # noqa: F401 - availability probe; the import IS the test
+                _get_provider as _get_prov,  # noqa: F401 - availability probe; the import IS the test
                 _import_elevenlabs,
                 _import_sounddevice,
             )

@@ -5,7 +5,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pytest
 
 from curator.drawer_consolidator import consolidate_for_agent
 

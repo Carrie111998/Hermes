@@ -13,7 +13,6 @@ import os
 import tempfile
 import time
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from tools import file_state

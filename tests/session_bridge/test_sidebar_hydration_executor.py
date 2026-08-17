@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-import pytest
 
 from session_bridge.coordinator import SidebarHydrationClaim
 from session_bridge.models import (

@@ -1138,7 +1138,6 @@ class TestPromptBuilderConstants:
         # Telegram Bot API 10.1 rich messages are default-on, so the hint must
         # encourage native structured markdown instead of forbidding tables.
         hint = PLATFORM_HINTS["telegram"]
-        lowered = hint.lower()
         assert "Telegram has NO table syntax" not in hint
         # Base hint covers MarkdownV2-compatible constructs.
         assert "MEDIA:" in hint

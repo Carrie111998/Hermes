@@ -238,7 +238,6 @@ class TestClientCacheBoundedGrowth:
                 with _client_cache_lock:
                     # Simulate what _get_cached_client does: replace on loop mismatch
                     if key in _client_cache:
-                        old_entry = _client_cache[key]
                         del _client_cache[key]
                     _client_cache[key] = (mock_client, f"model-{i}", loop)
 

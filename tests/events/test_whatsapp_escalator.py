@@ -1,8 +1,6 @@
 """Tests for events.subscribers.whatsapp_escalator — WhatsApp escalation with quiet hours."""
 
 import json
-from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest

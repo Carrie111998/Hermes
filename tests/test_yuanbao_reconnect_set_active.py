@@ -9,7 +9,6 @@ The original ``_do_reconnect()`` succeeded but never called
 
 import sys
 import os
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -51,7 +50,7 @@ async def test_do_reconnect_calls_set_active_on_success():
     mock_ws.close = AsyncMock()
 
     with (
-        patch.object(cm, "_cleanup_ws", new_callable=AsyncMock) as mock_cleanup,
+        patch.object(cm, "_cleanup_ws", new_callable=AsyncMock),
         patch(
             "gateway.platforms.yuanbao.SignManager.force_refresh",
             new_callable=AsyncMock,

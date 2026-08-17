@@ -307,7 +307,6 @@ class TestDispatchMessage(unittest.TestCase):
 
         adapter._message_handler = mock_handler
         # Override handle_message to capture the event directly
-        original_handle = adapter.handle_message
 
         async def capture_handle(event):
             captured_events.append(event)

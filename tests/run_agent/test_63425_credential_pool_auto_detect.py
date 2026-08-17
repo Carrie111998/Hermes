@@ -7,7 +7,6 @@ pool validation runs before URL-based provider inference.
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
-import pytest
 
 
 def _mock_client(api_key="test-key", base_url="https://api.anthropic.com"):

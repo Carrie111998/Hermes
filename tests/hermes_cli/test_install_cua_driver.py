@@ -344,7 +344,6 @@ class TestInstallerTimeoutKillsProcessGroup:
         trusting the helper.  As above, ``IS_WINDOWS`` must be patched or the
         helper takes its Windows creationflags arm on this host.
         """
-        import subprocess
         from unittest.mock import MagicMock
         from hermes_cli import tools_config
         from hermes_cli import _subprocess_compat
@@ -379,7 +378,6 @@ class TestInstallerNoShell:
     /tmp path TOCTOU that PR introduced)."""
 
     def _run(self, download_rc=0):
-        import subprocess
         from unittest.mock import MagicMock
         from hermes_cli import tools_config
 
@@ -434,7 +432,6 @@ class TestInstallerNoShell:
     def test_temp_script_removed_after_run(self, tmp_path):
         import os
         captured = {}
-        import subprocess
         from unittest.mock import MagicMock
         from hermes_cli import tools_config
 

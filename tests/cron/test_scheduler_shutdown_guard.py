@@ -15,7 +15,6 @@ sites so they skip gracefully with a warning instead of raising.
 
 from __future__ import annotations
 
-import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

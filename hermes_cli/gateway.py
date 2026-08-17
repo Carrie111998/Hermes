@@ -40,7 +40,7 @@ from hermes_cli.gateway_diag import (
     register_exit_hook as _register_exit_hook,
     write_diag as _gateway_exit_diag,
 )
-from gateway.status import pid_exists, terminate_pid
+from gateway.status import terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
@@ -440,7 +440,6 @@ def _scan_gateway_pids(
 
             _no_window = {"creationflags": windows_hide_flags()}
             wmic_path = shutil.which("wmic")
-            used_fallback = False
             result = None
             if wmic_path is not None:
                 try:
@@ -487,7 +486,6 @@ def _scan_gateway_pids(
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     return []
-                used_fallback = True
             if result.returncode != 0 or result.stdout is None:
                 return []
             current_cmd = ""

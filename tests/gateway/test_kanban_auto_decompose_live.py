@@ -9,7 +9,6 @@ called every tick, reading the current config.
 
 from __future__ import annotations
 
-import pytest
 
 from gateway.kanban_watchers import _resolve_auto_decompose_settings
 

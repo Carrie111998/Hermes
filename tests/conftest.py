@@ -24,9 +24,7 @@ import gc
 import logging
 import os
 import re
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -1869,7 +1867,6 @@ def _live_system_guard(request, monkeypatch):
         return _GuardedPopen
 
     real_run = _subprocess.run
-    real_popen = _subprocess.Popen
     real_call = _subprocess.call
     real_check_call = _subprocess.check_call
     real_check_output = _subprocess.check_output

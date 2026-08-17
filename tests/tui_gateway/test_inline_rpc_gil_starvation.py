@@ -15,7 +15,6 @@ the WS read loop is never blocked.
 """
 
 import io
-import json
 import sys
 import threading
 import time

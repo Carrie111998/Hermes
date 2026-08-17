@@ -12,7 +12,31 @@ from agent.transports.types import (
     Usage,
     build_tool_call,
     map_finish_reason,
-)  # noqa: F401
+)
+
+# Deliberate re-export: these live in .types but are part of this package's
+# public surface, so `from agent.transports import NormalizedResponse` works.
+# Declared in __all__ rather than suppressed with a `noqa: F401` directive — a
+# trailing suppression on the closing paren above was INERT, because ruff
+# attributes F401 to the individual name lines, not to the line the statement
+# ends on. It read as a live suppression for as long as the F group was off.
+# Names listed here are "used" as far as F401 is concerned, and the intent is
+# stated rather than silenced.
+#
+# The directive above is spelled without its leading "#" on purpose: ruff scans
+# comment text for that marker anywhere in the line, so quoting it in prose
+# creates a real directive. Spelled in full it made this very comment both an
+# invalid-code warning and, on the next line, a bare blanket suppression —
+# the exact inert-noqa trap the paragraph is describing.
+__all__ = [
+    "NormalizedResponse",
+    "ToolCall",
+    "Usage",
+    "build_tool_call",
+    "map_finish_reason",
+    "get_transport",
+    "register_transport",
+]
 
 _REGISTRY: dict = {}
 _discovered: bool = False

@@ -1534,7 +1534,7 @@ class TestAutoTtsEmptyTextGuard:
         """Code-only response results in empty speech text."""
         import re
         text_content = "```python\nprint(1)\n```"
-        speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+        re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
         # Note: base.py regex only strips individual chars, not full code blocks
         # So code blocks are partially stripped but may leave content
         # The real fix is in base.py — empty check after strip
@@ -2743,7 +2743,7 @@ class TestVoiceTTSPlayback:
         from gateway.platforms.base import SendResult
         adapter.send_voice = AsyncMock(return_value=SendResult(success=True))
         # Different chat_id — shouldn't match VC
-        result = await adapter.play_tts(chat_id="999", audio_path="/tmp/tts.ogg")
+        await adapter.play_tts(chat_id="999", audio_path="/tmp/tts.ogg")
         adapter.send_voice.assert_called_once()
 
     # -- Runner dedup --

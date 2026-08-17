@@ -10,7 +10,6 @@ full summaries verbatim into the parent.
 import os
 import tempfile
 
-import pytest
 
 import tools.delegate_tool as dt
 

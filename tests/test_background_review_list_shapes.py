@@ -36,11 +36,9 @@ are no I/O or model dependencies in the unit-of-work being tested.
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import json
 import os
 import sys
-import types
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

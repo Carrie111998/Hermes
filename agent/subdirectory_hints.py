@@ -15,7 +15,6 @@ Inspired by Block/goose's SubdirectoryHintTracker.
 
 import logging
 import os
-import shlex
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 

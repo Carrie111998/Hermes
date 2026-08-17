@@ -1,4 +1,3 @@
-import pytest
 
 from reply_handlers.auth import is_authorized_telegram, is_authorized_whatsapp
 

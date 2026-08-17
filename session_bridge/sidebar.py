@@ -603,7 +603,7 @@ def build_hydration_message(
     hydration_marker: str,
     send_reserved: bool,
 ) -> str:
-    source_id = _validated_source_session_id(source_session_id)
+    _validated_source_session_id(source_session_id)
     marker = _exact_single_line_text(hydration_marker, "hydration marker")
     if type(send_reserved) is not bool:
         raise ValueError("hydration send reservation flag is malformed")

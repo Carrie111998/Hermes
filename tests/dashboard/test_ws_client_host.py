@@ -21,7 +21,6 @@ The contract these tests pin down:
 
 from __future__ import annotations
 
-import os
 
 import pytest
 

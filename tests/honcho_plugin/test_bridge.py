@@ -1,4 +1,3 @@
-import json
 import subprocess
 from unittest import mock
 

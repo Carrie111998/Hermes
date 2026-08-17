@@ -412,3 +412,221 @@ identity and PR #64361 rather than a `REVIEW` marker, so the ambiguity stays vis
 **Verification.** `uvx ruff@0.15.12 check . --no-cache` exits 0 and
 `ruff check --isolated --select F601 .` is clean, so removing the markers did not reintroduce
 a duplicate key.
+
+## Stage 4 — delivered (2026-08-17): F401 and F541 are zero
+
+Predicted list-after was 172; actual is **171**, with **347 findings left — all F841**.
+F401 (534) and F541 (3) both go to zero. Every rule in the group except F841 is now clean
+tree-wide with no exemption anywhere.
+
+381 files changed. 501 findings took ruff's safe autofix, 9 more took `--unsafe-fixes`
+after each was individually checked, and the remainder were hand-graded — because F401 has
+a failure mode a green lint run cannot see.
+
+### "Unused import" is not the same as "unreferenced name"
+
+Seven imports were load-bearing despite being flagged unused, in three failure modes. They
+are listed here because the modes generalise, and only the first one fails loudly:
+
+**1. Re-export — fails at COLLECTION.** The module itself never uses the name; another
+module does `from <this module> import <name>`.
+
+| removed from | name | imported by |
+|---|---|---|
+| `gateway/run.py` | `_is_dangerous_confirmation` | `tests/gateway/test_stale_confirmation_expiry.py` |
+| `gateway/run.py` | `_PORT_BINDING_PLATFORM_VALUES` | `tests/gateway/test_multiplex_adapter_registry.py` |
+| `hermes_cli/config.py` | `get_process_hermes_home` | `hermes_cli/web_server.py` |
+
+The third is the one that mattered: `web_server` is imported across a wide slice of the
+suite, so one removal took **36 test modules** out at collection time — while `ruff check`
+stayed green.
+
+**2. Patch target — fails at RUNTIME, invisible to `ruff check` AND to collect-only.**
+`patch("pkg.mod.name")` resolves a dotted string at call time, so the name must be bound on
+the module even though no code in it reads the import.
+
+| removed from | name | patched as |
+|---|---|---|
+| `cron/scheduler.py` | `get_due_jobs` | `patch("cron.scheduler.get_due_jobs")` |
+| `hermes_cli/nous_subscription.py` | `managed_nous_tools_enabled` | `monkeypatch.setattr("hermes_cli.nous_subscription.managed_nous_tools_enabled", ...)` |
+| `plugins/memory/mem0/_setup.py` | `get_hermes_home` | `monkeypatch.setattr("plugins.memory.mem0._setup.get_hermes_home", ...)` |
+
+**3. Side effect — fails as a silently passing assertion.** Five sites in
+`tests/tools/test_kanban_tools.py` read `import tools.kanban_tools  # ensure registered`;
+the import populates the tool registry the assertions below then query. Removing it does
+not raise — it makes the test assert against an empty registry. Same class:
+`tests/tools/test_command_guards.py`, whose import carries the comment "Ensure the module
+is importable so we can patch it".
+
+All seven are restored with `# noqa: F401` and the reason recorded at the site, so a future
+sweep does not have to rediscover them.
+
+### Two more things worth keeping
+
+**16 availability probes** — `import X` inside `try/except ImportError`, where the import
+*is* the test. AST-verified all 16 sit in such a block; ruff declines to autofix them and
+suggests `importlib.util.find_spec`, but rewriting 16 probe sites is a larger change than
+the finding warrants, so they carry `noqa`.
+
+**An inert suppression, live for months.** `agent/transports/__init__.py` had
+`# noqa: F401` on the **closing paren** of a multi-line import. ruff attributes F401 to the
+individual name lines, so it suppressed nothing — and read as live protection for as long
+as the F group was off. Replaced with a real `__all__`. Worth checking for this shape
+elsewhere: a trailing `noqa` after `)` on a parenthesised import is always inert.
+
+### Verification
+
+The check that caught the damage was **`pytest --collect-only` against the base**, not the
+lint gate. Static analysis alone was badly incomplete: a scan of bare `import X` statements
+found 6 sites, a hand spot-check of the largest production diff found 2 more, and
+collection then reported 36 broken modules. Two independent scans afterwards — an AST index
+of every `from X import Y` in the repo, plus a dotted-reference/patch-target regex — over
+**454 removed names in 344 files** report zero remaining breakage.
+
+Baseline discipline: the first "main" collect-only read 51655 and appeared to show 18 lost
+tests. It had been run in the **shared checkout, which carried 14 uncommitted files from
+other live sessions**, including a new test file. Re-run against a clean worktree at the
+actual base commit, base and branch match exactly: **51637/51704 collected, 67 deselected,
+0 errors** on both. Never take a baseline from a checkout other sessions are writing to.
+
+Per-file tests over every hand-touched file: 1139 passed, 2 skipped, 0 failed.
+## Stage 5 — delivered (2026-08-17): F841 is zero
+
+Landed **out of stage order**: Stage 4 (F401/F541) was already in flight in a separate live
+worktree when this started, and the two were verified not to collide — the 141 files carrying
+*only* F841 have an empty intersection with the 381 files Stage 4 touches. Only 30 of Stage
+5's files overlap Stage 4's, and only `ruff.toml` collides at all, as line deletions on both
+sides. So the sunset list here goes **526 → 385** entries (141 deleted outright, 30 trimmed
+to fewer codes) rather than to zero, and **Stage 6 remains blocked on Stage 4 landing** — the
+F401/F541 entries are not this stage's to remove.
+
+### The gate was red on `main` before any of this
+
+`ruff check . --no-cache` exited 1 on `main`: a duplicate `import pytest` had landed in
+`tests/cron/test_codex_execution_paths.py`, a file with **no sunset entry**. F811 has been
+clean tree-wide since Stage 2, so the gate caught a new offender entering a clean file —
+working exactly as designed — but it also meant the CI `ruff-blocking` job was failing and
+every in-flight stage had an unmeetable exit criterion. Fixed first, as its own commit.
+
+### What the decision rule actually bought
+
+347 findings, graded by RHS rather than swept. The split was **224 keep-the-call, 98
+delete-the-line, 23 drop-the-`as`, 2 by hand** — so roughly **two thirds of the backlog would
+have lost a side effect** to a blanket `--unsafe-fixes`. ruff itself rated only **4 of the
+347** fixes safe, the same ~2% ratio the May campaign measured (4 of 198).
+
+Three cases show the rule earning its keep, each of which a blanket fix would have destroyed:
+
+- `session_bridge/sidebar.py:606` — `_validated_source_session_id(...)` is a **validator that
+  raises** on an empty or non-canonical ID. Its return value was unused, so deleting the line
+  would have silently accepted malformed session IDs into `build_hydration_message`.
+- `gateway/session.py:2532` — `dropped = pending.pop(0)` **mutates** the pending queue; the
+  binding is dead but the eviction is the entire point of the line.
+- `hermes_cli/setup_whatsapp_cloud.py:263` — a bare `input(...)` prompt whose result is
+  discarded. It exists to *block*, not to return.
+
+### F841 cascades within itself, so the fix must iterate
+
+F841 reports once per **variable**, not once per binding. `stocks_client.py` bound `last_err`
+in three except handlers and read it in none; clearing the reported one merely promoted the
+next to being reported. Clearing a binding also orphans whatever fed it — `import asyncio` in
+`tests/gateway/test_background_command.py` and `import hermes_cli.clipboard as cb` in
+`tests/tools/test_clipboard.py` both became F401 the moment their only consumer went, and
+those two files carried F841-**only** sunset entries, so F401 was live in them and **the gate
+failed until they were cleared**. That is precisely the cross-rule cascade the staging order
+predicted. The pass therefore re-runs ruff and re-derives its edits until the count reaches a
+fixed point; it converged after four rounds.
+
+### Keeping a call is not free — it can leave a statement that does nothing
+
+The rule's default ("assume a call has side effects") is right for safety and wrong for
+tidiness when the call turns out to be pure. `last_write = time.monotonic()` became a bare
+`time.monotonic()` three times in `gateway/platforms/api_server.py`'s SSE loop — dead
+keepalive bookkeeping nothing ever read. A second pass diffed the *new* bare expression
+statements against the pre-stage tree and graded them again: 13 were genuinely inert and were
+deleted, 5 kept deliberately. Two of the 13 were dead code the author had already superseded
+and said so in a comment — `website/scripts/generate-skill-docs.py` carried an unused
+`re.compile(...)` directly above `# Safer: match the exact current block shape.`, and
+`cron/scheduler.py`'s `_resolve_origin(job)` result was discarded by its only caller.
+
+### One real bug, flagged rather than guessed at
+
+`optional-skills/finance/stocks/scripts/stocks_client.py:573` documents the 52-week metric as
+`(current - 52w_low) / (52w_high - 52w_low)`, but the line below divides by `low_f` alone, so
+the parsed `52w_high` is discarded. Either the comment or the formula is wrong, and deciding
+which is a **behaviour change, not a lint fix**. Following the Stage-3 `REVIEW(F601)`
+precedent, the discrepancy is marked in the file with `REVIEW(F841)` rather than silently
+resolved. The parse itself is deliberately **kept**: it sits inside a `try/except ValueError`,
+so a non-numeric high currently suppresses the metric entirely, and deleting the dead binding
+would start emitting a performance figure for rows whose high is unparseable.
+
+`tests/gateway/test_voice_command.py::test_code_block_response_skips_tts` is a second, smaller
+flag: it asserts nothing at all, and its own comments explain why the obvious assertion would
+fail. Left exactly as it was rather than given an assertion this stage cannot justify.
+
+### Two traps worth not re-learning
+
+**`--isolated` is not a neutral measurement.** It discards `pyproject.toml`'s
+`requires-python` exactly as `--config <other>.toml` does, so `ExceptionGroup` and
+`BaseExceptionGroup` report as **F821 in four files that are clean on 3.11+**. This is the
+same trap Stage 2 recorded for regeneration, and mid-stage it reads as a fresh regression the
+pass just caused. The falsifier is one command: the same check under the real config reports
+zero.
+
+**Indentation is load-bearing when you rewrite `x = expr` into `expr`.** Stripping the target
+and the `=` while leaving the space after it shifts the statement one column right of its
+block. The first pass did exactly that and left **88 of 171 files unparseable** — caught only
+because every modified file was compiled afterwards, not by ruff, which never got that far.
+The rewriter now re-parses each file and refuses to write an edit that does not compile, and
+it never deletes a statement that is alone in its block (that leaves `else:` with no body).
+
+**Verification.** `ruff check . --no-cache` exits 0; `--select F841` reports zero under both
+the real config and `--isolated`; F811 and F821 remain zero tree-wide. `pytest --collect-only`
+is unchanged at **51655/51730 collected, 0 collection errors**, measured against a worktree
+pinned at the pre-stage commit rather than against a remembered number.
+
+All 130 modified test files were then run twice — once on this tree, once on that pinned
+worktree, same invocation and same machine:
+
+| | tests | failures |
+|---|---|---|
+| stage 5 | 8812 | 95 |
+| pre-stage baseline | 8812 | 96 |
+
+**Zero new failures**, and an identical test count, so nothing was silently dropped. The 95
+are pre-existing platform baselines that cluster by cause rather than by anything this stage
+touched: 42 tirith (binary absent, so the scanner fails open), 16 clipboard (macOS/Linux
+dispatch paths on Windows), 8 minimax (no credentials), 8 `socket has no attribute AF_UNIX`,
+7 Windows path shape. Exactly one *failing* test is one this stage edited at all, and that
+edit is inert. The lone failure on the **baseline** side only
+(`test_check_for_updates_official_ssh_origin_uses_https_probe`) was not fixed here either —
+its test was not edited, and update-flow tests reach real-host seams.
+
+Not covered on this box, and not claimed to be: `tests/hermes_cli/test_gateway_service.py`
+skips all 189 tests via `importorskip pwd/grp` on Windows, and `tests/stress/` is behind a
+marker. Those files' edits were reviewed by hand instead.
+
+## Stage 6 — how to reconcile the two branches
+
+Stages 4 and 5 were done in parallel by sessions that could not see each other, so **neither
+is on `main`** and both edit `ruff.toml`. That diff conflicts textually and reconciles
+trivially, because the two stages delete **disjoint rule codes from the same table**.
+
+The merge rule is code-wise intersection, not line-wise: an entry survives only if *both*
+branches still list it *for the same code*.
+
+| | entries | sunset entries |
+|---|---|---|
+| stage 4 (`claude/ruff-stage4-f401`) | 175 | 171, all `F841` |
+| stage 5 (`claude/laughing-chatelet-efdb45`) | 385 | 381, all `F401`/`F541` |
+| permanent `PLW1514`, on both | 4 | — |
+
+30 paths appear on both sides, and on each side with the *other* stage's code — `["F401"]` on
+stage 5, `["F841"]` on stage 4. Their code sets are disjoint, so every one of the 30 empties.
+The arithmetic closes exactly: **381 + 171 − 30 = 522**, the sunset count stage 3 left behind.
+
+So the landed result is a sunset list of **zero**, and Stage 6 is what the design always said
+it would be: delete the block and its marker comments, keep the four permanent `PLW1514`
+exemptions above it, and tighten `tests/test_lint_config.py` to assert no `F` code appears in
+`per-file-ignores` at all. Do **not** hand-merge the two `ruff.toml` files line by line;
+derive the result and check it against that arithmetic.

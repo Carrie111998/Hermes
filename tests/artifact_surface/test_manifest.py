@@ -1,5 +1,5 @@
 import json
-from artifact_surface.manifest import Manifest, parse_manifest
+from artifact_surface.manifest import parse_manifest
 
 
 def test_parse_full_manifest(tmp_path):

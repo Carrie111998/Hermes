@@ -9,7 +9,6 @@ import uuid
 from typing import Literal
 
 from .claude_visibility_codes import (
-    CLAUDE_VISIBILITY_ERROR_CODES,
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
 )

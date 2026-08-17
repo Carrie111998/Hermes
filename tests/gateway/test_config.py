@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override

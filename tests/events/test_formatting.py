@@ -5,8 +5,7 @@ from enum import Enum
 import pytest
 
 from events.formatting import (
-    PRIORITY_EMOJI, EVENT_TYPE_EMOJI, MAILBOX_INNER_EMOJI,
-    SEPARATOR,
+    PRIORITY_EMOJI, EVENT_TYPE_EMOJI, SEPARATOR,
     priority_dot, header_dot, event_icon,
     format_header, format_event_message, format_whatsapp_message,
     format_whatsapp_header,

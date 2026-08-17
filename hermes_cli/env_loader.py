@@ -453,7 +453,7 @@ def _load_secrets_config(home_path: Path) -> dict:
     if not config_path.exists():
         return {}
     try:
-        import yaml  # type: ignore
+        import yaml  # type: ignore  # noqa: F401 - availability probe; the import IS the test
     except ImportError:
         return {}
     try:

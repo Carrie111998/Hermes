@@ -2046,7 +2046,7 @@ class TestMultimodalToolContentUnsupported:
     def test_unrelated_400_is_not_misclassified(self):
         """Make sure the patterns don't false-positive on normal 400s."""
         e = MockAPIError("bad request: missing field 'model'", status_code=400)
-        result = classify_api_error(e, provider="openrouter", model="anthropic/claude-sonnet-4")
+        classify_api_error(e, provider="openrouter", model="anthropic/claude-sonnet-4")
 
 
 class TestOpenRouterUpstreamRateLimit:

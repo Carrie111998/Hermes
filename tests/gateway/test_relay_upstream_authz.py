@@ -27,7 +27,6 @@ explicitly declares the flag; every direct network-exposed adapter leaves it
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from gateway.config import Platform
 from gateway.session import SessionSource

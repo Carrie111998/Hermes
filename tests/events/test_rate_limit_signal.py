@@ -1,4 +1,4 @@
-from events.schema import Event, EventType, Priority
+from events.schema import Event, EventType
 from events.routing_policy import Attention, classify, ACTION_REQUIRED, ALERTS
 
 

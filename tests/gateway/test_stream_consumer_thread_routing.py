@@ -214,7 +214,7 @@ class TestFeishuFallbackThreadRouting:
 
         # Call _send_raw_message with reply_to=None and thread_id in metadata
         import json
-        result = await FeishuAdapter._send_raw_message(
+        await FeishuAdapter._send_raw_message(
             adapter,
             chat_id="oc_main_chat",
             msg_type="text",
@@ -269,7 +269,7 @@ class TestFeishuFallbackThreadRouting:
         adapter._run_blocking = _run_blocking_passthrough
 
         import json
-        result = await FeishuAdapter._send_raw_message(
+        await FeishuAdapter._send_raw_message(
             adapter,
             chat_id="oc_main_chat",
             msg_type="text",

@@ -3,7 +3,6 @@
 Fixtures are PII-scrubbed samples of real SCORE_RESULT and SCORE_BATCH_SUMMARY
 messages emitted by the matcher agent on 2026-04-16.
 """
-import json
 from pathlib import Path
 
 import pytest

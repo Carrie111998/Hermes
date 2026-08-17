@@ -9,7 +9,6 @@ hermes_cli/profiles.py::_count_skills) plus the disabled-set, with a short
 TTL bounding in-place SKILL.md edit staleness.
 """
 
-import time
 
 import pytest
 

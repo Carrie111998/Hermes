@@ -5,7 +5,6 @@ import pytest
 from reply_handlers.parser import CommandIntent
 from reply_handlers.executor import (
     execute,
-    CommandResult,
     VERB_TO_STAGE,
     VERB_TO_APPROVAL,
 )

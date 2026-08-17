@@ -4,6 +4,7 @@ Import-safe module with no dependencies — can be imported from anywhere
 without risk of circular imports.
 """
 
+import functools
 import os
 import shutil
 import stat
@@ -666,8 +667,26 @@ def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
     return merged
 
 
+@functools.lru_cache(maxsize=None)
 def agent_browser_runnable(path: str | None) -> bool:
     """Return True only when *path* is an agent-browser CLI that actually runs.
+
+    CACHED, because this SPAWNS a process. The 10s timeout below is correct and
+    honoured — the cost is frequency, not duration. ``_has_agent_browser()``
+    probes the PATH copy and then the node_modules copy, and
+    ``get_nous_subscription_features()`` reaches it both directly and via
+    ``_local_browser_runnable()``, all inside
+    ``_prompt_toolset_checklist``'s per-toolset × per-category loop — so one
+    ``hermes tools`` checklist render re-probed the same binary dozens of
+    times. It also blew the 180s per-test budget in
+    ``tests/hermes_cli/test_tools_config.py``, which under
+    ``--timeout-method=thread`` ``os._exit``s the whole pytest process.
+
+    Whether a given binary executes cannot change within a process except by
+    an install, so a process-lifetime cache is sound. The one path that can
+    change it, ``hermes_cli/tools_config.py::_run_post_setup``, calls
+    ``agent_browser_runnable.cache_clear()`` after installing. Tests that stub
+    the spawn must clear it too, or they inherit a previous test's answer.
 
     A bare presence check (``shutil.which`` / ``Path.exists``) is not enough:
     agent-browser's npm ``postinstall`` re-points a *global* install symlink

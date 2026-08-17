@@ -6,7 +6,6 @@ when ``~/.bash_profile`` contained ``exec /bin/zsh -l``.
 """
 
 import os
-import platform
 import subprocess
 import sys
 from unittest.mock import patch

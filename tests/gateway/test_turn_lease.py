@@ -19,7 +19,6 @@ Covers:
 
 import asyncio
 
-import pytest
 
 from gateway.turn_lease import SessionTurnLeaseRegistry
 

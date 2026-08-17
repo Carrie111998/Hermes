@@ -7,7 +7,6 @@ send fails. Selection flows through the same application path as the typed
 command, so picker and typed arguments can never diverge.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

@@ -173,7 +173,7 @@ def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
 
-    client = MagicMock()
+    MagicMock()
     with patch(
         "agent.auxiliary_client.call_llm",
         side_effect=RuntimeError("429 rate limited"),

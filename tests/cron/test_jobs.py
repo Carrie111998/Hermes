@@ -978,7 +978,7 @@ class TestGetDueJobs:
         assert len(due) == 0
 
     def test_disabled_not_returned(self, tmp_cron_dir):
-        job = create_job(prompt="Disabled", schedule="every 1h")
+        create_job(prompt="Disabled", schedule="every 1h")
         jobs = load_jobs()
         jobs[0]["enabled"] = False
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
@@ -1683,7 +1683,6 @@ class TestBadNextRunAtRecovery:
         from datetime import timezone, timedelta as td
         now = datetime.now(timezone.utc)
         past = (now - td(seconds=30)).isoformat()
-        future = (now + td(days=1)).isoformat()
 
         # Bad record: next_run_at is not a valid ISO string (e.g. from hand-edit or corruption)
         # Healthy sibling is past due with good schedule.
@@ -2403,7 +2402,6 @@ class TestJobsJsonUtf8Bom:
     def test_load_jobs_accepts_utf8_bom(self, tmp_cron_dir):
         """BOM'd jobs.json loads — the pre-fix crash repro."""
         import json
-        from pathlib import Path
         from cron.jobs import JOBS_FILE, load_jobs
 
         payload = {

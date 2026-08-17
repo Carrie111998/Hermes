@@ -279,8 +279,6 @@ class TestTakeCheckpoint:
         mgr.new_turn()
         assert mgr.ensure_checkpoint(str(b), "b") is True
 
-        # Only one "store" directory exists.
-        bases = list(Path(mgr._checkpointed_dirs).__iter__()) if False else None
         from tools.checkpoint_manager import CHECKPOINT_BASE as BASE
         # Exactly one store dir + two project metas
         assert (BASE / "store" / "HEAD").exists()

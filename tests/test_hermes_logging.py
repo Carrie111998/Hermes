@@ -104,7 +104,7 @@ class TestSetupLogging:
 
     def test_creates_agent_log_handler(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
-        root = logging.getLogger()
+        logging.getLogger()
 
         agent_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -116,7 +116,7 @@ class TestSetupLogging:
 
     def test_creates_errors_log_handler(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
-        root = logging.getLogger()
+        logging.getLogger()
 
         error_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -130,7 +130,7 @@ class TestSetupLogging:
         hermes_logging.setup_logging(hermes_home=hermes_home)
         hermes_logging.setup_logging(hermes_home=hermes_home)  # second call — should be no-op
 
-        root = logging.getLogger()
+        logging.getLogger()
         agent_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -144,7 +144,7 @@ class TestSetupLogging:
         # checks by resolved path.
         hermes_logging.setup_logging(hermes_home=hermes_home, force=True)
 
-        root = logging.getLogger()
+        logging.getLogger()
         agent_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -155,7 +155,7 @@ class TestSetupLogging:
     def test_custom_log_level(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home, log_level="DEBUG")
 
-        root = logging.getLogger()
+        logging.getLogger()
         agent_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -168,7 +168,7 @@ class TestSetupLogging:
             hermes_home=hermes_home, max_size_mb=10, backup_count=5
         )
 
-        root = logging.getLogger()
+        logging.getLogger()
         agent_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -231,7 +231,7 @@ class TestSetupLogging:
 
         hermes_logging.setup_logging(hermes_home=hermes_home)
 
-        root = logging.getLogger()
+        logging.getLogger()
         agent_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -249,7 +249,7 @@ class TestSetupLogging:
 
         hermes_logging.setup_logging(hermes_home=hermes_home, log_level="WARNING")
 
-        root = logging.getLogger()
+        logging.getLogger()
         agent_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -274,7 +274,7 @@ class TestGatewayMode:
 
     def test_gateway_log_created(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
-        root = logging.getLogger()
+        logging.getLogger()
 
         gw_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -285,7 +285,7 @@ class TestGatewayMode:
 
     def test_gateway_log_not_created_in_cli_mode(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
-        root = logging.getLogger()
+        logging.getLogger()
 
         gw_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -299,7 +299,7 @@ class TestGatewayMode:
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
-        root = logging.getLogger()
+        logging.getLogger()
         gw_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -321,7 +321,7 @@ class TestGatewayMode:
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
-        root = logging.getLogger()
+        logging.getLogger()
         gw_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -399,7 +399,7 @@ class TestGatewayMode:
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
-        root = logging.getLogger()
+        logging.getLogger()
         gw_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -421,7 +421,7 @@ class TestGatewayForensicsLog:
     def test_forensics_log_created_when_mode_gateway(self, hermes_home, monkeypatch):
         monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
-        root = logging.getLogger()
+        logging.getLogger()
 
         forensics_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -434,7 +434,7 @@ class TestGatewayForensicsLog:
     def test_forensics_log_not_created_in_cli_mode(self, hermes_home, monkeypatch):
         monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
-        root = logging.getLogger()
+        logging.getLogger()
 
         forensics_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -478,7 +478,7 @@ class TestGatewayForensicsLog:
         monkeypatch.setenv("HERMES_GATEWAY_LOG_FILE", str(custom_path))
 
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
-        root = logging.getLogger()
+        logging.getLogger()
 
         custom_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -509,7 +509,7 @@ class TestGatewayForensicsLog:
         monkeypatch.setenv("HERMES_GATEWAY_LOG_FILE", "~/my-forensics.log")
 
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
-        root = logging.getLogger()
+        logging.getLogger()
 
         expected = (tmp_path / "my-forensics.log").resolve()
         matching = [
@@ -527,7 +527,7 @@ class TestGatewayForensicsLog:
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
-        root = logging.getLogger()
+        logging.getLogger()
         forensics_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -543,7 +543,7 @@ class TestGatewayForensicsLog:
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
-        root = logging.getLogger()
+        logging.getLogger()
         forensics_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -572,7 +572,7 @@ class TestGatewayForensicsLog:
             hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
         # Curated gateway.log handler stays attached even when forensics fails.
-        root = logging.getLogger()
+        logging.getLogger()
         gw_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -592,7 +592,7 @@ class TestGuiMode:
 
     def test_gui_log_created(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gui")
-        root = logging.getLogger()
+        logging.getLogger()
 
         gui_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
@@ -605,7 +605,7 @@ class TestGuiMode:
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gui")
 
-        root = logging.getLogger()
+        logging.getLogger()
         gui_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
@@ -686,7 +686,6 @@ class TestSessionContext:
         """Session context is per-thread — one thread's context doesn't leak."""
         hermes_logging.setup_logging(hermes_home=hermes_home)
 
-        results = {}
 
         def thread_a():
             hermes_logging.set_session_context("thread_a_session")
@@ -1038,7 +1037,7 @@ class TestAddRotatingHandler:
                     level=logging.INFO, max_bytes=1, backup_count=1,
                     formatter=formatter,
                 )
-                handler = next(
+                next(
                     h for h in hermes_logging.rotating_file_handlers() if isinstance(h, RotatingFileHandler)
                 )
                 logger.info("a" * 256)

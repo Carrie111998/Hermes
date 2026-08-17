@@ -1,14 +1,12 @@
 """Tests for events.bus -- SQLite-backed EventBus."""
 
-import os
 import sqlite3
 import threading
-from pathlib import Path
 
 import pytest
 
 from events.bus import EventBus
-from events.schema import Event, EventType, Priority
+from events.schema import EventType, Priority
 
 
 @pytest.fixture

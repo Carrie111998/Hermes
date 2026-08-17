@@ -9,7 +9,7 @@ integration (install on join, play routing, ack) is tested with the standard
 
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -229,7 +229,7 @@ class TestPlayInVoiceChannelMixerPath:
                     coro.close()
                 return None
             with patch("asyncio.wait_for", _fast):
-                ok = await adapter.play_in_voice_channel(111, "/tmp/x.mp3")
+                await adapter.play_in_voice_channel(111, "/tmp/x.mp3")
         # Fell through to legacy path -> vc.play called.
         assert vc.play.called
 

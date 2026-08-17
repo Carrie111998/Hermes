@@ -311,7 +311,6 @@ class HonchoMemoryProvider(MemoryProvider):
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/honcho.json (Honcho SDK native format)."""
         import json
-        import os
         from pathlib import Path
         config_path = Path(hermes_home) / "honcho.json"
         existing = {}
@@ -351,8 +350,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._cron_skipped = True
                 return
 
-            from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
-            from plugins.memory.honcho.session import HonchoSessionManager
+            from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client  # noqa: F401 - availability probe; the import IS the test
+            from plugins.memory.honcho.session import HonchoSessionManager  # noqa: F401 - availability probe; the import IS the test
 
             cfg = HonchoClientConfig.from_global_config()
             if not cfg.enabled or not (cfg.api_key or cfg.base_url):

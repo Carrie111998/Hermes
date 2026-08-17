@@ -251,7 +251,6 @@ def test_new_skill_without_last_used_not_immediately_archived(curator_env):
     """A freshly-created skill with no use history should not get archived
     just because last_used_at is None."""
     c = curator_env["curator"]
-    u = curator_env["usage"]
     skills_dir = curator_env["home"] / "skills"
     _write_skill(skills_dir, "fresh")
 

@@ -202,7 +202,7 @@ class TestRmtreeWritableScopeGuard:
 
     def test_refuses_root_path(self, tmp_path):
         """``Path('/')`` is the entire filesystem — must always be rejected."""
-        from tools.skills_sync import _rmtree_writable, SKILLS_DIR
+        from tools.skills_sync import _rmtree_writable
 
         skills = tmp_path / "skills"
         skills.mkdir()
@@ -635,7 +635,7 @@ class TestSyncSkills:
         (user_skill / "SKILL.md").write_text("# User modified")
 
         with self._patches(bundled, skills_dir, manifest_file):
-            result = sync_skills(quiet=True)
+            sync_skills(quiet=True)
 
         assert (user_skill / "SKILL.md").read_text() == "# User modified"
 

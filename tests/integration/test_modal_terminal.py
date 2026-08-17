@@ -216,7 +216,7 @@ def test_environment_isolation():
     
     # Create file in task1
     print("Step 1: Creating file in task1...")
-    result1 = terminal_tool("echo 'task1 data' > /tmp/isolated.txt", task_id=task1)
+    terminal_tool("echo 'task1 data' > /tmp/isolated.txt", task_id=task1)
     
     # Try to read from task2 (should not exist)
     print("Step 2: Trying to read file from task2 (should not exist)...")

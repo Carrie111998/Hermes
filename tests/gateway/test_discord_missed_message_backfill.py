@@ -2,7 +2,6 @@
 
 import asyncio
 import datetime as dt
-import os
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace

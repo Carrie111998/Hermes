@@ -114,7 +114,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from gateway.config import Platform, PlatformConfig
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
-from utils import atomic_json_write, env_float, env_int
+from utils import atomic_json_write, env_float
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
