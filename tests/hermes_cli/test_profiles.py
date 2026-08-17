@@ -318,6 +318,68 @@ class TestDeleteProfile:
         pids = profiles._profile_bound_backend_pids("coder", profile_dir)
         assert pids == [101]
 
+    def test_stop_gateway_falls_back_to_lock_when_pid_file_missing(self, profile_env, monkeypatch):
+        """Task-spawned gateways on Windows write gateway.lock instead of
+        gateway.pid; _stop_gateway_process must fall back to the lock record's
+        pid field or the delete never stops the gateway and rmtree hits
+        WinError 32 (issue #87761)."""
+        profile_dir = create_profile("coder", no_alias=True)
+        # Simulate the Windows Task Scheduler scenario: gateway.lock exists with
+        # a valid pid, but gateway.pid does not.
+        lock_pid = 424242
+        (profile_dir / "gateway.lock").write_text(
+            json.dumps({"pid": lock_pid, "kind": "gateway"}), encoding="utf-8"
+        )
+        assert not (profile_dir / "gateway.pid").exists()
+
+        killed = []
+        monkeypatch.setattr(
+            "hermes_cli.profiles.time.sleep", lambda s: None,
+        )
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: killed.append((pid, force)),
+        )
+        # _pid_exists returns False immediately → graceful stop path prints
+        # "Gateway stopped" without force-killing.
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+
+        profiles._stop_gateway_process(profile_dir)
+
+        assert killed == [(lock_pid, False)], (
+            f"expected graceful terminate of lock-record pid {lock_pid}, got {killed}"
+        )
+
+    def test_stop_gateway_returns_when_no_pid_or_lock(self, profile_env, monkeypatch):
+        """No identity files → no-op (must not raise)."""
+        profile_dir = create_profile("coder", no_alias=True)
+        profiles._stop_gateway_process(profile_dir)  # should not raise
+
+    def test_cleanup_gateway_service_windows_uses_gateway_windows_uninstall(self, profile_env, monkeypatch):
+        """_cleanup_gateway_service must stop/delete the per-profile Scheduled
+        Task on Windows, otherwise the task keeps the gateway alive (or
+        respawns it) and rmtree fails with WinError 32 (issue #87761)."""
+        profile_dir = get_profile_dir("coder")
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        uninstall_called = []
+        fake_module = types.ModuleType("hermes_cli.gateway_windows")
+
+        def _fake_uninstall():
+            uninstall_called.append(True)
+
+        fake_module.uninstall = _fake_uninstall
+        monkeypatch.setitem(sys.modules, "hermes_cli.gateway_windows", fake_module)
+        # platform.system() is read directly from the platform module inside
+        # the function; force it to report Windows.
+        monkeypatch.setattr("platform.system", lambda: "Windows")
+
+        profiles._cleanup_gateway_service("coder", profile_dir)
+
+        assert uninstall_called, "expected gateway_windows.uninstall() to be called on Windows"
+        # HERMES_HOME is restored after cleanup
+        assert os.environ.get("HERMES_HOME") == str(profile_env / ".hermes")
+
 
 # ===================================================================
 # TestListProfiles
