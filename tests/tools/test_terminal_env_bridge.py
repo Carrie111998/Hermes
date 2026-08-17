@@ -29,6 +29,9 @@ def _reset_bridge_state(monkeypatch):
         "TERMINAL_ENV",
         "TERMINAL_CWD",
         "TERMINAL_DOCKER_IMAGE",
+        "TERMINAL_CONTAINER_PERSISTENT",
+        "TERMINAL_LIFETIME_SECONDS",
+        "TERMINAL_DEGRADED_MODE",
         "TERMINAL_SSH_HOST",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -248,3 +251,39 @@ def test_routed_ssh_profile_does_not_inherit_gateway_ssh_settings(monkeypatch, t
     assert config["env_type"] == "ssh"
     assert config["ssh_host"] == ""
     assert config["ssh_user"] == ""
+
+
+def test_routed_profile_direct_terminal_consumers_use_scoped_overlay(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profiles" / "docker"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "terminal:\n"
+        "  backend: docker\n"
+        "  container_persistent: false\n"
+        "  lifetime_seconds: 30\n"
+        "  degraded_mode: fail\n"
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+    monkeypatch.setenv("TERMINAL_LIFETIME_SECONDS", "300")
+    monkeypatch.setenv("TERMINAL_DEGRADED_MODE", "warn")
+    monkeypatch.setattr(terminal_tool, "_docker_orphan_reaper_profiles", set())
+    scope = set_secret_scope({})
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        with patch.object(terminal_tool.subprocess, "run") as sudo_probe:
+            assert terminal_tool._sudo_nopasswd_works() is False
+            sudo_probe.assert_not_called()
+        assert terminal_tool._docker_session_isolation_enabled() is True
+        assert terminal_tool._get_profile_terminal_env()["TERMINAL_DEGRADED_MODE"] == "fail"
+        assert os.environ["TERMINAL_ENV"] == "local"
+        with patch(
+            "tools.environments.docker._get_active_profile_name",
+            return_value="docker",
+        ), patch("tools.environments.docker.reap_orphan_containers", return_value=[]) as reap:
+            terminal_tool._maybe_reap_docker_orphans({"docker_orphan_reaper": True})
+            assert reap.call_args.kwargs["max_age_seconds"] == 120
+    finally:
+        reset_hermes_home_override(token)
+        reset_secret_scope(scope)
+    assert os.environ["TERMINAL_ENV"] == "local"
