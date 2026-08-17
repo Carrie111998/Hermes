@@ -2029,7 +2029,10 @@ class HermesACPAgent(acp.Agent):
                     exc_info=True,
                 )
 
-        final_response = result.get("final_response", "")
+        # Interrupted turns can legitimately return ``None`` when no assistant
+        # text was produced before the hard stop.  Normalize it before string
+        # handling so the cancellation path still reaches runtime release.
+        final_response = result.get("final_response") or ""
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
         # Hermes' local "waiting for model response" interrupt status is metadata,
@@ -2049,8 +2052,18 @@ class HermesACPAgent(acp.Agent):
             # or when a plugin hook transformed the response after streaming
             # finished (e.g. transform_llm_output) — otherwise the appended /
             # rewritten text never reaches the client.
-            update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
+            try:
+                update = acp.update_agent_message_text(final_response)
+                await conn.session_update(session_id, update)
+            except Exception:
+                # A client can disconnect after the worker finishes but before
+                # the terminal response is delivered.  Delivery failure must
+                # not strand the session's runtime lease.
+                logger.debug(
+                    "Failed to deliver ACP final response for %s",
+                    session_id,
+                    exc_info=True,
+                )
 
         await self._mark_idle_and_drain_queued_prompts(
             state=state,

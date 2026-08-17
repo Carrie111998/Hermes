@@ -237,5 +237,61 @@ async def test_cancelled_prompt_releases_runtime_and_drains_follow_up_queue():
     ]
 
 
+@pytest.mark.asyncio
+async def test_session_cancel_with_no_final_text_releases_runtime():
+    class InterruptedAgent(FakeAgent):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def interrupt(self):
+            self.release.set()
+
+        def run_conversation(
+            self, *, user_message, conversation_history, task_id, **kwargs
+        ):
+            self.runs.append(user_message)
+            self.started.set()
+            assert self.release.wait(timeout=2), "test did not cancel first turn"
+            return {
+                "final_response": None,
+                "messages": list(conversation_history or []),
+                "interrupted": True,
+            }
+
+    fake = InterruptedAgent()
+    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    acp_agent.on_connect(CaptureConn())
+
+    active_prompt = asyncio.create_task(
+        acp_agent.prompt(
+            session_id=state.session_id,
+            prompt=[TextContentBlock(type="text", text="wait for cancellation")],
+        )
+    )
+    assert await asyncio.to_thread(fake.started.wait, 1)
+
+    await acp_agent.cancel(state.session_id)
+    response = await asyncio.wait_for(active_prompt, timeout=2)
+
+    assert response.stop_reason == "cancelled"
+    assert state.is_running is False
+    assert state.current_prompt_text == ""
+
+    follow_up = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="follow up")],
+    )
+    assert follow_up.stop_reason == "end_turn"
+    assert fake.runs == [
+        "wait for cancellation",
+        (
+            "wait for cancellation\n\n"
+            "User correction/guidance after interrupt: follow up"
+        ),
+    ]
 
 
