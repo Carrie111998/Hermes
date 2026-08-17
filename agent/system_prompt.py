@@ -778,6 +778,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # system message is one cache unit regardless of internal order.)
     if skills_prompt:
         volatile_parts.append(skills_prompt)
+    # Dirac-style stale-file alert: the files the assistant edited last turn
+    # whose mtimes changed since — the model must re-read before editing.
+    _stale = getattr(agent, "_stale_edited_files", None)
+    if callable(_stale):
+        _changed = _stale()
+        if _changed:
+            volatile_parts.append(
+                "<explicit_instructions>\nCRITICAL FILE STATE ALERT: "
+                + ", ".join(_changed[:5])
+                + " was externally modified since the last interaction. The "
+                "cached content is stale; re-read before editing.\n"
+                "</explicit_instructions>"
+            )
 
     if agent._memory_store:
         if agent._memory_enabled:

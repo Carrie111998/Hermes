@@ -8181,6 +8181,8 @@ class AIAgent:
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers
+        # Dirac-style: the edited files' mtimes, for the stale-file alert
+        self._edited_files_mtimes: dict = {}
         self._executing_tools = True
         try:
             if len(tool_calls) <= 1:
@@ -8235,6 +8237,7 @@ class AIAgent:
             )
         finally:
             self._executing_tools = False
+            self._record_edited_files(tool_calls)
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch.
@@ -8316,6 +8319,43 @@ class AIAgent:
                 out_lines.extend(wrapped or [raw_line])
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
+
+    def _record_edited_files(self, tool_calls) -> None:
+        """Record the mtimes of the patch/write targets after the execution
+        (Dirac-style: the next turn's stale-file check compares them)."""
+        import json as _json
+        import os as _os
+
+        for tc in tool_calls or []:
+            name = getattr(getattr(tc, "function", None), "name", "")
+            if name not in ("patch", "write_file", "edit_file"):
+                continue
+            try:
+                args = _json.loads(getattr(getattr(tc, "function", None), "arguments", "{}"))
+            except Exception:
+                continue
+            path = args.get("path") if isinstance(args, dict) else None
+            if not path:
+                continue
+            p = _os.path.abspath(_os.path.expanduser(path))
+            try:
+                self._edited_files_mtimes[p] = _os.stat(p).st_mtime_ns
+            except OSError:
+                pass
+
+    def _stale_edited_files(self) -> list:
+        """The edited files whose mtimes changed since the last edit; a
+        DELETED file is the most drastic change — it is always flagged."""
+        import os as _os
+
+        changed = []
+        for path, recorded in list(getattr(self, "_edited_files_mtimes", {}).items()):
+            try:
+                if _os.stat(path).st_mtime_ns != recorded:
+                    changed.append(path)
+            except OSError:
+                changed.append(path)  # the file is gone — flag it
+        return changed
 
     def _execute_tool_calls_async_segment(self, assistant_message, messages, effective_task_id, api_call_count):
         """Run a parallel segment through the async batch: real daemon threads,

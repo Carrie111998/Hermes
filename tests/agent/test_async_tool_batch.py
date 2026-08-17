@@ -151,6 +151,8 @@ def test_dispatcher_async_path_runs_parallel_segment(monkeypatch):
     agent._interrupt_requested = False
     from run_agent import AIAgent as _AIAgent
     agent._execute_tool_calls_async_segment = _AIAgent._execute_tool_calls_async_segment.__get__(agent)
+    agent._record_edited_files = _AIAgent._record_edited_files.__get__(agent)
+    agent._edited_files_mtimes = {}
     agent._execute_tool_calls_concurrent = lambda *a, **k: None
     agent._execute_tool_calls_sequential = lambda *a, **k: None
 
