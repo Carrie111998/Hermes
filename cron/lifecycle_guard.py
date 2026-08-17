@@ -55,11 +55,10 @@ class GatewayLifecycleBlocked(ValueError):
 # actual shell-command-shaped strings, not on prose.
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
-    # Branch A: `hermes gateway restart|stop` — the canonical foot-gun.
-    # `start` is intentionally excluded: starting a gateway from inside a
-    # gateway is benign (a no-op or "already running" error), and a
-    # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    # Branch A: `hermes [--profile NAME] gateway restart|stop`. Global profile
+    # flags must be part of the match so a self-targeting command cannot bypass
+    # the hard guard merely by spelling the current profile explicitly.
+    r"(?:hermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(?:restart|stop))"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -101,6 +100,56 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+
+
+def explicit_cross_profile_gateway_lifecycle_details(
+    command: str, *, current_profile: str
+) -> Optional[tuple[str, str]]:
+    """Return ``(profile, action)`` for one literal sibling lifecycle command.
+
+    The sole accepted shape is ``hermes --profile NAME gateway restart|stop``.
+    Aliases, equals syntax, extra flags, wrappers, paths, and compound commands
+    fail closed so the terminal layer can bind one exact capability to the CLI
+    sink.
+    """
+    try:
+        segments = list(_iter_command_segments(command))
+    except Exception:
+        return None
+    if len(segments) != 1:
+        return None
+    tokens = segments[0]
+    if len(tokens) != 5 or tokens[:2] != ["hermes", "--profile"]:
+        return None
+    profile = tokens[2].strip().lower()
+    current_profile = current_profile.strip().lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile) is None:
+        return None
+    if profile == current_profile or tokens[3] != "gateway":
+        return None
+    action = tokens[4]
+    if action not in {"restart", "stop"}:
+        return None
+    return profile, action
+
+
+def explicit_cross_profile_gateway_lifecycle_target(
+    command: str, *, current_profile: str
+) -> Optional[str]:
+    """Return the sibling profile for one literal lifecycle command."""
+    details = explicit_cross_profile_gateway_lifecycle_details(
+        command, current_profile=current_profile
+    )
+    return details[0] if details is not None else None
+
+
+def is_explicit_cross_profile_gateway_lifecycle_command(
+    command: str, *, current_profile: str
+) -> bool:
+    """Whether *command* targets one explicit sibling through the Hermes CLI."""
+    return explicit_cross_profile_gateway_lifecycle_target(
+        command, current_profile=current_profile
+    ) is not None
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})

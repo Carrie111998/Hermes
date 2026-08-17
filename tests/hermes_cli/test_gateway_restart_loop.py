@@ -8,6 +8,9 @@ Covers:
 
 import json
 import os
+import shlex
+import subprocess
+import sys
 from argparse import Namespace
 
 import pytest
@@ -228,6 +231,225 @@ class TestGatewaySelfTargetingGuard:
         with pytest.raises(_Reached):
             gw.gateway_command(args)
 
+    @pytest.mark.parametrize("subcmd", ["stop", "restart"])
+    def test_lifecycle_allows_explicit_other_profile_inside_gateway(
+        self, monkeypatch, subcmd
+    ):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
+
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+
+        class _Reached(Exception):
+            pass
+
+        def _sentinel(*args, **kwargs):
+            raise _Reached()
+
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "marin")
+        monkeypatch.setattr(
+            gw, "_cross_profile_gateway_lifecycle_capability_valid", lambda action: True
+        )
+        monkeypatch.setattr(
+            gw, "_record_cross_profile_gateway_lifecycle_request", lambda action: True
+        )
+        monkeypatch.setattr(gw, "_dispatch_via_service_manager_if_s6", _sentinel)
+        monkeypatch.setattr(gw, "_dispatch_all_via_service_manager_if_s6", _sentinel)
+        args = Namespace(gateway_command=subcmd, all=False, system=False)
+
+        with pytest.raises(_Reached):
+            gw.gateway_command(args)
+
+    @pytest.mark.parametrize("subcmd", ["stop", "restart"])
+    def test_cross_profile_all_still_blocks_origin_gateway(
+        self, monkeypatch, subcmd
+    ):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
+
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "marin")
+        args = Namespace(gateway_command=subcmd, all=True, system=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            gw.gateway_command(args)
+        assert exc_info.value.code == 1
+
+    def test_target_dotenv_cannot_rewrite_gateway_routing(self, tmp_path):
+        root = tmp_path / ".hermes"
+        origin = root / "profiles" / "caspian"
+        target = root / "profiles" / "marin"
+        origin.mkdir(parents=True)
+        target.mkdir(parents=True)
+        (target / ".env").write_text(
+            "_HERMES_GATEWAY=0\n"
+            "_HERMES_GATEWAY_PROFILE=marin\n"
+            f"HERMES_HOME={origin}\n",
+            encoding="utf-8",
+        )
+        script = (
+            "import json, os, sys; "
+            "sys.argv=['hermes','--profile','marin','gateway','status']; "
+            "import hermes_cli.main; "
+            "print(json.dumps({k: os.environ.get(k) for k in "
+            "['_HERMES_GATEWAY','_HERMES_GATEWAY_PROFILE','HERMES_HOME']}))"
+        )
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path),
+            "HERMES_HOME": str(origin),
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, [os.getcwd(), env.get("PYTHONPATH", "")])
+            ),
+            "_HERMES_GATEWAY": "1",
+            "_HERMES_GATEWAY_PROFILE": "caspian",
+        })
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.fspath(tmp_path),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        routing = json.loads(result.stdout.strip().splitlines()[-1])
+        assert routing == {
+            "_HERMES_GATEWAY": "1",
+            "_HERMES_GATEWAY_PROFILE": "caspian",
+            "HERMES_HOME": str(target),
+        }
+
+    def test_cross_profile_capability_is_action_bound_and_consumed(
+        self, monkeypatch
+    ):
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+        import tools.terminal_tool as tt
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "marin")
+        prefix = tt._gateway_lifecycle_capability_prefix(
+            origin="caspian", target="marin", action="restart"
+        )
+        for assignment in shlex.split(prefix)[1:]:
+            name, value = assignment.split("=", 1)
+            monkeypatch.setenv(name, value)
+
+        assert gw._cross_profile_gateway_lifecycle_capability_valid("restart") is True
+        assert all(os.getenv(name) is None for name in gw._GATEWAY_LIFECYCLE_CAPABILITY_VARS)
+
+    def test_cross_profile_capability_rejects_wrong_action(self, monkeypatch):
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+        import tools.terminal_tool as tt
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "marin")
+        prefix = tt._gateway_lifecycle_capability_prefix(
+            origin="caspian", target="marin", action="stop"
+        )
+        for assignment in shlex.split(prefix)[1:]:
+            name, value = assignment.split("=", 1)
+            monkeypatch.setenv(name, value)
+
+        assert gw._cross_profile_gateway_lifecycle_capability_valid("restart") is False
+
+    def test_cross_profile_lifecycle_fails_closed_when_audit_fails(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
+
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "marin")
+        monkeypatch.setattr(
+            gw, "_cross_profile_gateway_lifecycle_capability_valid", lambda action: True
+        )
+        monkeypatch.setattr(
+            gw, "_record_cross_profile_gateway_lifecycle_request", lambda action: False
+        )
+        args = Namespace(gateway_command="restart", all=False, system=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            gw.gateway_command(args)
+        assert exc_info.value.code == 1
+
+    @pytest.mark.parametrize("subcmd", ["stop", "restart"])
+    def test_lifecycle_still_blocks_origin_profile_inside_gateway(
+        self, monkeypatch, subcmd
+    ):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
+
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "caspian")
+        args = Namespace(gateway_command=subcmd, all=False, system=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            gw.gateway_command(args)
+        assert exc_info.value.code == 1
+
+    def test_cross_profile_lifecycle_writes_origin_audit_record(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
+        monkeypatch.delenv("_HERMES_GATEWAY_HOME", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", "telegram:chat:thread")
+
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "marin")
+        monkeypatch.setattr(profiles, "get_profile_dir", lambda name: tmp_path / name)
+
+        assert gw._record_cross_profile_gateway_lifecycle_request("restart") is True
+
+        audit_path = tmp_path / "caspian" / "logs" / "gateway-lifecycle-audit.jsonl"
+        record = json.loads(audit_path.read_text(encoding="utf-8"))
+        assert record["origin_profile"] == "caspian"
+        assert record["target_profile"] == "marin"
+        assert record["action"] == "restart"
+        assert record["session_key"] == "telegram:chat:thread"
+
+    def test_custom_origin_audit_uses_exact_gateway_home(
+        self, monkeypatch, tmp_path
+    ):
+        origin_home = tmp_path / "arbitrary-custom-home"
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "custom")
+        monkeypatch.setenv("_HERMES_GATEWAY_HOME", str(origin_home))
+
+        import hermes_cli.gateway as gw
+        import hermes_cli.profiles as profiles
+
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "marin")
+        monkeypatch.setattr(
+            profiles,
+            "get_profile_dir",
+            lambda name: (_ for _ in ()).throw(
+                AssertionError("custom origin must not resolve through profiles/custom")
+            ),
+        )
+
+        assert gw._record_cross_profile_gateway_lifecycle_request("stop") is True
+
+        audit_path = origin_home / "logs" / "gateway-lifecycle-audit.jsonl"
+        record = json.loads(audit_path.read_text(encoding="utf-8"))
+        assert record["origin_profile"] == "custom"
+        assert record["target_profile"] == "marin"
+        assert record["action"] == "stop"
+
 
 # ---------------------------------------------------------------------------
 # Defense 3: terminal_tool hard-blocks gateway lifecycle commands inside gateway
@@ -261,8 +483,10 @@ class TestTerminalToolGatewayLifecycleGuard:
         monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
+            monkeypatch.setenv("_HERMES_GATEWAY_PROFILE", "caspian")
         else:
             monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+            monkeypatch.delenv("_HERMES_GATEWAY_PROFILE", raising=False)
 
     @pytest.mark.parametrize("cmd", [
         "systemctl restart hermes-gateway",
@@ -292,6 +516,161 @@ class TestTerminalToolGatewayLifecycleGuard:
         result = json.loads(tt.terminal_tool(
             command="systemctl restart hermes-gateway", force=True
         ))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    def test_allows_explicit_other_profile_restart_through_approval_layer(
+        self, monkeypatch
+    ):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "restarted and verified", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = "hermes --profile marin gateway restart"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert len(calls) == 1
+        assert calls[0].startswith("env _HERMES_GATEWAY_LIFECYCLE_KEY=")
+        assert calls[0].endswith(command)
+
+    @pytest.mark.parametrize("busy_state", [True, None])
+    def test_busy_or_unknown_other_profile_requires_fresh_nonpermanent_approval(
+        self, monkeypatch, busy_state
+    ):
+        import tools.approval as approval
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):  # pragma: no cover
+                calls.append(command)
+                raise AssertionError("execute must not be reached before approval")
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(tt, "_profile_gateway_busy", lambda profile: busy_state)
+        monkeypatch.setattr(
+            approval,
+            "request_tool_approval",
+            lambda *args, **kwargs: {
+                "approved": False,
+                "status": "approval_required",
+                "command": "<terminal> (plugin approval rule)",
+                "description": "target gateway has active turns",
+                "pattern_key": "plugin_rule:busy-cross-profile:unique",
+            },
+        )
+
+        result = json.loads(
+            tt.terminal_tool(command="hermes --profile marin gateway restart")
+        )
+
+        assert result["status"] == "pending_approval"
+        assert result["approval_pending"] is True
+        assert result["allow_permanent"] is False
+        assert "active turns" in result["description"]
+        assert calls == []
+
+    def test_busy_fresh_approval_is_the_only_approval_prompt(
+        self, monkeypatch
+    ):
+        import tools.approval as approval
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "restarted", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(tt, "_profile_gateway_busy", lambda profile: True)
+        monkeypatch.setattr(
+            approval,
+            "request_tool_approval",
+            lambda *args, **kwargs: {"approved": True},
+        )
+        monkeypatch.setattr(
+            tt,
+            "_check_all_guards",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("fresh busy-target consent must not prompt twice")
+            ),
+        )
+        command = "hermes --profile marin gateway restart"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert len(calls) == 1
+        assert calls[0].startswith("env _HERMES_GATEWAY_LIFECYCLE_KEY=")
+        assert calls[0].endswith(command)
+
+    def test_target_busy_probe_uses_profile_runtime_state(self, monkeypatch, tmp_path):
+        import gateway.status as status
+        import hermes_cli.profiles as profiles
+        import tools.terminal_tool as tt
+
+        runtime = {
+            "gateway_state": "running",
+            "active_agents": 2,
+            "pid": 123,
+        }
+        monkeypatch.setattr(profiles, "get_profile_dir", lambda name: tmp_path / name)
+        status_path = tmp_path / "marin" / "gateway_state.json"
+        status_path.parent.mkdir(parents=True)
+        status_path.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(status, "read_runtime_status", lambda path: runtime)
+        monkeypatch.setattr(status, "runtime_status_pid_is_live", lambda record: True)
+
+        assert tt._profile_gateway_busy("marin") is True
+
+        runtime["active_agents"] = 0
+        assert tt._profile_gateway_busy("marin") is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "hermes --profile caspian gateway restart",
+            "hermes -p caspian gateway stop",
+            "hermes -p marin gateway restart",
+            "hermes --profile=marin gateway stop",
+            "hermes gateway restart",
+            "launchctl kickstart -k gui/501/ai.hermes.gateway-marin",
+            "/tmp/hermes --profile marin gateway restart",
+            (
+                'hermes --profile "$(launchctl kickstart -k '
+                'gui/501/ai.hermes.gateway-caspian; printf marin)" gateway restart'
+            ),
+        ],
+    )
+    def test_still_blocks_self_or_noncanonical_lifecycle_commands(
+        self, monkeypatch, command
+    ):
+        import tools.terminal_tool as tt
+
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=command, force=True))
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]

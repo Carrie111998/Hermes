@@ -3315,6 +3315,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    fresh_once: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3351,6 +3352,9 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        fresh_once: Require a new human decision for this exact operation.
+            Ignores YOLO and cached session/permanent approvals, and offers only
+            one-operation approval or denial.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3359,11 +3363,13 @@ def _run_approval_gate(
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    if not fresh_once and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not fresh_once and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
     approval_callback = _resolve_cli_approval_callback(approval_callback)
@@ -3372,6 +3378,16 @@ def _run_approval_gate(
     is_gateway = _is_gateway_approval_context()
 
     if not is_cli and not is_gateway:
+        if fresh_once:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: this operation requires a fresh human decision, "
+                    "but no interactive user or gateway approval surface is present."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+            }
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -3427,8 +3443,8 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
-                "allow_session": True,
+                "allow_permanent": not fresh_once,
+                "allow_session": not fresh_once,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -3467,9 +3483,9 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
-            if choice == "session":
+            if not fresh_once and choice == "session":
                 approve_session(session_key, pattern_key)
-            elif choice == "always":
+            elif not fresh_once and choice == "always":
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
                 save_permanent_allowlist(_permanent_approved)
@@ -3489,6 +3505,8 @@ def _run_approval_gate(
                 "command": display_target,
                 "pattern_key": pattern_key,
                 "description": description,
+                "allow_permanent": not fresh_once,
+                "allow_session": not fresh_once,
             })
             return {
                 "approved": False,
@@ -3496,6 +3514,8 @@ def _run_approval_gate(
                 "status": "approval_required",
                 "command": display_target,
                 "description": description,
+                "allow_permanent": not fresh_once,
+                "allow_session": not fresh_once,
                 "message": (
                     f"⚠️ This action is potentially dangerous ({description}). "
                     f"Asking the user for approval.\n\n**Target:**\n```\n{display_target}\n```"
@@ -3511,8 +3531,13 @@ def _run_approval_gate(
         session_key=session_key,
         surface="cli",
     )
-    choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        display_target,
+        description,
+        allow_permanent=not fresh_once,
+        approval_callback=approval_callback,
+        smart_denied=fresh_once,
+    )
     _fire_approval_hook(
         "post_approval_response",
         command=display_target,
@@ -3553,9 +3578,9 @@ def _run_approval_gate(
             "user_consent": False,
         }
 
-    if choice == "session":
+    if not fresh_once and choice == "session":
         approve_session(session_key, pattern_key)
-    elif choice == "always":
+    elif not fresh_once and choice == "always":
         approve_session(session_key, pattern_key)
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
@@ -3653,6 +3678,8 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    fresh_once: bool = False,
+    display_target: str | None = None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3680,6 +3707,10 @@ def request_tool_approval(
             on the same tool).
         approval_callback: Optional CLI callback for interactive prompts
             (same contract as ``check_dangerous_command``).
+        fresh_once: Require a new one-operation decision, ignoring YOLO and
+            cached approvals. Session/permanent choices are not offered or saved.
+        display_target: Optional exact operation shown to the user instead of
+            the generic synthetic tool label.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or
@@ -3708,7 +3739,7 @@ def request_tool_approval(
     pattern_key = f"plugin_rule:{key_suffix}"
     # A synthetic "command" string for the display/allowlist layer. It never
     # executes; it only labels the gate. Namespaced identically.
-    display_target = f"<{tool_name}> (plugin approval rule)"
+    display_target = display_target or f"<{tool_name}> (plugin approval rule)"
 
     return _run_approval_gate(
         pattern_key=pattern_key,
@@ -3731,6 +3762,7 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
+        fresh_once=fresh_once,
     )
 
 

@@ -691,6 +691,28 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+# Gateway child processes inherit a trusted origin marker, while an explicit
+# ``--profile`` above selects the lifecycle target. Profile dotenv files are
+# user-controlled and load with override semantics, so they must not be able to
+# rewrite either identity (or redirect HERMES_HOME back to the origin) before
+# gateway dispatch. Snapshot only in gateway children; normal CLI dotenv
+# precedence remains unchanged.
+_gateway_routing_snapshot = None
+if os.environ.get("_HERMES_GATEWAY") == "1":
+    _gateway_routing_snapshot = {
+        "_HERMES_GATEWAY": "1",
+        "_HERMES_GATEWAY_PROFILE": os.environ.get("_HERMES_GATEWAY_PROFILE", ""),
+        "_HERMES_GATEWAY_HOME": os.environ.get("_HERMES_GATEWAY_HOME", ""),
+        "_HERMES_GATEWAY_LIFECYCLE_KEY": os.environ.get("_HERMES_GATEWAY_LIFECYCLE_KEY", ""),
+        "_HERMES_GATEWAY_LIFECYCLE_PROOF": os.environ.get("_HERMES_GATEWAY_LIFECYCLE_PROOF", ""),
+        "_HERMES_GATEWAY_LIFECYCLE_EXPIRES": os.environ.get("_HERMES_GATEWAY_LIFECYCLE_EXPIRES", ""),
+        "_HERMES_GATEWAY_LIFECYCLE_NONCE": os.environ.get("_HERMES_GATEWAY_LIFECYCLE_NONCE", ""),
+        "_HERMES_GATEWAY_LIFECYCLE_ORIGIN": os.environ.get("_HERMES_GATEWAY_LIFECYCLE_ORIGIN", ""),
+        "_HERMES_GATEWAY_LIFECYCLE_TARGET": os.environ.get("_HERMES_GATEWAY_LIFECYCLE_TARGET", ""),
+        "_HERMES_GATEWAY_LIFECYCLE_ACTION": os.environ.get("_HERMES_GATEWAY_LIFECYCLE_ACTION", ""),
+        "HERMES_HOME": os.environ.get("HERMES_HOME", ""),
+    }
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
@@ -707,6 +729,12 @@ load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
     load_external_secrets=sys.argv[1:2] != ["update"],
 )
+if _gateway_routing_snapshot is not None:
+    for _routing_key, _routing_value in _gateway_routing_snapshot.items():
+        if _routing_value:
+            os.environ[_routing_key] = _routing_value
+        else:
+            os.environ.pop(_routing_key, None)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at

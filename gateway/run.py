@@ -1872,8 +1872,17 @@ def _clear_planned_restart_notification() -> None:
 
 
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
-# knows not to clobber TERMINAL_CWD if lazily imported.
+# knows not to clobber TERMINAL_CWD if lazily imported. Preserve the immutable
+# origin profile as well: child management commands can then distinguish a
+# forbidden self-restart from an explicitly targeted sibling-profile restart.
 os.environ["_HERMES_GATEWAY"] = "1"
+try:
+    from hermes_cli.profiles import get_active_profile_name
+
+    _gateway_origin_profile = get_active_profile_name() or "default"
+except Exception:
+    _gateway_origin_profile = "default"
+os.environ["_HERMES_GATEWAY_PROFILE"] = _gateway_origin_profile
 
 _ensure_ssl_certs()
 
@@ -1884,6 +1893,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home, get_hermes_home_override
 from utils import atomic_json_write, base_url_hostname, is_truthy_value
 _hermes_home = get_hermes_home()
+_gateway_origin_home = str(_hermes_home.resolve())
+os.environ["_HERMES_GATEWAY_HOME"] = _gateway_origin_home
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -1891,6 +1902,11 @@ from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that m
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+# Internal routing identity is process-owned, never dotenv-owned.
+os.environ["_HERMES_GATEWAY"] = "1"
+os.environ["_HERMES_GATEWAY_PROFILE"] = _gateway_origin_profile
+os.environ["_HERMES_GATEWAY_HOME"] = _gateway_origin_home
+os.environ["HERMES_HOME"] = _gateway_origin_home
 
 
 def _reload_runtime_env_preserving_config_authority() -> None:
@@ -1919,6 +1935,10 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         hermes_home=_hermes_home,
         project_env=Path(__file__).resolve().parents[1] / '.env',
     )
+    os.environ["_HERMES_GATEWAY"] = "1"
+    os.environ["_HERMES_GATEWAY_PROFILE"] = _gateway_origin_profile
+    os.environ["_HERMES_GATEWAY_HOME"] = _gateway_origin_home
+    os.environ["HERMES_HOME"] = _gateway_origin_home
     _bridge_max_turns_from_config(_hermes_home)
 
 

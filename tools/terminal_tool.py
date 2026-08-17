@@ -34,12 +34,15 @@ Usage:
 """
 
 import importlib.util
+import hashlib
+import hmac
 import json
 import logging
 import os
 import platform
 import re
 import shlex
+import secrets
 import stat
 import time
 import threading
@@ -379,6 +382,65 @@ def _check_all_guards(command: str, env_type: str,
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
                                   has_host_access=has_host_access)
+
+
+def _profile_gateway_busy(profile_name: str) -> Optional[bool]:
+    """Return target busy state, or ``None`` when inspection is unreliable."""
+    try:
+        from gateway.status import (
+            derive_gateway_busy,
+            read_runtime_status,
+            runtime_status_pid_is_live,
+        )
+        from hermes_cli.profiles import get_profile_dir
+
+        status_path = get_profile_dir(profile_name) / "gateway_state.json"
+        if not status_path.exists():
+            return False
+        runtime = read_runtime_status(status_path)
+        if not isinstance(runtime, dict):
+            return None
+        if not runtime_status_pid_is_live(runtime):
+            return False
+        if runtime.get("gateway_state") != "running":
+            return None
+        try:
+            active_agents = int(runtime["active_agents"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return derive_gateway_busy(
+            gateway_running=True,
+            gateway_state="running",
+            active_agents=active_agents,
+        )
+    except Exception:
+        logger.debug(
+            "Could not inspect target profile %s busy state", profile_name, exc_info=True
+        )
+        return None
+
+
+def _gateway_lifecycle_capability_prefix(
+    *, origin: str, target: str, action: str
+) -> str:
+    """Build a short-lived action-bound capability for the CLI lifecycle sink."""
+    expires = int(time.time()) + 60
+    nonce = secrets.token_hex(16)
+    payload = f"v1\n{origin}\n{target}\n{action}\n{expires}\n{nonce}"
+    key = secrets.token_hex(32)
+    proof = hmac.new(bytes.fromhex(key), payload.encode(), hashlib.sha256).hexdigest()
+    values = {
+        "_HERMES_GATEWAY_LIFECYCLE_KEY": key,
+        "_HERMES_GATEWAY_LIFECYCLE_PROOF": proof,
+        "_HERMES_GATEWAY_LIFECYCLE_EXPIRES": str(expires),
+        "_HERMES_GATEWAY_LIFECYCLE_NONCE": nonce,
+        "_HERMES_GATEWAY_LIFECYCLE_ORIGIN": origin,
+        "_HERMES_GATEWAY_LIFECYCLE_TARGET": target,
+        "_HERMES_GATEWAY_LIFECYCLE_ACTION": action,
+    }
+    return "env " + " ".join(
+        f"{name}={shlex.quote(value)}" for name, value in values.items()
+    ) + " "
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2782,11 +2844,15 @@ def terminal_tool(
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
+        cross_profile_fresh_approved = False
+        cross_profile_details = None
+        execution_command = command
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
+                explicit_cross_profile_gateway_lifecycle_details,
             )
             if contains_launchctl_submit_command(command):
                 return json.dumps({
@@ -2865,23 +2931,96 @@ def terminal_tool(
                     pass
                 return None
 
-            if contains_gateway_lifecycle_command_or_referenced_script(
+            lifecycle_hit = contains_gateway_lifecycle_command_or_referenced_script(
                 command,
                 cwd=guard_cwd,
                 read_remote_script=_read_script_in_env,
-            ):
+            )
+            origin_profile = os.environ.get("_HERMES_GATEWAY_PROFILE", "").strip()
+            if origin_profile:
+                cross_profile_details = explicit_cross_profile_gateway_lifecycle_details(
+                    command, current_profile=origin_profile
+                )
+            cross_profile_target = (
+                cross_profile_details[0] if cross_profile_details is not None else None
+            )
+            if lifecycle_hit and cross_profile_details is None:
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,
                     "error": (
-                        "Blocked: command or referenced script cannot restart or stop "
-                        "the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
+                        "Blocked: command or referenced script may restart or stop "
+                        "the current gateway from inside its own process. Self-targeted, "
+                        "wrapped, and raw service-manager lifecycle commands remain "
+                        "blocked. To manage a sibling profile, use one direct command: "
+                        "`hermes --profile <other> gateway restart|stop`."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
+
+            if cross_profile_details is not None and env_type != "local":
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": "Blocked: sibling gateway lifecycle is available only on the local host backend.",
+                    "status": "error",
+                }, ensure_ascii=False)
+
+            if cross_profile_details is not None:
+                cross_profile_target, cross_profile_action = cross_profile_details
+                busy_state = _profile_gateway_busy(cross_profile_target)
+                if not force and busy_state is not False:
+                    from tools.approval import request_tool_approval
+
+                    state_reason = (
+                        "has active turns" if busy_state is True
+                        else "busy state could not be verified"
+                    )
+                    exact_reason = (
+                        f"Gateway profile '{cross_profile_target}' {state_reason}. "
+                        f"Approve this exact {cross_profile_action} operation once: {command}"
+                    )
+                    busy_approval = request_tool_approval(
+                        "terminal",
+                        exact_reason,
+                        rule_key=(
+                            f"busy_cross_profile_gateway:{origin_profile}:"
+                            f"{cross_profile_target}:{cross_profile_action}"
+                        ),
+                        approval_callback=_get_approval_callback(),
+                        fresh_once=True,
+                        display_target=command,
+                    )
+                    if not busy_approval.get("approved"):
+                        approval_status = busy_approval.get("status")
+                        if approval_status in {"approval_required", "pending_approval"}:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": -1,
+                                "error": "",
+                                "status": "pending_approval",
+                                "approval_pending": True,
+                                "command": busy_approval.get("command", command),
+                                "description": busy_approval.get("description", exact_reason),
+                                "pattern_key": busy_approval.get("pattern_key", ""),
+                                "allow_permanent": False,
+                            }, ensure_ascii=False)
+                        return json.dumps({
+                            "output": "",
+                            "exit_code": 1,
+                            "error": busy_approval.get("message") or (
+                                "BLOCKED: fresh approval is required because the target "
+                                "gateway's busy state is active or unknown."
+                            ),
+                            "status": "error",
+                        }, ensure_ascii=False)
+                    cross_profile_fresh_approved = True
+
+                execution_command = _gateway_lifecycle_capability_prefix(
+                    origin=origin_profile,
+                    target=cross_profile_target,
+                    action=cross_profile_action,
+                ) + command
 
         # Validate before the source guard resolves an explicit workdir.
         if workdir:
@@ -2928,8 +3067,8 @@ def terminal_tool(
         # force).  Drives the clean-interrupt-slate clear before env.execute so
         # an approved command can't be SIGINT-killed by a bit that landed during
         # the approval-wait (see clear_current_thread_interrupt).
-        _approved_run = bool(force)
-        if not force:
+        _approved_run = bool(force or cross_profile_fresh_approved)
+        if not force and not cross_profile_fresh_approved:
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
@@ -3278,7 +3417,7 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    result = env.execute(execution_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

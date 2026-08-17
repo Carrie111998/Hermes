@@ -5,6 +5,8 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -7230,6 +7232,132 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 
 
 
+def _gateway_lifecycle_targets_current_process(args=None) -> bool:
+    """Return whether a gateway lifecycle command would target this process.
+
+    Gateway children inherit ``_HERMES_GATEWAY_PROFILE`` from the parent
+    gateway.  The CLI's ``--profile`` handling changes the active target before
+    this function runs, so comparing the immutable origin marker with the
+    active profile distinguishes self-management from an explicitly targeted
+    sibling profile.  Missing origin identity fails closed for older gateways.
+    """
+    if os.getenv("_HERMES_GATEWAY") != "1":
+        return False
+
+    # An all-profile operation necessarily includes the origin gateway even
+    # when --profile selected a sibling before dispatch.
+    if args is not None and getattr(args, "all", False):
+        return True
+
+    origin_profile = os.getenv("_HERMES_GATEWAY_PROFILE", "").strip()
+    if not origin_profile:
+        return True
+
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        target_profile = (get_active_profile_name() or "default").strip()
+    except Exception:
+        return True
+    return target_profile == origin_profile
+
+
+_GATEWAY_LIFECYCLE_CAPABILITY_VARS = (
+    "_HERMES_GATEWAY_LIFECYCLE_KEY",
+    "_HERMES_GATEWAY_LIFECYCLE_PROOF",
+    "_HERMES_GATEWAY_LIFECYCLE_EXPIRES",
+    "_HERMES_GATEWAY_LIFECYCLE_NONCE",
+    "_HERMES_GATEWAY_LIFECYCLE_ORIGIN",
+    "_HERMES_GATEWAY_LIFECYCLE_TARGET",
+    "_HERMES_GATEWAY_LIFECYCLE_ACTION",
+)
+
+
+def _cross_profile_gateway_lifecycle_capability_valid(action: str) -> bool:
+    """Consume and verify the terminal-issued capability at the lifecycle sink."""
+    if os.getenv("_HERMES_GATEWAY") != "1":
+        return True
+    origin = os.getenv("_HERMES_GATEWAY_PROFILE", "").strip().lower()
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        target = (get_active_profile_name() or "default").strip().lower()
+        if not origin or target == origin:
+            return True
+        values = {name: os.getenv(name, "") for name in _GATEWAY_LIFECYCLE_CAPABILITY_VARS}
+        if any(not value for value in values.values()):
+            return False
+        if values["_HERMES_GATEWAY_LIFECYCLE_ORIGIN"] != origin:
+            return False
+        if values["_HERMES_GATEWAY_LIFECYCLE_TARGET"] != target:
+            return False
+        if values["_HERMES_GATEWAY_LIFECYCLE_ACTION"] != action:
+            return False
+        expires = int(values["_HERMES_GATEWAY_LIFECYCLE_EXPIRES"])
+        now = int(time.time())
+        if expires < now or expires > now + 120:
+            return False
+        nonce = values["_HERMES_GATEWAY_LIFECYCLE_NONCE"]
+        payload = f"v1\n{origin}\n{target}\n{action}\n{expires}\n{nonce}"
+        expected = hmac.new(
+            bytes.fromhex(values["_HERMES_GATEWAY_LIFECYCLE_KEY"]),
+            payload.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(
+            expected, values["_HERMES_GATEWAY_LIFECYCLE_PROOF"]
+        )
+    except (TypeError, ValueError, OSError):
+        return False
+    finally:
+        for name in _GATEWAY_LIFECYCLE_CAPABILITY_VARS:
+            os.environ.pop(name, None)
+
+
+def _record_cross_profile_gateway_lifecycle_request(action: str) -> bool:
+    """Durably record sibling gateway management before execution.
+
+    Approval decisions are already emitted through the approval hook system.
+    This local JSONL record preserves the origin/target/action even when no
+    observer plugin is installed. Cross-profile lifecycle fails closed if this
+    record cannot be flushed to the origin profile's audit log.
+    """
+    if os.getenv("_HERMES_GATEWAY") != "1":
+        return True
+    origin_profile = os.getenv("_HERMES_GATEWAY_PROFILE", "").strip()
+    if not origin_profile:
+        return False
+    try:
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+
+        target_profile = (get_active_profile_name() or "default").strip()
+        if target_profile == origin_profile:
+            return True
+        origin_home = os.getenv("_HERMES_GATEWAY_HOME", "").strip()
+        if origin_home:
+            path = Path(origin_home) / "logs" / "gateway-lifecycle-audit.jsonl"
+        else:
+            path = get_profile_dir(origin_profile) / "logs" / "gateway-lifecycle-audit.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "origin_profile": origin_profile,
+            "target_profile": target_profile,
+            "action": action,
+            "pid": os.getpid(),
+            "session_key": os.getenv("HERMES_SESSION_KEY", ""),
+            "status": "requested",
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return True
+    except Exception:
+        logger.debug("Failed to record cross-profile gateway lifecycle audit", exc_info=True)
+        return False
+
+
 def gateway_command(args):
     """Handle gateway subcommands."""
     try:
@@ -7610,11 +7738,24 @@ def _gateway_command_inner(args):
     elif subcmd == "stop":
         # Defense: refuse self-targeting gateway stop from inside the gateway.
         # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        if os.getenv("_HERMES_GATEWAY") == "1":
+        if _gateway_lifecycle_targets_current_process(args):
             print_error(
-                "Refusing to stop the gateway from inside the gateway process.\n"
+                "Refusing to stop the current gateway from inside its own process.\n"
                 "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway stop` from a shell outside the running gateway."
+                "Target a different profile explicitly, or run this command from "
+                "a shell outside the current gateway."
+            )
+            sys.exit(1)
+        if not _cross_profile_gateway_lifecycle_capability_valid("stop"):
+            print_error(
+                "Refusing cross-profile gateway stop without a valid, exact "
+                "terminal approval capability."
+            )
+            sys.exit(1)
+        if not _record_cross_profile_gateway_lifecycle_request("stop"):
+            print_error(
+                "Refusing cross-profile gateway stop because the lifecycle audit "
+                "record could not be written to the origin profile."
             )
             sys.exit(1)
 
@@ -7703,11 +7844,24 @@ def _gateway_command_inner(args):
     elif subcmd == "restart":
         # Defense: refuse self-targeting gateway restart from inside the gateway.
         # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        if os.getenv("_HERMES_GATEWAY") == "1":
+        if _gateway_lifecycle_targets_current_process(args):
             print_error(
-                "Refusing to restart the gateway from inside the gateway process.\n"
+                "Refusing to restart the current gateway from inside its own process.\n"
                 "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway restart` from a shell outside the running gateway."
+                "Target a different profile explicitly, or run this command from "
+                "a shell outside the current gateway."
+            )
+            sys.exit(1)
+        if not _cross_profile_gateway_lifecycle_capability_valid("restart"):
+            print_error(
+                "Refusing cross-profile gateway restart without a valid, exact "
+                "terminal approval capability."
+            )
+            sys.exit(1)
+        if not _record_cross_profile_gateway_lifecycle_request("restart"):
+            print_error(
+                "Refusing cross-profile gateway restart because the lifecycle audit "
+                "record could not be written to the origin profile."
             )
             sys.exit(1)
 

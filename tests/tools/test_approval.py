@@ -1626,3 +1626,91 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+class TestFreshOnceApproval:
+    def test_ignores_yolo_and_cached_grants_and_never_persists(self, monkeypatch):
+        from tools import approval as mod
+
+        pattern_key = "plugin_rule:busy_cross_profile_gateway:marin"
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        mod.approve_session("", pattern_key)
+        mod._permanent_approved.add(pattern_key)
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setattr(
+            mod,
+            "approve_session",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("fresh approval must not persist a session grant")
+            ),
+        )
+        monkeypatch.setattr(
+            mod,
+            "approve_permanent",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("fresh approval must not persist a permanent grant")
+            ),
+        )
+        seen = {}
+
+        def callback(command, description, **kwargs):
+            seen.update(kwargs)
+            return "session"
+
+        result = mod.request_tool_approval(
+            "terminal",
+            "target gateway has active turns",
+            rule_key="busy_cross_profile_gateway:marin",
+            approval_callback=callback,
+            fresh_once=True,
+        )
+
+        assert result["approved"] is True
+        assert seen["allow_permanent"] is False
+        assert seen["smart_denied"] is True
+
+    def test_pending_fresh_request_disables_session_and_permanent(self, monkeypatch):
+        from tools import approval as mod
+
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(mod, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(mod, "_should_fall_through_to_cli_approval", lambda **kw: False)
+        monkeypatch.setattr(mod, "get_current_session_key", lambda: "gateway-session")
+        monkeypatch.setattr(mod, "submit_pending", lambda *args, **kwargs: None)
+
+        result = mod.request_tool_approval(
+            "terminal",
+            "target gateway has active turns",
+            rule_key="busy_cross_profile_gateway:marin",
+            fresh_once=True,
+        )
+
+        assert result["status"] == "approval_required"
+        assert result["allow_session"] is False
+        assert result["allow_permanent"] is False
+
+    def test_fresh_once_blocks_cron_autoapprove_mode(self, monkeypatch):
+        from tools import approval as mod
+
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(mod, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(mod, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(mod, "_is_cron_approval_context", lambda: True)
+        monkeypatch.setattr(mod, "_get_cron_approval_mode", lambda: "approve")
+
+        result = mod.request_tool_approval(
+            "terminal",
+            "target busy state is unknown",
+            rule_key="busy_cross_profile_gateway:caspian:marin:restart",
+            fresh_once=True,
+            display_target="hermes --profile marin gateway restart",
+        )
+
+        assert result["approved"] is False
+        assert "fresh human decision" in result["message"]
