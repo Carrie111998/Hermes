@@ -413,6 +413,7 @@ def bind_terminal_sequence_handlers(kb, *, on_focus_in=None) -> None:
     reports without coupling this parser helper to ``HermesCLI``.
     """
     try:
+        from prompt_toolkit.key_binding.key_processor import KeyPress
         from prompt_toolkit.keys import Keys
     except Exception:
         return
@@ -424,7 +425,10 @@ def bind_terminal_sequence_handlers(kb, *, on_focus_in=None) -> None:
             for press in (getattr(event, "key_sequence", None) or ())
         }
         if payloads & _SHIFT_SPACE_SEQUENCES:
-            event.current_buffer.insert_text(" ")
+            # Re-feed a canonical keypress instead of mutating the buffer so
+            # active ``space`` bindings (for example clarify multi-select)
+            # retain their normal semantics. ``first`` preserves input order.
+            event.app.key_processor.feed(KeyPress(" ", " "), first=True)
         elif on_focus_in is not None and "\x1b[I" in payloads:
             try:
                 on_focus_in()
