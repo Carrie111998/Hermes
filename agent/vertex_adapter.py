@@ -37,8 +37,10 @@ try:
     import google.auth
     import google.auth.transport.requests
     from google.oauth2 import service_account
+    from google.oauth2.credentials import Credentials as UserCredentials
 except ImportError:
     google = None  # type: ignore[assignment]
+    UserCredentials = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -134,12 +136,18 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
                 except Exception:
                     # The credential file may be an ADC authorized_user token
                     # (the default output of `gcloud auth application-default
-                    # login`) rather than a service-account JSON. Fall back to
-                    # google.auth.default(), which handles both credential
-                    # types transparently.
-                    creds, project_id = google.auth.default(
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                    # login`) rather than a service-account JSON. Load it
+                    # directly via from_authorized_user_file() — do NOT call
+                    # google.auth.default() here, as that reads os.environ
+                    # internally and could bypass multiplex secret-scope
+                    # safeguards in multi-profile gateways.
+                    if UserCredentials is None:
+                        raise
+                    creds = UserCredentials.from_authorized_user_file(
+                        resolved_path,
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
                     )
+                    project_id = None
             else:
                 # google.auth.default() reads GOOGLE_APPLICATION_CREDENTIALS
                 # straight from os.environ internally — it has no notion of
