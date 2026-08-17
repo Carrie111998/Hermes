@@ -92,6 +92,19 @@ class TestQuietModeCacheIsolation:
         assert second[0]["function"]["parameters"]["properties"]["message"]["type"] == "string"
         assert second[0]["content"][0]["text"] == "original content"
 
+        second[0]["function"]["description"] = "cache-hit caller mutation"
+        second[0]["function"]["parameters"]["properties"]["message"]["type"] = "number"
+        second[0]["content"][0]["text"] = "cache-hit content mutation"
+        second.append({"type": "function", "function": {"name": "cache-hit added"}})
+
+        third = model_tools.get_tool_definitions(quiet_mode=True)
+
+        assert compute_calls == 1
+        assert len(third) == 1
+        assert third[0]["function"]["description"] == "original description"
+        assert third[0]["function"]["parameters"]["properties"]["message"]["type"] == "string"
+        assert third[0]["content"][0]["text"] == "original content"
+
 
 
     def test_cache_bounded_by_eviction(self):
