@@ -3019,6 +3019,11 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
   })
 }
 
+function botRosterKey(bot) {
+  const source = bot.remoteSource ? bot.connectionId || bot.connectionLabel || bot.handle || 'remote' : 'local'
+  return `${source}:${bot.name}`
+}
+
 // ── bot row ──────────────────────────────────────────────────────────────────
 
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
@@ -5979,7 +5984,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
               children: label
             })
           ]
-        }, bot.name)
+        }, botRosterKey(bot))
       })
     ]
   })
@@ -6438,7 +6443,7 @@ function BotsPane() {
                           }, `group:${section.group}`)
                         : null,
                       ...section.bots.map(bot =>
-                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, bot.name)
+                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, botRosterKey(bot))
                       )
                     ])
                   })
