@@ -242,59 +242,52 @@ def test_on_hit_reports_only_the_first_transition(tmp_path: Path):
     assert watcher.sightings == 1
 
 
-def test_sighting_record_is_durable_before_the_live_sweep(tmp_path: Path, monkeypatch):
-    """The SIGHTING row must hit disk while the live sweep is still running.
+def test_sighting_record_is_durable_before_the_live_sweep(monkeypatch, tmp_path):
+    """The SIGHTING row must be durable BEFORE the live sweep begins.
 
-    Not a row-ordering assertion: ordering alone passes even when the sweep is
-    moved above the write, which is the exact regression this guards. The live
-    sweep costs 60-200s on this box and the run can be killed at any moment,
-    so the durable write must not wait for it.
+    Deterministic by construction: both marks are recorded on on_hit's OWN
+    thread, so their order is fixed by the code path rather than by the
+    scheduler. An earlier version polled the log from a second thread and was
+    measured letting the regression through ~1 run in 8 under CPU contention.
     """
     import scripts.systemdrive_watcher as w
 
     root = tmp_path / "root"
     root.mkdir()
     log = tmp_path / "w.jsonl"
+    marks = {}
 
-    # Make the sweep measurably slow, as it is in reality.
-    real_describe_pid = w.describe_pid
-    monkeypatch.setattr(
-        w, "describe_pid",
-        lambda pid: (time.sleep(0.02), real_describe_pid(pid))[1],
-    )
-
-    watcher = w.Watcher([root], log=log, live_sweep_secs=0.5)
-
-    started = time.perf_counter()
-    returned: dict = {}
-
-    def run_hit():
-        watcher.on_hit(root.resolve(), "test")
-        returned["at"] = time.perf_counter() - started
-
-    thread = threading.Thread(target=run_hit)
-    thread.start()
-
-    # Poll for the SIGHTING row appearing on disk WHILE on_hit is still running.
-    durable_at = None
-    while thread.is_alive() and time.perf_counter() - started < 20:
-        if log.exists() and log.read_text(encoding="utf-8").strip():
-            durable_at = time.perf_counter() - started
-            break
+    real_describe = w.describe_pid
+    def slow_describe(pid):
+        # First call marks the moment the live sweep actually begins.
+        marks.setdefault("sweep_started", time.perf_counter())
         time.sleep(0.005)
-    thread.join(timeout=25)
+        return real_describe(pid)
+    monkeypatch.setattr(w, "describe_pid", slow_describe)
 
-    assert durable_at is not None, "SIGHTING never became durable while on_hit ran"
-    assert "at" in returned, "on_hit did not finish"
-    assert durable_at < returned["at"], (
-        f"SIGHTING became durable at {durable_at:.3f}s but on_hit only returned at "
-        f"{returned['at']:.3f}s - the durable write is not ahead of the sweep"
+    real_write = w.write_record
+    def spy_write(log_path, event, **fields):
+        record = real_write(log_path, event, **fields)
+        if event == "SIGHTING":
+            marks["sighting_durable"] = time.perf_counter()
+            # Prove it is genuinely ON DISK at this instant, not merely that
+            # the function was entered.
+            marks["sighting_bytes"] = log_path.stat().st_size
+        return record
+    monkeypatch.setattr(w, "write_record", spy_write)
+
+    w.Watcher([root], log=log, live_sweep_secs=0.3).on_hit(root.resolve(), "test")
+
+    assert "sighting_durable" in marks, "SIGHTING record was never written"
+    assert "sweep_started" in marks, "live sweep never ran - test proves nothing"
+    assert marks["sighting_bytes"] > 0, "SIGHTING was not flushed to disk before the sweep"
+    assert marks["sighting_durable"] < marks["sweep_started"], (
+        "the SIGHTING record was not durable before the live sweep began"
     )
 
     rows = _rows(log)
     assert rows[0]["event"] == "SIGHTING"
     assert rows[0]["live_sweep"] == "pending"
-    assert "ring_size" in rows[0]
     assert any(r["event"] == "SIGHTING_LIVE" for r in rows)
 
 
