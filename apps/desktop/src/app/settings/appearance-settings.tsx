@@ -24,6 +24,7 @@ import type { DesktopTheme } from '@/themes/types'
 import { $marketplaceInstalls, isUserTheme, removeUserTheme } from '@/themes/user-themes'
 
 import { MODE_OPTIONS } from './constants'
+import { IntroImageSettings } from './intro-image-settings'
 import { PetSettings } from './pet-settings'
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
 
@@ -516,6 +517,10 @@ export function AppearanceSettings() {
             title={a.embedsTitle}
           />
         </div>
+      </div>
+
+      <div className="mt-6">
+        <IntroImageSettings />
       </div>
 
       <div className="mt-6">

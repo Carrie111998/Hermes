@@ -310,6 +310,17 @@ export const zhHant = defineLocale({
       translucencyDesc: '讓整個視窗透出桌面。僅支援 macOS 與 Windows。',
       backdropTitle: '聊天背景',
       backdropDesc: '對話後方那張淡淡的雕像圖片。',
+      introImage: {
+        title: 'Intro Image',
+        intro: 'Replace the HERMES AGENT wordmark on the new-session welcome screen with your own image.',
+        empty: 'No image set. The default wordmark will be shown.',
+        pathLabel: (path: string) => `Current: ${path}`,
+        choose: 'Choose image',
+        replace: 'Replace',
+        clear: 'Clear',
+        previewAlt: 'Intro image preview',
+        loading: 'Image path is set, but the file is missing or unreadable.'
+      },
       embedsTitle: '內嵌預覽',
       embedsDesc:
         '豐富預覽會從第三方網站（YouTube、X 等）載入。詢問會在你允許前顯示佔位符；一律會自動載入；關閉則保留純連結。',

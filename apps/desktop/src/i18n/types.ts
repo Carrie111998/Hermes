@@ -351,6 +351,17 @@ export interface Translations {
       translucencyDesc: string
       backdropTitle: string
       backdropDesc: string
+      introImage: {
+        title: string
+        intro: string
+        empty: string
+        pathLabel: (path: string) => string
+        choose: string
+        replace: string
+        clear: string
+        previewAlt: string
+        loading: string
+      }
       embedsTitle: string
       embedsDesc: string
       embedsAsk: string

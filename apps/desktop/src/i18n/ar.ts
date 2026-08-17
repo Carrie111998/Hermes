@@ -397,6 +397,17 @@ export const ar = defineLocale({
       translucencyDesc: 'إظهار سطح المكتب من خلال النافذة بالكامل. متاح على macOS وWindows فقط.',
       backdropTitle: 'خلفية النافذة',
       backdropDesc: 'اختيار مقدار مزج خلفية سطح المكتب مع سطح Hermes.',
+      introImage: {
+        title: 'Intro Image',
+        intro: 'Replace the HERMES AGENT wordmark on the new-session welcome screen with your own image.',
+        empty: 'No image set. The default wordmark will be shown.',
+        pathLabel: (path: string) => `Current: ${path}`,
+        choose: 'Choose image',
+        replace: 'Replace',
+        clear: 'Clear',
+        previewAlt: 'Intro image preview',
+        loading: 'Image path is set, but the file is missing or unreadable.'
+      },
       embedsTitle: 'التضمينات المضمّنة',
       embedsDesc:
         'تُحمّل المعاينات الغنية من مواقع طرف ثالث (YouTube، X، …). "اسأل" يعرض عنصرا نائبا حتى تسمح لكل واحد؛ "دائما" يحمّلها تلقائيا؛ "إيقاف" يبقي الروابط عادية.',

@@ -318,6 +318,17 @@ export const ja = defineLocale({
       translucencyDesc: 'ウィンドウ全体を透過させてデスクトップを表示します。macOS と Windows のみ。',
       backdropTitle: 'チャット背景',
       backdropDesc: '会話の背後に表示される淡い彫像の画像。',
+      introImage: {
+        title: 'Intro Image',
+        intro: 'Replace the HERMES AGENT wordmark on the new-session welcome screen with your own image.',
+        empty: 'No image set. The default wordmark will be shown.',
+        pathLabel: (path: string) => `Current: ${path}`,
+        choose: 'Choose image',
+        replace: 'Replace',
+        clear: 'Clear',
+        previewAlt: 'Intro image preview',
+        loading: 'Image path is set, but the file is missing or unreadable.'
+      },
       embedsTitle: 'インライン埋め込み',
       embedsDesc:
         'リッチプレビューは第三者サイト（YouTube、X など）から読み込まれます。確認は許可するまでプレースホルダーを表示し、常には自動で読み込み、オフはリンクのままにします。',
