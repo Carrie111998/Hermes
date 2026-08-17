@@ -31,7 +31,7 @@ try:
     import msvcrt
 except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
@@ -948,12 +948,24 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         # with interval jobs.  This ensures that after a crash/restart,
         # the next run is anchored to the actual last execution time
         # rather than to an arbitrary restart time.
-        base_time = now
+        #
+        # IMPORTANT: evaluate the expression in UTC, matching the ticker's
+        # due-check, which compares next_run_at against the wall clock in
+        # UTC terms. `_hermes_now()` returns the *configured* zone (e.g.
+        # Asia/Shanghai), so using it as the croniter base would interpret
+        # "30 14 * * *" as 14:30 Shanghai and persist
+        # "2026-08-17T14:30:00+08:00" — an absolute instant 8h earlier than
+        # the intended 14:30 UTC fire. On restart the stored instant is
+        # already past and the job fires 8h early (#88220). Normalize to
+        # UTC so the persisted next_run_at is the correct absolute instant.
+        base_time = now.astimezone(timezone.utc)
         if last_run_at:
             try:
-                base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
+                base_time = _ensure_aware(
+                    datetime.fromisoformat(last_run_at)
+                ).astimezone(timezone.utc)
             except Exception:
-                base_time = now
+                base_time = now.astimezone(timezone.utc)
         cron = croniter(expr, base_time)
         next_run = cron.get_next(datetime)
         return next_run.isoformat()
