@@ -42,6 +42,9 @@ from runtime_state.retry_config import (
     no_retry_hook,
 )
 from runtime_state.schema import (
+    DIGEST_PARAMETER_ID,
+    JOURNAL_EVENT_VERSION,
+    JOURNAL_SCHEMA_VERSION,
     MIGRATION_1_BODY,
     MIGRATION_1_CHECKSUM,
     MIGRATION_1_SEED_SQL,
@@ -53,6 +56,9 @@ from runtime_state.schema import (
     STATE_TABLES,
     normalize_migration_body,
 )
+from runtime_state.key_custody import AuthJsonKeyCustody, KeyUnavailable
+from runtime_state.journal import KEY_UNAVAILABLE, LOCK_TIMEOUT, WRITE_ABORT
+from runtime_state.verifier import DRIFT, OK, UNKNOWN, VerificationResult, verify_all, verify_entity
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -65,6 +71,9 @@ __all__ = [
     "MIGRATION_1_SEED_SQL",
     "MIGRATION_1_CHECKSUM",
     "normalize_migration_body",
+    "DIGEST_PARAMETER_ID",
+    "JOURNAL_EVENT_VERSION",
+    "JOURNAL_SCHEMA_VERSION",
     "RuntimeStateDB",
     "RuntimeStateSchemaError",
     "RuntimeStatePreflightError",
@@ -95,4 +104,15 @@ __all__ = [
     "create_task_state",
     "create_approval_state",
     "create_compression_state",
+    "AuthJsonKeyCustody",
+    "KeyUnavailable",
+    "VerificationResult",
+    "OK",
+    "DRIFT",
+    "UNKNOWN",
+    "verify_entity",
+    "verify_all",
+    "KEY_UNAVAILABLE",
+    "LOCK_TIMEOUT",
+    "WRITE_ABORT",
 ]

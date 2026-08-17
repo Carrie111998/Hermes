@@ -1276,6 +1276,34 @@ Claude Opus and AGY independently passed the same correction set. The next
 gate is separate user authorization for implementation and Gate 0 preflight.
 No source, primary dirty worktree, or DGX runtime state was changed.
 
+## Implementation gate authorization and current delivery state
+
+On 2026-08-17 the user explicitly authorized implementation and the complete
+delivery sequence. The implementation was performed in an isolated checkout;
+the primary dirty worktree and DGX runtime were not modified.
+
+Current status: `IMPLEMENTATION_REVIEW_PASS_PENDING_CI`.
+
+Implementation review evidence:
+
+- authenticated AGY review: `PASS`, correction set empty;
+- fresh authenticated WSL Claude review in the isolated Hermes checkout:
+  `CLAUDE_REVIEW=PASS`, correction set empty;
+- both reviewers inspected the same nine changed source/test files and the
+  same metadata-only correction scope.
+
+Focused test evidence:
+
+- canonical `scripts/run_tests.sh` executed 24 ARCH-003 tests successfully;
+  its gateway integration file could not collect because the borrowed KLIB
+  venv lacks `yaml`; this is an environment limitation, not an assertion
+  failure;
+- the same focused paths with the complete Windows Python dependency set
+  passed `29 passed`.
+
+The remaining gates are commit, push, latest-head CI, merge, deployment,
+runtime health, rollback evidence, and final dirty-tree verification.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:

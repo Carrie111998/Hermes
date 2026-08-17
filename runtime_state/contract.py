@@ -577,3 +577,164 @@ def _timestamp() -> str:
     from runtime_state.migrations import utc_timestamp
 
     return utc_timestamp()
+
+
+# ARCH-003 replacement boundary.  The original ARCH-001 helpers remain above
+# as readable compatibility history; these definitions are the only exported
+# implementations after module import and add the journal transaction around
+# every successful mutation.
+from runtime_state.journal import JournalWriteError, run_journaled_mutation
+
+
+def _arch003_write(conn, table, profile, key, operation, callback):
+    try:
+        return run_journaled_mutation(conn, table, profile, key, operation, callback)
+    except JournalWriteError as exc:
+        try:
+            schema = _schema_version(conn)
+        except Exception:
+            schema = None
+        return CasResult(False, None, 0, exc.code, schema)
+
+
+def _arch003_insert_inner(conn, table, profile, key, statement, parameters):
+    existing = _existing_result(conn, table, profile, key)
+    if existing is not None:
+        return existing
+    parameters = tuple(_schema_version(conn) if item == "__SCHEMA__" else item for item in parameters)
+    try:
+        conn.execute(statement, parameters)
+    except sqlite3.IntegrityError:
+        return _existing_result(conn, table, profile, key) or _invalid_profile_result(conn)
+    return CasResult(True, None, 0, SUCCESS, _schema_version(conn))
+
+
+def create_session_state(conn, profile_name, session_id, *, user_id, workspace,
+                         target_host=None, deployment_target=None, status="active", now=None):
+    timestamp = now or _timestamp()
+    schema = _schema_version(conn)
+    return _arch003_write(conn, "session_state", profile_name, session_id, "create_session", lambda:
+        _arch003_insert_inner(conn, "session_state", profile_name, session_id,
+            "INSERT INTO session_state (profile_name, session_id, user_id, workspace, target_host, deployment_target, status, schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (profile_name, session_id, user_id or "unknown", workspace or "unknown", target_host,
+             deployment_target, status, schema, timestamp, timestamp)))
+
+
+def create_task_state(conn, profile_name, task_id, session_id, *, status="pending", branch=None,
+                      worktree=None, target_host=None, deployment_target=None, now=None):
+    if not profile_name or not task_id or not session_id:
+        return _invalid_profile_result(conn)
+    def mutate():
+        if not _reference_exists(conn, "session_state", profile_name, session_id):
+            return _invalid_profile_result(conn)
+        timestamp = now or _timestamp()
+        return _arch003_insert_inner(conn, "task_state", profile_name, task_id,
+            "INSERT INTO task_state (profile_name, task_id, session_id, branch, worktree, target_host, deployment_target, status, schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (profile_name, task_id, session_id, branch, worktree, target_host, deployment_target,
+             status, "__SCHEMA__", timestamp, timestamp))
+    return _arch003_write(conn, "task_state", profile_name, task_id, "create_task", mutate)
+
+
+def create_approval_state(conn, profile_name, approval_id, *, session_id=None, task_id=None,
+                          approval_status="pending", breaker_status="closed", now=None):
+    if not profile_name or not approval_id or (not session_id and not task_id):
+        return _invalid_profile_result(conn)
+    def mutate():
+        if session_id and not _reference_exists(conn, "session_state", profile_name, session_id):
+            return _invalid_profile_result(conn)
+        if task_id and not _reference_exists(conn, "task_state", profile_name, task_id):
+            return _invalid_profile_result(conn)
+        if session_id and task_id and conn.execute(
+            "SELECT 1 FROM task_state WHERE profile_name=? AND task_id=? AND session_id=?",
+            (profile_name, task_id, session_id)).fetchone() is None:
+            return _invalid_profile_result(conn)
+        timestamp = now or _timestamp()
+        return _arch003_insert_inner(conn, "approval_state", profile_name, approval_id,
+            "INSERT INTO approval_state (profile_name, approval_id, session_id, task_id, approval_status, breaker_status, schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (profile_name, approval_id, session_id, task_id, approval_status, breaker_status,
+             "__SCHEMA__", timestamp, timestamp))
+    return _arch003_write(conn, "approval_state", profile_name, approval_id, "create_approval", mutate)
+
+
+def create_compression_state(conn, profile_name, session_id, *, task_id=None,
+                             compression_status="idle", now=None):
+    if not profile_name or not session_id:
+        return _invalid_profile_result(conn)
+    def mutate():
+        if not _reference_exists(conn, "session_state", profile_name, session_id):
+            return _invalid_profile_result(conn)
+        if task_id and conn.execute(
+            "SELECT 1 FROM task_state WHERE profile_name=? AND task_id=? AND session_id=?",
+            (profile_name, task_id, session_id)).fetchone() is None:
+            return _invalid_profile_result(conn)
+        timestamp = now or _timestamp()
+        return _arch003_insert_inner(conn, "compression_state", profile_name, session_id,
+            "INSERT INTO compression_state (profile_name, session_id, task_id, compression_status, schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (profile_name, session_id, task_id, compression_status, "__SCHEMA__", timestamp, timestamp))
+    return _arch003_write(conn, "compression_state", profile_name, session_id, "create_compression", mutate)
+
+
+def cas_claim_owner(conn, table, profile_name, business_key_value, new_owner, expected_version, *, now=None):
+    key_col = _table_and_key(table)
+    def mutate():
+        schema = _schema_version(conn)
+        cursor = conn.execute(
+            f"UPDATE {table} SET owner=?, owner_version=owner_version+1, schema_version=?, updated_at=? WHERE profile_name=? AND {key_col}=? AND owner_version=? AND (owner IS NULL OR owner IS ?)",
+            (new_owner, schema, now or _timestamp(), profile_name, business_key_value, expected_version, new_owner))
+        if cursor.rowcount == 1:
+            return CasResult(True, new_owner, expected_version + 1, SUCCESS, schema)
+        return _failure_result(conn, table, profile_name, business_key_value,
+                               expected_version,
+                               attempted_owner=new_owner)
+    return _arch003_write(conn, table, profile_name, business_key_value, "claim_owner", mutate)
+
+
+def cas_update_columns(conn, table, profile_name, business_key_value, owner, expected_version,
+                       columns, *, now=None):
+    if not columns:
+        raise ValueError("columns must be non-empty")
+    key_col = _table_and_key(table)
+    unknown = set(columns) - _ALLOWED_UPDATE_COLUMNS[table]
+    if unknown:
+        raise ValueError(f"columns {sorted(unknown)} are not writable on {table!r}; allowed: {sorted(_ALLOWED_UPDATE_COLUMNS[table])}")
+    def mutate():
+        schema = _schema_version(conn)
+        current_owner, current_version, row_schema = _current_owner_state(conn, table, profile_name, business_key_value)
+        if row_schema is None:
+            return CasResult(False, None, 0, NOT_FOUND, None)
+        if current_owner != owner or current_version != expected_version:
+            return _failure_result(conn, table, profile_name, business_key_value, expected_version, expected_owner=owner)
+        state_column = _STATE_COLUMN[table]
+        if state_column in columns:
+            current_state = conn.execute(
+                f"SELECT {state_column} FROM {table} WHERE profile_name=? AND {key_col}=?",
+                (profile_name, business_key_value)).fetchone()[0]
+            next_state = columns[state_column]
+            if next_state not in STATE_TRANSITIONS[table].get(current_state, set()):
+                return CasResult(False, current_owner, current_version, INVALID_TRANSITION, row_schema)
+            if next_state == current_state and len(columns) == 1:
+                return CasResult(True, current_owner, current_version, SUCCESS, row_schema)
+        ordered = sorted(columns)
+        assignments = ", ".join(f"{column}=?" for column in ordered)
+        values = [columns[column] for column in ordered]
+        values.extend([schema, now or _timestamp(), profile_name, business_key_value, owner, expected_version])
+        cursor = conn.execute(
+            f"UPDATE {table} SET {assignments}, schema_version=?, updated_at=?, owner_version=owner_version+1 WHERE profile_name=? AND {key_col}=? AND owner IS ? AND owner_version=?",
+            values)
+        if cursor.rowcount == 1:
+            return CasResult(True, owner, expected_version + 1, SUCCESS, schema)
+        return _failure_result(conn, table, profile_name, business_key_value, expected_version, expected_owner=owner)
+    return _arch003_write(conn, table, profile_name, business_key_value, "update_columns", mutate)
+
+
+def cas_release_owner(conn, table, profile_name, business_key_value, owner, expected_version, *, now=None):
+    key_col = _table_and_key(table)
+    def mutate():
+        schema = _schema_version(conn)
+        cursor = conn.execute(
+            f"UPDATE {table} SET owner=NULL, owner_version=owner_version+1, schema_version=?, updated_at=? WHERE profile_name=? AND {key_col}=? AND owner IS ? AND owner_version=?",
+            (schema, now or _timestamp(), profile_name, business_key_value, owner, expected_version))
+        if cursor.rowcount == 1:
+            return CasResult(True, None, expected_version + 1, SUCCESS, schema)
+        return _failure_result(conn, table, profile_name, business_key_value, expected_version, expected_owner=owner)
+    return _arch003_write(conn, table, profile_name, business_key_value, "release_owner", mutate)

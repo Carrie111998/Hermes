@@ -19,6 +19,18 @@ STATE_TABLES = (
     "compression_state",
 )
 
+JOURNAL_SCHEMA_VERSION = 1
+JOURNAL_EVENT_VERSION = 1
+DIGEST_PARAMETER_ID = "hmac-sha256:v1:128"
+JOURNAL_EVENT_KINDS = ("mutation", "genesis", "baseline")
+ORIGIN_MARKERS = (
+    "POST_MIGRATION_GENESIS",
+    "NEW_ENTITY_GENESIS",
+    "POST_ROTATION_GENESIS",
+    "GENERATION_REORIGIN_GENESIS",
+    "MANUAL_REORIGIN_GENESIS",
+)
+
 TABLE_BUSINESS_KEY = {
     "session_state": "session_id",
     "task_state": "task_id",
@@ -148,6 +160,70 @@ CREATE INDEX approval_state_schema_version_idx
 CREATE INDEX compression_state_schema_version_idx
     ON compression_state(schema_version);
 """.strip()
+
+MATERIALIZED_COLUMNS_DDL = """
+ALTER TABLE {table} ADD COLUMN materialized_writer_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE {table} ADD COLUMN materialized_write_counter INTEGER NOT NULL DEFAULT 0;
+"""
+
+JOURNAL_DDL = """
+CREATE TABLE runtime_state_journal_migrations (
+    version INTEGER PRIMARY KEY,
+    description TEXT NOT NULL,
+    checksum_sha256 TEXT NOT NULL CHECK (length(checksum_sha256) = 64),
+    applied_at TEXT NOT NULL
+);
+
+CREATE TABLE runtime_state_journal_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    journal_schema_version INTEGER NOT NULL,
+    current_generation INTEGER NOT NULL CHECK (current_generation >= 1),
+    durable_writer_epoch INTEGER NOT NULL CHECK (durable_writer_epoch >= 0),
+    downgrade_unsafe INTEGER NOT NULL CHECK (downgrade_unsafe IN (0, 1)),
+    transition_epoch INTEGER NOT NULL CHECK (transition_epoch >= 0),
+    transition_at TEXT NOT NULL
+);
+
+CREATE TABLE runtime_state_journal (
+    event_id TEXT PRIMARY KEY,
+    event_kind TEXT NOT NULL CHECK (event_kind IN ('mutation', 'genesis', 'baseline')),
+    profile_name TEXT NOT NULL,
+    entity_category TEXT NOT NULL,
+    entity_digest TEXT NOT NULL,
+    digest_parameter_id TEXT NOT NULL,
+    key_check TEXT NOT NULL,
+    origin_marker TEXT NOT NULL,
+    origin_epoch INTEGER NOT NULL,
+    origin_genesis_seq INTEGER NOT NULL,
+    entity_seq INTEGER NOT NULL CHECK (entity_seq >= 1),
+    operation_category TEXT NOT NULL,
+    lifecycle_state_before TEXT,
+    lifecycle_state_after TEXT,
+    owner_version_before INTEGER,
+    owner_version_after INTEGER,
+    state_schema_version INTEGER NOT NULL,
+    journal_event_version INTEGER NOT NULL,
+    writer_generation INTEGER NOT NULL CHECK (writer_generation >= 1),
+    writer_epoch INTEGER NOT NULL CHECK (writer_epoch >= 0),
+    materialized_write_counter_before INTEGER NOT NULL CHECK (materialized_write_counter_before >= 0),
+    materialized_write_counter_after INTEGER NOT NULL CHECK (materialized_write_counter_after >= 0),
+    diagnostic_timestamp TEXT NOT NULL,
+    baseline_sealed_lifecycle_state TEXT,
+    baseline_sealed_owner_version INTEGER,
+    baseline_sealed_state_schema_version INTEGER,
+    sealed_through_seq INTEGER,
+    sealed_materialized_write_counter INTEGER,
+    UNIQUE (profile_name, entity_category, entity_digest, entity_seq)
+);
+
+CREATE INDEX runtime_state_journal_entity_idx
+    ON runtime_state_journal(profile_name, entity_category, entity_digest, entity_seq);
+""".strip()
+
+JOURNAL_MIGRATION_BODY = JOURNAL_DDL
+JOURNAL_MIGRATION_CHECKSUM = sha256(
+    JOURNAL_MIGRATION_BODY.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+).hexdigest()
 
 MIGRATION_1_SEED_SQL = """
 INSERT INTO schema_version
