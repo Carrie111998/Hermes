@@ -1573,6 +1573,13 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _delivery_parts(job: dict, content: str) -> list[str]:
+    """Return the message payloads requested by a cron job's delivery mode."""
+    if job.get("delivery_mode") == "separate_lines":
+        return [line.strip() for line in content.splitlines() if line.strip()]
+    return [content]
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -4578,7 +4585,15 @@ def run_one_job(
                     and not _resolve_delivery_targets(job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_errors = []
+                    for delivery_part in _delivery_parts(job, deliver_content):
+                        part_error = _deliver_result(
+                            job, delivery_part, adapters=adapters, loop=loop
+                        )
+                        if part_error:
+                            delivery_errors.append(part_error)
+                    if delivery_errors:
+                        delivery_error = "\\n".join(delivery_errors)
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)

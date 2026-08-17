@@ -67,6 +67,29 @@ def test_update_job_roundtrips_no_agent_flag(hermes_env):
     assert reloaded["no_agent"] is True
 
 
+def test_no_agent_delivery_mode_round_trips(hermes_env):
+    from cron.jobs import create_job, get_job, update_job
+
+    script_path = hermes_env / "scripts" / "w.sh"
+    script_path.write_text("echo hi\n")
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="w.sh",
+        no_agent=True,
+        deliver="local",
+        delivery_mode="separate_lines",
+    )
+    reloaded = get_job(job["id"])
+    assert reloaded is not None
+    assert reloaded["delivery_mode"] == "separate_lines"
+
+    update_job(job["id"], {"delivery_mode": None})
+    reloaded = get_job(job["id"])
+    assert reloaded is not None
+    assert reloaded["delivery_mode"] is None
+
+
 # ---------------------------------------------------------------------------
 # cronjob tool: API-layer validation
 # ---------------------------------------------------------------------------
@@ -103,6 +126,16 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert error is None
     assert "RAM 92% on host" in final_response
     assert "RAM 92% on host" in doc
+
+
+def test_no_agent_delivery_parts_are_opt_in(hermes_env):
+    from cron.scheduler import _delivery_parts
+
+    content = "first reminder\n\nsecond reminder\n"
+    assert _delivery_parts({}, content) == [content]
+    assert _delivery_parts(
+        {"delivery_mode": "separate_lines"}, content
+    ) == ["first reminder", "second reminder"]
 
 
 # ---------------------------------------------------------------------------

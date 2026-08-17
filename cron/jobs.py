@@ -1493,12 +1493,23 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _normalize_delivery_mode(mode: Optional[str]) -> Optional[str]:
+    if mode in (None, "", "single"):
+        return None
+    if mode != "separate_lines":
+        raise ValueError(
+            "delivery_mode must be 'single' or 'separate_lines'"
+        )
+    return mode
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
     origin: Optional[Dict[str, Any]] = None,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
@@ -1524,7 +1535,9 @@ def create_job(
         name: Optional friendly name
         repeat: How many times to run (None = forever, 1 = once)
         deliver: Where to deliver output ("origin", "local", "telegram", etc.)
-        origin: Source info where job was created (for "origin" delivery)
+        delivery_mode: Optional output mode; ``separate_lines`` sends each
+                       non-empty output line as a separate message.
+        origin: Source info where job was created for "origin" delivery
         skill: Optional legacy single skill name to load before running the prompt
         skills: Optional ordered list of skills to load before running the prompt
         model: Optional per-job model override
@@ -1588,6 +1601,7 @@ def create_job(
     if deliver is None:
         deliver = "origin" if origin else "local"
 
+    delivery_mode = _normalize_delivery_mode(delivery_mode)
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
 
@@ -1711,6 +1725,7 @@ def create_job(
         "last_delivery_error": None,
         # Delivery configuration
         "deliver": deliver,
+        "delivery_mode": delivery_mode,
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
