@@ -356,6 +356,97 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_run_agent_stream_preserves_event_delivery_correlation_metadata(
+    monkeypatch, tmp_path
+):
+    """Streaming sends and edits must retain the inbound Telegram correlation."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = MetadataEditProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-progress-correlation",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="event-1",
+        event_metadata={
+            "telegram_delivery_correlation_id": "a1b2c3d4e5f60708",
+        },
+    )
+
+    expected_metadata = {
+        "thread_id": "17585",
+        "telegram_delivery_correlation_id": "a1b2c3d4e5f60708",
+    }
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["metadata"] == expected_metadata
+    assert adapter.edits
+    assert all(call["metadata"] == expected_metadata for call in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_proxy_receives_event_delivery_metadata(monkeypatch):
+    """Proxy delegation must not drop event-scoped delivery metadata."""
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    captured = {}
+
+    async def fake_run_agent_via_proxy(**kwargs):
+        captured.update(kwargs)
+        return {"final_response": "proxy done"}
+
+    monkeypatch.setattr(runner, "_get_proxy_url", lambda: "http://proxy")
+    monkeypatch.setattr(runner, "_run_agent_via_proxy", fake_run_agent_via_proxy)
+
+    result = await runner._run_agent_inner(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="17585",
+        ),
+        session_id="sess-proxy-correlation",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="event-1",
+        event_metadata={
+            "telegram_delivery_correlation_id": "a1b2c3d4e5f60708",
+        },
+    )
+
+    assert result["final_response"] == "proxy done"
+    assert captured["event_metadata"] == {
+        "telegram_delivery_correlation_id": "a1b2c3d4e5f60708",
+    }
+
+
+@pytest.mark.asyncio
 async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(monkeypatch, tmp_path):
     """Telegram DM progress must not reuse event message id as thread metadata."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
