@@ -1,6 +1,7 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+import importlib
 from unittest.mock import ANY, call, patch
 
 
@@ -648,9 +649,27 @@ class TestConfigGatedToolsetContract:
             )
 
     def test_config_gated_tools_all_carry_check_fn(self):
-        # model_tools import registers every tool module, so registry
+        # model_tools import registers every core tool module, so registry
         # lookups below are live entries, not stubs.
         from tools.registry import registry
+
+        class _PluginCtx:
+            """Shim the bundled-plugin loader (see tests/plugins/test_a2a_plugin.py)."""
+
+            def register_tool(self, name, toolset, schema, handler, **kw):
+                registry.register(
+                    name=name, toolset=toolset, schema=schema,
+                    handler=handler, override=True, **kw,
+                )
+
+        for ts in _CONFIG_GATED_TOOLSETS:
+            tools = resolve_toolset(ts)
+            if any(registry.get_entry(t) is None for t in tools):
+                # Plugin-hosted toolset (currently: spotify): its tools
+                # register through the bundled-plugin loader, which the test
+                # env does not run. Load the plugin the way the loader does.
+                plugin_mod = importlib.import_module(f"plugins.{ts}")
+                plugin_mod.register(_PluginCtx())
 
         for ts in _CONFIG_GATED_TOOLSETS:
             for tool in resolve_toolset(ts):
