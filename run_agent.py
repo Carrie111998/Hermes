@@ -4245,6 +4245,14 @@ class AIAgent:
         Set ``HERMES_DUMP_REQUEST_FULL_BODY=1`` to retain full message content.
         That path is still routed through ``redact_object`` -- there is no
         configuration that writes an unredacted body to disk.
+
+        WARNING -- the escape hatch is debugging-only, and weaker than the
+        default. ``redact_object`` recognises known credential shapes and
+        sensitive key names; a high-entropy credential in no vendor format,
+        carried as ordinary conversation text under a key like ``content``,
+        matches neither and SURVIVES. The projected default contains it only
+        because it drops the content entirely. Do not leave the flag on.
+        Pinned by ``test_full_body_opt_in_does_NOT_contain_opaque_credentials``.
         """
         projected: Dict[str, Any] = {}
 

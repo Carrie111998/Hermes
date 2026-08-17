@@ -108,6 +108,40 @@ class TestFileSink:
         # ...but the recognisable credential is not.
         assert CANARY_PREFIXED not in raw
 
+    def test_full_body_opt_in_does_NOT_contain_opaque_credentials(
+        self, monkeypatch, tmp_path
+    ):
+        """Measured limitation of the escape hatch -- asserted, not assumed.
+
+        Under HERMES_DUMP_REQUEST_FULL_BODY the conversation text is written
+        back. Value-based matching only recognises known shapes, and a
+        high-entropy credential in no vendor format, sitting under an
+        innocuous key like "content", matches nothing. It survives.
+
+        This is why the flag is debugging-only and must not be left enabled:
+        the default projected path contains it (by dropping content entirely),
+        the full-body path does not. If a future matcher closes this gap, this
+        test will fail and should be updated deliberately.
+        """
+        monkeypatch.setenv("HERMES_DUMP_REQUEST_FULL_BODY", "1")
+        agent = _agent(monkeypatch, tmp_path)
+        dump_file = agent._dump_api_request_debug(
+            _kwargs_with_secret_in_conversation(), reason="preflight"
+        )
+        assert CANARY_OPAQUE in dump_file.read_text()
+
+    def test_default_projected_path_DOES_contain_opaque_credentials(
+        self, monkeypatch, tmp_path
+    ):
+        """The counterpart: the default path contains what redaction cannot,
+        because it drops conversation content rather than trying to match it.
+        This is the reason projection is the default and not merely a nicety."""
+        agent = _agent(monkeypatch, tmp_path)
+        dump_file = agent._dump_api_request_debug(
+            _kwargs_with_secret_in_conversation(), reason="preflight"
+        )
+        assert CANARY_OPAQUE not in dump_file.read_text()
+
 
 class TestErrorSinks:
     """The two sinks that carry PROVIDER-side text: error.body (:4286 pre-fix)
