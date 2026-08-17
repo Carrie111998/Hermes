@@ -157,6 +157,16 @@ describe('steer', () => {
     expect(runner.submitted).toEqual([])
     expect(session.outputs[0][1]).toMatch(/No Hermes task is running/)
   })
+
+  it('keeps the original task when steer submit fails', async () => {
+    const { ctrl, runner, session } = make()
+    await consult(ctrl, 'c1', 'original')
+    runner.accept = false
+    await ctrl.onFunctionCall(STEER_TOOL_NAME, 's1', { instruction: 'nope' })
+    expect(ctrl.currentTask).toBe('original')
+    expect(session.outputs.at(-1)?.[1]).toMatch(/Steering failed/)
+    expect(ctrl.onTurnComplete('original', 'done')).toBe(true)
+  })
 })
 
 describe('turn complete', () => {

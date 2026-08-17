@@ -226,10 +226,12 @@ export class RealtimeVoiceClient {
         socket.onerror = () => fail('realtime socket error')
 
         socket.onclose = ev => {
+          if (this.closed) {return}
           fail(ev.reason || 'realtime socket closed during connect')
         }
       })
     } catch (error) {
+      this.closed = true
       this.teardownAudio()
 
       try {

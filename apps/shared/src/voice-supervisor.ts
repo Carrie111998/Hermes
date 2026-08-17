@@ -210,6 +210,7 @@ export class VoiceSupervisorController {
     }
 
     this.onEvent?.('steer', instruction)
+    const prevTask = this.consult.task
     this.consult = { callId: this.consult.callId, task: instruction, at: Date.now() }
 
     try {
@@ -217,7 +218,7 @@ export class VoiceSupervisorController {
         await this.runner.interrupt()
       }
     } catch {
-      // interrupt is best-effort; still try to queue the new instruction
+      // still submit — interrupt is best-effort
     }
 
     let accepted = false
@@ -229,6 +230,9 @@ export class VoiceSupervisorController {
     }
 
     if (!accepted) {
+      if (this.consult) {
+        this.consult = { ...this.consult, task: prevTask }
+      }
       this.session.sendFunctionOutput(
         callId,
         'Steering failed — Hermes could not queue the new instruction.'

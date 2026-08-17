@@ -105,7 +105,7 @@ class VoiceSupervisorController:
         if consult is None:
             return
         session = self._session
-        if session is None or not getattr(session, "alive", False):
+        if session is None or getattr(session, "alive", True) is False:
             return
         try:
             session.send_function_output(consult["call_id"], reason)
@@ -176,6 +176,7 @@ class VoiceSupervisorController:
             )
             return
         self._emit("steer", instruction)
+        prev_task = self._consult["task"]
         self._consult["task"] = instruction
         self._consult["at"] = time.monotonic()
         try:
@@ -189,6 +190,8 @@ class VoiceSupervisorController:
             logger.debug("voice steer submit failed", exc_info=True)
             accepted = False
         if not accepted:
+            if self._consult is not None:
+                self._consult["task"] = prev_task
             self._session.send_function_output(
                 call_id, "Steering failed — Hermes could not queue the new instruction."
             )
@@ -228,7 +231,7 @@ class VoiceSupervisorController:
             return False
         self._consult = None
         session = self._session
-        if session is None or not getattr(session, "alive", False):
+        if session is None or getattr(session, "alive", True) is False:
             return False
         output = (response or "").strip() or "Hermes finished with no text output."
         if len(output) > MAX_CONSULT_OUTPUT_CHARS:
@@ -245,7 +248,7 @@ class VoiceSupervisorController:
             not function_name
             or self._consult is None
             or not self._narrate
-            or not getattr(self._session, "alive", False)
+            or getattr(self._session, "alive", True) is False
         ):
             return
         now = time.monotonic()

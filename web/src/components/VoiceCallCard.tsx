@@ -44,7 +44,6 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
 
   const stop = useCallback(() => {
     controllerRef.current?.failActiveConsult("Voice session ended.");
-    controllerRef.current?.reset();
     controllerRef.current = null;
     clientRef.current?.close();
     clientRef.current = null;
@@ -108,8 +107,6 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
       });
       controllerRef.current = controller;
 
-      // Consult turns complete via the terminal message.complete event on
-      // this card's own sidecar/session.
       gw.on("message.complete", (ev) => {
         if (ev.session_id !== sessionIdRef.current) {
           return;
@@ -153,6 +150,9 @@ export function VoiceCallCard({ profile }: { profile?: string | null }) {
           }
         },
       });
+      if (clientRef.current !== client) {
+        return;
+      }
       setStatus("listening");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

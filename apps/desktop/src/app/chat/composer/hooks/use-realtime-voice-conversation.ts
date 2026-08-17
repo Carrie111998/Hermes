@@ -88,7 +88,6 @@ export function useRealtimeVoiceConversation({
   const teardown = useCallback(() => {
     generationRef.current += 1
     controllerRef.current?.failActiveConsult('Voice session ended.')
-    controllerRef.current?.reset()
     controllerRef.current = null
     clientRef.current?.close()
     clientRef.current = null

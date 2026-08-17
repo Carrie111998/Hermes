@@ -165,6 +165,17 @@ class TestSteer:
         assert runner.interrupts == 0
         assert runner.submitted == ["original", "more"]
 
+    def test_failed_steer_keeps_original_task(self):
+        ctrl, session, runner, _ = _make()
+        _consult(ctrl, "c1", "original")
+        runner.accept = False
+        ctrl.on_function_call(
+            "steer_hermes", "s1", json.dumps({"instruction": "nope"})
+        )
+        assert ctrl._consult["task"] == "original"
+        assert "Steering failed" in session.outputs[-1][1]
+        assert ctrl.on_turn_complete("original", "done") is True
+
 
 class TestTurnComplete:
     def test_matching_turn_returns_result_and_clears(self):
