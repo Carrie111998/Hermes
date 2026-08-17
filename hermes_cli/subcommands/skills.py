@@ -39,8 +39,16 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
             "clawhub",
             "lobehub",
             "browse-sh",
+            # Provider filters (GitHub taps stored under source="github"):
+            "nvidia",
+            "openai",
+            "anthropic",
+            "huggingface",
+            "voltagent",
+            "gstack",
+            "minimax",
         ],
-        help="Filter by source (default: all)",
+        help="Filter by source or provider (e.g. nvidia, openai) (default: all)",
     )
 
     skills_search = skills_subparsers.add_parser(
@@ -59,9 +67,18 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
             "clawhub",
             "lobehub",
             "browse-sh",
+            # Provider filters (GitHub taps stored under source="github"):
+            "nvidia",
+            "openai",
+            "anthropic",
+            "huggingface",
+            "voltagent",
+            "gstack",
+            "minimax",
         ],
+        help="Filter by source or provider (e.g. nvidia, openai)",
     )
-    skills_search.add_argument("--limit", type=int, default=10, help="Max results")
+    skills_search.add_argument("--limit", type=int, default=25, help="Max results")
     skills_search.add_argument(
         "--json",
         action="store_true",
@@ -121,6 +138,11 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         "name",
         nargs="?",
         help="Specific skill to update (default: all outdated skills)",
+    )
+    skills_update.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite skills you have edited locally (they are skipped by default)",
     )
 
     skills_audit = skills_subparsers.add_parser(
@@ -295,4 +317,5 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         "config",
         help="Interactive skill configuration — enable/disable individual skills",
     )
+
     skills_parser.set_defaults(func=cmd_skills)
