@@ -1,20 +1,3 @@
-- source_id: fixture-directory
-  version: '1'
-  display_name: Verified buyer directory fixture
-  publisher: Interfaze test fixtures
-  jurisdiction: [global]
-  categories: [registry, opportunity]
-  homepage: null
-  access_tier: public
-  entity_levels: [named_company, opportunity]
-  capabilities: [organizations, company_signals, buying_requests]
-  countries: []
-  sector_ids: []
-  freshness_days: 30
-  adapter_mode: fixture
-  default_enabled: true
-  health: active
-  last_verified_at: '2026-07-14'
 - source_id: un-comtrade
   version: '1'
   display_name: UN Comtrade

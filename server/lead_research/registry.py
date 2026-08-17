@@ -1,13 +1,10 @@
 """Declarative provider catalog and tenant lifecycle state."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import yaml
 
 from .models import DatasetDefinition
 from .providers.base import CatalogProvider, Provider
-from .providers.fixture import FixtureProvider
 from .sectors import REFERENCE_DIR
 
 
@@ -15,14 +12,15 @@ CATALOG_PATH = REFERENCE_DIR / "provider-catalog.yaml"
 
 
 class ProviderRegistry:
-    def __init__(self, definitions: list[DatasetDefinition]):
+    def __init__(self, definitions: list[DatasetDefinition], providers: dict[str, Provider] | None = None):
         self.definitions = {item.source_id: item for item in definitions}
         if len(self.definitions) != len(definitions):
             raise ValueError("provider source ids must be unique")
-        self.providers: dict[str, Provider] = {}
-        for definition in definitions:
-            provider = FixtureProvider(definition) if definition.adapter_mode == "fixture" else CatalogProvider(definition)
-            self.providers[definition.source_id] = provider
+        supplied = providers or {}
+        self.providers = {
+            source_id: supplied.get(source_id, CatalogProvider(definition))
+            for source_id, definition in self.definitions.items()
+        }
 
     def get(self, source_id: str) -> Provider:
         try:
@@ -49,6 +47,6 @@ class ProviderRegistry:
             )
 
 
-def build_registry(path: Path = CATALOG_PATH) -> ProviderRegistry:
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
-    return ProviderRegistry([DatasetDefinition.model_validate(item) for item in raw])
+def build_registry(providers: dict[str, Provider] | None = None) -> ProviderRegistry:
+    raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8")) or []
+    return ProviderRegistry([DatasetDefinition.model_validate(item) for item in raw], providers)

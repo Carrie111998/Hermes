@@ -13,8 +13,8 @@ Status as of 2026-07-16.
 - Evidence-first Research workspace with tenant campaign drafts, source catalog,
   immutable local snapshots, canonical claims, separate fit/confidence scoring,
   ordered funnel metrics, evidence inspection, CSV export, and source lifecycle
-  impact/purge handling. The offline fixture provider qualifies the full path;
-  public/credentialed source entries remain access-gated until adapters are configured.
+  impact/purge handling. Production source entries remain access-gated until
+  adapters are configured; deterministic provider fakes qualify the test path.
 - Campaigns, custom outreach, revision-bound approvals, deterministic QA,
   draft/send modes, market CC rules, send limits/windows, and delivery
   idempotency.

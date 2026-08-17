@@ -8,9 +8,16 @@ from server.lead_research.models import (
     Claim, LeadCandidate, MarketSignal, ScoringProfile,
 )
 from server.lead_research.scoring import score_lead
+from server.lead_research.registry import build_registry
 from server.lead_research.sectors import (
     SECTOR_CSV, SECTOR_MD, load_sectors, render_sector_csv, render_sector_markdown,
 )
+
+
+def test_production_catalog_has_no_fixture_adapter():
+    registry = build_registry()
+    assert all(item.adapter_mode != "fixture" for item in registry.list())
+    assert "fixture-directory" not in {item.source_id for item in registry.list()}
 
 
 def test_generated_sector_artifacts_are_current():

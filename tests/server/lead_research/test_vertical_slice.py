@@ -1,4 +1,16 @@
 from tests.server.test_api_mvp import make_client
+from server.lead_research.registry import ProviderRegistry
+from server.lead_research.service import LeadResearchService
+from tests.server.lead_research.fakes import deterministic_provider, fixture_definition
+
+
+def make_research_client():
+    app, client, headers, company_id = make_client()
+    definition = fixture_definition()
+    provider = deterministic_provider(definition)
+    registry = ProviderRegistry([definition], {definition.source_id: provider})
+    app.state.lead_research = LeadResearchService(app.state.db, registry=registry)
+    return app, client, headers, company_id
 
 
 def campaign_body(name="DACH appliance distributors"):
@@ -13,7 +25,7 @@ def campaign_body(name="DACH appliance distributors"):
 
 
 def test_research_campaign_vertical_slice_and_tenant_scope():
-    _, client, headers, _ = make_client()
+    _, client, headers, _ = make_research_client()
     created = client.post("/api/v1/research-campaigns", headers=headers, json=campaign_body())
     assert created.status_code == 201, created.text
     campaign = created.json()
@@ -60,7 +72,7 @@ def test_research_campaign_vertical_slice_and_tenant_scope():
 
 
 def test_source_lifecycle_copy_matches_behavior_and_purge_needs_exact_name():
-    _, client, headers, _ = make_client()
+    _, client, headers, _ = make_research_client()
     catalog = client.get("/api/v1/data-sources/catalog", headers=headers).json()
     fixture = next(item for item in catalog if item["source_id"] == "fixture-directory")
     disabled = client.post(
@@ -94,7 +106,7 @@ def test_source_lifecycle_copy_matches_behavior_and_purge_needs_exact_name():
 
 
 def test_completed_campaign_can_refresh_without_duplicate_runtime_state():
-    _, client, headers, _ = make_client()
+    _, client, headers, _ = make_research_client()
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=campaign_body()).json()
     first = client.post(f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers)
     second = client.post(f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers)

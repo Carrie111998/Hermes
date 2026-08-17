@@ -1,11 +1,11 @@
-"""Deterministic offline provider used for contract and end-to-end tests."""
+"""Deterministic lead-research providers for server contract tests."""
 from __future__ import annotations
 
 import hashlib
 import json
 from datetime import datetime, timezone
 
-from ..models import (
+from server.lead_research.models import (
     DatasetDefinition,
     DiscoveryEstimate,
     DiscoveryQuery,
@@ -17,7 +17,23 @@ from ..models import (
 )
 
 
-class FixtureProvider:
+def fixture_definition() -> DatasetDefinition:
+    return DatasetDefinition(
+        source_id="fixture-directory",
+        display_name="Verified buyer directory fixture",
+        publisher="Interfaze test fixtures",
+        jurisdiction=["global"],
+        categories=["registry", "opportunity"],
+        access_tier="public",
+        entity_levels=["named_company", "opportunity"],
+        capabilities=["organizations", "company_signals", "buying_requests"],
+        freshness_days=30,
+        adapter_mode="fixture",
+        default_enabled=True,
+    )
+
+
+class DeterministicProvider:
     def __init__(self, definition: DatasetDefinition):
         self.definition = definition
 
@@ -25,7 +41,7 @@ class FixtureProvider:
         countries = max(1, len(query.target_countries))
         return DiscoveryEstimate(
             kind="reported", low=2 * countries, high=3 * countries,
-            basis="Deterministic named-company fixture records", confidence="high",
+            basis="Deterministic named-company test records", confidence="high",
         )
 
     def fetch_page(self, query: DiscoveryQuery, cursor: str | None) -> RawPage:
@@ -80,4 +96,8 @@ class FixtureProvider:
         return page.next_cursor
 
     def health(self) -> ProviderHealth:
-        return ProviderHealth(status="active", message="Offline deterministic contract fixture")
+        return ProviderHealth(status="active", message="Offline deterministic contract fake")
+
+
+def deterministic_provider(definition: DatasetDefinition) -> DeterministicProvider:
+    return DeterministicProvider(definition)
