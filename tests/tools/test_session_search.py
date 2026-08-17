@@ -207,6 +207,37 @@ class TestGatewayOwnershipScope:
             "owned-history"
         }
 
+    def test_browse_does_not_project_to_foreign_compression_child(self, db):
+        db.create_session(
+            "owned-compression-root",
+            source="telegram",
+            session_key="telegram:dm:owner",
+        )
+        db.append_message(
+            "owned-compression-root", role="user", content="owned root preview"
+        )
+        db.end_session("owned-compression-root", "compression")
+        db.create_session(
+            "foreign-compression-child",
+            source="telegram",
+            session_key="telegram:dm:other",
+            parent_session_id="owned-compression-root",
+        )
+        db.append_message(
+            "foreign-compression-child",
+            role="user",
+            content="foreign projected preview",
+        )
+
+        result = json.loads(
+            session_search(db=db, caller_session_key="telegram:dm:owner")
+        )
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "owned-compression-root"
+        ]
+        assert "foreign projected preview" not in json.dumps(result)
+
     def test_discovery_only_returns_hits_in_the_callers_gateway_scope(self, db):
         self._seed(db)
 
@@ -285,6 +316,34 @@ class TestGatewayOwnershipScope:
         assert [row["session_id"] for row in result["results"]] == [
             "owned-title"
         ]
+
+    def test_title_match_does_not_hydrate_foreign_lineage_parent(self, db):
+        db.create_session(
+            "foreign-parent", source="telegram", session_key="telegram:dm:other"
+        )
+        db.set_session_title("foreign-parent", "Foreign Parent Secret")
+        db.create_session(
+            "owned-child",
+            source="telegram",
+            session_key="telegram:dm:owner",
+            parent_session_id="foreign-parent",
+        )
+        db.set_session_title("owned-child", "Owned Child Plan")
+        db.append_message("owned-child", role="user", content="owned child content")
+
+        result = json.loads(
+            session_search(
+                query="Owned Child Plan",
+                detail="full",
+                db=db,
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert [row["session_id"] for row in result["results"]] == ["owned-child"]
+        assert result["results"][0]["title"] == "Owned Child Plan"
+        assert "Foreign Parent Secret" not in json.dumps(result)
+        assert "parent_session_id" not in result["results"][0]
 
     @pytest.mark.parametrize("shape", ["read", "scroll"])
     def test_direct_lookup_rejects_another_gateway_scope(self, db, shape):

@@ -405,6 +405,18 @@ def _session_in_scope(db, session_id: str, caller_session_key: str = None) -> bo
     return bool(row.get("session_key")) and row.get("session_key") == caller_session_key
 
 
+def _scoped_lineage_root(
+    db, session_id: str, caller_session_key: str = None
+) -> str:
+    """Resolve lineage without crossing a gateway ownership boundary."""
+    root = _resolve_lineage(db, session_id)
+    if caller_session_key and not _session_in_scope(
+        db, root, caller_session_key
+    ):
+        return session_id
+    return root
+
+
 def _locate_session_db(session_id: str):
     """Scan every profile's ``state.db`` (read-only) for a session id.
 
@@ -526,10 +538,16 @@ def _list_recent_sessions(
             _resolve_to_parent(db, current_session_id)
             if current_session_id else (None, False)
         )
+        if current_root and caller_session_key and not _session_in_scope(
+            db, current_root, caller_session_key
+        ):
+            current_root = current_session_id
 
         results = []
         for s in sessions:
             sid = s.get("id", "")
+            if not _session_in_scope(db, sid, caller_session_key):
+                continue
             if sid == current_session_id:
                 continue
             # Compression continuation: the root's original turns were
@@ -736,7 +754,9 @@ def _title_match_result(
     if not _session_in_scope(db, session_id, caller_session_key):
         return None
 
-    lineage_root = _resolve_lineage(db, session_id)
+    lineage_root = _scoped_lineage_root(
+        db, session_id, caller_session_key
+    )
     if current_lineage_root and lineage_root == current_lineage_root:
         # Same-lineage title hits are in-context only when the session is
         # still live. /new-reset and compression-ended parents are not.
@@ -802,7 +822,10 @@ def _discover(
 ) -> str:
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     role_list = role_filter if role_filter else ["user", "assistant"]
-    current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
+    current_lineage_root = (
+        _scoped_lineage_root(db, current_session_id, caller_session_key)
+        if current_session_id else None
+    )
     title_result = _title_match_result(
         db, query, current_lineage_root, caller_session_key
     )
@@ -862,6 +885,10 @@ def _discover(
             break
         raw_sid = r["session_id"]
         resolved_sid, _ = _resolve_to_parent(db, raw_sid)
+        if caller_session_key and not _session_in_scope(
+            db, resolved_sid, caller_session_key
+        ):
+            resolved_sid = raw_sid
         # Skip the current session lineage — UNLESS the hit's transcript has
         # left live context. Three sub-cases:
         #
@@ -909,8 +936,13 @@ def _discover(
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
 
+        metadata_sid = (
+            lineage_root
+            if _session_in_scope(db, lineage_root, caller_session_key)
+            else hit_sid
+        )
         try:
-            session_meta = db.get_session(lineage_root) or {}
+            session_meta = db.get_session(metadata_sid) or {}
         except Exception:
             session_meta = {}
 

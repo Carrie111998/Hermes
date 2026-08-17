@@ -8481,7 +8481,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(
+        self, session_id: str, session_key: str = None
+    ) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child of a session whose
@@ -8504,6 +8506,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         current = session_id
         seen = {current} if current else set()
+        scope_clause = "AND child.session_key = ?" if session_key else ""
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
@@ -8518,6 +8521,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {scope_clause}
                     ORDER BY
                       CASE
                         WHEN child.end_reason = 'compression' THEN 0
@@ -8529,7 +8533,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       child.id DESC
                     LIMIT 1
                     """,
-                    (current,),
+                    (current, session_key) if session_key else (current,),
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -8791,6 +8795,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
                 )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
+            chain_scope_sql = "AND child.session_key = ?" if session_key else ""
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
                     SELECT s.id, s.id FROM sessions s {where_sql}
@@ -8803,6 +8808,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {chain_scope_sql}
                 ),
                 chain_max AS (
                     SELECT
@@ -8828,9 +8834,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
                 LIMIT ? OFFSET ?
             """
-            # WHERE params apply twice (CTE seed + outer select); the id filter
+            # WHERE params apply twice (CTE seed + outer select); the lineage
+            # scope sits between them in the recursive term, and the id filter
             # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            params = (
+                params
+                + ([session_key] if session_key else [])
+                + params
+                + id_params
+                + [limit, offset]
+            )
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
@@ -8917,7 +8930,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             for s in sessions:
                 if s.get("end_reason") != "compression":
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_compression_tip(
+                    s["id"], session_key=session_key
+                )
                 if tip_id != s["id"]:
                     tip_ids_by_root[s["id"]] = tip_id
 
