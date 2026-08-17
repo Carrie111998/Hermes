@@ -86,22 +86,36 @@ Demo checklist:
 Live-provider consent stays outside automated CI. The automated suite must
 never call Google or Microsoft.
 
-## Seed the tenant-backed test client
+## Provision a clean demo account
 
-For local product testing, seed the deterministic Silverine client into the
-configured local database. The command replaces only the `company_silverline`
-tenant and leaves every other company untouched:
+For local product testing, provision a customer account with a completed setup
+profile but no products, selected markets, leads, contacts, research, campaigns,
+or other operational tenant data. The command is idempotent and refuses to
+replace a tenant once operational data exists.
+
+Store the account password in an owner-readable file and restrict it before
+running the command:
 
 ```bash
-python -m server seed-demo \
-  --email client@silverline.test \
-  --password silverline-test-123
+chmod 600 /secure/path/demo-password.txt
+python -m server provision-demo \
+  --email demo-user@example.com \
+  --password-file /secure/path/demo-password.txt \
+  --profile /secure/path/demo-profile.json
 ```
 
-Then sign in at `/` with those credentials. The profile contains 7 products,
-5 historical document records, 25 leads, 14 contacts, 2 campaigns, 10 outreach
-messages, and 16 completed agent runs. Historical document records cannot be
-reprocessed until their source files are uploaded again.
+The profile file is a JSON object containing the public company profile and
+the public sources used during onboarding:
+
+```json
+{
+  "company_profile": {"name": "Example Company", "website": "https://example.invalid"},
+  "onboarding_sources": [{"url": "https://example.invalid", "retrieved_at": 1.0}]
+}
+```
+
+The command output contains account identifiers and onboarding status only; it
+never includes the password.
 
 ## Production / Supabase
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import stat
 import time
 from pathlib import Path
 
@@ -10,9 +11,9 @@ from .agent_service import AgentRunService, HermesProcessExecutor, StubRunExecut
 from .api_cli import main as api_main
 from .config import Settings
 from .db import json_dump, new_id, now
-from .demo_seed import seed_silverline
 from .markets import no_research_markets
 from .postgres import create_database
+from .provisioning import provision_demo_account
 from .run_types import REGISTRY
 
 
@@ -47,6 +48,29 @@ def _print(run: dict) -> None:
     print(json.dumps(run, ensure_ascii=False, indent=2))
 
 
+def _read_password_file(path: Path) -> str:
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("password file must be a regular file")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise ValueError("password file permissions must restrict access to its owner")
+    password = path.read_text(encoding="utf-8").rstrip("\r\n")
+    if not password:
+        raise ValueError("password file is empty")
+    return password
+
+
+def _load_provisioning_profile(path: Path) -> tuple[dict, list[dict]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("profile must be a JSON object")
+    company_profile = data.get("company_profile")
+    onboarding_sources = data.get("onboarding_sources")
+    if not isinstance(company_profile, dict) or not isinstance(onboarding_sources, list):
+        raise ValueError("profile must contain company_profile and onboarding_sources")
+    return company_profile, onboarding_sources
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="python -m server")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -69,9 +93,10 @@ def main(argv=None) -> None:
         if name != "list":
             command.add_argument("run_id")
     sub.add_parser("types")
-    seed = sub.add_parser("seed-demo", help="Create/reset the tenant-backed Silverine test client")
-    seed.add_argument("--email", default="client@silverline.test")
-    seed.add_argument("--password", default="silverline-test-123")
+    provision = sub.add_parser("provision-demo", help="Provision a clean, completed demo account")
+    provision.add_argument("--email", required=True)
+    provision.add_argument("--password-file", type=Path, required=True)
+    provision.add_argument("--profile", type=Path, required=True)
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -85,13 +110,20 @@ def main(argv=None) -> None:
             print(f"{run_type:26} -> {skill or '(deterministic aggregation)'}")
         return
 
-    if args.command == "seed-demo":
+    if args.command == "provision-demo":
         settings = Settings.load()
         if settings.auth_mode != "local":
-            raise SystemExit("seed-demo is intentionally limited to auth_mode: local")
+            raise SystemExit("provision-demo is intentionally limited to auth_mode: local")
         db = create_database(settings)
         try:
-            _print(seed_silverline(db, email=args.email, password=args.password))
+            company_profile, onboarding_sources = _load_provisioning_profile(args.profile)
+            _print(provision_demo_account(
+                db,
+                email=args.email,
+                password=_read_password_file(args.password_file),
+                company_profile=company_profile,
+                onboarding_sources=onboarding_sources,
+            ))
         finally:
             close = getattr(db, "close", None)
             if close:

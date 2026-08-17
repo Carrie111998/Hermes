@@ -52,7 +52,7 @@ Status as of 2026-07-16.
 - `tests/server/test_run_harness.py`: 7 production run-service checks.
 - `tests/server/test_webui.py`: 16 serving, security, connection, core-flow,
   chat-isolation, and long-tail checks.
-- `tests/server/test_demo_seed.py`: 2 tenant seed and local draft-flow checks.
+- `tests/server/test_provisioning.py`: clean demo-account provisioning checks.
 - `tests/server/lead_research/` and `tests/server/test_research_webui.py`: 10
   evidence-contract, tenant-isolation, refresh, source-removal, API, and WebUI checks.
 - Full `tests/server` qualification: 40 passed.
