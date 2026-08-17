@@ -7,7 +7,7 @@ Also tests the vision_tools and browser_tool model override env vars.
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, AsyncMock
 
 import pytest
 

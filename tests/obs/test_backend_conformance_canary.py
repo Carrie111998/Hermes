@@ -1,6 +1,4 @@
-import json
 from types import SimpleNamespace
-import pytest
 
 
 # ---- Fake stream plumbing (mimics openai responses.stream context manager) ----

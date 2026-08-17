@@ -14,9 +14,7 @@ concurrently, barrier calls sequentially — while preserving:
 import json
 import sys
 import threading
-import time
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -430,7 +428,6 @@ class TestPathCanonicalization:
     def test_symlink_aliases_are_not_parallelized(self, tmp_path):
         """A symlink alias and the real path must be detected as overlapping
         so they are never placed in the same parallel segment."""
-        import os
         from agent.tool_dispatch_helpers import (
             _canonical_path,
             _paths_overlap,
@@ -486,7 +483,6 @@ class TestPathCanonicalization:
     def test_symlink_alias_nonexistent_write_target_overlap(self, tmp_path):
         """Symlink parent + not-yet-created leaf file must still be detected
         as overlapping — write_file targets may not exist at planning time."""
-        import os
         from agent.tool_dispatch_helpers import _canonical_path, _paths_overlap
 
         real_dir = tmp_path / "real"

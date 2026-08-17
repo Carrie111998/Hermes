@@ -4,7 +4,6 @@ import pytest
 
 from intent_applier.jobops_client import (
     JobOpsClient,
-    JobOpsClientError,
     JobOpsClientPermanentError,
     JobOpsClientTransientError,
 )

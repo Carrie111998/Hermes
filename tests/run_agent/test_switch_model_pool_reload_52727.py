@@ -18,7 +18,6 @@ making it impossible for a legitimate same-call switch to trip the guard.
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from agent.agent_runtime_helpers import switch_model
 

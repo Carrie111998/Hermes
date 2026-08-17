@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from gateway.config import GatewayConfig, Platform, SessionResetPolicy
 from gateway.session import SessionEntry, SessionSource, SessionStore

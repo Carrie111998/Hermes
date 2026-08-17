@@ -1,6 +1,5 @@
 """Tests for CriticSubscriber — wakes Critic on AGENT_FAILURE_CLUSTER."""
 
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest

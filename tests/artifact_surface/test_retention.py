@@ -1,7 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from artifact_surface import retention
 

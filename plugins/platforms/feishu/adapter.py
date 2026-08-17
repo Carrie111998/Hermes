@@ -5569,7 +5569,6 @@ def interactive_setup() -> None:
         print_info,
         print_success,
         print_warning,
-        print_error,
     )
 
     print_header("Feishu / Lark")

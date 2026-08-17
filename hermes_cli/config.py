@@ -762,7 +762,9 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
+# get_process_hermes_home is unused in this module but re-exported:
+# hermes_cli/web_server.py does `from hermes_cli.config import get_process_hermes_home`.
+from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402,F401
 from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
@@ -9405,7 +9407,6 @@ def _inject_platform_plugin_env_vars() -> None:
         return
     _platform_plugin_env_vars_injected = True
     try:
-        import yaml  # type: ignore
 
         # Resolve the bundled plugins dir from this file's location so the
         # injector works regardless of CWD.

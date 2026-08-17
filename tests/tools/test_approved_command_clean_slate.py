@@ -29,7 +29,6 @@ from tools.environments.local import _quote_bash_path
 from tools.interrupt import (
     set_interrupt,
     is_interrupted,
-    clear_current_thread_interrupt,
     _interrupted_threads,
     _lock,
 )

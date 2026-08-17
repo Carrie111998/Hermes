@@ -8,7 +8,6 @@ import json
 import os
 from unittest.mock import patch
 
-import pytest
 
 import tools.web_tools as wt
 

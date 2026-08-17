@@ -4,7 +4,6 @@ import copy
 import pytest
 
 from plugins.memory.mem0._backend import (
-    Mem0Backend,
     PlatformBackend,
     OSSBackend,
     SelfHostedBackend,

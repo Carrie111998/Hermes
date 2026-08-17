@@ -9952,7 +9952,7 @@ _oauth_sessions_lock = threading.Lock()
 try:
     from agent.anthropic_adapter import (
         _OAUTH_CLIENT_ID as _ANTHROPIC_OAUTH_CLIENT_ID,
-        _OAUTH_TOKEN_URL as _ANTHROPIC_OAUTH_TOKEN_URL,
+        _OAUTH_TOKEN_URL as _ANTHROPIC_OAUTH_TOKEN_URL,  # noqa: F401 - availability probe; the import IS the test
         _OAUTH_TOKEN_URLS as _ANTHROPIC_OAUTH_TOKEN_URLS,
         _OAUTH_REDIRECT_URI as _ANTHROPIC_OAUTH_REDIRECT_URI,
         _OAUTH_SCOPES as _ANTHROPIC_OAUTH_SCOPES,
@@ -10711,7 +10711,6 @@ def _codex_full_login_worker(session_id: str) -> None:
         from hermes_cli.auth import (
             CODEX_OAUTH_CLIENT_ID,
             CODEX_OAUTH_TOKEN_URL,
-            DEFAULT_CODEX_BASE_URL,
         )
         issuer = "https://auth.openai.com"
 

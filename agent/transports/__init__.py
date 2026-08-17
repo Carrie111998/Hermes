@@ -12,7 +12,25 @@ from agent.transports.types import (
     Usage,
     build_tool_call,
     map_finish_reason,
-)  # noqa: F401
+)
+
+# Deliberate re-export: these live in .types but are part of this package's
+# public surface, so `from agent.transports import NormalizedResponse` works.
+# Declared in __all__ rather than suppressed with `# noqa: F401` — a trailing
+# noqa on the closing paren above was INERT, because ruff attributes F401 to
+# the individual name lines, not to the line the statement ends on. It read as
+# a live suppression for as long as the F group was off. Names listed here are
+# "used" as far as F401 is concerned, and the intent is stated rather than
+# silenced.
+__all__ = [
+    "NormalizedResponse",
+    "ToolCall",
+    "Usage",
+    "build_tool_call",
+    "map_finish_reason",
+    "get_transport",
+    "register_transport",
+]
 
 _REGISTRY: dict = {}
 _discovered: bool = False

@@ -18,7 +18,7 @@ from unittest.mock import patch, MagicMock
 
 import time
 
-from agent.context_compressor import ContextCompressor, _CHARS_PER_TOKEN
+from agent.context_compressor import ContextCompressor
 
 
 # ---------------------------------------------------------------------------

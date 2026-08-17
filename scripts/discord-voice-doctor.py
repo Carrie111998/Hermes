@@ -97,20 +97,20 @@ def check_packages():
 
     # Optional: local STT
     try:
-        import faster_whisper
+        import faster_whisper  # noqa: F401 - availability probe; the import IS the test
         check("faster-whisper (local STT)", True)
     except ImportError:
         warn("faster-whisper (local STT)", "not installed — local STT unavailable")
 
     # Optional: TTS providers
     try:
-        import edge_tts
+        import edge_tts  # noqa: F401 - availability probe; the import IS the test
         check("edge-tts", True)
     except ImportError:
         warn("edge-tts", "not installed — edge TTS unavailable")
 
     try:
-        import elevenlabs
+        import elevenlabs  # noqa: F401 - availability probe; the import IS the test
         check("elevenlabs SDK", True)
     except ImportError:
         warn("elevenlabs SDK", "not installed — premium TTS unavailable")

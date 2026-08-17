@@ -6,7 +6,6 @@ the ambient accounting context (agent/aux_accounting.py), making aux model
 spend visible in analytics.
 """
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest

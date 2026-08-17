@@ -9,7 +9,6 @@ The original ``_do_reconnect()`` succeeded but never called
 
 import sys
 import os
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

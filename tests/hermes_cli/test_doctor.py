@@ -1584,7 +1584,6 @@ class TestDoctorStaleMaxIterationsDrift:
 
     def _run_config_section(self, monkeypatch, tmp_path, *, fix, ghost, cfg_turns,
                             os_environ_value=None):
-        import pathlib
         import contextlib
         import io
         from argparse import Namespace

@@ -16,7 +16,7 @@ from tools.approval import (
 )
 
 # Ensure the module is importable so we can patch it
-import tools.tirith_security
+import tools.tirith_security  # noqa: F401 - module must stay imported so patch() can reach it
 
 
 # ---------------------------------------------------------------------------

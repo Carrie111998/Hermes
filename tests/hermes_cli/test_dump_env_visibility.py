@@ -9,7 +9,6 @@ configured" path (the real cause behind gated tools like ``web_search`` going
 missing on Desktop). The dump now flags that mismatch.
 """
 
-from pathlib import Path
 from types import SimpleNamespace
 
 

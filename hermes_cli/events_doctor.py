@@ -182,7 +182,7 @@ def run_doctor(check_telegram_api: bool = True) -> int:
             cnt = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE timestamp > ?", (since,)
             ).fetchone()[0]
-            _check(f"events emitted in last 24h", cnt > 0, f"{cnt} events")
+            _check("events emitted in last 24h", cnt > 0, f"{cnt} events")
             if cnt == 0:
                 issues += 1
 

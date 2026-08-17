@@ -2,7 +2,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 
 import cli as cli_mod
 

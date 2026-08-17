@@ -33,7 +33,6 @@ from plugins.platforms.raft.adapter import (
     _on_post_tool_call,
     _on_session_end,
     _on_session_finalize,
-    check_raft_requirements,
     interactive_setup,
     register,
 )

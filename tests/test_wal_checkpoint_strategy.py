@@ -6,7 +6,7 @@ while close() and pre-VACUUM paths still use TRUNCATE.
 
 import sqlite3
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

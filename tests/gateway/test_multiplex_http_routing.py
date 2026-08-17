@@ -1,5 +1,4 @@
 """Phase 1: HTTP-inbound /p/<profile>/ routing for the webhook adapter."""
-import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, build_session_key

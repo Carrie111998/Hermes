@@ -1,6 +1,6 @@
 """Regression coverage for one-shot claims during blocking cron scripts."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import threading
 from unittest.mock import MagicMock, patch
 

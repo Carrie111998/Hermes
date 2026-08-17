@@ -4,7 +4,6 @@ The gate only decides and records evidence. It never transitions lifecycle state
 merges, deploys, restarts a gateway, or creates the operator-owned sentinel.
 """
 
-from pathlib import Path
 
 from devflow_delegation.allowlist import TargetConfig
 from devflow_delegation.gate import GateRequest, evaluate_gate, record_shadow_decision

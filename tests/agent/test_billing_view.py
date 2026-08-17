@@ -22,7 +22,6 @@ import agent.billing_view as bv
 from agent.billing_view import (
     AutoReload,
     AutoReloadCard,
-    BillingState,
     CardInfo,
     MonthlyCap,
     billing_state_from_payload,

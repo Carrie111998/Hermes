@@ -40,7 +40,7 @@ from hermes_cli.gateway_diag import (
     register_exit_hook as _register_exit_hook,
     write_diag as _gateway_exit_diag,
 )
-from gateway.status import pid_exists, terminate_pid
+from gateway.status import terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,

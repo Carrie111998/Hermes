@@ -24,7 +24,7 @@ Design constraints (spec: "Lifecycle state machine" + conservative rollout):
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from devflow_delegation.contract import SEVERITY_RANK
 from devflow_delegation.lifecycle import IllegalTransitionError, transition

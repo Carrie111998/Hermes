@@ -23,7 +23,6 @@ import pytest
 
 from jobflow_quality.golden_set import (
     Difficulty,
-    GoldenItem,
     Label,
     LabelSource,
     build_golden_set,

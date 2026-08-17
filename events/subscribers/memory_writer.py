@@ -12,7 +12,7 @@ import logging
 import re
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from events.bus import EventBus
 from events.schema import Event, EventType

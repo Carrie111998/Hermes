@@ -11,12 +11,11 @@ schema.
 """
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 
 from events.bus import EventBus
-from events.schema import Event, EventType, Priority
+from events.schema import EventType, Priority
 
 
 @pytest.fixture

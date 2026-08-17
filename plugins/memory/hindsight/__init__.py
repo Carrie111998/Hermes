@@ -181,7 +181,6 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
     Any failure (timeout, 404, malformed JSON, missing key) → None, which
     the caller treats as "legacy API, no update_mode support".
     """
-    import urllib.error
     import urllib.request
     if not api_url:
         return None

@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from events.bus import EventBus
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
 

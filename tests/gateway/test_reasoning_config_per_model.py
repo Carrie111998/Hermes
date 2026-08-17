@@ -1,6 +1,5 @@
 """Tests for per-model reasoning_effort override in gateway _load_reasoning_config."""
 
-import pytest
 
 import gateway.run as gateway_run
 
@@ -10,7 +9,6 @@ class TestGatewayPerModelReasoningConfig:
 
     def test_per_model_override_takes_precedence(self, monkeypatch):
         """Per-model override wins over global reasoning_effort."""
-        from hermes_cli.config import DEFAULT_CONFIG
 
         fake_cfg = {
             "model": {"default": "anthropic/claude-opus-4.5"},

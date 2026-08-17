@@ -16,7 +16,6 @@ tail) by handling the user-side confirmation tail.
 """
 
 import time
-import pytest
 from typing import Dict, List
 
 from gateway.run import (

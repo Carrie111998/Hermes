@@ -1,11 +1,10 @@
 """Tests for MailboxTranslator subscriber (Silence #1 fix)."""
 import json
-from pathlib import Path
 
 import pytest
 
 from events.bus import EventBus
-from events.schema import Event, EventType, Priority
+from events.schema import EventType
 from events.subscribers.mailbox_translator import MailboxTranslator
 
 

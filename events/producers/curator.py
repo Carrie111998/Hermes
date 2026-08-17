@@ -14,7 +14,7 @@ import logging
 from typing import Any, Dict
 
 from events.bus import EventBus
-from events.schema import Event, EventType, Priority
+from events.schema import EventType, Priority
 
 logger = logging.getLogger(__name__)
 

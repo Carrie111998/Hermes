@@ -91,13 +91,11 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.miniapp_agents import MiniAppAgentRegistry
 from gateway.platforms.miniapp_commands import command_catalog, execute_command
-from gateway.platforms.miniapp_vision import inject_attachment_hints
 import gateway.platforms.miniapp_status as miniapp_status
 from gateway.platforms.telegram_miniapp_auth import (
     MiniAppAuthError,
     validate_telegram_init_data,
 )
-from hermes_constants import get_hermes_home
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 

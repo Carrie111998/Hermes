@@ -197,7 +197,6 @@ def test_search_tool_blocks_direct_auth_json_path(fake_home, monkeypatch):
     import json
 
     import tools.file_tools as ft
-    import tools.terminal_tool as terminal_tool
 
     auth = _create(fake_home, "auth.json")
     auth.write_text("SEARCH_DIRECT_AUTH_SECRET", encoding="utf-8")

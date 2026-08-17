@@ -10,7 +10,7 @@ import logging
 import re
 from datetime import datetime
 from types import MappingProxyType
-from typing import Mapping, Optional
+from typing import Mapping
 
 from events.outcomes import OutcomeState, OutcomeVerdict, marker_for_verdict
 from events.schema import Event, EventType, Priority

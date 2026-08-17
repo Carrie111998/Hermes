@@ -1,6 +1,5 @@
 """Tests for browser first-open timeout and timeout diagnostics."""
 
-from unittest.mock import patch
 
 import pytest
 

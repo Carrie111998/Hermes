@@ -3,21 +3,15 @@
 Regression test for https://github.com/NousResearch/hermes-agent/issues/20476
 """
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tools.browser_camofox import (
     _auth_headers,
-    camofox_back,
-    camofox_click,
     camofox_close,
     camofox_navigate,
-    camofox_press,
-    camofox_scroll,
     camofox_snapshot,
-    camofox_type,
 )
 
 

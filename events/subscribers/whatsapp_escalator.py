@@ -18,7 +18,6 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 from events.bus import EventBus
 from events.noise_guards import RepeatGuard, is_sustained_resource_repeat
 from events.routing_policy import (
-    HIGH_SCORE_WA_THRESHOLD,
     WA_IMMEDIATE,
     WA_IMPORTANT,
     WA_URGENT,

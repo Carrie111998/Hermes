@@ -27,10 +27,9 @@ HTTPXRequest falls back to PTB's default 5.0s keepalive) fails this test.
 
 import asyncio
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import httpx
-import pytest
 
 from gateway.config import PlatformConfig
 

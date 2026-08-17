@@ -13,9 +13,7 @@ mirroring the already-correct ``tui_gateway/server.py:_persist_model_switch``
 pattern (fixed for #48305).
 """
 
-from unittest.mock import MagicMock, patch
 
-import pytest
 
 from hermes_cli.model_switch import ModelSwitchResult
 

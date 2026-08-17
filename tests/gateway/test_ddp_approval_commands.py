@@ -847,7 +847,6 @@ async def test_ddp_lazy_emitter_uses_fixture_control_plane_paths(tmp_path, monke
     """A production runner without injected test doubles resolves the canonical
     DDP emitter lazily, entirely under the configured Hermes root."""
     from events import paths
-    from gateway.run import GatewayRunner
 
     runner = _make_runner(DelegationLedger(tmp_path / "injected-ledger.db"))
     del runner._ddp_ledger

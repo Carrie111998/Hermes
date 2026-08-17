@@ -1,6 +1,5 @@
 """Tests for per-model reasoning_effort override in TUI gateway _load_reasoning_config."""
 
-import pytest
 
 import tui_gateway.server as tui_server
 

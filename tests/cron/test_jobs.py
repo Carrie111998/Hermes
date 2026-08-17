@@ -2403,7 +2403,6 @@ class TestJobsJsonUtf8Bom:
     def test_load_jobs_accepts_utf8_bom(self, tmp_cron_dir):
         """BOM'd jobs.json loads — the pre-fix crash repro."""
         import json
-        from pathlib import Path
         from cron.jobs import JOBS_FILE, load_jobs
 
         payload = {

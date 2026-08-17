@@ -212,10 +212,7 @@ class TestStdioPidTracking:
     def test_run_stdio_reaps_orphans_before_spawn(self):
         """_run_stdio kills orphaned PIDs from prior failed attempts (#57355)."""
         from tools.mcp_tool import (
-            _kill_orphaned_mcp_children,
             _orphan_stdio_pids,
-            _stdio_pids,
-            _stdio_pgids,
             _lock,
             MCPServerTask,
         )
@@ -462,7 +459,6 @@ class TestStdioPgroupReaping:
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pids,
-            _stdio_pgids,
             _lock,
         )
 

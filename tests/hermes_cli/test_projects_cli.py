@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 
-import pytest
 
 from hermes_cli import projects_cmd
 from hermes_cli import projects_db as pdb

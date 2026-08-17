@@ -1,4 +1,3 @@
-import pytest
 from events.schema import EventType, Priority
 
 

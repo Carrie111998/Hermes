@@ -14,7 +14,6 @@ Covers two residual bypasses addressed in the PR:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import patch, AsyncMock
 
 import pytest

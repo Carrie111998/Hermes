@@ -21,7 +21,6 @@ from typing import Any, Protocol, cast
 
 from agent.transports.codex_app_server import CodexAppServerClient
 from hermes_constants import (
-    get_hermes_home,
     reset_hermes_home_override,
     set_hermes_home_override,
 )
@@ -107,7 +106,6 @@ from .sidebar_executor import (
     SidebarExecutor,
 )
 from .sidebar_hydration_executor import SidebarHydrationExecutor
-from .sidebar_placement import SidebarPlacement, resolve_sidebar_placement
 from .sidebar_runtime import (
     configured_mcp_server_names,
     sidebar_registration_app_server_args,
