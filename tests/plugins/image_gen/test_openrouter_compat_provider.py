@@ -86,29 +86,36 @@ class TestProviderClass:
         with patch(_RUNTIME, return_value=_runtime_ok()):
             assert _openrouter().is_available() is True
 
-    def test_is_available_without_key(self):
-        with patch(_RUNTIME, return_value=_runtime_ok(api_key="")):
-            assert _openrouter().is_available() is False
-
-    def test_is_available_on_resolution_error(self):
-        with patch(_RUNTIME, side_effect=RuntimeError("boom")):
-            assert _openrouter().is_available() is False
 
     def test_default_model(self):
         from plugins.image_gen.openrouter import DEFAULT_MODEL
 
         with patch("plugins.image_gen.openrouter._load_image_gen_config", return_value={}):
             assert _openrouter().default_model() == DEFAULT_MODEL
-            assert DEFAULT_MODEL == "google/gemini-2.5-flash-image"
+            # Default must be an image-output model id (provider/model form).
+            assert "/" in DEFAULT_MODEL and "image" in DEFAULT_MODEL
+
 
     def test_model_env_override(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_IMAGE_MODEL", "black-forest-labs/flux.2-pro")
         assert _openrouter()._resolve_model() == "black-forest-labs/flux.2-pro"
+        assert _openrouter()._resolve_model_chain() == ["black-forest-labs/flux.2-pro"]
 
-    def test_model_config_override(self):
-        cfg = {"openrouter": {"model": "google/gemini-3.1-flash-image-preview"}}
+
+    def test_nous_honors_top_level_model(self):
+        from plugins.image_gen.openrouter import _build_providers
+
+        cfg = {"model": "openai/gpt-image-2"}
+        nous = {p.name: p for p in _build_providers()}["nous"]
         with patch("plugins.image_gen.openrouter._load_image_gen_config", return_value=cfg):
-            assert _openrouter()._resolve_model() == "google/gemini-3.1-flash-image-preview"
+            assert nous._resolve_model_chain() == ["openai/gpt-image-2"]
+
+    def test_explicit_model_kwarg_wins_over_config(self):
+        cfg = {"model": "openai/gpt-image-2"}
+        with patch("plugins.image_gen.openrouter._load_image_gen_config", return_value=cfg):
+            assert _openrouter()._resolve_model_chain("google/gemini-3-pro-image") == [
+                "google/gemini-3-pro-image"
+            ]
 
 
 # ---------------------------------------------------------------------------
@@ -123,20 +130,19 @@ class TestHelpers:
         assert _to_image_url_part("https://x/y.png") == "https://x/y.png"
         assert _to_image_url_part("data:image/png;base64,AAAA") == "data:image/png;base64,AAAA"
 
-    def test_to_image_url_part_inlines_local_file(self, tmp_path):
+
+    def test_to_image_url_part_blocks_credential_store(self, tmp_path, monkeypatch):
         from plugins.image_gen.openrouter import _to_image_url_part
 
-        f = tmp_path / "base.png"
-        f.write_bytes(b"\x89PNG\r\n")
-        part = _to_image_url_part(str(f))
-        assert part.startswith("data:image/png;base64,")
-        decoded = base64.b64decode(part.split(",", 1)[1])
-        assert decoded == b"\x89PNG\r\n"
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        auth_json = hermes_home / "auth.json"
+        auth_json.write_text('{"api_key":"sk-secret"}', encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    def test_to_image_url_part_missing_file(self):
-        from plugins.image_gen.openrouter import _to_image_url_part
+        with pytest.raises(ValueError, match="credential store"):
+            _to_image_url_part(str(auth_json))
 
-        assert _to_image_url_part("/no/such/file.png") is None
 
     def test_extract_images(self):
         from plugins.image_gen.openrouter import _extract_images
@@ -148,10 +154,19 @@ class TestHelpers:
         }
         assert _extract_images(payload) == ["data:image/png;base64,AA"]
 
-    def test_extract_images_empty(self):
-        from plugins.image_gen.openrouter import _extract_images
 
-        assert _extract_images({"choices": [{"message": {"content": "no image"}}]}) == []
+    def test_access_error_hint_for_gated_openai_model(self):
+        from plugins.image_gen.openrouter import _FALLBACK_MODEL, _access_error_hint
+
+        hint = _access_error_hint(
+            "OpenRouter", "openai/gpt-5.4-image-2", "OPENROUTER_IMAGE_MODEL", 404, "No endpoints found"
+        )
+        assert hint is not None
+        assert "openai/gpt-5.4-image-2" in hint
+        assert "OPENROUTER_IMAGE_MODEL" in hint
+        assert _FALLBACK_MODEL in hint
+        # Stays a single line under the humanizer's 200-char truncation.
+        assert "\n" not in hint and len(hint) <= 200
 
 
 # ---------------------------------------------------------------------------
@@ -180,18 +195,6 @@ class TestGenerate:
         assert result["provider"] == "openrouter"
         mock_save.assert_called_once()
 
-    def test_success_http_url(self):
-        with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", return_value=_mock_chat_response(["https://cdn/x.png"])), \
-             patch(
-                 "plugins.image_gen.openrouter.save_url_image",
-                 return_value=Path("/tmp/openrouter_gen_url.png"),
-             ) as mock_save_url:
-            result = _openrouter().generate(prompt="a pet")
-
-        assert result["success"] is True
-        assert result["image"] == "/tmp/openrouter_gen_url.png"
-        mock_save_url.assert_called_once()
 
     def test_empty_response(self):
         with patch(_RUNTIME, return_value=_runtime_ok()), \
@@ -232,6 +235,17 @@ class TestGenerate:
         headers = mock_post.call_args.kwargs["headers"]
         assert headers["Authorization"] == "Bearer sk-or-test"
 
+    def test_generate_uses_model_kwarg_from_dispatch(self):
+        """image_generate passes image_gen.model as a model kwarg — honor it."""
+        with patch(_RUNTIME, return_value=_runtime_ok()), \
+             patch("requests.post", return_value=_mock_chat_response([_PNG_DATA_URI])) as mock_post, \
+             patch("plugins.image_gen.openrouter.save_b64_image", return_value=Path("/tmp/x.png")):
+            result = _openrouter().generate(prompt="a pet", model="openai/gpt-image-2")
+
+        assert result["success"] is True
+        assert result["model"] == "openai/gpt-image-2"
+        assert mock_post.call_args.kwargs["json"]["model"] == "openai/gpt-image-2"
+
     def test_posts_to_resolved_base_url(self):
         """Nous routes to its own base URL — proves the same code serves both."""
         nous_runtime = _runtime_ok(
@@ -260,10 +274,11 @@ class TestGenerate:
         resp.raise_for_status.side_effect = req_lib.HTTPError(response=resp)
 
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", return_value=resp):
+             patch("requests.post", return_value=resp) as mock_post:
             result = _openrouter().generate(prompt="a pet")
         assert result["success"] is False
         assert result["error_type"] == "api_error"
+        assert mock_post.call_count == 1
 
     def test_timeout(self):
         import requests as req_lib

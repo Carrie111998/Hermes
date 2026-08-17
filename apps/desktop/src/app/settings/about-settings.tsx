@@ -3,8 +3,9 @@ import { useEffect, useState } from 'react'
 
 import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { type Translations, useI18n } from '@/i18n'
-import { CheckCircle2, ExternalLink, Loader2, RefreshCw, Sparkles } from '@/lib/icons'
+import { CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
   $desktopVersion,
@@ -62,6 +63,9 @@ export function AboutSettings() {
   }, [])
 
   const behind = status?.behind ?? 0
+  // behind is null when the exact count is unknowable (shallow clone): the
+  // backend flags that case via updateAvailable instead of a number.
+  const updateAvailable = behind > 0 || Boolean(status?.updateAvailable)
   const supported = status?.supported !== false
   const applying = apply.applying || apply.stage === 'restart'
 
@@ -83,8 +87,8 @@ export function AboutSettings() {
   } else if (applying) {
     statusLine = a.installing
     statusTone = 'available'
-  } else if (behind > 0) {
-    statusLine = a.updateReady(behind)
+  } else if (updateAvailable) {
+    statusLine = behind > 0 ? a.updateReady(behind) : a.updateReadyUnknown
     statusTone = 'available'
   } else if (status) {
     statusLine = a.onLatest
@@ -117,7 +121,7 @@ export function AboutSettings() {
         >
           <div className="flex items-start gap-2">
             {statusTone === 'available' ? (
-              <Sparkles className="mt-0.5 size-4 shrink-0 text-primary" />
+              <Codicon className="mt-0.5 size-4 shrink-0 text-primary" name="cloud-download" size="1rem" />
             ) : statusTone === 'error' ? null : (
               <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
             )}
@@ -141,7 +145,7 @@ export function AboutSettings() {
               {checking ? a.checking : a.checkNow}
             </Button>
 
-            {behind > 0 && supported && !applying && (
+            {updateAvailable && supported && !applying && (
               <>
                 <Button onClick={() => startActiveUpdate()} size="sm">
                   {a.updateNow}
