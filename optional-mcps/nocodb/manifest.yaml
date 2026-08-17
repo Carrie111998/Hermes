@@ -1,0 +1,70 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: nocodb
+description: >-
+  Read and write records in your NocoDB bases.
+source: https://nocodb.com/docs/product-docs/developer-resources/mcp
+
+# Official vendor-hosted remote MCP (URL-only — Hermes never spawns a local
+# process for this entry). NocoDB advertises OAuth 2.1 + Dynamic Client
+# Registration at the instance root, so Hermes's MCP client +
+# mcp_oauth_manager handle discovery, PKCE, token exchange, and refresh
+# with no client_id to paste. Verified against app.nocodb.com (2026-08-17):
+#
+#   /.well-known/oauth-protected-resource
+#     resource: https://app.nocodb.com/mcp
+#     authorization_servers: [https://app.nocodb.com]
+#     bearer_methods_supported: [header]
+#
+#   /.well-known/oauth-authorization-server
+#     registration_endpoint: /api/v2/oauth/register   (DCR — no allowlist)
+#     code_challenge_methods_supported: [S256]
+#     grant_types_supported: [authorization_code, refresh_token]
+#     token_endpoint_auth_methods_supported: [none, client_secret_post]
+transport:
+  type: http
+  url: https://app.nocodb.com/mcp
+
+auth:
+  type: oauth
+
+# Composer-suggestion triggers (desktop brand pills).
+suggest:
+  keywords:
+    - nocodb
+  hosts:
+    - nocodb.com
+
+post_install: |
+  On first connection Hermes opens a browser to authorize with
+  NocoDB (or run `hermes mcp login nocodb`). Approve access, then
+  restart the session so tools load.
+
+  Scope: this server is record-level only — create, read, update, and
+  delete rows. It does not create tables, add fields, or make any other
+  schema change. For schema work, workspace/base administration, views,
+  filters, or attachments, install the `nocodb` skill instead
+  (`hermes skills install nocodb`), which drives the NocoDB v3 REST API.
+
+  Self-hosted instances: the OAuth metadata is served from your own
+  instance root, so point the URL at it after install —
+
+    hermes mcp configure nocodb
+
+  and set url to https://nocodb.example.com/mcp. The browser flow then
+  authorizes against that instance.
+
+  Per-base token alternative: NocoDB also exposes a scoped endpoint at
+  /mcp/<mcpTokenId> authenticated with an `xc-mcp-token` header instead
+  of OAuth. That custom header is not expressible in this manifest
+  format, so configure it directly in ~/.hermes/config.yaml:
+
+    mcp_servers:
+      nocodb:
+        url: https://app.nocodb.com/mcp/<mcpTokenId>
+        headers:
+          xc-mcp-token: "${NOCODB_MCP_TOKEN}"
+
+  Treat that token as full control over the base it is scoped to.
