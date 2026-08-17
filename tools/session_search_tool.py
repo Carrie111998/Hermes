@@ -569,6 +569,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    caller_session_key: str = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -652,7 +653,11 @@ def _scroll(
     rebind_warning = None
     if not messages:
         owning = owning_session_id
-        if owning and owning != session_id:
+        if (
+            owning
+            and owning != session_id
+            and _session_in_scope(db, owning, caller_session_key)
+        ):
             a_root = _resolve_lineage(db, session_id)
             o_root = _resolve_lineage(db, owning)
             if a_root and o_root and a_root == o_root:
@@ -1046,6 +1051,7 @@ def _session_search_impl(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            caller_session_key=caller_session_key,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.

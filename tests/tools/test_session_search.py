@@ -324,6 +324,32 @@ class TestGatewayOwnershipScope:
         assert result["success"] is True
         assert result["session_id"] == "owned-history"
 
+    def test_scroll_rebind_rejects_child_from_another_gateway_scope(self, db):
+        db.create_session(
+            "owned-parent", source="telegram", session_key="telegram:dm:owner"
+        )
+        db.create_session(
+            "foreign-child",
+            source="telegram",
+            session_key="telegram:dm:other",
+            parent_session_id="owned-parent",
+        )
+        foreign_mid = db.append_message(
+            "foreign-child", role="user", content="foreign child transcript"
+        )
+
+        result = json.loads(
+            session_search(
+                db=db,
+                session_id="owned-parent",
+                around_message_id=foreign_mid,
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert result["success"] is False
+        assert "foreign child transcript" not in json.dumps(result)
+
     def test_scoped_lookup_fails_closed_for_legacy_row_without_session_key(self, db):
         db.create_session("legacy", source="telegram")
         db.append_message("legacy", role="user", content="legacy private text")
