@@ -53,6 +53,14 @@ if _parseltongue_path.exists():
 if _race_path.exists():
     exec(compile(open(_race_path).read(), str(_race_path), 'exec'), _caller_globals)
 
+# The exec() calls above inject escalate_encoding() (parseltongue.py) and
+# score_response() (godmode_race.py) into this module's globals, which is where
+# the functions below resolve them at call time. Static analysers cannot follow
+# exec() injection, so declare the names here to satisfy ruff F821. This branch
+# never runs — the real callables already exist by the time anything is invoked.
+if False:  # static-analysis declaration for exec()-injected names; never runs
+    escalate_encoding = score_response = None
+
 # ═══════════════════════════════════════════════════════════════════
 # Hermes config paths
 # ═══════════════════════════════════════════════════════════════════
