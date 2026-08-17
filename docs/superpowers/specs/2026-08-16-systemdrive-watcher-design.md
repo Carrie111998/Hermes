@@ -227,6 +227,9 @@ Every record carries `event`, `at` (ISO-8601 seconds), `watcher_pid`.
 - **`armed`** — `roots`, `backend_by_root`, `sample_ms`, `poll_ms`, `ring_capacity`,
   `watcher_has_systemdrive`, `watcher_cwd`.
 - **`preexisting`** — `root`, `path`, `note` (explicitly: cannot attribute).
+- **`backend_downgrade`** — `root`, `reason`, `note`. Emitted when a root cannot
+  be opened for a directory watch and falls back to polling, so a degraded watch is
+  never mistaken for a fast one.
 - **`SIGHTING`** — `root`, `path`, `backend`, `watcher_has_systemdrive`,
   `live_cwd_matches`, `ring_cwd_matches`, `live_process_count`, `ring_size`,
   `snapshot_file`.
