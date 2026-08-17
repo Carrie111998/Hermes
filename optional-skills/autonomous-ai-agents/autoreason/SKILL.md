@@ -18,6 +18,8 @@ Autoreason is a self-refinement pipeline that iteratively improves LLM outputs v
 
 It fixes the three structural failures of naive critique-and-revise: *prompt bias* (models hallucinate flaws when asked to critique), *scope creep* (outputs expand unchecked each pass), and *lack of restraint* (models never say "no changes needed").
 
+Unlike the Autoreason methodology embedded in `skills/research/research-paper-writing`, this optional skill is a general-purpose, independently installable execution entry point with a bundled runnable CLI.
+
 ## When to Use
 
 Load `/skill autoreason` when the user asks you to:
@@ -31,8 +33,8 @@ Do **not** use for: simple Q&A (a single pass suffices), high-frequency batch wo
 ## Prerequisites
 
 - Python 3.11+
-- `litellm` installed (`pip install litellm` or `uv pip install litellm`)
-- An API key for the target model (e.g. `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`)
+- `litellm` available in the Python environment
+- An API key for the selected provider/model (e.g. `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`)
 
 ## How to Run
 
@@ -55,8 +57,8 @@ Options: `--model` (default `anthropic/claude-sonnet-4-20250514`), `--judges` (d
 
 1. Get the task prompt and choose a model.
 2. Run the pipeline with `terminal`, e.g. `python scripts/run_autoreason.py --task '...' --model anthropic/claude-sonnet-4-20250514`.
-3. Inspect `autoreason_output/history.json` for the winner trajectory and word count per pass.
-4. Read `autoreason_output/final_output.md` and deliver it to the user.
+3. Use `read_file` on `autoreason_output/history.json` for the winner trajectory and word count per pass.
+4. Use `read_file` on `autoreason_output/final_output.md` and deliver it to the user.
 
 If the CLI is unavailable (no `litellm` or no API key), run the pipeline manually with native tools: spawn fresh Critic, Author B, Synthesizer, and Judge agents via `delegate_task` (each with no shared context), then aggregate rankings by Borda count. Prompt templates are below.
 

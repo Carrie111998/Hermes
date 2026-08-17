@@ -1,23 +1,27 @@
-# Autoreason 论文核心结果速查
+# Autoreason Experimental Results
 
-## 规模缩放曲线（CodeContests private-test）
+Quick reference for the results reported in
+[NousResearch/autoreason](https://github.com/NousResearch/autoreason).
 
-- **Haiku 3.5**: 单次 ~31% → Autoreason ~40%（+9%）
-- **Haiku 4.5**: 单次 ~60% → Autoreason ~60%（~0%，转折点）
-- **Sonnet 4**: 单次 ~61% → Autoreason ~64%（+3%）
-- **Sonnet 4.6**: 单次 ~73% → Autoreason ~77%（+4%）
+## Code scaling
 
-关键洞察: Haiku 4.5 处 gain 消失——模型"生成能力"≈"评判能力"时迭代优化空间闭合。
+- **Haiku 3.5**: Autoreason reaches ~40% private-test accuracy on CodeContests.
+- **Haiku 4.5**: ~60% private-test accuracy; this is the transition point where
+  the held-out gain from Autoreason vanishes.
+- **Sonnet 4**: ~64% private-test accuracy with Autoreason.
+- **Sonnet 4.6**: ~77% private-test accuracy with Autoreason.
+- **Sonnet 4.6**: 77% Autoreason vs 73% single-pass on 150 CodeContests
+  problems.
+- **Haiku 3.5**: 40% Autoreason vs 31% best-of-6 sampling at matched compute
+  (150 problems).
 
-## 为什么 autoreason 有效
+## Writing / ablations
 
-- "不做改动"（A）是一等选项
-- 每个 agent 都是 fresh（无上下文污染）
-- 盲审 + Borda count 消除位置偏差
-- 三个独立声音而非"自己找问题自己修"
-
-## 消融实验
-
-- 去掉 B 或 AB: 收敛极快（2-3轮）但质量差
-- Judge 数量: 7 > 3 > 1
-- Borda vs Majority: Borda 更稳定
+- **Haiku 3.5 + Autoreason**: 42/42 perfect Borda across 3 tasks; all
+  baselines degraded below single-pass.
+- **Judge count**: 7 judges converge about 3× faster than 3 judges; 1 judge
+  is noisy and slow.
+- **Component necessity**: removing either B or AB collapses the tournament /
+  causes premature convergence.
+- **Design choices**: incumbent A as a first-class option and a conservative
+  A-favored tiebreak are central to the method.

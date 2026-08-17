@@ -16,18 +16,33 @@ import re
 from pathlib import Path
 
 import pytest
-import yaml
 
 SKILL_DIR = Path(__file__).resolve().parents[2] / "optional-skills" / "autonomous-ai-agents" / "autoreason"
 SCRIPT = SKILL_DIR / "scripts" / "run_autoreason.py"
 
 
+def _frontmatter_field(src: str, key: str) -> str:
+    match = re.search(rf"^{key}:\s*(.+)$", src, re.MULTILINE)
+    assert match, f"SKILL.md missing frontmatter field {key!r}"
+    return match.group(1).strip()
+
+
+def _frontmatter_platforms(src: str) -> list[str]:
+    match = re.search(r"^platforms:\s*\[(.*)\]$", src, re.MULTILINE)
+    assert match, "SKILL.md missing platforms frontmatter list"
+    return [item.strip() for item in match.group(1).split(",") if item.strip()]
+
+
 @pytest.fixture(scope="module")
 def frontmatter() -> dict:
     src = (SKILL_DIR / "SKILL.md").read_text()
-    m = re.search(r"^---\n(.*?)\n---", src, re.DOTALL)
-    assert m, "SKILL.md missing YAML frontmatter"
-    return yaml.safe_load(m.group(1))
+    return {
+        "name": _frontmatter_field(src, "name"),
+        "description": _frontmatter_field(src, "description"),
+        "author": _frontmatter_field(src, "author"),
+        "license": _frontmatter_field(src, "license"),
+        "platforms": _frontmatter_platforms(src),
+    }
 
 
 @pytest.fixture(scope="module")
@@ -91,10 +106,16 @@ def test_skill_documents_script_path() -> None:
     assert "terminal" in src, "SKILL.md must drive the CLI via the native `terminal` tool"
 
 
+def test_skill_documents_native_read_file() -> None:
+    src = (SKILL_DIR / "SKILL.md").read_text()
+    assert "read_file" in src, "SKILL.md must use native `read_file` for result files"
+
+
 def test_skill_has_modern_sections() -> None:
     src = (SKILL_DIR / "SKILL.md").read_text()
     for section in ["## When to Use", "## Prerequisites", "## How to Run",
-                    "## Procedure", "## Pitfalls", "## Verification"]:
+                    "## Quick Reference", "## Procedure", "## Pitfalls",
+                    "## Verification"]:
         assert section in src, f"SKILL.md missing required section {section}"
 
 
@@ -114,6 +135,18 @@ def test_parse_ranking_missing_returns_none(mod) -> None:
     assert mod.parse_ranking("No ranking given here") is None
 
 
+def test_parse_ranking_truncated_returns_none(mod) -> None:
+    assert mod.parse_ranking("RANKING: 2, 1") is None
+
+
+def test_parse_ranking_duplicate_returns_none(mod) -> None:
+    assert mod.parse_ranking("RANKING: 1, 1, 2") is None
+
+
+def test_parse_ranking_unexpected_label_returns_none(mod) -> None:
+    assert mod.parse_ranking("RANKING: 2, 1, 4") is None
+
+
 def test_borda_aggregation_picks_top(mod) -> None:
     rankings = [["A", "B", "AB"], ["A", "AB", "B"]]
     winner, scores, valid = mod.aggregate_rankings(rankings, ["A", "B", "AB"], tiebreak_winner="A")
@@ -130,11 +163,39 @@ def test_borda_tiebreak_prefers_incumbent(mod) -> None:
     assert winner == "A", "tiebreak must prefer the incumbent"
 
 
-def test_borda_ignores_malformed_judges(mod) -> None:
+def test_borda_ignores_none_ballot(mod) -> None:
     rankings = [["A", "B", "AB"], None, ["AB", "A", "B"]]
     winner, _, valid = mod.aggregate_rankings(rankings, ["A", "B", "AB"], tiebreak_winner="A")
     assert valid == 2
     assert winner in {"A", "AB"}
+
+
+def test_borda_ignores_truncated_ballot(mod) -> None:
+    rankings = [["A", "B", "AB"], ["A", "B"]]
+    winner, _, valid = mod.aggregate_rankings(rankings, ["A", "B", "AB"], tiebreak_winner="A")
+    assert valid == 1
+    assert winner == "A"
+
+
+def test_borda_ignores_duplicate_ballot(mod) -> None:
+    rankings = [["A", "B", "AB"], ["A", "A", "B"]]
+    winner, _, valid = mod.aggregate_rankings(rankings, ["A", "B", "AB"], tiebreak_winner="A")
+    assert valid == 1
+    assert winner == "A"
+
+
+def test_borda_ignores_unknown_label_ballot(mod) -> None:
+    rankings = [["A", "B", "AB"], ["A", "B", "X"]]
+    winner, _, valid = mod.aggregate_rankings(rankings, ["A", "B", "AB"], tiebreak_winner="A")
+    assert valid == 1
+    assert winner == "A"
+
+
+def test_borda_invalid_ballots_do_not_score(mod) -> None:
+    malformed = [None, ["A", "B"], ["A", "A", "B"], ["A", "B", "X"]]
+    _, scores, valid = mod.aggregate_rankings(malformed, ["A", "B", "AB"], tiebreak_winner="A")
+    assert valid == 0
+    assert all(score == 0 for score in scores.values())
 
 
 def test_blind_shuffle_permutes_labels(mod) -> None:

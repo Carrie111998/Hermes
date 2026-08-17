@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -138,11 +139,23 @@ Where each slot is 1, 2, or 3."""
 
 
 # ── LLM wrapper (paper's retry/rate-limit logic) ──────────────────────────
+_LITELLM = None
+
+
+def _get_litellm():
+    """Lazily import litellm and configure debug suppression exactly once."""
+    global _LITELLM
+    if _LITELLM is None:
+        import litellm
+        litellm.suppress_debug_info = True
+        _LITELLM = litellm
+    return _LITELLM
+
+
 async def call_llm(system: str, user: str, model: str, temperature: float,
                    max_tokens: int, max_retries: int = 8) -> str:
     """Call LLM with exponential backoff rate-limit handling (from paper code)."""
-    import litellm
-    litellm.suppress_debug_info = True
+    litellm = _get_litellm()
 
     for attempt in range(max_retries):
         try:
@@ -186,15 +199,35 @@ def randomize_for_judge(va: str, vb: str, vab: str) -> tuple[str, dict]:
 
 
 def parse_ranking(text: str, valid_chars: str = "123") -> list[str] | None:
-    """Parse 'RANKING: [best], [second], [worst]' from judge output."""
+    """Parse 'RANKING: [best], [second], [worst]' from judge output.
+
+    Returns a complete permutation of ``valid_chars`` (e.g. ``["2", "1", "3"]``).
+    Truncated, duplicate, missing, or unexpected labels return ``None``.
+    """
     for line in reversed(text.split("\n")):
         line = line.strip().strip("*").strip().lstrip("#").strip()
         if line.upper().startswith("RANKING:"):
             raw = line.split(":", 1)[1].strip()
-            items = [c for c in raw if c in valid_chars]
-            if len(items) >= 2:
-                return items
+            items = re.findall(r"\d+", raw)
+            if len(items) != len(valid_chars):
+                return None
+            if any(len(item) != 1 or item not in valid_chars for item in items):
+                return None
+            if sorted(items) != sorted(valid_chars):
+                return None
+            return items
     return None
+
+
+def _is_valid_ballot(ranking: list[str] | None, labels: list[str]) -> bool:
+    """A ballot is valid only if it is a complete permutation of ``labels``."""
+    if ranking is None:
+        return False
+    if len(ranking) != len(labels):
+        return False
+    if len(set(ranking)) != len(labels):
+        return False
+    return set(ranking) == set(labels)
 
 
 def aggregate_rankings(rankings: list[list[str] | None],
@@ -203,11 +236,10 @@ def aggregate_rankings(rankings: list[list[str] | None],
     """Borda count: each judge allocates (n-pos) points. Returns (winner, scores, valid_count)."""
     scores = {l: 0 for l in labels}
     n = len(labels)
-    valid = [r for r in rankings if r is not None]
+    valid = [r for r in rankings if _is_valid_ballot(r, labels)]
     for ranking in valid:
         for pos, label in enumerate(ranking):
-            if label in scores and pos < n:
-                scores[label] += (n - pos)
+            scores[label] += (n - pos)
     if tiebreak_winner:
         priority = {l: (0 if l == tiebreak_winner else i+1) for i, l in enumerate(labels)}
     else:
@@ -383,7 +415,6 @@ Based on NousResearch/autoreason by SHL0MS (2026).
                         help=f"Max iterations (default: {DEFAULT_MAX_PASSES})")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_DIR,
                         help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})")
-    parser.add_argument("--quiet", "-q", action="store_true", help="Less verbose output")
 
     args = parser.parse_args()
 
