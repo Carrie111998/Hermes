@@ -573,7 +573,9 @@ test('pidIsOurDashboard keeps direct launcher matching when the token argument i
 })
 
 test('pidIsOurDashboard preserves backslashes in direct launcher paths', async () => {
-  if (process.platform === 'win32') {
+  // This exercises Linux's exact /proc/<pid>/cmdline path. The Darwin fallback
+  // is deliberately fail-closed because flattened ps output loses argv boundaries.
+  if (process.platform !== 'linux') {
     return
   }
 
