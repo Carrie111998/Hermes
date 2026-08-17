@@ -315,6 +315,14 @@ class GatewayKanbanWatchersMixin:
                             getattr(platform, "value", str(platform)).lower()
                             for platform in _profile_adapter_map.keys()
                         )
+                    _relay = getattr(self, "adapters", {}).get(_Platform.RELAY)
+                    _fronts_platform = getattr(_relay, "fronts_platform", None)
+                    if callable(_fronts_platform):
+                        active_platforms.update(
+                            platform.value
+                            for platform in _Platform
+                            if platform != _Platform.RELAY and _fronts_platform(platform)
+                        )
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
@@ -435,6 +443,7 @@ class GatewayKanbanWatchersMixin:
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
+                                        notifier_profile=sub.get("notifier_profile"),
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
@@ -476,10 +485,15 @@ class GatewayKanbanWatchersMixin:
                     try:
                         plat = _Platform(platform_str)
                     except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
+                        # Unknown logical platforms fail closed. Keep the event
+                        # pending rather than silently consuming it or falling
+                        # back to an unrelated adapter.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_rewind,
+                            sub,
+                            d["cursor"],
+                            d.get("old_cursor", 0),
+                            board_slug,
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
@@ -493,6 +507,13 @@ class GatewayKanbanWatchersMixin:
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
                     adapter = self._authorization_adapter(plat, sub_profile or None)
+                    relay_delivery = False
+                    if adapter is None:
+                        relay = getattr(self, "adapters", {}).get(_Platform.RELAY)
+                        fronts_platform = getattr(relay, "fronts_platform", None)
+                        if callable(fronts_platform) and fronts_platform(plat):
+                            adapter = relay
+                            relay_delivery = True
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -513,7 +534,7 @@ class GatewayKanbanWatchersMixin:
                     # ``else`` clause) needs it even when every event in the
                     # claim was skipped before reaching the send site.
                     sub_key = (
-                        sub["task_id"], sub["platform"],
+                        sub["task_id"], sub_profile, sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
                     mode = sub.get("delivery_mode") or "notify"
@@ -633,6 +654,10 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        if sub.get("user_id") and not metadata.get("user_id"):
+                            metadata["user_id"] = sub["user_id"]
+                        if relay_delivery:
+                            metadata["_relay_logical_platform"] = platform_str
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -1025,6 +1050,7 @@ class GatewayKanbanWatchersMixin:
             _kb.advance_notify_cursor(
                 conn,
                 task_id=sub["task_id"],
+                notifier_profile=sub.get("notifier_profile"),
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
@@ -1040,6 +1066,7 @@ class GatewayKanbanWatchersMixin:
             _kb.remove_notify_sub(
                 conn,
                 task_id=sub["task_id"],
+                notifier_profile=sub.get("notifier_profile"),
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
@@ -1061,6 +1088,7 @@ class GatewayKanbanWatchersMixin:
             _kb.rewind_notify_cursor(
                 conn,
                 task_id=sub["task_id"],
+                notifier_profile=sub.get("notifier_profile"),
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",

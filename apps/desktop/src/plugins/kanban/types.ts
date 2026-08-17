@@ -122,6 +122,29 @@ export interface KanbanTaskDetail {
   runs: KanbanRun[]
 }
 
+export interface KanbanHomeChannel {
+  platform: string
+  chat_id: string
+  thread_id: string
+  name: string
+  subscribed: boolean
+  subscription_state?: 'none' | 'home' | 'other' | 'home_and_other'
+  mutable?: boolean
+}
+
+export interface StaleHomeSubscription {
+  platform: string
+  chat_id: string
+  thread_id: string
+  name: string
+  notifier_profile: string
+}
+
+export interface KanbanHomeChannelsResponse {
+  home_channels: KanbanHomeChannel[]
+  stale_home_subscriptions?: StaleHomeSubscription[]
+}
+
 /** GET /boards — every board on disk + which one is the server's current. */
 export interface BoardMeta {
   slug: string

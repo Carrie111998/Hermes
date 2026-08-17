@@ -45,6 +45,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { HomeChannelNotifications } from './home-subscriptions'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -785,6 +786,8 @@ export function TaskDrawer({
               {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
               {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
             </div>
+
+            <HomeChannelNotifications taskId={task.id} />
 
             {task.status === 'ready' && !task.assignee && !defaultAssignee && (
               <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>

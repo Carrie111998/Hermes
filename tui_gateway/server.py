@@ -9864,6 +9864,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                 _old, _new, events = _kb.claim_unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
+                    notifier_profile=sub.get("notifier_profile"),
                     platform=sub["platform"],
                     chat_id=sub["chat_id"],
                     thread_id=sub.get("thread_id") or "",
@@ -9885,6 +9886,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                         _kb.remove_notify_sub(
                             conn,
                             task_id=sub["task_id"],
+                            notifier_profile=sub.get("notifier_profile"),
                             platform=sub["platform"],
                             chat_id=sub["chat_id"],
                             thread_id=sub.get("thread_id") or "",

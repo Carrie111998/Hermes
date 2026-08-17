@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 
 
 from gateway.config import Platform
@@ -22,6 +23,11 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+
+class RecordingRelayAdapter(RecordingAdapter):
+    def fronts_platform(self, platform):
+        return platform == Platform.TELEGRAM
 
 
 class DisconnectedAdapters(dict):
@@ -168,6 +174,60 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
+def test_notifier_prefers_native_adapter_over_relay(tmp_path, monkeypatch):
+    db_path = tmp_path / "native-before-relay.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="native route", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, notifier_profile="default",
+            platform="telegram", chat_id="chat-native",
+        )
+        kb.complete_task(conn, task_id, summary="done")
+    finally:
+        conn.close()
+
+    native = RecordingAdapter()
+    relay = RecordingRelayAdapter()
+    runner = _make_runner(native)
+    runner.adapters[Platform.RELAY] = cast(Any, relay)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [item["chat_id"] for item in native.sent] == ["chat-native"]
+    assert relay.sent == []
+
+
+def test_notifier_falls_back_to_relay_for_fronted_logical_platform(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "relay-fallback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="relay route", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, notifier_profile="default",
+            platform="telegram", chat_id="chat-relay", user_id="user-1",
+            delivery_metadata={"scope_id": "scope-1"},
+        )
+        kb.complete_task(conn, task_id, summary="done")
+    finally:
+        conn.close()
+
+    relay = RecordingRelayAdapter()
+    runner = _make_runner(relay)
+    runner.adapters = cast(Any, {Platform.RELAY: relay})
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [item["chat_id"] for item in relay.sent] == ["chat-relay"]
+    assert relay.sent[0]["metadata"]["_relay_logical_platform"] == "telegram"
+    assert relay.sent[0]["metadata"]["user_id"] == "user-1"
+    assert relay.sent[0]["metadata"]["scope_id"] == "scope-1"
+
+
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     tmp_path, monkeypatch,
 ):
@@ -212,7 +272,11 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
 
     assert [delivery["chat_id"] for delivery in adapter.sent] == ["writer-chat"]
     assert owned_tid in adapter.sent[0]["text"]
-    assert len(_unseen_terminal_events_for(foreign_tid, "default-chat")) == 1
+    assert len(
+        _unseen_terminal_events_for(
+            foreign_tid, "default-chat", notifier_profile="default"
+        )
+    ) == 1
 
 
 def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
@@ -501,12 +565,13 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     assert ":group:" not in wake_key
 
 
-def _unseen_terminal_events_for(tid, chat_id):
+def _unseen_terminal_events_for(tid, chat_id, notifier_profile=None):
     conn = kb.connect()
     try:
         _, events = kb.unseen_events_for_sub(
             conn,
             task_id=tid,
+            notifier_profile=notifier_profile,
             platform="telegram",
             chat_id=chat_id,
             kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],

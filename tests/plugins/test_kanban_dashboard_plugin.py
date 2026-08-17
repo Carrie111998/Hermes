@@ -81,6 +81,189 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_home_subscription_reports_current_and_stale_profile_owned_sources(
+    client, kanban_home, monkeypatch
+):
+    from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+
+    current_home = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="new-chat",
+        thread_id="topic",
+        name="Current Telegram",
+        user_id="user-1",
+        scope_id="scope-1",
+    )
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                home_channel=current_home,
+            )
+        }
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "stale home"}
+    ).json()["task"]
+    with kb.connect() as conn:
+        kb.replace_home_notify_source(
+            conn,
+            task_id=task["id"],
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="old-chat",
+            thread_id="old-topic",
+        )
+
+    response = client.get(
+        f"/api/plugins/kanban/home-channels?task_id={task['id']}"
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["home_channels"] == [
+        {
+            "platform": "telegram",
+            "chat_id": "new-chat",
+            "thread_id": "topic",
+            "name": "Current Telegram",
+            "subscribed": False,
+            "subscription_state": "none",
+            "mutable": True,
+        }
+    ]
+    assert payload["stale_home_subscriptions"] == [
+        {
+            "platform": "telegram",
+            "chat_id": "old-chat",
+            "thread_id": "old-topic",
+            "name": "old-chat / old-topic",
+            "notifier_profile": "default",
+        }
+    ]
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/home-subscribe/telegram"
+    )
+    assert response.status_code == 200
+    with kb.connect() as conn:
+        sources = kb.list_notify_sources(conn, task["id"])
+        assert [(s["source_kind"], s["chat_id"]) for s in sources] == [
+            ("home", "new-chat")
+        ]
+        assert sources[0]["delivery_metadata"] == {
+            "scope_id": "scope-1",
+            "user_id": "user-1",
+        }
+
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: GatewayConfig())
+    response = client.delete(
+        f"/api/plugins/kanban/tasks/{task['id']}/home-subscribe/telegram"
+    )
+    assert response.status_code == 200
+    assert response.json()["delivery_active"] is False
+    with kb.connect() as conn:
+        assert kb.list_notify_subs(conn, task["id"]) == []
+
+
+def test_home_read_adopts_only_exact_passive_profile_legacy_route(
+    client, monkeypatch
+):
+    from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="current-chat",
+                    thread_id="topic",
+                    name="Current Telegram",
+                ),
+            )
+        }
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+
+    adopted_task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "adopt legacy"}
+    ).json()["task"]
+    wake_task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "retain wake legacy"}
+    ).json()["task"]
+    other_task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "other source"}
+    ).json()["task"]
+    with kb.connect() as conn:
+        for task_id, mode in (
+            (adopted_task["id"], "notify"),
+            (wake_task["id"], "notify+wake"),
+        ):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                notifier_profile="default",
+                platform="telegram",
+                chat_id="current-chat",
+                thread_id="topic",
+                delivery_mode=mode,
+                source_kind="legacy",
+                source_key="route",
+            )
+        kb.add_notify_sub(
+            conn,
+            task_id=other_task["id"],
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="current-chat",
+            thread_id="topic",
+            source_kind="manual",
+            source_key="route",
+        )
+
+    adopted = client.get(
+        f"/api/plugins/kanban/home-channels?task_id={adopted_task['id']}"
+    ).json()["home_channels"][0]
+    wake = client.get(
+        f"/api/plugins/kanban/home-channels?task_id={wake_task['id']}"
+    ).json()["home_channels"][0]
+    other = client.get(
+        f"/api/plugins/kanban/home-channels?task_id={other_task['id']}"
+    ).json()["home_channels"][0]
+
+    assert adopted["subscription_state"] == "home"
+    assert adopted["mutable"] is True
+    assert wake["subscription_state"] == "other"
+    assert wake["mutable"] is True
+    assert other["subscription_state"] == "other"
+    assert other["mutable"] is True
+
+    assert client.post(
+        f"/api/plugins/kanban/tasks/{other_task['id']}/home-subscribe/telegram"
+    ).status_code == 200
+    shared = client.get(
+        f"/api/plugins/kanban/home-channels?task_id={other_task['id']}"
+    ).json()["home_channels"][0]
+    assert shared["subscription_state"] == "home_and_other"
+    assert shared["mutable"] is False
+    detached = client.delete(
+        f"/api/plugins/kanban/tasks/{other_task['id']}/home-subscribe/telegram"
+    ).json()
+    assert detached["delivery_active"] is True
+
+    with kb.connect() as conn:
+        assert [
+            source["source_kind"]
+            for source in kb.list_notify_sources(conn, adopted_task["id"])
+        ] == ["home"]
+        assert [
+            source["source_kind"]
+            for source in kb.list_notify_sources(conn, wake_task["id"])
+        ] == ["legacy"]
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

@@ -188,7 +188,7 @@ def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     # Simulate 11 prior consecutive failures (MAX_SEND_FAILURES = 12).
     runner._kanban_sub_fail_counts = {
-        (tid, "telegram", "chat-1", ""): 11,
+        (tid, "", "telegram", "chat-1", ""): 11,
     }
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 

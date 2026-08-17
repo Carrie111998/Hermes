@@ -857,6 +857,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--platform", required=True)
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
+    p_nrm.add_argument(
+        "--notifier-profile", default=None,
+        help="Profile-owned route to remove (default: active profile)",
+    )
 
     # --- log ---
     p_log = sub.add_parser(
@@ -2977,11 +2981,24 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        notifier_profile = (
+            _profile_author()
+            if args.notifier_profile is None
+            else args.notifier_profile
+        )
         ok = kb.remove_notify_sub(
             conn, task_id=args.task_id,
+            notifier_profile=notifier_profile,
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id,
         )
+        if not ok and args.notifier_profile is None:
+            ok = kb.remove_notify_sub(
+                conn, task_id=args.task_id,
+                notifier_profile="",
+                platform=args.platform, chat_id=args.chat_id,
+                thread_id=args.thread_id,
+            )
     if not ok:
         print("(no such subscription)", file=sys.stderr)
         return 1
