@@ -10,6 +10,7 @@ import { openSession } from '@/app/open-session'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { HighlightMarked, HighlightText, MatchFieldChip } from '@/components/ui/search-highlight'
 import { OverflowTip, Tip } from '@/components/ui/tooltip'
 import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
@@ -19,6 +20,7 @@ import { compactNumber } from '@/lib/format'
 import { triggerHaptic } from '@/lib/haptics'
 import { middleClickHandlers } from '@/lib/middle-click'
 import { displayModelName } from '@/lib/model-status-label'
+import { stripHighlightMarkers } from '@/lib/search-match'
 import { sessionProjectLabel } from '@/lib/session-project-label'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
@@ -44,6 +46,7 @@ import {
   SidebarRowLeadGlyph,
   SidebarRowShell
 } from './chrome'
+import { useSessionSearchMeta } from './search-meta-context'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
 import { sessionRowDetails } from './session-row-details'
 import { resolveSessionRowClick } from './session-row-gesture'
@@ -143,6 +146,7 @@ function SidebarSessionRowImpl({
   const { t } = useI18n()
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
+  const searchMeta = useSessionSearchMeta(session.id)
   const title = sessionTitle(session)
   const density = useStore($sessionListDensity)
   const fmt = t.sidebar
@@ -328,6 +332,16 @@ function SidebarSessionRowImpl({
       </SessionActionsMenu>
     </div>
   )
+  const titleNode = searchMeta?.titleRanges?.length ? (
+    <HighlightText ranges={searchMeta.titleRanges} text={title} />
+  ) : searchMeta?.markedSnippet && !session.title?.trim() ? (
+    <HighlightMarked text={searchMeta.markedSnippet} />
+  ) : (
+    title
+  )
+  const rowTitleAttr = searchMeta?.tooltip
+    ? `${title} · ${searchMeta.fieldLabel}: ${stripHighlightMarkers(searchMeta.tooltip)}`
+    : title
 
   return (
     <SessionContextMenu
@@ -477,13 +491,16 @@ function SidebarSessionRowImpl({
                   {leadNode}
                   {handoffBadge}
                   <span className="min-w-0 flex-1 self-center">
-                    <OverflowTip label={title}>
+                    <OverflowTip label={rowTitleAttr}>
                       <SidebarRowLabel
                         className="hover-marquee block font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90"
                         onPointerEnter={armMarquee}
                         onPointerLeave={disarmMarquee}
                       >
-                        <span className="hover-marquee-inner">{title}</span>
+                        <span className="hover-marquee-inner flex min-w-0 items-center gap-1">
+                          <span className="min-w-0 truncate">{titleNode}</span>
+                          {searchMeta ? <MatchFieldChip label={searchMeta.fieldLabel} /> : null}
+                        </span>
                       </SidebarRowLabel>
                     </OverflowTip>
                     {/* Session-list density (#68119): comfortable adds one
@@ -522,13 +539,16 @@ function SidebarSessionRowImpl({
                 {/* Title + preview: ONE grouped cell with its own tight
                     internal gap — it does not inherit the card's rhythm. */}
                 <div className="-mt-[0.2em] flex min-w-0 flex-col gap-[0.3rem]">
-                  <OverflowTip label={title}>
+                  <OverflowTip label={rowTitleAttr}>
                     <SidebarRowLabel
                       className="hover-marquee text-[0.8125rem] leading-none font-medium text-(--ui-text-primary) group-data-[working=true]:text-foreground"
                       onPointerEnter={armMarquee}
                       onPointerLeave={disarmMarquee}
                     >
-                      <span className="hover-marquee-inner">{title}</span>
+                      <span className="hover-marquee-inner flex min-w-0 items-center gap-1">
+                        <span className="min-w-0 truncate">{titleNode}</span>
+                        {searchMeta ? <MatchFieldChip label={searchMeta.fieldLabel} /> : null}
+                      </span>
                     </SidebarRowLabel>
                   </OverflowTip>
                   {session.preview && rowMeta.includes('preview') ? (

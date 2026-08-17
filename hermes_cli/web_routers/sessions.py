@@ -327,16 +327,70 @@ async def search_sessions(
                 exclude_sources=exclude_list or None,
             ):
                 sid = row.get("id")
+                title = (row.get("title") or "").strip() or None
                 preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
+                snippet = preview or (f"Session ID: {sid}" if sid else "")
                 add_lineage_result(
                     sid,
                     {
                         "snippet": snippet,
+                        "title": title,
+                        "matched_on": "id",
                         "role": None,
                         "source": row.get("source"),
                         "model": row.get("model"),
                         "session_started": row.get("started_at"),
+                    },
+                )
+
+            # Title / id mid-string (Latin infix) via list_sessions_rich.search_query.
+            # Sessions table is small; catches mid-title hits FTS prefix wildcards
+            # miss on the id path alone. Forward the same source contract as
+            # ID + FTS paths so filtered dashboards stay consistent.
+            try:
+                meta_rows = db.list_sessions_rich(
+                    limit=max(safe_limit * 3, 30),
+                    offset=0,
+                    include_archived=True,
+                    order_by_last_active=True,
+                    search_query=q.strip(),
+                    compact_rows=True,
+                    source=source_filter,
+                    sources=source_list or None,
+                    exclude_sources=exclude_list or None,
+                )
+            except Exception:
+                meta_rows = []
+            for row in meta_rows:
+                if len(seen) >= safe_limit:
+                    break
+                sid = row.get("id")
+                if not sid:
+                    continue
+                title = (row.get("title") or "").strip() or None
+                preview = (row.get("preview") or "").strip()
+                needle = q.strip().lower()
+                title_l = (title or "").lower()
+                preview_l = preview.lower()
+                if title and needle in title_l:
+                    matched_on = "title"
+                    snippet = title
+                elif preview and needle in preview_l:
+                    matched_on = "preview"
+                    snippet = preview
+                else:
+                    matched_on = "meta"
+                    snippet = title or preview or f"Session ID: {sid}"
+                add_lineage_result(
+                    sid,
+                    {
+                        "snippet": snippet,
+                        "title": title,
+                        "matched_on": matched_on,
+                        "role": None,
+                        "source": row.get("source"),
+                        "model": row.get("model"),
+                        "session_started": row.get("started_at") or row.get("last_active"),
                     },
                 )
 
@@ -376,6 +430,7 @@ async def search_sessions(
                     m["session_id"],
                     {
                         "snippet": m.get("snippet", ""),
+                        "matched_on": "message",
                         "role": m.get("role"),
                         "source": m.get("source"),
                         "model": m.get("model"),
