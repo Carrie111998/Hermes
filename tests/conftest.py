@@ -1073,8 +1073,23 @@ def _live_system_guard(request, monkeypatch):
     )
     # ``curl … | sh``-style one-liners: fetch a remote script, pipe it into a
     # shell. Provider-supplied memory-backend setup snippets take this shape.
-    _REMOTE_FETCH_HEADS = ("curl", "wget", "iwr", "invoke-webrequest")
+    # ``irm``/``invoke-restmethod`` are here because PowerShell's canonical
+    # download-and-execute one-liner uses them, not ``iwr`` — their absence
+    # was half of why the cua-driver installer walked straight past this guard
+    # (see _is_powershell_remote_exec for the other half).
+    _REMOTE_FETCH_HEADS = (
+        "curl", "wget", "iwr", "invoke-webrequest", "irm", "invoke-restmethod",
+    )
     _REMOTE_SHELL_HEADS = ("sh", "bash", "zsh", "dash", "iex", "invoke-expression")
+
+    # PowerShell download-and-execute: the Windows twin of ``curl … | sh``.
+    _PS_HEADS = ("powershell", "pwsh")
+    _PS_FETCH_CMDLETS = (
+        "irm", "invoke-restmethod", "iwr", "invoke-webrequest",
+        "downloadstring", "downloadfile", "start-bitstransfer",
+    )
+    _PS_EXEC_CMDLETS = ("iex", "invoke-expression")
+    _PS_B64_RE = re.compile(r"^[A-Za-z0-9+/]{16,}={0,2}$")
 
     def _exe_head(tok: str) -> str:
         head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
@@ -1237,6 +1252,64 @@ def _live_system_guard(request, monkeypatch):
             seg.split() and _exe_head(seg.split()[0]) in _REMOTE_SHELL_HEADS
             for seg in segments[1:]
         )
+
+    def _ps_decoded_payloads(tokens):
+        """Yield decoded ``-EncodedCommand`` payloads (base64 UTF-16LE).
+
+        Without this the guard is one flag away from being bypassed: the exact
+        same one-liner survives verbatim as
+        ``powershell -EncodedCommand <base64>``. Every token is tried rather
+        than parsing the flag name, because PowerShell accepts any unambiguous
+        prefix (``-e``, ``-en``, ``-enc``, …); a token that is not valid base64
+        UTF-16LE simply yields nothing. Only reached once the head is already
+        known to be PowerShell, so this costs nothing on other spawns.
+        """
+        import base64 as _b64
+
+        for tok in tokens:
+            if not _PS_B64_RE.match(tok):
+                continue
+            try:
+                raw = _b64.b64decode(tok, validate=True)
+            except Exception:
+                continue
+            yield raw.decode("utf-16-le", errors="ignore").lower()
+
+    def _is_powershell_remote_exec(cmd) -> bool:
+        """True if *cmd* is PowerShell fetching a remote script and running it.
+
+        ``_is_remote_installer_pipe`` cannot see this shape. It splits the
+        command on ``|`` and requires a fetch verb to HEAD a segment, but in
+        ``powershell -Command "irm … | iex"`` the whole pipeline sits inside a
+        single argv element, so segment 0 is headed by ``powershell`` and the
+        fetch verb heads nothing. ``iex (irm …)`` has no pipe at all.
+
+        This is the gap the 2026-08-16 incident fell through: a test stub
+        pointed at a not-yet-called seam let
+        ``hermes_cli/tools_config.py``'s real
+        ``powershell -Command "irm …/install.ps1 | iex"`` run against the
+        network and hang the session, with this guard sitting directly
+        underneath it saying nothing.
+
+        Requires ALL THREE of a URL, a fetch cmdlet and an exec cmdlet — so the
+        in-repo PowerShell callers that merely query CIM or format JSON
+        (``hermes_cli/claw.py``, ``session_bridge/mcp_server.py``,
+        ``tools/environments/local.py``) keep working. A command that only
+        mentions a URL is not blocked.
+        """
+        tokens = _cmd_words(cmd)
+        if not tokens or _exe_head(tokens[0]) not in _PS_HEADS:
+            return False
+        payloads = [" ".join(tokens[1:]).lower()]
+        payloads.extend(_ps_decoded_payloads(tokens[1:]))
+        for text in payloads:
+            if "://" not in text:
+                continue
+            if not any(f in text for f in _PS_FETCH_CMDLETS):
+                continue
+            if any(re.search(rf"\b{e}\b", text) for e in _PS_EXEC_CMDLETS):
+                return True
+        return False
 
     def _cmd_to_string(cmd) -> str:
         if cmd is None:
@@ -1476,6 +1549,24 @@ def _live_system_guard(request, monkeypatch):
                 "'<that module>.run_text_capture' instead. Mark with "
                 "@pytest.mark.live_system_guard_bypass only if a real "
                 "package install is genuinely the point."
+            )
+        if _is_powershell_remote_exec(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this is PowerShell's "
+                "download-and-execute one-liner (irm/iwr/DownloadString piped "
+                "or passed into iex). It runs whatever the remote host serves, "
+                "on this machine, from a test run. On 2026-08-16 exactly this "
+                "argv — hermes_cli/tools_config.py's cua-driver install, "
+                "'irm .../install.ps1 | iex' — escaped a stub that was pointed "
+                "at a seam the code did not call yet, reached the network, and "
+                "hung the session on the capture-pipe reader thread. Patch the "
+                "transport too: stub 'subprocess.Popen' (which every helper "
+                "bottoms out in) alongside "
+                "'hermes_cli._subprocess_compat.run_text_capture', so a dead "
+                "seam fails closed instead of shelling out. Mark with "
+                "@pytest.mark.live_system_guard_bypass only if genuinely "
+                "intended."
             )
         if _is_remote_installer_pipe(cmd):
             raise RuntimeError(

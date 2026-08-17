@@ -20,6 +20,7 @@ quietly shelling out to the network.
 """
 
 import subprocess
+import sys
 
 import pytest
 
@@ -88,3 +89,123 @@ def test_command_merely_mentioning_npm_is_not_blocked():
         ["cmd", "/c", "echo", "run npm install to continue"], timeout=30
     )
     assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# PowerShell download-and-execute
+# ---------------------------------------------------------------------------
+#
+# Same hazard as ``curl … | sh``, but invisible to _is_remote_installer_pipe
+# for two independent reasons, both real:
+#
+#   1. ``irm`` (Invoke-RestMethod) was simply absent from _REMOTE_FETCH_HEADS,
+#      which listed only curl/wget/iwr/invoke-webrequest.
+#   2. Even with it listed, the detector requires the fetch verb to HEAD a
+#      pipeline segment. In ``powershell -Command "irm … | iex"`` the whole
+#      pipeline lives inside one argv token, so splitting on "|" leaves
+#      ``powershell`` heading segment 0 and ``irm`` never heads anything.
+#
+# This is not hypothetical. On 2026-08-16, writing the RED test for the
+# cua-driver capture-pipe fix, a stub pointed at a not-yet-called seam let
+# `hermes_cli/tools_config.py`'s real
+# ``powershell -Command "irm …/install.ps1 | iex"`` execute against the
+# network and hang the session. The guard sat right underneath and said
+# nothing.
+#
+# Every URL below uses a `.invalid` host (RFC 2606 — guaranteed not to
+# resolve), so if the guard ever stops firing these tests fail fast instead of
+# fetching and executing a remote script the way the incident did.
+
+_PS_INSTALL_URL = (
+    "https://raw.githubusercontent.invalid/trycua/cua/main/"
+    "libs/cua-driver/scripts/install.ps1"
+)
+
+
+def test_powershell_irm_pipe_iex_is_blocked():
+    """The exact shape hermes_cli/tools_config.py hands the cua-driver."""
+    with pytest.raises(RuntimeError, match=_GUARD):
+        run_text_capture(
+            [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-Command", f"irm {_PS_INSTALL_URL} | iex",
+            ],
+            timeout=5,
+        )
+
+
+def test_powershell_iex_wrapping_irm_is_blocked():
+    """``iex (irm …)`` has no pipe at all, so a "|"-based check cannot see it."""
+    with pytest.raises(RuntimeError, match=_GUARD):
+        run_text_capture(
+            ["pwsh", "-NoProfile", "-Command", f"iex (irm {_PS_INSTALL_URL})"],
+            timeout=5,
+        )
+
+
+def test_powershell_downloadstring_iex_is_blocked():
+    """The pre-``irm`` idiom, still all over the internet."""
+    with pytest.raises(RuntimeError, match=_GUARD):
+        run_text_capture(
+            [
+                "powershell", "-Command",
+                f"iex ((New-Object Net.WebClient).DownloadString('{_PS_INSTALL_URL}'))",
+            ],
+            timeout=5,
+        )
+
+
+def test_powershell_encoded_command_is_blocked():
+    """``-EncodedCommand`` is base64 UTF-16LE — the obvious way past a
+    substring check on the argv. Decode before deciding, or the guard is
+    one flag away from being bypassed."""
+    import base64
+
+    script = f"iex (irm {_PS_INSTALL_URL})"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    with pytest.raises(RuntimeError, match=_GUARD):
+        run_text_capture(
+            ["powershell", "-NoProfile", "-EncodedCommand", encoded],
+            timeout=5,
+        )
+
+
+def test_powershell_shell_string_form_is_blocked():
+    with pytest.raises(RuntimeError, match=_GUARD):
+        run_text_capture(
+            f'powershell -NoProfile -Command "irm {_PS_INSTALL_URL} | iex"',
+            timeout=5, shell=True,
+        )
+
+
+# --- the other half: this must not become a blanket ban on PowerShell -------
+#
+# Three real in-repo callers pass -Command scripts and must keep working:
+# hermes_cli/claw.py:96 (Get-CimInstance), session_bridge/mcp_server.py:1273
+# (SID lookup + ConvertTo-Json), tools/environments/local.py:749
+# (Get-ProcessMitigation). None fetches anything. The predicate therefore
+# requires ALL THREE of: a URL, a fetch cmdlet, and an exec cmdlet.
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"), reason="powershell.exe is Windows-only"
+)
+def test_plain_powershell_command_is_not_blocked():
+    run_text_capture(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+        timeout=60,
+    )
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"), reason="powershell.exe is Windows-only"
+)
+def test_powershell_merely_printing_a_url_is_not_blocked():
+    """A URL alone must not trip it, or every diagnostic that echoes a link
+    becomes unrunnable."""
+    run_text_capture(
+        [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Write-Output 'docs at https://example.invalid/help'",
+        ],
+        timeout=60,
+    )
