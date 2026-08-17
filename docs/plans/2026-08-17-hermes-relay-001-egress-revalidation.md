@@ -255,23 +255,28 @@ runtime health, and delivery evidence.
   failures. This is `BLOCKED`, not a reviewer PASS.
 - Implementation: `AUTHORIZED`, isolated checkout only; Relay remains disabled
   by default and DGX was not modified.
-- Focused tests: `PASS`; `27 passed` across the Relay revalidation and
-  tool-call guardrail slices; compileall and `git diff --check` passed.
+- Focused tests: `PASS`; `26 passed` on the origin/main publish baseline,
+  including the Relay revalidation, tool-call guardrail, and dashboard schema
+  invariant; compileall and `git diff --check` passed.
 - Related plugin slice: `83 passed, 1 failed`; the single Nemo initialization
   failure reproduced identically on clean committed HEAD `9d1dbb2bb` and the
   implementation checkout. It is excluded under waiver
   `HERMES-RELAY-001-NEMO-BASELINE-WAIVER-20260817` and is not treated as
   implementation evidence.
 - Implementation review packet SHA-256:
-  `7BE0A28FFCEC836F76A7BD379DF0C7A0A06ABFB0FA15767ED064221E8E9CE60A`.
-- Claude implementation review: `PASS` on the same corrected metadata-only
-  packet after two evidence correction rounds; no correction set remains.
-- AGY implementation review: `PASS` on the exact same packet in the
+  `97A8B7D61B53D129ED1299EC97852CA608D0D017CA14547921FC51A01B155895`.
+- CI correction: run `32016400492` failed only because the new single Relay
+  dashboard category violated the existing schema invariant; the correction
+  folds `relay` into `security` without enabling Relay.
+- Claude implementation re-review: `PASS` on the same corrected
+  metadata-only packet; no correction set remains.
+- AGY implementation re-review: `PASS` on the exact same packet in the
   authenticated DGX Spark `/home/cwliao/.hermes` environment; no correction
   set remains.
 - Latest packet SHA-256 and plan SHA-256 are recorded in the session evidence;
   no older verdict is carried forward after a packet change.
-- CI: `NOT_RUN`
+- CI: `FAILED` run `32016400492` (`Python tests / Run tests slice 4/8`,
+  pre-correction); rerun pending after the schema correction.
 - Merge: `NOT_AUTHORIZED`
 - DGX deployment: `NOT_AUTHORIZED`
 - Relay enablement: `NOT_AUTHORIZED`
