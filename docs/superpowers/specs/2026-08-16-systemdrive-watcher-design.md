@@ -403,20 +403,35 @@ Ran against a fresh, never-reused sentinel directory, default 100 ms cadence, re
 tuned or cherry-picked — cadence was left at the shipped default across all 8 trials
 and the 3 misses are reported as misses.
 
-### A second, previously-undocumented limitation: `ring_cwd_matches` raced the writer's own `chdir`
+### `ring_cwd_matches` and the `chdir` race — measured, then CORRECTED
 
-The spec already documents that a process which exits before enrichment has no
-recoverable `cwd` (see "The `cwd` discriminator" above). This measurement found a
-**different** failure mode in the same field: **`ring_cwd_matches` was empty in all 8
-trials — including all 5 successes.** In every successful attribution, the captured
-`cwd` was the *writer's parent's* cwd, not the sentinel directory, because the
-sampler's enrichment read `proc.cwd()` before the child process had executed its own
-`os.chdir()` — a race between two independent processes, not a dead one. The `cmdline`
-was still fully readable in those 5 cases (it names the target directory as `argv[1]`
-regardless of `cwd`), so attribution still succeeded — but **only because a human read
-the full ring dump, not the pre-filtered `ring_cwd_matches` field.** Relying on
-`ring_cwd_matches` alone would have shown 0/8 and looked like a total failure of the
-instrument, when the raw ring array had the answer in 5/8.
+**First measurement (2026-08-17):** `ring_cwd_matches` was empty in all 8 trials,
+including all 5 successes. In every successful attribution the captured `cwd` was the
+*writer's parent's* cwd, not the sentinel, because the sampler read `proc.cwd()` before
+the child had executed its own `os.chdir()`. Attribution still succeeded, but only from
+the raw ring array's `cmdline`, not from the pre-filtered field.
+
+**Correction, same day — that 0/8 is an artifact of the REPRODUCER, not a property of
+the instrument, and the distinction matters because the wrong reading would retire a
+working discriminator.** The stub spawned a process that *then* chdir'd into the target.
+The established mechanism is the opposite: the writer **inherits** `cwd = repo_root`
+from its parent and never chdirs — that inheritance is the whole reason the junk lands
+in the checkout root. Re-measured with both shapes, one cadence tick, otherwise
+identical:
+
+| Writer shape | Present in ring | `ring_cwd_matches` |
+|---|---|---|
+| `chdir` after spawn (the Task 7 stub) | 4/4 | **0/4** |
+| **inherits `cwd` at spawn (the real mechanism)** | 4/4 | **3/4** |
+
+So the `cwd` discriminator **works for the shape that actually matters**. It fails only
+against a writer that changes directory after starting — a shape not yet observed here,
+and one that would additionally have to defeat the inheritance mechanism to be relevant.
+
+The operational guidance below is unchanged and still correct: the filtered field is a
+shortcut, and the raw ring is the evidence. But do not conclude from the 0/8 that the
+discriminator is broken — measured against the real writer shape it is the thing that
+turns ~1000 processes into a shortlist, exactly as designed.
 
 **Guidance for a future hunter:** read the whole `ring` array from the sidecar
 snapshot (or the ring dump attached to `SIGHTING`), matching on `cmdline` substrings,
