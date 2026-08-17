@@ -9612,7 +9612,12 @@ def _call_llm_impl(
                     # alternative providers can still serve the request.
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        # Pass the key used for the retry so
+                        # mark_exhausted_and_rotate targets the correct entry.
+                        # Without this, the pool falls back to pool.current()
+                        # which may point at a DIFFERENT healthy entry, marking
+                        # it exhausted with the wrong account's error (#43747).
+                        _recover_provider_pool(pool_provider, retry2_err, failed_api_key=resolved_api_key or "")
                         first_err = retry2_err
                     else:
                         raise
@@ -10308,7 +10313,12 @@ async def _async_call_llm_impl(
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        # Pass the key used for the retry so
+                        # mark_exhausted_and_rotate targets the correct entry.
+                        # Without this, the pool falls back to pool.current()
+                        # which may point at a DIFFERENT healthy entry, marking
+                        # it exhausted with the wrong account's error (#43747).
+                        _recover_provider_pool(pool_provider, retry2_err, failed_api_key=resolved_api_key or "")
                         first_err = retry2_err
                     else:
                         raise
