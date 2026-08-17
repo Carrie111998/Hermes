@@ -29411,15 +29411,26 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
 
     # Disk retention sweep cadence (config: disk.retention.sweep_interval_minutes)
     # — OOF-250 / OOF-269: hosted instances must never fill their volume.
+    # Import failure disables the sweep (module genuinely unavailable); a
+    # config problem must NOT — get_disk_config() sanitizes every knob and
+    # falls back to shipped defaults, so a malformed config.yaml can never
+    # silently turn retention off.
     try:
         from hermes_cli.disk_retention import get_disk_config, sweep_and_log
-        _sweep_minutes = int(
-            get_disk_config()["retention"].get("sweep_interval_minutes", 30)
-        )
     except Exception as e:
-        logger.debug("Disk retention config load failed: %s", e)
+        logger.warning("Disk retention unavailable (import failed): %s", e)
         sweep_and_log = None
-        _sweep_minutes = 30
+    _sweep_minutes = 30
+    if sweep_and_log is not None:
+        try:
+            _sweep_minutes = int(
+                get_disk_config()["retention"].get("sweep_interval_minutes", 30)
+            )
+        except Exception as e:
+            logger.warning(
+                "Disk retention config load failed (using %dm default): %s",
+                _sweep_minutes, e,
+            )
     # Convert minutes -> ticks at the configured interval (min 1 tick).
     DISK_SWEEP_EVERY = max(1, (_sweep_minutes * 60) // max(1, interval))
     logger.info("Gateway housekeeping started (interval=%ds)", interval)

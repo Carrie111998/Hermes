@@ -232,7 +232,7 @@ class TestDiskUsageSummary:
         _write(home / "logs" / "agent.log", 5_000)
         _write(home / "sessions" / "x.jsonl", 3_000)
         _write(home / "state.db", 2_000)
-        _write(home / "state.db.malformed-20260817", 1_000)
+        _write(home / "state.db.malformed-backup-20260817_000000", 1_000)
         summary = dr.disk_usage_summary(home)
         assert summary["logs"] >= 5_000
         assert summary["sessions"] >= 3_000
@@ -274,13 +274,15 @@ class TestRetentionSweep:
         assert backup.stat().st_size >= 5_000_000
 
     def test_prunes_db_malformed_backups(self, home):
+        # Uses the exact writer contract from hermes_state._backup_db_file:
+        # state.db.malformed-backup-<stamp> (+ optional -wal/-shm sidecars).
         files = []
         for i in range(8):
-            f = _write(home / f"state.db.malformed-2026081{i}", 100)
+            f = _write(home / f"state.db.malformed-backup-2026081{i}_000000", 100)
             _age(f, days=20 + i)
             files.append(f)
         report = dr.run_retention_sweep(home, _cfg())
-        survivors = list(home.glob("state.db.malformed-*"))
+        survivors = list(home.glob("state.db.malformed-backup-*"))
         assert len(survivors) == 5  # keep_count default
         assert report["families"]["db_backups"]["files_removed"] == 3
 
@@ -364,3 +366,217 @@ class TestSweepAndLog:
              caplog.at_level("WARNING", logger=dr.__name__):
             dr.sweep_and_log()
         assert any("low_space=True" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial hardening (independent review round: symlink/hardlink escape,
+# backup family contract, config sanitization, unlink accounting)
+# ---------------------------------------------------------------------------
+
+
+class TestTruncationInodeSafety:
+    """The hard contract: retention must never mutate protected inodes,
+    even when a swept directory contains a link pointing at them."""
+
+    def test_symlink_to_state_db_is_refused(self, home):
+        db = home / "state.db"
+        db.write_bytes(b"X" * 10_000)
+        evil = home / "logs" / "evil.log"
+        evil.symlink_to("../state.db")
+        got = dr.truncate_log_tail(evil, max_bytes=1_000, keep_bytes=100, home=home)
+        assert got == 0
+        assert db.stat().st_size == 10_000
+
+    def test_hardlink_to_state_db_is_refused(self, home):
+        db = home / "state.db"
+        db.write_bytes(b"X" * 10_000)
+        evil = home / "logs" / "evil2.log"
+        os.link(db, evil)
+        got = dr.truncate_log_tail(evil, max_bytes=1_000, keep_bytes=100, home=home)
+        assert got == 0
+        assert db.stat().st_size == 10_000
+
+    def test_symlink_to_unprotected_file_outside_home_is_refused(self, home, tmp_path):
+        target = tmp_path / "other.log"
+        target.write_bytes(b"Y" * 10_000)
+        evil = home / "logs" / "link.log"
+        evil.symlink_to(target)
+        got = dr.truncate_log_tail(evil, max_bytes=1_000, keep_bytes=100, home=home)
+        assert got == 0
+        assert target.stat().st_size == 10_000
+
+    def test_sweep_with_hostile_links_never_touches_state_db(self, home):
+        db = home / "state.db"
+        db.write_bytes(b"D" * 5_000_000)
+        (home / "logs" / "sneaky.log").symlink_to("../state.db")
+        try:
+            os.link(db, home / "logs" / "sneaky2.log")
+        except OSError:
+            pass
+        report = dr.run_retention_sweep(home=home)
+        assert db.stat().st_size == 5_000_000
+        assert isinstance(report, dict)
+
+    def test_fifo_is_refused(self, home):
+        fifo = home / "logs" / "pipe.log"
+        try:
+            os.mkfifo(fifo)
+        except (AttributeError, OSError):
+            pytest.skip("mkfifo unavailable")
+        got = dr.truncate_log_tail(fifo, max_bytes=0, keep_bytes=0, home=home)
+        assert got == 0
+
+
+class TestPruneLinkSafety:
+    def test_prune_skips_symlinks_and_hardlinks(self, home):
+        db = home / "state.db"
+        db.write_bytes(b"Z" * 1_000)
+        d = home / "cache" / "audio"
+        link = d / "old-link.mp3"
+        link.symlink_to(db)
+        hard = d / "old-hard.mp3"
+        os.link(db, hard)
+        _age(link, 30)
+        _age(hard, 30)
+        removed, _ = dr.prune_files(d.iterdir(), max_age_days=1, home=home)
+        assert removed == 0
+        assert db.exists() and db.stat().st_size == 1_000
+
+
+class TestDbBackupFamily:
+    """prune_db_backup_family honours the hermes_state writer contract:
+    exact prefix, base+sidecars as one unit, keep-count in sets."""
+
+    def _mk_set(self, home, stamp: str, *, age_days: float = 0.0):
+        base = home / f"state.db.malformed-backup-{stamp}"
+        base.write_bytes(b"B" * 100)
+        wal = home / (base.name + "-wal")
+        wal.write_bytes(b"W" * 50)
+        if age_days:
+            _age(base, age_days)
+            _age(wal, age_days)
+        return base, wal
+
+    def test_keeps_newest_sets_with_sidecars(self, home):
+        for i in range(8):
+            self._mk_set(home, f"2026010{i}_000000", age_days=90)
+        removed, reclaimed = dr.prune_db_backup_family(
+            home, keep_count=5, max_age_days=14
+        )
+        bases = sorted(
+            p.name for p in home.glob("state.db.malformed-backup-*")
+            if not p.name.endswith(("-wal", "-shm"))
+        )
+        wals = sorted(
+            p.name for p in home.glob("state.db.malformed-backup-*-wal")
+        )
+        assert len(bases) == 5
+        assert len(wals) == 5
+        for w in wals:
+            assert w[: -len("-wal")] in bases, f"orphaned sidecar {w}"
+        assert removed == 6  # 3 bases + 3 wals
+        assert reclaimed == 3 * 150
+
+    def test_prefix_neighbours_never_match(self, home):
+        for name in ("state.db.repair-attempts.json", "state.db-wal",
+                     "state.db.corrupt.abc.bak"):
+            f = home / name
+            f.write_bytes(b"N")
+            _age(f, 365)
+        self._mk_set(home, "20260101_000000", age_days=365)
+        dr.prune_db_backup_family(home, keep_count=0, max_age_days=1)
+        assert (home / "state.db.repair-attempts.json").exists()
+        assert (home / "state.db-wal").exists()
+        assert (home / "state.db.corrupt.abc.bak").exists()
+
+    def test_orphaned_sidecar_pruned_once_expired(self, home):
+        orphan = home / "state.db.malformed-backup-20260101_000000-wal"
+        orphan.write_bytes(b"W" * 10)
+        _age(orphan, 365)
+        removed, _ = dr.prune_db_backup_family(home, keep_count=5, max_age_days=14)
+        assert removed == 1
+        assert not orphan.exists()
+
+    def test_fresh_sets_kept_even_beyond_keep_count(self, home):
+        for i in range(8):
+            self._mk_set(home, f"2026010{i}_000000")  # fresh mtime
+        removed, _ = dr.prune_db_backup_family(home, keep_count=5, max_age_days=14)
+        assert removed == 0
+
+
+class TestConfigSanitization:
+    def _with_user_config(self, monkeypatch, disk_section):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"disk": disk_section},
+        )
+
+    def test_malformed_values_fall_back_to_defaults(self, home, monkeypatch):
+        self._with_user_config(monkeypatch, {
+            "retention": {
+                "diag_log_max_bytes": "x",
+                "diag_log_keep_bytes": None,
+                "cache_max_age_hours": {},
+                "db_backup_keep_count": float("nan"),
+                "sweep_interval_minutes": -5,
+            },
+            "low_space": {"min_free_bytes": "lots", "min_free_percent": [1]},
+        })
+        cfg = dr.get_disk_config()
+        d = dr._DEFAULT_DISK_CONFIG
+        assert cfg["retention"]["diag_log_max_bytes"] == d["retention"]["diag_log_max_bytes"]
+        assert cfg["retention"]["diag_log_keep_bytes"] == d["retention"]["diag_log_keep_bytes"]
+        assert cfg["retention"]["cache_max_age_hours"] == d["retention"]["cache_max_age_hours"]
+        assert cfg["retention"]["db_backup_keep_count"] == d["retention"]["db_backup_keep_count"]
+        assert cfg["retention"]["sweep_interval_minutes"] == d["retention"]["sweep_interval_minutes"]
+        assert cfg["low_space"]["min_free_bytes"] == d["low_space"]["min_free_bytes"]
+        assert cfg["low_space"]["min_free_percent"] == d["low_space"]["min_free_percent"]
+
+    def test_negative_sizes_never_weaponize_truncation(self, home, monkeypatch):
+        self._with_user_config(monkeypatch, {
+            "retention": {"diag_log_max_bytes": -1, "diag_log_keep_bytes": -1},
+        })
+        cfg = dr.get_disk_config()
+        assert cfg["retention"]["diag_log_max_bytes"] >= 4096
+        assert cfg["retention"]["diag_log_keep_bytes"] >= 0
+
+    def test_string_false_disables(self, home, monkeypatch):
+        self._with_user_config(monkeypatch, {"retention": {"enabled": "false"}})
+        assert dr.get_disk_config()["retention"]["enabled"] is False
+
+    def test_string_true_enables(self, home, monkeypatch):
+        self._with_user_config(monkeypatch, {"retention": {"enabled": "true"}})
+        assert dr.get_disk_config()["retention"]["enabled"] is True
+
+    def test_unknown_string_uses_default(self, home, monkeypatch):
+        self._with_user_config(monkeypatch, {"retention": {"enabled": "maybe"}})
+        assert dr.get_disk_config()["retention"]["enabled"] is True
+
+
+class TestUnlinkAccounting:
+    def test_failed_unlink_does_not_over_delete_newer_files(self, home):
+        d = home / "cache" / "audio"
+        files = []
+        for i in range(5):
+            f = d / f"f{i}.mp3"
+            f.write_bytes(b"A" * 100)
+            _age(f, 5 - i)  # f0 oldest
+            files.append(f)
+
+        real_unlink = dr._unlink
+        blocked = files[0]
+
+        def flaky_unlink(path):
+            if path == blocked:
+                return False
+            return real_unlink(path)
+
+        with patch.object(dr, "_unlink", side_effect=flaky_unlink):
+            removed, _ = dr.prune_files(
+                d.iterdir(), max_total_bytes=350, home=home
+            )
+        # Budget needs 150 bytes freed => oldest two candidates (f0 blocked,
+        # f1 removed). f2..f4 must survive — no compensation deletes.
+        assert files[1].exists() is False
+        assert all(f.exists() for f in (files[2], files[3], files[4]))
+        assert removed == 1

@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat as stat_mod
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -119,7 +120,89 @@ def get_disk_config() -> Dict[str, Any]:
                 merged[section].update(sub)
     except Exception:  # noqa: BLE001 — config problems must not break retention
         pass
-    return merged
+    return _sanitize_disk_config(merged)
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """Tolerant bool coercion: YAML-ish strings never silently mean True."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "yes", "on", "1"):
+            return True
+        if lowered in ("false", "no", "off", "0"):
+            return False
+    return default
+
+
+def _coerce_number(value: Any, default: float, *, minimum: float = 0.0) -> float:
+    """Coerce a config knob to a finite non-negative number, else default.
+
+    Malformed values (strings, None, dicts, negatives, NaN) fall back to the
+    shipped default with a WARNING — one bad knob must never disable or
+    weaponize retention (e.g. a negative size truncating everything).
+    """
+    try:
+        if isinstance(value, bool):
+            raise TypeError("bool is not a size/duration")
+        num = float(value)
+        if num != num or num in (float("inf"), float("-inf")):
+            raise ValueError("non-finite")
+        if num < minimum:
+            raise ValueError("below minimum")
+        return num
+    except (TypeError, ValueError):
+        logger.warning(
+            "disk retention config value %r invalid; using default %r",
+            value,
+            default,
+        )
+        return default
+
+
+def _sanitize_disk_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Clamp every knob to a sane value so user config can't break the sweep."""
+    d = _DEFAULT_DISK_CONFIG
+    ret = cfg.get("retention") or {}
+    low = cfg.get("low_space") or {}
+    dret = d["retention"]
+    dlow = d["low_space"]
+    return {
+        "retention": {
+            "enabled": _coerce_bool(ret.get("enabled"), dret["enabled"]),
+            "sweep_interval_minutes": int(_coerce_number(
+                ret.get("sweep_interval_minutes"),
+                dret["sweep_interval_minutes"], minimum=1)),
+            "diag_log_max_bytes": int(_coerce_number(
+                ret.get("diag_log_max_bytes"),
+                dret["diag_log_max_bytes"], minimum=4096)),
+            "diag_log_keep_bytes": int(_coerce_number(
+                ret.get("diag_log_keep_bytes"),
+                dret["diag_log_keep_bytes"], minimum=0)),
+            "cache_max_age_hours": _coerce_number(
+                ret.get("cache_max_age_hours"),
+                dret["cache_max_age_hours"], minimum=1.0),
+            "db_backup_keep_count": int(_coerce_number(
+                ret.get("db_backup_keep_count"),
+                dret["db_backup_keep_count"], minimum=0)),
+            "db_backup_max_age_days": _coerce_number(
+                ret.get("db_backup_max_age_days"),
+                dret["db_backup_max_age_days"], minimum=1.0),
+            "pkg_cache_max_age_days": _coerce_number(
+                ret.get("pkg_cache_max_age_days"),
+                dret["pkg_cache_max_age_days"], minimum=1.0),
+        },
+        "low_space": {
+            "min_free_bytes": int(_coerce_number(
+                low.get("min_free_bytes"), dlow["min_free_bytes"], minimum=0)),
+            "min_free_percent": _coerce_number(
+                low.get("min_free_percent"), dlow["min_free_percent"],
+                minimum=0.0),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +214,15 @@ def _is_protected(path: Path, home: Path) -> bool:
     if path.name in _PROTECTED_NAMES:
         return True
     try:
-        rel = path.resolve().relative_to(home.resolve())
+        resolved = path.resolve()
+    except (ValueError, OSError):
+        return True
+    # A symlink whose TARGET is a protected file (e.g. logs/evil.log ->
+    # ../state.db) must be refused even though the link name looks safe.
+    if resolved.name in _PROTECTED_NAMES:
+        return True
+    try:
+        rel = resolved.relative_to(home.resolve())
     except (ValueError, OSError):
         # Outside HERMES_HOME — refuse to touch it.
         return True
@@ -154,23 +245,61 @@ def truncate_log_tail(
     Keeps the last *keep_bytes* (aligned to the next newline) prefixed with a
     truncation marker.  Returns bytes reclaimed (0 when under the cap).
 
+    Known-lossy race: bytes appended by an O_APPEND writer between the tail
+    read and ``truncate()`` are discarded with the head.  Acceptable for the
+    diagnostic log families this sweeps (loss window is microseconds, files
+    are best-effort forensics); do NOT point this at data that must survive.
+
     In-place truncation (open "rb+", rewrite, ftruncate) frees disk space
     immediately even if another process holds the file open — unlike unlink,
     which leaves a deleted-but-open file consuming space (OOF-2).
+
+    Hard safety contract: the fd we mutate is verified to be a regular file
+    with a single hard link, opened with O_NOFOLLOW.  A symlink placed in a
+    swept directory (``logs/evil.log -> ../state.db``) is refused by the
+    kernel; a hardlink to a protected file (``st_nlink > 1``) is refused by
+    the fstat check.  All truncation happens through the verified fd — there
+    is no path-based reopen after the check (no TOCTOU window).
     """
     home = home or get_hermes_home()
     if _is_protected(path, home):
         return 0
     try:
-        size = path.stat().st_size
+        lst = os.lstat(path)
     except OSError:
         return 0
-    if size <= max_bytes:
+    if stat_mod.S_ISLNK(lst.st_mode) or not stat_mod.S_ISREG(lst.st_mode):
+        logger.warning("disk retention: refusing non-regular file %s", path)
+        return 0
+    if lst.st_nlink != 1:
+        # A hardlink shares its inode with another name — possibly a
+        # protected file. Never mutate multi-linked inodes.
+        logger.warning(
+            "disk retention: refusing hardlinked file %s (nlink=%d)",
+            path, lst.st_nlink,
+        )
         return 0
 
-    keep_bytes = max(0, min(keep_bytes, max_bytes))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        with open(path, "rb+") as f:
+        fd = os.open(str(path), os.O_RDWR | nofollow)
+    except OSError as exc:
+        logger.debug("truncate_log_tail(%s) open failed: %s", path, exc)
+        return 0
+    try:
+        fst = os.fstat(fd)
+        if not stat_mod.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+            logger.warning(
+                "disk retention: refusing %s post-open (mode=%o nlink=%d)",
+                path, fst.st_mode, fst.st_nlink,
+            )
+            return 0
+        size = fst.st_size
+        if size <= max_bytes:
+            return 0
+
+        keep_bytes = max(0, min(keep_bytes, max_bytes))
+        with os.fdopen(fd, "rb+", closefd=False) as f:
             f.seek(size - keep_bytes)
             tail = f.read(keep_bytes)
             # Start the kept tail at a line boundary for readable logs.
@@ -181,11 +310,16 @@ def truncate_log_tail(
             f.write(_TRUNCATION_MARKER)
             f.write(tail)
             f.truncate()
-        new_size = path.stat().st_size
+        new_size = os.fstat(fd).st_size
         return max(0, size - new_size)
     except OSError as exc:
-        logger.debug("truncate_log_tail(%s) failed: %s", path, exc)
+        logger.warning("truncate_log_tail(%s) failed: %s", path, exc)
         return 0
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def prune_files(
@@ -210,10 +344,14 @@ def prune_files(
         if _is_protected(p, home):
             continue
         try:
-            st = p.stat()
+            st = p.lstat()
         except OSError:
             continue
-        if not p.is_file():
+        # Regular files only: symlinks are never followed (deleting one is
+        # harmless but its stat lies about size), and multi-linked inodes
+        # share their data with another name — pruning them reclaims nothing
+        # and may surprise the other owner.
+        if not stat_mod.S_ISREG(st.st_mode) or st.st_nlink != 1:
             continue
         entries.append((p, st.st_mtime, st.st_size))
 
@@ -241,13 +379,15 @@ def prune_files(
     if max_total_bytes is not None:
         total = sum(size for _, _, size in survivors)
         # Remove oldest first (end of the newest-first list), but never dip
-        # into the protected keep_count head.
+        # into the protected keep_count head.  A failed unlink is treated as
+        # unreclaimable — we do NOT delete additional newer files to
+        # compensate (that would over-delete while the cap is never met).
         while total > max_total_bytes and len(survivors) > keep:
             p, _, size = survivors.pop()
             if _unlink(p):
                 removed += 1
                 reclaimed += size
-                total -= size
+            total -= size
 
     return removed, reclaimed
 
@@ -257,8 +397,106 @@ def _unlink(path: Path) -> bool:
         path.unlink()
         return True
     except OSError as exc:
-        logger.debug("retention unlink(%s) failed: %s", path, exc)
+        logger.warning("retention unlink(%s) failed: %s", path, exc)
         return False
+
+
+_DB_BACKUP_PREFIX = "state.db.malformed-backup-"
+_DB_BACKUP_SIDECAR_SUFFIXES = ("-wal", "-shm")
+
+
+def prune_db_backup_family(
+    home: Path,
+    *,
+    keep_count: int,
+    max_age_days: float,
+) -> Tuple[int, int]:
+    """Prune forensic state.db backups honouring the writer's contract.
+
+    ``hermes_state._backup_db_file`` writes ``state.db.malformed-backup-<ts>``
+    plus optional ``-wal``/``-shm`` sidecars.  A backup and its sidecars are
+    ONE retention unit: keep-count is counted in backup *sets*, and a pruned
+    base always takes its sidecars with it (no orphaned WAL/SHM files).
+
+    Exact-prefix enumeration only — never a broad ``state.db.*`` glob, so
+    unrelated prefix-neighbours (``state.db.repair-attempts.json``,
+    ``state.db-wal``) can never match.
+    """
+    bases: List[Path] = []
+    try:
+        for p in home.iterdir():
+            name = p.name
+            if not name.startswith(_DB_BACKUP_PREFIX):
+                continue
+            if name.endswith(_DB_BACKUP_SIDECAR_SUFFIXES):
+                continue
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if not stat_mod.S_ISREG(st.st_mode):
+                continue
+            bases.append(p)
+    except OSError:
+        return 0, 0
+
+    # Timestamped names sort chronologically; newest first.
+    bases.sort(key=lambda p: p.name, reverse=True)
+
+    removed = 0
+    reclaimed = 0
+    now = time.time()
+    for idx, base in enumerate(bases):
+        try:
+            mtime = base.lstat().st_mtime
+        except OSError:
+            continue
+        expired = (now - mtime) > max_age_days * 86400
+        if idx < keep_count or not expired:
+            continue
+        family = [base] + [
+            base.with_name(base.name + suffix)
+            for suffix in _DB_BACKUP_SIDECAR_SUFFIXES
+        ]
+        for victim in family:
+            try:
+                size = victim.lstat().st_size
+            except OSError:
+                continue
+            if _unlink(victim):
+                removed += 1
+                reclaimed += size
+
+    # Orphaned sidecars: a -wal/-shm whose base backup is already gone is
+    # useless forensics — prune once expired.
+    base_names = {p.name for p in bases}
+    try:
+        for p in home.iterdir():
+            name = p.name
+            if not name.startswith(_DB_BACKUP_PREFIX):
+                continue
+            if not name.endswith(_DB_BACKUP_SIDECAR_SUFFIXES):
+                continue
+            parent_base = name
+            for suffix in _DB_BACKUP_SIDECAR_SUFFIXES:
+                if parent_base.endswith(suffix):
+                    parent_base = parent_base[: -len(suffix)]
+                    break
+            if parent_base in base_names:
+                continue
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if not stat_mod.S_ISREG(st.st_mode):
+                continue
+            if (now - st.st_mtime) > max_age_days * 86400:
+                if _unlink(p):
+                    removed += 1
+                    reclaimed += st.st_size
+    except OSError:
+        pass
+    return removed, reclaimed
 
 
 def _dir_size(path: Path) -> int:
@@ -345,7 +583,7 @@ def disk_usage_summary(home: Optional[Path] = None) -> Dict[str, int]:
 
     db_backups = sum(
         f.stat().st_size
-        for f in home.glob("state.db.malformed*")
+        for f in home.glob("state.db.malformed-backup-*")
         if f.is_file()
     )
     if db_backups:
@@ -483,13 +721,12 @@ def run_retention_sweep(
 
     _family("skills_audit_log", _audit_log)
 
-    # 5. state.db malformed-recovery backups: keep the newest N, drop old ones.
+    # 5. state.db malformed-recovery backups: keep the newest N SETS
+    #    (base + WAL/SHM sidecars pruned together — see
+    #    prune_db_backup_family for the writer contract).
     def _db_backups():
-        files = list(home.glob("state.db.malformed*")) + list(
-            home.glob("state.db.corrupt*")
-        )
-        return prune_files(
-            files, keep_count=db_keep, max_age_days=db_age_d, home=home
+        return prune_db_backup_family(
+            home, keep_count=db_keep, max_age_days=db_age_d
         )
 
     _family("db_backups", _db_backups)
