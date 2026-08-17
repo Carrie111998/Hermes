@@ -46,7 +46,9 @@ display:
 
 ### Colors (`colors:`)
 
-Controls all color values throughout the CLI. Values are hex color strings.
+Controls all color values throughout the CLI. Values are hex color strings —
+or one of the terminal-palette values described in
+[Terminal colors](#terminal-colors-instead-of-hex) below.
 
 | Key | Description | Default (`default` skin) |
 |-----|-------------|--------------------------|
@@ -72,6 +74,48 @@ Controls all color values throughout the CLI. Values are hex color strings.
 | `completion_menu_current_bg` | Background color for the active completion row | `#333355` |
 | `completion_menu_meta_bg` | Background color for the completion meta column | `#1a1a2e` |
 | `completion_menu_meta_current_bg` | Background color for the active completion meta column | `#333355` |
+
+### Terminal colors instead of hex
+
+Any color key also accepts two non-hex values that hand the choice back to the
+terminal, so a skin can follow the user's own theme instead of pinning a
+literal RGB:
+
+| Value | Meaning |
+|-------|---------|
+| `ansi:<name>` | One of the terminal's 16 palette slots — whatever color the user's theme assigns it |
+| `""` (empty string) | The terminal's default foreground/background |
+
+The 16 slot names are `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
+`cyan`, `white` and their bright variants `blackBright`, `redBright`,
+`greenBright`, `yellowBright`, `blueBright`, `magentaBright`, `cyanBright`,
+`whiteBright` (note the camelCase suffix — the names are case-sensitive).
+
+```yaml
+name: terminal
+description: Follows the terminal's own 16-color theme
+
+colors:
+  banner_border: "ansi:blue"
+  banner_title: "ansi:cyanBright"
+  banner_dim: "ansi:blackBright"
+  banner_text: ""            # whatever the terminal uses for normal text
+  ui_ok: "ansi:green"
+  ui_error: "ansi:red"
+```
+
+A skin like this looks correct on a light terminal and a dark one without
+maintaining two palettes, and it stays readable in a terminal profile with a
+transparent or custom background.
+
+**Mixing is fine.** Hex and `ansi:*` can coexist in one skin; each key is
+resolved independently, and hex values are passed through to the renderer
+untouched.
+
+**Typos degrade, they don't crash.** An unknown slot (`ansi:chartreuse`) or a
+malformed value falls back to the terminal's default color for that role. The
+CLI keeps running; you'll just see an unstyled element where you expected a
+colored one.
 
 ### Spinner (`spinner:`)
 
