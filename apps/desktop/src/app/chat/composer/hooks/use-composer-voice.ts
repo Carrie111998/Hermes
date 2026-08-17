@@ -6,6 +6,7 @@ import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { createSpokenReplyDedupe } from '@/lib/spoken-reply'
 import type { SpokenReplyDedupe } from '@/lib/spoken-reply'
+import { wasTextAlreadySpoken } from '@/lib/voice-playback'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -107,6 +108,14 @@ export function useComposerVoice({
       return null
     }
 
+    // Audio-side dedupe: every playback path (auto-speak, the manual Read
+    // aloud button, voice conversation) marks successfully played text here,
+    // so a reply that was already audible — however it got spoken — is never
+    // auto-spoken again at the playback-idle edge.
+    if (wasTextAlreadySpoken(text, sessionId)) {
+      return null
+    }
+
     return {
       id: last.id,
       pending: Boolean(last.pending),
@@ -168,7 +177,8 @@ export function useComposerVoice({
     pendingResponse: pendingTurnResponse,
     // Before the conversation opens the mic, wait for any in-flight wake.pause
     // to finish releasing the capture device (see wakePauseBarrierRef).
-    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
+    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined,
+    sessionId
   })
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
