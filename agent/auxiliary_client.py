@@ -3999,7 +3999,8 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
                 label,
             )
             return
-    except Exception:
+    except Exception as exc:
+        logger.debug("Auxiliary: pool availability check for %s failed (%s) — falling through to marking unhealthy", label, exc)
         pass  # No pool or pool check failed — fall through to marking
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at

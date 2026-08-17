@@ -1247,7 +1247,19 @@ def _classify_by_status(
         # or days).  Classify as ``billing`` so the recovery path rotates
         # immediately instead of retrying the same dead credential, and the
         # cooldown gets the full billing bench.
+        #
+        # But first check for transient signals — a 429 that says "daily limit,
+        # try again in 5 minutes" is a periodic quota that resets, not billing
+        # exhaustion.  Mirrors the disambiguation already done in
+        # ``_classify_402`` and ``_classify_by_message``.
         if any(p in error_msg for p in _429_BILLING_SIGNALS):
+            if any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS):
+                return result_fn(
+                    FailoverReason.rate_limit,
+                    retryable=True,
+                    should_rotate_credential=True,
+                    should_fallback=True,
+                )
             return result_fn(
                 FailoverReason.billing,
                 retryable=False,
