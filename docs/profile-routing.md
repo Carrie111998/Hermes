@@ -108,6 +108,12 @@ If no route matches, the message uses the default/active profile.
 Because `gateway_runner` is injected for **all** adapters (declared on `BasePlatformAdapter`),
 every platform goes through this path — not just Discord.
 
+Durable session recovery is profile-fail-closed. If the exact session-key lookup misses and
+the gateway falls back to platform/chat/user identity, it resumes a row only when that
+row's `agent:<profile>` namespace matches the requested profile. A newly routed named
+profile never adopts an older `agent:main` transcript from the same channel; rows without
+a profile-attributable key are recoverable only for the default profile.
+
 ## Relationship to multiplexing
 
 `profile_routes` requires `gateway.multiplex_profiles: true`. Multiplexing is what
@@ -115,3 +121,19 @@ activates the per-profile runtime scope (per-profile `HERMES_HOME`, secret scope
 profile-namespaced session keys); routing is the decision layer that picks *which*
 profile a given guild/channel/thread lands in. With multiplexing off, `profile_routes`
 is ignored entirely — behavior is byte-identical to a single-profile gateway.
+
+Every multiplex cron tick stays inside one profile's `HERMES_HOME` and secret scope
+through agent execution **and delivery**. Default ticks use the primary gateway adapter
+map. For a named profile, a platform present in its local scoped config is profile-owned:
+its connected adapter is used, and an explicit disable, missing/failed own adapter, or
+failed own live send never falls back to the primary adapter. A platform absent from the
+named profile config may intentionally reuse the primary live adapter as the gateway's
+shared transport. If that shared live send fails and the named profile has no standalone
+configuration of its own, delivery fails closed.
+
+Profile config and credentials are never inherited, copied, or merged from Default;
+process-global Default credentials are ignored while loading the named profile. The
+shared-adapter exception requires a running gateway loop and a present live adapter, so
+standalone, no-loop, stopped-loop, missing-adapter, and explicit-disable paths retain
+their strict configured/enabled checks. Relay-fronted delivery keeps its existing,
+separate process-owned transport rules.

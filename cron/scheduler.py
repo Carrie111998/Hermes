@@ -3038,6 +3038,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             pconfig = config.platforms.get(platform)
             runtime_adapter = None
 
+        # An explicitly supplied native adapter is the authenticated transport
+        # for a running gateway, even when this isolated profile has no local
+        # platform config.  Keep the exception tied to the live gateway loop so
+        # standalone and stopped-gateway delivery remain fail-closed.
+        live_adapter_ready = (
+            runtime_adapter is not None
+            and loop is not None
+            and getattr(loop, "is_running", lambda: False)()
+        )
+        live_native_adapter_ready = (
+            live_adapter_ready
+            and transport is not None
+            and not transport.is_relay
+        )
+
         if transport is not None and transport.is_relay:
             # A relay transport carries the RELAY adapter's config, and
             # resolve_delivery_transport already applied relay's enablement
@@ -3049,27 +3064,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             if pconfig is None:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(enabled=True)
-        elif not pconfig or not pconfig.enabled:
+        elif (not pconfig or not pconfig.enabled) and not (
+            pconfig is None and live_native_adapter_ready
+        ):
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
             continue
+        standalone_fallback_available = pconfig is not None
 
         # Prefer the resolved live transport when the gateway is running. This
         # supports E2EE native adapters and relay-fronted logical platforms.
         # The live-send path (which SEEDS the flat in_channel continuation
         # session via _seed_cron_channel_session) needs not just a live adapter
-        # but a running event loop to schedule the async send onto. Compute that
-        # gate ONCE so the in_channel thread_id clear below stays in lockstep
+        # but a running event loop to schedule the async send onto. That gate is
+        # computed once above so the in_channel thread_id clear stays in lockstep
         # with the live-send/seed block further down (they used to drift): an
         # adapter can be present while the loop is absent/not-running, in which
         # case the live-send block is skipped and delivery falls through to the
         # standalone path — which cannot seed the flat session (r3609147550).
-        live_adapter_ready = (
-            runtime_adapter is not None
-            and loop is not None
-            and getattr(loop, "is_running", lambda: False)()
-        )
         delivered = False
         target_errors = []
 
@@ -3338,12 +3351,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     "timed out before the coroutine was dispatched"
                                 )
-                                logger.warning(
-                                    "Job '%s': %s, falling back to standalone",
-                                    job["id"], msg,
-                                )
+                                if standalone_fallback_available:
+                                    logger.warning(
+                                        "Job '%s': %s, falling back to standalone",
+                                        job["id"], msg,
+                                    )
+                                else:
+                                    logger.warning("Job '%s': %s", job["id"], msg)
                                 target_errors.append(msg)
-                                adapter_ok = False  # fall through to standalone path
+                                adapter_ok = False
                                 timeout_handled = True
                             else:
                                 timed_out = True
@@ -3400,7 +3416,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                if (
+                                    transport is not None and transport.is_relay
+                                ) or not standalone_fallback_available:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
@@ -3537,7 +3555,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                if transport is not None and transport.is_relay:
+                if (
+                    transport is not None and transport.is_relay
+                ) or not standalone_fallback_available:
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
                     logger.warning(
@@ -3546,6 +3566,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
+            if live_native_adapter_ready and not standalone_fallback_available:
+                # This profile has no standalone credential/config of its own.
+                # The resolved gateway adapter was the only permitted transport;
+                # never fall through to a sender that could consult process-wide
+                # (Default-profile) credentials after the live send fails.
+                if not target_errors:
+                    target_errors.append(
+                        f"live adapter delivery to {platform_name}:{chat_id} failed"
+                    )
+                delivery_errors.extend(target_errors)
+                continue
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery
@@ -6624,39 +6655,51 @@ def run_one_job(
     run cooperatively — agent interruption AND script process-tree kill —
     through the single fenced completion path.
     """
-    claim = job.get("fire_claim")
-    fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
-    execution_token = object()
     profile_home = _get_hermes_home().resolve()
-    with _running_lock:
-        _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
-            fire_owner or None,
-            profile_home,
-        )
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+    hydrate_profile_secret_sources(profile_home)
+    scope_token = set_secret_scope(build_profile_secret_scope(profile_home))
     try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
-                job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token,
-            ),
-        )
-    finally:
+        claim = job.get("fire_claim")
+        fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+        execution_token = object()
         with _running_lock:
-            executions = _running_fire_owners.get(job["id"])
-            if executions is not None:
-                executions.pop(execution_token, None)
-                if not executions:
-                    _running_fire_owners.pop(job["id"], None)
+            _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
+                fire_owner or None,
+                profile_home,
+            )
+        try:
+            return _run_with_fire_claim_heartbeat(
+                job,
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token,
+                ),
+            )
+        finally:
+            with _running_lock:
+                executions = _running_fire_owners.get(job["id"])
+                if executions is not None:
+                    executions.pop(execution_token, None)
+                    if not executions:
+                        _running_fire_owners.pop(job["id"], None)
+    finally:
+        reset_secret_scope(scope_token)
 
 
 def _run_one_job_body(
@@ -6728,22 +6771,10 @@ def _run_one_job_body(
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
 
-        # Run the job under the profile's secret scope. get_secret() fails
-        # closed outside a scope once profile isolation is in play (multiple
-        # gateway profiles / room→profile multiplexing), and cron fires from
-        # the ticker thread where no per-turn scope is installed — so
-        # resolve_runtime_provider() raised UnscopedSecretError before model
-        # selection, breaking every cron job. Mirrors the per-turn pattern in
-        # gateway/run.py (_profile_runtime_scope).
-        from agent.secret_scope import (
-            build_profile_secret_scope,
-            reset_secret_scope,
-            set_secret_scope,
-        )
-
-        _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
-        )
+        # run_one_job() keeps the profile secret scope installed across this
+        # entire body, including both execution and delivery. Resetting it
+        # after run_job() would let delivery config read process-global
+        # credentials belonging to the Default profile.
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the
@@ -6775,9 +6806,6 @@ def _run_one_job_body(
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
-        finally:
-            reset_secret_scope(_scope_token)
-
         if _fire_claim_ownership_lost():
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])

@@ -342,18 +342,23 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     (tmp_path / ".env").write_text("OPENROUTER_BASE_URL=https://openrouter.ai/api/v1\n")
     monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
 
-    scope_during_run = {}
+    observed = {}
 
     def fake_run_job(job, *, defer_agent_teardown=None, **kw):
         # This is where resolve_runtime_provider() would read a secret. Prove a
         # scope is installed and the profile's secret resolves without raising.
-        scope_during_run["scope"] = ss.current_secret_scope()
-        scope_during_run["base_url"] = ss.get_secret("OPENROUTER_BASE_URL")
+        observed["run_scope"] = ss.current_secret_scope()
+        observed["run_base_url"] = ss.get_secret("OPENROUTER_BASE_URL")
         return (True, "out", "final", None)
+
+    def fake_deliver(*_args, **_kwargs):
+        observed["delivery_scope"] = ss.current_secret_scope()
+        observed["delivery_base_url"] = ss.get_secret("OPENROUTER_BASE_URL")
+        return None
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
     monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
-    monkeypatch.setattr(s, "_deliver_result", lambda *a, **k: None)
+    monkeypatch.setattr(s, "_deliver_result", fake_deliver)
     monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
 
     ss.set_multiplex_active(True)
@@ -364,9 +369,10 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
 
     assert ok is True
     # Scope was installed during run_job and the profile secret resolved.
-    assert scope_during_run["scope"] is not None
-    assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
+    assert observed["run_scope"] is not None
+    assert observed["run_base_url"] == "https://openrouter.ai/api/v1"
+    assert observed["delivery_scope"] is observed["run_scope"]
+    assert observed["delivery_base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
 

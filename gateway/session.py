@@ -1912,11 +1912,21 @@ class SessionStore:
         requested_session_key: str,
         recovered: Dict[str, Any],
     ) -> bool:
-        """Prevent non-multiplexed gateways from reviving another profile's row."""
-        if getattr(self.config, "multiplex_profiles", False):
-            return True
-
+        """Prevent durable peer fallback from crossing a profile namespace."""
         recovered_key = str(recovered.get("session_key") or "")
+        requested_profile = self._profile_from_session_key(requested_session_key)
+
+        if getattr(self.config, "multiplex_profiles", False):
+            if requested_profile is None:
+                return False
+            if not recovered_key:
+                return requested_profile == "default"
+            recovered_profile = self._profile_from_session_key(recovered_key)
+            return (
+                recovered_profile is not None
+                and recovered_profile == requested_profile
+            )
+
         if not recovered_key or recovered_key == requested_session_key:
             return True
 
@@ -2129,9 +2139,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the "
+                "durable row belongs to a different profile namespace",
                 recovered.get("session_key"),
                 session_key,
             )
@@ -2206,9 +2215,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the "
+                "durable row belongs to a different profile namespace",
                 recovered.get("session_key"),
                 session_key,
             )

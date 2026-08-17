@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import threading
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Any
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
@@ -62,6 +63,35 @@ def _note_tick_failure(exc: BaseException, consecutive_failures: int) -> int:
         _reclaim_fds_best_effort()
         return consecutive_failures + 1
     return 0
+
+
+@contextmanager
+def _profile_cron_scope(profile_home):
+    """Keep one multiplex profile authoritative for a complete ticker step."""
+    from pathlib import Path
+
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    home = Path(profile_home)
+    home_token = set_hermes_home_override(str(home))
+    try:
+        hydrate_profile_secret_sources(home)
+        secret_token = set_secret_scope(build_profile_secret_scope(home))
+        try:
+            yield
+        finally:
+            reset_secret_scope(secret_token)
+    finally:
+        reset_hermes_home_override(home_token)
 
 
 class CronScheduler(ABC):
@@ -511,6 +541,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        adapter_resolver=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -538,6 +569,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                adapter_resolver=adapter_resolver,
             )
             return
 
@@ -609,6 +641,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        adapter_resolver=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -626,8 +659,6 @@ class InProcessCronScheduler(CronScheduler):
             record_ticker_heartbeat,
             use_cron_store,
         )
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s",
@@ -638,8 +669,7 @@ class InProcessCronScheduler(CronScheduler):
         # Recovery + initial heartbeat for every profile.
         for entry in profile_homes:
             home = entry[1] if isinstance(entry, tuple) else entry
-            home_token = set_hermes_home_override(str(home))
-            try:
+            with _profile_cron_scope(home):
                 with use_cron_store(home):
                     recovered = self.recover_interrupted()
                     if recovered:
@@ -649,8 +679,6 @@ class InProcessCronScheduler(CronScheduler):
                             home,
                         )
                     record_ticker_heartbeat()
-            finally:
-                reset_hermes_home_override(home_token)
 
         consecutive_failures = 0
         while not stop_event.is_set():
@@ -661,19 +689,24 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
+                        profile_name = (
+                            entry[0] if isinstance(entry, tuple) else "default"
+                        )
                         home = entry[1] if isinstance(entry, tuple) else entry
-                        home_token = set_hermes_home_override(str(home))
-                        try:
+                        with _profile_cron_scope(home):
                             with use_cron_store(home):
+                                profile_adapters = (
+                                    adapter_resolver(profile_name)
+                                    if adapter_resolver is not None
+                                    else adapters
+                                )
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=profile_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
                                 )
-                        finally:
-                            reset_hermes_home_override(home_token)
                 ok = True
             except BaseException as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)
@@ -685,8 +718,7 @@ class InProcessCronScheduler(CronScheduler):
             # Record per-profile heartbeat after each tick cycle.
             for entry in profile_homes:
                 home = entry[1] if isinstance(entry, tuple) else entry
-                home_token = set_hermes_home_override(str(home))
-                try:
+                with _profile_cron_scope(home):
                     with use_cron_store(home):
                         record_ticker_heartbeat(success=ok)
                         # Surface the failure reason (or clear it) per profile
@@ -696,8 +728,6 @@ class InProcessCronScheduler(CronScheduler):
                             clear_ticker_error()
                         elif _tick_error:
                             record_ticker_error(_tick_error)
-                finally:
-                    reset_hermes_home_override(home_token)
             if ok:
                 consecutive_failures = 0
             stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))

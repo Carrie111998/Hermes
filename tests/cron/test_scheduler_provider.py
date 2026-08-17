@@ -640,3 +640,79 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_resolves_adapters_inside_each_profile_scope(
+    tmp_path, monkeypatch
+):
+    """The adapter resolver sees the same home and secret scope as tick()."""
+    from agent import secret_scope
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / "default"
+    named_home = tmp_path / "profiles" / "ops"
+    for home, token in (
+        (default_home, "default-token"),
+        (named_home, "ops-token"),
+    ):
+        (home / "cron").mkdir(parents=True)
+        (home / ".env").write_text(
+            f"DISCORD_BOT_TOKEN={token}\n", encoding="utf-8"
+        )
+
+    profile_homes = [("default", default_home), ("ops", named_home)]
+    resolved = {
+        "default": {"discord": object()},
+        "ops": {"discord": object()},
+    }
+    resolver_observations = []
+    tick_observations = []
+
+    def adapter_resolver(profile_name):
+        resolver_observations.append(
+            (
+                profile_name,
+                get_hermes_home().resolve(),
+                secret_scope.get_secret("DISCORD_BOT_TOKEN"),
+            )
+        )
+        return resolved[profile_name]
+
+    stop = threading.Event()
+
+    def tracking_tick(*_args, adapters=None, **_kwargs):
+        tick_observations.append(
+            (
+                get_hermes_home().resolve(),
+                secret_scope.get_secret("DISCORD_BOT_TOKEN"),
+                adapters,
+            )
+        )
+        if len(tick_observations) == len(profile_homes):
+            stop.set()
+        return 0
+
+    previous = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        with patch("cron.scheduler.tick", side_effect=tracking_tick), patch(
+            "cron.jobs.record_ticker_heartbeat", lambda **_kwargs: None
+        ):
+            InProcessCronScheduler().start(
+                stop,
+                interval=0,
+                profile_homes=profile_homes,
+                adapter_resolver=adapter_resolver,
+            )
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+    assert resolver_observations == [
+        ("default", default_home.resolve(), "default-token"),
+        ("ops", named_home.resolve(), "ops-token"),
+    ]
+    assert tick_observations == [
+        (default_home.resolve(), "default-token", resolved["default"]),
+        (named_home.resolve(), "ops-token", resolved["ops"]),
+    ]
+    assert secret_scope.current_secret_scope() is None
+

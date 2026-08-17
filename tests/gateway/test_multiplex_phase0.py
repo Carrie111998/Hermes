@@ -172,3 +172,151 @@ class TestSessionStoreUnmultiplexedRecovery:
         assert recovered.session_id == "sess-coder"
         assert recovered.session_key == "agent:main:telegram:dm:99"
         assert store._db.reopened == ["sess-coder"]
+
+
+class TestSessionStoreMultiplexRecoveryIsolation:
+    """Durable peer fallback must not cross a multiplex profile namespace."""
+
+    def _store_with_row(self, tmp_path, row):
+        config = GatewayConfig(multiplex_profiles=True)
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        recovering_db = _RecoveringDB(row)
+        object.__setattr__(store, "_db", recovering_db)
+        store._loaded = True
+        return store, recovering_db
+
+    def _recover(self, store, *, requested_key, profile):
+        source = _src(chat_id="99", chat_type="dm", profile=profile)
+        return store._recover_session_from_db(
+            session_key=requested_key,
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
+
+    def test_allows_exact_named_profile_recovery(self, tmp_path):
+        store, recovering_db = self._store_with_row(
+            tmp_path,
+            {
+                "id": "sess-str",
+                "started_at": 1700000000,
+                "session_key": "agent:str:telegram:dm:99",
+            },
+        )
+
+        recovered = self._recover(
+            store,
+            requested_key="agent:str:telegram:dm:99",
+            profile="str",
+        )
+
+        assert recovered is not None
+        assert recovered.session_id == "sess-str"
+        assert recovering_db.reopened == ["sess-str"]
+
+    @pytest.mark.parametrize(
+        ("requested_key", "profile", "recovered_key"),
+        [
+            (
+                "agent:str:telegram:dm:99",
+                "str",
+                "agent:main:telegram:dm:99",
+            ),
+            (
+                "agent:main:telegram:dm:99",
+                None,
+                "agent:str:telegram:dm:99",
+            ),
+            (
+                "agent:str:telegram:dm:99",
+                "str",
+                None,
+            ),
+        ],
+    )
+    def test_rejects_cross_profile_or_unattributed_recovery(
+        self, tmp_path, requested_key, profile, recovered_key
+    ):
+        store, recovering_db = self._store_with_row(
+            tmp_path,
+            {
+                "id": "wrong-profile-session",
+                "started_at": 1700000000,
+                "session_key": recovered_key,
+            },
+        )
+
+        recovered = self._recover(
+            store,
+            requested_key=requested_key,
+            profile=profile,
+        )
+
+        assert recovered is None
+        assert recovering_db.reopened == []
+
+    def test_default_keeps_legacy_missing_key_recovery(self, tmp_path):
+        store, recovering_db = self._store_with_row(
+            tmp_path,
+            {
+                "id": "legacy-default-session",
+                "started_at": 1700000000,
+                "session_key": None,
+            },
+        )
+
+        recovered = self._recover(
+            store,
+            requested_key="agent:main:telegram:dm:99",
+            profile=None,
+        )
+
+        assert recovered is not None
+        assert recovered.session_id == "legacy-default-session"
+        assert recovering_db.reopened == ["legacy-default-session"]
+
+    def test_real_db_does_not_adopt_default_transcript_for_named_profile(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        sessions_dir = tmp_path / "sessions"
+        default_source = _src(
+            platform=Platform.DISCORD,
+            chat_id="route-channel",
+            chat_type="group",
+            user_id="cyril",
+        )
+        original = SessionStore(
+            sessions_dir=sessions_dir,
+            config=GatewayConfig(multiplex_profiles=False),
+        )
+        default_entry = original.get_or_create_session(default_source)
+        original.append_to_transcript(
+            default_entry.session_key,
+            {"role": "user", "content": "default-only context"},
+        )
+        assert original._db is not None
+        original._db.close()
+
+        restarted = SessionStore(
+            sessions_dir=sessions_dir,
+            config=GatewayConfig(multiplex_profiles=True),
+        )
+        str_source = _src(
+            platform=Platform.DISCORD,
+            chat_id="route-channel",
+            chat_type="group",
+            user_id="cyril",
+            profile="str",
+        )
+
+        routed_entry = restarted.get_or_create_session(str_source)
+
+        assert default_entry.session_key.startswith("agent:main:")
+        assert routed_entry.session_key.startswith("agent:str:")
+        assert routed_entry.session_id != default_entry.session_id
+        assert restarted.load_transcript(routed_entry.session_id) == []
+        assert restarted._db is not None
+        restarted._db.close()

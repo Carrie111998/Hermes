@@ -2214,6 +2214,42 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     )
 
 
+def _cron_adapters_for_profile(runner: "GatewayRunner", profile_name: str):
+    """Resolve the live delivery transports owned or shared by one profile.
+
+    A named profile owns every platform present in its scoped gateway config,
+    including explicit disables and adapters that failed to connect. Those
+    entries therefore mask the primary adapter instead of silently sending as
+    the Default bot. Platforms absent from the named config may intentionally
+    reuse the primary live transport. Relay remains process-owned and keeps its
+    existing multiplex behavior.
+
+    The caller must invoke this under that profile's home + secret scope so
+    ``load_gateway_config`` cannot discover Default credentials in os.environ.
+    """
+    primary_adapters = getattr(runner, "adapters", None) or {}
+    active_profile_name = getattr(runner, "_active_profile_name", None)
+    primary_profile = (
+        active_profile_name()
+        if callable(active_profile_name)
+        else "default"
+    )
+    if profile_name == primary_profile:
+        return primary_adapters
+
+    from gateway.config import Platform, load_gateway_config
+
+    profile_config = load_gateway_config()
+    resolved = dict(primary_adapters)
+    for platform in profile_config.platforms:
+        if platform is not Platform.RELAY:
+            resolved.pop(platform, None)
+    resolved.update(
+        (getattr(runner, "_profile_adapters", None) or {}).get(profile_name, {})
+    )
+    return resolved
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -31020,6 +31056,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                cron_start_kwargs["adapter_resolver"] = (
+                    lambda profile_name: _cron_adapters_for_profile(
+                        runner, profile_name
+                    )
+                )
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
