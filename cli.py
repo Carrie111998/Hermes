@@ -2779,7 +2779,19 @@ def _hex_to_ansi(hex_color: str, *, bold: bool = False) -> str:
     Auto-remaps known dark-mode-tuned colors to readable light-mode
     equivalents when running on a light terminal (see
     _maybe_remap_for_light_mode + _LIGHT_MODE_REMAP).
+
+    A skin may also ask for one of the terminal's own palette slots
+    (``ansi:*``) or its default (``""``). Those are emitted as 30-37/90-97 /
+    39 — falling through to the hex parser would land on the gold truecolor
+    fallback below and quietly repaint a terminal-native skin.
     """
+    try:
+        from hermes_cli.skin_engine import is_terminal_palette_color, to_sgr_fg
+        if is_terminal_palette_color(hex_color):
+            return to_sgr_fg(hex_color, bold=bold)
+    except Exception:
+        pass  # never let color resolution break a print
+
     hex_color = _maybe_remap_for_light_mode(hex_color)
     try:
         r = int(hex_color[1:3], 16)
@@ -4515,15 +4527,15 @@ HERMES_CADUCEUS = """[#CD7F32]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀�
 def _build_compact_banner() -> str:
     """Build a compact banner that fits the current terminal width."""
     try:
-        from hermes_cli.skin_engine import get_active_skin
+        from hermes_cli.skin_engine import get_active_skin, to_rich_color
         _skin = get_active_skin()
     except Exception:
         _skin = None
 
     skin_name = getattr(_skin, "name", "default") if _skin else "default"
-    border_color = _skin.get_color("banner_border", "#FFD700") if _skin else "#FFD700"
-    title_color = _skin.get_color("banner_title", "#FFBF00") if _skin else "#FFBF00"
-    dim_color = _skin.get_color("banner_dim", "#B8860B") if _skin else "#B8860B"
+    border_color = to_rich_color(_skin.get_color("banner_border", "#FFD700")) if _skin else "#FFD700"
+    title_color = to_rich_color(_skin.get_color("banner_title", "#FFBF00")) if _skin else "#FFBF00"
+    dim_color = to_rich_color(_skin.get_color("banner_dim", "#B8860B")) if _skin else "#B8860B"
 
     if skin_name == "default":
         line1 = "⚕ NOUS HERMES - AI Agent Framework"
@@ -7674,15 +7686,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 label = "⚕ Hermes"
                 _text_hex = "#FFF8DC"
-            # Build a true-color ANSI escape for the response text color
-            # so streamed content matches the Rich Panel appearance.
+            # Build an ANSI escape for the response text color so streamed
+            # content matches the Rich Panel appearance — truecolor for a hex
+            # skin, a 30-37/90-97 palette code for a terminal-native one.
             try:
-                _r = int(_text_hex[1:3], 16)
-                _g = int(_text_hex[3:5], 16)
-                _b = int(_text_hex[5:7], 16)
-                self._stream_text_ansi = f"\033[38;2;{_r};{_g};{_b}m"
-            except (ValueError, IndexError):
-                self._stream_text_ansi = ""
+                from hermes_cli.skin_engine import is_terminal_palette_color, to_sgr_fg
+                _is_palette = is_terminal_palette_color(_text_hex)
+            except Exception:
+                _is_palette = False
+            if _is_palette:
+                self._stream_text_ansi = to_sgr_fg(_text_hex)
+            else:
+                try:
+                    _r = int(_text_hex[1:3], 16)
+                    _g = int(_text_hex[3:5], 16)
+                    _b = int(_text_hex[5:7], 16)
+                    self._stream_text_ansi = f"\033[38;2;{_r};{_g};{_b}m"
+                except (ValueError, IndexError):
+                    self._stream_text_ansi = ""
             if self.show_timestamps:
                 label = f"{label} {datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))}"
             w = self._scrollback_box_width()
@@ -8911,11 +8932,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Build status line with proper markup — skin-aware colors
         try:
-            from hermes_cli.skin_engine import get_active_skin
+            from hermes_cli.skin_engine import get_active_skin, to_rich_color
             skin = get_active_skin()
-            separator_color = skin.get_color("banner_dim", "#B8860B")
-            accent_color = skin.get_color("ui_accent", "#FFBF00")
-            label_color = skin.get_color("ui_label", "#DAA520")
+            separator_color = to_rich_color(skin.get_color("banner_dim", "#B8860B"))
+            accent_color = to_rich_color(skin.get_color("ui_accent", "#FFBF00"))
+            label_color = to_rich_color(skin.get_color("ui_label", "#DAA520"))
         except Exception:
             separator_color, accent_color, label_color = "#B8860B", "#FFBF00", "cyan"
         toolsets_info = ""
@@ -11373,8 +11394,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     from hermes_cli.tips import get_random_tip
                     _tip = get_random_tip()
                     try:
-                        from hermes_cli.skin_engine import get_active_skin
-                        _tip_color = get_active_skin().get_color("banner_dim", "#B8860B")
+                        from hermes_cli.skin_engine import get_active_skin, to_rich_color
+                        _tip_color = to_rich_color(get_active_skin().get_color("banner_dim", "#B8860B"))
                     except Exception:
                         _tip_color = "#B8860B"
                     cc.print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
@@ -11388,8 +11409,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     from hermes_cli.tips import get_random_tip
                     _tip = get_random_tip()
                     try:
-                        from hermes_cli.skin_engine import get_active_skin
-                        _tip_color = get_active_skin().get_color("banner_dim", "#B8860B")
+                        from hermes_cli.skin_engine import get_active_skin, to_rich_color
+                        _tip_color = to_rich_color(get_active_skin().get_color("banner_dim", "#B8860B"))
                     except Exception:
                         _tip_color = "#B8860B"
                     self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
@@ -15996,11 +16017,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if response and not response_previewed:
                 # Use skin engine for label/color with fallback
                 try:
-                    from hermes_cli.skin_engine import get_active_skin
+                    from hermes_cli.skin_engine import get_active_skin, to_rich_color
                     _skin = get_active_skin()
                     label = _skin.get_branding("response_label", "⚕ Hermes")
-                    _resp_color = _maybe_remap_for_light_mode(_skin.get_color("response_border", "#CD7F32"))
-                    _resp_text = _maybe_remap_for_light_mode(_skin.get_color("banner_text", "#FFF8DC"))
+                    _resp_color = to_rich_color(_maybe_remap_for_light_mode(_skin.get_color("response_border", "#CD7F32")))
+                    _resp_text = to_rich_color(_maybe_remap_for_light_mode(_skin.get_color("banner_text", "#FFF8DC")))
                 except Exception:
                     label = "⚕ Hermes"
                     _resp_color = _maybe_remap_for_light_mode("#CD7F32")
@@ -16643,10 +16664,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._display_resumed_history()
 
         try:
-            from hermes_cli.skin_engine import get_active_skin
+            from hermes_cli.skin_engine import get_active_skin, to_rich_color
             _welcome_skin = get_active_skin()
             _welcome_text = _welcome_skin.get_branding("welcome", "Welcome to Hermes Agent! Type your message or /help for commands.")
-            _welcome_color = _welcome_skin.get_color("banner_text", "#FFF8DC")
+            _welcome_color = to_rich_color(_welcome_skin.get_color("banner_text", "#FFF8DC"))
         except Exception:
             _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
             _welcome_color = "#FFF8DC"
@@ -16715,7 +16736,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
             if not is_seen(self.config, OPENCLAW_RESIDUE_FLAG) and detect_openclaw_residue():
                 try:
-                    _resid_color = _welcome_skin.get_color("banner_dim", "#B8860B")
+                    from hermes_cli.skin_engine import to_rich_color as _to_rich
+                    _resid_color = _to_rich(_welcome_skin.get_color("banner_dim", "#B8860B"))
                 except Exception:
                     _resid_color = "#B8860B"
                 self._console_print(f"[{_resid_color}]{openclaw_residue_hint_cli()}[/]")
@@ -16731,7 +16753,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from hermes_cli.tips import get_random_tip
             _tip = get_random_tip()
             try:
-                _tip_color = _welcome_skin.get_color("banner_dim", "#B8860B")
+                from hermes_cli.skin_engine import to_rich_color as _to_rich
+                _tip_color = _to_rich(_welcome_skin.get_color("banner_dim", "#B8860B"))
             except Exception:
                 _tip_color = "#B8860B"
             self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")

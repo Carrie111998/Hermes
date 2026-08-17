@@ -55,10 +55,15 @@ def cprint(text: str):
 # =========================================================================
 
 def _skin_color(key: str, fallback: str) -> str:
-    """Get a color from the active skin, or return fallback."""
+    """Get a color from the active skin, ready for rich, or return fallback.
+
+    Every consumer of this helper interpolates the result into rich markup, so
+    the skin's own vocabulary (``ansi:*`` palette slots, ``""`` for the
+    terminal default) is translated here — rich raises on both spellings.
+    """
     try:
-        from hermes_cli.skin_engine import get_active_skin
-        return get_active_skin().get_color(key, fallback)
+        from hermes_cli.skin_engine import get_active_skin, to_rich_color
+        return to_rich_color(get_active_skin().get_color(key, fallback))
     except Exception:
         return fallback
 # =========================================================================

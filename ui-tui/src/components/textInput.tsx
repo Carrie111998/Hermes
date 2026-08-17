@@ -40,11 +40,44 @@ type MinimalEnv = Record<string, string | undefined>
 
 const invert = (s: string) => INV + s + INV_OFF
 
-// Placeholder styling is EXPLICIT truecolor only — never SGR dim/inverse:
+// Placeholder styling is an EXPLICIT color only — never SGR dim/inverse:
 // both are terminal-interpreted relative to the default fg/bg, and on
 // transparent profiles (terminal.background #00000000) they composite
 // against a black RGB the user never sees — the hint rendered as a slab.
+// A palette slot (SGR 30-37/90-97) is explicit in exactly that sense — the
+// terminal looks it up in its own theme, it is not derived from whatever the
+// current cell happens to be — so the rule is "explicit color, never relative
+// attribute", not "truecolor at all costs".
 const HINT_FALLBACK = '#808080'
+
+const ANSI_PREFIX = 'ansi:'
+
+/** The terminal's 16 palette slots, keyed by the skin's `ansi:<name>`
+ *  vocabulary. `darkInk` marks the slots light enough to need black ink when
+ *  used as a chip background (the static stand-in for the hex path's
+ *  luminance test — the slot's real RGB lives in the user's terminal theme
+ *  and is unknowable from here). Mirrors skin_engine.py's table. */
+const ANSI_SLOTS: Record<string, { fg: number; bg: number; darkInk: boolean }> = {
+  black: { fg: 30, bg: 40, darkInk: false },
+  red: { fg: 31, bg: 41, darkInk: false },
+  green: { fg: 32, bg: 42, darkInk: false },
+  yellow: { fg: 33, bg: 43, darkInk: true },
+  blue: { fg: 34, bg: 44, darkInk: false },
+  magenta: { fg: 35, bg: 45, darkInk: false },
+  cyan: { fg: 36, bg: 46, darkInk: false },
+  white: { fg: 37, bg: 47, darkInk: true },
+  blackBright: { fg: 90, bg: 100, darkInk: false },
+  redBright: { fg: 91, bg: 101, darkInk: false },
+  greenBright: { fg: 92, bg: 102, darkInk: true },
+  yellowBright: { fg: 93, bg: 103, darkInk: true },
+  blueBright: { fg: 94, bg: 104, darkInk: false },
+  magentaBright: { fg: 95, bg: 105, darkInk: false },
+  cyanBright: { fg: 96, bg: 106, darkInk: true },
+  whiteBright: { fg: 97, bg: 107, darkInk: true },
+}
+
+const ansiSlot = (color?: string) =>
+  color?.startsWith(ANSI_PREFIX) ? ANSI_SLOTS[color.slice(ANSI_PREFIX.length)] : undefined
 
 const hintRgb = (hex?: string): [number, number, number] => {
   const n = parseInt((/^#([0-9a-f]{6})$/i.exec(hex ?? '')?.[1] ?? HINT_FALLBACK.slice(1)) as string, 16)
@@ -52,11 +85,24 @@ const hintRgb = (hex?: string): [number, number, number] => {
   return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]
 }
 
-const colorizeHint = (s: string, hex?: string) => {
-  const [r, g, b] = hintRgb(hex)
+/** SGR foreground parameters for a skin color: truecolor for `#rrggbb`, a
+ *  palette code for `ansi:<name>`, 39 (terminal default) for `''`. Anything
+ *  unrecognized keeps today's grey fallback. */
+const hintFgSgr = (color?: string): string => {
+  if (color === '') {
+    return '39'
+  }
 
-  return `${ESC}[38;2;${r};${g};${b}m${s}${ESC}[39m`
+  const slot = ansiSlot(color)
+
+  if (slot) {
+    return String(slot.fg)
+  }
+
+  return `38;2;${hintRgb(color).join(';')}`
 }
+
+export const colorizeHint = (s: string, hex?: string) => `${ESC}[${hintFgSgr(hex)}m${s}${ESC}[39m`
 
 // Typed-text fast-echo must carry the SAME explicit fg the Ink render uses:
 // the bypass writes raw cells, and a default-fg glyph goes invisible the
@@ -64,11 +110,20 @@ const colorizeHint = (s: string, hex?: string) => {
 // skin on a light terminal ⇒ black-on-black). No color ⇒ passthrough, so
 // unthemed inputs keep the terminal default.
 export const colorizeEcho = (s: string, hex?: string) =>
-  /^#[0-9a-f]{6}$/i.test(hex ?? '') ? `${ESC}[38;2;${hintRgb(hex).join(';')}m${s}${ESC}[39m` : s
+  /^#[0-9a-f]{6}$/i.test(hex ?? '') || ansiSlot(hex) ? `${ESC}[${hintFgSgr(hex)}m${s}${ESC}[39m` : s
 
 /** Synthetic placeholder cursor: a hint-colored chip with luminance-picked
- *  ink, standing in for the hidden hardware cursor (bubbles pattern). */
+ *  ink, standing in for the hidden hardware cursor (bubbles pattern).
+ *  Palette slots use a static ink table instead — SGR 7 (inverse) would be
+ *  the obvious shortcut and is exactly the relative attribute this file
+ *  refuses to emit. */
 const hintCursorCell = (ch: string, hex?: string) => {
+  const slot = ansiSlot(hex)
+
+  if (slot) {
+    return `${ESC}[${slot.bg}m${ESC}[${slot.darkInk ? 30 : 97}m${ch}${ESC}[39m${ESC}[49m`
+  }
+
   const [r, g, b] = hintRgb(hex)
   const ink = 0.2126 * r + 0.7152 * g + 0.0722 * b > 140 ? '0;0;0' : '255;255;255'
 

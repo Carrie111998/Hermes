@@ -2210,11 +2210,11 @@ class CLICommandsMixin:
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
                 if response:
                     try:
-                        from hermes_cli.skin_engine import get_active_skin
+                        from hermes_cli.skin_engine import get_active_skin, to_rich_color
                         _skin = get_active_skin()
                         label = _skin.get_branding("response_label", "⚕ Hermes")
-                        _resp_color = _maybe_remap_for_light_mode(_skin.get_color("response_border", "#CD7F32"))
-                        _resp_text = _maybe_remap_for_light_mode(_skin.get_color("banner_text", "#FFF8DC"))
+                        _resp_color = to_rich_color(_maybe_remap_for_light_mode(_skin.get_color("response_border", "#CD7F32")))
+                        _resp_text = to_rich_color(_maybe_remap_for_light_mode(_skin.get_color("banner_text", "#FFF8DC")))
                     except Exception:
                         label = "⚕ Hermes"
                         _resp_color = "#CD7F32"

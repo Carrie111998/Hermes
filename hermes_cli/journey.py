@@ -30,10 +30,14 @@ def _build_payload() -> dict[str, Any]:
 def _primary_hex() -> str:
     """The active skin's primary color (mirrors the TUI theme primary)."""
     try:
-        from hermes_cli.skin_engine import get_active_skin
+        from hermes_cli.skin_engine import get_active_skin, to_rich_color
 
         skin = get_active_skin()
-        return skin.get_color("ui_primary", "") or skin.get_color("banner_title", "#FFD700")
+        # The palette's `primary` reaches rich unfaded (``_fade`` short-circuits
+        # at alpha 1.0), so it has to be spelled the way rich expects.
+        return to_rich_color(
+            skin.get_color("ui_primary", "") or skin.get_color("banner_title", "#FFD700")
+        )
     except Exception:
         return "#FFD700"
 

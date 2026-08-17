@@ -152,6 +152,132 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Terminal-palette color vocabulary
+# =============================================================================
+#
+# A skin value is normally a ``#rrggbb`` literal, but it may also name one of
+# the terminal's own 16 palette slots (``ansi:red``, ``ansi:blueBright``) or
+# ask for the terminal default (``""``). Those two forms are what let a skin
+# inherit the user's terminal theme instead of nailing colors to truecolor.
+#
+# Every rendering engine spells them differently, and none of them accepts the
+# skin's own spelling, so this table is the single source of truth and the
+# adapters below are the only translation layer. Getting it wrong is not
+# always loud: prompt_toolkit calls slot 7 ``ansigray`` and slot 15
+# ``ansiwhite`` — there is no ``ansibrightwhite`` — so a naive
+# ``"ansi" + name.lower()`` mapping raises on white and silently collapses the
+# base/bright pair everywhere else it guesses.
+
+_ANSI_PREFIX = "ansi:"
+
+
+@dataclass(frozen=True)
+class _AnsiSlot:
+    """One of the terminal's 16 palette slots, per rendering engine."""
+    rich: str
+    prompt_toolkit: str
+    sgr_fg: int
+    sgr_bg: int
+
+
+_ANSI_SLOTS: Dict[str, _AnsiSlot] = {
+    "black":         _AnsiSlot("black",          "ansiblack",         30, 40),
+    "red":           _AnsiSlot("red",            "ansired",           31, 41),
+    "green":         _AnsiSlot("green",          "ansigreen",         32, 42),
+    "yellow":        _AnsiSlot("yellow",         "ansiyellow",        33, 43),
+    "blue":          _AnsiSlot("blue",           "ansiblue",          34, 44),
+    "magenta":       _AnsiSlot("magenta",        "ansimagenta",       35, 45),
+    "cyan":          _AnsiSlot("cyan",           "ansicyan",          36, 46),
+    # prompt_toolkit names slot 7 "gray" and reserves "ansiwhite" for slot 15.
+    "white":         _AnsiSlot("white",          "ansigray",          37, 47),
+    "blackBright":   _AnsiSlot("bright_black",   "ansibrightblack",   90, 100),
+    "redBright":     _AnsiSlot("bright_red",     "ansibrightred",     91, 101),
+    "greenBright":   _AnsiSlot("bright_green",   "ansibrightgreen",   92, 102),
+    "yellowBright":  _AnsiSlot("bright_yellow",  "ansibrightyellow",  93, 103),
+    "blueBright":    _AnsiSlot("bright_blue",    "ansibrightblue",    94, 104),
+    "magentaBright": _AnsiSlot("bright_magenta", "ansibrightmagenta", 95, 105),
+    "cyanBright":    _AnsiSlot("bright_cyan",    "ansibrightcyan",    96, 106),
+    # ...and slot 15 is plain "ansiwhite", NOT "ansibrightwhite".
+    "whiteBright":   _AnsiSlot("bright_white",   "ansiwhite",         97, 107),
+}
+
+# SGR codes for "whatever the terminal's default fg/bg is".
+_SGR_DEFAULT_FG = 39
+_SGR_DEFAULT_BG = 49
+
+
+def _ansi_slot(value: Any) -> Optional[_AnsiSlot]:
+    """Resolve an ``ansi:<name>`` token to its slot, or None if it isn't one."""
+    if isinstance(value, str) and value.startswith(_ANSI_PREFIX):
+        return _ANSI_SLOTS.get(value[len(_ANSI_PREFIX):])
+    return None
+
+
+def is_terminal_palette_color(value: Any) -> bool:
+    """True when ``value`` asks for a terminal color rather than a literal one.
+
+    Both ``ansi:*`` (a palette slot) and ``""`` (the terminal default) belong to
+    this vocabulary — including malformed ``ansi:`` tokens, which degrade to the
+    default rather than falling through to a hex parser.
+    """
+    return isinstance(value, str) and (value == "" or value.startswith(_ANSI_PREFIX))
+
+
+def to_rich_color(value: Any) -> str:
+    """Translate a skin color into something ``rich`` can parse.
+
+    ``ansi:*`` becomes rich's palette name (``bright_blue``), ``""`` becomes
+    ``"default"`` (rich raises on the empty string), and everything else —
+    ``#rrggbb`` above all — passes through byte-identically. Unknown slots and
+    non-string junk degrade to the terminal default: a typo in a user's skin
+    must never crash the CLI.
+    """
+    slot = _ansi_slot(value)
+    if slot is not None:
+        return slot.rich
+    if not isinstance(value, str) or value == "" or value.startswith(_ANSI_PREFIX):
+        return "default"
+    return value
+
+
+def to_prompt_toolkit_color(value: Any) -> str:
+    """Translate a skin color into something ``prompt_toolkit`` can parse.
+
+    ``ansi:*`` becomes prompt_toolkit's palette name (``ansibrightblue``, and
+    the ``ansigray``/``ansiwhite`` pair for slots 7 and 15). ``""`` is left
+    exactly as ``""``: prompt_toolkit reads it as "inherit", which is the
+    deliberate default for the typed-input style — rewriting it to
+    ``ansidefault`` would change the cascade. Everything else passes through.
+    """
+    slot = _ansi_slot(value)
+    if slot is not None:
+        return slot.prompt_toolkit
+    if not isinstance(value, str) or value.startswith(_ANSI_PREFIX):
+        return ""
+    return value
+
+
+def to_sgr_fg(value: Any, *, bold: bool = False) -> str:
+    """Foreground SGR escape for a terminal-palette color (30-37 / 90-97).
+
+    Only meaningful for the ``ansi:*`` / ``""`` vocabulary; anything else
+    (including hex) resolves to the terminal default so callers can — and
+    should — check :func:`is_terminal_palette_color` first and keep their own
+    hex path intact.
+    """
+    slot = _ansi_slot(value)
+    code = slot.sgr_fg if slot is not None else _SGR_DEFAULT_FG
+    return f"\033[{'1;' if bold else ''}{code}m"
+
+
+def to_sgr_bg(value: Any) -> str:
+    """Background SGR escape for a terminal-palette color (40-47 / 100-107)."""
+    slot = _ansi_slot(value)
+    code = slot.sgr_bg if slot is not None else _SGR_DEFAULT_BG
+    return f"\033[{code}m"
+
+
+# =============================================================================
 # Skin data structure
 # =============================================================================
 
@@ -1021,6 +1147,26 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
     menu_current_bg = skin.get_color("completion_menu_current_bg", "#333355")
     menu_meta_bg = skin.get_color("completion_menu_meta_bg", menu_bg)
     menu_meta_current_bg = skin.get_color("completion_menu_meta_current_bg", menu_current_bg)
+
+    # Translate the resolved values into prompt_toolkit's color vocabulary
+    # ONCE, here, before they are interpolated into the rules below. Doing it
+    # on the variables rather than on the composed rules covers every rule —
+    # foregrounds and `bg:` fills alike — without teaching each rule about the
+    # `ansi:*` spelling, and keeps hex skins passing through untouched.
+    (
+        prompt, input_rule, title, text, dim, label, warn, error,
+        status_bg, status_text, status_strong, status_dim, status_good,
+        status_warn, status_bad, status_critical, voice_bg,
+        menu_bg, menu_current_bg, menu_meta_bg, menu_meta_current_bg,
+    ) = (
+        to_prompt_toolkit_color(value)
+        for value in (
+            prompt, input_rule, title, text, dim, label, warn, error,
+            status_bg, status_text, status_strong, status_dim, status_good,
+            status_warn, status_bad, status_critical, voice_bg,
+            menu_bg, menu_current_bg, menu_meta_bg, menu_meta_current_bg,
+        )
+    )
 
     return {
         # Typed input always uses terminal default fg/bg so it's
