@@ -1085,6 +1085,7 @@ class TestSenderAuthentication(unittest.TestCase):
         ok, reason = self._verify(
             "Admin <admin@example.com>",
             ["mx.google.com; dmarc=pass header.from=example.com; spf=pass"],
+            authserv_id="mx.google.com",
         )
         self.assertTrue(ok, reason)
 
@@ -1093,6 +1094,7 @@ class TestSenderAuthentication(unittest.TestCase):
         ok, reason = self._verify(
             "admin@example.com",
             ["mx.google.com; dkim=pass header.d=example.com"],
+            authserv_id="mx.google.com",
         )
         self.assertTrue(ok, reason)
 
@@ -1101,6 +1103,7 @@ class TestSenderAuthentication(unittest.TestCase):
         ok, reason = self._verify(
             "admin@example.com",
             ["mx.google.com; spf=pass smtp.mailfrom=bounce@evil.com"],
+            authserv_id="mx.google.com",
         )
         self.assertFalse(ok, reason)
 
@@ -1120,6 +1123,16 @@ class TestSenderAuthentication(unittest.TestCase):
             authserv_id="mx.ourserver.com",
         )
         self.assertFalse(ok, reason)
+
+    def test_empty_authserv_refuses_forged_only_header(self):
+        """Without a configured authserv-id the only header may be attacker-written."""
+        ok, reason = self._verify(
+            "owner@allowed.example",
+            ["attacker.self; dmarc=pass header.from=allowed.example"],
+            authserv_id="",
+        )
+        self.assertFalse(ok, reason)
+        self.assertIn("authserv-id", reason)
 
 
 if __name__ == "__main__":

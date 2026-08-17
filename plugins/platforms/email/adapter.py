@@ -403,6 +403,10 @@ def _verify_sender_authentication(
     ``Authentication-Results`` an attacker injected into the body of their
     message sorts below it.
 
+    ``authserv_id`` is required. When it is empty we refuse every header —
+    including a lone ``dmarc=pass`` written by the sender — because there is
+    no way to tell a receiving-server stamp from an injected one.
+
     Returns ``(authenticated, reason)``. ``authenticated`` is True when:
       * a DMARC pass is recorded for the From domain, OR
       * an SPF pass aligned with the From domain, OR
@@ -418,21 +422,24 @@ def _verify_sender_authentication(
         return False, "missing From domain"
 
     # get_all preserves header order; the receiving server prepends its result,
-    # so the FIRST Authentication-Results is the trusted one. We pin to the
-    # configured authserv-id when provided to defend against an injected header
-    # that happens to sort first.
+    # so the FIRST Authentication-Results is the trusted one — but only when
+    # we can pin it to a configured authserv-id. Without a pin, the only
+    # header may be one the sender injected (self-hosted IMAP with no
+    # rspamd/opendkim is the common case), and trusting it revives the
+    # From: spoofing path that GHSA-rxqh-5572-8m77 closed.
     headers = msg.get_all("Authentication-Results") or []
     if not headers:
         return False, "no Authentication-Results header"
+    if not (authserv_id or "").strip():
+        return False, "authserv-id is not configured; refusing to trust Authentication-Results"
 
     trusted = None
     for raw in headers:
         value = " ".join(str(raw).split())
-        if authserv_id:
-            # authserv-id is the first token before the first ';'
-            serv = value.split(";", 1)[0].strip().lower()
-            if not _domains_aligned(serv, authserv_id) and serv != authserv_id.lower():
-                continue
+        # authserv-id is the first token before the first ';'
+        serv = value.split(";", 1)[0].strip().lower()
+        if not _domains_aligned(serv, authserv_id) and serv != authserv_id.lower():
+            continue
         trusted = value
         break
     if trusted is None:
@@ -585,9 +592,10 @@ class EmailAdapter(BasePlatformAdapter):
         else:
             self._require_authenticated_sender = True
 
-        # Optional authserv-id to pin Authentication-Results to the operator's
-        # own receiving server (defends against an injected header that sorts
-        # first). Defaults to the From-domain of the agent's own address.
+        # Required authserv-id to pin Authentication-Results to the operator's
+        # own receiving server. Without it, a sender-injected header would be
+        # treated as trusted. Leave unset to fail closed (or opt out via
+        # require_authenticated_sender / EMAIL_TRUST_FROM_HEADER).
         self._authserv_id = (
             extra.get("authserv_id", "") or _get_secret("EMAIL_AUTHSERV_ID", "")
         ).strip().lower()
