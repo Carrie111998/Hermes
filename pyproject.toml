@@ -408,6 +408,9 @@ redundant-cast = "ignore"
 # here SILENTLY -- no warning, no error -- so a table added back would be dead
 # config that still greps as live.  tests/test_lint_config.py enforces this.
 #
-# The split exists because ruff.toml carries a several-hundred-line
-# per-file-ignores sunset list that would more than double this file.
+# The split was originally made because ruff.toml carried a several-hundred-line
+# per-file-ignores sunset list that would have more than doubled this file.  That
+# list is GONE (burned to zero and deleted 2026-08-17), so ruff.toml is now small
+# -- but it stays separate, because moving the config back would re-create the
+# silent-shadowing hazard above for no gain.
 # See docs/superpowers/specs/2026-08-16-ruff-f-group-reland-design.md
