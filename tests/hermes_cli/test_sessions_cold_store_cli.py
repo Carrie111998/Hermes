@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -208,6 +209,78 @@ def test_cold_verify_missing_snapshot_fails_without_creating_root(
     assert "Error: could not cold-verify session lineage" in out
     assert "snapshot not found" in out
     assert not archive_root.exists()
+
+
+def test_cold_verify_database_open_failure_exits_nonzero(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+
+    def fail_read_only_open(*args, **kwargs):
+        assert kwargs.get("read_only") is True
+        raise sqlite3.OperationalError("read-only open failed")
+
+    monkeypatch.setattr("hermes_state.SessionDB", fail_read_only_open)
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-verify",
+        str(session_home.parent / "cold-root"),
+        "--session-id",
+        "lineage-terminal",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "Error: Could not open session database: read-only open failed" in out
+
+
+@pytest.mark.parametrize(
+    ("action", "execution_flags"),
+    [
+        ("cold-store", ("--yes",)),
+        ("cold-verify", ()),
+    ],
+)
+def test_cold_commands_reject_finite_out_of_range_started_at_cleanly(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    execution_flags: tuple[str, ...],
+) -> None:
+    db = SessionDB()
+    try:
+        db.create_session("bad-start-time", source="cli")
+        db.end_session("bad-start-time", "completed")
+        assert db.set_session_archived("bad-start-time", True)
+        assert db._conn is not None
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (1e300, "bad-start-time"),
+        )
+    finally:
+        db.close()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        action,
+        str(session_home.parent / "cold-root"),
+        "--session-id",
+        "bad-start-time",
+        *execution_flags,
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "terminal session start time is outside the supported range" in out
+    assert "Traceback" not in out
 
 
 def test_cold_store_default_confirmation_warns_about_raw_transcript_and_cancels(

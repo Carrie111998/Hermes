@@ -381,6 +381,53 @@ def test_store_same_fingerprint_is_idempotent_without_staging(
         db.close()
 
 
+@pytest.mark.parametrize("operation", ["store", "verify"])
+def test_existing_snapshot_rejects_replaced_open_parent_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """A valid snapshot is not accepted after its opened parent is displaced."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        stored = store_archived_lineage(db, "terminal", archive_root)
+        snapshot_parent = stored.snapshot_dir.parent
+        displaced_parent = snapshot_parent.with_name("day-displaced")
+        real_validate = cold_store._valid_existing_snapshot_at
+        swapped = False
+
+        def validate_then_replace_parent(*args, **kwargs):
+            nonlocal swapped
+            valid = real_validate(*args, **kwargs)
+            if valid is True and not swapped:
+                snapshot_parent.rename(displaced_parent)
+                snapshot_parent.mkdir()
+                swapped = True
+            return valid
+
+        monkeypatch.setattr(
+            cold_store,
+            "_valid_existing_snapshot_at",
+            validate_then_replace_parent,
+        )
+
+        with pytest.raises(ValueError, match="unsafe archive parent path"):
+            if operation == "store":
+                store_archived_lineage(db, "terminal", archive_root)
+            else:
+                cold_store.verify_archived_lineage(db, "terminal", archive_root)
+
+        assert swapped
+        assert not stored.snapshot_dir.exists()
+        assert (displaced_parent / stored.snapshot_dir.name).is_dir()
+    finally:
+        db.close()
+
+
 def test_store_does_not_use_old_snapshot_after_replacement(tmp_path: Path) -> None:
     """Only the replacement payload remains at the logical session's current path."""
     db = SessionDB(db_path=tmp_path / "state.db")

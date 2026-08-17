@@ -485,10 +485,17 @@ def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
     _enforce_message_limit(conn, lineage)
     records = _records(conn, lineage)
     _validate_sqlite_values(records)
+    try:
+        validated_started_at = float(started_at)
+        datetime.fromtimestamp(validated_started_at, UTC)
+    except (OSError, OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "terminal session start time is outside the supported range"
+        ) from exc
     return _StorePlan(
         terminal_id=terminal_id,
         physical_ids=lineage,
-        started_at=float(started_at),
+        started_at=validated_started_at,
         records=records,
         source_fingerprint=_fingerprint(records),
     )
@@ -643,6 +650,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
             len(records),
         )
         if existing is True:
+            _validate_directory_chain(edges)
             return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
 
         staging_name, staging_fd = _create_staging_directory(snapshot_parent_fd)
