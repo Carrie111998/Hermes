@@ -424,8 +424,10 @@ export async function mount(root, ctx) {
       listBody = emptyState({
         icon: 'search',
         title: state.view === 'active' ? 'No active results' : 'No rejected results',
+        // A brief that researched nothing at all also lands here, so the copy
+        // must not claim an evidence judgement that never ran.
         hint: state.view === 'active'
-          ? 'No companies met the evidence threshold for Active.'
+          ? 'No company reached the Active threshold. A brief that researched none lands here too — check the run funnel counts.'
           : 'This brief did not reject any researched companies.',
       });
     } else {
