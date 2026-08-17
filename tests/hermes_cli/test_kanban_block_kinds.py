@@ -165,6 +165,22 @@ def test_block_cause_fingerprint_is_normalized_and_privacy_safe(
         assert kb.get_task(conn, tid).status == "triage"
 
 
+def test_punctuation_change_starts_distinct_recurrence_lineage(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="Use the saved card?", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+
+        kb.block_task(conn, tid, reason="Use the saved card!", kind="needs_input")
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_recurrences == 1
+
+
 def test_status_only_specification_preserves_same_cause_lineage(
     kanban_home: Path,
 ) -> None:
@@ -178,6 +194,26 @@ def test_status_only_specification_preserves_same_cause_lineage(
         assert kb.get_task(conn, tid).status == "triage"
 
         assert kb.specify_triage_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.block_recurrences == 3
+
+
+def test_assignee_only_specification_preserves_same_cause_lineage(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        reason = "Still waiting for the payment method"
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        assert kb.get_task(conn, tid).status == "triage"
+
+        assert kb.specify_triage_task(conn, tid, assignee="reviewer")
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         kb.block_task(conn, tid, reason=reason, kind="needs_input")
         task = kb.get_task(conn, tid)
@@ -205,6 +241,7 @@ def test_legacy_recurrence_row_recovers_cause_from_latest_event(
 
 def test_legacy_fingerprint_tolerates_invalid_utf8_block_payload(
     kanban_home: Path,
+    caplog,
 ) -> None:
     """Corrupt BLOB payloads must not crash the legacy cause reader."""
     with kb.connect_closing() as conn:
@@ -227,6 +264,8 @@ def test_legacy_fingerprint_tolerates_invalid_utf8_block_payload(
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
         assert task.block_recurrences == 1
+        assert "Could not recover legacy block reason fingerprint" in caplog.text
+        assert reason not in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -5897,7 +5897,11 @@ def edit_completed_task_result(
 
 
 def _block_reason_fingerprint(reason: Optional[str]) -> str:
-    """Return a privacy-safe identity for normalized-equivalent reason text."""
+    """Hash NFKC-, whitespace-, and case-normalized reason text.
+
+    Whitespace and case-only changes share an identity. Distinct ASCII
+    punctuation remains distinct; NFKC-equivalent punctuation does not.
+    """
     normalized = unicodedata.normalize("NFKC", reason or "")
     normalized = re.sub(r"\s+", " ", normalized).strip().casefold()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -6050,6 +6054,12 @@ def block_task(
         cause_fingerprint = _block_reason_fingerprint(reason)
         if prev_fingerprint is None and prev_recurrences:
             prev_fingerprint = _legacy_block_reason_fingerprint(conn, task_id)
+            if prev_fingerprint is None:
+                _log.warning(
+                    "Could not recover legacy block reason fingerprint for task %s; "
+                    "resetting recurrence lineage",
+                    task_id,
+                )
         same_cause = (
             prev_kind == kind
             and prev_fingerprint is not None
@@ -6951,7 +6961,7 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
-        if changed_fields:
+        if any(field in changed_fields for field in ("title", "body")):
             # A materially revised specification represents fresh human input,
             # so an earlier unresolved blocker must not consume the new task's
             # recurrence budget.
