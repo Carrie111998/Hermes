@@ -5145,6 +5145,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Agent will be initialized on first use
         self.agent: Optional[Any] = None
+        # Session interaction mode from config (agent.interaction_mode).
+        # "build" = tools enabled, "plan" = read-only. Shift+Tab toggles.
+        _cfg_mode = (self.config or {}).get("agent", {}).get("interaction_mode", "build")
+        self._interaction_mode = str(_cfg_mode).strip().lower() if _cfg_mode in ("build", "plan") else "build"
         self._tool_callbacks_installed = False
         self._tirith_security_checked = False
         self._app = None  # prompt_toolkit Application (set in run())
@@ -6771,6 +6775,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_title = snapshot.get("session_title") or ""
 
             yolo_active = self._is_session_yolo_active()
+            plan_active = getattr(self, '_interaction_mode', 'build') == 'plan'
             goal_segment = self._status_bar_goal_segment(snapshot)
             if width < 52:
                 text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
@@ -6778,6 +6783,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     text += f" · {goal_segment}"
                 if focus_label:
                     text += f" · {focus_label}"
+                if plan_active:
+                    text += " · ◎ PLAN"
+                else:
+                    text += " · ◉ BUILD"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._right_align_status_title(text, session_title, width)
@@ -6802,6 +6811,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(duration_label)
                 if focus_label:
                     parts.append(focus_label)
+                if plan_active:
+                    parts.append("◎ PLAN")
+                else:
+                    parts.append("◉ BUILD")
                 if yolo_active:
                     parts.append("⚠ YOLO")
                 return self._right_align_status_title(" · ".join(parts), session_title, width)
@@ -6839,6 +6852,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(idle_since)
             if focus_label:
                 parts.append(focus_label)
+            if plan_active:
+                parts.append("◎ PLAN")
+            else:
+                parts.append("◉ BUILD")
             if yolo_active:
                 parts.append("⚠ YOLO")
             return self._right_align_status_title(" │ ".join(parts), session_title, width)
@@ -6858,6 +6875,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             width = self._get_tui_terminal_width()
             duration_label = snapshot["duration"]
             yolo_active = self._is_session_yolo_active()
+            plan_active = getattr(self, '_interaction_mode', 'build') == 'plan'
             goal_segment = self._status_bar_goal_segment(snapshot)
             battery_label = snapshot.get("battery_label") or ""
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
@@ -6880,6 +6898,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                if plan_active:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-plan", "◎ PLAN"))
+                else:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-build", "◉ BUILD"))
                 frags.append(("class:status-bar", " "))
             else:
                 percent = snapshot["context_percent"]
@@ -6917,6 +6941,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if focus_label:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", focus_label))
+                    if plan_active:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-plan", "◎ PLAN"))
+                    else:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-build", "◉ BUILD"))
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -6978,6 +7008,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if focus_label:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", focus_label))
+                    if plan_active:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-plan", "◎ PLAN"))
+                    else:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-build", "◉ BUILD"))
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -15621,6 +15657,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
+                    # Sync interaction mode before each turn.
+                    if hasattr(self.agent, 'interaction_mode'):
+                        self.agent.interaction_mode = self._interaction_mode
+                    # Inject mode awareness into the turn.
+                    _mode_note = (
+                        f"[System: Current interaction mode: {self._interaction_mode.upper()}. "
+                        + ("All tool execution is disabled. You may still use read-only tools "
+                           "(read_file, search_files, session_search) to gather context. "
+                           "Do NOT fabricate answers — read the actual code first. "
+                           "Do not attempt to write, edit, or execute any tools."
+                           if self._interaction_mode == 'plan'
+                           else "Tools are enabled. You may use all available tools.")
+                        + "]"
+                    )
+                    agent_message = _mode_note + "\n\n" + agent_message
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -17516,6 +17567,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             """
             self._force_full_redraw()
 
+        _imode_raw = str(((self.config or {}).get("agent", {}) or {}).get("interaction_mode_key", "s-tab")).strip().lower() or "s-tab"
+        _IMODE_KEY_ALIASES = {
+            "shift+tab": "s-tab", "shift-tab": "s-tab", "backtab": "s-tab",
+            "ctrl+p": "c-p", "alt+p": "escape,p", "f2": "f2",
+        }
+        _imode_key = _IMODE_KEY_ALIASES.get(_imode_raw, _imode_raw)
+
+        @kb.add(_imode_key)
+        def handle_interaction_mode_toggle(event):
+            """Toggle PLAN/BUILD interaction mode.
+
+            Session-scoped. PLAN disables write/execute tools; BUILD is the
+            normal default. No model turn spent. Default key: Shift+Tab.
+            Config: agent.interaction_mode_key
+            """
+            self._interaction_mode = 'plan' if self._interaction_mode == 'build' else 'build'
+            if self.agent is not None:
+                try:
+                    self.agent.interaction_mode = self._interaction_mode
+                except Exception:
+                    pass
+            mode_label = 'plan — tools disabled' if self._interaction_mode == 'plan' else 'build — tools enabled'
+            _cprint(f'  ⇥ {mode_label}  (key: {_imode_key})')
+            try:
+                event.app.invalidate()
+            except Exception:
+                pass
+
         @kb.add('c-c')
         def handle_ctrl_c(event):
             """Handle Ctrl+C - cancel interactive prompts, interrupt agent, or exit.
@@ -18807,6 +18886,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
             'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
             'status-bar-yolo': 'bg:#1a1a2e #FF4444 bold',
+            'status-bar-plan': 'bg:#1a1a2e #FFD700 bold',
+            'status-bar-build': 'bg:#1a1a2e #8FBC8F',
             'status-bar-session-title': 'bg:#FFD700 #1a1a2e bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
