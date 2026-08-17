@@ -171,7 +171,7 @@ def test_format_footer_dual_telegram_context_uses_exact_two_line_format():
         telegram_topic="227617",
         fields=("session_id", "telegram_topic"),
     )
-    assert out == "Session: sid-42\nTelegram topic: 227617"
+    assert out == "Session: sid-42\nTelegram thread: 227617"
 
 
 def test_format_footer_unknown_field_silently_ignored():
@@ -303,7 +303,7 @@ def test_build_footer_returns_dual_telegram_context_when_configured():
         session_id="sid-42",
         telegram_topic="227617",
     )
-    assert out == "Session: sid-42\nTelegram topic: 227617"
+    assert out == "Session: sid-42\nTelegram thread: 227617"
 
 
 def test_build_footer_per_platform_off_suppresses():

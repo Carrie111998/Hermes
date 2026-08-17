@@ -126,7 +126,7 @@ def format_runtime_footer(
                 parts.append(f"Session: {session_id}")
         elif field == "telegram_topic":
             if telegram_topic:
-                parts.append(f"Telegram topic: {telegram_topic}")
+                parts.append(f"Telegram thread: {telegram_topic}")
         # Unknown field names are silently ignored.
 
     if not parts:
