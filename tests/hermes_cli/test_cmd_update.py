@@ -8,6 +8,9 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli.main import cmd_update, PROJECT_ROOT
+# Bound at import time, i.e. BEFORE the autouse fixture stubs the module
+# attribute — TestClearBytecodeCacheSkipList tests the real implementation.
+from hermes_cli.main import _clear_bytecode_cache as _real_clear_bytecode_cache
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +54,15 @@ def _stub_update_side_effects(monkeypatch):
 
     monkeypatch.setattr(_m, "_build_web_ui", lambda *a, **k: True)
     monkeypatch.setattr(_m, "_kill_stale_dashboard_processes", lambda *a, **k: None)
+    # A FOURTH seam of the same class, missed until 2026-08-17:
+    # ``_clear_bytecode_cache`` ``os.walk``s the REAL ``PROJECT_ROOT`` and
+    # ``shutil.rmtree``s every ``__pycache__`` it finds. Unstubbed, a unit test
+    # deleted bytecode across all 27 sibling worktrees on this box, and the
+    # walk itself hung the tests/hermes_cli sweep at 10%. No test here asserts
+    # on it, so stubbing costs no coverage.
+    _stub_clear = lambda *a, **k: 0  # noqa: E731
+    _stub_clear._stubbed_for_tests = True
+    monkeypatch.setattr(_m, "_clear_bytecode_cache", _stub_clear)
     monkeypatch.setattr(
         _lazy, "_venv_pip_install",
         lambda *a, **k: _lazy._InstallResult(True, "", ""),
@@ -1289,3 +1301,91 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+
+class TestClearBytecodeCacheSkipList:
+    """``_clear_bytecode_cache`` must not walk into sibling checkouts.
+
+    It ``os.walk``s the repo root and ``shutil.rmtree``s every ``__pycache__``.
+    Its skip-list named ``.worktrees`` — a directory that does not exist here.
+    Claude Code puts worktrees under ``.claude/worktrees/<name>``, each a FULL
+    checkout of this repo: measured 2026-08-17 on this box, **27 worktrees
+    holding 737 ``__pycache__`` directories**. So one ``hermes update`` — or
+    any test reaching this function — walked all 27 and deleted other live
+    sessions' bytecode, forcing each of them into a full recompile.
+
+    That is both a cross-session destructive side effect and a long
+    filesystem walk: it is what hung the tests/hermes_cli sweep at 10%
+    (``test_update_falls_back_to_main_when_branch_not_on_remote`` ->
+    ``cmd_update`` -> ``_cmd_update_impl`` -> here).
+
+    The name-based skip is kept and corrected, but the load-bearing rule is
+    structural: never descend into a directory that carries a ``.git`` entry.
+    A nested clone has a ``.git`` DIRECTORY and a git worktree has a ``.git``
+    FILE, so one ``exists`` check covers both no matter what the parent
+    directory is called.
+    """
+
+    def _pkg_with_cache(self, parent, name="pkg"):
+        pkg = parent / name
+        cache = pkg / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "mod.cpython-311.pyc").write_bytes(b"\x00")
+        return cache
+
+    def test_removes_pycache_under_the_root(self, tmp_path):
+        """Vacuity guard: a fix that skips everything would pass the rest."""
+        cache = self._pkg_with_cache(tmp_path)
+        removed = _real_clear_bytecode_cache(tmp_path)
+
+        assert not cache.exists(), "the function stopped doing its job"
+        assert removed == 1
+
+    def test_skips_claude_worktrees(self, tmp_path):
+        own = self._pkg_with_cache(tmp_path)
+        wt = tmp_path / ".claude" / "worktrees" / "sibling-session"
+        wt.mkdir(parents=True)
+        (wt / ".git").write_text("gitdir: ../../../.git/worktrees/sibling-session\n")
+        foreign = self._pkg_with_cache(wt)
+
+        _real_clear_bytecode_cache(tmp_path)
+
+        assert not own.exists(), "should still clear its own bytecode"
+        assert foreign.exists(), (
+            "deleted a sibling worktree's __pycache__ — that is another live "
+            "session's bytecode, and wiping it forces a full recompile there"
+        )
+
+    def test_skips_any_nested_checkout_whatever_its_name(self, tmp_path):
+        """A nested clone (.git DIRECTORY) under an arbitrary name."""
+        own = self._pkg_with_cache(tmp_path)
+        nested = tmp_path / "vendor" / "some-other-repo"
+        (nested / ".git").mkdir(parents=True)
+        foreign = self._pkg_with_cache(nested)
+
+        _real_clear_bytecode_cache(tmp_path)
+
+        assert not own.exists()
+        assert foreign.exists(), (
+            "descended into a nested checkout; bytecode there belongs to a "
+            "different repo"
+        )
+
+
+def test_update_flow_does_not_clear_bytecode_on_the_real_checkout(monkeypatch):
+    """The autouse stub fixture must also cover ``_clear_bytecode_cache``.
+
+    Its docstring enumerates three seams that reach the developer's machine
+    and misses this fourth one, which ``os.walk``s and ``rmtree``s under the
+    REAL ``PROJECT_ROOT``. Nothing in this file asserts on it, so stubbing
+    costs no coverage — and leaving it live is what let a unit test delete
+    bytecode across every worktree on the box.
+    """
+    import hermes_cli.main as _m
+
+    assert getattr(_m._clear_bytecode_cache, "__module__", "") != "hermes_cli.main" or \
+        getattr(_m._clear_bytecode_cache, "_stubbed_for_tests", False), (
+        "hermes_cli.main._clear_bytecode_cache is not stubbed by the autouse "
+        "fixture — a test driving cmd_update will rmtree __pycache__ under the "
+        "real checkout"
+    )
