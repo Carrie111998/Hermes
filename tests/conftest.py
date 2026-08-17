@@ -930,8 +930,8 @@ def _ensure_current_event_loop(request):
 # 2026-05-10 — remains TRUE for signal safety: the ``os.kill`` guard above
 # catches the actual signal call and the ``systemctl`` guard catches the systemd
 # path, so a scanned PID is never signalled. It is NOT true for cost or
-# determinism, which is why ``_gateway_pid_scan_guard`` below now defaults the
-# host process-table sweep to empty. Reversal approved by Diego 2026-08-15 on
+# determinism, which is why ``_pid_scan_guard`` below now defaults the host
+# process-table scans to empty. Reversal approved by Diego 2026-08-15 on
 # these measurements:
 #
 #   • Cost. ``_scan_gateway_pids`` returned the developer's LIVE gateway PID
@@ -956,27 +956,60 @@ def _ensure_current_event_loop(request):
 # restart-manager gating) stays under real coverage and simply sees an empty
 # contribution from the process table, which is the correct hermetic default.
 #
+# ``hermes_cli.main._find_stale_dashboard_pids`` is the same hazard one notch
+# sharper, and is guarded the same way (2026-08-17). It walks the host process
+# table IN-PROCESS — ``psutil.process_iter(["pid","cmdline"])``, since Windows
+# 11 dropped ``wmic`` — so there is no subprocess to intercept and the sweep
+# probe written for the gateway scanner was structurally blind to it:
+#
+#   • Cost. 1011 host processes walked, 1.1–4.3 s per call standalone, and
+#     1.5552 s / 670 processes inside the confirmed offender
+#     (tests/hermes_cli/test_update_zip_symlink_reject.py::
+#     test_update_via_zip_accepts_normal_member, which reaches it via
+#     ``_update_via_zip`` -> ``_kill_stale_dashboard_processes``).
+#   • Determinism AND delivery. Unlike the gateway sweep, this one is wired
+#     straight to a killer: ``_kill_stale_dashboard_processes`` runs
+#     ``subprocess.run(["taskkill", "/PID", pid, "/F"])`` for every PID it
+#     returns. In the offender that was neutralised only by the test's own
+#     broad ``patch("subprocess.run")`` — which ALSO stopped
+#     ``_is_foreign_pid_kill`` below from ever evaluating the argv. Removing
+#     that patch and calling the reaper for real (2026-08-17) produced
+#     "⟲ Stopping 3 dashboard process(es)" against the developer's live
+#     dashboards, blocked at ``taskkill /PID 1784 /F`` by this file's guard
+#     alone. Neither test named "dashboard" or the scanner, so grep could not
+#     have found either — see the canaries in
+#     tests/test_live_system_guard_self_test.py.
+#
 # Design: docs/superpowers/specs/2026-08-17-gateway-pid-scan-test-guard-design.md
 
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 _REAL_GATEWAY_PID_SCAN_MARK = "real_gateway_pid_scan"
+_REAL_DASHBOARD_PID_SCAN_MARK = "real_dashboard_pid_scan"
 
-# ── gateway PID-scan guard: arm at import, decide at call ──────────────────
+# ── PID-scan guards: arm at import, decide at call ─────────────────────────
 #
-# ``_scan_gateway_pids`` must be stubbed before any unmarked test can call it,
-# WITHOUT importing ``hermes_cli.gateway`` anywhere in a test process. Both
-# halves of that are hard constraints, and together they rule out the two
-# obvious implementations (see the spec above for the full analysis):
+# Each guarded scanner must be stubbed before any unmarked test can call it,
+# WITHOUT importing its module anywhere in a test process. Both halves of that
+# are hard constraints, and together they rule out the two obvious
+# implementations (see the spec above for the full analysis):
 #
 #   • Importing the module in the autouse fixture costs 3.6 s and 463 modules
-#     (measured 2026-08-17) and pulls ``agent.model_metadata`` into every
-#     trivial test — exactly what tests/test_conftest_import_cost.py forbids.
-#     Note that test snapshots ``sys.modules`` at ``pytest_sessionfinish``, so
-#     importing once at conftest load instead of per-test fails it too.
+#     for ``hermes_cli.gateway`` (measured 2026-08-17) and pulls
+#     ``agent.model_metadata`` into every trivial test — exactly what
+#     tests/test_conftest_import_cost.py forbids. Note that test snapshots
+#     ``sys.modules`` at ``pytest_sessionfinish``, so importing once at conftest
+#     load instead of per-test fails it too. ``hermes_cli.main`` is cheaper
+#     (2.1 s / 252 modules) and pulls none of that test's FORBIDDEN_PREFIXES,
+#     so its *stated* assertion would pass — but the same test runs its child
+#     pytest with ``-p import_probe``, and main's import-time
+#     ``_apply_profile_override()`` reads ``-p`` as ``--profile`` and
+#     ``sys.exit(1)``s, so the child aborts and ``returncode == 0`` fails. The
+#     no-import rule holds for both modules, for two different reasons.
 #   • A ``sys.modules.get`` lookup at fixture setup imports nothing, but leaves
 #     the guard UNARMED whenever the module is not yet imported at that point.
-#     That is the common case: 17 test files import it inside a function body
-#     versus 15 at module scope, and the runner gives each file its own process.
+#     That is the common case, and the runner gives each file its own process:
+#     for ``hermes_cli.gateway`` 17 test files import it inside a function body
+#     versus 15 at module scope; for ``hermes_cli.main`` it is 176 versus 136.
 #
 # So: patch at IMPORT time via a ``sys.meta_path`` finder, and choose real-vs-
 # stub at CALL time from a flag the autouse fixture flips. The split is what
@@ -999,50 +1032,86 @@ _REAL_GATEWAY_PID_SCAN_MARK = "real_gateway_pid_scan"
 # Overhead measured 2026-08-17: 646 ns per ``find_spec`` call, 310 calls on the
 # heaviest import chain in the repo = 0.2 ms per process.
 
-_PID_SCAN_TARGET_MODULE = "hermes_cli.gateway"
-_PID_SCAN_ATTR = "_scan_gateway_pids"
+class _PidScanSpec:
+    """One host process-table scanner that unmarked tests get ``[]`` from.
 
-# Single-element list rather than a module global + ``global`` statement, so the
-# closure below mutates the same cell the fixture writes.
-_PID_SCAN_ALLOW_REAL = [False]
+    Adding a third is a one-line entry in ``_PID_SCAN_SPECS`` plus a marker in
+    ``pytest_configure`` and ``pyproject.toml`` — the finder, the installer and
+    the fixture are all spec-driven.
+    """
+
+    __slots__ = ("module_name", "attr", "marker", "allow_real")
+
+    def __init__(self, module_name, attr, marker):
+        self.module_name = module_name
+        self.attr = attr
+        self.marker = marker
+        # Flipped per test by ``_pid_scan_guard`` and read by the wrapper when
+        # it is CALLED — the split that lets a marked test import the module
+        # fresh inside its own body and still get the real scanner.
+        self.allow_real = False
 
 
-def _install_pid_scan_guard(module):
-    """Replace ``module._scan_gateway_pids`` with the call-time dispatcher.
+_PID_SCAN_SPECS = (
+    _PidScanSpec(
+        "hermes_cli.gateway", "_scan_gateway_pids", _REAL_GATEWAY_PID_SCAN_MARK
+    ),
+    _PidScanSpec(
+        "hermes_cli.main",
+        "_find_stale_dashboard_pids",
+        _REAL_DASHBOARD_PID_SCAN_MARK,
+    ),
+)
+_PID_SCAN_SPECS_BY_MODULE = {spec.module_name: spec for spec in _PID_SCAN_SPECS}
+
+
+def _install_pid_scan_guard(module, guarded):
+    """Replace ``module.<guarded.attr>`` with the call-time dispatcher.
 
     Idempotent: a second call (``importlib.reload``, double registration) sees
     its own wrapper and returns. Exceptions are swallowed — a conftest bug must
-    never break imports for the whole suite. The self-test canary in
-    tests/test_live_system_guard_self_test.py is what converts a silent failure
+    never break imports for the whole suite. The self-test canaries in
+    tests/test_live_system_guard_self_test.py are what convert a silent failure
     here into one loud red test.
     """
     try:
-        real = getattr(module, _PID_SCAN_ATTR, None)
+        real = getattr(module, guarded.attr, None)
         if real is None or getattr(real, "_hermes_pid_scan_guard", False):
             return
 
-        def _guarded_scan_gateway_pids(*args, **kwargs):
-            if _PID_SCAN_ALLOW_REAL[0]:
+        def _guarded_scan(*args, **kwargs):
+            if guarded.allow_real:
                 return real(*args, **kwargs)
+            # A plain ``[]``, never the scanner's own richer return type:
+            # ``_find_stale_dashboard_pids`` really returns a ``_DashboardPids``
+            # carrying ``scan_ok``, and ``main._scan_ok()`` defaults a plain
+            # list to True — so this reads as a SUCCESSFUL empty scan rather
+            # than "couldn't look". That is what the many existing tests
+            # patching these functions with ``return_value=[]`` already assume;
+            # a failed-scan stub would make the reaper print a warning instead
+            # of returning silently.
             return []
 
         # Deliberately NOT functools.wraps: copying ``__name__`` would disguise
         # the wrapper as the real scanner in tracebacks and in any identity
-        # check. The attributes below are the supported way to recognise it.
-        _guarded_scan_gateway_pids._hermes_pid_scan_guard = True
-        _guarded_scan_gateway_pids._hermes_pid_scan_real = real
-        setattr(module, _PID_SCAN_ATTR, _guarded_scan_gateway_pids)
+        # check. A distinct, self-describing name instead; the attributes below
+        # are the supported way to recognise it.
+        _guarded_scan.__name__ = f"_guarded_{guarded.attr}"
+        _guarded_scan._hermes_pid_scan_guard = True
+        _guarded_scan._hermes_pid_scan_real = real
+        setattr(module, guarded.attr, _guarded_scan)
     except Exception:
         pass
 
 
 class _PidScanGuardFinder:
-    """Patch ``hermes_cli.gateway`` the moment it is first imported."""
+    """Patch a guarded module the moment it is first imported."""
 
     def find_spec(self, fullname, path=None, target=None):
-        # First statement is a string compare that returns None, so every other
+        # First statement is a dict lookup that returns None, so every other
         # import in the process pays one cheap call and nothing else.
-        if fullname != _PID_SCAN_TARGET_MODULE:
+        guarded = _PID_SCAN_SPECS_BY_MODULE.get(fullname)
+        if guarded is None:
             return None
         try:
             for finder in sys.meta_path:
@@ -1053,9 +1122,9 @@ class _PidScanGuardFinder:
                     continue
                 _orig_exec = spec.loader.exec_module
 
-                def _patched_exec(module, _orig_exec=_orig_exec):
+                def _patched_exec(module, _orig_exec=_orig_exec, _guarded=guarded):
                     _orig_exec(module)
-                    _install_pid_scan_guard(module)
+                    _install_pid_scan_guard(module, _guarded)
 
                 # Set on the loader INSTANCE, which FileFinder builds fresh per
                 # spec, so this never leaks to another module's import.
@@ -1211,13 +1280,20 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "defaults hermes_cli.gateway._scan_gateway_pids to [] (for tests of "
         "the scanner itself, which stub the process-table source beneath it).",
     )
+    config.addinivalue_line(
+        "markers",
+        f"{_REAL_DASHBOARD_PID_SCAN_MARK}: opt out of the autouse stub that "
+        "defaults hermes_cli.main._find_stale_dashboard_pids to [] (for tests "
+        "of the scanner itself, which stub psutil.process_iter beneath it).",
+    )
 
-    # Arm the gateway PID-scan guard. Patch now if the module is somehow
-    # already imported (a plugin, an earlier conftest), then install the finder
-    # so any later first-import is patched at exec_module time.
-    _already_imported = sys.modules.get(_PID_SCAN_TARGET_MODULE)
-    if _already_imported is not None:
-        _install_pid_scan_guard(_already_imported)
+    # Arm the PID-scan guards. Patch now if a module is somehow already
+    # imported (a plugin, an earlier conftest), then install the finder so any
+    # later first-import is patched at exec_module time.
+    for _guarded in _PID_SCAN_SPECS:
+        _already_imported = sys.modules.get(_guarded.module_name)
+        if _already_imported is not None:
+            _install_pid_scan_guard(_already_imported, _guarded)
     sys.meta_path.insert(0, _PidScanGuardFinder())
 
     # Same two-step for the local-server probes.
@@ -1239,7 +1315,7 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
 def _live_system_guard(request, monkeypatch):
     """Block real os.kill / systemctl / process-killer commands during tests.
 
-    Gateway *PID scans* are handled separately by ``_gateway_pid_scan_guard``
+    *PID scans* themselves are handled separately by ``_pid_scan_guard``
     below — this fixture only stops a scanned PID from being signalled, it
     does not stop the scan itself.
 
@@ -1418,12 +1494,15 @@ def _live_system_guard(request, monkeypatch):
                     "os.kill guard entirely (it terminates from C), so this "
                     "is the only thing standing between a real "
                     "psutil.process_iter() walk and the developer's live "
-                    "dashboard / gateway. Stub the scan the code under test "
-                    "uses (e.g. hermes_cli.main._find_stale_dashboard_pids, "
-                    "hermes_cli.gateway.find_gateway_pids) rather than "
-                    "letting it reach the real process table, or mark the "
-                    "test with @pytest.mark.live_system_guard_bypass if real "
-                    "termination is genuinely required."
+                    "dashboard / gateway. The host scanners "
+                    "(hermes_cli.main._find_stale_dashboard_pids, "
+                    "hermes_cli.gateway._scan_gateway_pids) are already "
+                    "stubbed to [] by _pid_scan_guard, so reaching here means "
+                    "either this test opted out with a real_*_pid_scan marker "
+                    "without stubbing the process table beneath it, or the "
+                    "code under test walks psutil itself — stub that walk, or "
+                    "mark the test with @pytest.mark.live_system_guard_bypass "
+                    "if real termination is genuinely required."
                 )
 
             _guarded_psutil.__name__ = f"_guarded_psutil_{method_name}"
@@ -1922,11 +2001,14 @@ def _live_system_guard(request, monkeypatch):
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this terminates a LIVE "
                 "process outside the test subtree by PID. Reaching here "
-                "means the test walked the real process table: stub the "
-                "scan (hermes_cli.main._find_stale_dashboard_pids, "
-                "hermes_cli.gateway.find_gateway_pids) so the code under "
-                "test never sees a real PID, or mark with "
-                "@pytest.mark.live_system_guard_bypass if terminating a "
+                "means the test walked the real process table. The two "
+                "known scanners (hermes_cli.main._find_stale_dashboard_pids, "
+                "hermes_cli.gateway._scan_gateway_pids) already default to "
+                "[] via _pid_scan_guard, so this is either a real_*_pid_scan "
+                "opt-out that did not stub the process table beneath it, or "
+                "a third scanner that needs a _PID_SCAN_SPECS entry. Stub the "
+                "scan so the code under test never sees a real PID, or mark "
+                "with @pytest.mark.live_system_guard_bypass if terminating a "
                 "real foreign process is genuinely the point."
             )
         if _is_package_install(cmd):
@@ -2143,30 +2225,35 @@ def _live_system_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _gateway_pid_scan_guard(request):
-    """Choose whether this test gets the real host process-table sweep.
+def _pid_scan_guard(request):
+    """Choose whether this test gets the real host process-table scans.
 
-    The wrapper itself is installed at import time by ``_PidScanGuardFinder``;
-    all this fixture does is flip the flag the wrapper reads when called. No
-    import, no ``sys.modules`` lookup, no monkeypatch — which is why it cannot
-    regress tests/test_conftest_import_cost.py.
+    The wrappers themselves are installed at import time by
+    ``_PidScanGuardFinder``; all this fixture does is flip the flag each wrapper
+    reads when called. No import, no ``sys.modules`` lookup, no monkeypatch —
+    which is why it cannot regress tests/test_conftest_import_cost.py.
 
-    Tests of the scanner itself opt out with
-    ``@pytest.mark.real_gateway_pid_scan``. Those are already hermetic and fast
-    because they stub the process-table *source* beneath the scanner
-    (``subprocess.run``, ``os.listdir``/``/proc``, ``shutil.which``), so they
-    never touch the real host either.
+    Tests of a scanner itself opt out with that scanner's marker
+    (``@pytest.mark.real_gateway_pid_scan`` /
+    ``@pytest.mark.real_dashboard_pid_scan``). Those are already hermetic and
+    fast because they stub the process-table *source* beneath the scanner
+    (``psutil.process_iter``, ``subprocess.run``, ``os.listdir``/``/proc``,
+    ``shutil.which``), so they never touch the real host either. The markers are
+    per-scanner rather than one shared marker so that opting into the dashboard
+    walk does not silently re-enable the gateway sweep as well.
 
     Mirrors the existing ``real_concurrent_gate`` / ``real_agent_prewarm``
     autouse-stub-plus-opt-out-marker pattern.
     """
-    _PID_SCAN_ALLOW_REAL[0] = (
-        request.node.get_closest_marker(_REAL_GATEWAY_PID_SCAN_MARK) is not None
-    )
+    for guarded in _PID_SCAN_SPECS:
+        guarded.allow_real = (
+            request.node.get_closest_marker(guarded.marker) is not None
+        )
     try:
         yield
     finally:
-        _PID_SCAN_ALLOW_REAL[0] = False
+        for guarded in _PID_SCAN_SPECS:
+            guarded.allow_real = False
 
 
 @pytest.fixture(autouse=True)

@@ -377,6 +377,7 @@ markers = [
     "real_local_server_probe: opt out of the autouse stub that neutralises agent.model_metadata's network probes of a local model server (detect_local_server_type, _query_local_context_length, _query_ollama_api_show, fetch_endpoint_model_metadata)",
     "real_provider_model_fetch: opt out of the autouse stub that defaults hermes_cli.models.cached_provider_model_ids to [] (live provider model-catalog fetch + real cache-file fsync)",
     "real_lazy_feature_refresh: opt out of the autouse stub that no-ops hermes_cli.main._refresh_active_lazy_features (importlib.metadata scan of every LAZY_DEPS spec, plus install-path side effects)",
+    "real_dashboard_pid_scan: opt out of the autouse stub that defaults hermes_cli.main._find_stale_dashboard_pids to [] (host process-table walk feeding taskkill)",
 ]
 # pytest-timeout: per-test 30s hard cap.
 # This is the fallback inside each per-file pytest subprocess (see

@@ -288,6 +288,89 @@ risk is correctness — a buggy `find_spec` would break every import — mitigat
 first statement being a string compare that returns `None`, and by the swallow-and-fall-
 through posture above.
 
+## Addendum, same day: the dashboard scanner joins the same guard
+
+`hermes_cli.main._find_stale_dashboard_pids` (`main.py:6315`) is a second host
+process-table scanner — stale `hermes dashboard` / `hermes serve` servers, killed at the
+end of `hermes update`. It is now guarded by the same mechanism, with the finder, the
+installer and the fixture generalised to a list of `_PidScanSpec(module, attr, marker)`
+rather than duplicated. Adding a third scanner is one entry in `_PID_SCAN_SPECS` plus a
+marker registration.
+
+**It is the sharper hazard of the two, and four things about it differ from the gateway
+case. Do not inherit the gateway's analysis.**
+
+1. **No subprocess to intercept.** Commit `7b4b3a40ad` replaced the `wmic` branch with an
+   in-process `psutil.process_iter(["pid","cmdline"])` walk (wmic is gone from Windows 11,
+   so every scan was raising `FileNotFoundError` and returning `[]`). The
+   `subprocess.run`-argv probe used for the gateway sweep above is therefore structurally
+   blind to this one and reports zero. Instrumentation has to wrap `psutil.process_iter`
+   and attribute by caller frame.
+2. **Discovery here IS delivery.** `_kill_stale_dashboard_processes` (`main.py:6568`) feeds
+   every returned PID straight into `subprocess.run(["taskkill", "/PID", pid, "/F"])`. The
+   "discovery without delivery is harmless" stance never applied to this scanner at all.
+3. **`import hermes_cli.main` does not trip `test_conftest_import_cost.py`'s stated
+   assertion** — 2.1 s / 252 modules, but zero of its `FORBIDDEN_PREFIXES`. The no-import
+   rule still holds, via a different mechanism: that test runs its child pytest with
+   `-p import_probe`, and main's import-time `_apply_profile_override()` reads `-p` as
+   `--profile` and `sys.exit(1)`s, so the child aborts and `assert proc.returncode == 0`
+   fails. (Same reason a throwaway probe plugin must be loaded with `PYTEST_PLUGINS` +
+   `PYTHONPATH`, never `-p`.)
+4. **The `sys.modules.get` gap is far bigger**: 176 test files import `hermes_cli`/
+   `hermes_cli.main` only inside function bodies versus 136 at module scope (15/17 for
+   gateway).
+
+**Stub value.** A plain `[]`, not a `_DashboardPids`. `main._scan_ok()` reads the flag with
+`getattr(pids, "scan_ok", True)`, so a plain list means "looked, found nothing" — which is
+what the many existing tests patching this function with `return_value=[]` already assume.
+A failed-scan stub would make the reaper print its "could not scan the process table"
+warning on every update test instead of returning silently.
+
+**Markers are per-scanner** (`real_gateway_pid_scan`, `real_dashboard_pid_scan`) rather than
+one shared marker, so opting into the dashboard walk does not silently re-enable the gateway
+sweep. Verified by probe: across all 18 tests of a marked file the flags read
+`_scan_gateway_pids=False, _find_stale_dashboard_pids=True`.
+
+### Files touched (addendum)
+
+| File | Change |
+|---|---|
+| `tests/conftest.py` | `_PidScanSpec` + spec list; installer/finder/fixture generalised; fixture renamed `_gateway_pid_scan_guard` -> `_pid_scan_guard`; new marker; two guard error messages rewritten |
+| `pyproject.toml` | `real_dashboard_pid_scan` in `markers` |
+| `tests/hermes_cli/test_dashboard_process_scan.py` | file-level `pytestmark` |
+| `tests/hermes_cli/test_update_stale_dashboard.py` | file-level `pytestmark` |
+| `tests/test_windows_subprocess_no_window_flags.py` | 1 marker on `test_stale_dashboard_windows_scan_spawns_nothing` |
+| `tests/test_live_system_guard_self_test.py` | 3 canaries |
+
+The last two files were **not** in the task brief, which named only
+`test_dashboard_process_scan.py`. They drive the real scanner with `psutil.process_iter`
+faked beneath it and would have gone red under the default stub — found by running them,
+not by grep.
+
+### Evidence (measured 2026-08-17, PowerShell, worktree `admiring-yonath-fbcfaa`)
+
+The confirmed offender, `tests/hermes_cli/test_update_zip_symlink_reject.py::
+test_update_via_zip_accepts_normal_member`, reaches the scan through `_update_via_zip` ->
+`_kill_stale_dashboard_processes` and names neither "dashboard" nor the scanner:
+
+| | BEFORE | AFTER |
+|---|---|---|
+| result | 2 passed | 2 passed |
+| real host walks | **1** | **0** |
+| processes walked | **831** | **0** |
+| seconds inside the scan | **11.54** | **0.00** |
+
+Walk counts come from a `psutil.process_iter` probe that attributes by caller frame, so it
+measures identically on both arms. **Do not gate this A/B on wall clock**: the same file
+measured 22.23 s unguarded and 35.26 s guarded on two adjacent runs — a load artefact that
+inverts the true result. The probe's attributed seconds are the honest figure, and the
+guarded run of the same file later came in at 11.22 s.
+
+The RED step for canary 2 is worth recording: with the guard removed, calling the real
+reaper printed "⟲ Stopping 3 dashboard process(es)" against the developer's live dashboards
+and was stopped at `taskkill /PID 1784 /F` by `_is_foreign_pid_kill` alone. That is the
+whole argument for this guard, reproduced live.
+
 ## Open items
 
 - The finder stays on `sys.meta_path` for the whole session with no teardown removal.

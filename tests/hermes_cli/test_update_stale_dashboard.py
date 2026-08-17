@@ -27,6 +27,14 @@ from hermes_cli.main import (
 )
 
 
+# ``TestFindStaleDashboardPids`` drives the real scanner, so this file opts out
+# of the autouse stub that defaults it to ``[]`` (tests/conftest.py::
+# _pid_scan_guard). Safe and fast: those tests fake ``psutil.process_iter``
+# beneath the scanner, and every other class here patches the scan function
+# outright, so the host process table is never walked.
+pytestmark = pytest.mark.real_dashboard_pid_scan
+
+
 @pytest.fixture(autouse=True)
 def _refresh_bindings_against_live_module():
     """Rebind module-level names to the *current* ``hermes_cli.main``.

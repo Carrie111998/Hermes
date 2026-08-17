@@ -32,6 +32,15 @@ import pytest
 from hermes_cli import main
 
 
+# This file is about the scanner itself, so it opts out of the autouse stub
+# that defaults ``_find_stale_dashboard_pids`` to ``[]`` (tests/conftest.py::
+# _pid_scan_guard). Opting out is safe here and stays fast: every test below
+# fakes the process table one layer *beneath* the scanner — the ``fake_psutil``
+# fixture, an explicit ``patch.object(psutil, ...)``, or a ``patch`` of the
+# scan function itself — so nothing reaches the host's 1000-odd processes.
+pytestmark = pytest.mark.real_dashboard_pid_scan
+
+
 # ── Fixtures / helpers ───────────────────────────────────────────────
 
 class _FakeProc:

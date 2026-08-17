@@ -979,3 +979,101 @@ def test_real_local_server_probe_marker_restores_the_probe(monkeypatch):
     assert mm.detect_local_server_type("http://127.0.0.1:11434/v1") == "ollama", (
         "the real_local_server_probe marker did not restore the real probe"
     )
+
+
+# ──────────────────── dashboard PID-scan guard ────────────────────
+#
+# Sibling canary for the dashboard half of ``_pid_scan_guard``, and the sharper
+# of the two hazards: ``hermes_cli.main._find_stale_dashboard_pids`` walks the
+# host process table in-process via ``psutil.process_iter(["pid","cmdline"])``,
+# and ``_kill_stale_dashboard_processes`` feeds every PID it returns straight
+# into ``taskkill /PID <n> /F``. Measured 2026-08-17 on this box, standalone:
+# 1011 host processes walked, 1.1-4.3 s per call, returning the developer's
+# LIVE dashboard PIDs.
+#
+# Because that walk is in-process there is no subprocess to intercept, so the
+# gateway guard's own ``subprocess.run``-argv instrumentation was structurally
+# blind to it and reported zero. The confirmed offender never says "dashboard"
+# either — tests/hermes_cli/test_update_zip_symlink_reject.py::
+# test_update_via_zip_accepts_normal_member reached the scan through
+# ``_update_via_zip`` -> ``_kill_stale_dashboard_processes`` and swept 670
+# processes in 1.5552 s, returning 3 live PIDs. Its own broad
+# ``patch("subprocess.run")`` is the only thing that stopped the taskkills, and
+# that same patch is what prevented the live-system guard's
+# ``_is_foreign_pid_kill`` from ever seeing the argv. Grep cannot find offenders
+# of this shape; only instrumentation can.
+#
+# As with the gateway canaries above, every test here imports the module INSIDE
+# its body on purpose — that is the shape a ``sys.modules``-lookup design fails.
+
+
+def test_dashboard_pid_scan_is_stubbed_by_default():
+    """The host process-table walk must not run in an unmarked test."""
+    from hermes_cli import main
+
+    assert getattr(
+        main._find_stale_dashboard_pids, "_hermes_pid_scan_guard", False
+    ), (
+        "the autouse _pid_scan_guard is not installed on "
+        "hermes_cli.main._find_stale_dashboard_pids — an unmarked test can walk "
+        "the host process table and hand live PIDs to taskkill"
+    )
+    # Behaviour, not just identity: a wrapper that delegated anyway would pass
+    # the attribute check above.
+    started = time.perf_counter()
+    assert main._find_stale_dashboard_pids() == []
+    assert time.perf_counter() - started < 0.5, (
+        "the stub took long enough to have reached the real process table"
+    )
+
+
+def test_dashboard_pid_scan_stub_reads_as_a_successful_empty_scan(capsys):
+    """The stub's plain ``[]`` must mean "looked, found nothing".
+
+    The real scanner returns a ``_DashboardPids`` carrying ``scan_ok``, and the
+    reaper prints a "could not scan the process table" warning when that flag is
+    False. ``_scan_ok`` defaults to True via ``getattr`` for a plain list, so the
+    stub reads as a clean box — the same shape the dozens of existing tests that
+    patch this function with ``return_value=[]`` already rely on. A stub that
+    returned a failed ``_DashboardPids`` instead would turn every update test
+    into a warning-printing near-miss.
+
+    Calling the reaper for real also proves only the *scan* is stubbed: this is
+    the real ``_kill_stale_dashboard_processes`` taking its real early return.
+    """
+    from hermes_cli import main
+
+    assert main._scan_ok(main._find_stale_dashboard_pids()) is True
+    main._kill_stale_dashboard_processes()
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.real_dashboard_pid_scan
+def test_real_dashboard_pid_scan_marker_restores_the_scanner(monkeypatch):
+    """Tests of the scanner itself must still get the real implementation.
+
+    Asserts by BEHAVIOUR, with the process table faked one layer beneath the
+    scanner, rather than by comparing ``__name__``: the wrapper stays installed
+    under the marker and delegates at call time, so an identity assertion would
+    be both wrong and — since it never calls anything — vacuous if delegation
+    ever broke.
+
+    No real walk happens here: ``psutil.process_iter`` is stubbed, so the
+    scanner matches a canned argv.
+    """
+    import psutil
+
+    from hermes_cli import main
+
+    class _Proc:
+        info = {"pid": 98765, "cmdline": ["hermes", "dashboard", "--port", "9119"]}
+
+    monkeypatch.setattr(
+        psutil, "process_iter", lambda attrs=None, ad_value=None: iter([_Proc()])
+    )
+
+    pids = main._find_stale_dashboard_pids()
+    assert list(pids) == [98765], (
+        "the real_dashboard_pid_scan marker did not restore the real scanner"
+    )
+    assert pids.scan_ok is True

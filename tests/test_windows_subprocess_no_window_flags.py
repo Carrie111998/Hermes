@@ -214,6 +214,7 @@ def test_gateway_pid_scan_hides_wmic_and_powershell_windows(monkeypatch):
     ]
 
 
+@pytest.mark.real_dashboard_pid_scan  # asserts the scanner itself spawns nothing
 def test_stale_dashboard_windows_scan_spawns_nothing(monkeypatch):
     """The dashboard scan satisfies the windowless contract by not spawning.
 
