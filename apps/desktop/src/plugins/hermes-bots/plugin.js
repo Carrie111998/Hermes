@@ -172,6 +172,9 @@ const $groupChats = atom({})
 /** Group whose room view is open in the Bots pane (secondary navigation,
  *  same pattern as $botSessionsWorkspace). */
 const $groupChatWorkspace = atom(null)
+/** Group whose room is shown in the large expanded dialog (same $groupChats
+ *  state, wider surface — not a forked log). */
+const $groupChatExpanded = atom(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
 
@@ -6190,7 +6193,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
 /** Merged room view for one group: shared timeline with per-member
  *  attribution, a composer that drives the round-robin, and a working
  *  indicator while member turns run. */
-function GroupChatWorkspace({ group, members }) {
+function GroupChatWorkspace({ group, members, expanded = false, onExpand = null }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
@@ -6199,7 +6202,7 @@ function GroupChatWorkspace({ group, members }) {
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
     children: [
-      jsx(Button, {
+      !expanded && jsx(Button, {
         variant: 'ghost',
         size: 'sm',
         onClick: () => $groupChatWorkspace.set(null),
@@ -6212,6 +6215,12 @@ function GroupChatWorkspace({ group, members }) {
       jsx('span', {
         className: 'shrink-0 text-[0.65rem] text-(--ui-text-quaternary)',
         children: `${members.length} bots`
+      }),
+      !expanded && onExpand && jsx(Button, {
+        variant: 'ghost',
+        size: 'sm',
+        onClick: onExpand,
+        children: 'Expand'
       })
     ]
   })
@@ -6309,6 +6318,36 @@ function GroupChatWorkspace({ group, members }) {
   })
 }
 
+/** Large read-friendly room surface: same GroupChatWorkspace rendered inside a
+ *  resizable Dialog. Shares $groupChats state — closing it never touches the
+ *  room log, watermarks, or an in-flight round-robin. */
+function GroupChatExpandedDialog({ group, members, onClose }) {
+  return jsx(Dialog, {
+    open: true,
+    onOpenChange: value => !value && onClose(),
+    children: jsxs(DialogContent, {
+      className: 'max-w-3xl',
+      // Resizable-window treatment, same pattern as EditProfileDialog advanced.
+      style: { resize: 'both', overflow: 'auto', minWidth: 520, minHeight: 420, maxWidth: '95vw', maxHeight: '90vh', width: 860, height: 640 },
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: `${group} — group chat` }),
+            jsx(DialogDescription, {
+              children: `Expanded room view with ${members.length} bots. Same live log as the Bots pane — closing this window keeps the room and any running turns intact.`
+            })
+          ]
+        }),
+        jsx('div', {
+          className: 'flex min-h-0 flex-1 flex-col border-t border-(--ui-stroke-secondary)',
+          style: { height: '100%' },
+          children: jsx(GroupChatWorkspace, { group, members, expanded: true })
+        })
+      ]
+    })
+  })
+}
+
 function BotsPane() {
   const { data, error, isLoading, refetch } = useRoster()
   const gatewayState = useValue(host.state.gateway)
@@ -6324,6 +6363,7 @@ function BotsPane() {
   const activityToasts = useValue($activityToasts)
   const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
+  const groupExpandedName = useValue($groupChatExpanded)
   const groupNeedsYou = useValue($groupNeedsYou)
 
   // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
@@ -6387,8 +6427,30 @@ function BotsPane() {
     ? roster.filter(bot => (allMeta[bot.name]?.group || '').trim() === groupChatName)
     : []
 
+  const groupExpandedMembers = groupExpandedName
+    ? roster.filter(bot => (allMeta[bot.name]?.group || '').trim() === groupExpandedName)
+    : []
+
+  const expandedDialog = groupExpandedName && groupExpandedMembers.length
+    ? jsx(GroupChatExpandedDialog, {
+        group: groupExpandedName,
+        members: groupExpandedMembers,
+        onClose: () => $groupChatExpanded.set(null)
+      })
+    : null
+
   if (groupChatName && groupChatMembers.length) {
-    return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
+    return jsxs('div', {
+      className: 'flex h-full flex-col',
+      children: [
+        jsx(GroupChatWorkspace, {
+          group: groupChatName,
+          members: groupChatMembers,
+          onExpand: () => $groupChatExpanded.set(groupChatName)
+        }),
+        expandedDialog
+      ]
+    })
   }
 
   return jsxs('div', {
