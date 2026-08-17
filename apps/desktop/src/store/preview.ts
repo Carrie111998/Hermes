@@ -155,6 +155,7 @@ export function decodePreviewTabs(raw: string): PreviewTab[] {
       tab.target.kind === 'url' || tab.target.kind === 'file'
         ? previewTabId(tab.target, tab.sessionId)
         : tab.id
+
     deduped.set(id, { ...tab, id })
   }
 
@@ -211,6 +212,7 @@ $focusedStoredSessionId.listen(sessionId => {
   if (tabs.some(tab => tab.sessionId == null && !tab.pinned)) {
     const activeId = $rightRailActiveTabId.get()
     let newActiveId = activeId
+
     const updated = tabs.map(tab => {
       if (tab.sessionId != null || tab.pinned) {
         return tab
@@ -321,6 +323,7 @@ export function openPreview(target: PreviewTarget, source: PreviewRecordSource =
   const id = previewTabId(resolved, sessionId)
   const current = $previewTabs.get()
   const index = current.findIndex(tab => tab.id === id)
+
   // A PINNED row for the same file carries the unprefixed (legacy) id, so a
   // session-scoped open would otherwise stack a second tab for the same file.
   // Reuse the pinned row instead — refreshed, still pinned, fronted. Never
@@ -331,20 +334,40 @@ export function openPreview(target: PreviewTarget, source: PreviewRecordSource =
           tab => tab.pinned && tab.target.kind === 'file' && canonicalFileKey(tab.target) === canonicalFileKey(resolved)
         )
       : current[index]
-  // The tab belongs to the session that was active when it opened. A re-open
-  // of an existing tab (same session, same file) keeps the tab's owner and
-  // pin state — only the target refreshes.
+
+  // Reuse semantics depend on WHY the row was found:
+  // - Same-session re-open (any kind): keep the owner and pin state — only
+  //   the target refreshes.
+  // - A PINNED file row reached from ANOTHER session: keep its owner (and
+  //   therefore its owner-keyed id) — the pin is the explicit cross-session
+  //   workspace contract, and rekeying to the opening session would leave
+  //   `id` and `sessionId` disagreeing until the next unpin (which returns
+  //   the tab to that owner anyway).
+  // - The singleton Browser or an artifact reached from another session: the
+  //   surface NAVIGATES, so it re-owns to the opening session — otherwise the
+  //   new URL would stay invisible in the session that just opened it.
+  // - Ownerless legacy rows: adopted — rekeyed and stamped — into the opening
+  //   session (see the pinned-legacy test).
+  // The id is derived from the FINAL session id so the two can never split.
+  const tabSessionId =
+    existing?.sessionId == null || existing.pinned || existing.sessionId === sessionId
+      ? existing?.sessionId ?? sessionId
+      : sessionId
+
   const tab: PreviewTab = {
-    id,
+    id: previewTabId(resolved, tabSessionId),
     target: resolved,
-    sessionId: existing?.sessionId ?? sessionId,
+    sessionId: tabSessionId,
     pinned: existing?.pinned
   }
 
   const replaceIndex = existing ? current.indexOf(existing) : -1
 
   $previewTabs.set(replaceIndex === -1 ? [...current, tab] : current.map((item, i) => (i === replaceIndex ? tab : item)))
-  selectRightRailTab(id)
+  // Select the row's FINAL id: when a pinned row is reused from another
+  // session, the id keeps the owner's session, so the pre-computed id would
+  // point at nothing.
+  selectRightRailTab(tab.id)
 }
 
 /** Pin or unpin a preview tab. Pinned tabs render in EVERY session — the

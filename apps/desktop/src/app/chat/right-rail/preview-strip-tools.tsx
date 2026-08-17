@@ -109,7 +109,11 @@ export function previewPinTool(tabId: string): PaneStripTool {
     id: 'preview-pin',
     label: translateNow(pinned ? 'preview.unpin' : 'preview.pin'),
     onSelect: () => {
-      setPreviewTabPinned(tabId, !pinned)
+      // Read the CURRENT pin state at click time, not the render-time
+      // closure: a rapid second click before the strip re-renders must
+      // toggle from the state the first click produced.
+      const current = Boolean($previewTabs.get().find(tab => tab.id === tabId)?.pinned)
+      setPreviewTabPinned(tabId, !current)
       invalidateStripTools()
     }
   }
