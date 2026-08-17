@@ -2093,14 +2093,18 @@ def _default_cron_broker_policy() -> tuple[bool, set[str], Path]:
     if current_home == default_home:
         return False, set(), default_home
 
-    token = set_hermes_home_override(default_home)
     try:
-        cfg = load_config() or {}
+        with _default_cron_broker_scope(default_home):
+            cfg = load_config() or {}
     except Exception:
-        logger.debug("cron default delivery broker: default config unavailable", exc_info=True)
+        logger.debug(
+            "cron default delivery broker: default config unavailable",
+            exc_info=True,
+        )
         return False, set(), default_home
-    finally:
-        reset_hermes_home_override(token)
+
+    if not isinstance(cfg, dict):
+        return False, set(), default_home
 
     gateway_cfg = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
     cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
@@ -2129,34 +2133,61 @@ def _default_cron_broker_policy() -> tuple[bool, set[str], Path]:
     return bool(allowed), allowed, default_home
 
 
+@contextlib.contextmanager
+def _default_cron_broker_scope(default_home: Path):
+    """Temporarily install Default's home and credential scope.
+
+    ``run_one_job`` tears down the specialist secret scope before delivery.
+    Broker policy and transport probes still need to read Default's gateway
+    configuration at that point, and profile-isolation mode deliberately
+    refuses credential reads without an explicit scope.  Install Default's
+    scope only for these root-owned reads, then restore the previous home and
+    secret scope exactly.  Credentials remain out of the sanitized broker
+    subprocess environment.
+    """
+    home_token = set_hermes_home_override(default_home)
+    try:
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            reset_secret_scope,
+            set_secret_scope,
+        )
+
+        scope_token = set_secret_scope(build_profile_secret_scope(default_home))
+        try:
+            yield
+        finally:
+            reset_secret_scope(scope_token)
+    finally:
+        reset_hermes_home_override(home_token)
+
+
 def _default_cron_broker_connected_platforms() -> set[str]:
     """Return broker-allowed platforms configured on the default profile."""
     enabled, allowed, default_home = _default_cron_broker_policy()
     if not enabled:
         return set()
-    token = set_hermes_home_override(default_home)
     try:
-        from gateway.config import load_gateway_config
+        with _default_cron_broker_scope(default_home):
+            from gateway.config import load_gateway_config
 
-        gateway_config = load_gateway_config()
-        connected = {p.value for p in gateway_config.get_connected_platforms()}
-        # Do not expand relay-fronted logical platforms here. The broker sends
-        # through a separate `hermes send` process, which has no live gateway
-        # adapter/relay connection to borrow. Filter through the send layer's
-        # standalone-capability predicate so live-adapter-only platforms are
-        # never advertised as brokerable.
-        from tools.send_message_tool import supports_standalone_send
+            gateway_config = load_gateway_config()
+            connected = {p.value for p in gateway_config.get_connected_platforms()}
+            # Do not expand relay-fronted logical platforms here. The broker sends
+            # through a separate `hermes send` process, which has no live gateway
+            # adapter/relay connection to borrow. Filter through the send layer's
+            # standalone-capability predicate so live-adapter-only platforms are
+            # never advertised as brokerable.
+            from tools.send_message_tool import supports_standalone_send
 
-        return {
-            name
-            for name in connected & allowed
-            if supports_standalone_send(name)
-        }
+            return {
+                name
+                for name in connected & allowed
+                if supports_standalone_send(name)
+            }
     except Exception:
         logger.debug("cron default delivery broker: platform probe failed", exc_info=True)
         return set()
-    finally:
-        reset_hermes_home_override(token)
 
 
 def _default_cron_broker_home_target(platform_name: str) -> tuple[str, Optional[str]]:
@@ -2165,15 +2196,12 @@ def _default_cron_broker_home_target(platform_name: str) -> tuple[str, Optional[
     platform_key = str(platform_name).strip().lower()
     if not enabled or platform_key not in allowed:
         return "", None
-    token = set_hermes_home_override(default_home)
-    try:
+    with _default_cron_broker_scope(default_home):
         home = _get_config_home_channel(platform_key)
         if home is None or not getattr(home, "chat_id", None):
             return "", None
         thread_id = getattr(home, "thread_id", None)
         return str(home.chat_id), str(thread_id) if thread_id else None
-    finally:
-        reset_hermes_home_override(token)
 
 
 def _send_via_default_cron_broker(

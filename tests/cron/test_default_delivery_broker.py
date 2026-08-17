@@ -22,6 +22,50 @@ def test_preflight_accepts_authorized_default_broker(monkeypatch):
         assert sched._preflight_check_delivery({"deliver": "telegram"}) is None
 
 
+def test_preflight_accepts_numeric_discord_from_tokenless_specialist(
+    monkeypatch, tmp_path
+):
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    default_home = tmp_path / "fleet-root"
+    specialist_home = default_home / "profiles" / "research"
+    specialist_home.mkdir(parents=True)
+    (default_home / "config.yaml").write_text(
+        "gateway:\n"
+        "  multiplex_profiles: true\n"
+        "cron:\n"
+        "  broker_outbound_via_default: true\n"
+        "  broker_outbound_platforms:\n"
+        "    - discord\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(sched, "get_default_hermes_root", lambda: default_home)
+
+    def fake_gateway_config():
+        connected = {"discord"} if get_hermes_home() == default_home else set()
+        return _gateway_config(connected)
+
+    token = set_hermes_home_override(specialist_home)
+    try:
+        with patch(
+            "gateway.config.load_gateway_config", side_effect=fake_gateway_config
+        ), patch(
+            "tools.send_message_tool.supports_standalone_send", return_value=True
+        ):
+            reason = sched._preflight_check_delivery(
+                {"deliver": "discord:123456789012345678"}
+            )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert reason is None
+
+
 def test_preflight_rejects_platform_outside_broker(monkeypatch):
     monkeypatch.setattr(
         sched, "_default_cron_broker_connected_platforms", lambda: {"telegram"}
@@ -120,6 +164,17 @@ def test_policy_reads_authority_from_default_profile(monkeypatch, tmp_path):
     assert observed["home"] == default_home
 
 
+def test_policy_fails_closed_when_default_scope_is_unavailable(monkeypatch, tmp_path):
+    default_home, _specialist_home = _set_profile_homes(monkeypatch, tmp_path)
+
+    def unavailable_scope(_default_home):
+        raise RuntimeError("default scope unavailable")
+
+    monkeypatch.setattr(sched, "_default_cron_broker_scope", unavailable_scope)
+
+    assert sched._default_cron_broker_policy() == (False, set(), default_home)
+
+
 def test_default_profile_never_brokers_through_itself(monkeypatch, tmp_path):
     default_home = tmp_path / "fleet-root"
     default_home.mkdir()
@@ -158,6 +213,106 @@ def test_policy_real_config_load_from_named_profile_context(monkeypatch, tmp_pat
     assert enabled is True
     assert allowed == {"telegram"}
     assert resolved_default == default_home
+
+
+def test_broker_probe_installs_default_secret_scope_after_specialist_reset(
+    monkeypatch, tmp_path
+):
+    from agent.secret_scope import current_secret_scope
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    default_home = tmp_path / "fleet-root"
+    specialist_home = default_home / "profiles" / "research"
+    specialist_home.mkdir(parents=True)
+    (default_home / ".env").write_text(
+        "DISCORD_BOT_TOKEN=root-discord-token\n",
+        encoding="utf-8",
+    )
+    (default_home / "config.yaml").write_text(
+        "gateway:\n"
+        "  multiplex_profiles: true\n"
+        "cron:\n"
+        "  broker_outbound_via_default: true\n"
+        "  broker_outbound_platforms:\n"
+        "    - discord\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(sched, "get_default_hermes_root", lambda: default_home)
+
+    def fake_gateway_config():
+        scope = current_secret_scope()
+        assert get_hermes_home() == default_home
+        assert scope is not None
+        assert scope.get("DISCORD_BOT_TOKEN") == "root-discord-token"
+        return _gateway_config({"discord"})
+
+    token = set_hermes_home_override(specialist_home)
+    try:
+        assert current_secret_scope() is None
+        with patch(
+            "gateway.config.load_gateway_config", side_effect=fake_gateway_config
+        ), patch(
+            "tools.send_message_tool.supports_standalone_send", return_value=True
+        ):
+            connected = sched._default_cron_broker_connected_platforms()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert connected == {"discord"}
+    assert current_secret_scope() is None
+
+
+def test_default_broker_scope_restores_specialist_context_after_exception(
+    monkeypatch, tmp_path
+):
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        current_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    default_home = tmp_path / "fleet-root"
+    specialist_home = default_home / "profiles" / "research"
+    specialist_home.mkdir(parents=True)
+    (default_home / ".env").write_text(
+        "DISCORD_BOT_TOKEN=root-discord-token\n",
+        encoding="utf-8",
+    )
+    (specialist_home / ".env").write_text(
+        "OPENAI_API_KEY=specialist-provider-key\n",
+        encoding="utf-8",
+    )
+
+    home_token = set_hermes_home_override(specialist_home)
+    scope_token = set_secret_scope(build_profile_secret_scope(specialist_home))
+    try:
+        specialist_scope = current_secret_scope()
+        assert specialist_scope == {"OPENAI_API_KEY": "specialist-provider-key"}
+
+        with pytest.raises(RuntimeError, match="probe failed"):
+            with sched._default_cron_broker_scope(default_home):
+                assert get_hermes_home() == default_home
+                assert current_secret_scope() == {
+                    "DISCORD_BOT_TOKEN": "root-discord-token"
+                }
+                raise RuntimeError("probe failed")
+
+        assert get_hermes_home() == specialist_home
+        assert current_secret_scope() is specialist_scope
+    finally:
+        reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
 
 
 @pytest.mark.parametrize(
