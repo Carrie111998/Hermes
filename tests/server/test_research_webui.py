@@ -26,7 +26,9 @@ def test_production_webui_has_no_mock_runtime():
         text = client.get(path).text
         assert "./mocks/" not in text
         assert "config.mode" not in text
+    assert "mode: 'mock'" not in client.get("/js/api.js").text
     assert client.get("/js/mocks/handlers.js").status_code == 404
+    assert client.get("/js/mocks/seed.js").status_code == 404
 
 
 def test_source_picker_is_catalog_driven_and_admin_copy_is_distinct():

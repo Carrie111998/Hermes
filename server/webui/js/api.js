@@ -28,7 +28,6 @@ export const config = {
   // Future sales backend only. The browser must never call Hermes directly.
   // That backend owns the Hermes session, CSRF/cookie flow, and all provider secrets.
   agentAdapter: {
-    mode: 'mock',
     enabled: false,
   },
 };
