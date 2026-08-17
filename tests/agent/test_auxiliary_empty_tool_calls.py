@@ -18,7 +18,7 @@ fast path when nothing needs stripping. Both sync and async call paths must
 apply it before the wire.
 """
 
-from agent.auxiliary_client import _strip_empty_tool_calls
+from agent.auxiliary_client import _INTERRUPTED_PLACEHOLDER, _strip_empty_tool_calls
 
 
 def _tc(cid, name="tool_x", args="{}"):
@@ -53,7 +53,7 @@ def test_strip_empty_array_empty_content_gets_placeholder():
     ]
     out = _strip_empty_tool_calls(msgs)
     assert "tool_calls" not in out[0]
-    assert out[0]["content"] == "(tool call removed)"
+    assert out[0]["content"] == _INTERRUPTED_PLACEHOLDER
 
 
 def test_strip_final_empty_assistant_keeps_empty_content():
@@ -407,3 +407,162 @@ def test_async_call_llm_strips_empty_tool_calls_before_wire(monkeypatch):
     assert not bad, f"empty tool_calls reached the wire: {bad}"
     # caller list is never mutated
     assert poison[1]["tool_calls"] == []
+
+
+# ── route_info records ONLY the route that actually answered ──────────────
+# Review finding (2026-08-16): route_info used to record the last-ATTEMPTED
+# route even when every candidate failed — a caller reading route_info after
+# an exception could not tell "this is the route that answered" from "this
+# is the last thing we tried". The record now happens only on success.
+
+def test_route_info_recorded_on_primary_success(monkeypatch):
+    """Primary path success must populate route_info with the actual route."""
+    from types import SimpleNamespace
+    import agent.auxiliary_client as ac
+
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return _fake_completions_create(captured)(**kwargs)
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        base_url = "http://fake/v1"
+        chat = FakeChat()
+
+    monkeypatch.setattr(
+        ac, "_get_cached_client",
+        lambda *a, **kw: (FakeClient(), "fake-model"),
+    )
+    monkeypatch.setattr(
+        ac, "_relay_sync_completion",
+        lambda client, kwargs, *, provider=None, api_mode=None, create=None: create(kwargs),
+    )
+
+    route_info = {}
+    ac.call_llm(
+        task="test_verify", messages=[{"role": "user", "content": "hi"}],
+        provider="custom", base_url="http://fake/v1", model="fake-model",
+        route_info=route_info,
+    )
+
+    assert route_info.get("provider") == "custom"
+    assert route_info.get("model") == "fake-model"
+
+
+def test_route_info_not_written_when_every_candidate_fails(monkeypatch):
+    """The whole point of the review fix: when the primary AND all fallback
+    candidates fail, route_info must NOT claim a route answered. It stays
+    empty so a caller can distinguish failure from success."""
+    from types import SimpleNamespace
+    from openai import APIConnectionError
+    import agent.auxiliary_client as ac
+
+    class FailingCompletions:
+        def create(self, **kwargs):
+            raise APIConnectionError(request=SimpleNamespace())
+
+    class FakeChat:
+        completions = FailingCompletions()
+
+    class FakeClient:
+        base_url = "http://fake/v1"
+        chat = FakeChat()
+
+    monkeypatch.setattr(
+        ac, "_get_cached_client",
+        lambda *a, **kw: (FakeClient(), "fake-model"),
+    )
+    monkeypatch.setattr(
+        ac, "_relay_sync_completion",
+        lambda client, kwargs, *, provider=None, api_mode=None, create=None: create(kwargs),
+    )
+    # Every fallback candidate fails too -> the chain is exhausted.
+    def fake_try_chain(task, provider, **kwargs):
+        fb = SimpleNamespace(base_url="http://fb/v1")
+        return fb, "fb-model", "fb-label"
+
+    def fake_fallback(*args, **kwargs):
+        raise APIConnectionError(request=SimpleNamespace())
+
+    monkeypatch.setattr(ac, "_try_configured_fallback_chain", fake_try_chain)
+    monkeypatch.setattr(ac, "_call_fallback_candidate_sync", fake_fallback)
+
+    route_info = {}
+    try:
+        ac.call_llm(
+            task="test_verify", messages=[{"role": "user", "content": "hi"}],
+            provider="custom", base_url="http://fake/v1", model="fake-model",
+            route_info=route_info,
+        )
+    except APIConnectionError:
+        pass
+    else:
+        raise AssertionError("expected call_llm to raise after all candidates failed")
+
+    assert route_info == {}, f"route_info must stay empty on total failure: {route_info}"
+
+
+def test_route_info_records_fallback_not_last_tried(monkeypatch):
+    """When the primary fails but a fallback answers, route_info must name the
+    fallback route — not the primary (which never answered)."""
+    from types import SimpleNamespace
+    from openai import APIConnectionError
+    import agent.auxiliary_client as ac
+
+    captured = {}
+
+    class FailingCompletions:
+        def create(self, **kwargs):
+            raise APIConnectionError(request=SimpleNamespace())
+
+    class FakeChat:
+        completions = FailingCompletions()
+
+    class FakeClient:
+        base_url = "http://fake/v1"
+        chat = FakeChat()
+
+    monkeypatch.setattr(
+        ac, "_get_cached_client",
+        lambda *a, **kw: (FakeClient(), "fake-model"),
+    )
+    monkeypatch.setattr(
+        ac, "_relay_sync_completion",
+        lambda client, kwargs, *, provider=None, api_mode=None, create=None: create(kwargs),
+    )
+
+    def fake_try_chain(task, provider, **kwargs):
+        fb = SimpleNamespace(base_url="http://fb/v1")
+        return fb, "fb-model", "fb-label"
+
+    def fake_fallback(fb_client, fb_model, fb_label, *, task, messages, **kwargs):
+        return SimpleNamespace(
+            id="x", model="fb-model", object="chat.completion",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant", content="from fallback", tool_calls=None, reasoning=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    monkeypatch.setattr(ac, "_try_configured_fallback_chain", fake_try_chain)
+    monkeypatch.setattr(ac, "_call_fallback_candidate_sync", fake_fallback)
+
+    route_info = {}
+    ac.call_llm(
+        task="test_verify", messages=[{"role": "user", "content": "hi"}],
+        provider="custom", base_url="http://fake/v1", model="fake-model",
+        route_info=route_info,
+    )
+
+    assert route_info.get("provider") == "fb-label", (
+        f"fallback route not recorded: {route_info}"
+    )
+    assert route_info.get("model") == "fb-model"

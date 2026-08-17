@@ -8164,6 +8164,15 @@ def _contains_profile_reasoning_fields(value: Any) -> bool:
     return False
 
 
+# Placeholder injected when an empty non-final assistant turn is stripped of
+# its empty ``tool_calls``. Kept byte-identical to the main-loop constant
+# (agent.agent_runtime_helpers._INTERRUPTED_PLACEHOLDER) so a model sees the
+# same signal for an interrupted turn on both paths. Importing the reference
+# would pull agent_runtime_helpers into the auxiliary import graph, so the
+# value is duplicated here with an explicit sync obligation.
+_INTERRUPTED_PLACEHOLDER = "[response interrupted]"
+
+
 def _strip_empty_tool_calls(messages: list) -> list:
     """Drop ``tool_calls`` keys that are empty/invalid on assistant messages.
 
@@ -8217,7 +8226,7 @@ def _strip_empty_tool_calls(messages: list) -> list:
             # message, so placeholder substitution must too, or a valid
             # final-assistant request gets altered.
             if idx != last_idx and not str(msg.get("content") or "").strip():
-                msg["content"] = "(tool call removed)"
+                msg["content"] = _INTERRUPTED_PLACEHOLDER
             stripped += 1
         out.append(msg)
     logger.debug(
@@ -9184,9 +9193,6 @@ def _call_llm_impl(
         final_model,
         resolved_api_mode,
     )
-    _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
-    )
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -9204,15 +9210,6 @@ def _call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
-    # Strict OpenAI-compatible providers (Console Go / opencode.ai zen,
-    # DeepSeek v4) reject an assistant message carrying an EMPTY tool_calls
-    # array with HTTP 400 "Invalid 'messages[N].tool_calls': empty array".
-    # The main loop strips these pre-send in sanitize_api_messages, but this
-    # auxiliary path (MoA aggregator/reference advisors, compression, vision,
-    # titles) bypasses that chokepoint — normalize the request-local copy here
-    # so a poisoned live-history message can't 400 the whole auxiliary call
-    # (mirror of the main-loop pass, #58755).
-    kwargs["messages"] = _strip_empty_tool_calls(kwargs["messages"])
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
 
@@ -9243,6 +9240,9 @@ def _call_llm_impl(
             # completed response into a one-chunk delta iterator at its
             # boundary.
             return client.chat.completions.create(**kwargs)
+        _record_route_info(
+            route_info, _fallback_provider_from_label(request_provider), final_model
+        )
         return _relay_sync_stream(
             client,
             kwargs,
@@ -9270,7 +9270,7 @@ def _call_llm_impl(
         # ``first_err`` and the existing fallback handling unchanged. Unified home
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
-            return _validate_llm_response(
+            result = _validate_llm_response(
                 _relay_sync_completion(
                     client,
                     kwargs,
@@ -9287,6 +9287,13 @@ def _call_llm_impl(
                 ),
                 task,
                 provider=request_provider, base_url=_base_info)
+            # Record the route ONLY after a confirmed success — a caller
+            # reading route_info after an exception must not mistake the
+            # last-tried route for the route that answered.
+            _record_route_info(
+                route_info, _fallback_provider_from_label(request_provider), final_model
+            )
+            return result
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -9715,9 +9722,6 @@ def _call_llm_impl(
                         failed_model=_chain_failed_model)
 
             if fb_client is not None:
-                _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
-                )
                 fb_resp = _call_fallback_candidate_sync(
                     fb_client, fb_model, fb_label,
                     task=task, messages=messages,
@@ -9726,6 +9730,10 @@ def _call_llm_impl(
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
+                    # Record only on success (see main-path comment).
+                    _record_route_info(
+                        route_info, _fallback_provider_from_label(fb_label), fb_model
+                    )
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
                 # quarantined — walk the discovery chain once more; unhealthy
@@ -9733,9 +9741,6 @@ def _call_llm_impl(
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
-                    _record_route_info(
-                        route_info, _fallback_provider_from_label(fb_label), fb_model
-                    )
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
                         task=task, messages=messages,
@@ -9744,6 +9749,10 @@ def _call_llm_impl(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
+                        # Record only on success (see main-path comment).
+                        _record_route_info(
+                            route_info, _fallback_provider_from_label(fb_label), fb_model
+                        )
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
@@ -9986,9 +9995,6 @@ async def _async_call_llm_impl(
         final_model,
         resolved_api_mode,
     )
-    _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
-    )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
@@ -10000,11 +10006,6 @@ async def _async_call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
-    # Same empty-tool_calls normalization as the sync path: strict
-    # OpenAI-compatible providers reject ``tool_calls: []`` with HTTP 400
-    # (mirror of the main-loop pass, #58755).
-    kwargs["messages"] = _strip_empty_tool_calls(kwargs["messages"])
-
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
@@ -10030,7 +10031,7 @@ async def _async_call_llm_impl(
             return await client.chat.completions.create(**_kwargs)
 
         try:
-            return _validate_llm_response(
+            result = _validate_llm_response(
                 await _relay_async_completion(
                     client,
                     kwargs,
@@ -10040,6 +10041,13 @@ async def _async_call_llm_impl(
                 ),
                 task,
                 provider=request_provider, base_url=_client_base)
+            # Record the route ONLY after a confirmed success — a caller
+            # reading route_info after an exception must not mistake the
+            # last-tried route for the route that answered.
+            _record_route_info(
+                route_info, _fallback_provider_from_label(request_provider), final_model
+            )
+            return result
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -10394,11 +10402,6 @@ async def _async_call_llm_impl(
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
-                _record_route_info(
-                    route_info,
-                    _fallback_provider_from_label(fb_label),
-                    async_fb_model or fb_model,
-                )
                 fb_resp = await _call_fallback_candidate_async(
                     async_fb, async_fb_model or fb_model, fb_label,
                     task=task, messages=messages,
@@ -10407,6 +10410,12 @@ async def _async_call_llm_impl(
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
+                    # Record only on success (see main-path comment).
+                    _record_route_info(
+                        route_info,
+                        _fallback_provider_from_label(fb_label),
+                        async_fb_model or fb_model,
+                    )
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
                 # the discovery chain once more (unhealthy entries skipped).
@@ -10416,11 +10425,6 @@ async def _async_call_llm_impl(
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
-                    _record_route_info(
-                        route_info,
-                        _fallback_provider_from_label(fb_label),
-                        async_fb_model or fb_model,
-                    )
                     fb_resp = await _call_fallback_candidate_async(
                         async_fb, async_fb_model or fb_model, fb_label,
                         task=task, messages=messages,
@@ -10429,6 +10433,12 @@ async def _async_call_llm_impl(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
+                        # Record only on success (see main-path comment).
+                        _record_route_info(
+                            route_info,
+                            _fallback_provider_from_label(fb_label),
+                            async_fb_model or fb_model,
+                        )
                         return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
