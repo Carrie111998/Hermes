@@ -3515,7 +3515,7 @@ class TestRunConversation:
             result = agent.run_conversation("answer me")
 
         assert result["interrupted"] is True
-        assert "Operation interrupted during empty-response retry" in result["final_response"]
+        assert "Operation interrupted: retrying empty response from model" in result["final_response"]
         assert agent._empty_content_retries == 1
         assert 0.2 in sleep_called
         assert mock_persist.call_count == 2
@@ -3566,7 +3566,8 @@ class TestRunConversation:
         # 7.5s wait, slept in 0.2s increments -> 37.5 -> at least 37 calls
         assert len([c for c in sleep_calls if c == 0.2]) >= 37
 
-        retry_status = [m for m in status_messages if "Empty response from model; retrying" in m and "in 7.5s" in m]
+        # Status shows the budget-aware retry line; 7.5s renders as "8s" (: .0f).
+        retry_status = [m for m in status_messages if "Empty response from model" in m and "(1/3) in 8s" in m]
         assert len(retry_status) == 1
 
     def test_partial_stream_recovery_uses_streamed_content(self, agent):

@@ -251,13 +251,19 @@ def deterministic_empty(agent: Any) -> bool:
     )
 
 
+def empty_retry_base(agent: Any) -> int:
+    """Configured empty-retry ceiling for this agent: the
+    ``agent.empty_response_retries`` config value (0 means never retry,
+    go straight to fallback), or 3 when the attribute is absent (agents
+    built without ``init_agent``)."""
+    return getattr(agent, "_empty_response_retries", DEFAULT_EMPTY_RETRY_BUDGET)
+
+
 def empty_retry_budget(agent: Any, response: Any) -> int:
-    """Empty-retry budget for the current streak: the operator-configured
-    ``agent.empty_response_retries`` (default 3), or 1 when a single attempt
-    is estimated to cost more than the configured threshold."""
-    base = getattr(agent, "_empty_response_retries", None)
-    if not isinstance(base, int) or base < 1:
-        base = DEFAULT_EMPTY_RETRY_BUDGET
+    """Empty-retry budget for the current streak: the configured base
+    (see :func:`empty_retry_base`; config default is 5), or 1 when a single
+    attempt is estimated to cost more than the configured threshold."""
+    base = empty_retry_base(agent)
     if not guard_enabled(agent):
         return base
     cost = _estimate_attempt_cost(agent, response)

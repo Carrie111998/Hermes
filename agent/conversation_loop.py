@@ -7626,14 +7626,11 @@ def run_conversation(
                     # Base ceiling is the operator-configured
                     # agent.empty_response_retries (see empty_response_guard);
                     # the guard can reduce it further for high-cost attempts.
+                    _empty_retry_base = _empty_guard.empty_retry_base(agent)
                     _empty_retry_budget = (
                         _empty_guard.empty_retry_budget(agent, response)
                         if _empty_candidate
-                        else getattr(
-                            agent,
-                            "_empty_response_retries",
-                            _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET,
-                        )
+                        else _empty_retry_base
                     )
                     _deterministic_empty = _empty_candidate and (
                         _empty_guard.deterministic_empty(agent)
@@ -7657,11 +7654,7 @@ def run_conversation(
                         )
                         _budget_note = (
                             " — high-cost request, reduced retry budget"
-                            if _empty_retry_budget < getattr(
-                                agent,
-                                "_empty_response_retries",
-                                _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET,
-                            )
+                            if _empty_retry_budget < _empty_retry_base
                             else ""
                         )
                         agent._buffer_status(
@@ -7670,6 +7663,7 @@ def run_conversation(
                             f"in {wait_time:.0f}s{_budget_note}"
                         )
                         sleep_end = time.time() + wait_time
+                        _backoff_touch_counter = 0
                         while time.time() < sleep_end:
                             if agent._interrupt_requested:
                                 agent._vprint(
