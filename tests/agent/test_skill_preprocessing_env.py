@@ -93,3 +93,42 @@ def test_ambient_value_is_stripped_when_no_mode_is_bound(monkeypatch):
     set_session_vars(session_key="k", source="tui")
     captured = _capture_spawn_env(monkeypatch)
     assert MODE_ENV not in captured["env"]
+
+
+def test_snippet_is_not_spawned_when_the_env_factory_fails(monkeypatch):
+    """A sanitizer that cannot be built must fail CLOSED, not fall back to env=None.
+
+    ``subprocess.run(env=None)`` inherits the raw parent environment, so the
+    old ``except: _run_env = None`` fallback handed the snippet an ambient
+    ``HERMES_DESKTOP_CONNECTION_MODE=local`` verbatim — reopening exactly the
+    spoofing path the scrub exists to close, and only on the error branch where
+    nobody would look for it (#82187 follow-up review, item 3).
+    """
+    monkeypatch.setenv(MODE_ENV, "local")
+    set_session_vars(session_key="k", source="desktop")
+    set_desktop_connection_mode("remote")
+
+    import tools.environments.local as local_env
+
+    def _boom():
+        raise RuntimeError("sanitizer unavailable")
+
+    monkeypatch.setattr(local_env, "build_subprocess_env", _boom)
+
+    spawned = []
+
+    def _record(argv, **kwargs):
+        spawned.append({"argv": argv, "env": kwargs.get("env")})
+        return SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _record)
+
+    result = run_inline_shell("echo hi", None, timeout=5)
+
+    # The strongest assertion available: the child never existed, so there is
+    # no environment for it to have inherited.
+    assert spawned == [], (
+        "the snippet was spawned with a non-sanitized environment: "
+        f"{spawned[0]['env'] if spawned else None}"
+    )
+    assert "inline-shell error" in result

@@ -78,8 +78,18 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
 
         _run_env = build_subprocess_env()
     except Exception:
-        logger.debug("build_subprocess_env unavailable for inline shell", exc_info=True)
-        _run_env = None
+        # FAIL CLOSED. Falling back to ``env=None`` makes subprocess.run
+        # inherit the RAW parent environment, which is the one door the scrub
+        # above exists to shut: an ambient HERMES_DESKTOP_CONNECTION_MODE=local
+        # set in the user's shell would reach the snippet and be read as the
+        # resolved Desktop mode, re-opening the spoofing path. Not running the
+        # snippet is the safe outcome and costs nothing the caller cannot
+        # absorb — it already treats a marker as a non-fatal result.
+        logger.warning(
+            "build_subprocess_env unavailable for inline shell; refusing to run the snippet",
+            exc_info=True,
+        )
+        return "[inline-shell error: sanitized environment unavailable]"
     try:
         completed = subprocess.run(
             ["bash", "-c", command],
