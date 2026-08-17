@@ -213,11 +213,13 @@ class TestTelegramGuestFinalDelivery:
         adapter.send_document.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_agent_failure_sends_one_terminal_guest_error(self):
+    async def test_agent_failure_sends_one_terminal_guest_error(self, caplog):
         adapter = _DummyAdapter(Platform.TELEGRAM)
         adapter._keep_typing = AsyncMock()
+        secret = "123456789:AAExampleSecretToken"
+        pii = "guest@example.com"
         adapter.set_message_handler(
-            AsyncMock(side_effect=RuntimeError("guest processing failed"))
+            AsyncMock(side_effect=RuntimeError(f"request for {pii} used {secret}"))
         )
 
         event = self._guest_event()
@@ -225,7 +227,12 @@ class TestTelegramGuestFinalDelivery:
 
         assert len(adapter.sent) == 1
         delivered = adapter.sent[0]
-        assert "RuntimeError" in delivered["content"]
+        assert "encountered an error" in delivered["content"].lower()
+        assert secret not in delivered["content"]
+        assert pii not in delivered["content"]
+        assert "RuntimeError" not in delivered["content"]
+        assert secret not in caplog.text
+        assert pii not in caplog.text
         assert delivered["metadata"]["telegram_guest_query_id"] == "query-1"
         assert delivered["metadata"]["notify"] is True
         adapter._keep_typing.assert_not_awaited()

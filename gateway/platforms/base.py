@@ -6829,21 +6829,37 @@ class BasePlatformAdapter(ABC):
             raise
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
-            logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if _is_telegram_guest_query:
+                # Guest queries cross an untrusted, one-shot transport boundary.
+                # Do not serialize exception details or tracebacks here: provider
+                # errors can contain credentials, request URLs, or sender PII.
+                logger.error(
+                    "[%s] Error handling Telegram Guest Query (%s)",
+                    self.name,
+                    type(e).__name__,
+                )
+            else:
+                logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                 if _is_telegram_guest_query:
                     _thread_metadata = _mark_notify_metadata(_thread_metadata)
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
+                    error_content = (
+                        "Sorry, I encountered an error while processing this "
+                        "Telegram Guest Query. Please try again."
+                    )
+                else:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    error_content = (
                         f"Sorry, I encountered an error ({error_type}).\n"
                         f"{error_detail}\n"
                         "Try again or use /reset to start a fresh session."
-                    ),
+                    )
+                await self.send(
+                    chat_id=event.source.chat_id,
+                    content=error_content,
                     metadata=_thread_metadata,
                 )
             except Exception as notify_err:
