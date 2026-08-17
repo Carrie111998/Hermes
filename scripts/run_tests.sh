@@ -91,15 +91,23 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-# NOTE (Windows): this allowlist has no SYSTEMDRIVE, and run_tests_parallel.py
-# spawns every worker with `env=os.environ` and `cwd=repo_root`. That is
-# exactly the condition that makes a process expand `%SystemDrive%\ProgramData`
-# (a REG_EXPAND_SZ template) as a RELATIVE path and build the known-folder
-# cache in the checkout root. One such writer was found and fixed on
-# 2026-08-16 (run_secret_cli); a later sighting suggests a second is open.
-# Do NOT "fix" this by adding SYSTEMDRIVE here until the watcher has caught
-# one: that would erase the only reproducer we have. Arm it instead with
-# HERMES_TEST_JUNK_PROBE=1 (forwarded below).
+# NOTE (Windows, %SystemDrive% junk trees). This allowlist scrubbing SYSTEMDRIVE
+# is what made a worker expand `%SystemDrive%\ProgramData` (a REG_EXPAND_SZ
+# template) as a RELATIVE path and build the known-folder cache under
+# `cwd=repo_root`. SYSTEMDRIVE and friends are now forwarded ~35 lines below,
+# which is the fix -- do not remove that loop.
+#
+# CORRECTED 2026-08-17: this comment previously read "Do NOT 'fix' this by
+# adding SYSTEMDRIVE here ... that would erase the only reproducer we have",
+# and it survived the watcher branch's merge sitting ~36 lines above the loop
+# that now adds exactly that. The hunks never overlapped, so git merged the
+# contradiction in silently. Generalise: a clean merge proves TEXTUAL
+# compatibility, not semantic -- comments asserting facts go stale without ever
+# conflicting, so re-read the prose around any auto-merged hunk.
+#
+# Preserving the trap is no longer the right trade: the watcher is
+# runner-agnostic (it watches the filesystem, not this runner's env), so it
+# needs no bait. Arm it with HERMES_TEST_JUNK_PROBE=1 (forwarded below).
 CLEAN_ENV=(
   "PATH=$PATH"
   "HOME=$HOME"
