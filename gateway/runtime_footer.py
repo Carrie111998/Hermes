@@ -1,6 +1,6 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
+Renders a compact footer showing runtime state (model, context %, cwd, session ID) and
 appends it to the FINAL message of an agent turn when enabled.  Off by default
 to keep replies minimal.
 
@@ -94,6 +94,7 @@ def format_runtime_footer(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    session_id: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -115,6 +116,9 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "session_id":
+            if session_id:
+                parts.append(f"Session ID: {session_id}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -130,6 +134,7 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -145,5 +150,6 @@ def build_footer_line(
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
+        session_id=session_id,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

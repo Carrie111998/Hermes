@@ -137,6 +137,30 @@ def test_format_footer_custom_field_order():
     assert out == "50% · gpt-5.4"
 
 
+def test_format_footer_session_id_field():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        session_id="20260817_113500_a1b2c3d4",
+        fields=("session_id",),
+    )
+    assert out == "Session ID: 20260817_113500_a1b2c3d4"
+
+
+def test_format_footer_missing_session_id_skips_field():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        session_id=None,
+        fields=("session_id",),
+    )
+    assert out == ""
+
+
 def test_format_footer_unknown_field_silently_ignored():
     out = format_runtime_footer(
         model="openai/gpt-5.4",
@@ -229,6 +253,23 @@ def test_build_footer_returns_rendered_when_enabled(monkeypatch, tmp_path):
     (tmp_path / "proj").mkdir(exist_ok=True)
     assert "gpt-5.4" in out
     assert "25%" in out
+
+
+def test_build_footer_returns_session_id_when_configured():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {"enabled": True, "fields": ["session_id"]},
+            },
+        },
+        platform_key="telegram",
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        session_id="sid-42",
+    )
+    assert out == "Session ID: sid-42"
 
 
 def test_build_footer_per_platform_off_suppresses():
