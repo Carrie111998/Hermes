@@ -413,7 +413,7 @@ DISCORD_ALLOWED_USERS=284102345871466496
 voice:
   record_key: "ctrl+b"            # Key to start/stop recording
   max_recording_seconds: 120       # Maximum recording length
-  auto_tts: false                  # Shared automatic speech preference
+  auto_tts: false                  # Automatic speech; does not enable microphone mode
   beep_enabled: true               # Play record start/stop beeps
   silence_threshold: 200           # RMS level (0-32767) below which counts as silence
   silence_duration: 3.0            # Seconds of silence before auto-stop
