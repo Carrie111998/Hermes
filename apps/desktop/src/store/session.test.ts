@@ -531,6 +531,29 @@ describe('unread finished sessions', () => {
     setSelectedStoredSessionId('s1')
     expect($unreadFinishedSessionIds.get()).toEqual([])
   })
+
+  it('clears unread across a compression tip rotation (root recorded, tip selected)', () => {
+    // A background session finishes under its lineage-root id, then
+    // auto-compression rotates the tip before the user opens it. The sidebar
+    // row carries the new tip; the unread set still holds the root. The
+    // dot-state computed expands via lineageAliases so the green dot SHOWS on
+    // the new-tip row — clearing must match that expansion or the dot stays
+    // on a conversation the user is actively reading.
+    $selectedStoredSessionId.set('other')
+    setSessions([session({ id: 'tip-2', _lineage_root_id: 'root-a' })])
+
+    const working = makeState({ busy: true, storedSessionId: 'root-a' })
+    publishSessionState('rt1', working)
+
+    const idle = { ...working, busy: false }
+    publishSessionState('rt1', idle)
+
+    expect($unreadFinishedSessionIds.get()).toEqual(['root-a'])
+
+    // User opens the session via the sidebar row, which carries the new tip.
+    setSelectedStoredSessionId('tip-2')
+    expect($unreadFinishedSessionIds.get()).toEqual([])
+  })
 })
 
 describe('remembered session id (per profile)', () => {

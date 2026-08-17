@@ -656,10 +656,24 @@ export const markAllSessionsRead = () => {
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   updateAtom($selectedStoredSessionId, next)
   // Opening a session clears its unread state — the user is now looking at it.
+  // The unread set is PUBLISHED under every lineage alias (the dot-state
+  // computed expands $unreadFinishedSessionIds via lineageAliases), so clear
+  // by lineage, not by exact id: auto-compression can rotate a session's tip
+  // id AFTER it finishes (recording the old tip, usually the lineage root) but
+  // BEFORE the user opens it (selecting the new tip). An exact-match check
+  // would miss and leave the green dot on a conversation the user is reading.
   const id = $selectedStoredSessionId.get()
+  const unread = $unreadFinishedSessionIds.get()
 
-  if (id && $unreadFinishedSessionIds.get().includes(id)) {
-    $unreadFinishedSessionIds.set($unreadFinishedSessionIds.get().filter(x => x !== id))
+  if (!id || !unread.length) {
+    return
+  }
+
+  const aliases = new Set(lineageAliases(id, $sessions.get()))
+  const nextUnread = unread.filter(x => !aliases.has(x))
+
+  if (nextUnread.length !== unread.length) {
+    $unreadFinishedSessionIds.set(nextUnread)
   }
 }
 
