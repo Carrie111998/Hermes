@@ -258,6 +258,59 @@ class TestRequestShape:
         )
         assert payload["images"] == [{"image_url": "data:image/png;base64,abc"}]
 
+    def test_edit_payload_preserves_validated_image_order(self):
+        payload = codex_plugin._build_images_payload(
+            prompt="combine these",
+            size="1024x1024",
+            quality="medium",
+            input_images=[
+                {"type": "input_image", "image_url": "https://example.test/one.png"},
+                {"type": "input_image", "image_url": "https://example.test/two.png"},
+            ],
+        )
+
+        assert payload["images"] == [
+            {"image_url": "https://example.test/one.png"},
+            {"image_url": "https://example.test/two.png"},
+        ]
+
+    @pytest.mark.parametrize(
+        "malformed_part",
+        [
+            pytest.param(None, id="null-part"),
+            pytest.param("private-image-marker", id="string-part"),
+            pytest.param({}, id="missing-fields"),
+            pytest.param(
+                {"type": "input_image", "image_url": {"data": "private-image-marker"}},
+                id="non-string-url",
+            ),
+            pytest.param(
+                {
+                    "type": "unexpected-private-image-marker",
+                    "image_url": "https://example.test/image.png",
+                },
+                id="wrong-part-type",
+            ),
+            pytest.param(
+                {"type": "input_image", "image_url": "   "},
+                id="blank-url",
+            ),
+        ],
+    )
+    def test_edit_payload_rejects_malformed_internal_image_parts(self, malformed_part):
+        with pytest.raises(ValueError) as excinfo:
+            codex_plugin._build_images_payload(
+                prompt="edit",
+                size="1024x1024",
+                quality="medium",
+                input_images=[malformed_part],
+            )
+
+        message = str(excinfo.value)
+        assert "index 0" in message
+        assert "private-image-marker" not in message
+        assert len(message) < 200
+
     def test_collect_routes_generation_to_dedicated_endpoint(self, monkeypatch):
         import httpx
 
@@ -382,8 +435,16 @@ class TestRequestShape:
     def test_invalid_json_response_is_diagnostic(self, monkeypatch):
         import httpx
 
+        credential = "credential-marker-must-not-leak"
+        image_data = _b64_png() * 20
+        body = (
+            "upstream returned malformed content; "
+            f"Authorization: Bearer {credential}; "
+            f"image=data:image/png;base64,{image_data}; " + "padding=" + ("x" * 2_000)
+        )
+
         def _handler(request):
-            return httpx.Response(200, text="not-json", request=request)
+            return httpx.Response(200, text=body, request=request)
 
         real_client = httpx.Client
         monkeypatch.setattr(
@@ -395,10 +456,115 @@ class TestRequestShape:
                 timeout=kwargs.get("timeout"),
             ),
         )
-        with pytest.raises(RuntimeError, match="invalid JSON"):
+        with pytest.raises(RuntimeError, match="invalid JSON") as excinfo:
             codex_plugin._collect_image_b64(
                 "codex-token", prompt="a cat", size="1024x1024", quality="low"
             )
+
+        message = str(excinfo.value)
+        assert "upstream returned malformed content" in message
+        assert credential not in message
+        assert image_data[:40] not in message
+        assert len(message) < 700
+
+    @pytest.mark.parametrize(
+        "response_payload",
+        [
+            pytest.param([], id="root-list"),
+            pytest.param({"status": "ok"}, id="missing-data"),
+            pytest.param({"data": {}}, id="non-list-data"),
+            pytest.param({"data": [None]}, id="non-object-item"),
+            pytest.param({"data": [{"b64_json": 123}]}, id="non-string-image"),
+        ],
+    )
+    def test_success_with_unexpected_json_shape_is_diagnostic(
+        self, monkeypatch, response_payload
+    ):
+        import httpx
+
+        def _handler(request):
+            return httpx.Response(200, json=response_payload, request=request)
+
+        real_client = httpx.Client
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda *args, **kwargs: real_client(
+                transport=httpx.MockTransport(_handler),
+                headers=kwargs.get("headers"),
+                timeout=kwargs.get("timeout"),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="unexpected response") as excinfo:
+            codex_plugin._collect_image_b64(
+                "codex-token", prompt="a cat", size="1024x1024", quality="low"
+            )
+
+        assert len(str(excinfo.value)) < 700
+
+    def test_unexpected_json_diagnostic_is_bounded_and_sanitized(self, monkeypatch):
+        import httpx
+
+        credential = "credential-marker-must-not-leak"
+        image_data = _b64_png() * 20
+        body = json.dumps({
+            "error": {
+                "message": "backend schema mismatch",
+                "access_token": credential,
+            },
+            "data": {"b64_json": image_data},
+            "padding": "x" * 2_000,
+        })
+
+        def _handler(request):
+            return httpx.Response(200, text=body, request=request)
+
+        real_client = httpx.Client
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda *args, **kwargs: real_client(
+                transport=httpx.MockTransport(_handler),
+                headers=kwargs.get("headers"),
+                timeout=kwargs.get("timeout"),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="unexpected response") as excinfo:
+            codex_plugin._collect_image_b64(
+                "codex-token", prompt="a cat", size="1024x1024", quality="low"
+            )
+
+        message = str(excinfo.value)
+        assert "backend schema mismatch" in message
+        assert credential not in message
+        assert image_data[:40] not in message
+        assert len(message) < 700
+
+    def test_empty_data_list_remains_an_empty_response(self, monkeypatch):
+        import httpx
+
+        def _handler(request):
+            return httpx.Response(200, json={"data": []}, request=request)
+
+        real_client = httpx.Client
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda *args, **kwargs: real_client(
+                transport=httpx.MockTransport(_handler),
+                headers=kwargs.get("headers"),
+                timeout=kwargs.get("timeout"),
+            ),
+        )
+
+        assert (
+            codex_plugin._collect_image_b64(
+                "codex-token", prompt="a cat", size="1024x1024", quality="low"
+            )
+            is None
+        )
 
     def test_five_total_input_images_are_accepted(self, tmp_path):
         paths = []

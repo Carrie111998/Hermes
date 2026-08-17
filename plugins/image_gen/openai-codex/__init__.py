@@ -23,6 +23,7 @@ import base64
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -44,6 +45,95 @@ logger = logging.getLogger(__name__)
 # request rejection as an account entitlement problem; see #19505 and #49008.
 
 _MAX_ERROR_BODY_CHARS = 500
+_MAX_DIAGNOSTIC_STRING_CHARS = 160
+_MAX_DIAGNOSTIC_ITEMS = 8
+_MAX_DIAGNOSTIC_DEPTH = 3
+_SENSITIVE_DIAGNOSTIC_KEYS = frozenset({
+    "api_key",
+    "authorization",
+    "b64_json",
+    "cookie",
+    "credential",
+    "image",
+    "image_url",
+    "images",
+    "password",
+    "refresh_token",
+    "secret",
+    "token",
+})
+
+
+def _sanitize_diagnostic_text(value: str) -> str:
+    """Redact common credential/image encodings from diagnostic text."""
+    text = re.sub(
+        r"(?i)data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=_-]+",
+        "[redacted image data]",
+        value,
+    )
+    text = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", text)
+    text = re.sub(r"\b(?:sk|sess)-[a-zA-Z0-9_-]{8,}\b", "[redacted credential]", text)
+    text = re.sub(
+        r"\beyJ[a-zA-Z0-9_-]{10,}(?:\.[a-zA-Z0-9_-]+){1,2}\b",
+        "[redacted credential]",
+        text,
+    )
+    text = re.sub(
+        r"(?<![a-zA-Z0-9+/=_-])[a-zA-Z0-9+/=_-]{64,}"
+        r"(?![a-zA-Z0-9+/=_-])",
+        "[redacted blob]",
+        text,
+    )
+    return text[:_MAX_DIAGNOSTIC_STRING_CHARS]
+
+
+def _sanitize_diagnostic_value(value: Any, *, depth: int = 0) -> Any:
+    """Return a bounded JSON-compatible value safe for error diagnostics."""
+    if depth >= _MAX_DIAGNOSTIC_DEPTH:
+        return f"<{type(value).__name__}>"
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for index, (key, child) in enumerate(value.items()):
+            if index >= _MAX_DIAGNOSTIC_ITEMS:
+                break
+            safe_key = _sanitize_diagnostic_text(str(key))
+            key_lc = safe_key.lower()
+            if any(marker in key_lc for marker in _SENSITIVE_DIAGNOSTIC_KEYS):
+                sanitized[safe_key] = "[redacted]"
+            else:
+                sanitized[safe_key] = _sanitize_diagnostic_value(child, depth=depth + 1)
+        if len(value) > _MAX_DIAGNOSTIC_ITEMS:
+            sanitized["..."] = f"<{len(value) - _MAX_DIAGNOSTIC_ITEMS} more keys>"
+        return sanitized
+    if isinstance(value, list):
+        sanitized_items = [
+            _sanitize_diagnostic_value(item, depth=depth + 1)
+            for item in value[:_MAX_DIAGNOSTIC_ITEMS]
+        ]
+        if len(value) > _MAX_DIAGNOSTIC_ITEMS:
+            sanitized_items.append(f"<{len(value) - _MAX_DIAGNOSTIC_ITEMS} more items>")
+        return sanitized_items
+    if isinstance(value, str):
+        return _sanitize_diagnostic_text(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return f"<{type(value).__name__}>"
+
+
+def _summarize_diagnostic_body(body: str) -> str:
+    """Return a bounded, sanitized excerpt of an unexpected response body."""
+    text = body or ""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        summary = _sanitize_diagnostic_text(text)
+    else:
+        summary = json.dumps(
+            _sanitize_diagnostic_value(payload),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    return summary[:_MAX_ERROR_BODY_CHARS]
 
 
 def _summarize_error_body(body: str) -> str:
@@ -289,11 +379,21 @@ def _build_images_payload(
         "size": size,
     }
     if input_images:
-        payload["images"] = [
-            {"image_url": part["image_url"]}
-            for part in input_images
-            if isinstance(part.get("image_url"), str)
-        ]
+        images: List[Dict[str, str]] = []
+        for index, part in enumerate(input_images):
+            if not isinstance(part, dict) or part.get("type") != "input_image":
+                raise ValueError(
+                    f"Malformed Codex image input at index {index}: "
+                    "expected an input_image object"
+                )
+            image_url = part.get("image_url")
+            if not isinstance(image_url, str) or not image_url.strip():
+                raise ValueError(
+                    f"Malformed Codex image input at index {index}: "
+                    "expected a non-empty string image_url"
+                )
+            images.append({"image_url": image_url})
+        payload["images"] = images
     return payload
 
 
@@ -337,14 +437,32 @@ def _collect_image_b64(
         try:
             result = response.json()
         except (TypeError, ValueError) as exc:
-            raise RuntimeError("Codex Images API returned invalid JSON") from exc
+            raise RuntimeError(
+                "Codex Images API returned invalid JSON: "
+                f"{_summarize_diagnostic_body(response.text)}"
+            ) from exc
 
-    data = result.get("data") if isinstance(result, dict) else None
-    if not isinstance(data, list) or not data:
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "Codex Images API returned unexpected response: "
+            f"{_summarize_diagnostic_body(response.text)}"
+        )
+    data = result.get("data")
+    if not isinstance(data, list):
+        raise RuntimeError(
+            "Codex Images API returned unexpected response: "
+            f"{_summarize_diagnostic_body(response.text)}"
+        )
+    if not data:
         return None
     first = data[0]
     image_b64 = first.get("b64_json") if isinstance(first, dict) else None
-    return image_b64 if isinstance(image_b64, str) and image_b64 else None
+    if not isinstance(image_b64, str) or not image_b64:
+        raise RuntimeError(
+            "Codex Images API returned unexpected response: "
+            f"{_summarize_diagnostic_body(response.text)}"
+        )
+    return image_b64
 
 
 # ---------------------------------------------------------------------------
