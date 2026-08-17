@@ -2234,11 +2234,55 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         raise
 
 
+# Re-read backoff for the torn-extend check, in seconds. A WAL checkpoint
+# window closes in milliseconds; a genuinely short file never does. Only
+# ever paid on the rare path where the first sample already looks wrong.
+_TORN_EXTEND_CONFIRM_DELAYS = (0.005, 0.02, 0.05)
+
+
+def _sample_file_pages(path: str, page_size: int):
+    """Return ``(actual_pages, header_page_count, file_size)`` or None.
+
+    Both reads are raw and unlocked, which is what makes a single sample
+    untrustworthy while another connection is checkpointing.
+    """
+    file_size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(28)
+        header_bytes = f.read(4)
+    if len(header_bytes) < 4:
+        return None  # can't read header; skip
+    header_page_count = int.from_bytes(header_bytes, "big")
+    if header_page_count == 0:
+        return None  # new/empty DB; skip
+    return file_size // page_size, header_page_count, file_size
+
+
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
     """Read the SQLite header page_count and compare against actual file size.
 
-    Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).
+    Raises sqlite3.DatabaseError if the file is *persistently* shorter than
+    the header claims (torn-extend corruption).
+
+    A single sample is not sufficient. This database runs in WAL mode, where
+    the main file is only brought current by a checkpoint — and a checkpoint
+    writes page 1 (which carries the new page count) and extends the file as
+    separate I/O, with these unlocked reads excluded from neither. A reader
+    that lands between the two observes header=N against a file still holding
+    N-1 pages. That is a checkpoint in flight, not corruption.
+
+    It matters because this runs *post-COMMIT* (see write_txn): raising here
+    fails a transaction that already committed durably, and the caller
+    unwinds mid-flight. Measured on this tree before the confirm loop: 13
+    fires in 113,856 samples on a database whose integrity_check and
+    quick_check both returned ok with every row present — and in the
+    concurrency stress run one such fire killed a worker and left its task
+    stranded in 'running' with an open run, i.e. the guard producing exactly
+    the damage it exists to detect.
+
+    So a mismatch is re-sampled before it is believed. A checkpoint window
+    closes within milliseconds; a truly truncated file stays truncated and
+    still raises.
     """
     try:
         row = conn.execute("PRAGMA database_list").fetchone()
@@ -2249,24 +2293,30 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
             return  # in-memory or unnamed DB; skip
         path = path_str
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
-            return  # new/empty DB; skip
-        actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
-            raise sqlite3.DatabaseError(
-                f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
-                f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
-                f"file_size={file_size}, page_size={page_size})"
-            )
+        sample = _sample_file_pages(path, page_size)
+        if sample is None:
+            return
+        actual_pages, header_page_count, file_size = sample
+        if actual_pages >= header_page_count:
+            return
+        # Looks short. Confirm it is not a checkpoint mid-extend before
+        # calling a committed transaction corrupt.
+        for delay in _TORN_EXTEND_CONFIRM_DELAYS:
+            time.sleep(delay)
+            sample = _sample_file_pages(path, page_size)
+            if sample is None:
+                return
+            actual_pages, header_page_count, file_size = sample
+            if actual_pages >= header_page_count:
+                return  # transient: the checkpoint completed
+        raise sqlite3.DatabaseError(
+            f"torn-extend detected: page count mismatch on {path}: "
+            f"header claims {header_page_count} pages, "
+            f"file has {actual_pages} pages "
+            f"(missing {header_page_count - actual_pages} pages, "
+            f"file_size={file_size}, page_size={page_size}); "
+            f"persisted across {len(_TORN_EXTEND_CONFIRM_DELAYS)} re-reads"
+        )
     except sqlite3.DatabaseError:
         raise
     except Exception:
