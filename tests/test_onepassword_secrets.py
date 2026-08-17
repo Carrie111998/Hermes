@@ -44,6 +44,21 @@ def _clean_op_env(monkeypatch):
     yield
 
 
+def _env_get_ci(env, name: str):
+    """Look up ``name`` in ``env`` without pinning its case.
+
+    Windows folds ``os.environ`` keys to upper case, so a var set as
+    ``OP_SESSION_myacct`` is reported by the OS as ``OP_SESSION_MYACCT``.
+    ``_op_child_env`` copies through whatever spelling it is handed, so an
+    assertion on the mixed-case spelling would only ever hold on POSIX.
+    """
+    lowered = name.lower()
+    for key, val in env.items():
+        if key.lower() == lowered:
+            return val
+    return None
+
+
 def _ok(value: str):
     return mock.Mock(returncode=0, stdout=value, stderr="")
 
@@ -210,7 +225,7 @@ def test_fetch_child_env_is_allowlisted(monkeypatch, tmp_path):
     env = captured["env"]
     assert "OPENAI_API_KEY" not in env          # not inherited
     assert env["OP_SERVICE_ACCOUNT_TOKEN"] == "ops_tok"
-    assert env["OP_SESSION_myacct"] == "sess123"
+    assert _env_get_ci(env, "OP_SESSION_myacct") == "sess123"
     assert env.get("NO_COLOR") == "1"
 
 
@@ -259,7 +274,8 @@ def test_disk_cache_roundtrip_and_no_token_on_disk(monkeypatch, tmp_path):
 
     cache_path = op._disk_cache_path(tmp_path)
     assert cache_path.exists()
-    assert (os.stat(cache_path).st_mode & 0o777) == 0o600
+    if os.name != "nt":  # POSIX mode bits not enforced on Windows (NTFS reports 0o666)
+        assert (os.stat(cache_path).st_mode & 0o777) == 0o600
     text = cache_path.read_text()
     assert "ops_supersecret" not in text            # token never on disk
     payload = json.loads(text)

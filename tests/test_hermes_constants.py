@@ -28,6 +28,7 @@ from hermes_constants import (
     set_hermes_home_override,
     with_hermes_node_path,
 )
+from tests.symlink_support import requires_symlinks
 
 
 class TestGetDefaultHermesRoot:
@@ -1036,6 +1037,7 @@ class TestSecureParentDir:
         # Should not raise
         secure_parent_dir(target)
 
+    @requires_symlinks
     def test_symlink_resolved(self, tmp_path, monkeypatch):
         """Symlinks should be resolved before checking depth."""
         real_dir = tmp_path / "a" / "b"
@@ -1274,6 +1276,7 @@ class TestGetHermesDir:
         result = get_hermes_dir("platforms/pairing", "pairing")
         assert result == legacy
 
+    @requires_symlinks
     def test_dangling_legacy_symlink_returns_new(self, tmp_path, monkeypatch):
         """A dangling legacy symlink must NOT shadow populated new-layout data.
 
@@ -1292,6 +1295,7 @@ class TestGetHermesDir:
         result = get_hermes_dir("platforms/pairing", "pairing")
         assert result == new
 
+    @requires_symlinks
     def test_symlink_to_populated_dir_returns_legacy(self, tmp_path, monkeypatch):
         """A legacy symlink pointing at a populated directory is honoured."""
         self._set_home(tmp_path, monkeypatch)
@@ -1303,6 +1307,7 @@ class TestGetHermesDir:
         result = get_hermes_dir("cache/images", "image_cache")
         assert result == legacy
 
+    @requires_symlinks
     def test_symlink_to_empty_dir_returns_new(self, tmp_path, monkeypatch):
         """A legacy symlink pointing at an EMPTY directory falls through."""
         self._set_home(tmp_path, monkeypatch)
