@@ -172,3 +172,6 @@ test-results/
 
 # Local hermes runtime config (may carry provider credentials — never committed).
 .local-hermes/
+
+# Isolated feature worktrees created by the agent workflow.
+.worktrees/
