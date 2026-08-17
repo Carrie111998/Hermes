@@ -1694,6 +1694,30 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
+        # The official SDK's websocket worker can be blocked inside its
+        # reconnect/read loop.  Cancelling asyncio tasks alone does not
+        # interrupt that synchronous worker, so invoke the SDK close/stop
+        # primitive first and give it a short bounded window to unblock.
+        ws_client = self._ws_client
+        if ws_client is not None:
+            for method_name in ("stop", "close", "disconnect"):
+                method = getattr(ws_client, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(method), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        "[Feishu] websocket client %s() did not return within 3s",
+                        method_name,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Feishu] websocket client %s() failed during disconnect",
+                        method_name,
+                        exc_info=True,
+                    )
+                break
         self._disable_websocket_auto_reconnect()
         await self._stop_webhook_server()
 

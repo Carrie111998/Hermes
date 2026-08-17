@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -271,6 +272,10 @@ class LSPClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._cwd,
+                # Give every language server its own process group so
+                # shutdown can also reap children such as tsserver that a
+                # language-server wrapper may spawn.
+                start_new_session=(sys.platform != "win32"),
             )
         except FileNotFoundError as e:
             raise LSPProtocolError(
@@ -442,12 +447,29 @@ class LSPClient:
             return
         if proc.returncode is None:
             try:
-                proc.terminate()
+                if sys.platform != "win32":
+                    # LSP wrappers (notably typescript-language-server) can
+                    # spawn additional Node workers.  Terminating only the
+                    # wrapper leaves those workers in the gateway cgroup.
+                    # start_new_session=True in _spawn() makes this group
+                    # owned by this client.
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proc.terminate()
+                else:
+                    proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
                     try:
-                        proc.kill()
+                        if sys.platform != "win32":
+                            try:
+                                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError, OSError):
+                                proc.kill()
+                        else:
+                            proc.kill()
                         await proc.wait()
                     except ProcessLookupError:
                         pass
