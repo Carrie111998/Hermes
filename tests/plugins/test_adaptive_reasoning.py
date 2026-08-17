@@ -211,10 +211,11 @@ def test_middleware_skips_when_effort_already_at_target():
 def test_middleware_rewrites_top_level_reasoning_effort():
     # top-level reasoning_effort is the PROVIDER-NATIVE scale, written by the
     # transport via the provider profile. The plugin must reuse the same
-    # profile mapping (zai glm-5.3: minimal/low→low, medium/high→high,
-    # xhigh/max/ultra→max) instead of writing raw Hermes levels.
-    # Start from native low; work context + complex msg → Hermes medium → native high.
-    req = {"model": "glm-5.3", "messages": [
+    # profile mapping instead of writing raw Hermes levels.
+    # kimi-coding (upstream) maps Hermes effort onto native low/high/max
+    # (_K3_EFFORT_MAP). Start from native low; work context + complex msg →
+    # Hermes medium/high → kimi native high.
+    req = {"model": "kimi-k3", "messages": [
         {"role": "user", "content": "help me debug the failing migration and analyze the root cause"},
         {"role": "assistant", "tool_calls": [
             {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
@@ -224,18 +225,18 @@ def test_middleware_rewrites_top_level_reasoning_effort():
     ], "reasoning_effort": "low"}
     result = plugin_mod.adaptive_llm_request_middleware(
         request=req,
-        provider="zai",
+        provider="kimi-coding",
         session_id="s1", turn_id="t1", api_call_count=1,
     )
     assert result is not None
     assert result["request"]["reasoning_effort"] == "high"
 
-    # brevity → minimal; zai glm-5.3 native mapping: minimal → low
-    req2 = {"model": "glm-5.3", "messages": [], "reasoning_effort": "high"}
+    # brevity → minimal; kimi native mapping: minimal → low
+    req2 = {"model": "kimi-k3", "messages": [], "reasoning_effort": "high"}
     result2 = plugin_mod.adaptive_llm_request_middleware(
         request=req2,
         user_message="ok",
-        provider="zai",
+        provider="kimi-coding",
         session_id="s1", turn_id="t1", api_call_count=1,
     )
     assert result2 is not None
@@ -245,25 +246,30 @@ def test_middleware_rewrites_top_level_reasoning_effort():
 def test_middleware_never_writes_offscale_native_effort():
     # INVARIANT: whatever lands in top-level reasoning_effort must be a value
     # the provider profile itself would emit. Hermes-only levels (minimal,
-    # xhigh, ultra…) must never appear there for zai/kimi.
-    req = {"model": "glm-5.3", "messages": [], "reasoning_effort": "high"}
+    # xhigh, ultra…) must never appear there for kimi/zai.
+    req = {"model": "kimi-k3", "messages": [], "reasoning_effort": "high"}
     result = plugin_mod.adaptive_llm_request_middleware(
         request=req,
         user_message="ok",  # brevity → minimal on Hermes scale
-        provider="zai",
+        provider="kimi-coding",
         session_id="s1", turn_id="t1", api_call_count=1,
     )
     assert result["request"]["reasoning_effort"] in {"low", "high", "max"}
 
-    # kimi: only low/medium/high are legal wire values
-    req2 = {"model": "kimi-k2", "messages": [], "reasoning_effort": "medium"}
+    # zai glm-5.2 (upstream): native scale is exactly {high, max}; every
+    # enabled Hermes level collapses to high, so an already-high request is
+    # a no-op (result None) — and could NEVER be a Hermes-only value.
+    req2 = {"model": "glm-5.2", "messages": [], "reasoning_effort": "high"}
     result2 = plugin_mod.adaptive_llm_request_middleware(
         request=req2,
-        user_message="帮我排查这个死锁问题的根因，分析整个调用链路",  # → high
-        provider="kimi",
+        user_message="ok",  # brevity → minimal; profile collapses to high
+        provider="zai",
         session_id="s1", turn_id="t1", api_call_count=1,
     )
-    assert result2["request"]["reasoning_effort"] in {"low", "medium", "high"}
+    if result2 is not None:
+        assert result2["request"]["reasoning_effort"] in {"high", "max"}
+    else:
+        assert req2["reasoning_effort"] in {"high", "max"}
 
 
 def test_middleware_noop_when_profile_cannot_express_level():
@@ -488,7 +494,7 @@ def test_request_middleware_applies_feedback_mid_loop():
     plugin_mod._LAST_RESPONSE_STATS["s-fb2"] = {
         "reasoning_tokens": 0, "finish_reason": "stop", "turn_id": "t1",
     }
-    req = {"model": "glm-5.3",
+    req = {"model": "kimi-k3",
            "messages": [{"role": "user", "content": "ok"},
                         {"role": "assistant", "tool_calls": [
                             {"id": "c1", "type": "function",
@@ -497,7 +503,7 @@ def test_request_middleware_applies_feedback_mid_loop():
            "reasoning_effort": "high"}
     r2 = plugin_mod.adaptive_llm_request_middleware(
         request=req, session_id="s-fb2", turn_id="t1",
-        api_call_count=2, provider="zai",
+        api_call_count=2, provider="kimi-coding",
     )
     assert r2 is not None
     assert r2["request"]["reasoning_effort"] == "low"
@@ -505,11 +511,11 @@ def test_request_middleware_applies_feedback_mid_loop():
 
 def test_request_middleware_rejects_stale_turn_stats():
     # SAME stats but from a PREVIOUS turn (turn_id mismatch): feedback
-    # rejected → prior medium stands → zai native HIGH (never native low)
+    # rejected → prior medium stands → kimi native HIGH (never native low)
     plugin_mod._LAST_RESPONSE_STATS["s-stale"] = {
         "reasoning_tokens": 0, "finish_reason": "stop", "turn_id": "t-old",
     }
-    req = {"model": "glm-5.3",
+    req = {"model": "kimi-k3",
            "messages": [{"role": "user", "content": "ok"},
                         {"role": "assistant", "tool_calls": [
                             {"id": "c1", "type": "function",
@@ -518,9 +524,9 @@ def test_request_middleware_rejects_stale_turn_stats():
            "reasoning_effort": "high"}
     r = plugin_mod.adaptive_llm_request_middleware(
         request=req, session_id="s-stale", turn_id="t-new",
-        api_call_count=2, provider="zai",
+        api_call_count=2, provider="kimi-coding",
     )
-    # prior medium → zai native high == request's starting value → no-op;
+    # prior medium → kimi native high == request's starting value → no-op;
     # the ONLY failure mode would be a native LOW leaking through (stale
     # easy-feedback applied). Assert the invariant, not the wrapper shape.
     assert r is None or r["request"]["reasoning_effort"] == "high"
