@@ -32,6 +32,7 @@ class _RuntimeCLI(CLIAgentSetupMixin):
         self._explicit_base_url = None
         self._credential_pool = None
         self.service_tier = None
+        self.max_tokens = None
 
     def _normalize_model_for_provider(self, _provider: str) -> bool:
         return False
@@ -47,6 +48,7 @@ providers:
   qwen-token-plan:
     base_url: https://qwen-token-plan.example/v1
     api_key: test-key
+    max_output_tokens: 4096
     models:
       qwen3.8-max-preview:
         supports_vision: true
@@ -96,6 +98,12 @@ def test_real_cli_args_keep_transport_and_capability_identities_separate():
     cli.agent = sentinel_agent
     assert cli._ensure_runtime_credentials() is True
     assert cli.agent is sentinel_agent
+
+
+def test_named_custom_provider_output_cap_reaches_cli_agent_config():
+    cli, _route = _resolve_cli_route()
+
+    assert cli.max_tokens == 4096
 
 
 def test_named_identity_reaches_agent_and_vision_tool_native_gates():

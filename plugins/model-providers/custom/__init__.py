@@ -13,6 +13,7 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
 """
 
 from typing import Any
+from urllib.parse import urlparse
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -30,6 +31,21 @@ class CustomProfile(ProviderProfile):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
+
+        # Cloudflare's account-scoped REST API and legacy /compat surface use
+        # OpenAI-compatible request envelopes, but reject the generic
+        # reasoning_effort / think controls emitted for Ollama, GLM, and ARK.
+        # Omit both and let the selected upstream model apply its own default.
+        parsed_base_url = urlparse(str(ctx.get("base_url") or ""))
+        cloudflare_path = parsed_base_url.path.rstrip("/")
+        if (
+            parsed_base_url.hostname == "api.cloudflare.com"
+            and cloudflare_path.endswith("/ai/v1")
+        ) or (
+            parsed_base_url.hostname == "gateway.ai.cloudflare.com"
+            and cloudflare_path.endswith("/compat")
+        ):
+            return extra_body, top_level
 
         # Ollama context window
         if ollama_num_ctx:
