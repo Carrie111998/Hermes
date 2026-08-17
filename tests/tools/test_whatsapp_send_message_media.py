@@ -9,6 +9,7 @@ Covers two layers:
 """
 
 import asyncio
+import json
 import os
 import tempfile
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ import pytest
 
 from gateway.config import Platform
 from plugins.platforms.whatsapp.adapter import _bridge_media_type, _standalone_send
-from tools.send_message_tool import _send_to_platform
+from tools.send_message_tool import _handle_send, _send_to_platform
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +205,40 @@ def test_send_message_path_surfaces_oversight_suppression():
     assert result["suppressed"] is True
     assert result["reason"] == "oversight_outbound_policy"
     session.assert_not_called()
+
+
+def test_suppressed_send_is_not_mirrored_as_delivered():
+    config = SimpleNamespace(
+        platforms={
+            Platform.WHATSAPP: SimpleNamespace(
+                enabled=True,
+                token="",
+                extra={},
+                home_channel=None,
+            )
+        }
+    )
+    suppressed = {
+        "success": True,
+        "suppressed": True,
+        "reason": "oversight_outbound_policy",
+    }
+
+    with patch("gateway.config.load_gateway_config", return_value=config), patch(
+        "tools.send_message_tool._send_to_platform",
+        new=AsyncMock(return_value=suppressed),
+    ), patch("gateway.mirror.mirror_to_session") as mirror:
+        result = json.loads(
+            _handle_send(
+                {
+                    "target": "whatsapp:+15550002222",
+                    "message": "contact",
+                }
+            )
+        )
+
+    assert result == suppressed
+    mirror.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -89,7 +89,18 @@ def _oversight_target_allowed(
             adapter_name,
         )
         return False
-    allowed = to_whatsapp_jid(chat_id) == to_whatsapp_jid(home)
+    target_jid = to_whatsapp_jid(chat_id)
+    home_jid = to_whatsapp_jid(home)
+    individual_domains = {"s.whatsapp.net", "lid"}
+    target_domain = target_jid.rpartition("@")[2].lower()
+    home_domain = home_jid.rpartition("@")[2].lower()
+    if target_domain in individual_domains and home_domain in individual_domains:
+        allowed = (
+            canonical_whatsapp_identifier(target_jid)
+            == canonical_whatsapp_identifier(home_jid)
+        )
+    else:
+        allowed = target_jid == home_jid
     if not allowed:
         logger.warning(
             "[%s] Blocking WhatsApp outbound to non-home chat in oversight mode",
@@ -321,7 +332,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
-from gateway.whatsapp_identity import to_whatsapp_jid
+from gateway.whatsapp_identity import canonical_whatsapp_identifier, to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,

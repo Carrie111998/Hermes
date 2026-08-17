@@ -13,6 +13,7 @@ trusts the payload.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock
 
@@ -123,6 +124,19 @@ def test_oversight_allows_home_chat_with_equivalent_jid_shape():
     adapter = _oversight_adapter(home="+1 (555) 000-1111")
 
     assert adapter._oversight_allows_outbound("15550001111@s.whatsapp.net") is True
+
+
+def test_oversight_allows_home_chat_lid_alias(monkeypatch, tmp_path):
+    mapping_dir = tmp_path / "whatsapp" / "session"
+    mapping_dir.mkdir(parents=True)
+    (mapping_dir / "lid-mapping-999999999999999.json").write_text(
+        json.dumps("15550001111@s.whatsapp.net"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _oversight_adapter(home="15550001111@s.whatsapp.net")
+
+    assert adapter._oversight_allows_outbound("999999999999999@lid") is True
 
 
 def test_oversight_without_home_channel_fails_closed():
