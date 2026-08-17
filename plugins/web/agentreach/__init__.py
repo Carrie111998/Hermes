@@ -1,7 +1,7 @@
 """Agent Reach (free) plugin — bundled, auto-loaded.
 
-Provides free web search (via Exa, GitHub, Reddit, V2EX) and content
-extraction (via Jina Reader). No API keys required.
+Provides free web search (via DDGS, GitHub, Jina Reader, HackerNews)
+and content extraction (via Jina Reader). No API keys required.
 
 Mirrors the plugins/web/brave_free/ layout.
 """

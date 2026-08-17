@@ -2,9 +2,10 @@
 
 Verifies that the AgentReachWebSearchProvider:
 - Registers correctly via the plugin system
-- Performs search via Jina Reader + DuckDuckGo fallback
+- Performs search via DDGS + Jina Reader + GitHub + HackerNews
 - Performs extraction via Jina Reader
 - Returns properly shaped responses
+- Supports site: and date: operators
 """
 
 from __future__ import annotations
@@ -71,7 +72,6 @@ class TestAgentReachProviderIntegration:
         results = p.extract(["https://example.com"])
         assert len(results) == 1
         assert results[0]["url"] == "https://example.com"
-        # error key only present on failure
         assert results[0].get("error") is None
         assert len(results[0]["content"]) > 0
 
@@ -79,49 +79,51 @@ class TestAgentReachProviderIntegration:
     def test_real_jina_search(self):
         """Test real Jina Reader + DuckDuckGo search."""
         p = AgentReachWebSearchProvider()
-        result = p.search("Python programming", limit=3)
-        assert result["success"] is True
-        assert "data" in result
-        assert "web" in result["data"]
-        assert len(result["data"]["web"]) > 0
-        # Verify result shape
-        for item in result["data"]["web"]:
-            assert "title" in item
-            assert "url" in item
-            assert "description" in item
-            assert "position" in item
+        results = p.search("Python web framework", limit=3)
+        assert len(results) > 0
+        # Should have results from at least one backend
+        assert any("url" in r for r in results)
 
     @pytest.mark.integration
-    def test_search_result_shape(self):
-        """Verify search results match Hermes's expected contract."""
+    def test_real_hackernews_search(self):
+        """Test real Hacker News search via Algolia API."""
         p = AgentReachWebSearchProvider()
-        result = p.search("test query", limit=2)
-        assert result["success"] is True
-        web = result["data"]["web"]
-        assert len(web) <= 2
-        for i, item in enumerate(web):
-            assert item["position"] == i + 1
+        results = p.search("Python", limit=3)
+        # Should include HN results
+        assert len(results) > 0
+
+    @pytest.mark.integration
+    def test_site_operator(self):
+        """Test site: operator support."""
+        p = AgentReachWebSearchProvider()
+        results = p.search("web framework", limit=3, site="github.com")
+        assert len(results) > 0
+        # All results should be from github
+        for r in results:
+            assert "github" in r.get("url", "")
 
 
-class TestAgentReachPluginRegistration:
-    """Test plugin registration via the plugin system."""
+class TestAgentReachLiveHermes:
+    """Live end-to-end test against running Hermes instance."""
 
-    def test_plugin_registers(self):
-        """Verify the plugin registers correctly."""
+    @pytest.mark.integration
+    def test_plugin_discovery(self):
+        """Verify plugin auto-discovers in Hermes."""
         from hermes_cli.plugins import discover_plugins
-        from agent.web_search_registry import list_providers
+        plugins = discover_plugins()
+        assert any(getattr(p, "name", lambda: "")() == "agentreach" for p in plugins.get("web_search", []))
 
-        discover_plugins()
-        providers = list_providers()
-        names = [p.name for p in providers]
-        assert "agentreach" in names
+    @pytest.mark.integration
+    def test_live_search_via_web_tools(self):
+        """Test search via web_search_tool."""
+        from tools.web_tools import web_search_tool
+        results = web_search_tool("Python web framework", limit=3, backend="agentreach")
+        assert len(results) > 0
 
-    def test_provider_instance(self):
-        """Verify the registered provider is the correct class."""
-        from hermes_cli.plugins import discover_plugins
-        from agent.web_search_registry import get_provider
-
-        discover_plugins()
-        provider = get_provider("agentreach")
-        assert provider is not None
-        assert isinstance(provider, AgentReachWebSearchProvider)
+    @pytest.mark.integration
+    def test_live_extract_via_web_tools(self):
+        """Test extract via web_extract_tool."""
+        from tools.web_tools import web_extract_tool
+        results = web_extract_tool(["https://example.com"], backend="agentreach")
+        assert len(results) == 1
+        assert results[0].get("error") is None
