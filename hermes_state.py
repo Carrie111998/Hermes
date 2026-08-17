@@ -595,6 +595,37 @@ def _is_production_state_db(resolved: Path, root: Path) -> bool:
     return len(parts) == 3 and parts[0] == "profiles"
 
 
+# ---------------------------------------------------------------------------
+# Test-only instance registry
+# ---------------------------------------------------------------------------
+# Under pytest, every successfully constructed SessionDB is added to this
+# WeakSet so the suite-wide autouse fixture in tests/conftest.py
+# (_close_leaked_session_dbs) can close whatever a test forgot to close.
+#
+# Why this exists: dozens of tests construct SessionDB() directly and never
+# call close(). Each instance holds a writer connection (state.db + -wal fds)
+# plus up to _READ_POOL_MAX pooled readers, and once queue_token_counts has
+# run, the atexit hook pins the instance alive until interpreter exit. In a
+# single-process pytest run over tests/hermes_cli/ that accumulation reached
+# 16-25 GB RSS (OOM incident 20260816). The per-file spawn isolation of
+# scripts/run_tests_parallel.py masks the leak in CI; this registry fixes the
+# class at the source instead of patching ~40 test files.
+#
+# Population is gated on HERMES_TEST_ISOLATION (exported unconditionally by
+# tests/conftest.py before any test module imports), so production processes
+# never touch the registry. WeakSet membership itself never pins an instance.
+_test_instance_registry: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _register_test_instance(db: "SessionDB") -> None:
+    """Track *db* for suite-level teardown closing (pytest runs only)."""
+    if os.environ.get("HERMES_TEST_ISOLATION"):
+        try:
+            _test_instance_registry.add(db)
+        except Exception:  # pragma: no cover — registry must never break init
+            pass
+
+
 def _ensure_test_isolation(db_path: Path) -> None:
     """Fail hard when a pytest-context process resolves a production DB.
 
@@ -3522,6 +3553,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+            else:
+                # Pytest-only (gated on HERMES_TEST_ISOLATION inside the
+                # helper): register for suite-level leak closing.
+                _register_test_instance(self)
 
     # ── Read-path split ──
 
