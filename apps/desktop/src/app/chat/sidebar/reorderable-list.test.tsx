@@ -94,6 +94,8 @@ function BehaviorProbe({ id }: { id: string }) {
 }
 
 const spaceKey = { key: ' ', code: 'Space', bubbles: true, cancelable: true } as const
+// Enter is also a KeyboardSensor default start/end code — same swallow class.
+const enterKey = { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true } as const
 
 describe('useSortableBindings keyboard behavior', () => {
   it('does not swallow Space on the shell nor start a keyboard drag from it', () => {
@@ -103,6 +105,10 @@ describe('useSortableBindings keyboard behavior', () => {
     // started a drag (and was preventDefaulted). Post-fix, the shell has only
     // the pointer activator, so the keydown must pass through untouched.
     expect(fireEvent.keyDown(getByTestId('shell'), spaceKey)).toBe(true)
+    expect(getByTestId('state').textContent).toBe('IDLE')
+
+    // Enter is in the same default start/end codes — must pass through too.
+    expect(fireEvent.keyDown(getByTestId('shell'), enterKey)).toBe(true)
     expect(getByTestId('state').textContent).toBe('IDLE')
   })
 
