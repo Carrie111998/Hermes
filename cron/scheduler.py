@@ -4031,7 +4031,10 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     existing skipped-skill handling in ``_build_job_prompt`` (fail-open):
     this check only blocks on an affirmative "setup needed" verdict, i.e.
     the skill exists but its required environment is missing — a run that
-    is guaranteed to misfire.
+    is guaranteed to misfire. Since P4, ``setup_needed`` also reflects a
+    broken ``requires`` transitive closure (missing / disabled /
+    unsupported / setup_needed required skill), reported via
+    ``missing_required_skills`` with the full dependency chain.
     """
     skills = job.get("skills")
     if skills is None:
@@ -4069,6 +4072,11 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
             missing += [
                 f"credential file {name}"
                 for name in payload.get("missing_credential_files") or []
+            ]
+            missing += [
+                f"required skill '{r['name']}' ({r['reason']}) — chain: "
+                + " → ".join(r.get("chain") or [])
+                for r in (payload.get("missing_required_skills") or [])
             ]
             detail = ", ".join(missing) or "required setup incomplete"
             return (

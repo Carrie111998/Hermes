@@ -314,6 +314,81 @@ class TestSkillReadiness:
         assert agent_constructed is True
 
 
+class TestRequiresPreflight:
+    def test_missing_required_skill_blocks_with_chain(self, tmp_path):
+        """A broken requires closure (missing required skill) blocks the run
+        before the agent is constructed, and the message carries the chain."""
+        payload = json.dumps(
+            {
+                "success": True,
+                "content": "# needy skill\nbody",
+                "readiness_status": "setup_needed",
+                "setup_needed": True,
+                "missing_required_environment_variables": [],
+                "missing_required_commands": [],
+                "missing_credential_files": [],
+                "missing_required_skills": [
+                    {
+                        "name": "google-workspace",
+                        "reason": "setup_needed: credential file creds.json",
+                        "chain": [
+                            "needy-skill",
+                            "polished-docx-report",
+                            "google-workspace",
+                        ],
+                    }
+                ],
+            }
+        )
+
+        def fake_skill_view(name, *args, **kwargs):
+            return payload
+
+        job = _job(skills=["needy-skill"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, output, final_response, error, agent_constructed = \
+                _run_job_patched(job, tmp_path, skill_view=fake_skill_view)
+
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None and "[blocked_config]" in error
+        combined = f"{error} {output}"
+        assert "google-workspace" in combined
+        assert "chain" in combined
+        assert (
+            "needy-skill → polished-docx-report → google-workspace" in combined
+        )
+
+    def test_requires_satisfied_runs(self, tmp_path):
+        """A skill whose requires closure is healthy (no missing_required_skills)
+        does not block the run."""
+        payload = json.dumps(
+            {
+                "success": True,
+                "content": "# ok skill\nbody",
+                "readiness_status": "available",
+                "setup_needed": False,
+                "missing_required_environment_variables": [],
+                "requires": ["hermes-agent"],
+                "missing_required_skills": [],
+            }
+        )
+
+        def fake_skill_view(name, *args, **kwargs):
+            return payload
+
+        job = _job(skills=["ok-skill"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, output, final_response, error, agent_constructed = \
+                _run_job_patched(job, tmp_path, skill_view=fake_skill_view)
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+
 class TestDeliveryPlatform:
     def test_unknown_delivery_platform_blocks(self, tmp_path):
         job = _job(deliver="notaplatform")
