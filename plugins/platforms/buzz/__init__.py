@@ -1,5 +1,5 @@
 from .adapter import register as register_platform
-from .channel_tools import register_tools
+from .tools import register_tools
 
 
 def register(ctx) -> None:
