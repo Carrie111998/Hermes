@@ -58,3 +58,29 @@ class TestSkinConfigToolEmojis:
         skin = _build_skin_config(data)
         assert skin.tool_emojis == {"terminal": "🗡️", "patch": "⚒️"}
 
+
+
+class TestRegistryEmojiValues:
+    """Every declared tool emoji must actually be a glyph.
+
+    The TUI prints ``registry.get_emoji()`` verbatim into the tool row, so a
+    plain word slipped into ``emoji=`` renders as that word next to real icons.
+    This stayed invisible while the TUI drew a generic bullet for every tool.
+    The assertion is an invariant over whatever the registry holds, not a
+    snapshot of it: tools added later are covered with no edit here.
+    """
+
+    def test_every_registered_tool_emoji_is_a_glyph(self):
+        import model_tools  # noqa: F401  -- triggers tools/*.py auto-discovery
+        from tools.registry import registry
+
+        offenders = []
+        for name in sorted(getattr(registry, "_tools", {})):
+            emoji = registry.get_emoji(name, default="")
+            if emoji and not any(ord(ch) > 0x2000 for ch in emoji):
+                offenders.append((name, emoji))
+
+        assert not offenders, (
+            "these tools declare a non-glyph emoji= value, which the TUI would "
+            f"print literally into the tool row: {offenders}"
+        )
