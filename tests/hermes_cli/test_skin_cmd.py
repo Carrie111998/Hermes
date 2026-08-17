@@ -55,6 +55,31 @@ def test_set_forks_a_builtin_without_inventing_a_background():
     assert (get_hermes_home() / "config.yaml").read_text().find("default-custom") != -1
 
 
+def test_set_reuses_an_existing_builtin_fork_without_resetting_it():
+    fork = _skins() / "default-custom.yaml"
+    fork.write_text(
+        'name: default-custom\n'
+        'description: my settled terminal\n'
+        'colors:\n'
+        '  background: "#111111"\n'
+        '  ui_tool: "#00AAAA"\n'
+        'branding:\n'
+        '  greeting: keep-me\n',
+        encoding="utf-8",
+    )
+    _activate("default")
+
+    assert skin_cmd._skin_set("banner_title", "#FFFF00", None) == 0
+
+    data = yaml.safe_load(fork.read_text(encoding="utf-8"))
+    assert data["colors"]["banner_title"] == "#FFFF00"
+    assert data["colors"]["background"] == "#111111"
+    assert data["colors"]["ui_tool"] == "#00AAAA"
+    assert data["description"] == "my settled terminal"
+    assert data["branding"] == {"greeting": "keep-me"}
+    assert "default-custom" in (get_hermes_home() / "config.yaml").read_text()
+
+
 def test_set_rejects_non_hex():
     _activate("default")
     assert skin_cmd._skin_set("ui_tool", "teal", None) == 1
