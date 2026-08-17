@@ -867,6 +867,21 @@ class HindsightMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "hindsight"
 
+    def _credential_state(self, cfg: dict) -> tuple[bool, bool]:
+        """Return (has_api_key, has_api_url) for cloud mode.
+
+        Single source of truth shared by :meth:`is_available` and
+        :meth:`unavailable_reason` so the two can never drift apart if
+        credential sources are extended later.
+        """
+        has_key = bool(
+            cfg.get("apiKey")
+            or cfg.get("api_key")
+            or get_secret("HINDSIGHT_API_KEY", "")
+        )
+        has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
+        return has_key, has_url
+
     def is_available(self) -> bool:
         try:
             cfg = _load_config()
@@ -876,12 +891,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return available
             if mode == "local_external":
                 return True
-            has_key = bool(
-                cfg.get("apiKey")
-                or cfg.get("api_key")
-                or get_secret("HINDSIGHT_API_KEY", "")
-            )
-            has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
+            has_key, has_url = self._credential_state(cfg)
             return has_key or has_url
         except Exception:
             return False
@@ -914,12 +924,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if mode == "local_external":
             return ""
         # Cloud mode: report exactly which credential is missing.
-        has_key = bool(
-            cfg.get("apiKey")
-            or cfg.get("api_key")
-            or get_secret("HINDSIGHT_API_KEY", "")
-        )
-        has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
+        has_key, has_url = self._credential_state(cfg)
         missing = [name for name, present in
                    (("HINDSIGHT_API_URL", has_url), ("HINDSIGHT_API_KEY", has_key))
                    if not present]
