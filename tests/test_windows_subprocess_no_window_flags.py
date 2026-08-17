@@ -379,21 +379,49 @@ def test_local_stt_audio_prep_hides_ffmpeg_window(monkeypatch, tmp_path):
     assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
 
 def test_checkpoint_manager_git_hides_windows(monkeypatch):
+    """checkpoint_manager's git spawns must not flash a console window.
+
+    Asserts the flag reaches the TRANSPORT (``subprocess.Popen``) rather than
+    that some particular helper was called with it. On 2026-08-15 ``_run_git``
+    moved from ``subprocess.run(creationflags=windows_hide_flags())`` to
+    ``run_text_capture`` (the git-gc grandchild timeout fix). The no-flash
+    guarantee survived intact — ``run_text_capture`` sets ``CREATE_NO_WINDOW``
+    itself — but this test broke anyway, because it patched
+    ``checkpoint_manager.windows_hide_flags``, an attribute the module no
+    longer has, and ``checkpoint_manager.subprocess.run``, which it no longer
+    calls. Binding to the transport is what makes it survive the next such
+    move; every helper bottoms out in ``Popen``.
+
+    ``IS_WINDOWS`` is forced so the assertion is meaningful on any host, the
+    same role the old ``windows_hide_flags`` stub played. The check is a
+    bitmask, not equality, because ``run_text_capture`` also sets
+    ``CREATE_NEW_PROCESS_GROUP``.
+    """
     from tools import checkpoint_manager
+    from hermes_cli import _subprocess_compat
 
     captured = []
 
-    def fake_run(cmd, **kwargs):
+    class _FakeProc:
+        pid = 4242
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
         captured.append((cmd, kwargs))
-        return _Completed(stdout="clean\n")
+        return _FakeProc()
 
-    monkeypatch.setattr(checkpoint_manager, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(checkpoint_manager.subprocess, "run", fake_run)
+    monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
-    ok, _, _ = checkpoint_manager._run_git(["status", "--short"], Path("C:/store"), ".")
-    assert ok
-    assert captured[0][0][0] == "git"
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
+    checkpoint_manager._run_git(["status", "--short"], Path("C:/store"), ".")
+
+    spawned = _spawns(captured, "status", "--short")
+    assert spawned, "no git spawn was captured — the seam is dead"
+    assert spawned[0][0][0] == "git"
+    assert spawned[0][1]["creationflags"] & _CREATE_NO_WINDOW
 
 
 def test_skills_hub_gh_token_hides_windows(monkeypatch):
