@@ -2374,6 +2374,8 @@ export interface Translations {
 
   preview: {
     tab: string
+    pin: string
+    unpin: string
     closePane: string
     loading: string
     unavailable: string
