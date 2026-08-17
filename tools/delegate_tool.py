@@ -3604,9 +3604,26 @@ def delegate_task(
         return tool_error(str(exc))
 
     # Apply agent definition overrides to credentials
+    # Rule: if agent_def specifies a model but no provider/base_url,
+    # DON'T override the model — let the child inherit the parent's
+    # full credential bundle (provider + model). Overriding just the
+    # model without a provider breaks resolution (child gets a model
+    # name the parent's provider can't route).
     if _agent_def is not None:
-        if _agent_def.model:
+        _has_provider_override = (
+            _agent_def.base_url or _agent_def.provider or _agent_def.api_key
+        )
+        if _has_provider_override and _agent_def.model:
             creds["model"] = _agent_def.model
+        elif _agent_def.model and not _has_provider_override:
+            # Model-only override without provider — skip model override
+            # so child inherits parent's full provider+model bundle.
+            # Store as hint for context injection only.
+            logger.debug(
+                "Agent '%s' has model '%s' but no provider — "
+                "inheriting parent provider+model instead",
+                _agent_def.name, _agent_def.model,
+            )
         # Provider overrides (base_url, provider, api_mode, api_key)
         if _agent_def.base_url:
             creds["base_url"] = _agent_def.base_url
