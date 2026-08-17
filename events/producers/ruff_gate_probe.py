@@ -54,6 +54,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -173,6 +174,29 @@ def describe_checkout(repo: Path) -> Dict[str, str]:
     return {"branch": branch or "?", "commit": commit or "?"}
 
 
+def resolve_ruff() -> List[str]:
+    """The argv prefix that runs ruff.
+
+    Deliberately NOT ``sys.executable -m ruff``. The Scheduled Task runs the
+    house uv-managed CPython (the one every other Hermes task uses, and the
+    only one that can import this package), and that interpreter does not have
+    ruff installed — ruff lives as a standalone .exe on PATH. Running it as
+    its own executable decouples the gate from whichever interpreter happens
+    to host the probe.
+
+    ``RUFF_BIN`` overrides for tests and for a pinned toolchain. The
+    interpreter-module form is kept only as a last resort; :func:`run_ruff`
+    treats its failure mode as unmeasurable rather than clean.
+    """
+    override = os.getenv("RUFF_BIN")
+    if override:
+        return [override]
+    found = shutil.which("ruff")
+    if found:
+        return [found]
+    return [sys.executable, "-m", "ruff"]
+
+
 def run_ruff(repo: Path, timeout: float = DEFAULT_RUFF_TIMEOUT_SECONDS) -> RuffSample:
     """Lint the whole tree. Never writes to the repo.
 
@@ -180,10 +204,15 @@ def run_ruff(repo: Path, timeout: float = DEFAULT_RUFF_TIMEOUT_SECONDS) -> RuffS
     ``invalid-syntax`` diagnostics), >=2 = ruff itself failed. That last case
     is a BROKEN PROBE, not a clean gate: report it as unmeasurable so a
     mangled ruff.toml can never read as "all checks passed".
+
+    Exit 1 is only believed when it comes with at least one parsed finding.
+    An interpreter missing the ruff module also exits 1 — with EMPTY stdout,
+    which parsed as ``[]`` and would have alerted "0 ruff violations" on every
+    tick forever. A red gate that cannot name a single violation is a broken
+    probe, so it reports unmeasurable too.
     """
     cmd = [
-        sys.executable, "-m", "ruff", "check", "--no-cache",
-        "--output-format", "json", ".",
+        *resolve_ruff(), "check", "--no-cache", "--output-format", "json", ".",
     ]
     try:
         proc = subprocess.run(
@@ -203,12 +232,24 @@ def run_ruff(repo: Path, timeout: float = DEFAULT_RUFF_TIMEOUT_SECONDS) -> RuffS
             detail=f"ruff exited {proc.returncode}: {detail[0] if detail else 'no output'}",
         )
 
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+        first_err = (proc.stderr or "").strip().splitlines()
+        return RuffSample(
+            ok=False,
+            detail="ruff exited 1 with no output: "
+                   + (first_err[0] if first_err else "no stderr either"),
+        )
     try:
-        findings = json.loads(proc.stdout or "[]")
+        findings = json.loads(stdout)
     except ValueError as exc:
         return RuffSample(ok=False, detail=f"ruff JSON unparseable: {exc}")
     if not isinstance(findings, list):
         return RuffSample(ok=False, detail="ruff JSON was not a list")
+    if not findings:
+        return RuffSample(
+            ok=False, detail="ruff exited 1 but reported no findings",
+        )
 
     codes = Counter()
     sample: List[str] = []
@@ -268,6 +309,9 @@ class RuffGateProbe:
         self._state_path = Path(state_path) if state_path else ruff_gate_state_path()
         self.re_alert_cooldown_seconds = re_alert_cooldown_seconds
         self.ruff_timeout_seconds = ruff_timeout_seconds
+        # Last measurement, so the CLI can distinguish "gate is green" from
+        # "could not measure" — the two states check() both reports as None.
+        self.last_sample: Optional[RuffSample] = None
 
         state = load_state(self._state_path, {})
         self._alerting = bool(state.get("alerting", False))
@@ -302,6 +346,7 @@ class RuffGateProbe:
             return None
 
         sample = run_ruff(self._repo, timeout=self.ruff_timeout_seconds)
+        self.last_sample = sample
 
         if not sample.ok:
             # Unmeasurable. Leave episode state alone so this neither
@@ -399,6 +444,13 @@ def main(argv=None) -> int:
     event_id = probe.check()
     if event_id:
         print(event_id)
+
+    # An unmeasurable gate is a BROKEN ALARM, and its whole failure mode is
+    # silence — no event, no Telegram message, nothing to notice. Exit
+    # non-zero so it surfaces as the Scheduled Task's LastTaskResult instead
+    # of looking exactly like a healthy green tree.
+    if probe.last_sample is not None and not probe.last_sample.ok:
+        return 3
     return 0
 
 

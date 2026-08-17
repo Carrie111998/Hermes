@@ -239,3 +239,69 @@ def test_run_ruff_parses_a_real_f_group_violation(tmp_path):
 
 def test_operation_in_progress_is_false_on_a_non_repo(tmp_path):
     assert operation_in_progress(tmp_path) is False
+
+
+# --------------------------------------------------------------------------
+# The exit-1 contract. An interpreter without the ruff module ALSO exits 1,
+# with empty stdout — which parsed as [] and alerted "0 ruff violations" on
+# every tick. Caught while wiring the Scheduled Task to the house uv python.
+# --------------------------------------------------------------------------
+
+
+def test_missing_ruff_module_is_unmeasurable_not_red(tmp_path, monkeypatch):
+    """`python -m ruff` on an interpreter without ruff: exit 1, empty stdout."""
+    monkeypatch.setenv(
+        "RUFF_BIN", "<never-run>",
+    )
+    monkeypatch.setattr(
+        probe_module.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(
+            a[0] if a else [], 1, "", "No module named ruff",
+        ),
+    )
+    sample = run_ruff(tmp_path)
+    assert sample.ok is False
+    assert sample.red is False
+    assert "no output" in sample.detail
+
+
+def test_exit_1_with_an_empty_finding_list_is_unmeasurable(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUFF_BIN", "<never-run>")
+    monkeypatch.setattr(
+        probe_module.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0] if a else [], 1, "[]", ""),
+    )
+    sample = run_ruff(tmp_path)
+    assert sample.ok is False
+    assert sample.red is False
+    assert "no findings" in sample.detail
+
+
+def test_unmeasurable_gate_exits_nonzero_so_it_is_not_silent(
+    bus, repo, state_path, monkeypatch
+):
+    """A broken alarm's failure mode is silence; the task result must show it."""
+    probe = _make(
+        bus, repo, state_path, monkeypatch,
+        RuffSample(ok=False, detail="ruff exited 1 with no output"),
+    )
+    monkeypatch.setattr(probe_module, "RuffGateProbe", lambda **kw: probe)
+    assert probe_module.main(["--repo", str(repo)]) == 3
+
+
+def test_green_gate_exits_zero(bus, repo, state_path, monkeypatch):
+    probe = _make(bus, repo, state_path, monkeypatch, _GREEN)
+    monkeypatch.setattr(probe_module, "RuffGateProbe", lambda **kw: probe)
+    assert probe_module.main(["--repo", str(repo)]) == 0
+
+
+def test_resolve_ruff_honours_the_env_override(monkeypatch):
+    monkeypatch.setenv("RUFF_BIN", r"C:\tools\ruff.exe")
+    assert probe_module.resolve_ruff() == [r"C:\tools\ruff.exe"]
+
+
+def test_resolve_ruff_prefers_a_standalone_exe_over_the_interpreter(monkeypatch):
+    """The house interpreter has no ruff module, so PATH must win."""
+    monkeypatch.delenv("RUFF_BIN", raising=False)
+    monkeypatch.setattr(probe_module.shutil, "which", lambda name: r"C:\bin\ruff.exe")
+    assert probe_module.resolve_ruff() == [r"C:\bin\ruff.exe"]
