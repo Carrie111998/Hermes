@@ -619,3 +619,44 @@ class TestShutdownAttributionTiming:
         mon.shutdown()
 
         assert _stale_events(bus) == []
+
+    def test_age_is_measured_at_the_shutdown_not_at_the_flush(self, bus):
+        """``age_seconds`` answers "how far into the run did the shutdown land".
+
+        Deferring the REPORT must not change what the report SAYS. The field
+        predates the deferral — it was computed against the GATEWAY_STOPPED —
+        so measuring it at flush time silently redefines it, adding however
+        long teardown took. Teardown on this box has run minutes (2026-08-17:
+        05:31:22Z stop, the process still emitting at 05:36:48Z), so the drift
+        is not a rounding error.
+
+        Self-calibrating rather than absolute: the bound is derived from the
+        measured staging window, so a loaded box cannot fail it. cf. the
+        _WITHIN_MARGIN_SECONDS note above, where a fixed margin lost that race.
+        """
+        import time
+
+        BACKDATE_SECONDS = 600
+        DEFERRAL_SECONDS = 3  # stands in for the rest of teardown
+
+        old = datetime.now(timezone.utc) - timedelta(seconds=BACKDATE_SECONDS)
+        started_id = _emit_started(bus, "job-killed", started_at=old)
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        before_poll = time.monotonic()
+        mon.poll()  # stages the report
+        staged_within = time.monotonic() - before_poll
+        time.sleep(DEFERRAL_SECONDS)
+        mon.shutdown()  # flushes it
+
+        evts = [e for e in _stale_events(bus)
+                if e.payload.get("scope") == "gateway_stopped"]
+        assert len(evts) == 1
+        age = evts[0].payload["age_seconds"]
+        # +1 absorbs int() truncation; the deferral must NOT be in there.
+        assert age <= BACKDATE_SECONDS + staged_within + 1, (
+            f"age_seconds={age} carries the {DEFERRAL_SECONDS}s deferral "
+            f"(run was {BACKDATE_SECONDS}s old when the shutdown was seen, "
+            f"staged within {staged_within:.2f}s)"
+        )

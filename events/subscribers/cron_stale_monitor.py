@@ -138,6 +138,7 @@ class CronStaleMonitor(BaseSubscriber):
         if not isinstance(raw, (list, tuple)):
             return
         exit_reason = event.payload.get("exit_reason")
+        now = datetime.now(timezone.utc)
 
         for correlation_id in raw:
             job_id = self._started_event_ids.pop(correlation_id, None)
@@ -148,10 +149,19 @@ class CronStaleMonitor(BaseSubscriber):
             if entry is None:
                 continue
             started_at, job_name = entry
+            try:
+                age = (now - started_at).total_seconds()
+            except (TypeError, ValueError):
+                age = 0.0
             self._pending_shutdown.append({
                 "job_id": job_id,
                 "job_name": job_name,
-                "started_at": started_at,
+                # Measured HERE, against the GATEWAY_STOPPED, not at flush
+                # time: age_seconds means "how far into the run did the
+                # shutdown land", and it predates the staging. Computing it at
+                # the flush would silently redefine it to include however long
+                # teardown took — minutes, on this box.
+                "age_seconds": int(age),
                 "exit_reason": exit_reason,
                 "gateway_stopped_event_id": event.event_id,
                 "cron_started_event_id": correlation_id,
@@ -166,15 +176,13 @@ class CronStaleMonitor(BaseSubscriber):
         pending, self._pending_shutdown = self._pending_shutdown, []
         if not pending:
             return
-        now = datetime.now(timezone.utc)
         for record in pending:
             job_id = record["job_id"]
             job_name = record["job_name"]
             exit_reason = record["exit_reason"]
-            try:
-                age = (now - record["started_at"]).total_seconds()
-            except (TypeError, ValueError):
-                age = 0.0
+            # Computed when the shutdown was seen, not now — see the staging
+            # site. The flush may be minutes later.
+            age = record["age_seconds"]
             try:
                 self.bus.emit(
                     event_type=EventType.CRON_STALE,
