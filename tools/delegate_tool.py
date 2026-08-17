@@ -3439,12 +3439,12 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
 
 
 def delegate_task(
+    agent: str = None,
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
-    background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
@@ -3456,7 +3456,7 @@ def delegate_task(
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
+      - Single: provide agent + optional goal/context
       - Batch:  provide tasks array [{goal, context, role}, ...]
 
     Control modes (synchronous, never backgrounded):
@@ -3465,15 +3465,48 @@ def delegate_task(
                           (subagent_id + message)
       - action='stop'  -> interrupt a running child early (subagent_id)
 
-    The 'role' parameter controls whether a child can further delegate:
-    'leaf' (default) cannot; 'orchestrator' retains the delegation
-    toolset and can spawn its own workers, bounded by
-    delegation.max_spawn_depth.  Per-task role beats the top-level one.
+    The 'agent' parameter loads an agent definition from .hermes/agents/.
+    When set, the agent's config (model, reasoning, temperature, tools,
+    skills) overrides the default delegation config. Each delegate gets
+    a new session (session tracking).
+
+    Background is always True — delegations run async. Results re-enter
+    the conversation when finished.
 
     Returns JSON with results array, one entry per task.
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    # ── Agent definition loading ──────────────────────────────────────
+    # When 'agent' is specified, load the agent definition from the
+    # registry and apply its config (model, reasoning, temperature, etc.)
+    # to the delegation.  Per-task overrides still win over agent config.
+    _agent_def = None
+    if agent:
+        try:
+            from agent.agent_registry import get_agent_registry
+            _agent_def = get_agent_registry().get_agent(agent)
+            if _agent_def is None:
+                # Try loading from default locations
+                registry = get_agent_registry()
+                if not registry._loaded:
+                    from pathlib import Path
+                    from hermes_cli.config import load_config
+                    try:
+                        cfg = load_config()
+                        registry.load_from_config(cfg)
+                    except Exception:
+                        pass
+                    for d in (Path.home() / ".hermes" / "agents", Path.cwd() / ".agents"):
+                        if d.exists():
+                            registry.load_from_directory(d)
+                _agent_def = registry.get_agent(agent)
+            if _agent_def is None:
+                return tool_error(f"Agent '{agent}' not found in .hermes/agents/ or .agents/")
+        except Exception as exc:
+            logger.debug("Failed to load agent '%s': %s", agent, exc)
+            return tool_error(f"Failed to load agent '{agent}': {exc}")
 
     # ── Control plane: list/steer/stop run synchronously and return here.
     # They never spawn, so they bypass the pause gate, depth limit, and the
@@ -3507,7 +3540,8 @@ def delegate_task(
     # carrying the consolidated per-task results. It re-enters the conversation
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
-    background = is_truthy_value(background, default=False) if background is not None else False
+    # Background is always True — delegations run async.
+    background = True
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -3543,10 +3577,56 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
+    # When an agent definition is loaded, its model overrides the delegation
+    # credential model.
     try:
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Apply agent definition overrides to credentials
+    if _agent_def is not None:
+        if _agent_def.model:
+            creds["model"] = _agent_def.model
+        # Provider overrides (base_url, provider, api_mode, api_key)
+        if _agent_def.base_url:
+            creds["base_url"] = _agent_def.base_url
+        if _agent_def.provider:
+            creds["provider"] = _agent_def.provider
+        if _agent_def.api_mode:
+            creds["api_mode"] = _agent_def.api_mode
+        if _agent_def.api_key:
+            creds["api_key"] = _agent_def.api_key
+        # Agent-specific reasoning overrides delegation config
+        if _agent_def.reasoning and _agent_def.reasoning != "medium":
+            try:
+                from hermes_constants import parse_reasoning_effort
+                parsed = parse_reasoning_effort(_agent_def.reasoning)
+                if parsed is not None:
+                    creds["reasoning"] = parsed
+            except Exception:
+                pass
+        # Temperature and top_p go via request_overrides
+        if _agent_def.temperature != 0.7 or _agent_def.top_p != 0.9:
+            if "request_overrides" not in creds or not creds["request_overrides"]:
+                creds["request_overrides"] = {}
+            if _agent_def.temperature != 0.7:
+                creds["request_overrides"]["temperature"] = _agent_def.temperature
+            if _agent_def.top_p != 0.9:
+                creds["request_overrides"]["top_p"] = _agent_def.top_p
+        # Max tokens
+        if _agent_def.max_tokens and _agent_def.max_tokens != 4096:
+            creds["max_output_tokens"] = _agent_def.max_tokens
+        # Context length (via request_overrides)
+        if _agent_def.context_length and _agent_def.context_length > 0:
+            if "request_overrides" not in creds or not creds["request_overrides"]:
+                creds["request_overrides"] = {}
+            creds["request_overrides"]["context_length"] = _agent_def.context_length
+        # Compression settings
+        if _agent_def.compression_threshold > 0:
+            creds["compression_threshold"] = _agent_def.compression_threshold
+        if _agent_def.compression_target_ratio > 0:
+            creds["compression_target_ratio"] = _agent_def.compression_target_ratio
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3574,7 +3654,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        # Prepend agent definition prompt to context if agent is specified
+        _effective_context = context
+        if _agent_def and _agent_def.prompt:
+            _agent_header = f"[Agent: {_agent_def.name}]\n{_agent_def.prompt}\n\n"
+            _effective_context = _agent_header + (context or "")
+        single_task: Dict[str, Any] = {"goal": goal, "context": _effective_context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3677,6 +3762,10 @@ def delegate_task(
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
+        # Prepend agent definition prompt to context if agent is specified
+        if _agent_def and _agent_def.prompt:
+            _agent_header = f"[Agent: {_agent_def.name}]\n{_agent_def.prompt}\n\n"
+            _child_context = _agent_header + (_child_context or "")
         if _task_schema is not None:
             from tools.delegation_output_schema import append_output_contract
 
@@ -4650,18 +4739,6 @@ DELEGATE_TASK_SCHEMA = {
                     "(same semantics as tasks[].output_schema)."
                 ),
             },
-            "background": {
-                "type": "boolean",
-                "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
-                ),
-            },
             "action": {
                 "type": "string",
                 "enum": ["spawn", "list", "steer", "stop"],
@@ -4692,6 +4769,16 @@ DELEGATE_TASK_SCHEMA = {
                     "and specific — the child sees it appended to its next "
                     "tool result mid-run (e.g. \"Stop exploring X; focus on Y "
                     "and return early results\")."
+                ),
+            },
+            "agent": {
+                "type": "string",
+                "description": (
+                    "Agent name from .hermes/agents/ or .agents/ definitions. "
+                    "When set, loads the agent's config (model, base_url, "
+                    "provider, api_mode, reasoning, temperature, tools, skills, "
+                    "context_length) and system prompt. "
+                    "Example: 'coder', 'reviewer', 'debugger'."
                 ),
             },
         },
