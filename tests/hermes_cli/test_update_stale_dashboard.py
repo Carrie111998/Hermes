@@ -653,6 +653,137 @@ class TestLaunchdBackendRestart:
         respawn.assert_called_once_with([argv])
         assert result["killed"] == [4324]
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Darwin launchd path")
+    def test_pid_turnover_before_signal_fails_closed(self, capsys):
+        """KeepAlive churn between the scan and the ownership lookup must not
+        publish a detached respawn.
+
+        The stale-process scan and ``_get_launchd_job_for_pid`` are separate
+        snapshots.  When launchd replaces the job in between, the scanned PID
+        is absent from both bootstrap domains and looks manually started;
+        ``SIGTERM`` then raises ``ProcessLookupError``.  Counting that as a
+        clean kill and respawning the captured argv detaches a second
+        dashboard alongside the one launchd just restarted — the duplicate
+        listener / ``EADDRINUSE`` incident.  Fail closed instead.
+        """
+        live = self._live()
+        argv = ["hermes", "dashboard", "--port", "9119"]
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError
+
+        with patch("sys.platform", "darwin"), \
+             patch.object(live, "_restart_managed_dashboard_service", return_value=False), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=[4321]), \
+             patch.object(live, "_get_launchd_job_for_pid", return_value=(None, None)), \
+             patch.object(live, "_get_pid_cgroup_path", return_value=None), \
+             patch.object(live, "_get_systemd_service_for_pid", return_value=None), \
+             patch.object(live, "_dashboard_cmdline_for_pid", return_value=argv), \
+             patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch("os.kill", side_effect=fake_kill), \
+             patch("time.sleep"):
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        respawn.assert_not_called()
+        assert result["matched"] == [4321]
+        assert result["killed"] == []
+        # Not "unrecovered" either: telling the operator to relaunch by hand
+        # would recreate the duplicate launchd is already supervising.
+        assert result["unrecovered"] == []
+        assert result["failed"][0][0] == 4321
+        assert "vanished" in result["failed"][0][1]
+        out = capsys.readouterr().out
+        assert "left PID 4321 untouched" in out
+        assert "when you're ready" not in out
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Darwin launchd path")
+    def test_loaded_launchd_job_without_current_pid_fails_closed(self, capsys):
+        """A loaded job between KeepAlive restarts reports PID 0.
+
+        ``launchctl print`` lists a loaded-but-not-running job with ``0`` in
+        the PID column, so the stale scanned PID matches no label and the
+        real lookup returns "manually started".  The PID-0 entry must never
+        be claimed as the owner of an unrelated PID, and the vanished
+        candidate must still fail closed rather than respawn.
+        """
+        live = self._live()
+        argv = ["hermes", "dashboard", "--port", "9119"]
+
+        def fake_run(args, *a, **kw):
+            if args == ["launchctl", "print", "gui/502"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "gui/502 = {\n"
+                        " services = {\n"
+                        "        0      - \tcom.hermes.dashboard\n"
+                        " }\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            if args == ["launchctl", "print", "user/502"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout="user/502 = {\n services = {\n }\n}\n",
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError
+
+        with patch("sys.platform", "darwin"), \
+             patch.object(live.os, "getuid", return_value=502), \
+             patch.object(live, "_restart_managed_dashboard_service", return_value=False), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=[4321]), \
+             patch.object(live, "_get_pid_cgroup_path", return_value=None), \
+             patch.object(live, "_get_systemd_service_for_pid", return_value=None), \
+             patch.object(live, "_dashboard_cmdline_for_pid", return_value=argv), \
+             patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("hermes_cli._subprocess_compat.bounded_probe_run", side_effect=fake_run), \
+             patch("os.kill", side_effect=fake_kill), \
+             patch("time.sleep"):
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        respawn.assert_not_called()
+        assert result["killed"] == []
+        assert result["unrecovered"] == []
+        assert result["failed"][0][0] == 4321
+        assert "vanished" in result["failed"][0][1]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX kill semantics")
+    def test_non_darwin_vanished_manual_pid_still_respawns(self):
+        """The fail-closed guard is launchd-specific.
+
+        Off macOS there is no KeepAlive replacement to collide with, so a
+        manual backend that exits between the scan and ``SIGTERM`` keeps the
+        #40449 respawn.
+        """
+        live = self._live()
+        argv = ["hermes", "dashboard", "--port", "8300"]
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError
+
+        with patch("sys.platform", "linux"), \
+             patch.object(live, "_restart_managed_dashboard_service", return_value=False), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=[6002]), \
+             patch.object(live, "_get_pid_cgroup_path", return_value=None), \
+             patch.object(live, "_get_systemd_service_for_pid", return_value=None), \
+             patch.object(live, "_dashboard_cmdline_for_pid", return_value=argv), \
+             patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
+             patch.object(live, "_respawn_dashboard_processes", return_value=[]) as respawn, \
+             patch("os.kill", side_effect=fake_kill), \
+             patch("time.sleep"):
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        respawn.assert_called_once_with([argv])
+        assert result["killed"] == [6002]
+
 
 class TestManualBackendRespawn:
     """Manually-started dashboards/serves have their argv captured before the

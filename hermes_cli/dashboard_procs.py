@@ -321,6 +321,15 @@ def _kill_stale_dashboard_processes(
     restarted after the kill, because systemd treats our SIGTERM as a clean
     stop and ``Restart=on-failure`` would never fire (#68934).
 
+    macOS: a PID owned directly by a launchd job is restarted with
+    ``launchctl kickstart -k`` and never signalled, so KeepAlive cannot race
+    our SIGTERM.  Anything launchd does not claim is treated as manual — but
+    only while we can prove it: if such a PID has already vanished when we go
+    to signal it, the ownership snapshot is stale (a replaced KeepAlive job
+    looks exactly like a manual backend that exited), so it fails closed
+    without a detached respawn rather than duplicating the job launchd just
+    restarted (review on #87989).
+
     *already_restarted_units* names units (no ``.service`` suffix) the
     caller already restarted directly — e.g. ``hermes update``'s systemd
     fleet-restart loop, which restarts ``hermes-serve*`` units before this
@@ -417,6 +426,7 @@ def _kill_stale_dashboard_processes(
     launchd_restarted: list[tuple[int, str]] = []
     launchd_lookup_failures: dict[int, str] = {}
     launchd_kickstart_failures: dict[int, str] = {}
+    launchd_turnover_failures: dict[int, str] = {}
 
     if restart_managed and sys.platform == "darwin":
         manual_pids: list[int] = []
@@ -474,8 +484,25 @@ def _kill_stale_dashboard_processes(
             try:
                 os.kill(pid, _signal.SIGTERM)
             except ProcessLookupError:
-                # Already gone — count as killed.
-                killed.append(pid)
+                if restart_managed and sys.platform == "darwin":
+                    # The PID vanished before we signalled it, so the launchd
+                    # ownership snapshot taken by the scan above is stale: a
+                    # KeepAlive job replaced between the two snapshots is
+                    # absent from both bootstrap domains and indistinguishable
+                    # from a manual backend that exited on its own.  Counting
+                    # it killed would publish a detached respawn next to the
+                    # process launchd just restarted (duplicate listener /
+                    # EADDRINUSE), so fail closed instead (review on #87989).
+                    failure = (
+                        "candidate vanished before the stop signal; launchd "
+                        "ownership could not be revalidated, so no detached "
+                        "respawn was published"
+                    )
+                    failed.append((pid, failure))
+                    launchd_turnover_failures[pid] = failure
+                else:
+                    # Already gone — count as killed.
+                    killed.append(pid)
             except (PermissionError, OSError) as e:
                 failed.append((pid, str(e)))
 
@@ -510,7 +537,7 @@ def _kill_stale_dashboard_processes(
     for pid in killed:
         print(f"    ✓ stopped PID {pid}")
     for pid, err_msg in failed:
-        if pid in launchd_lookup_failures:
+        if pid in launchd_lookup_failures or pid in launchd_turnover_failures:
             print(f"    ⚠ left PID {pid} untouched: {err_msg}")
         elif pid in launchd_kickstart_failures:
             print(f"    ⚠ state of PID {pid} is indeterminate: {err_msg}")
@@ -524,6 +551,10 @@ def _kill_stale_dashboard_processes(
     if launchd_kickstart_failures:
         print("  A failed launchd kickstart leaves the dashboard post-state")
         print("  indeterminate; do not retry with raw kill or detached respawn.")
+    if launchd_turnover_failures:
+        print("  A dashboard PID that vanished before the stop signal may have")
+        print("  been replaced by its launchd job; check the job's current PID")
+        print("  before starting another dashboard by hand.")
 
     # Restart what we just killed (update path only).  Two categories:
     #  - systemd-supervised PIDs: restart the owning unit.  Without this, a
