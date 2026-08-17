@@ -2285,10 +2285,25 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    try:
+        from hermes_cli.config import load_config
+
+        raw_worker_cap = (load_config() or {}).get("kanban", {}).get(
+            "max_concurrent_workers", 3
+        )
+        max_concurrent_workers = int(raw_worker_cap)
+        if max_concurrent_workers < 1:
+            max_concurrent_workers = 3
+    except Exception:
+        max_concurrent_workers = 3
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_concurrent_workers=max_concurrent_workers,
+            board=board,
         )
         # DispatchResult is a dataclass.
         try:

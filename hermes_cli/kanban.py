@@ -139,7 +139,7 @@ def _check_dispatcher_presence(
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
-      config has ``kanban.dispatch_in_gateway`` on (default). Message
+      config explicitly has ``kanban.dispatch_in_gateway`` on. Message
       is a short status line.
     - ``running=False``: either no gateway is running, or the gateway
       is running but the config flag is off. Message is human guidance
@@ -147,9 +147,9 @@ def _check_dispatcher_presence(
 
     Used by ``hermes kanban create`` (and callers) to warn when a task
     will sit in ``ready`` because nothing is there to pick it up.
-    Defensive against import failures and config-read errors — if the
-    probe itself errors, we return ``(True, "")`` so we don't spam
-    false warnings (better to miss a warning than to cry wolf).
+    Defensive against liveness-probe failures, which remain silent to avoid
+    false warnings. Configuration failures instead mirror the actual watcher
+    and report dispatch disabled because automatic dispatch fails closed.
 
     ``hermes_home`` scopes the probe to a named profile's directory. The
     dashboard plugin API passes it because the dashboard backend process can
@@ -183,10 +183,17 @@ def _check_dispatcher_presence(
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
         from hermes_cli.config import load_config
-        cfg = load_config()
-        dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
+
+        env_override = os.environ.get(
+            "HERMES_KANBAN_DISPATCH_IN_GATEWAY", ""
+        ).strip().lower()
+        if env_override:
+            dispatch_on = env_override not in {"0", "false", "no", "off"}
+        else:
+            cfg = load_config()
+            dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", False))
     except Exception:
-        dispatch_on = True  # can't tell — assume default
+        dispatch_on = False  # watcher also fails closed when config cannot load
 
     if pid and dispatch_on:
         return (True, f"gateway pid={pid}, dispatch enabled")
@@ -195,17 +202,17 @@ def _check_dispatcher_presence(
             False,
             "Gateway is running but kanban.dispatch_in_gateway=false in "
             "config.yaml — the task will sit in 'ready' until you flip it "
-            "back on and restart the gateway, OR run the legacy "
-            "standalone daemon (`hermes kanban daemon --force`)."
+            "on and restart the gateway, OR run a one-shot manual pass "
+            "(`hermes kanban dispatch`)."
         )
     return (
         False,
         "No gateway is running — the task will sit in 'ready' until you "
         "start it. Run:\n"
         "    hermes gateway start\n"
-        "The gateway hosts an embedded dispatcher (tick interval 60s by "
-        "default); your task will be picked up on the next tick after "
-        "the gateway comes up."
+        "Then explicitly enable `kanban.dispatch_in_gateway: true` in "
+        "config.yaml and restart it, or run `hermes kanban dispatch` for "
+        "a one-shot manual pass."
     )
 
 
@@ -2618,7 +2625,8 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee as the fallback for unassigned ready
-    # tasks (#27145), kanban.max_in_progress as the global concurrency cap
+    # tasks (#27145), kanban.max_concurrent_workers as the host-wide cap,
+    # kanban.max_in_progress as the per-board concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
     # cap (#21582), and kanban.max_spawn as the per-tick spawn limit
     # (#28805). Same semantics as the gateway dispatch path so behavior
@@ -2643,6 +2651,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        max_concurrent_workers = _coerce_positive_int(
+            _kanban_cfg.get("max_concurrent_workers", 3)
+        ) or 3
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2653,12 +2664,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        max_concurrent_workers = 3
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
+            max_concurrent_workers=max_concurrent_workers,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
@@ -2743,13 +2756,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             "hermes kanban daemon: DEPRECATED — the dispatcher now runs\n"
             "inside the gateway. To use kanban:\n"
             "\n"
-            "    hermes gateway start       # starts the gateway + embedded dispatcher\n"
+            "    hermes config set kanban.dispatch_in_gateway true\n"
+            "    hermes gateway start       # starts the explicitly enabled dispatcher\n"
             "\n"
             "Ready tasks will be picked up on the next dispatcher tick\n"
             "(default: every 60 seconds). Configure via config.yaml:\n"
             "\n"
             "    kanban:\n"
-            "      dispatch_in_gateway: true      # default\n"
+            "      dispatch_in_gateway: true      # explicit opt-in; default false\n"
+            "      max_concurrent_workers: 3      # host-wide safety cap\n"
             "      dispatch_interval_seconds: 60\n"
             "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
             "\n"
@@ -2778,7 +2793,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         f"Kanban dispatcher running STANDALONE via --force "
         f"(interval={args.interval}s, pid={os.getpid()}). "
         f"Ctrl-C to stop. NOTE: if a gateway is also running with "
-        f"dispatch_in_gateway=true (default), you have two dispatchers "
+        f"dispatch_in_gateway=true, you have two dispatchers "
         f"racing for claims.",
         file=sys.stderr,
     )
@@ -2848,9 +2863,21 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return False
 
     try:
+        try:
+            from hermes_cli.config import load_config
+
+            raw_worker_cap = (load_config() or {}).get("kanban", {}).get(
+                "max_concurrent_workers", 3
+            )
+            max_concurrent_workers = int(raw_worker_cap)
+            if max_concurrent_workers < 1:
+                max_concurrent_workers = 3
+        except Exception:
+            max_concurrent_workers = 3
         kb.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
+            max_concurrent_workers=max_concurrent_workers,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
         )

@@ -66,7 +66,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
-- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. It can run inside the gateway after explicit opt-in (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; the default host-wide `kanban.max_concurrent_workers: 3` cap prevents fan-outs from exhausting the machine. Workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
 ## Boards (multi-project)
@@ -199,7 +199,8 @@ The commands below are **you** (the human) setting up the board and creating tas
 # 1. Create the board (you)
 hermes kanban init
 
-# 2. Start the gateway (hosts the embedded dispatcher)
+# 2. Explicitly enable automatic dispatch, then start the gateway
+hermes config set kanban.dispatch_in_gateway true
 hermes gateway start
 
 # 3. Create a task (you — or an orchestrator agent via kanban_create)
@@ -215,16 +216,19 @@ hermes kanban stats
 
 When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
 
-### Gateway-embedded dispatcher (default)
+### Gateway-embedded dispatcher (opt-in)
 
-The dispatcher runs inside the gateway process. Nothing to install, no
-separate service to manage — if the gateway is up, ready tasks get picked
-up on the next tick (60s by default).
+The dispatcher can run inside the gateway process, but automatic dispatch is
+off by default. This prevents installing or starting a messaging backend from
+silently turning every ready card into a worker. Enable it explicitly on the
+one gateway that should own dispatch. Otherwise cards remain in `ready` until
+you run `hermes kanban dispatch` manually.
 
 ```yaml
 # config.yaml
 kanban:
-  dispatch_in_gateway: true        # default
+  dispatch_in_gateway: true        # explicit opt-in; default is false
+  max_concurrent_workers: 3        # host-wide across all boards
   dispatch_interval_seconds: 60    # default
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
@@ -791,13 +795,16 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
+| `kanban.max_concurrent_workers` | `3` | Host-wide worker cap shared across all boards and dispatch entry points. The count-and-spawn decision is cross-process locked so concurrent gateway/manual ticks cannot overbook it. Invalid or below-1 config values fall back to `3`. |
+| `kanban.max_in_progress` | unset (unlimited) | Optional per-board cap. When the board already has N running, the dispatcher skips spawning more. It composes with the host-wide cap; the stricter limit wins. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
+  dispatch_in_gateway: true
+  max_concurrent_workers: 3
   max_in_progress: 2
   auto_promote_children: false
   default_workdir: ~/work/active-project

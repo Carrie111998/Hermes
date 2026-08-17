@@ -1182,7 +1182,7 @@ class GatewayKanbanWatchersMixin:
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
-        Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
+        Gated by `kanban.dispatch_in_gateway` in config.yaml (default False).
         When true, the gateway hosts the single dispatcher for this profile:
         no separate `hermes kanban daemon` process needed. When false, the
         loop exits immediately and an external daemon is expected.
@@ -1207,19 +1207,23 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return
 
         try:
             cfg = _load_config()
         except Exception as exc:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        raw_kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        kanban_cfg = raw_kanban_cfg if isinstance(raw_kanban_cfg, dict) else {}
+        dispatch_enabled = (
+            env_override not in {"0", "false", "no", "off"}
+            if env_override
+            else bool(kanban_cfg.get("dispatch_in_gateway", False))
+        )
+        if not dispatch_enabled:
             logger.info(
-                "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
+                "kanban dispatcher: disabled; set kanban.dispatch_in_gateway=true "
+                "to enable automatic dispatch"
             )
             return
 
@@ -1229,9 +1233,8 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
-        # new profile gateway (or a same-profile restart race) can silently
-        # start a second dispatcher; concurrent dispatchers double reclaim
+        # Single-dispatcher backstop. Config drift or a same-profile restart
+        # race can start a second dispatcher; concurrent dispatchers double reclaim
         # frequency, double claim-attempt events, and — with
         # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
         # index pages. The lock lives at the machine-global kanban root
@@ -1268,6 +1271,26 @@ class GatewayKanbanWatchersMixin:
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
             logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+
+        raw_max_concurrent_workers = kanban_cfg.get("max_concurrent_workers", 3)
+        try:
+            max_concurrent_workers = int(raw_max_concurrent_workers)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.max_concurrent_workers=%r; using 3",
+                raw_max_concurrent_workers,
+            )
+            max_concurrent_workers = 3
+        if max_concurrent_workers < 1:
+            logger.warning(
+                "kanban dispatcher: kanban.max_concurrent_workers=%r is below 1; using 3",
+                raw_max_concurrent_workers,
+            )
+            max_concurrent_workers = 3
+        logger.info(
+            "kanban dispatcher: max_concurrent_workers=%d",
+            max_concurrent_workers,
+        )
 
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
@@ -1461,6 +1484,7 @@ class GatewayKanbanWatchersMixin:
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
+                    max_concurrent_workers=max_concurrent_workers,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,

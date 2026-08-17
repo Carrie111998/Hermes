@@ -2497,12 +2497,12 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
-        # Run the dispatcher inside the gateway process. On by default —
-        # the cost is ~300µs every `dispatch_interval_seconds` when idle,
-        # and gateway is the supervisor users already have. Set to false
-        # only if you run the dispatcher as a separate systemd unit or
-        # don't want the gateway to spawn workers.
-        "dispatch_in_gateway": True,
+        # Run the dispatcher inside the gateway process. This is deliberately
+        # opt-in: installing or starting a messaging gateway must not silently
+        # turn every ready card into a worker process. Enable it explicitly on
+        # hosts that should own automatic dispatch. One-shot
+        # `hermes kanban dispatch` remains available while this is false.
+        "dispatch_in_gateway": False,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
@@ -2510,6 +2510,11 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Host-wide worker cap shared by every board and dispatch entry point.
+        # This is distinct from max_in_progress (a per-board override) and the
+        # per-profile cap below. A small safe default prevents a newly enabled
+        # dispatcher from exhausting CPU, memory, or model quota on a fan-out.
+        "max_concurrent_workers": 3,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

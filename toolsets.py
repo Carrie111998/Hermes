@@ -315,7 +315,7 @@ TOOLSETS = {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
             "is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env "
-            "set). The dispatcher runs inside the gateway by default; see "
+            "set). Gateway dispatch is explicitly opt-in; see "
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
             "tasks done with structured handoffs, enter first-class review "
             "(request_review — not a block), return review changes, block for human input, "

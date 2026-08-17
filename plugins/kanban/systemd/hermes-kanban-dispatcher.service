@@ -1,8 +1,9 @@
-# DEPRECATED — the kanban dispatcher now runs inside the gateway by
-# default (config key: kanban.dispatch_in_gateway, default true). To
+# DEPRECATED — the kanban dispatcher can run inside the gateway after
+# explicit opt-in (config key: kanban.dispatch_in_gateway, default false). To
 # migrate:
 #
 #     systemctl --user disable --now hermes-kanban-dispatcher.service
+#     hermes config set kanban.dispatch_in_gateway true
 #     # then make sure a gateway is running; e.g. a systemd user unit
 #     # for `hermes gateway start`. The gateway hosts the dispatcher.
 #
