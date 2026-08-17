@@ -4,6 +4,29 @@
 **Status:** approved, ready for implementation plan
 **Supersedes:** `9a6df34e25` on branch `claude/friendly-chatelet-25a116` (never landed)
 
+> ## 🗄 RETIRED 2026-08-17 — the instrument described here no longer exists
+>
+> `scripts/systemdrive_watcher.py` and `tests/scripts/test_systemdrive_watcher.py`
+> were **deleted from `main`**, along with the `HERMES_TEST_JUNK_PROBE` gate and the
+> sidecar spawn in `scripts/run_tests_parallel.py`. Detection is now
+> **`scripts/systemdrive_sweep.py`** — an always-on existence check over every
+> checkout root.
+>
+> **Why:** this design assumed the writer's ancestry and the artifact were both
+> perishable, so detection had to be sub-millisecond. Neither is. Security-4688
+> retains ancestry with command lines for ~2 days (the ring buffer's own author
+> conceded this — see "SUPERSEDED IN PART" below), and the junk trees persist on
+> disk. The one real failure on record — the 2026-08-14 sighting, unattributed
+> because nobody looked inside the retention window — is a failure a
+> **manually-armed** instrument structurally cannot fix.
+>
+> **These two documents are kept as a design record. Do not implement from them,
+> and do not treat any directive below as live** — in particular the
+> do-not-add-`SYSTEMDRIVE` instruction, which was **already reversed on `main`**
+> by `3bc7442b9b` (the forwarding loop) and `9d35742809` (the comment). Retrieve
+> the watcher with `git show 2a4ece2c07:scripts/systemdrive_watcher.py` if a
+> future third writer ever justifies it.
+
 ## Problem
 
 A literal `%SystemDrive%/ProgramData/Microsoft/Windows/Caches/` tree periodically
@@ -660,8 +683,11 @@ infrastructure already exists and already runs at a cadence fast enough to catch
 - Fixing any newly identified writer. This is an instrument; a fix is separate work
   with its own reproducer and regression test.
 - Deleting existing `%SystemDrive%` trees. They are evidence.
-- Adding `SYSTEMDRIVE` to the `run_tests.sh` allowlist. Doing so before the instrument
-  catches a writer would erase the only reproducer.
+- ~~Adding `SYSTEMDRIVE` to the `run_tests.sh` allowlist. Doing so before the instrument
+  catches a writer would erase the only reproducer.~~ **REVERSED — this was wrong.**
+  The allowlist scrubbing `SYSTEMDRIVE` *was* the writer; forwarding it is the fix,
+  landed as `3bc7442b9b`. Preserving a live bug as bait for an instrument that never
+  caught anything was a bad trade, and the instrument is now retired.
 - ETW / `Win32_ProcessStartTrace` process-creation events. True sub-millisecond creation
   hooking needs elevation; the ring buffer is the non-elevated approximation.
 

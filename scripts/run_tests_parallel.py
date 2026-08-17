@@ -40,9 +40,6 @@ Usage:
 Environment:
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
-    HERMES_TEST_JUNK_PROBE  Spawn scripts/systemdrive_watcher.py alongside the
-                            run to watch the repo root for a literal
-                            %SystemDrive% tree (default: off)
 
     NOTE: scripts/run_tests.sh execs this script under ``env -i`` with an
     explicit allowlist, so a variable only reaches us if that allowlist
@@ -57,7 +54,6 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import os
 import shutil
@@ -1192,154 +1188,6 @@ def _split_argv(argv: List[str]) -> "tuple[List[str], List[str]]":
     return our_args, bare_passthrough + explicit_passthrough
 
 
-# --- %SystemDrive% junk watcher (opt-in diagnostic) ----------------------
-#
-# The watcher is a SEPARATE process on purpose. Its predecessor lived inside
-# this file and could only observe spawns this runner made -- but on
-# 2026-08-16 the writer reproduced from ONE plain sequential pytest run, so
-# an in-runner probe was structurally unable to see it.
-#
-# The sidecar inherits this process's environment verbatim, which is what
-# makes `watcher_has_systemdrive` report OUR condition for free.
-_JUNK_PROBE_ENV = "HERMES_TEST_JUNK_PROBE"
-# Backstop only: the stop-file is the normal shutdown path. This bounds an
-# orphaned watcher if the runner is killed outright.
-_WATCHER_ORPHAN_BUDGET_SECS = 6 * 3600
-# How long _stop_junk_watcher() waits for the watcher's OWN graceful exit
-# (via the stop-file) before giving up and force-terminating it. Reconciled
-# 2026-08-17 against systemdrive_watcher.DEFAULT_LIVE_SWEEP_SECS (30s): this
-# used to be a bare 15, which is LESS than the watcher's own live-sweep
-# budget, so a sighting late in the run could get force-terminated mid-sweep
-# on the graceful-shutdown path too, not just on a hard kill. That is much
-# less catastrophic than it used to be -- the watcher now writes the raw
-# ring to its snapshot file BEFORE the sweep starts (see on_hit()'s
-# CRITICAL 1 fix), so a force-terminate here only costs the best-effort
-# SIGHTING_LIVE enrichment, never the ring.
-#
-# MUST STAY STRICTLY GREATER than the watcher's own worst-case graceful
-# shutdown, which is `DEFAULT_LIVE_SWEEP_SECS + 5` = 35s (the watcher's own
-# `_await_in_flight_sweeps` grace period -- see systemdrive_watcher.py). An
-# equal value still lets `done` get truncated exactly at the boundary: the
-# runner's timer and the watcher's internal grace timer start from slightly
-# different moments (stop-file detection happens on the watcher's sampler
-# cadence, not instantly), so a tie is not actually simultaneous in
-# practice and the runner can fire first. Kept a clean 5s above that
-# worst case rather than the bare tie it used to be; if either number
-# changes, keep this one strictly larger than
-# `DEFAULT_LIVE_SWEEP_SECS + 5`, not merely equal to it.
-_WATCHER_STOP_GRACE_SECS = 40
-
-_watcher_proc: "subprocess.Popen | None" = None
-_watcher_stop_file: "Path | None" = None
-
-
-def _start_junk_watcher(repo_root: Path) -> None:
-    """Spawn the watcher for this run if the gate is set. Default off."""
-    global _watcher_proc, _watcher_stop_file  # noqa: PLW0603 — invocation-scoped diagnostic state
-    if not os.environ.get(_JUNK_PROBE_ENV):
-        return
-    script = repo_root / "scripts" / "systemdrive_watcher.py"
-    if not script.exists():
-        print(f"  [junk-probe] watcher missing at {script}; run is UNWATCHED", file=sys.stderr)
-        return
-    stop_file = Path(tempfile.gettempdir()) / f"systemdrive-watcher-stop-{os.getpid()}"
-    try:
-        stop_file.unlink()
-    except OSError:
-        pass
-    try:
-        _watcher_proc = subprocess.Popen(
-            [
-                sys.executable, str(script), str(repo_root),
-                "--secs", str(_WATCHER_ORPHAN_BUDGET_SECS),
-                "--stop-file", str(stop_file),
-            ],
-            cwd=str(Path.home()),  # NEVER the watched root
-            env=os.environ,        # inherit: watcher_has_systemdrive == ours
-        )
-    except OSError as exc:
-        # Say so loudly. An unwatched run must not be mistaken for a clean
-        # negative -- that is the exact failure this whole design exists to
-        # avoid.
-        print(f"  [junk-probe] could not start watcher: {exc}; run is UNWATCHED", file=sys.stderr)
-        return
-    _watcher_stop_file = stop_file
-    atexit.register(_stop_junk_watcher)
-    # This confirms only that Popen() returned a PID -- i.e. a process was
-    # spawned -- NOT that the watch is actually established. If the watcher
-    # crashed on startup this line would still print. The real confirmation
-    # is the watcher's own "armed" record.
-    print(f"  [junk-probe] watcher process spawned for {repo_root} (pid {_watcher_proc.pid}); see the watcher's own 'armed' record for confirmation the watch is live")
-
-
-def _stop_junk_watcher() -> None:
-    """Ask the watcher to stop through its NORMAL path.
-
-    Registered via atexit because main() has several return points. Touching
-    the stop-file lets the watcher emit its `done` record -- i.e. the
-    NEGATIVE -- instead of being killed before it can report.
-    """
-    proc, stop_file = _watcher_proc, _watcher_stop_file
-    if proc is None:
-        return
-    exit_code = proc.poll()
-    if exit_code is not None:
-        # SUPPORTING 6: the sidecar died on its own sometime during the run
-        # -- possibly seconds into a multi-hour run -- and the only prior
-        # evidence of the watcher's existence was "watcher process spawned"
-        # at startup. Silence here would leave a crashed watcher
-        # indistinguishable from a healthy one that simply had nothing to
-        # report, which is exactly the kind of fabricated-clean-negative
-        # this whole instrument exists to eliminate.
-        print(
-            f"  [junk-probe] watcher process (pid {proc.pid}) had ALREADY "
-            f"exited (code {exit_code}) by the time the stop signal was "
-            f"sent; its 'done' record (the NEGATIVE) is likely missing. "
-            "Treat this run as UNWATCHED from whenever the crash happened -- "
-            "check the watcher's JSONL log for its last record.",
-            file=sys.stderr,
-        )
-        try:
-            if stop_file is not None:
-                stop_file.unlink()
-        except OSError:
-            pass
-        return
-    try:
-        if stop_file is not None:
-            stop_file.touch()
-        proc.wait(timeout=_WATCHER_STOP_GRACE_SECS)
-    except OSError as exc:
-        print(
-            f"  [junk-probe] could not signal the watcher via its stop-file "
-            f"({exc}); force-terminating it. Its 'done' record (the "
-            f"NEGATIVE) will therefore be missing from this run.",
-            file=sys.stderr,
-        )
-        try:
-            proc.terminate()
-        except OSError:
-            pass
-    except subprocess.TimeoutExpired:
-        print(
-            f"  [junk-probe] watcher did not exit within "
-            f"{_WATCHER_STOP_GRACE_SECS}s of the stop signal; "
-            "force-terminating it. Its 'done' record (the NEGATIVE) will "
-            "therefore be missing from this run.",
-            file=sys.stderr,
-        )
-        try:
-            proc.terminate()
-        except OSError:
-            pass
-    finally:
-        try:
-            if stop_file is not None:
-                stop_file.unlink()
-        except OSError:
-            pass
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -1487,9 +1335,6 @@ def main() -> int:
     _MIN_FREE_COMMIT = int(max(0.0, args.min_free_commit_gb) * 1024**3)
 
     repo_root = Path(__file__).resolve().parent.parent
-
-    # Arm before any spawn, so the watch covers the whole run.
-    _start_junk_watcher(repo_root)
 
     # --files: explicit file list from the CI generate job — skip discovery.
     if args.files:

@@ -2,6 +2,29 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> ## 🗄 RETIRED 2026-08-17 — the instrument described here no longer exists
+>
+> `scripts/systemdrive_watcher.py` and `tests/scripts/test_systemdrive_watcher.py`
+> were **deleted from `main`**, along with the `HERMES_TEST_JUNK_PROBE` gate and the
+> sidecar spawn in `scripts/run_tests_parallel.py`. Detection is now
+> **`scripts/systemdrive_sweep.py`** — an always-on existence check over every
+> checkout root.
+>
+> **Why:** this design assumed the writer's ancestry and the artifact were both
+> perishable, so detection had to be sub-millisecond. Neither is. Security-4688
+> retains ancestry with command lines for ~2 days (the ring buffer's own author
+> conceded this — see "SUPERSEDED IN PART" below), and the junk trees persist on
+> disk. The one real failure on record — the 2026-08-14 sighting, unattributed
+> because nobody looked inside the retention window — is a failure a
+> **manually-armed** instrument structurally cannot fix.
+>
+> **These two documents are kept as a design record. Do not implement from them,
+> and do not treat any directive below as live** — in particular the
+> do-not-add-`SYSTEMDRIVE` instruction, which was **already reversed on `main`**
+> by `3bc7442b9b` (the forwarding loop) and `9d35742809` (the comment). Retrieve
+> the watcher with `git show 2a4ece2c07:scripts/systemdrive_watcher.py` if a
+> future third writer ever justifies it.
+
 **Goal:** Replace the never-landed runner-embedded `%SystemDrive%` probe with a standalone watcher that can attribute a sighting to a writer even after that writer has exited, and fix the `--help` trap that starts a full suite run.
 
 **Architecture:** A standalone `scripts/systemdrive_watcher.py` watches N roots for a literal `%SystemDrive%` child using `ReadDirectoryChangesW` (polling fallback). A background sampler keeps a bounded ring buffer of process *creations* so a sighting can look backward at processes that already exited. `scripts/run_tests_parallel.py` keeps the `HERMES_TEST_JUNK_PROBE` knob, but it now spawns the watcher as a sidecar instead of doing its own inline stat-probing.
@@ -1764,7 +1787,7 @@ Record passed/failed counts **and the names of any failures**. `tests/scripts/te
 ## Notes for the implementer
 
 - **Never run `python scripts/run_tests_parallel.py --help` before Task 1 Step 3.** That is the bug being fixed; it starts a ~2384-file run.
-- **Do not add `SYSTEMDRIVE` to the `run_tests.sh` allowlist.** It looks like an obvious fix and would erase the only reproducer.
+- ~~**Do not add `SYSTEMDRIVE` to the `run_tests.sh` allowlist.** It looks like an obvious fix and would erase the only reproducer.~~ **REVERSED 2026-08-17 — it WAS the obvious fix, and it was right.** Forwarding `SYSTEMDRIVE` landed as `3bc7442b9b`; the contradicting comment was removed by `9d35742809`. The quoted `run_tests.sh` block earlier in this plan is a verbatim snapshot of the pre-fix file and is left unaltered as history — it is not current.
 - **Do not delete any `%SystemDrive%` tree you find.** The byte sizes and version counters inside are the evidence that distinguishes a fresh mis-expanded cache build from a stray copy.
 - A `preexisting` record means that root is spent for this run. Delete the tree (after recording it elsewhere) and re-arm.
 - The watcher's own process appears in its own snapshots. It runs with `cwd=$HOME`, so it will never show up in `*_cwd_matches` for a repo root — that is the design, not a bug.

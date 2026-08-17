@@ -105,9 +105,11 @@ echo "▶ launching test runner"
 # compatibility, not semantic -- comments asserting facts go stale without ever
 # conflicting, so re-read the prose around any auto-merged hunk.
 #
-# Preserving the trap is no longer the right trade: the watcher is
-# runner-agnostic (it watches the filesystem, not this runner's env), so it
-# needs no bait. Arm it with HERMES_TEST_JUNK_PROBE=1 (forwarded below).
+# Preserving the trap is no longer the right trade either: the bug is fixed
+# below and regression-tested, so there is nothing left to bait. Detection of
+# a FUTURE writer is scripts/systemdrive_sweep.py, which runs unattended and
+# needs nothing from this runner (the opt-in watcher it replaced was retired
+# 2026-08-17 -- it could only see runs someone had already armed it for).
 CLEAN_ENV=(
   "PATH=$PATH"
   "HOME=$HOME"
@@ -158,7 +160,7 @@ fi
 # scripts/run_tests_parallel.py` call. Forward them so the documented
 # behaviour is the real behaviour.
 for _var in HERMES_TEST_WORKERS HERMES_TEST_PATHS HERMES_TEST_FILE_TIMEOUT \
-            HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_JUNK_PROBE; do
+            HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
   eval "_val=\${$_var:-}"
   if [ -n "$_val" ]; then
     CLEAN_ENV+=("$_var=$_val")
