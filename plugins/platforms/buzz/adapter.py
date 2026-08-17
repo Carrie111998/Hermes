@@ -454,7 +454,15 @@ class BuzzAdapter(BasePlatformAdapter):
         # determine whether the gateway's reply_to (incoming message_id) was
         # a top-level message or a deliberate in-thread reply.  The response
         # is anchored to the thread root to avoid nested sub-threads.
-        self._inbound_thread_roots: Dict[str, str] = {}
+        # Bounded as an LRU to prevent unbounded growth from messages that
+        # never produce an outbound send (filtered, non-mention, etc.).
+        self._inbound_thread_roots: OrderedDict[str, str] = OrderedDict()
+        # event_id -> reply_parent_event_id (direct NIP-10 parent).  Used by
+        # send() when thread_replies is enabled to anchor the response to the
+        # direct parent of the incoming message, producing a flat thread
+        # (siblings, not nested children).  Bounded LRU for the same reason.
+        self._inbound_reply_parents: OrderedDict[str, str] = OrderedDict()
+        self._thread_roots_cap = 500
 
     @property
     def name(self) -> str:
@@ -645,15 +653,24 @@ class BuzzAdapter(BasePlatformAdapter):
         # to the thread ROOT so it stays in the thread without creating a
         # nested sub-thread.
         if self.thread_replies:
-            reply_target = reply_to or (metadata or {}).get("thread_id")
+            # When thread_replies is enabled, prefer the reply parent (direct
+            # NIP-10 parent) if we recorded one for this incoming message —
+            # this produces a flat thread (our response is a sibling of the
+            # user's message) rather than a nested child.  Fall back to the
+            # gateway's reply_to, then metadata["thread_id"].
+            rp = self._inbound_reply_parents.get(reply_to, "") if reply_to else ""
+            reply_target = rp or reply_to or (metadata or {}).get("thread_id")
         elif reply_to and reply_to in self._inbound_thread_roots:
             # User replied in a thread — anchor to the root, not the reply.
             reply_target = self._inbound_thread_roots[reply_to]
         else:
             reply_target = None
-        # Clean up the thread-root entry to prevent unbounded growth.
-        if reply_to and reply_to in self._inbound_thread_roots:
-            del self._inbound_thread_roots[reply_to]
+        # Clean up both thread-root and reply-parent entries to prevent
+        # unbounded growth (the LRU cap above is a backstop; this is the
+        # primary cleanup on the send path).
+        if reply_to:
+            self._inbound_thread_roots.pop(reply_to, None)
+            self._inbound_reply_parents.pop(reply_to, None)
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -1146,14 +1163,30 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
-        # Extract NIP-10 thread root so the adapter knows whether the user
-        # deliberately replied in a thread.  When thread_replies is disabled,
-        # only an inbound reply triggers outbound threading, and the response
-        # is anchored to the thread root (not the user's individual reply) to
-        # avoid creating nested sub-threads.
+        # Extract NIP-10 thread root and reply parent so the adapter knows
+        # whether the user deliberately replied in a thread.  When
+        # thread_replies is disabled, only an inbound reply triggers
+        # outbound threading, and the response is anchored to the thread
+        # root (not the user's individual reply) to avoid creating nested
+        # sub-threads.  When thread_replies is enabled, the reply parent
+        # (direct parent) is used by send() to anchor the response as a
+        # sibling of the incoming message rather than a nested child.
         thread_root = self._extract_thread_root(event)
+        reply_parent = self._extract_reply_parent(event)
         if thread_root:
             self._inbound_thread_roots[event_id] = thread_root
+            # LRU cap: evict oldest entry if over the limit.
+            if len(self._inbound_thread_roots) > self._thread_roots_cap:
+                self._inbound_thread_roots.popitem(last=False)
+        if reply_parent:
+            self._inbound_reply_parents[event_id] = reply_parent
+            if len(self._inbound_reply_parents) > self._thread_roots_cap:
+                self._inbound_reply_parents.popitem(last=False)
+
+        # Only pass reply_to_message_id into the gateway when thread_replies
+        # is enabled — otherwise the gateway threading semantics engage even
+        # with the flag off.
+        gw_reply_to = thread_root if self.thread_replies else None
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1163,7 +1196,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
-            reply_to_message_id=thread_root,
+            reply_to_message_id=gw_reply_to,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1466,6 +1499,13 @@ def _env_enablement() -> Optional[dict]:
     return seed
 
 
+# Cache for the standalone-send path's self-pubkey (resolved once from
+# `buzz users get`).  Stored as a single-element list so the async function
+# can mutate it without `nonlocal` gymnastics.  ``None`` = not yet probed,
+# ``""`` = probed but failed, any other string = the hex pubkey.
+_standalone_self_pubkey: list[str | None] = [None]
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -1502,17 +1542,25 @@ async def _standalone_send(
         args += ["--file", str(path)]
     # Resolve our own pubkey and pass it via --mention so the Buzz CLI
     # treats unresolved @Name text (prose like "@-mention") as
-    # presentation-only instead of rejecting the send.
-    try:
-        pcode, pout, _ = await _exec_buzz(
-            cli_path, ["users", "get"], relay_url=relay, private_key=private_key
-        )
-        if pcode == 0:
-            _profiles = _parse_json_list(pout)
-            if _profiles and _profiles[0].get("pubkey"):
-                args += ["--mention", str(_profiles[0]["pubkey"])]
-    except Exception:
-        pass  # best-effort; send proceeds without --mention
+    # presentation-only instead of rejecting the send.  Gate on the
+    # content actually containing an "@" to avoid a subprocess on every
+    # standalone send.  Cache the pubkey so we only call `users get` once.
+    if "@" in message and _standalone_self_pubkey[0] is not None:
+        if not _standalone_self_pubkey[0]:
+            try:
+                pcode, pout, _ = await _exec_buzz(
+                    cli_path, ["users", "get"], relay_url=relay, private_key=private_key
+                )
+                if pcode == 0:
+                    _profiles = _parse_json_list(pout)
+                    if _profiles and _profiles[0].get("pubkey"):
+                        _standalone_self_pubkey[0] = str(_profiles[0]["pubkey"])
+                else:
+                    logger.debug("Buzz standalone: users get failed (code=%s)", pcode)
+            except Exception as exc:
+                logger.debug("Buzz standalone: users get error — %s", exc)
+        if _standalone_self_pubkey[0]:
+            args += ["--mention", _standalone_self_pubkey[0]]
     try:
         code, out, err = await _exec_buzz(
             cli_path, args, relay_url=relay, private_key=private_key, input_text=message
