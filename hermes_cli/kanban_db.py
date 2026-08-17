@@ -10586,7 +10586,10 @@ def _read_worker_run_log_tail(
     )
     encoded = redacted.encode("utf-8")
     if len(encoded) > max_bytes:
-        redacted = encoded[-max_bytes:].decode("utf-8", errors="replace")
+        start = len(encoded) - max_bytes
+        while start < len(encoded) and encoded[start] & 0xC0 == 0x80:
+            start += 1
+        redacted = encoded[start:].decode("utf-8")
     return redacted.strip() or None
 
 

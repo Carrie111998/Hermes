@@ -92,6 +92,22 @@ def test_spawn_failure_explicitly_reports_no_worker_output(kanban_home: Path) ->
     assert payload["worker_log_tail"] is None
 
 
+def test_worker_tail_remains_byte_bounded_for_invalid_utf8(kanban_home: Path) -> None:
+    task_id = "t_invalid_utf8"
+    run_id = 77
+    log_path = kb.worker_logs_dir() / f"{task_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_bytes(
+        kb._worker_run_marker(run_id)
+        + b"\x80" * kb.WORKER_DIAGNOSTIC_TAIL_BYTES
+    )
+
+    tail = kb._read_worker_run_log_tail(task_id, run_id)
+
+    assert tail is not None
+    assert len(tail.encode("utf-8")) <= kb.WORKER_DIAGNOSTIC_TAIL_BYTES
+
+
 def test_default_spawn_marks_log_with_current_run(
     kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
