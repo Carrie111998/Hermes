@@ -1623,6 +1623,7 @@ class TestCuaDriverSessionReconnect:
         """_call_tool_via_cli must base64-read a screenshot written to disk
         (screenshot_out_file path) when no inline base64 is present."""
         import base64 as _b64
+        import json as _json
         from typing import Any, cast
         from tools.computer_use.cua_backend import _CuaDriverSession
 
@@ -1637,9 +1638,15 @@ class TestCuaDriverSessionReconnect:
         class FakeProc:
             returncode = 0
             stderr = ""
-            # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      ' "screenshot_file_path": "%s"}' % str(shot))
+            # Daemon returns a path, not inline base64. Build the body with
+            # json.dumps: on Windows str(shot) is a backslash path, and
+            # interpolating it into a JSON string literal produces invalid
+            # escapes (\U, \A, \t) that json.loads rightly rejects.
+            stdout = _json.dumps({
+                "element_count": 7,
+                "tree_markdown": "- [0] AXButton",
+                "screenshot_file_path": str(shot),
+            })
 
         import subprocess as _sp
         orig_run = _sp.run
