@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts.systemdrive_watcher import JUNK_NAME, build_parser, write_record, ProcessRing, cwd_matches, describe_pid
 
 
@@ -185,3 +187,127 @@ def test_sample_never_raises(monkeypatch):
     )
     assert ring.sample() == 0
     assert ring._sample_errors >= 1
+
+
+import threading
+import time
+
+from scripts.systemdrive_watcher import Watcher, watch_polling
+
+
+def _rows(log: Path) -> list[dict]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+# These two tests exercise on_hit()'s real (unmocked) `psutil.pids()` +
+# `describe_pid()` walk of the FULL live process table, by design (see
+# on_hit's docstring: ancestry is the perishable part). On this box that
+# walk is measured at ~70-200s (~900 live processes at ~80-90ms/describe_pid
+# under load), well past the repo's global 30s pytest-timeout default
+# (pyproject.toml addopts --timeout=30). That is real, reproducible
+# environmental latency -- not a hang and not a defect in on_hit -- so the
+# per-test cap is raised rather than mocking away the behavior under test.
+@pytest.mark.timeout(240)
+def test_on_hit_writes_the_sighting_before_returning(tmp_path: Path):
+    """Requirement 4: JSONL at the MOMENT of the sighting, not at exit."""
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    watcher = Watcher([root], log=log)
+    watcher.on_hit(root.resolve(), "test")
+    assert log.exists()
+    sightings = [r for r in _rows(log) if r["event"] == "SIGHTING"]
+    assert len(sightings) == 1
+    rec = sightings[0]
+    assert rec["backend"] == "test"
+    assert "watcher_has_systemdrive" in rec
+    assert "live_cwd_matches" in rec
+    assert "ring_cwd_matches" in rec
+    assert rec["live_process_count"] > 0
+
+
+@pytest.mark.timeout(240)
+def test_on_hit_reports_only_the_first_transition(tmp_path: Path):
+    """Later ticks would re-report the same tree and bury the original."""
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    watcher = Watcher([root], log=log)
+    watcher.on_hit(root.resolve(), "test")
+    watcher.on_hit(root.resolve(), "test")
+    assert len([r for r in _rows(log) if r["event"] == "SIGHTING"]) == 1
+    assert watcher.sightings == 1
+
+
+def test_preexisting_tree_is_recorded_and_blames_nobody(tmp_path: Path):
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    (root / JUNK_NAME).mkdir(parents=True)
+    watcher = Watcher([root], log=log)
+    watcher.record_preexisting()
+    rows = [r for r in _rows(log) if r["event"] == "preexisting"]
+    assert len(rows) == 1
+    assert "cannot attribute" in rows[0]["note"]
+    # A pre-existing tree must not later be reported as a fresh sighting.
+    watcher.on_hit(root.resolve(), "test")
+    assert not [r for r in _rows(log) if r["event"] == "SIGHTING"]
+
+
+def test_watch_polling_detects_a_created_directory(tmp_path: Path):
+    hits = []
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=watch_polling,
+        args=(tmp_path.resolve(), lambda r, b: hits.append((r, b)), stop, 0.02),
+        daemon=True,
+    )
+    thread.start()
+    time.sleep(0.05)
+    (tmp_path / JUNK_NAME).mkdir()
+    thread.join(timeout=5)
+    assert hits, "polling backend never fired"
+    assert hits[0][1] == "polling"
+
+
+def test_watch_polling_stops_on_the_stop_event(tmp_path: Path):
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=watch_polling,
+        args=(tmp_path.resolve(), lambda r, b: None, stop, 0.02),
+        daemon=True,
+    )
+    thread.start()
+    stop.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_run_emits_the_negative_when_nothing_appears(tmp_path: Path):
+    """A quiet armed run must be evidence, not silence."""
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    watcher = Watcher([root], log=log, secs=0.3, poll_ms=20, sample_ms=20,
+                      force_polling=True)
+    assert watcher.run() == 0
+    rows = _rows(log)
+    assert rows[0]["event"] == "armed"
+    assert "backend_by_root" in rows[0]
+    done = [r for r in rows if r["event"] == "done"][0]
+    assert done["sightings"] == 0
+    assert "NEGATIVE" in done["note"]
+    assert done["watched_secs"] >= 0
+
+
+def test_run_stops_early_when_the_stop_file_appears(tmp_path: Path):
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    stop_file = tmp_path / "stop"
+    watcher = Watcher([root], log=log, secs=30, poll_ms=20, sample_ms=20,
+                      stop_file=stop_file, force_polling=True)
+    threading.Timer(0.2, stop_file.touch).start()
+    started = time.monotonic()
+    watcher.run()
+    assert time.monotonic() - started < 10, "stop-file did not shut the watcher down"
+    assert [r for r in _rows(log) if r["event"] == "done"]

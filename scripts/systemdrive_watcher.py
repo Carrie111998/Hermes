@@ -30,6 +30,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Deque, List
@@ -258,3 +259,190 @@ class ProcessRing:
     def __len__(self) -> int:
         with self._lock:
             return len(self._entries)
+
+
+def watch_polling(root: Path, on_hit, stop: threading.Event, interval_s: float) -> None:
+    """Fallback backend: one ``exists()`` per tick.
+
+    Used on non-Windows, when the root cannot be opened for a directory
+    watch, or under --force-polling. Deliberately does NOT walk or stat the
+    tree -- the sizes and version counters inside it are the evidence.
+    """
+    target = root / JUNK_NAME
+    while not stop.is_set():
+        try:
+            if target.exists():
+                on_hit(root, "polling")
+                return
+        except OSError:
+            pass
+        stop.wait(interval_s)
+
+
+class Watcher:
+    """Watches N roots for a literal %SystemDrive% child."""
+
+    def __init__(
+        self,
+        roots,
+        log: "Path | None" = None,
+        ring_capacity: int = DEFAULT_RING,
+        sample_ms: int = DEFAULT_SAMPLE_MS,
+        poll_ms: int = DEFAULT_POLL_MS,
+        secs: float = DEFAULT_SECS,
+        stop_file: "Path | None" = None,
+        force_polling: bool = False,
+    ) -> None:
+        self.roots = [Path(r).resolve() for r in roots]
+        self.log = log or log_path()
+        self.secs = secs
+        self.stop_file = stop_file
+        self.force_polling = force_polling
+        self._sample_s = sample_ms / 1000.0
+        self._poll_s = poll_ms / 1000.0
+        # Kept as its own attribute rather than read back off the deque's
+        # maxlen: the `armed` record reports it, and reaching into another
+        # object's private state to report your own config is a trap.
+        self._ring_capacity = ring_capacity
+        self._ring = ProcessRing(ring_capacity)
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._hit_roots: set = set()
+        self.sightings = 0
+
+    def record_preexisting(self) -> None:
+        """A tree already present at arm time blames nobody.
+
+        It is also latched, so it can never be re-reported as a fresh
+        transition later in this watch.
+        """
+        for root in self.roots:
+            target = root / JUNK_NAME
+            try:
+                present = target.exists()
+            except OSError:
+                continue
+            if present:
+                with self._lock:
+                    self._hit_roots.add(str(root))
+                write_record(
+                    self.log, "preexisting", root=str(root), path=str(target),
+                    note="present before the watch started - cannot attribute; "
+                         "delete it and re-run to make this root usable",
+                )
+
+    def on_hit(self, root: Path, backend: str) -> None:
+        """Record the first absent->present transition for ``root``.
+
+        Ordering is the whole point: the ring buffer is dumped FIRST because
+        it is already in memory, then the live table is enumerated. Ancestry
+        is the perishable part; the directory is not.
+        """
+        key = str(root)
+        with self._lock:
+            if key in self._hit_roots:
+                return
+            self._hit_roots.add(key)
+            self.sightings += 1
+
+        ring = self._ring.dump()                      # in memory, instant
+        live = [describe_pid(pid) for pid in psutil.pids()]
+
+        snapshot: "Path | None" = self.log.with_name(
+            f"systemdrive-sighting-{datetime.now():%Y%m%d-%H%M%S-%f}.json"
+        )
+        try:
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            snapshot.write_text(
+                json.dumps({"ring": ring, "live": live}, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except OSError:
+            snapshot = None
+
+        write_record(
+            self.log, "SIGHTING",
+            root=key,
+            path=str(root / JUNK_NAME),
+            backend=backend,
+            # The falsifier for the whole mechanism story. A sighting recorded
+            # while SYSTEMDRIVE IS present kills the missing-SYSTEMDRIVE
+            # explanation and restarts the hunt.
+            watcher_has_systemdrive="SYSTEMDRIVE" in os.environ,
+            live_cwd_matches=[e for e in live if cwd_matches(e, root)],
+            ring_cwd_matches=[e for e in ring if cwd_matches(e, root)],
+            live_process_count=len(live),
+            ring_size=len(ring),
+            snapshot_file=str(snapshot) if snapshot else None,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _sampler_loop(self) -> None:
+        while not self._stop.is_set():
+            # Deduct the sample's own cost from the sleep. A fixed sleep AFTER
+            # sample() would make the true cadence `interval + cost`, and cost
+            # grows with process churn -- so the gap between samples would
+            # stretch precisely during a busy run, which is exactly when the
+            # writer is most likely to appear. Measured: one sample costs
+            # ~16.65ms with ~1000 live processes, more under churn.
+            started = time.monotonic()
+            try:
+                self._ring.sample()
+            except Exception:  # sampling must never kill the watch
+                pass
+            if self.stop_file is not None:
+                try:
+                    if self.stop_file.exists():
+                        self._stop.set()
+                        return
+                except OSError:
+                    pass
+            elapsed = time.monotonic() - started
+            self._stop.wait(max(0.0, self._sample_s - elapsed))
+
+    def _start_backends(self) -> dict:
+        """Start one detection thread per root; return backend by root."""
+        chosen = {}
+        for root in self.roots:
+            target = watch_polling
+            name = "polling"
+            args = (root, self.on_hit, self._stop, self._poll_s)
+            chosen[str(root)] = name
+            threading.Thread(target=target, args=args, daemon=True).start()
+        return chosen
+
+    def run(self) -> int:
+        """Watch until the deadline, the stop-file, or a stop() call."""
+        self.record_preexisting()
+        threading.Thread(target=self._sampler_loop, daemon=True).start()
+        backends = self._start_backends()
+        write_record(
+            self.log, "armed",
+            roots=[str(r) for r in self.roots],
+            backend_by_root=backends,
+            sample_ms=int(self._sample_s * 1000),
+            poll_ms=int(self._poll_s * 1000),
+            ring_capacity=self._ring_capacity,
+            watcher_has_systemdrive="SYSTEMDRIVE" in os.environ,
+            watcher_cwd=os.getcwd(),
+        )
+        started = time.monotonic()
+        deadline = started + self.secs
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            self._stop.wait(0.2)
+        self._stop.set()
+        watched = round(time.monotonic() - started, 1)
+        write_record(
+            self.log, "done",
+            sightings=self.sightings,
+            roots=[str(r) for r in self.roots],
+            watched_secs=watched,
+            note=(
+                f"NEGATIVE - watched {len(self.roots)} root(s) for {watched}s, "
+                "no %SystemDrive% appeared"
+                if not self.sightings else "see SIGHTING record(s)"
+            ),
+        )
+        return 0
