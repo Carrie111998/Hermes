@@ -704,7 +704,6 @@ async def test_status_command_does_not_mutate_session_state_on_display(monkeypat
         model_override={
             "model": "override-model",
             "provider": "override-provider",
-            "base_url": None,
         },
     )
     runner = _make_runner(session_entry)
