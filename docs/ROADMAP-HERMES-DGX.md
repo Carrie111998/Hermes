@@ -56,16 +56,16 @@
 | ARCH-002 | MERGED_DEPLOYED | PR #29 merge `3e9fd48d...`; 24 focused tests passed; CI `31937692260` PASS; AGY + Claude Opus implementation review PASS; immutable DGX release active. |
 | ARCH-003 | MERGED_DEPLOYED | PR #30; merge `e8cdfd1e...`; implementation review consensus PASS; CI run `31981532693` PASS after retrying an unrelated pre-existing stream-consumer slice; immutable DGX release active with rollback metadata. |
 | ARCH-004 | MERGED_DEPLOYED | PR #33; implementation commit `650a34808`; merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`; focused tests `32 passed`, compileall PASS; required CI run `31990198398` PASS; Claude + active DGX `.hermes` AGY implementation review PASS with no corrections; immutable DGX release active with rollback metadata. |
-| HERMES-TELEGRAM-DELIVERY-VERIFICATION-001 | MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN | PR #38 merged as `36c2d243...`; final CI run `32056603324` had no failures; authenticated Claude and AGY final review PASS. Correction release is deployed and healthy. Prove an explicitly authorized user-visible Telegram response/delivery path with metadata-only evidence; do not substitute service health, polling progress, `getMe`, `getWebhookInfo`, or empty `getUpdates`. |
+| HERMES-TELEGRAM-DELIVERY-VERIFICATION-001 | PARTIAL_USER_VISIBLE_DELIVERY_PASS_OUTBOUND_UNPROVEN | PR #38 merged as `36c2d243...`; final CI run `32056603324` had no failures; authenticated Claude and AGY final review PASS. PR #40 records one authorized test with direct user-visible confirmation; the matching outbound runtime audit is still missing. Do not substitute service health, polling progress, `getMe`, `getWebhookInfo`, or empty `getUpdates`. |
 
 ## Current next lane
 
-**HERMES-TELEGRAM-DELIVERY-VERIFICATION-001** is the next lane. Establish
-real user-visible Telegram response/delivery evidence through an approved test
-path, recording only metadata needed to correlate the attempt and outcome.
+**HERMES-TELEGRAM-DELIVERY-VERIFICATION-001** has a partial result. The
+authorized test produced direct user-visible confirmation and an accepted
+inbound metadata record, but the matching outbound runtime audit was absent.
 Polling progress, gateway health, token-protected API probes, and empty update
-batches remain supporting evidence only and cannot close this gate. No new
-runtime implementation or DGX mutation is authorized by this roadmap entry.
+batches remain supporting evidence only. Do not retry the conversation merely
+to manufacture the missing outbound evidence.
 
 ## Runtime and deployment boundary
 
@@ -76,7 +76,8 @@ gateway has historical evidence of API reachability and repeated empty
 `getUpdates` progress after transient startup recovery, but this is inbound
 polling evidence, not user-visible delivery evidence. No Telegram credentials,
 allowlists, webhook state, or TLS verification were changed during the
-correction deployment; no Telegram send or retry was issued.
+correction deployment; one authorized Telegram test was performed, and no
+retry or second action was issued.
 
 ## Ticket inventory note
 
