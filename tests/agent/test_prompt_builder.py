@@ -737,18 +737,18 @@ class TestPromptBuilderConstants:
             assert "do not use markdown" not in hint.lower()
             assert "markdown" in hint.lower()
 
-    def test_discord_and_slack_hints_carry_markdown_and_no_html_guidance(self):
-        """#88623 — Discord and Slack render Markdown natively but never HTML.
+    def test_slack_hint_carries_markdown_and_no_html_guidance(self):
+        """#88623 — Slack renders Markdown natively but never HTML.
         Without formatting guidance the model emits raw HTML tags (<br>, <ul>)
-        that display as literal text. Their hints must name the markdown
-        syntax, forbid HTML explicitly, and keep the MEDIA guidance."""
-        for key in ("discord", "slack"):
-            hint = PLATFORM_HINTS[key]
-            low = hint.lower()
-            assert "markdown" in low, key
-            assert "**bold**" in hint or "*bold*" in hint, key
-            assert "html" in low and "not" in low, key
-            assert "MEDIA:" in hint, key  # existing media guidance intact
+        that display as literal text. The hint must name the markdown
+        syntax, forbid HTML explicitly, and keep the MEDIA guidance. (The
+        Discord hint is covered by #77370's delivery-path parity change.)"""
+        hint = PLATFORM_HINTS["slack"]
+        low = hint.lower()
+        assert "markdown" in low
+        assert "*bold*" in hint
+        assert "html" in low and "not" in low
+        assert "MEDIA:" in hint  # existing media guidance intact
 
     def test_cli_hint_does_not_suggest_media_tags(self):
         # Regression: MEDIA:/path tags are intercepted only by messaging

@@ -850,11 +850,6 @@ PLATFORM_HINTS = {
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
-        "Discord renders Markdown natively: **bold**, *italic*, __underline__, "
-        "~~strikethrough~~, `inline code`, ```code blocks```, > blockquotes, "
-        "- bullet and 1. numbered lists, [links](url), and ||spoiler||. "
-        "HTML tags are NOT rendered — never emit <br>, <b>, <ul> or any HTML; "
-        "they display as literal text (#88623). "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "
