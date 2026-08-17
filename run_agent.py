@@ -147,6 +147,7 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
+from agent.redact import redact_object
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -4231,6 +4232,94 @@ class AIAgent:
         summary["total_tokens"] = cu.total_tokens
         return summary
 
+    @staticmethod
+    def _project_request_body(body: Dict[str, Any]) -> Dict[str, Any]:
+        """Reduce a request body to debugging metadata, dropping content.
+
+        These dumps exist to diagnose provider-side 4xx. What that needs is
+        shape -- model, sampling params, message roles and sizes, tool names,
+        the ordering of the turn -- not the conversation text itself. Since
+        the conversation text is exactly where credentials read into context
+        end up, the default is to keep the shape and drop the content.
+
+        Set ``HERMES_DUMP_REQUEST_FULL_BODY=1`` to retain full message content.
+        That path is still routed through ``redact_object`` -- there is no
+        configuration that writes an unredacted body to disk.
+        """
+        projected: Dict[str, Any] = {}
+
+        for key, value in body.items():
+            if key == "messages" and isinstance(value, list):
+                projected["messages"] = [
+                    AIAgent._project_message(m) for m in value
+                ]
+            elif key == "tools" and isinstance(value, list):
+                projected["tools"] = {
+                    "count": len(value),
+                    "names": [
+                        (t.get("function", {}) or {}).get("name")
+                        if isinstance(t, dict) else None
+                        for t in value
+                    ],
+                }
+            elif key in ("input", "instructions"):
+                # codex_responses mode carries content under these keys
+                projected[key] = {
+                    "type": type(value).__name__,
+                    "length": len(value) if hasattr(value, "__len__") else None,
+                }
+            else:
+                # Sampling/config scalars (model, temperature, max_tokens,
+                # stream, tool_choice, ...) are shape, not content -- keep.
+                projected[key] = value
+
+        return projected
+
+    @staticmethod
+    def _project_message(message: Any) -> Dict[str, Any]:
+        """One message reduced to role/shape/size, with content dropped."""
+        if not isinstance(message, dict):
+            return {"type": type(message).__name__}
+
+        content = message.get("content")
+        if isinstance(content, str):
+            content_shape: Any = {"type": "str", "length": len(content)}
+        elif isinstance(content, list):
+            content_shape = {
+                "type": "list",
+                "parts": [
+                    (p.get("type") if isinstance(p, dict) else type(p).__name__)
+                    for p in content
+                ],
+            }
+        elif content is None:
+            content_shape = None
+        else:
+            content_shape = {"type": type(content).__name__}
+
+        projected: Dict[str, Any] = {
+            "role": message.get("role"),
+            "content": content_shape,
+        }
+
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            projected["tool_calls"] = [
+                {
+                    "name": (tc.get("function", {}) or {}).get("name"),
+                    "arguments_length": len(
+                        (tc.get("function", {}) or {}).get("arguments") or ""
+                    ),
+                }
+                if isinstance(tc, dict) else {"type": type(tc).__name__}
+                for tc in tool_calls
+            ]
+        for passthrough in ("tool_call_id", "tool_name", "name", "finish_reason"):
+            if message.get(passthrough) is not None:
+                projected[passthrough] = message[passthrough]
+
+        return projected
+
     def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
@@ -4244,6 +4333,14 @@ class AIAgent:
         Captures the request body from api_kwargs (excluding transport-only keys
         like timeout). Intended for debugging provider-side 4xx failures where
         retries are not useful.
+
+        SECURITY (Phase 9 / B2): an agent that reads a credential into context
+        carries it in the conversation payload, so the body, the provider error
+        body, and the provider response text are all credential-bearing. The
+        body is projected to metadata by default, and the whole payload is run
+        through ``redact_object`` once -- before BOTH the file write and the
+        HERMES_DUMP_REQUEST_STDOUT print, since the latter lands in gateway.log.
+        The file is created 0600; these dumps were previously world-readable.
         """
         try:
             body = copy.deepcopy(api_kwargs)
@@ -4256,10 +4353,18 @@ class AIAgent:
             except Exception as e:
                 logger.debug("Could not extract API key for debug dump: %s", e)
 
+            if env_var_enabled("HERMES_DUMP_REQUEST_FULL_BODY"):
+                body_record: Any = body
+                body_mode = "full (HERMES_DUMP_REQUEST_FULL_BODY, redacted)"
+            else:
+                body_record = self._project_request_body(body)
+                body_mode = "projected (metadata only)"
+
             dump_payload: Dict[str, Any] = {
                 "timestamp": datetime.now().isoformat(),
                 "session_id": self.session_id,
                 "reason": reason,
+                "body_mode": body_mode,
                 "request": {
                     "method": "POST",
                     "url": f"{self.base_url.rstrip('/')}{'/responses' if self.api_mode == 'codex_responses' else '/chat/completions'}",
@@ -4267,7 +4372,7 @@ class AIAgent:
                         "Authorization": f"Bearer {self._mask_api_key_for_logs(api_key)}",
                         "Content-Type": "application/json",
                     },
-                    "body": body,
+                    "body": body_record,
                 },
             }
 
@@ -4295,17 +4400,32 @@ class AIAgent:
 
                 dump_payload["error"] = error_info
 
+            # SECURITY: single redaction seam. Must stay ABOVE the serialization
+            # below -- both the file write and the stdout print consume the
+            # result, and the stdout path is captured into gateway.log.
+            dump_payload = redact_object(dump_payload)
+
+            serialized = json.dumps(
+                dump_payload, ensure_ascii=False, indent=2, default=str
+            )
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             dump_file = self.logs_dir / f"request_dump_{self.session_id}_{timestamp}.json"
-            dump_file.write_text(
-                json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
+
+            # Create 0600. These dumps were previously written world-readable
+            # (644) inside a 700 directory -- correct by accident, wrong on
+            # their own terms.
+            fd = os.open(dump_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(serialized)
+            # O_CREAT's mode only applies when the file is created; enforce it
+            # unconditionally in case the path already existed.
+            os.chmod(dump_file, 0o600)
 
             self._vprint(f"{self.log_prefix}🧾 Request debug dump written to: {dump_file}")
 
             if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
-                print(json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str))
+                print(serialized)
 
             return dump_file
         except Exception as dump_error:
