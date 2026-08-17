@@ -250,6 +250,7 @@ class SkillMutationLockReleaseFailure(RuntimeError):
         release_error=None,
         close_error=None,
         live_mutation_committed=False,
+        secondary_failures=None,
     ):
         release_repr = (
             "{0}: {1}".format(type(release_error).__name__, release_error)
@@ -273,6 +274,7 @@ class SkillMutationLockReleaseFailure(RuntimeError):
         self.release_error = release_error
         self.close_error = close_error
         self.live_mutation_committed = bool(live_mutation_committed)
+        self.secondary_failures = list(secondary_failures or [])
 
 
 def _platform_name():
@@ -976,10 +978,719 @@ def _target_lock_path(canonical_skill_path):
     """Derive the per-target mutation lock path (separate namespace)."""
     canonical = Path(canonical_skill_path).resolve(strict=False)
     lock_parent = _resolve_lock_parent(canonical)
+    identity = _path_lock_identity(canonical)
     digest = _hashlib.sha256(
-        str(canonical).encode("utf-8")
+        identity.encode("utf-8")
     ).hexdigest()[:16]
     return lock_parent / (".hermes-skill-mutex-" + digest + ".lock")
+
+
+def _canonical_path(path):
+    """Resolve a path with the module's existing non-strict convention."""
+    try:
+        return Path(path).resolve(strict=False)
+    except Exception:
+        return Path(path)
+
+
+def _normalize_path_identity_text(path):
+    """Return the platform lock-identity spelling for a path string.
+
+    Windows path identity is case-insensitive; POSIX path identity is not.
+    Tests may simulate Windows by patching ``_IS_WINDOWS`` on a POSIX host,
+    so this helper performs the fold directly instead of relying on the
+    host implementation of ``os.path.normcase``.
+    """
+    text = str(path).replace(os.sep, "/")
+    if os.altsep:
+        text = text.replace(os.altsep, "/")
+    if _IS_WINDOWS:
+        text = text.lower()
+    return text
+
+
+def _path_lock_identity(path):
+    """Canonical mutation-lock identity shared by dedupe, sort, and hashing."""
+    return _normalize_path_identity_text(_canonical_path(path))
+
+
+def _path_live_identity(path):
+    """Lexical/live pathname identity that does not follow final symlinks."""
+    return _normalize_path_identity_text(Path(path))
+
+
+def _dedupe_lock_identity_paths(paths):
+    seen = set()
+    result = []
+    for path in paths:
+        canonical = _canonical_path(path)
+        key = _path_lock_identity(canonical)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(canonical)
+    return result
+
+
+def _dedupe_live_paths(paths):
+    seen = set()
+    result = []
+    for path in paths:
+        live = Path(path)
+        key = _path_live_identity(live)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(live)
+    return result
+
+
+def _dedupe_canonical_paths(paths):
+    return _dedupe_lock_identity_paths(paths)
+
+
+def _path_sort_key(path):
+    """Stable path-content lock ordering key.
+
+    The key is based on Path.resolve(strict=False), os.path.normcase,
+    slash-normalized text, and the resolved path text as a deterministic
+    tie-breaker. It never depends on object identity.
+    """
+    identity = _path_lock_identity(path)
+    return (identity, identity)
+
+
+def _read_skill_frontmatter_name(skill_dir):
+    """Return (name, error) for SKILL.md frontmatter in a skill directory."""
+    skill_md = Path(skill_dir) / "SKILL.md"
+    if not skill_md.exists():
+        return None, None
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except Exception as exc:
+        return None, exc
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, None
+    end = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            end = idx
+            break
+    if end is None:
+        return None, ValueError("unterminated SKILL.md frontmatter")
+    for line in lines[1:end]:
+        stripped = line.strip()
+        if stripped.startswith("name:"):
+            raw = stripped.split(":", 1)[1].strip()
+            if (raw.startswith('"') and raw.endswith('"')) or (
+                raw.startswith("'") and raw.endswith("'")
+            ):
+                raw = raw[1:-1]
+            return raw, None
+    return None, None
+
+
+def _is_path_redirect(path):
+    """True when ``path`` is a symlink or supported Windows junction."""
+    path = Path(path)
+    try:
+        return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+    except OSError:
+        return False
+
+
+def _path_identity(path, *, require_frontmatter_identity=False):
+    """Capture filesystem identity for an approved existing repair path."""
+    path = Path(path)
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise ValueError("approved repair path disappeared: {0}".format(path)) from exc
+    if stat.S_ISLNK(st.st_mode) or _is_path_redirect(path):
+        raise ValueError(
+            "approved repair path became a symlink/junction: {0}".format(path)
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError(
+            "approved repair path is not a directory: {0}".format(path)
+        )
+    frontmatter_name = None
+    if require_frontmatter_identity:
+        frontmatter_name, error = _read_skill_frontmatter_name(path)
+        if error is not None:
+            raise ValueError(
+                "could not re-read approved repair path identity at {0}: {1}".format(
+                    path, error
+                )
+            ) from error
+    return (
+        st.st_dev,
+        st.st_ino,
+        stat.S_IFMT(st.st_mode),
+        frontmatter_name if require_frontmatter_identity else None,
+    )
+
+
+def _capture_approved_path_identity(
+    path,
+    *,
+    canonical_skill_path,
+    lock_path,
+    require_frontmatter_identity=False,
+):
+    try:
+        return _path_identity(
+            path,
+            require_frontmatter_identity=require_frontmatter_identity,
+        )
+    except (ValueError, OSError) as exc:
+        _raise_repair_failure(
+            canonical_skill_path=canonical_skill_path,
+            lock_path=lock_path,
+            message="approved repair path identity could not be captured: {0}".format(path),
+            cause=exc,
+        )
+
+
+def _maintenance_duplicate_scan(name, *, identity_names=()):
+    """Maintenance-only same-identity scan for live skill repair.
+
+    This intentionally does NOT change ordinary ``global_duplicate_scan``
+    semantics. Repair identity may come from directory basename,
+    SKILL.md frontmatter ``name``, or explicit ``identity_names`` aliases.
+    The aliases are scan identity only: callers must canonicalize aliases
+    to one canonical ``name`` before entering the guard, and aliases never
+    create additional global lock keys.
+    """
+    identities = {name}
+    for identity in identity_names or ():
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("identity_names entries must be non-empty strings")
+        identities.add(identity)
+
+    try:
+        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    except Exception:
+        return []
+
+    matches = []
+    by_key = set()
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        candidates = []
+        # Flat layout candidate.
+        try:
+            for entry in skills_dir.iterdir():
+                if entry.is_dir():
+                    candidates.append(entry)
+        except Exception:
+            continue
+        # One-level category layout candidates.
+        for entry in list(candidates):
+            try:
+                for child in entry.iterdir():
+                    if child.is_dir():
+                        candidates.append(child)
+            except Exception:
+                continue
+
+        for candidate in candidates:
+            try:
+                if is_excluded_skill_path(candidate / "SKILL.md", root=skills_dir):
+                    continue
+            except Exception:
+                pass
+            basis = []
+            if candidate.name in identities:
+                basis.append("basename")
+            frontmatter_name, error = _read_skill_frontmatter_name(candidate)
+            if error is not None and candidate.name in identities:
+                raise ValueError(
+                    "malformed/unreadable identity state at approved candidate {0}: {1}".format(
+                        candidate, error
+                    )
+                ) from error
+            if frontmatter_name in identities:
+                basis.append("frontmatter")
+            if not basis:
+                continue
+            key = _path_live_identity(candidate)
+            if key in by_key:
+                continue
+            by_key.add(key)
+            matches.append({"path": candidate, "basis": tuple(basis)})
+    return matches
+
+
+def _raise_repair_failure(*, canonical_skill_path, lock_path, message, cause=None):
+    if cause is None:
+        cause = ValueError(message)
+    raise SkillMutationLockAcquireFailure(
+        canonical_skill_path=canonical_skill_path,
+        lock_path=lock_path,
+        platform=_platform_name(),
+        lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+        cause=cause,
+        safe_to_retry=False,
+    )
+
+
+def _validate_repair_scan_exact(
+    *,
+    canonical_skill_path,
+    lock_path,
+    approved_paths,
+    scan_records,
+    label,
+):
+    observed = {_path_live_identity(record["path"]) for record in scan_records}
+    approved = {_path_live_identity(path) for path in approved_paths}
+    if observed != approved:
+        unexpected = [str(record["path"]) for record in scan_records if _path_live_identity(record["path"]) not in approved]
+        missing = [str(path) for path in approved_paths if _path_live_identity(path) not in observed]
+        _raise_repair_failure(
+            canonical_skill_path=canonical_skill_path,
+            lock_path=lock_path,
+            message=(
+                "repair approved set mismatch during {0}; unexpected={1}; missing={2}".format(
+                    label, unexpected, missing
+                )
+            ),
+        )
+
+
+def _enter_classified_lock(ctx, *, canonical_skill_path, lock_path):
+    try:
+        ctx.__enter__()
+    except SkillMutationLockAcquireFailure:
+        raise
+    except PermissionError as exc:
+        raise SkillMutationLockAcquireFailure(
+            canonical_skill_path=canonical_skill_path,
+            lock_path=lock_path,
+            platform=_platform_name(),
+            lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+            cause=exc,
+            safe_to_retry=False,
+        ) from exc
+
+
+def _release_lock_contexts(records, *, exc_type=None, exc=None, tb=None):
+    first_release_failure = None
+    secondary_release_failures = []
+    for record in reversed(records):
+        try:
+            record["ctx"].__exit__(exc_type, exc, tb)
+        except SkillMutationLockReleaseFailure as release_exc:
+            if exc is not None:
+                release_exc.__context__ = exc
+            if first_release_failure is None:
+                first_release_failure = release_exc
+            else:
+                secondary_release_failures.append(release_exc)
+        except Exception as release_exc:
+            wrapped = SkillMutationLockReleaseFailure(
+                canonical_skill_path=record["canonical_skill_path"],
+                lock_path=record["lock_path"],
+                platform=_platform_name(),
+                release_error=release_exc,
+                close_error=None,
+                live_mutation_committed=False,
+            )
+            if exc is not None:
+                wrapped.__context__ = exc
+            if first_release_failure is None:
+                first_release_failure = wrapped
+            else:
+                secondary_release_failures.append(wrapped)
+    if first_release_failure is not None:
+        first_release_failure.secondary_failures.extend(secondary_release_failures)
+        raise first_release_failure
+
+
+@contextmanager
+def _live_skill_transaction_guard(
+    name,
+    *,
+    target,
+    replacement_policy="new_only",
+    mode="publish",
+    approved_existing_paths=None,
+    mutation_paths=None,
+    identity_names=(),
+):
+    """Shared global-name transaction guard for publish and repair.
+
+    The canonical normalized-name lock is always the first and only global
+    serialization key. ``identity_names`` is used only by repair scanning;
+    it MUST NOT create extra global lock keys. Callers are responsible for
+    canonicalizing aliases to a single canonical ``name`` before entry.
+    """
+    canonical = canonical_normalize_skill_name(name)
+    if canonical is None:
+        raise ValueError(
+            "refusing to publish: name " + repr(name) + " is not L1-valid"
+        )
+
+    canonical_skill_path = _canonical_path(target)
+    state = LockState()
+    global_lock_path = normalized_name_lock_target(
+        canonical, anchor=canonical_skill_path
+    )
+    _acquire = globals()["_acquire_lock_at_path"]
+
+    state.active_lock_scope = "global_normalized_name"
+    state.active_lock_path = global_lock_path
+    try:
+        global_ctx = _acquire(
+            lock_path=global_lock_path,
+            canonical_skill_path=canonical_skill_path,
+        )
+    except SkillMutationLockAcquireFailure:
+        raise
+    except PermissionError as exc:
+        raise SkillMutationLockAcquireFailure(
+            canonical_skill_path=canonical_skill_path,
+            lock_path=global_lock_path,
+            platform=_platform_name(),
+            lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+            cause=exc,
+            safe_to_retry=False,
+        ) from exc
+    body_exc = None
+    try:
+        _enter_classified_lock(
+            global_ctx,
+            canonical_skill_path=canonical_skill_path,
+            lock_path=global_lock_path,
+        )
+        state.global_entered = True
+        if mode == "publish":
+            replacement_policy = validate_replacement_policy(replacement_policy)
+            yield from _live_skill_publish_locked(
+                canonical=canonical,
+                canonical_skill_path=canonical_skill_path,
+                replacement_policy=replacement_policy,
+                global_lock_path=global_lock_path,
+                state=state,
+                acquire=_acquire,
+            )
+        elif mode == "repair":
+            yield from _live_skill_repair_locked(
+                canonical=canonical,
+                canonical_skill_path=canonical_skill_path,
+                approved_existing_paths=approved_existing_paths,
+                mutation_paths=mutation_paths,
+                identity_names=identity_names,
+                global_lock_path=global_lock_path,
+                state=state,
+                acquire=_acquire,
+            )
+        else:
+            raise ValueError("unknown live skill transaction mode: {0}".format(mode))
+    except BaseException as exc:
+        body_exc = exc
+        if state.global_entered:
+            try:
+                global_ctx.__exit__(type(exc), exc, exc.__traceback__)
+            except SkillMutationLockReleaseFailure as release_exc:
+                release_exc.__context__ = exc
+                raise
+            except Exception as release_exc:
+                wrapped = SkillMutationLockReleaseFailure(
+                    canonical_skill_path=canonical_skill_path,
+                    lock_path=global_lock_path,
+                    platform=_platform_name(),
+                    release_error=release_exc,
+                    close_error=None,
+                    live_mutation_committed=False,
+                )
+                wrapped.__context__ = exc
+                raise wrapped from release_exc
+        raise
+    finally:
+        try:
+            if state.global_entered and body_exc is None:
+                global_ctx.__exit__(None, None, None)
+        finally:
+            state.global_entered = False
+            state.active_lock_scope = ""
+            state.active_lock_path = None
+
+
+def _live_skill_publish_locked(
+    *,
+    canonical,
+    canonical_skill_path,
+    replacement_policy,
+    global_lock_path,
+    state,
+    acquire,
+):
+    conflicts = global_duplicate_scan(
+        canonical,
+        approved_replacement_target=canonical_skill_path,
+    )
+    _validate_publish_conflicts(
+        conflicts,
+        canonical=canonical,
+        canonical_skill_path=canonical_skill_path,
+        lock_path=global_lock_path,
+        replacement_policy=replacement_policy,
+        scan_label="across skills roots",
+    )
+
+    target_lock_path = _target_lock_path(canonical_skill_path)
+    state.active_lock_scope = "prospective_target"
+    state.active_lock_path = target_lock_path
+    try:
+        target_ctx = acquire(
+            lock_path=target_lock_path,
+            canonical_skill_path=canonical_skill_path,
+        )
+    except SkillMutationLockAcquireFailure:
+        raise
+    except PermissionError as exc:
+        raise SkillMutationLockAcquireFailure(
+            canonical_skill_path=canonical_skill_path,
+            lock_path=target_lock_path,
+            platform=_platform_name(),
+            lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+            cause=exc,
+            safe_to_retry=False,
+        ) from exc
+    try:
+        _enter_classified_lock(
+            target_ctx,
+            canonical_skill_path=canonical_skill_path,
+            lock_path=target_lock_path,
+        )
+        state.target_entered = True
+        conflicts2 = global_duplicate_scan(
+            canonical,
+            approved_replacement_target=canonical_skill_path,
+        )
+        _validate_publish_conflicts(
+            conflicts2,
+            canonical=canonical,
+            canonical_skill_path=canonical_skill_path,
+            lock_path=target_lock_path,
+            replacement_policy=replacement_policy,
+            scan_label="appeared during scan #2",
+        )
+        try:
+            yield state
+        except BaseException as exc:
+            _release_lock_contexts(
+                [{"ctx": target_ctx, "canonical_skill_path": canonical_skill_path, "lock_path": target_lock_path}],
+                exc_type=type(exc), exc=exc, tb=exc.__traceback__,
+            )
+            raise
+        else:
+            _release_lock_contexts(
+                [{"ctx": target_ctx, "canonical_skill_path": canonical_skill_path, "lock_path": target_lock_path}],
+            )
+    finally:
+        state.target_entered = False
+        state.active_lock_scope = "global_normalized_name"
+        state.active_lock_path = global_lock_path
+
+
+def _validate_publish_conflicts(
+    conflicts,
+    *,
+    canonical,
+    canonical_skill_path,
+    lock_path,
+    replacement_policy,
+    scan_label,
+):
+    if len(conflicts) > 1:
+        raise SkillMutationLockAcquireFailure(
+            canonical_skill_path=canonical_skill_path,
+            lock_path=lock_path,
+            platform=_platform_name(),
+            lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+            cause=ValueError(
+                "more than one live skill named "
+                + repr(canonical)
+                + " found "
+                + str(scan_label)
+                + ": "
+                + str(conflicts)
+            ),
+            safe_to_retry=False,
+        )
+    if len(conflicts) == 1:
+        only = conflicts[0]
+        try:
+            only_resolved = only.resolve(strict=False)
+        except Exception:
+            only_resolved = only
+        try:
+            target_resolved = canonical_skill_path.resolve(strict=False)
+        except Exception:
+            target_resolved = canonical_skill_path
+        same_target = only_resolved == target_resolved
+        if not same_target:
+            raise SkillMutationLockAcquireFailure(
+                canonical_skill_path=canonical_skill_path,
+                lock_path=lock_path,
+                platform=_platform_name(),
+                lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+                cause=ValueError(
+                    "duplicate live skill named "
+                    + repr(canonical)
+                    + " at "
+                    + str(only_resolved)
+                    + "; existing skill blocks publish under different target "
+                    + str(target_resolved)
+                ),
+                safe_to_retry=False,
+            )
+        if replacement_policy == "new_only":
+            raise SkillMutationLockAcquireFailure(
+                canonical_skill_path=canonical_skill_path,
+                lock_path=lock_path,
+                platform=_platform_name(),
+                lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+                cause=ValueError(
+                    "skill "
+                    + repr(canonical)
+                    + " already exists at "
+                    + str(target_resolved)
+                    + " and replacement_policy="
+                    + repr(replacement_policy)
+                    + " does not permit replacement"
+                ),
+                safe_to_retry=False,
+            )
+
+
+def _live_skill_repair_locked(
+    *,
+    canonical,
+    canonical_skill_path,
+    approved_existing_paths,
+    mutation_paths,
+    identity_names,
+    global_lock_path,
+    state,
+    acquire,
+):
+    if approved_existing_paths is None:
+        raise ValueError("approved_existing_paths is mandatory for repair")
+    if mutation_paths is None:
+        raise ValueError("mutation_paths is mandatory for repair")
+
+    approved_paths = _dedupe_live_paths(approved_existing_paths)
+    mutation_lock_paths = _dedupe_lock_identity_paths(mutation_paths)
+
+    scan1 = _maintenance_duplicate_scan(canonical, identity_names=identity_names)
+    _validate_repair_scan_exact(
+        canonical_skill_path=canonical_skill_path,
+        lock_path=global_lock_path,
+        approved_paths=approved_paths,
+        scan_records=scan1,
+        label="scan #1",
+    )
+    basis_by_key = {_path_live_identity(record["path"]): record["basis"] for record in scan1}
+    identities1 = {}
+    for path in approved_paths:
+        key = _path_live_identity(path)
+        identities1[key] = _capture_approved_path_identity(
+            path,
+            canonical_skill_path=canonical_skill_path,
+            lock_path=global_lock_path,
+            require_frontmatter_identity="frontmatter" in basis_by_key.get(key, ()),
+        )
+
+    ordered_mutation_paths = sorted(mutation_lock_paths, key=_path_sort_key)
+    held = []
+    try:
+        for mutation_path in ordered_mutation_paths:
+            lock_path = _target_lock_path(mutation_path)
+            try:
+                ctx = acquire(lock_path=lock_path, canonical_skill_path=mutation_path)
+            except SkillMutationLockAcquireFailure as exc:
+                _release_lock_contexts(
+                    held,
+                    exc_type=type(exc),
+                    exc=exc,
+                    tb=exc.__traceback__,
+                )
+                raise
+            except PermissionError as exc:
+                classified = SkillMutationLockAcquireFailure(
+                    canonical_skill_path=mutation_path,
+                    lock_path=lock_path,
+                    platform=_platform_name(),
+                    lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
+                    cause=exc,
+                    safe_to_retry=False,
+                )
+                _release_lock_contexts(
+                    held,
+                    exc_type=type(classified),
+                    exc=classified,
+                    tb=classified.__traceback__,
+                )
+                raise classified from exc
+            state.active_lock_scope = "prospective_target"
+            state.active_lock_path = lock_path
+            try:
+                _enter_classified_lock(
+                    ctx,
+                    canonical_skill_path=mutation_path,
+                    lock_path=lock_path,
+                )
+            except BaseException as exc:
+                _release_lock_contexts(held, exc_type=type(exc), exc=exc, tb=exc.__traceback__)
+                raise
+            held.append({
+                "ctx": ctx,
+                "canonical_skill_path": mutation_path,
+                "lock_path": lock_path,
+            })
+        state.target_entered = bool(held)
+
+        scan2 = _maintenance_duplicate_scan(canonical, identity_names=identity_names)
+        _validate_repair_scan_exact(
+            canonical_skill_path=canonical_skill_path,
+            lock_path=global_lock_path,
+            approved_paths=approved_paths,
+            scan_records=scan2,
+            label="scan #2",
+        )
+        basis2_by_key = {_path_live_identity(record["path"]): record["basis"] for record in scan2}
+        for path in approved_paths:
+            key = _path_live_identity(path)
+            identity2 = _capture_approved_path_identity(
+                path,
+                canonical_skill_path=canonical_skill_path,
+                lock_path=global_lock_path,
+                require_frontmatter_identity="frontmatter" in basis2_by_key.get(key, ()),
+            )
+            if identities1.get(key) != identity2:
+                _raise_repair_failure(
+                    canonical_skill_path=canonical_skill_path,
+                    lock_path=global_lock_path,
+                    message="approved repair path identity changed before yield: {0}".format(path),
+                )
+
+        try:
+            yield state
+        except BaseException as exc:
+            _release_lock_contexts(held, exc_type=type(exc), exc=exc, tb=exc.__traceback__)
+            raise
+        else:
+            _release_lock_contexts(held)
+    finally:
+        state.target_entered = False
+        state.active_lock_scope = "global_normalized_name"
+        state.active_lock_path = global_lock_path
 
 
 @contextmanager
@@ -991,269 +1702,55 @@ def live_skill_publish_guard(
 ):
     """Combined global-name + per-target protection for a live publish.
 
-    Sequence (frozen):
-
-      1. canonicalize ``name`` (L1 strict);
-      2. derive the global normalized-name lock path;
-      3. acquire the global normalized-name lock;
-      4. global duplicate scan #1 (with the global lock held);
-      5. acquire the per-target mutation lock;
-      6. global duplicate scan #2 (with both locks held);
-      7. yield ``LockState`` to the caller so publisher-specific
-         logic can run under the combined protection;
-      8. release the per-target lock;
-      9. release the global lock.
-
-    Body or release failures are NOT coerced into acquisition failures.
-    The discriminator fields (``global_entered``, ``target_entered``) on
-    ``LockState`` are populated so a structured payload can tag the
-    failing scope correctly without relying on string equality of
-    ``lock_path``.
-
-    No real publish action is integrated in Block 1. The context manager
-    only protects the region; the publisher integration arrives in
-    Block 2 onwards.
+    This public API remains source-compatible with the original Phase C
+    primitive. Normal publishing still uses ordinary ``global_duplicate_scan``
+    semantics, the same replacement_policy values, and the same global-name
+    then target-lock ordering.
     """
-    # 1. canonicalize
-    canonical = canonical_normalize_skill_name(name)
-    if canonical is None:
-        raise ValueError(
-            "refusing to publish: name " + repr(name) + " is not L1-valid"
-        )
+    with _live_skill_transaction_guard(
+        name,
+        target=target,
+        replacement_policy=replacement_policy,
+        mode="publish",
+    ) as state:
+        yield state
 
-    replacement_policy = validate_replacement_policy(replacement_policy)
 
-    canonical_skill_path = target
-    state = LockState()
+@contextmanager
+def live_skill_repair_guard(
+    name,
+    *,
+    target,
+    approved_existing_paths,
+    mutation_paths,
+    identity_names=(),
+):
+    """Guard a same-name live-skill repair transaction.
 
-    # 2. derive the global lock path eagerly. The anchor argument
-    # routes the resolution through the real publisher target so
-    # the lock_parent sits outside every known skills root AND on a
-    # writable filesystem (no /skills synthetic root).
-    global_lock_path = normalized_name_lock_target(
-        canonical, anchor=canonical_skill_path
-    )
+    ``approved_existing_paths`` is an explicit prerequisite set and is
+    revalidated exactly before and after mutation path locks are acquired.
+    ``mutation_paths`` is the independent set that receives per-path locks;
+    approved external survivors may be omitted from it. In that case the
+    global normalized-name lock serializes Hermes-managed same-name operations,
+    but it does NOT prevent an external process from mutating the unlocked
+    survivor during the repair body. External survivor state is therefore an
+    observed/revalidated prerequisite, not a filesystem lock guarantee.
 
-    # 3. acquire the global lock. A raw PermissionError here is an
-    # acquisition failure on the GLOBAL lock.
-    state.active_lock_scope = "global_normalized_name"
-    state.active_lock_path = global_lock_path
-    # Late-binding lookups so test suites can monkey-patch the
-    # underlying helpers without invalidating an import-time
-    # reference. The names are resolved at call time through the
-    # module's namespace.
-    _acquire = globals()["_acquire_lock_at_path"]
+    ``identity_names`` supplies repair scan aliases only. It never creates
+    additional global lock keys; callers must canonicalize aliases to the one
+    canonical ``name`` before entering this guard.
+    """
+    with _live_skill_transaction_guard(
+        name,
+        target=target,
+        mode="repair",
+        approved_existing_paths=approved_existing_paths,
+        mutation_paths=mutation_paths,
+        identity_names=identity_names,
+    ) as state:
+        yield state
 
-    @contextmanager
-    def _classified_global_lock_context():
-        # Acquire the global normalized-name lock, classify any
-        # PermissionError raised either by the factory or by the
-        # context-manager __enter__ as a global acquisition failure,
-        # and yield into the protected body. PermissionError raised
-        # after global_entered has been flipped to True (body or
-        # release) propagates verbatim and is NOT reclassified.
-        try:
-            _global_ctx = _acquire(
-                lock_path=global_lock_path,
-                canonical_skill_path=canonical_skill_path,
-            )
-            with _global_ctx:
-                state.global_entered = True
-                yield
-        except PermissionError as exc:
-            if state.global_entered:
-                # body or release PermissionError: propagate verbatim
-                # and do not reclasify as an acquisition failure.
-                raise
-            raise SkillMutationLockAcquireFailure(
-                canonical_skill_path=canonical_skill_path,
-                lock_path=global_lock_path,
-                platform=_platform_name(),
-                lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                cause=exc,
-                safe_to_retry=False,
-            ) from exc
 
-    with _classified_global_lock_context():
-
-            # 4. global duplicate scan #1 (with the global lock held)
-            conflicts = global_duplicate_scan(
-                canonical,
-                approved_replacement_target=canonical_skill_path,
-            )
-            if len(conflicts) > 1:
-                raise SkillMutationLockAcquireFailure(
-                    canonical_skill_path=canonical_skill_path,
-                    lock_path=global_lock_path,
-                    platform=_platform_name(),
-                    lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                    cause=ValueError(
-                        "more than one live skill named "
-                        + repr(canonical)
-                        + " found across skills roots: "
-                        + str(conflicts)
-                    ),
-                    safe_to_retry=False,
-                )
-            if len(conflicts) == 1:
-                only = conflicts[0]
-                try:
-                    only_resolved = only.resolve(strict=False)
-                except Exception:
-                    only_resolved = only
-                try:
-                    target_resolved = canonical_skill_path.resolve(strict=False)
-                except Exception:
-                    target_resolved = canonical_skill_path
-                same_target = only_resolved == target_resolved
-                if not same_target:
-                    raise SkillMutationLockAcquireFailure(
-                        canonical_skill_path=canonical_skill_path,
-                        lock_path=global_lock_path,
-                        platform=_platform_name(),
-                        lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                        cause=ValueError(
-                            "duplicate live skill named "
-                            + repr(canonical)
-                            + " at "
-                            + str(only_resolved)
-                            + "; existing skill blocks publish under different target "
-                            + str(target_resolved)
-                        ),
-                        safe_to_retry=False,
-                    )
-                if replacement_policy == "new_only":
-                    raise SkillMutationLockAcquireFailure(
-                        canonical_skill_path=canonical_skill_path,
-                        lock_path=global_lock_path,
-                        platform=_platform_name(),
-                        lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                        cause=ValueError(
-                            "skill "
-                            + repr(canonical)
-                            + " already exists at "
-                            + str(target_resolved)
-                            + " and replacement_policy="
-                            + repr(replacement_policy)
-                            + " does not permit replacement"
-                        ),
-                        safe_to_retry=False,
-                    )
-
-            # 5. acquire the per-target mutation lock. Symmetric to the
-            # global helper above: a raw PermissionError raised either by
-            # the factory (PermissionError raised before __enter__ runs)
-            # or by the context-manager __enter__ BEFORE target_entered
-            # flips to True is a target acquisition failure and is
-            # classified as such. PermissionError raised AFTER
-            # target_entered (body or __exit__) propagates verbatim and
-            # is NOT reclassified.
-            target_lock_path = _target_lock_path(canonical_skill_path)
-            state.active_lock_scope = "prospective_target"
-            state.active_lock_path = target_lock_path
-
-            @contextmanager
-            def _classified_target_lock_context():
-                _target_ctx = _acquire(
-                    lock_path=target_lock_path,
-                    canonical_skill_path=canonical_skill_path,
-                )
-                try:
-                    with _target_ctx:
-                        state.target_entered = True
-                        yield
-                except PermissionError as exc:
-                    if state.target_entered:
-                        # body or release PermissionError: propagate
-                        # verbatim and do not reclassify as an
-                        # acquisition failure.
-                        raise
-                    raise SkillMutationLockAcquireFailure(
-                        canonical_skill_path=canonical_skill_path,
-                        lock_path=target_lock_path,
-                        platform=_platform_name(),
-                        lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                        cause=exc,
-                        safe_to_retry=False,
-                    ) from exc
-
-            with _classified_target_lock_context():
-
-                # 6. global duplicate scan #2 (with both locks held).
-                conflicts2 = global_duplicate_scan(
-                    canonical,
-                    approved_replacement_target=canonical_skill_path,
-                )
-                if len(conflicts2) > 1:
-                    raise SkillMutationLockAcquireFailure(
-                        canonical_skill_path=canonical_skill_path,
-                        lock_path=target_lock_path,
-                        platform=_platform_name(),
-                        lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                        cause=ValueError(
-                            "more than one live skill named "
-                            + repr(canonical)
-                            + " appeared during scan #2: "
-                            + str(conflicts2)
-                        ),
-                        safe_to_retry=False,
-                    )
-                if len(conflicts2) == 1:
-                    only = conflicts2[0]
-                    try:
-                        only_resolved = only.resolve(strict=False)
-                    except Exception:
-                        only_resolved = only
-                    try:
-                        target_resolved = canonical_skill_path.resolve(strict=False)
-                    except Exception:
-                        target_resolved = canonical_skill_path
-                    same_target = only_resolved == target_resolved
-                    if not same_target:
-                        raise SkillMutationLockAcquireFailure(
-                            canonical_skill_path=canonical_skill_path,
-                            lock_path=target_lock_path,
-                            platform=_platform_name(),
-                            lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                            cause=ValueError(
-                                "duplicate live skill named "
-                                + repr(canonical)
-                                + " appeared during scan #2 at "
-                                + str(only_resolved)
-                            ),
-                            safe_to_retry=False,
-                        )
-                    if replacement_policy == "new_only":
-                        raise SkillMutationLockAcquireFailure(
-                            canonical_skill_path=canonical_skill_path,
-                            lock_path=target_lock_path,
-                            platform=_platform_name(),
-                            lock_failure_stage=LOCK_FAILURE_STAGE_PRIMITIVE_ACQUIRE,
-                            cause=ValueError(
-                                "skill "
-                                + repr(canonical)
-                                + " already exists at "
-                                + str(target_resolved)
-                                + " and replacement_policy="
-                                + repr(replacement_policy)
-                                + " does not permit replacement"
-                            ),
-                            safe_to_retry=False,
-                        )
-
-                # 7. yield under combined protection. Body failures are
-                # NOT coerced into acquisition failures.
-                yield state
-
-            # 8. release target lock (handled by _target_ctx exit).
-            state.target_entered = False
-            state.active_lock_scope = "global_normalized_name"
-            state.active_lock_path = global_lock_path
-
-    # 9. release global lock (handled by _global_ctx exit).
-    state.global_entered = False
-    state.active_lock_scope = ""
-    state.active_lock_path = None
 class PublishGuard:
     """OO-style wrapper around :func:`live_skill_publish_guard`.
 
