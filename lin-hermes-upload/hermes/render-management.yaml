@@ -3,13 +3,13 @@ services:
     name: lin-hermes-management
     runtime: python
     plan: starter
-    buildCommand: uv sync --extra dev
-    startCommand: sh lin_runtime/start_management.sh
+    buildCommand: uv sync --frozen --extra web
+    startCommand: sh lin-hermes-upload/hermes/start_management.sh
     healthCheckPath: /health
     envVars:
       - key: HERMES_HOME
         value: /var/data/hermes
-      - key: HERMES_DASHBOARD_BASIC_AUTH
+      - key: HERMES_DASHBOARD_UPSTREAM
         sync: false
       - key: HERMES_DASHBOARD_INTERNAL_TOKEN
         sync: false
