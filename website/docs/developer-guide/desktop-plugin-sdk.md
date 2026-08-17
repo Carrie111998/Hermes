@@ -42,7 +42,8 @@ plugin, and fail to resolve in a disk plugin). Capability comes in tiers:
   atoms): active session, per-session turn-busy, cwd, gateway socket status,
   model, profile, viewport. `gateway` is the WebSocket, not turn-busy.
 - **`host.*` actions** — curated safe verbs: toast, navigate, tail logs,
-  restart the gateway, subscribe to the gateway event stream.
+  restart the gateway, archive stored sessions, subscribe to the gateway event
+  stream.
 - **`host.request`** — the gateway JSON-RPC door: sessions, config, skills,
   cron — everything the app itself calls.
 - **`ctx.rest` / `ctx.socket`** — your plugin's own backend namespace
@@ -406,7 +407,9 @@ host.navigate('/route')                    // hash-route navigation
 host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
                                            //   intent: 'in-place' (default) | 'stack' | 'tab' | 'window'
-host.newChat(profile?)                     // fresh chat draft, optionally in another profile
+await host.archiveSession(storedSessionId, { profile? }) // native archive workflow + cleanup;
+                                                     // rejects when the mutation rolls back
+host.newChat(profile?)                     // fresh draft; optional background-profile target
 host.onEvent(type, fn)                     // gateway event stream ('*' = all); returns disposer
 host.logs(...)                             // tail an app log file
 host.status()                              // one-shot system status snapshot

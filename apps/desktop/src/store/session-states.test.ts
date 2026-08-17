@@ -283,4 +283,20 @@ describe('reopenLastClosedTile focuses the restored tab', () => {
     expect(findGroupOfPane(tree.$layoutTree.get()!, tilePane('closed'))?.active).toBe(tilePane('closed'))
     expect(tree.$activeTreeGroup.get()).toBe('grp-main')
   })
+
+  it('discards a background profile tile and its closed-tab entry', async () => {
+    const profile = await import('@/store/profile')
+    const states = await import('@/store/session-states')
+
+    profile.$activeGatewayProfile.set('work')
+    states.openSessionTile('background-session', 'center', 'workspace')
+    states.closeSessionTile('background-session')
+
+    profile.$activeGatewayProfile.set('default')
+    states.discardSessionTile('background-session', 'work')
+    profile.$activeGatewayProfile.set('work')
+    states.reopenLastClosedTile()
+
+    expect(states.$sessionTiles.get().some(tile => tile.storedSessionId === 'background-session')).toBe(false)
+  })
 })

@@ -652,7 +652,7 @@ export function unbindTileRuntime(runtimeId: string) {
 
 export interface SessionTileDelegate {
   /** Archive a stored session (the sidebar's archive, incl. tile cleanup). */
-  archiveSession(storedSessionId: string): Promise<void>
+  archiveSession(storedSessionId: string, options?: { profile?: null | string }): Promise<void>
   /** Branch a stored session into a new chat (the sidebar's branch). */
   branchSession(storedSessionId: string): Promise<void>
   /** Delete a stored session (the sidebar's delete, incl. tile cleanup). */
@@ -904,7 +904,7 @@ export function reuseBlankDraftTile(storedSessionId: string): boolean {
 // tiles themselves, so ⌘⇧T after a profile switch never resurrects the other
 // profile's session. The tile's placement is remembered so it returns in place.
 const closedTilesByProfile: Record<string, SessionTile[]> = {}
-const closedStack = (): SessionTile[] => (closedTilesByProfile[profileKey()] ??= [])
+const closedStack = (key = profileKey()): SessionTile[] => (closedTilesByProfile[key] ??= [])
 
 export function closeSessionTile(storedSessionId: string) {
   const tile = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)
@@ -932,14 +932,39 @@ export function closeSessionTile(storedSessionId: string) {
  *  backend (resume 404s). Unlike close, it leaves no ⌘⇧T undo (resurrecting it
  *  would just 404 again) and evicts any cached state. This is what clears the
  *  "Session not found" resume spam from stale/cross-profile persisted tiles. */
-export function discardSessionTile(storedSessionId: string) {
-  const runtimeId = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId
+export function discardSessionTile(storedSessionId: string, profile?: null | string) {
+  const key = profile === undefined ? profileKey() : normalizeProfileKey(profile)
+  const active = key === profileKey()
+  const tiles = active ? $sessionTiles.get() : [...(tilesByProfile[key] ?? [])]
+  const runtimeId = active ? $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId : undefined
+
+  // Destructive removals (archive/delete/404) must not remain eligible for
+  // ⌘⇧T resurrection, including a tile the user closed before the mutation.
+  const stack = closedStack(key)
+
+  for (let index = stack.length - 1; index >= 0; index -= 1) {
+    if (stack[index]?.storedSessionId === storedSessionId) {
+      stack.splice(index, 1)
+    }
+  }
 
   if (runtimeId) {
     dropSessionState(runtimeId)
   }
 
-  saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
+  const remaining = tiles.filter(t => t.storedSessionId !== storedSessionId)
+
+  if (active) {
+    saveTiles(remaining)
+  } else {
+    if (remaining.length > 0) {
+      tilesByProfile[key] = remaining.map(toStored)
+    } else {
+      delete tilesByProfile[key]
+    }
+
+    persistTiles()
+  }
 }
 
 /** ⌘⇧T — reopen the most recently closed tab where it was, then focus it.

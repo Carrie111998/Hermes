@@ -684,7 +684,7 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
 // that hit the local primary would no-op or 404. Omit for the current/default.
 export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...(profile !== undefined ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { archived }
