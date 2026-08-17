@@ -152,7 +152,7 @@ def test_self_hosted_fonts_serve_with_the_woff2_media_type():
         assert res.content[:4] == b"wOF2", f"{path} is not a valid woff2"
 
 
-def test_phase3_buyers_workspace_is_served_with_customer_safe_boundaries():
+def test_legacy_buyers_workspace_redirects_to_customer_research_results():
     _, client = make_client()
     for path in (
         "/js/pages/buyers.js",
@@ -168,7 +168,8 @@ def test_phase3_buyers_workspace_is_served_with_customer_safe_boundaries():
     evidence = client.get("/js/pages/research-evidence.js").text
 
     assert "{ path: '/app/buyers'" in main
-    assert "path: '/app/buyers'" in shell
+    assert "to: () => '/app/research'" in main
+    assert "path: '/app/research'" in shell
     assert all(call in buyers for call in (
         "call('leads.list')",
         "call('contacts.list')",
@@ -221,7 +222,7 @@ def test_phase5_cutover_collapses_nav_and_keeps_every_legacy_bookmark_alive():
 
     # Exactly four customer destinations, plus Analytics kept off the nav.
     customer_nav = re.findall(r"path:\s*['\"](/app/[^'\"]+)['\"]", nav)
-    assert customer_nav == ["/app/today", "/app/approvals", "/app/buyers", "/app/setup"], customer_nav
+    assert customer_nav == ["/app/today", "/app/approvals", "/app/research", "/app/setup"], customer_nav
     for path in customer_nav:
         assert re.search(rf"path:\s*['\"]{path}['\"]", main), path
     assert re.search(r"path:\s*['\"]/app/analytics['\"]", main)
@@ -241,9 +242,9 @@ def test_phase5_cutover_collapses_nav_and_keeps_every_legacy_bookmark_alive():
                  "/app/research/:campaignId/edit"):
         assert re.search(rf"path:\s*['\"]{re.escape(path)}['\"]", main), path
 
-    # Redirects carry context the destination can actually use.
-    assert "buyer: r.params.leadId" in main
-    assert "person: r.params.contactId" in main
+    # The legacy buyer ledger now resolves to the evidence-first workspace.
+    assert "{ path: '/app/buyers',          to: () => '/app/research' }" in main
+    assert "{ path: '/app/research',        mount:" in main
     assert "message: r.query.message" in main
 
     # A redirect into a Setup section must name a section Setup actually renders,
@@ -867,8 +868,8 @@ def test_admin_documents_ui_is_wired_and_customer_copy_hides_implementation_term
     # into setup.js, so that is where the upload copy now lives. Each file is
     # fetched and asserted 200 first: a typo'd path would otherwise "pass" by
     # scanning a 404 body.
-    customer_pages = ("setup.js", "today.js", "buyers.js", "approvals.js",
-                      "analytics.js", "_components.js")
+    customer_pages = ("setup.js", "today.js", "buyers.js", "research-results.js",
+                      "approvals.js", "analytics.js", "_components.js")
     customer_sources = ""
     for page in customer_pages:
         response = client.get(f"/js/pages/{page}")

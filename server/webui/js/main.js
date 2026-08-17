@@ -11,7 +11,7 @@ import * as login from './pages/login.js';
 import * as accessPending from './pages/access-pending.js';
 import * as today from './pages/today.js';
 import * as approvals from './pages/approvals.js';
-import * as buyers from './pages/buyers.js';
+import * as researchResults from './pages/research-results.js';
 import * as setup from './pages/setup.js';
 import * as analytics from './pages/analytics.js';
 import * as admin from './pages/admin.js';
@@ -105,13 +105,14 @@ const LEGACY_REDIRECTS = [
   { path: '/app/dashboard',       to: () => '/app/today' },
   { path: '/app/onboarding',      to: () => '/app/setup' },
 
-  // Leads + Contacts + Custom Outreach + Lead Map all became Buyers.
-  { path: '/app/leads',           to: r => withQuery('/app/buyers', { q: r.query.q, country: r.query.country }) },
-  { path: '/app/leads/:leadId',   to: r => withQuery('/app/buyers', { buyer: r.params.leadId }) },
-  { path: '/app/contacts',        to: r => withQuery('/app/buyers', { q: r.query.q, country: r.query.country }) },
-  { path: '/app/contacts/:contactId', to: r => withQuery('/app/buyers', { person: r.params.contactId }) },
-  { path: '/app/custom-outreach', to: () => withQuery('/app/buyers', { add: '1' }) },
-  { path: '/app/lead-map',        to: () => withQuery('/app/buyers', { map: '1' }) },
+  // The evidence-first research workspace supersedes the old buyer ledger.
+  { path: '/app/buyers',          to: () => '/app/research' },
+  { path: '/app/leads',           to: () => '/app/research' },
+  { path: '/app/leads/:leadId',   to: () => '/app/research' },
+  { path: '/app/contacts',        to: () => '/app/research' },
+  { path: '/app/contacts/:contactId', to: () => '/app/research' },
+  { path: '/app/custom-outreach', to: () => '/app/research' },
+  { path: '/app/lead-map',        to: () => '/app/research' },
 
   // Campaigns became a filter over the approval queue, not a destination.
   { path: '/app/outreach',        to: r => withQuery('/app/approvals', { message: r.query.message }) },
@@ -126,10 +127,9 @@ const LEGACY_REDIRECTS = [
   // Agent Runs is a log viewer: admin-only now. Research configuration moved too.
   { path: '/app/agent-runs',      to: () => '/app/today' },
   { path: '/app/agent-runs/:runId', to: () => '/app/today' },
-  { path: '/app/research',        to: () => '/app/buyers' },
-  { path: '/app/research/new',    to: () => '/app/buyers' },
-  { path: '/app/research/:campaignId', to: () => '/app/buyers' },
-  { path: '/app/research/:campaignId/edit', to: () => '/app/buyers' },
+  { path: '/app/research/new',    to: () => '/app/research' },
+  { path: '/app/research/:campaignId', to: () => '/app/research' },
+  { path: '/app/research/:campaignId/edit', to: () => '/app/research' },
 ];
 
 const routes = [
@@ -139,7 +139,7 @@ const routes = [
   // The four customer destinations.
   { path: '/app/today',           mount: appPage('Today', today.mount) },
   { path: '/app/approvals',       mount: appPage('Approvals', approvals.mount) },
-  { path: '/app/buyers',          mount: appPage('Buyers', buyers.mount) },
+  { path: '/app/research',        mount: appPage('Research', researchResults.mount) },
   { path: '/app/setup',           mount: appPage('Setup', setup.mount) },
   // Kept and reachable from Today's "See the numbers", deliberately off the nav.
   { path: '/app/analytics',       mount: appPage('Analytics', analytics.mount) },

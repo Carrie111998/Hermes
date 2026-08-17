@@ -20,6 +20,30 @@ def test_research_modules_routes_and_evidence_copy_are_served():
     assert "based on verified sources" in components and "partly estimated" in components
 
 
+def test_customer_research_results_workspace_is_served_and_routed():
+    _, client, _, _ = make_client()
+    results = client.get("/js/pages/research-results.js")
+    assert results.status_code == 200
+
+    main = client.get("/js/main.js").text
+    shell = client.get("/js/shell.js").text
+    api = client.get("/js/api.js").text
+    source = results.text
+
+    assert "import * as researchResults from './pages/research-results.js'" in main
+    assert "{ path: '/app/research'" in main
+    assert "{ path: '/app/buyers'," in main and "to: () => '/app/research'" in main
+    assert "path: '/app/research', label: 'Research'" in shell
+    assert "researchCampaigns.results" in api
+    assert "researchResults.claims" in api
+    assert all(label in source for label in (
+        "Active", "Rejected", "Fit", "Confidence", "Country", "Buyer role", "Sources",
+        "Why this verdict", "Supporting claims", "Conflicting claims", "Missing evidence",
+        "Snapshot", "SHA-256",
+    ))
+    assert "outreach" not in source.casefold()
+
+
 def test_production_webui_has_no_mock_runtime():
     _, client, _, _ = make_client()
     for path in ("/js/main.js", "/js/api.js", "/js/shell.js", "/js/real-state.js"):

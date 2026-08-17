@@ -153,6 +153,15 @@ export function syncRealResponse(name, payload, { params = {}, query = {} } = {}
   else if (name === 'leads.delete') remove('leads', params.leadId);
   else if (name === 'research.list') replace('research', payload);
   else if (name === 'research.get') upsert('research', payload);
+  else if (name === 'researchCampaigns.results') {
+    if (!db.researchResults) db.researchResults = { active: [], rejected: [], claims: {} };
+    db.researchResults[query.view || 'active'] = items(payload);
+    emit('researchResults', db.researchResults);
+  } else if (name === 'researchResults.claims') {
+    if (!db.researchResults) db.researchResults = { active: [], rejected: [], claims: {} };
+    db.researchResults.claims[params.resultId] = items(payload);
+    emit('researchResults', db.researchResults);
+  }
   else if (name === 'contacts.list') replace('contacts', payload);
   else if (['contacts.create', 'contacts.get', 'contacts.update'].includes(name)) upsert('contacts', payload);
   else if (name === 'contacts.delete') remove('contacts', params.contactId);

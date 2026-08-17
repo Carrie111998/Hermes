@@ -1,0 +1,436 @@
+/* Customer research results: verdict-led review with cited evidence. */
+
+import { call } from '../api.js';
+import {
+  badge, blobDownload, button, el, emptyState, fmt, pageHead, setBusy, tabs, toast,
+} from '../ui.js';
+
+const itemsOf = value => Array.isArray(value) ? value : value?.items || [];
+const TERMINAL_CAMPAIGN_STATES = new Set(['succeeded', 'completed', 'partial', 'failed']);
+
+function sentence(value, fallback = 'Not known') {
+  const text = String(value || '').replace(/[_-]+/g, ' ').trim();
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : fallback;
+}
+
+function claimValue(value) {
+  if (value == null || value === '') return 'Not known';
+  if (Array.isArray(value)) return value.length ? value.join(', ') : 'Not known';
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  return String(value);
+}
+
+function confidencePercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 'Not known';
+  return `${Math.round(number <= 1 ? number * 100 : number)}%`;
+}
+
+function verdictLabel(verdict) {
+  return {
+    strong_fit: 'Strong fit',
+    review: 'Review',
+    reject: 'Reject',
+  }[verdict] || sentence(verdict);
+}
+
+function verdictBadge(verdict) {
+  const tone = { strong_fit: 'completed', review: 'partial', reject: 'failed' }[verdict] || verdict;
+  return badge(tone, verdictLabel(verdict));
+}
+
+function campaignNotice(campaign) {
+  const missing = campaign?.credential_required_source_ids
+    || campaign?.missing_credential_source_ids
+    || [];
+  if (missing.length) return {
+    tone: 'warning',
+    title: 'A research source needs credentials',
+    copy: `${missing.map(source => sentence(source)).join(', ')} cannot provide evidence until an administrator connects it.`,
+  };
+  if (campaign?.status === 'partial') return {
+    tone: 'warning',
+    title: 'Research completed with partial coverage',
+    copy: 'Available evidence is shown. Missing coverage remains visible in each result.',
+  };
+  if (campaign?.status === 'failed') return {
+    tone: 'error',
+    title: 'Research did not complete',
+    copy: 'No assumptions were added. Review the saved evidence or choose another brief.',
+  };
+  if (['succeeded', 'completed'].includes(campaign?.status)) return {
+    tone: 'success',
+    title: 'Research completed',
+    copy: 'Verdicts are ordered by fit and evidence confidence.',
+  };
+  return {
+    tone: 'neutral',
+    title: 'Research has not completed',
+    copy: 'Results will appear here when the selected brief has finished.',
+  };
+}
+
+function noticeNode(campaign) {
+  const notice = campaignNotice(campaign);
+  return el('div', {
+    class: `ifz-results-notice ${notice.tone}`,
+    role: notice.tone === 'error' ? 'alert' : 'status',
+  },
+  el('strong', {}, notice.title),
+  el('span', { class: 'ifz-prose' }, notice.copy));
+}
+
+function loadingNode(label = 'Loading research results') {
+  return el('div', { class: 'ifz-results-loading', role: 'status', 'aria-label': label },
+    el('span', { class: 'ifz-results-loading-line' }),
+    el('span', { class: 'ifz-results-loading-line short' }),
+    el('span', { class: 'ifz-results-loading-block' }));
+}
+
+function safeSourceLink(evidence) {
+  const value = String(evidence?.provenance_url || '');
+  if (!value.startsWith('https://')) return null;
+  return el('a', {
+    href: value,
+    target: '_blank',
+    rel: 'noreferrer',
+    class: 'ifz-result-source-link',
+  }, 'Open source');
+}
+
+function evidenceNode(evidence) {
+  const link = safeSourceLink(evidence);
+  const checked = evidence.retrieved_at
+    ? `${fmt.date(evidence.retrieved_at)} at ${fmt.time(evidence.retrieved_at)}`
+    : 'Not recorded';
+  return el('div', { class: 'ifz-result-citation' },
+    el('div', { class: 'ifz-result-citation-head' },
+      el('strong', {}, sentence(evidence.source_id, 'Saved source')),
+      link),
+    el('dl', { class: 'ifz-result-citation-meta' },
+      el('div', {}, el('dt', {}, 'Checked'), el('dd', {}, checked)),
+      el('div', {}, el('dt', {}, 'Snapshot'), el('dd', {}, evidence.snapshot_id || 'Not recorded')),
+      el('div', {}, el('dt', {}, 'SHA-256'),
+        el('dd', {}, el('code', {}, evidence.raw_hash || 'Not recorded')))));
+}
+
+function claimNode(claim) {
+  return el('article', { class: 'ifz-result-claim' },
+    el('div', { class: 'ifz-result-claim-head' },
+      el('strong', {}, sentence(claim.field)),
+      el('span', {}, confidencePercent(claim.confidence))),
+    el('div', { class: 'ifz-result-claim-value ifz-prose' }, claimValue(claim.value)),
+    (claim.evidence || []).length
+      ? el('div', { class: 'ifz-result-citations' }, claim.evidence.map(evidenceNode))
+      : el('p', { class: 'ifz-result-uncited ifz-prose' }, 'No cited source is attached to this claim.'));
+}
+
+function textList(values, emptyCopy) {
+  return values?.length
+    ? el('ul', { class: 'ifz-result-text-list ifz-prose' },
+        values.map(value => el('li', {}, sentence(value))))
+    : el('p', { class: 'ifz-result-none ifz-prose' }, emptyCopy);
+}
+
+function evidencePanel(result, claimState) {
+  if (!result) return emptyState({
+    icon: 'search',
+    title: 'Select a company',
+    hint: 'Choose a row to inspect the evidence behind its verdict.',
+  });
+  if (!claimState || claimState.status === 'loading') {
+    return loadingNode(`Loading evidence for ${result.company_name}`);
+  }
+  if (claimState.status === 'error') return el('div', { class: 'ifz-results-error', role: 'alert' },
+    el('strong', {}, 'Evidence could not be loaded'),
+    el('p', { class: 'ifz-prose' }, 'The verdict is unchanged. Select the company again to retry.'));
+
+  const claims = claimState.items || [];
+  const supporting = claims.filter(claim => claim.status !== 'conflicted');
+  const conflicting = claims.filter(claim => claim.status === 'conflicted');
+  const conflictNames = new Set(result.conflicting_claims || []);
+  for (const claim of conflicting) conflictNames.delete(claim.field);
+
+  return el('section', { class: 'ifz-result-evidence', 'aria-label': `Evidence for ${result.company_name}` },
+    el('header', { class: 'ifz-result-evidence-head' },
+      el('div', {},
+        el('span', { class: 'ifz-overline' }, 'Selected company'),
+        el('h2', {}, result.company_name)),
+      verdictBadge(result.verdict)),
+    el('div', { class: 'ifz-result-evidence-metrics' },
+      el('div', {}, el('span', {}, 'Fit'), el('strong', {}, `${result.fit_score} / 100`)),
+      el('div', {}, el('span', {}, 'Confidence'), el('strong', {}, confidencePercent(result.evidence_confidence))),
+      el('div', {}, el('span', {}, 'Sources'), el('strong', {}, String(result.source_count ?? 0)))),
+    el('section', { class: 'ifz-result-evidence-section' },
+      el('h3', {}, 'Why this verdict'),
+      textList(result.reasons, 'No verdict reason was recorded.')),
+    el('section', { class: 'ifz-result-evidence-section' },
+      el('h3', {}, 'Supporting claims'),
+      supporting.length
+        ? el('div', { class: 'ifz-result-claim-list' }, supporting.map(claimNode))
+        : el('p', { class: 'ifz-result-none ifz-prose' }, 'No supporting claims were recorded.')),
+    el('section', { class: 'ifz-result-evidence-section' },
+      el('h3', {}, 'Conflicting claims'),
+      conflicting.length || conflictNames.size
+        ? el('div', { class: 'ifz-result-claim-list' },
+            conflicting.map(claimNode),
+            [...conflictNames].map(field => el('p', { class: 'ifz-result-conflict ifz-prose' }, sentence(field))))
+        : el('p', { class: 'ifz-result-none ifz-prose' }, 'No conflicting claims were recorded.')),
+    el('section', { class: 'ifz-result-evidence-section' },
+      el('h3', {}, 'Missing evidence'),
+      textList(result.missing_evidence, 'No required evidence is marked missing.')));
+}
+
+function resultTable(results, selectedId, onSelect) {
+  if (!results.length) return null;
+  const headers = ['Company', 'Verdict', 'Fit', 'Confidence', 'Country', 'Buyer role', 'Sources'];
+  return el('div', { class: 'ifz-result-tablewrap' },
+    el('table', { class: 'ifz-result-table' },
+      el('thead', {}, el('tr', {}, headers.map(label => el('th', {}, label)))),
+      el('tbody', {}, results.map(result => {
+        const selected = result.id === selectedId;
+        const row = el('tr', {
+          class: selected ? 'selected' : '',
+          tabindex: '0',
+          role: 'button',
+          'aria-current': selected ? 'true' : null,
+          'aria-label': `Inspect evidence for ${result.company_name}`,
+        },
+        el('td', {}, el('strong', {}, result.company_name)),
+        el('td', {}, verdictBadge(result.verdict)),
+        el('td', { class: 'cell-num' }, `${result.fit_score} / 100`),
+        el('td', { class: 'cell-num' }, confidencePercent(result.evidence_confidence)),
+        el('td', {}, result.country || 'Not known'),
+        el('td', {}, sentence(result.buyer_role)),
+        el('td', { class: 'cell-num' }, String(result.source_count ?? 0)));
+        row.addEventListener('click', () => onSelect(result));
+        row.addEventListener('keydown', event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            onSelect(result);
+          }
+        });
+        return row;
+      }))));
+}
+
+export async function mount(root, ctx) {
+  let disposed = false;
+  const pageEl = root.closest('.ifz-page') || root;
+  pageEl.classList.add('ifz-page--research-results');
+  const state = {
+    campaigns: [],
+    campaignId: ctx.query.campaign || '',
+    view: 'active',
+    resultStates: { active: { status: 'idle', items: [] }, rejected: { status: 'idle', items: [] } },
+    selected: { active: '', rejected: '' },
+    claims: new Map(),
+    campaignError: null,
+  };
+  const page = el('div', { class: 'ifz-research-results' }, loadingNode('Loading research briefs'));
+  root.append(page);
+
+  function campaign() {
+    return state.campaigns.find(item => item.id === state.campaignId) || null;
+  }
+
+  function selectedResult() {
+    const viewState = state.resultStates[state.view];
+    return viewState.items.find(item => item.id === state.selected[state.view]) || null;
+  }
+
+  async function loadClaims(result) {
+    if (!result || state.claims.get(result.id)?.status === 'loaded') return;
+    state.claims.set(result.id, { status: 'loading', items: [] });
+    render();
+    try {
+      const response = await call('researchResults.claims', { params: { resultId: result.id } });
+      if (disposed) return;
+      state.claims.set(result.id, { status: 'loaded', items: itemsOf(response) });
+    } catch (error) {
+      if (disposed) return;
+      state.claims.set(result.id, { status: 'error', error, items: [] });
+    }
+    render();
+  }
+
+  function chooseResult(result) {
+    state.selected[state.view] = result.id;
+    render();
+    void loadClaims(result);
+  }
+
+  async function loadResults(view) {
+    if (!state.campaignId || state.resultStates[view].status === 'loaded') return;
+    state.resultStates[view] = { status: 'loading', items: [] };
+    render();
+    try {
+      const response = await call('researchCampaigns.results', {
+        params: { campaignId: state.campaignId },
+        query: { view },
+      });
+      if (disposed) return;
+      const items = itemsOf(response);
+      state.resultStates[view] = { status: 'loaded', items };
+      if (!state.selected[view] && items.length) state.selected[view] = items[0].id;
+      render();
+      const first = items.find(item => item.id === state.selected[view]);
+      if (first) await loadClaims(first);
+    } catch (error) {
+      if (disposed) return;
+      state.resultStates[view] = { status: 'error', error, items: [] };
+      render();
+    }
+  }
+
+  async function switchView(view) {
+    if (state.view === view) return;
+    state.view = view;
+    render();
+    await loadResults(view);
+  }
+
+  async function switchCampaign(campaignId) {
+    state.campaignId = campaignId;
+    state.view = 'active';
+    state.resultStates = {
+      active: { status: 'idle', items: [] },
+      rejected: { status: 'idle', items: [] },
+    };
+    state.selected = { active: '', rejected: '' };
+    state.claims.clear();
+    render();
+    await loadResults('active');
+  }
+
+  async function exportView(action) {
+    setBusy(action, true, 'Preparing');
+    try {
+      const file = await call('researchCampaigns.export', {
+        params: { campaignId: state.campaignId },
+        query: { view: state.view },
+      });
+      blobDownload(file.filename, file.blob, `Downloaded ${file.filename}`);
+    } catch {
+      toast('The research export could not be prepared.', 'error');
+    } finally {
+      setBusy(action, false);
+    }
+  }
+
+  function briefNode(current) {
+    const config = current.config || {};
+    return el('section', { class: 'ifz-results-brief', 'aria-label': 'Active research brief' },
+      el('div', { class: 'ifz-results-brief-copy' },
+        el('span', { class: 'ifz-overline' }, 'Active research brief'),
+        el('strong', {}, current.name),
+        el('p', { class: 'ifz-prose' },
+          `${(config.sector_ids || []).map(value => sentence(value)).join(', ') || 'All configured sectors'}. `
+          + `${(config.buyer_types || []).map(value => sentence(value)).join(', ') || 'Configured buyer roles'}.`)),
+      el('dl', { class: 'ifz-results-coverage' },
+        el('div', {}, el('dt', {}, 'Run'), el('dd', {}, sentence(current.status))),
+        el('div', {}, el('dt', {}, 'Markets'), el('dd', {}, String((config.target_countries || []).length))),
+        el('div', {}, el('dt', {}, 'Configured sources'), el('dd', {}, String((config.enabled_source_ids || []).length))),
+        el('div', {}, el('dt', {}, state.view === 'active' ? 'Active results' : 'Rejected results'),
+          el('dd', {}, String(state.resultStates[state.view].items.length)))));
+  }
+
+  function render() {
+    if (disposed) return;
+    if (state.campaignError) {
+      page.replaceChildren(emptyState({
+        icon: 'warning',
+        title: 'Research briefs could not be loaded',
+        hint: 'Your saved research is unchanged. Reload the page to try again.',
+      }));
+      return;
+    }
+    if (!state.campaigns.length) {
+      page.replaceChildren(emptyState({
+        icon: 'search',
+        title: 'No research brief yet',
+        hint: 'An administrator can configure and run an evidence-backed research brief.',
+      }));
+      return;
+    }
+    const current = campaign();
+    if (!current) return;
+    const viewState = state.resultStates[state.view];
+    const selected = selectedResult();
+    const campaignSelect = el('select', {
+      class: 'ifz-select ifz-results-campaign-select',
+      'aria-label': 'Active research brief',
+      onchange: event => void switchCampaign(event.target.value),
+    }, state.campaigns.map(item => el('option', {
+      value: item.id,
+      selected: item.id === state.campaignId,
+    }, item.name)));
+    campaignSelect.value = state.campaignId;
+    const exportAction = button(`Export ${state.view}`, {
+      kind: 'primary',
+      icon: 'download',
+      disabled: viewState.status !== 'loaded' || !viewState.items.length,
+    });
+    exportAction.addEventListener('click', () => void exportView(exportAction));
+    const tabHost = tabs([
+      { key: 'active', label: 'Active' },
+      { key: 'rejected', label: 'Rejected' },
+    ], state.view, view => void switchView(view));
+
+    let listBody;
+    if (viewState.status === 'loading' || viewState.status === 'idle') {
+      listBody = loadingNode(`Loading ${state.view} research results`);
+    } else if (viewState.status === 'error') {
+      listBody = el('div', { class: 'ifz-results-error', role: 'alert' },
+        el('strong', {}, 'Results could not be loaded'),
+        el('p', { class: 'ifz-prose' }, 'The selected brief is unchanged. Choose it again to retry.'));
+    } else if (!viewState.items.length) {
+      listBody = emptyState({
+        icon: 'search',
+        title: state.view === 'active' ? 'No active results' : 'No rejected results',
+        hint: state.view === 'active'
+          ? 'No companies met the evidence threshold for Active.'
+          : 'This brief did not reject any researched companies.',
+      });
+    } else {
+      listBody = resultTable(viewState.items, state.selected[state.view], chooseResult);
+    }
+
+    page.replaceChildren(
+      pageHead({
+        title: 'Research results',
+        sub: 'Review fit and evidence separately. Unknowns stay visible and every source remains traceable.',
+        actions: [campaignSelect, exportAction],
+      }),
+      noticeNode(current),
+      briefNode(current),
+      tabHost,
+      el('div', { class: 'ifz-results-workspace' },
+        el('section', { class: 'ifz-results-list', 'aria-label': `${sentence(state.view)} company results` }, listBody),
+        el('aside', { class: 'ifz-results-detail', 'aria-live': 'polite' },
+          evidencePanel(selected, selected ? state.claims.get(selected.id) : null))),
+    );
+  }
+
+  try {
+    const response = await call('researchCampaigns.list');
+    if (!disposed) {
+      state.campaigns = itemsOf(response);
+      if (!state.campaigns.some(item => item.id === state.campaignId)) {
+        state.campaignId = state.campaigns.find(item => TERMINAL_CAMPAIGN_STATES.has(item.status))?.id
+          || state.campaigns[0]?.id
+          || '';
+      }
+      render();
+      await loadResults('active');
+    }
+  } catch (error) {
+    state.campaignError = error;
+    render();
+  }
+
+  return () => {
+    disposed = true;
+    pageEl.classList.remove('ifz-page--research-results');
+  };
+}

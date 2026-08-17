@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import csv
 import io
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal, require_admin
@@ -40,6 +40,17 @@ def _serialize(row) -> dict:
     }
 
 
+def _with_source_availability(campaign: dict, catalog: list[dict]) -> dict:
+    enabled = set(campaign.get("config", {}).get("enabled_source_ids", []))
+    credential_required = sorted(
+        source["source_id"]
+        for source in catalog
+        if source.get("source_id") in enabled
+        and source.get("unavailable_reason") == "credential_required"
+    )
+    return {**campaign, "credential_required_source_ids": credential_required}
+
+
 def _row(request: Request, company_id: str, campaign_id: str):
     row = request.app.state.db.one(
         "SELECT * FROM research_campaigns WHERE id=? AND company_id=?", (campaign_id, company_id)
@@ -49,13 +60,85 @@ def _row(request: Request, company_id: str, campaign_id: str):
     return row
 
 
+ResultView = Literal["active", "rejected"]
+
+
+def _result_rows(request: Request, company_id: str, campaign_id: str, view: ResultView):
+    _row(request, company_id, campaign_id)
+    if view == "rejected":
+        sql = (
+            "SELECT * FROM research_results "
+            "WHERE company_id=? AND campaign_id=? AND verdict='reject' "
+            "ORDER BY fit_score DESC,evidence_confidence DESC,created_at DESC"
+        )
+    else:
+        sql = (
+            "SELECT * FROM research_results "
+            "WHERE company_id=? AND campaign_id=? AND verdict IN ('strong_fit','review') "
+            "ORDER BY fit_score DESC,evidence_confidence DESC,created_at DESC"
+        )
+    return request.app.state.db.all(sql, (company_id, campaign_id))
+
+
+def _serialize_result(request: Request, row) -> dict:
+    data = json_load(row["data"], {})
+    organization = request.app.state.db.one(
+        "SELECT display_name,domain,country FROM organizations WHERE id=? AND company_id=?",
+        (row["organization_id"], row["company_id"]),
+    )
+    lead = None
+    if row["lead_id"]:
+        lead = request.app.state.db.one(
+            "SELECT company_name,website,country,data FROM leads WHERE id=? AND company_id=?",
+            (row["lead_id"], row["company_id"]),
+        )
+    lead_data = json_load(lead["data"], {}) if lead else {}
+    buyer_role = lead_data.get("buyer_type")
+    if not buyer_role:
+        claim = request.app.state.db.one(
+            "SELECT value FROM feature_claims "
+            "WHERE company_id=? AND organization_id=? AND campaign_id=? AND field='buyer_role' "
+            "ORDER BY verified_at DESC",
+            (row["company_id"], row["organization_id"], row["campaign_id"]),
+        )
+        value = json_load(claim["value"], None) if claim else None
+        buyer_role = value[0] if isinstance(value, list) and value else value
+    source_ids = data.get("source_ids", [])
+    return {
+        **data,
+        "id": row["id"],
+        "company_id": row["company_id"],
+        "campaign_id": row["campaign_id"],
+        "organization_id": row["organization_id"],
+        "lead_id": row["lead_id"],
+        "company_name": (lead["company_name"] if lead else None)
+        or (organization["display_name"] if organization else "Unknown company"),
+        "website": (lead["website"] if lead else None)
+        or (organization["domain"] if organization else None),
+        "country": (lead["country"] if lead else None)
+        or (organization["country"] if organization else None),
+        "buyer_role": buyer_role,
+        "verdict": row["verdict"],
+        "fit_score": row["fit_score"],
+        "evidence_confidence": row["evidence_confidence"],
+        "source_ids": source_ids,
+        "source_count": len(source_ids),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 @router.get("/research-campaigns")
 def list_campaigns(request: Request, principal: Principal = Depends(current_principal),
                    x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
-    return [_serialize(row) for row in request.app.state.db.all(
-        "SELECT * FROM research_campaigns WHERE company_id=? ORDER BY updated_at DESC", (company_id,)
-    )]
+    catalog = request.app.state.lead_research.catalog(company_id)
+    return [
+        _with_source_availability(_serialize(row), catalog)
+        for row in request.app.state.db.all(
+            "SELECT * FROM research_campaigns WHERE company_id=? ORDER BY updated_at DESC", (company_id,)
+        )
+    ]
 
 
 @router.post("/research-campaigns", status_code=201)
@@ -85,7 +168,11 @@ def create_campaign(body: dict[str, Any], request: Request,
 def get_campaign(campaign_id: str, request: Request,
                  principal: Principal = Depends(current_principal),
                  x_company_id: str | None = Header(default=None)):
-    return _serialize(_row(request, _scope(principal, x_company_id), campaign_id))
+    company_id = _scope(principal, x_company_id)
+    return _with_source_availability(
+        _serialize(_row(request, company_id, campaign_id)),
+        request.app.state.lead_research.catalog(company_id),
+    )
 
 
 @router.patch("/research-campaigns/{campaign_id}")
@@ -239,6 +326,18 @@ def campaign_leads(campaign_id: str, request: Request,
     return result
 
 
+@router.get("/research-campaigns/{campaign_id}/results")
+def campaign_results(campaign_id: str, request: Request,
+                     view: ResultView = Query(default="active"),
+                     principal: Principal = Depends(current_principal),
+                     x_company_id: str | None = Header(default=None)):
+    company_id = _scope(principal, x_company_id)
+    return [
+        _serialize_result(request, row)
+        for row in _result_rows(request, company_id, campaign_id, view)
+    ]
+
+
 @router.get("/research/leads/{lead_id}/claims")
 def lead_claims(lead_id: str, request: Request,
                 principal: Principal = Depends(current_principal),
@@ -271,23 +370,82 @@ def lead_claims(lead_id: str, request: Request,
     return result
 
 
+@router.get("/research/results/{result_id}/claims")
+def result_claims(result_id: str, request: Request,
+                  principal: Principal = Depends(current_principal),
+                  x_company_id: str | None = Header(default=None)):
+    company_id = _scope(principal, x_company_id)
+    result_row = request.app.state.db.one(
+        "SELECT company_id,campaign_id,organization_id FROM research_results "
+        "WHERE id=? AND company_id=?",
+        (result_id, company_id),
+    )
+    if not result_row:
+        raise HTTPException(404, "Research result not found")
+    claims = []
+    for row in request.app.state.db.all(
+        "SELECT * FROM feature_claims "
+        "WHERE company_id=? AND campaign_id=? AND organization_id=? ORDER BY field,verified_at DESC",
+        (company_id, result_row["campaign_id"], result_row["organization_id"]),
+    ):
+        data = json_load(row["data"], {})
+        evidence_ids = json_load(row["evidence_ids"], [])
+        evidence = []
+        for evidence_id in evidence_ids:
+            stored = request.app.state.db.one(
+                "SELECT source_id,provenance_url,retrieved_at,snapshot_id,raw_hash,method,confidence "
+                "FROM evidence_records WHERE id=? AND company_id=? AND organization_id=?",
+                (evidence_id, company_id, result_row["organization_id"]),
+            )
+            if stored:
+                item = dict(stored)
+                url = item.get("provenance_url")
+                item["provenance_url"] = url if str(url or "").startswith("https://") else None
+                evidence.append(item)
+        claims.append({
+            **data,
+            "id": row["id"],
+            "field": row["field"],
+            "value": json_load(row["value"], None),
+            "status": row["status"],
+            "confidence": row["confidence"],
+            "method": row["method"],
+            "evidence_ids": evidence_ids,
+            "evidence": evidence,
+            "verified_at": row["verified_at"],
+        })
+    return claims
+
+
 @router.post("/research-campaigns/{campaign_id}/export")
 def export_campaign(campaign_id: str, request: Request,
+                    view: ResultView = Query(default="active"),
                     principal: Principal = Depends(current_principal),
                     x_company_id: str | None = Header(default=None)):
-    rows = campaign_leads(campaign_id, request, principal, x_company_id)
+    company_id = _scope(principal, x_company_id)
+    rows = [
+        _serialize_result(request, row)
+        for row in _result_rows(request, company_id, campaign_id, view)
+    ]
     fields = [
-        "id", "company_name", "website", "country", "buyer_type", "fit_score",
-        "evidence_confidence", "priority_band", "applicable_feature_completeness", "source_ids",
+        "id", "company_name", "website", "country", "buyer_role", "verdict", "fit_score",
+        "evidence_confidence", "source_count", "reasons", "missing_evidence",
+        "conflicting_claims", "source_ids",
     ]
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
-        writer.writerow({**row, "source_ids": ";".join(row.get("source_ids", []))})
+        writer.writerow({
+            **row,
+            "reasons": ";".join(row.get("reasons", [])),
+            "missing_evidence": ";".join(row.get("missing_evidence", [])),
+            "conflicting_claims": ";".join(row.get("conflicting_claims", [])),
+            "source_ids": ";".join(row.get("source_ids", [])),
+        })
     return Response(
         content="\ufeff" + stream.getvalue(), media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="research-{campaign_id}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="research-{campaign_id}-{view}.csv"'},
     )
 
 

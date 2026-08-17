@@ -21,7 +21,7 @@ const NAV_GROUPS = [
   { label: '', items: [
     { path: '/app/today', label: 'Today', icon: 'dashboard' },
     { path: '/app/approvals', label: 'Approvals', icon: 'check', badgeTopic: 'approvals' },
-    { path: '/app/buyers', label: 'Buyers', icon: 'leads' },
+    { path: '/app/research', label: 'Research', icon: 'search' },
     { path: '/app/setup', label: 'Setup', icon: 'gear' },
   ]},
   { label: 'Admin', items: [

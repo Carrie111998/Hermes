@@ -106,6 +106,88 @@ def test_research_campaign_vertical_slice_and_tenant_scope():
     ).status_code == 404
 
 
+def test_result_views_exports_and_claims_are_filtered_and_tenant_scoped():
+    app, client, headers, _ = make_research_client()
+    campaign = client.post(
+        "/api/v1/research-campaigns", headers=headers, json=campaign_body(),
+    ).json()
+    started = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
+    )
+    assert started.status_code == 202
+
+    rows = app.state.db.all(
+        "SELECT id,organization_id FROM research_results "
+        "WHERE company_id=? AND campaign_id=? ORDER BY id",
+        (campaign["company_id"], campaign["id"]),
+    )
+    rejected_id = rows[0]["id"]
+    app.state.db.execute(
+        "UPDATE research_results SET verdict='reject',lead_id=NULL,data=? WHERE id=?",
+        (json.dumps({
+            "reasons": ["buyer_role"],
+            "missing_evidence": ["independent_source"],
+            "conflicting_claims": [],
+            "source_ids": ["fixture-directory"],
+        }), rejected_id),
+    )
+
+    active = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/results", headers=headers,
+    )
+    assert active.status_code == 200
+    assert active.json()
+    assert {row["verdict"] for row in active.json()} <= {"strong_fit", "review"}
+    assert rejected_id not in {row["id"] for row in active.json()}
+    assert {
+        "company_name", "verdict", "fit_score", "evidence_confidence",
+        "country", "buyer_role", "source_count",
+    } <= set(active.json()[0])
+
+    rejected = client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/results?view=rejected",
+        headers=headers,
+    )
+    assert rejected.status_code == 200
+    assert [row["id"] for row in rejected.json()] == [rejected_id]
+    assert {row["verdict"] for row in rejected.json()} == {"reject"}
+    assert client.get(
+        f"/api/v1/research-campaigns/{campaign['id']}/results?view=everything",
+        headers=headers,
+    ).status_code == 422
+
+    active_export = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/export", headers=headers,
+    )
+    rejected_export = client.post(
+        f"/api/v1/research-campaigns/{campaign['id']}/export?view=rejected",
+        headers=headers,
+    )
+    assert active_export.status_code == rejected_export.status_code == 200
+    assert rejected_id not in active_export.text
+    assert rejected_id in rejected_export.text
+    assert 'filename="research-' in active_export.headers["content-disposition"]
+    assert '-rejected.csv"' in rejected_export.headers["content-disposition"]
+
+    result_id = active.json()[0]["id"]
+    claims = client.get(
+        f"/api/v1/research/results/{result_id}/claims", headers=headers,
+    )
+    assert claims.status_code == 200 and claims.json()
+    cited = [evidence for claim in claims.json() for evidence in claim["evidence"]]
+    assert cited
+    assert all(item["provenance_url"].startswith("https://") for item in cited)
+    assert all(item["snapshot_id"] and item["raw_hash"] for item in cited)
+
+    other = client.post(
+        "/api/v1/admin/companies", headers=headers, json={"name": "Other tenant"},
+    ).json()
+    other_headers = {**headers, "X-Company-ID": other["id"]}
+    assert client.get(
+        f"/api/v1/research/results/{result_id}/claims", headers=other_headers,
+    ).status_code == 404
+
+
 def test_source_lifecycle_copy_matches_behavior_and_purge_needs_exact_name():
     _, client, headers, _ = make_research_client()
     catalog = client.get("/api/v1/data-sources/catalog", headers=headers).json()

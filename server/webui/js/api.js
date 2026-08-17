@@ -163,6 +163,7 @@ export const routes = {
   'researchCampaigns.sources':  ['GET',    '/research-campaigns/:campaignId/source-runs'],
   'researchCampaigns.issues':   ['GET',    '/research-campaigns/:campaignId/issues'],
   'researchCampaigns.leads':    ['GET',    '/research-campaigns/:campaignId/leads'],
+  'researchCampaigns.results':  ['GET',    '/research-campaigns/:campaignId/results'],
   'researchCampaigns.export':   ['POST',   '/research-campaigns/:campaignId/export'],
   'research.configuration':     ['GET',    '/research/configuration'],
   'research.sectors':           ['GET',    '/research/sectors'],
@@ -170,6 +171,7 @@ export const routes = {
   'research.enrichmentProfiles':['GET',    '/research/enrichment-profiles'],
   'research.modelProfiles':     ['GET',    '/research/model-profiles'],
   'research.leadClaims':        ['GET',    '/research/leads/:leadId/claims'],
+  'researchResults.claims':     ['GET',    '/research/results/:resultId/claims'],
 
   // 7.11 Leads
   'leads.list':                 ['GET',    '/leads'],
@@ -424,7 +426,8 @@ async function realCall(name, { params, query, body, authOverride, authRetried =
   // Binary routes: the body is the file itself, so it must not be parsed as
   // JSON. Document artifacts are the admin preview/download of the exact bytes
   // the backend holds — same handling as a CSV export.
-  if (name === 'exports.download' || name === 'admin.documents.artifact') {
+  if (name === 'exports.download' || name === 'admin.documents.artifact'
+      || name === 'researchCampaigns.export') {
     if (!res.ok) {
       let errorPayload = null;
       try { errorPayload = await res.json(); } catch { /* non-JSON error */ }
@@ -437,7 +440,9 @@ async function realCall(name, { params, query, body, authOverride, authRetried =
     const blob = await res.blob();
     const fallback = name === 'exports.download'
       ? `${params?.exportId || 'export'}.csv`
-      : `${params?.documentId || 'document'}-${params?.role || 'file'}`;
+      : name === 'researchCampaigns.export'
+        ? `research-${params?.campaignId || 'results'}.csv`
+        : `${params?.documentId || 'document'}-${params?.role || 'file'}`;
     return { blob, filename: responseFilename(res.headers.get('Content-Disposition'), fallback) };
   }
   let payload = null;
