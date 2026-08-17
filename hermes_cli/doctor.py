@@ -2883,17 +2883,33 @@ def run_doctor(args):
         try:
             from plugins.memory.mem0 import _load_config as _load_mem0_config
             mem0_cfg = _load_mem0_config()
-            mem0_key = mem0_cfg.get("api_key", "")
-            if mem0_key:
-                check_ok("Mem0 API key configured")
-                check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+            mem0_mode = mem0_cfg.get("mode", "platform")
+            if mem0_mode == "oss":
+                vector_store = mem0_cfg.get("oss", {}).get("vector_store", {})
+                vector_provider = vector_store.get("provider", "vector store")
+                if vector_store:
+                    check_ok(f"Mem0 OSS configured", f"vector store={vector_provider}")
+                else:
+                    _fail_and_issue(
+                        "Mem0 OSS vector store not configured",
+                        "run: hermes memory setup",
+                        "Mem0 OSS is set as memory provider but no vector store is configured",
+                        issues,
+                    )
+                # OSS mode uses a local/self-hosted vector store and does not
+                # require the Mem0 Platform API key.
             else:
-                _fail_and_issue(
-                    "Mem0 API key not set",
-                    "(set MEM0_API_KEY in .env or run hermes memory setup)",
-                    "Mem0 is set as memory provider but API key is missing",
-                    issues,
-                )
+                mem0_key = mem0_cfg.get("api_key", "")
+                if mem0_key:
+                    check_ok("Mem0 API key configured")
+                    check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+                else:
+                    _fail_and_issue(
+                        "Mem0 API key not set",
+                        "(set MEM0_API_KEY in .env or run hermes memory setup)",
+                        "Mem0 is set as memory provider but API key is missing",
+                        issues,
+                    )
         except ImportError:
             _fail_and_issue(
                 "Mem0 plugin not loadable",

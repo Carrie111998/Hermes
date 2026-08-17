@@ -279,6 +279,24 @@ class TestDoctorMemoryProviderSection:
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
 
+    def test_mem0_oss_does_not_require_platform_api_key(self, monkeypatch, tmp_path):
+        home = self._make_hermes_home(tmp_path, provider="mem0")
+        (home / "mem0.json").write_text(
+            '{"mode": "oss", "oss": {"vector_store": {"provider": "qdrant"}}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(
+            "plugins.memory.mem0._load_config",
+            lambda: {"mode": "oss", "oss": {"vector_store": {"provider": "qdrant"}}},
+        )
+
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+
+        assert "Mem0 OSS configured" in out
+        assert "Mem0 API key not set" not in out
+        assert "Mem0 OSS is set as memory provider but no vector store is configured" not in out
+
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
