@@ -388,7 +388,9 @@ async def _run_application_probe(sequence, bindings):
         )
         run_task = asyncio.create_task(app.run_async())
         pipe_input.send_text(f"ab{sequence}cd")
-        for _ in range(100):
+        # Keep the fallback bound loose enough for contended CI workers; the
+        # condition normally becomes true immediately.
+        for _ in range(300):
             if buffer.text.endswith("cd"):
                 break
             await asyncio.sleep(0.01)
