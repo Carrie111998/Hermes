@@ -844,3 +844,26 @@ def test_help_exits_without_starting_a_suite_run():
     assert proc.returncode == 0, proc.stderr
     assert "usage:" in proc.stdout.lower()
     assert "Discovered" not in proc.stdout
+
+
+from scripts import run_tests_parallel as rtp
+
+
+def test_watcher_not_started_when_the_knob_is_unset(monkeypatch, tmp_path):
+    """Opt-in, default off."""
+    monkeypatch.delenv("HERMES_TEST_JUNK_PROBE", raising=False)
+    monkeypatch.setattr(rtp, "_watcher_proc", None)
+    rtp._start_junk_watcher(tmp_path)
+    assert rtp._watcher_proc is None
+
+
+def test_run_tests_sh_forwards_the_junk_probe_gate():
+    """Without forwarding, the knob is SILENTLY INERT through the wrapper.
+
+    run_tests.sh execs the runner under `env -i` with an explicit allowlist,
+    so an unforwarded variable simply never arrives -- and the run then looks
+    exactly like a clean negative.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    body = (repo_root / "scripts" / "run_tests.sh").read_text(encoding="utf-8")
+    assert "HERMES_TEST_JUNK_PROBE" in body

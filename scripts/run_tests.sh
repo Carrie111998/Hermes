@@ -91,6 +91,15 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# NOTE (Windows): this allowlist has no SYSTEMDRIVE, and run_tests_parallel.py
+# spawns every worker with `env=os.environ` and `cwd=repo_root`. That is
+# exactly the condition that makes a process expand `%SystemDrive%\ProgramData`
+# (a REG_EXPAND_SZ template) as a RELATIVE path and build the known-folder
+# cache in the checkout root. One such writer was found and fixed on
+# 2026-08-16 (run_secret_cli); a later sighting suggests a second is open.
+# Do NOT "fix" this by adding SYSTEMDRIVE here until the watcher has caught
+# one: that would erase the only reproducer we have. Arm it instead with
+# HERMES_TEST_JUNK_PROBE=1 (forwarded below).
 CLEAN_ENV=(
   "PATH=$PATH"
   "HOME=$HOME"
@@ -120,7 +129,7 @@ fi
 # scripts/run_tests_parallel.py` call. Forward them so the documented
 # behaviour is the real behaviour.
 for _var in HERMES_TEST_WORKERS HERMES_TEST_PATHS HERMES_TEST_FILE_TIMEOUT \
-            HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
+            HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_JUNK_PROBE; do
   eval "_val=\${$_var:-}"
   if [ -n "$_val" ]; then
     CLEAN_ENV+=("$_var=$_val")
