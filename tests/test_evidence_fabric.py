@@ -85,6 +85,28 @@ def test_all_terminal_run_graph_mutations_are_rejected(tmp_path):
         db.close()
 
 
+def test_evidence_deduplicates_by_run_uri_or_raw_reference_and_service_hash(tmp_path):
+    db, service = _service(tmp_path)
+    try:
+        run = service.create_research_run("objective")
+        first = service.add_evidence(run.id, source_type="WEB_PAGE", retrieval_method="DIRECT_HTTP", content="same", source_uri="https://example.test")
+        duplicate = service.add_evidence(run.id, source_type="WEB_PAGE", retrieval_method="DIRECT_HTTP", content="same", source_uri="HTTPS://EXAMPLE.TEST:443/")
+        assert first.created is True
+        assert duplicate.created is False
+        assert duplicate.evidence.id == first.evidence.id
+        distinct = service.add_evidence(run.id, source_type="WEB_PAGE", retrieval_method="DIRECT_HTTP", content="different", source_uri="https://example.test")
+        assert distinct.created is True
+        raw1 = service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content=b"bytes", raw_reference="artifact:x")
+        raw2 = service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content=b"bytes", raw_reference="artifact:x")
+        assert raw2.created is False and raw2.evidence.id == raw1.evidence.id
+        verified = service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content="verified", raw_reference="artifact:y", expected_content_hash=content_sha256("verified"))
+        assert verified.created is True
+        with pytest.raises(EvidenceValidationError):
+            service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content="wrong", raw_reference="artifact:w", expected_content_hash=content_sha256("verified"))
+    finally:
+        db.close()
+
+
 def test_validation_rejects_bad_hash_uri_and_terminal_mutation(tmp_path):
     db, service = _service(tmp_path)
     try:
