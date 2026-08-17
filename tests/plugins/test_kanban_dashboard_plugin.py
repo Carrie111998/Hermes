@@ -94,6 +94,7 @@ def test_create_task_appears_on_board(client):
             "assignee": "researcher",
             "priority": 3,
             "tenant": "acme",
+            "metadata": {"agentplane": {"task_id": "20260817-ABC"}},
         },
     )
     assert r.status_code == 200, r.text
@@ -103,6 +104,7 @@ def test_create_task_appears_on_board(client):
     assert task["status"] == "ready"  # no parents -> immediately ready
     assert task["priority"] == 3
     assert task["tenant"] == "acme"
+    assert task["metadata"] == {"agentplane": {"task_id": "20260817-ABC"}}
     task_id = task["id"]
 
     # Board now lists it under 'ready'.
@@ -503,16 +505,35 @@ def test_add_comment(client):
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_dry_run(client):
+def test_dispatch_dry_run(client, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+
     client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "work", "assignee": "researcher"},
     )
+    lane_spawn = lambda *_args, **_kwargs: None
+    lane_predicate = lambda _assignee: True
+    monkeypatch.setattr(
+        plugins_mod,
+        "build_worker_lane_dispatch",
+        lambda: (lane_spawn, lane_predicate),
+    )
+    original_dispatch = kb.dispatch_once
+    captured = {}
+
+    def capture_dispatch(conn, **kwargs):
+        captured.update(kwargs)
+        return original_dispatch(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "dispatch_once", capture_dispatch)
     r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
     assert r.status_code == 200
     body = r.json()
     # DispatchResult is serialized as a dataclass dict.
     assert isinstance(body, dict)
+    assert captured["spawn_fn"] is lane_spawn
+    assert captured["spawnable_assignee_fn"] is lane_predicate
 
 
 # ---------------------------------------------------------------------------
@@ -1228,5 +1249,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-
