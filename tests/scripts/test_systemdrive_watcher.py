@@ -143,3 +143,45 @@ def test_cwd_matches_is_true_for_the_watched_root(tmp_path: Path):
 def test_cwd_matches_is_false_without_a_cwd(tmp_path: Path):
     """Best-effort: a process that exited before enrichment has no cwd."""
     assert not cwd_matches({"pid": 1, "error": "NoSuchProcess"}, tmp_path.resolve())
+
+
+def test_failed_enrichment_leaves_the_creation_retryable(monkeypatch):
+    """Fix for the ordering bug: `_known` must advance only AFTER entries land.
+
+    If `_known` were advanced before enrichment, a pid whose enrichment
+    raised would be marked "known" forever and never recorded -- the ring
+    silently losing the very creation it exists to capture.
+    """
+    import scripts.systemdrive_watcher as w
+
+    ring = w.ProcessRing(capacity=5000)
+    ring.sample()  # prime
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(6)"])
+    try:
+        monkeypatch.setattr(
+            w, "describe_pid",
+            lambda pid: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert ring.sample() == 0            # swallowed, not raised
+        assert ring._sample_errors == 1
+        monkeypatch.undo()                   # enrichment works again
+        ring.sample()
+        assert any(e["pid"] == child.pid for e in ring.dump()), \
+            "child lost after a failed enrichment - _known advanced too early"
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_sample_never_raises(monkeypatch):
+    """A diagnostic must never take down the run it observes."""
+    import scripts.systemdrive_watcher as w
+
+    ring = w.ProcessRing(capacity=10)
+    ring.sample()
+    monkeypatch.setattr(
+        w.psutil, "pids",
+        lambda: (_ for _ in ()).throw(RuntimeError("pids exploded")),
+    )
+    assert ring.sample() == 0
+    assert ring._sample_errors >= 1
