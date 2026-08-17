@@ -4619,8 +4619,23 @@ class APIServerAdapter(BasePlatformAdapter):
             # transcribe_audio is CPU/IO-bound (local whisper loads weights on
             # first call). Run it off the aiohttp event loop.
             from tools.transcription_tools import transcribe_audio
+            from tools.transcription_tools import LOCAL_STT_LANGUAGE_ENV
 
-            result = await asyncio.to_thread(transcribe_audio, spool.name, model)
+            # Pass the client-supplied language hint through to the STT engine.
+            # transcribe_audio resolves language from config/env, so we set the
+            # env var temporarily for this call. Without this, Chinese speech
+            # is often misdected as English, producing garbage transliteration.
+            old_lang = os.environ.get(LOCAL_STT_LANGUAGE_ENV)
+            if language:
+                os.environ[LOCAL_STT_LANGUAGE_ENV] = language
+            try:
+                result = await asyncio.to_thread(transcribe_audio, spool.name, model)
+            finally:
+                if language:
+                    if old_lang is not None:
+                        os.environ[LOCAL_STT_LANGUAGE_ENV] = old_lang
+                    else:
+                        os.environ.pop(LOCAL_STT_LANGUAGE_ENV, None)
         finally:
             with suppress(OSError):
                 os.unlink(spool.name)
