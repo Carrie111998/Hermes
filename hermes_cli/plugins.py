@@ -2055,6 +2055,25 @@ class PluginContext:
             is True
         )
 
+    def inject_message_for_session(
+        self,
+        session_id: str,
+        content: str,
+        role: str = "user",
+    ) -> bool:
+        """Inject only when the requested interactive session is still active.
+
+        Background adapters use this bounded interface instead of a process-
+        global injection when delivery must remain attached to the interaction
+        that originated an asynchronous request.
+        """
+        cli = self._manager._cli_ref
+        if cli is None or not session_id:
+            return False
+        if str(getattr(cli, "session_id", "")) != session_id:
+            return False
+        return self.inject_message(content, role=role)
+
     # -- CLI command registration --------------------------------------------
 
     @_serialized_replacement
