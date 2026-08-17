@@ -25,6 +25,31 @@ def _patch_info(tmp_path, config_yaml, model, runtime):
 
 
 class TestFormatSessionInfo:
+    def test_channel_runtime_is_shown_in_new_session_info(self, runner):
+        """A /new banner must show the channel override, not the global route."""
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        source = SessionSource(platform=Platform.SLACK, chat_id="C0BQDHWP3M0", user_id="u1")
+        runtime = {
+            "provider": "custom",
+            "requested_provider": "llamacpp",
+            "base_url": "http://127.0.0.1:18080/v1",
+            "api_key": "local",
+        }
+        with patch.object(
+            runner,
+            "_resolve_session_agent_runtime",
+            return_value=("qwen3.8-27b-q4_k_m-128k", runtime),
+        ), patch("gateway.run._load_gateway_config", return_value={"model": {}}), patch(
+            "agent.model_metadata.get_model_context_length", return_value=131072
+        ):
+            info = runner._format_session_info(source)
+
+        assert "qwen3.8-27b-q4_k_m-128k" in info
+        assert "llamacpp" in info
+        assert "127.0.0.1:18080" in info
+
 
     def test_includes_model_name(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: anthropic/claude-opus-4.6\n  provider: openrouter\n",

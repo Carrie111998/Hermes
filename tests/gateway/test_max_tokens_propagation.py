@@ -95,3 +95,103 @@ def test_per_provider_max_output_tokens_fallback(isolated_home):
     assert kw["max_tokens"] == 12000
 
 
+def test_explicit_provider_keeps_its_output_cap(isolated_home):
+    """A channel override must pass its provider output cap to the agent."""
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          default: cloud-model
+          provider: openai-codex
+        providers:
+          llamacpp:
+            api: http://127.0.0.1:18080/v1
+            api_key: local
+            default_model: qwen3.8-27b-q4_k_m-128k
+            max_output_tokens: 12000
+        """
+    )
+    grun = fresh_gateway()
+    kw = grun._resolve_runtime_agent_kwargs_for_provider("llamacpp")
+    assert kw["max_tokens"] == 12000
+    # The actual resolver canonicalizes the OpenAI-compatible endpoint to
+    # ``custom`` but preserves the configured alias for presentation and
+    # provider-specific config lookup.
+    assert kw["provider"] == "custom"
+    assert kw["requested_provider"] == "llamacpp"
+    assert kw["base_url"] == "http://127.0.0.1:18080/v1"
+
+
+def test_explicit_provider_honors_environment_output_cap(isolated_home, monkeypatch):
+    """A one-off cap must override channel-provider and global defaults."""
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          default: cloud-model
+          provider: openai-codex
+          max_tokens: 16000
+        providers:
+          llamacpp:
+            api: http://127.0.0.1:18080/v1
+            api_key: local
+            default_model: qwen3.8-27b-q4_k_m-128k
+            max_output_tokens: 12000
+        """
+    )
+    monkeypatch.setenv("HERMES_MAX_TOKENS", "8000")
+    grun = fresh_gateway()
+
+    kw = grun._resolve_runtime_agent_kwargs_for_provider("llamacpp")
+
+    assert kw["max_tokens"] == 8000
+
+
+def test_invalid_environment_cap_falls_through_to_model_cap(isolated_home, monkeypatch):
+    """An unusable HERMES_MAX_TOKENS must not skip model.max_tokens."""
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        """
+        model:
+          default: cloud-model
+          provider: openai-codex
+          max_tokens: 16000
+        providers:
+          llamacpp:
+            api: http://127.0.0.1:18080/v1
+            default_model: qwen3.8-27b-q4_k_m-128k
+            max_output_tokens: 12000
+        """
+    )
+    monkeypatch.setenv("HERMES_MAX_TOKENS", "not-a-number")
+
+    assert fresh_gateway()._resolve_runtime_agent_kwargs_for_provider("llamacpp")["max_tokens"] == 16000
+
+
+@pytest.mark.parametrize(
+    ("model_cap", "provider_cap", "expected"),
+    [
+        (True, 12000, 12000),
+        (False, True, None),
+    ],
+)
+def test_boolean_caps_are_not_accepted(isolated_home, model_cap, provider_cap, expected):
+    """YAML bool is an int subclass but is never a valid output-token cap."""
+    write_cfg, fresh_gateway = isolated_home
+    write_cfg(
+        f"""
+        model:
+          default: cloud-model
+          provider: openai-codex
+          max_tokens: {str(model_cap).lower()}
+        providers:
+          llamacpp:
+            api: http://127.0.0.1:18080/v1
+            default_model: qwen3.8-27b-q4_k_m-128k
+            max_output_tokens: {str(provider_cap).lower() if isinstance(provider_cap, bool) else provider_cap}
+        """
+    )
+
+    assert fresh_gateway()._resolve_runtime_agent_kwargs_for_provider("llamacpp")["max_tokens"] == expected
+
+
