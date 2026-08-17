@@ -787,3 +787,60 @@ def test_unusable_slot_dir_degrades_to_unlimited_instead_of_spinning(
         pass
     elapsed = time.monotonic() - started
     assert elapsed < 10, f"spun {elapsed:.1f}s on an unusable slot dir"
+
+
+from scripts.run_tests_parallel import _split_argv
+
+
+def test_split_argv_routes_long_help_to_our_args():
+    """--help must reach argparse, not pytest passthrough.
+
+    Regression: any token starting with '-' that is not in _OUR_FLAGS is
+    routed to pytest. --help was not in the set, so our_args ended up empty,
+    discovery went unfiltered, and the runner started the FULL suite.
+    """
+    our, passthrough = _split_argv(["--help"])
+    assert our == ["--help"]
+    assert passthrough == []
+
+
+def test_split_argv_routes_short_help_to_our_args():
+    our, passthrough = _split_argv(["-h"])
+    assert our == ["-h"]
+    assert passthrough == []
+
+
+def test_split_argv_still_routes_bare_pytest_flags():
+    """The fix must not break deliberate bare-pytest-flag routing."""
+    our, passthrough = _split_argv(["tests/foo.py", "-q", "-k", "expr"])
+    assert our == ["tests/foo.py"]
+    assert passthrough == ["-q", "-k", "expr"]
+
+
+def test_split_argv_honours_explicit_separator():
+    our, passthrough = _split_argv(["tests/foo.py", "--", "--tb=long"])
+    assert our == ["tests/foo.py"]
+    assert passthrough == ["--tb=long"]
+
+
+def test_split_argv_keeps_our_own_flags():
+    our, passthrough = _split_argv(["-j", "4", "--paths=tests/x", "tests/foo.py"])
+    assert our == ["-j", "4", "--paths=tests/x", "tests/foo.py"]
+    assert passthrough == []
+
+
+def test_help_exits_without_starting_a_suite_run():
+    """--help must exit 0 before discovery.
+
+    Guarded by a short timeout on purpose: if this regresses, the failure
+    mode is a full ~2384-file run, and a 30s bound keeps that from becoming
+    a 12-worker stray run that needs a PID-tree kill.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"), "--help"],
+        capture_output=True, text=True, timeout=30, cwd=str(repo_root),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "usage:" in proc.stdout.lower()
+    assert "Discovered" not in proc.stdout
