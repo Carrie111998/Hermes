@@ -15661,16 +15661,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if hasattr(self.agent, 'interaction_mode'):
                         self.agent.interaction_mode = self._interaction_mode
                     # Inject mode awareness into the turn.
-                    _mode_note = (
-                        f"[System: Current interaction mode: {self._interaction_mode.upper()}. "
-                        + ("All tool execution is disabled. You may still use read-only tools "
-                           "(read_file, search_files, session_search) to gather context. "
-                           "Do NOT fabricate answers — read the actual code first. "
-                           "Do not attempt to write, edit, or execute any tools."
-                           if self._interaction_mode == 'plan'
-                           else "Tools are enabled. You may use all available tools.")
-                        + "]"
-                    )
+                    # Build mode-specific instructions
+                    if self._interaction_mode == 'plan':
+                        _mode_note = (
+                            "[System: Current interaction mode: PLAN. "
+                            "All tool execution is disabled. You may still use read-only tools "
+                            "(read_file, search_files, session_search, skill_view, skills_list) "
+                            "to gather context. "
+                            "Do NOT fabricate answers — read the actual code first. "
+                            "Do not attempt to write, edit, or execute any tools.\n\n"
+                            "PLAN mode behavior:\n"
+                            "- Q&A: answer questions with critical analysis\n"
+                            "- Explore: read code, search files, understand architecture\n"
+                            "- Load skills: use skill_view/skills_list for relevant knowledge\n"
+                            "- Create PRD: create .ares/prd/ files when planning features\n"
+                            "- Critique: sharp, direct, no sugarcoating — problem + solution\n"
+                            "- Research: use context7 for library docs, web_search for references\n"
+                            "- Plan: break down tasks, create roadmap, identify risks\n"
+                            "- Do NOT: write code, edit files, run commands, deploy, commit]"
+                        )
+                    else:
+                        _mode_note = (
+                            "[System: Current interaction mode: BUILD. "
+                            "Tools are enabled. You may use all available tools.\n\n"
+                            "BUILD mode behavior:\n"
+                            "- Explore FIRST: read code, search files, understand structure before writing\n"
+                            "- Find exact location: locate the file, function, line number before editing\n"
+                            "- Verify approach: confirm your fix/approach is correct before implementing\n"
+                            "- Execute: write code, edit files, run commands only after exploration\n"
+                            "- Test: run tests, verify changes, check results\n"
+                            "- Deploy: commit, push, deploy when asked\n"
+                            "- Delegate: use delegate_task for subagent work\n"
+                            "- Verify: confirm changes work before reporting done\n"
+                            "- Do NOT: guess, assume, write without reading, skip exploration]"
+                        )
                     agent_message = _mode_note + "\n\n" + agent_message
                     result = self.agent.run_conversation(
                         user_message=agent_message,
