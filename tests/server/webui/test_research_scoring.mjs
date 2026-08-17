@@ -24,6 +24,23 @@ test('plus five takes from the highest other weight', () => {
   assert.equal(Object.values(next).reduce((a, b) => a + b, 0), 100);
 });
 
+test('plus five breaks equal highest donor ties by SCORE_DIMENSIONS order', () => {
+  const weights = {
+    product_sector_fit: 20,
+    buyer_channel_fit: 20,
+    buying_intent: 20,
+    market_coverage: 15,
+    commercial_scale: 10,
+    trade_activity: 10,
+    contactability: 5,
+  };
+  const next = transferWeight(weights, 'contactability', 5);
+
+  assert.equal(next.product_sector_fit, 15);
+  assert.equal(next.buyer_channel_fit, 20);
+  assert.equal(next.buying_intent, 20);
+});
+
 test('minus five gives to the lowest eligible other weight in dimension order', () => {
   const next = transferWeight(DEFAULTS, 'product_sector_fit', -5);
 
@@ -32,12 +49,41 @@ test('minus five gives to the lowest eligible other weight in dimension order', 
   assert.equal(Object.values(next).reduce((a, b) => a + b, 0), 100);
 });
 
+test('minus five breaks equal lowest recipient ties by SCORE_DIMENSIONS order', () => {
+  const weights = {
+    product_sector_fit: 30,
+    buyer_channel_fit: 20,
+    buying_intent: 15,
+    market_coverage: 15,
+    commercial_scale: 5,
+    trade_activity: 5,
+    contactability: 10,
+  };
+  const next = transferWeight(weights, 'product_sector_fit', -5);
+
+  assert.equal(next.product_sector_fit, 25);
+  assert.equal(next.commercial_scale, 10);
+  assert.equal(next.trade_activity, 5);
+});
+
 test('illegal five-point transfers leave the profile unchanged', () => {
   const atFloor = { ...DEFAULTS, contactability: 0, trade_activity: 15 };
   const atCeiling = { ...DEFAULTS, product_sector_fit: 100, buyer_channel_fit: 0, buying_intent: 0, market_coverage: 0, commercial_scale: 0, trade_activity: 0, contactability: 0 };
 
   assert.deepEqual(transferWeight(atFloor, 'contactability', -5), atFloor);
   assert.deepEqual(transferWeight(atCeiling, 'product_sector_fit', 5), atCeiling);
+});
+
+test('invalid totals and incomplete weight shapes fail closed', () => {
+  const invalidTotal = { ...DEFAULTS, contactability: 10 };
+  const missingDimension = Object.fromEntries(
+    Object.entries(DEFAULTS).filter(([key]) => key !== 'contactability'),
+  );
+  const unexpectedDimension = { ...DEFAULTS, untracked_weight: 0 };
+
+  assert.deepEqual(transferWeight(invalidTotal, 'contactability', -5), invalidTotal);
+  assert.deepEqual(transferWeight(missingDimension, 'product_sector_fit', -5), missingDimension);
+  assert.deepEqual(transferWeight(unexpectedDimension, 'product_sector_fit', -5), unexpectedDimension);
 });
 
 test('weight controls announce and highlight both dimensions after a transfer', () => {

@@ -9,20 +9,28 @@ export const SCORE_DIMENSIONS = [
   ['trade_activity', 'Relevant trade activity', 'Company-specific trade evidence, never aggregate market totals.'],
   ['contactability', 'Contactability', 'Reachable company channels; downstream contact discovery remains separate.'],
 ];
+const SCORE_DIMENSION_KEYS = SCORE_DIMENSIONS.map(([key]) => key);
 
 export function weightTotal(weights) {
   return Object.values(weights || {}).reduce((sum, value) => sum + Number(value || 0), 0);
 }
 
+function hasValidWeightShape(weights) {
+  if (!weights || typeof weights !== 'object' || Array.isArray(weights)) return false;
+  const keys = Object.keys(weights);
+  return keys.length === SCORE_DIMENSION_KEYS.length
+    && keys.every(key => SCORE_DIMENSION_KEYS.includes(key))
+    && SCORE_DIMENSION_KEYS.every(key => Number.isInteger(weights[key]) && weights[key] >= 0 && weights[key] <= 100 && weights[key] % 5 === 0)
+    && weightTotal(weights) === 100;
+}
+
 export function transferWeight(weights, key, delta) {
   const next = { ...(weights || {}) };
-  if (!SCORE_DIMENSIONS.some(([dimension]) => dimension === key) || ![5, -5].includes(delta)) return next;
-  const value = Number(next[key]);
-  if (!Number.isInteger(value) || value < 0 || value > 100 || value % 5) return next;
+  if (!hasValidWeightShape(weights) || !SCORE_DIMENSION_KEYS.includes(key) || ![5, -5].includes(delta)) return next;
+  const value = next[key];
   const others = SCORE_DIMENSIONS.map(([dimension], index) => ({
-    key: dimension, index, value: Number(next[dimension]),
-  })).filter(item => item.key !== key && Number.isInteger(item.value) && item.value >= 0 && item.value <= 100 && item.value % 5 === 0);
-  if (others.length !== SCORE_DIMENSIONS.length - 1) return next;
+    key: dimension, index, value: next[dimension],
+  })).filter(item => item.key !== key);
   const eligible = delta === 5
     ? others.filter(item => item.value >= 5).sort((a, b) => b.value - a.value || a.index - b.index)
     : others.filter(item => item.value <= 95).sort((a, b) => a.value - b.value || a.index - b.index);
