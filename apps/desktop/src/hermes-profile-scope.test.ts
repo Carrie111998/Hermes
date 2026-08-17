@@ -5,13 +5,16 @@ import {
   getActionStatus,
   getElevenLabsVoices,
   getMemoryProviderConfig,
+  getMessagingPlatforms,
   getStatus,
   restartGateway,
   saveMemoryProviderConfig,
   setApiRequestProfile,
   speakText,
+  testMessagingPlatform,
   transcribeAudio,
-  updateHermes
+  updateHermes,
+  updateMessagingPlatform
 } from './hermes'
 
 // Contract: every backend-targeted action helper must carry the active gateway
@@ -31,11 +34,15 @@ describe('backend action helpers are profile-scoped', () => {
     delete (window as { hermesDesktop?: unknown }).hermesDesktop
   })
 
-  const lastProfile = () => api.mock.calls.at(-1)?.[0].profile
-
   it('omits profile when none is active (single-profile users unaffected)', () => {
     void getStatus()
-    expect(lastProfile()).toBeUndefined()
+    void getMessagingPlatforms()
+
+    expect(api.mock.calls).toHaveLength(2)
+
+    for (const call of api.mock.calls) {
+      expect(call[0].profile).toBeUndefined()
+    }
   })
 
   it('forwards the active profile to memory provider config calls', () => {
@@ -79,5 +86,29 @@ describe('backend action helpers are profile-scoped', () => {
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('jarvis')
     }
+  })
+
+  it('forwards the active profile to messaging platform endpoints', () => {
+    setApiRequestProfile('hmbot2')
+    const update = { enabled: true, env: { TELEGRAM_BOT_TOKEN: 'replacement-token' } }
+
+    void getMessagingPlatforms()
+    void updateMessagingPlatform('telegram', update)
+    void testMessagingPlatform('telegram')
+
+    expect(api.mock.calls.map(call => call[0])).toEqual([
+      { profile: 'hmbot2', path: '/api/messaging/platforms' },
+      {
+        profile: 'hmbot2',
+        path: '/api/messaging/platforms/telegram',
+        method: 'PUT',
+        body: update
+      },
+      {
+        profile: 'hmbot2',
+        path: '/api/messaging/platforms/telegram/test',
+        method: 'POST'
+      }
+    ])
   })
 })
