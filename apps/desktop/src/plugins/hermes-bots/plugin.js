@@ -5306,10 +5306,11 @@ async function invalidateRoutineOwner(profile) {
 function selectRoutineJobs(data, error, lastJobs, bot) {
   const live = Array.isArray(data?.jobs) ? data.jobs : null
   const all = live ?? (error ? lastJobs : [])
+  const scopedToBot = normalizedProfileName(data?.scoped) === normalizedProfileName(bot)
   return {
     live,
     all,
-    jobs: all.filter(job => routineBot(job) === bot)
+    jobs: scopedToBot ? all : all.filter(job => routineBot(job) === bot)
   }
 }
 
