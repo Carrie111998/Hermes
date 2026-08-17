@@ -1,4 +1,4 @@
-import { backendScopeKey } from '@hermes/shared'
+import { registryBackendScopeKey } from '@hermes/shared'
 import { atom, computed } from 'nanostores'
 
 import { readKey, writeKey } from '@/lib/storage'
@@ -182,8 +182,8 @@ const newId = () =>
 const terminalMatchesIdentity = (term: TerminalEntry, identity: ActiveGatewayIdentity) =>
   term.kind === 'user' &&
   (!term.profile ||
-    backendScopeKey(term.connectionId, normalizeProfileKey(term.profile)) ===
-      backendScopeKey(identity.connectionId, normalizeProfileKey(identity.profile)))
+    registryBackendScopeKey(term.connectionId, normalizeProfileKey(term.profile)) ===
+      registryBackendScopeKey(identity.connectionId, normalizeProfileKey(identity.profile)))
 
 const currentTerminalIdentity = (): ActiveGatewayIdentity => $activeGatewayIdentity.get()
 

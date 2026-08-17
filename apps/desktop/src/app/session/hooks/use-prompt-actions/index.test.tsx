@@ -33,6 +33,7 @@ import type { SubmitTextOptions } from './utils'
 import { uploadComposerAttachment, usePromptActions } from '.'
 
 vi.mock('@/hermes', () => ({
+  getApiRequestProfile: () => 'default',
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   getSession: vi.fn(),
   PROMPT_SUBMIT_REQUEST_TIMEOUT_MS: 1_800_000,

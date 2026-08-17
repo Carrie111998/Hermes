@@ -58,7 +58,12 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
-import { applyConnectionChange, resolveTerminalConnection, terminalRegistrySourceKind } from './connection-apply'
+import {
+  applyConnectionChange,
+  resolveTerminalConnection,
+  terminalConnectionId,
+  terminalRegistrySourceKind
+} from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
@@ -14214,8 +14219,7 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   const rows = Math.max(2, Number.parseInt(String(payload?.rows || 24), 10) || 24)
   const requestedProfile = String(payload?.profile || '').trim()
   const profile = PROFILE_NAME_RE.test(requestedProfile) ? requestedProfile : primaryProfileKey()
-  const requestedConnectionId = String(payload?.connectionId || '').trim()
-  const connectionId = requestedConnectionId && requestedConnectionId !== 'local' ? requestedConnectionId : null
+  const connectionId = terminalConnectionId(payload?.connectionId)
   const identity = { connectionId, profile }
 
   const sshTarget = await resolveTerminalConnection(identity, activeSshTerminalTarget, ensureTerminalBackend)

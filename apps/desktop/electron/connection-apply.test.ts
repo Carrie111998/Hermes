@@ -4,6 +4,7 @@ import {
   applyConnectionChange,
   commitConnectionFailure,
   resolveTerminalConnection,
+  terminalConnectionId,
   terminalRegistrySourceKind
 } from './connection-apply'
 
@@ -104,6 +105,13 @@ describe('resolveTerminalConnection', () => {
         async () => undefined
       )
     ).rejects.toThrow('not ready')
+  })
+})
+
+describe('terminalConnectionId', () => {
+  it('preserves explicit local as a registry route instead of legacy routing', () => {
+    expect(terminalConnectionId('local')).toBe('local')
+    expect(terminalConnectionId('')).toBeNull()
   })
 })
 

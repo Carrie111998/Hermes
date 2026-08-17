@@ -54,6 +54,12 @@ async function resolveTerminalConnection(identity, getTarget, ensureBackend) {
   return target
 }
 
+function terminalConnectionId(value) {
+  const connectionId = String(value || '').trim()
+
+  return connectionId || null
+}
+
 /** Classify registry terminal transport without silently downgrading a stale
  * persisted connection to a local shell. */
 function terminalRegistrySourceKind(connectionId, sources) {
@@ -66,4 +72,10 @@ function terminalRegistrySourceKind(connectionId, sources) {
   return source.kind === 'ssh' ? 'ssh' : 'local'
 }
 
-export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection, terminalRegistrySourceKind }
+export {
+  applyConnectionChange,
+  commitConnectionFailure,
+  resolveTerminalConnection,
+  terminalConnectionId,
+  terminalRegistrySourceKind
+}

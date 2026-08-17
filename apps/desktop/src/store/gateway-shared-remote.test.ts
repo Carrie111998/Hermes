@@ -19,6 +19,7 @@ const gatewayMocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/hermes', () => ({
+  getApiRequestProfile: vi.fn(() => 'default'),
   setApiRequestConnection: vi.fn(),
   HermesGateway: class {
     connectionState = 'closed'
@@ -42,6 +43,7 @@ const {
   activeGatewayIdentity,
   closeSecondaryGateways,
   configureGatewayRegistry,
+  deriveActiveGatewayIdentity,
   ensureActiveGatewayOpen,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
@@ -74,6 +76,28 @@ afterEach(() => {
   closeSecondaryGateways()
   vi.clearAllMocks()
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+})
+
+describe('HMR active gateway identity migration', () => {
+  it('reconstructs registry-secondary and shared-primary route identities', () => {
+    const secondaryState = {
+      activeKey: 'conn:local::work',
+      activeRouteProfile: undefined,
+      primaryProfile: 'default',
+      secondaries: new Map([['conn:local::work', { connectionId: 'local', profile: 'work' }]])
+    }
+
+    expect(deriveActiveGatewayIdentity(secondaryState as never, 'stale')).toEqual({
+      connectionId: 'local',
+      profile: 'work'
+    })
+    expect(
+      deriveActiveGatewayIdentity(
+        { activeKey: 'default', activeRouteProfile: undefined, primaryProfile: 'default', secondaries: new Map() } as never,
+        'venture'
+      )
+    ).toEqual({ connectionId: null, profile: 'venture' })
+  })
 })
 
 describe('ensureGatewayForProfile under a shared global remote', () => {

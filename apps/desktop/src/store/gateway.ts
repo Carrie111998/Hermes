@@ -2,7 +2,7 @@ import { type ConnectionState, type GatewayEvent, registryBackendScopeKey, resol
 import { atom } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
-import { HermesGateway, setApiRequestConnection } from '@/hermes'
+import { getApiRequestProfile, HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
@@ -113,6 +113,24 @@ function gatewayState(): GatewayRegistryState {
 
 const g = gatewayState()
 
+export function deriveActiveGatewayIdentity(
+  state: Pick<GatewayRegistryState, 'activeKey' | 'activeRouteProfile' | 'primaryProfile' | 'secondaries'>,
+  routedProfile: null | string = null
+): ActiveGatewayIdentity {
+  if (state.activeKey !== state.primaryProfile) {
+    const secondary = state.secondaries.get(state.activeKey)
+
+    if (secondary) {
+      return { connectionId: secondary.connectionId, profile: normKey(secondary.profile) }
+    }
+  }
+
+  return {
+    connectionId: null,
+    profile: normKey(state.activeRouteProfile || routedProfile || state.primaryProfile)
+  }
+}
+
 // Re-exported as a stable binding: the atom instance lives in `g`, so every hot
 // reload of this module hands back the SAME atom subscribers are already wired
 // to. (A fresh `atom()` per reload would orphan existing subscriptions.)
@@ -126,10 +144,9 @@ export interface ActiveGatewayIdentity {
 /** Atomically published route identity. Unlike `$activeGatewayProfile`, this is
  * updated in the same operation as the active gateway key, so consumers cannot
  * observe a connection id paired with the previous visible profile. */
-export const $activeGatewayIdentity = (g.$activeIdentity ??= atom<ActiveGatewayIdentity>({
-  connectionId: null,
-  profile: g.activeRouteProfile ?? g.primaryProfile
-}))
+export const $activeGatewayIdentity = (g.$activeIdentity ??= atom<ActiveGatewayIdentity>(
+  deriveActiveGatewayIdentity(g, getApiRequestProfile?.())
+))
 
 /** The backend identity currently owning renderer requests. Registry
  * secondaries carry their source id; primary/local and legacy profile routes
@@ -348,20 +365,31 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
     return
   }
 
+  const activationEpoch = gatewayActivationEpoch()
   entry.reconnecting = true
 
   try {
     await openSecondary(entry)
     entry.reconnectAttempt = 0
+
+    if (entry.wantOpen && g.activeKey === entry.scope && g.secondaries.get(entry.scope) === entry) {
+      applyActive(entry.scope, activationEpoch, entry.profile)
+    }
   } catch (error) {
     // The registry no longer knows this connection (removed while we were
     // backing off). Retrying forever can never succeed — fail-stop: dispose
     // the entry and evict it instead of an infinite 15s-cap retry loop.
     if (entry.connectionId && isMissingConnectionError(error)) {
+      const wasActive = g.activeKey === entry.scope
+
       entry.reconnecting = false
       disposeSecondary(entry)
       g.secondaries.delete(entry.scope)
       restoreActiveToPrimaryIfEvicted()
+
+      if (wasActive) {
+        g.config?.onActiveConnectionInvalidated?.(g.primaryProfile, gatewayActivationEpoch())
+      }
 
       return
     }
@@ -749,6 +777,7 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
   }
 
   if (!isOpen(entry.gateway)) {
+    clearTimer(entry)
     await reconnectSecondary(entry)
   }
 
@@ -862,6 +891,22 @@ export function disposeSecondariesForConnection(connectionId: string, opts: { re
     disposeSecondary(entry)
     g.secondaries.delete(key)
 
+    // Never leave the published gateway pointing at the disposed socket. For
+    // material edits, preserve the selected source identity but withdraw the
+    // gateway until a replacement is live; removals fall back to primary.
+    if (wasActive) {
+      if (opts.redial) {
+        // Keep the selected source identity, but make outbound work unavailable
+        // until its replacement socket is live. Publishing primary here while
+        // profile/connection state still names the edited source can execute a
+        // request on the wrong machine.
+        g.$gateway.set(null)
+        setGatewayState('closed')
+      } else {
+        setActive(g.primaryProfile)
+      }
+    }
+
     if (opts.redial) {
       const reopen = wasActive
         ? ensureGatewayForAgent(entry.connectionId, entry.profile)
@@ -872,7 +917,6 @@ export function disposeSecondariesForConnection(connectionId: string, opts: { re
   }
 
   if (activeInvalidated && !opts.redial) {
-    setActive(g.primaryProfile)
     g.config?.onActiveConnectionInvalidated?.(g.primaryProfile, gatewayActivationEpoch())
   }
 }

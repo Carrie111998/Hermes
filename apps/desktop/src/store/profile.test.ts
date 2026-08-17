@@ -12,7 +12,13 @@ const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
-vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForAgent, ensureGatewayForProfile, openGatewayForProfile }))
+vi.mock('@/store/gateway', () => ({
+  $gateway,
+  activeGatewayIdentity: () => ({ connectionId: null, profile: $activeGatewayProfile.get() }),
+  ensureGatewayForAgent,
+  ensureGatewayForProfile,
+  openGatewayForProfile
+}))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   setApiRequestProfile: vi.fn()

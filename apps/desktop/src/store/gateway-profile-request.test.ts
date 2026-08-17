@@ -40,6 +40,7 @@ vi.mock('@/hermes', () => ({
       secondaryGateways.push(this)
     }
   },
+  getApiRequestProfile: vi.fn(() => 'default'),
   setApiRequestConnection: vi.fn()
 }))
 vi.mock('@/store/session', () => ({ setGatewayState: vi.fn() }))

@@ -7,6 +7,7 @@ const patch = vi.fn<(id: string, pinned: boolean, profile?: null | string) => Pr
 )
 
 vi.mock('@/hermes', () => ({
+  getApiRequestProfile: () => 'default',
   // The layout store reaches the profile store, which sets the request profile
   // at import time; this suite only cares about the pin call.
   setApiRequestProfile: () => {},

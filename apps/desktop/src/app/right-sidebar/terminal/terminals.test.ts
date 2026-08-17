@@ -188,6 +188,21 @@ describe('terminal store persistence', () => {
     )
   })
 
+  it('keeps explicit local separate from a legacy route for the same profile', async () => {
+    const { $activeTerminalId, $terminals, createTerminal, ensureTerminal } = await loadTerminalStore()
+    const legacyId = createTerminal('/legacy', { connectionId: null, profile: 'default' })
+
+    ensureTerminal({ connectionId: 'local', profile: 'default' })
+
+    expect($activeTerminalId.get()).not.toBe(legacyId)
+    expect($terminals.get()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: legacyId, profile: 'default' }),
+        expect.objectContaining({ connectionId: 'local', profile: 'default' })
+      ])
+    )
+  })
+
   it('selects the active profile terminal and creates one when that profile has none', async () => {
     const { $activeTerminalId, $terminals, createTerminal, ensureTerminal, setActiveGatewayIdentity } =
       await loadTerminalStore()
