@@ -331,6 +331,7 @@ export interface Translations {
       agent: {
         title: string
         blurb: string
+        appliesTo: string
         empty: string
         loadFailed: string
         portable: string
