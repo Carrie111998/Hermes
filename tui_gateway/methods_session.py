@@ -189,6 +189,11 @@ def _(rid, params: dict) -> dict:
                     limit=fetch_limit,
                     order_by_last_active=True,
                     compact_rows=True,
+                    # Ghost rows (0 messages — leftover imports/migrations)
+                    # clutter the picker with empty headers (#81888). The
+                    # desktop project-tree sidebar already excludes them the
+                    # same way (see ``_project_tree_inputs`` in server.py).
+                    min_message_count=1,
                 )
                 if (s.get("source") or "").strip().lower() not in deny
             ][:limit]
