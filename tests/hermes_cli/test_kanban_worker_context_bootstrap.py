@@ -86,6 +86,40 @@ def test_worker_query_caps_many_parent_handoffs_without_losing_task_body(kanban_
     assert query.endswith(" chars omitted]\n")
 
 
+def test_worker_query_preserves_parent_handoff_before_attachment_overflow(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="Attachment-heavy fan-in worker",
+            body="Worker requirement",
+            assignee="worker-a",
+        )
+        parent_id = kb.create_task(conn, title="Parent", assignee="worker-a")
+        assert kb.complete_task(conn, parent_id, result="PARENT-HANDOFF-SENTINEL")
+        kb.link_tasks(conn, parent_id, task_id)
+        for index in range(100):
+            kb.add_attachment(
+                conn,
+                task_id,
+                filename=f"attachment-{index}.txt",
+                stored_path="C:/attachments/" + ("a" * 1024) + f"/{index}",
+            )
+
+        query = kb.build_worker_query(
+            conn,
+            task_id,
+            f"work kanban task {task_id}",
+        )
+    finally:
+        conn.close()
+
+    assert len(query) == kb._CTX_MAX_WORKER_QUERY_CHARS
+    assert "PARENT-HANDOFF-SENTINEL" in query
+    assert query.index("## Parent task results") < query.index("## Attachments")
+    assert "[worker context truncated," in query
+
+
 def test_worker_query_caps_title_before_authoritative_task_body(kanban_home):
     conn = kb.connect()
     try:

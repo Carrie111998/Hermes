@@ -9410,25 +9410,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
-    # Attachments — files uploaded to this task (PDFs, source docs,
-    # images). Surface the absolute on-disk path so the worker, which has
-    # full file-tool access, can read them directly (read_file, terminal
-    # `pdftotext`, etc.). On the local terminal backend the path resolves
-    # as-is; remote backends need the kanban attachments dir mounted.
-    attachments = list_attachments(conn, task_id)
-    if attachments:
-        lines.append("## Attachments")
-        lines.append(
-            "Files attached to this task. Read them with the file/terminal "
-            "tools at the absolute paths below:"
-        )
-        for att in attachments:
-            size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
-            size_str = f", {size_kb} KB" if size_kb else ""
-            ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
-        lines.append("")
-
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).
     # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
@@ -9527,6 +9508,27 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                     pass
             lines.extend(body_lines)
             lines.append("")
+
+    # Attachments — files uploaded to this task (PDFs, source docs,
+    # images). Keep them after parent handoffs so the aggregate worker-query
+    # cap preserves upstream results before optional file metadata. Surface
+    # the absolute on-disk path so the worker, which has full file-tool access,
+    # can read them directly (read_file, terminal `pdftotext`, etc.). On the
+    # local terminal backend the path resolves as-is; remote backends need the
+    # kanban attachments dir mounted.
+    attachments = list_attachments(conn, task_id)
+    if attachments:
+        lines.append("## Attachments")
+        lines.append(
+            "Files attached to this task. Read them with the file/terminal "
+            "tools at the absolute paths below:"
+        )
+        for att in attachments:
+            size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
+            size_str = f", {size_kb} KB" if size_kb else ""
+            ctype = f", {att.content_type}" if att.content_type else ""
+            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+        lines.append("")
 
     # Cross-task role history: what else has THIS assignee completed
     # recently? Gives the worker implicit continuity — "I'm the reviewer
