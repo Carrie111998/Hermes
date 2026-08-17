@@ -9454,6 +9454,8 @@ def interactive_setup() -> None:
     )
     if app_token:
         save_env_value("SLACK_APP_TOKEN", app_token)
+    else:
+        remove_env_value("SLACK_APP_TOKEN")
     print_success("Slack tokens saved")
 
     print()
