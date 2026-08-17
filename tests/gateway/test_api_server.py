@@ -2411,6 +2411,83 @@ class TestSessionKeyHeader:
             assert captured_kwargs.get("gateway_session_key") == "agent:main:webui:dm:user-7"
 
     @pytest.mark.asyncio
+    async def test_missing_session_key_scopes_search_to_session_id(
+        self, auth_adapter, tmp_path
+    ):
+        """An authenticated API turn without the optional key is still scoped."""
+        from hermes_state import SessionDB
+        from tools.session_search_tool import session_search
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("session-a", source="api_server", session_key="session-a")
+        db.create_session(
+            "session-a-history", source="api_server", session_key="session-a"
+        )
+        db.append_message(
+            "session-a-history", role="user", content="owned API transcript"
+        )
+        db.create_session(
+            "session-b", source="api_server", session_key="session-b"
+        )
+        db.append_message("session-b", role="user", content="foreign API transcript")
+        auth_adapter._session_db = db
+        observed = {}
+
+        def _fake_create_agent(**kwargs):
+            observed["scope"] = kwargs.get("gateway_session_key")
+            mock_agent = MagicMock()
+
+            def _run(**_run_kwargs):
+                observed["browse"] = json.loads(
+                    session_search(
+                        db=db,
+                        current_session_id="session-a",
+                        caller_session_key=observed["scope"],
+                    )
+                )
+                observed["foreign_read"] = json.loads(
+                    session_search(
+                        session_id="session-b",
+                        db=db,
+                        caller_session_key=observed["scope"],
+                    )
+                )
+                return {"final_response": "ok", "messages": []}
+
+            mock_agent.run_conversation.side_effect = _run
+            mock_agent.session_id = "session-a"
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_app(auth_adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(
+                    auth_adapter, "_create_agent", side_effect=_fake_create_agent
+                ):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        headers={
+                            "X-Hermes-Session-Id": "session-a",
+                            "Authorization": "Bearer sk-secret",
+                        },
+                        json={
+                            "model": "hermes-agent",
+                            "messages": [{"role": "user", "content": "search"}],
+                        },
+                    )
+            assert resp.status == 200
+            assert observed["scope"] == "session-a"
+            assert {
+                row["session_id"] for row in observed["browse"]["results"]
+            } == {"session-a-history"}
+            assert observed["foreign_read"]["success"] is False
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
     async def test_responses_endpoint_accepts_session_key(self, auth_adapter):
         """Responses API honors the same X-Hermes-Session-Key contract."""
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
