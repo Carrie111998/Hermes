@@ -35,7 +35,7 @@ where role = 'admin';
 Worth replacing with real reset emails once a transactional sender (Resend,
 Postmark, SES) exists — that is the actual fix, not a bigger workaround.
 
-## Migrate the public base URL to `agent.interfaze.co`
+## Migrate the public base URL to `agent.tugrap.dev`
 
 Production currently runs on the Fly-issued domain:
 
@@ -43,7 +43,7 @@ Production currently runs on the Fly-issued domain:
 INTERFAZE_PUBLIC_BASE_URL=https://agent-rota.fly.dev
 ```
 
-Target: `https://agent.interfaze.co`.
+Target: `https://agent.tugrap.dev`.
 
 **Do this before the first outbound email goes out.** `INTERFAZE_PUBLIC_BASE_URL`
 is embedded as an absolute URL into every unsubscribe link
@@ -55,13 +55,13 @@ filters, so deliverability improves on the branded domain.
 
 Steps:
 
-1. `fly certs add agent.interfaze.co` and add the A/AAAA records it prints.
-2. `fly secrets set INTERFAZE_PUBLIC_BASE_URL="https://agent.interfaze.co"`.
+1. `fly certs add agent.tugrap.dev` and add the A/AAAA records it prints.
+2. `fly secrets set INTERFAZE_PUBLIC_BASE_URL="https://agent.tugrap.dev"`.
 3. Add the new callback URLs to the Google and Microsoft OAuth apps — the
    `redirect_uri` is derived from this same value (`server/routes/oauth.py:116`),
    and a mismatch fails the authorization with `redirect_uri_mismatch`:
-   - `https://agent.interfaze.co/api/v1/integrations/email/oauth/google/callback`
-   - `https://agent.interfaze.co/api/v1/integrations/email/oauth/microsoft/callback`
+   - `https://agent.tugrap.dev/api/v1/integrations/email/oauth/google/callback`
+   - `https://agent.tugrap.dev/api/v1/integrations/email/oauth/microsoft/callback`
 4. Keep the `agent-rota.fly.dev` domain resolving afterwards, so unsubscribe
    links mailed before the cutover still work.
 

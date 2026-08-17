@@ -41,6 +41,7 @@ interfaze_server:
   # Only needed for a dashboard served from a different origin. The bundled
   # server/webui is same-origin, so this is inert until interagent-web ships.
   cors_origins:
+    - https://agent.tugrap.dev
     - https://agent-rota.fly.dev
 
   # 8 failed sign-ins per 5 minutes per email (server/auth.py:95).
