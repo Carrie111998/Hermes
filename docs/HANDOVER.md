@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** hermes-agent  
-**Last verified:** 2026-08-16 (Asia/Taipei)  
+**Last verified:** 2026-08-17 (Asia/Taipei)
 **Handover owner/session:** Codex  
 **Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
 
@@ -9,7 +9,7 @@
 
 - **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
 - **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Merged runtime code baseline:** `3e9fd48dc28b7df186c780992351ef01febaa070` (PR #29, ARCH-002).
+- **Merged runtime code baseline:** `e8cdfd1e65191b68423afd7e12248d3c6e728e00` (PR #30, ARCH-003; ARCH-002 remains the prior runtime-state baseline).
 - **DGX runtime:** host `140.96.58.171`, hostname `55-0940189-03`, user service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
 - **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
@@ -21,20 +21,20 @@ The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`
 ## 2. Goal and roadmap
 
 - **Current goal:** preserve the merged ARCH-002 runtime-state contract, keep Telegram service/inbound/outbound gates separate, and prepare the next architecture ticket.
-- **Completed and deployed:** ARCH-002, PR #29, merge `3e9fd48dc28b7df186c780992351ef01febaa070`; implementation review consensus PASS, latest-head CI PASS, immutable DGX deployment complete.
+- **Completed and deployed:** ARCH-002, PR #29, merge `3e9fd48dc28b7df186c780992351ef01febaa070`; and ARCH-003, PR #30, merge `e8cdfd1e65191b68423afd7e12248d3c6e728e00`. Both have implementation-review consensus, latest-head CI, immutable DGX release, rollback metadata, and post-deploy service evidence.
 - **Telegram runtime:** the gateway recovered from a transient startup timeout through its bounded retry path. Post-recovery logs show repeated qualifying empty `telegram_polling_progress` events; user-visible delivery remains a separate gate.
 - **Deferred/blocked:** HERMES-MONITORING-001 remains BLOCKED. Telegram user-visible delivery is not claimed from service or polling health.
-- **Next candidate:** ARCH-003 audit/replay integration after the shared runtime-state boundary is stable. No ARCH-003 plan has been written or approved yet.
+- **Next candidate:** ARCH-004 redaction and SQLite/WAL safeguards. ARCH-003 audit/replay integration is merged and deployed; no ARCH-004 implementation is authorized yet.
 
 ## 3. Verified runtime and deployment state
 
 - **DGX host identity:** `cwliao@55-0940189-03`.
-- **Active release:** `/home/cwliao/.hermes/releases/v2026.8.16-hermes-arch-002-3e9fd48dc2`.
-- **Release marker:** `HERMES_RELEASE_SHA=3e9fd48dc28b7df186c780992351ef01febaa070`.
-- **Effective service:** `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `467772`, `NRestarts=0`.
-- **Effective WorkingDirectory/PYTHONPATH:** the ARCH-002 immutable release above.
-- **Rollback:** prior Telegram-inbound release `v2026.8.16-hermes-telegram-inbound-178c9be1` and its drop-in remain available.
-- **Deployment manifest:** the release records source commit `3e9fd48d...`, base release `178c9be1...`, and the runtime-state overlay hashes.
+- **Active release:** `/home/cwliao/.hermes/releases/v2026.8.17-hermes-arch-003-e8cdfd1e`.
+- **Release marker:** `HERMES_RELEASE_SHA=e8cdfd1e65191b68423afd7e12248d3c6e728e00`.
+- **Effective service:** `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `1419906`, `NRestarts=0`, `ExecMainStatus=0`.
+- **Effective WorkingDirectory/PYTHONPATH:** the ARCH-003 immutable release above.
+- **Rollback:** prior ARCH-002 release `v2026.8.16-hermes-arch-002-3e9fd48dc2`, prior Telegram-inbound release `v2026.8.16-hermes-telegram-inbound-178c9be1`, and their drop-ins remain available.
+- **Deployment manifest:** the ARCH-003 release marker records source commit `e8cdfd1e...`; rollback metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-arch-003-e8cdfd1e`.
 
 ### Telegram evidence boundary
 
@@ -62,7 +62,7 @@ The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`
 - **HERMES-AUTH-001 / AUTH-002:** merged/deployed separately; do not conflate them with ARCH-003.
 - **HERMES-CALENDAR-GUARD-001:** merged/deployed; actual DGX guard naming/effective unit remains a separate documentation hygiene concern.
 - **HERMES-MONITORING-001:** BLOCKED; do not infer readiness from gateway health.
-- **ARCH-003:** proposed next architecture ticket; design scope and plan are pending approval. No implementation is authorized.
+- **ARCH-003:** `MERGED_DEPLOYED`; PR #30, implementation commit `9b777c0b1`, merge `e8cdfd1e...`; focused Windows dependency test `29 passed`; canonical runner ARCH-003 tests `24 passed` with its gateway integration collection limited by the borrowed KLIB venv missing PyYAML; authenticated AGY and fresh authenticated WSL Claude implementation reviews both `PASS`; CI run `31981532693` passed after retrying an unrelated pre-existing stream-consumer slice; immutable release and runtime health verified on DGX.
 
 ### Gate rule
 
@@ -74,6 +74,6 @@ Ticket design, implementation, tests, independent review, reconciliation, CI, me
 2. Verify repository root, remote, branch, HEAD, GitHub main code baseline, DGX hostname, service, release marker, and rollback release.
 3. Preserve the primary dirty worktree and DGX live source checkout; do not reset, clean, or overwrite either.
 4. Keep reviewer packets metadata-only; never send source, secrets, tokens, absolute paths, message bodies, or generated evidence text.
-5. For ARCH-003, write and review the ticket plan before implementation. The proposed direction is an append-only runtime-state audit journal plus a read-only replay verifier; this proposal is not yet approved.
-6. Keep ARCH-002 and Telegram delivery evidence separate from ARCH-003.
+5. For ARCH-004, write and review the ticket plan before implementation; do not infer authorization from ARCH-003 deployment.
+6. Keep ARCH-002, ARCH-003, and Telegram delivery evidence separate.
 7. Refresh this handover only with verified facts and the exact next action.

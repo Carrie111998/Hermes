@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_PASS
+status: MERGED_DEPLOYED
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -12,9 +12,9 @@ target_repo: hermes-agent
 
 ## Status and gate
 
-This is a source-implementation plan only. It does not authorize source edits,
-database migration, live-state inspection, DGX mutation, deployment, repair, or
-event-sourcing.
+This document records the source-implementation plan and its completed
+delivery gates. The earlier plan-only restrictions below are historical gate
+conditions; the current delivery evidence is recorded in the final sections.
 
 The design gate passed with one authenticated Claude Opus reviewer and one
 authenticated AGY reviewer on the identical final packet:
@@ -1282,7 +1282,7 @@ On 2026-08-17 the user explicitly authorized implementation and the complete
 delivery sequence. The implementation was performed in an isolated checkout;
 the primary dirty worktree and DGX runtime were not modified.
 
-Current status: `IMPLEMENTATION_REVIEW_PASS_PENDING_CI`.
+Current status: `MERGED_DEPLOYED`.
 
 Implementation review evidence:
 
@@ -1301,12 +1301,34 @@ Focused test evidence:
 - the same focused paths with the complete Windows Python dependency set
   passed `29 passed`.
 
-The remaining gates are commit, push, latest-head CI, merge, deployment,
-runtime health, rollback evidence, and final dirty-tree verification.
+The delivery gates below are now complete and recorded in the project
+handover and roadmap.
+
+## Delivery evidence
+
+- commit/push: implementation commit `9b777c0b1` pushed on
+  `codex/arch-003-implementation`;
+- CI: run `31981532693` completed `success` after rerunning the unrelated
+  pre-existing stream-consumer slice;
+- merge: PR #30 merged to `main` as
+  `e8cdfd1e65191b68423afd7e12248d3c6e728e00`;
+- DGX release: immutable release
+  `/home/cwliao/.hermes/releases/v2026.8.17-hermes-arch-003-e8cdfd1e` with
+  marker matching the merge SHA;
+- rollback: prior ARCH-002 drop-in and release retained, with deployment
+  metadata under `/home/cwliao/.hermes/deploy-backups/hermes-arch-003-e8cdfd1e`;
+- runtime: `hermes-gateway.service` active/running, MainPID `1419906`,
+  `NRestarts=0`, `ExecMainStatus=0`, and effective WorkingDirectory set to
+  the ARCH-003 release;
+- cleanup: temporary staging directory removed and verified absent; primary
+  dirty worktree remained untouched.
+
+ARCH-003 is complete. The next ticket is ARCH-004, which requires its own
+ticket-design review and separate implementation authorization.
 
 ## Acceptance criteria
 
-ARCH-003 implementation is ready for its delivery gates only when:
+The following acceptance criteria were used for the ARCH-003 delivery gate:
 
 - every committed replay-tuple mutation emits exactly one metadata-only event;
 - journal failure cannot commit a materialized mutation;
