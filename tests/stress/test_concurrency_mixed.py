@@ -104,32 +104,47 @@ def worker_loop(worker_id: int, hermes_home: str, result_file: str) -> None:
                 events.append({"kind": "lost_claim_race", "task": tid})
                 continue
 
-            run = kb.latest_run(conn, tid)
+            # Use the run id the claim itself returned. Re-reading it with
+            # latest_run(conn, tid) is a second, non-atomic query: with
+            # ttl_seconds=5 and the reclaimer running, this worker's claim
+            # can lapse and another worker can claim the task — creating a
+            # NEWER run — before that query lands, and the worker would then
+            # file its events under a run it never owned. That is precisely
+            # what produced the intermittent "CROSS-WORKER COMPLETION"
+            # failures; on a loaded host a >5s gap between two statements is
+            # real (the same runs log 10s kanban init-lock waits).
+            run_id = claimed.current_run_id
             events.append({"kind": "claimed", "task": tid, "worker": worker_id,
-                           "run_id": run.id, "t": time.monotonic() - start})
+                           "run_id": run_id, "t": time.monotonic() - start})
 
             time.sleep(random.uniform(0.005, 0.05))
 
             # 20% of the time, block instead of complete
+            # block_task/complete_task return False when the CAS guard
+            # refuses the write — e.g. the reclaimer took this run back
+            # mid-work. Recording the event regardless would book a refused
+            # write as a successful one and corrupt every count below.
             if random.random() < 0.20:
                 try:
-                    kb.block_task(conn, tid,
-                                  reason=f"blocked by worker-{worker_id}")
-                    events.append({"kind": "blocked", "task": tid,
-                                   "worker": worker_id, "run_id": run.id})
+                    ok = kb.block_task(conn, tid,
+                                       reason=f"blocked by worker-{worker_id}")
+                    events.append({"kind": "blocked" if ok else "block_refused",
+                                   "task": tid, "worker": worker_id,
+                                   "run_id": run_id})
                 except sqlite3.OperationalError as e:
                     events.append({"kind": "sqlite_err", "op": "block",
                                    "task": tid, "err": str(e)[:100]})
             else:
                 try:
-                    kb.complete_task(
+                    ok = kb.complete_task(
                         conn, tid,
                         result=f"done by worker-{worker_id}",
                         summary=f"worker-{worker_id} ok",
                         metadata={"worker_id": worker_id},
                     )
-                    events.append({"kind": "completed", "task": tid,
-                                   "worker": worker_id, "run_id": run.id,
+                    events.append({"kind": "completed" if ok else "complete_refused",
+                                   "task": tid, "worker": worker_id,
+                                   "run_id": run_id,
                                    "t": time.monotonic() - start})
                 except sqlite3.OperationalError as e:
                     events.append({"kind": "sqlite_err", "op": "complete",
@@ -188,8 +203,16 @@ def main():
     print(f"Seeded {NUM_TASKS} tasks, launching {NUM_WORKERS} workers + 1 reclaimer")
 
     ctx = mp.get_context("spawn")
-    worker_results = [f"/tmp/mixed_worker_{i}.json" for i in range(NUM_WORKERS)]
-    reclaim_result = "/tmp/mixed_reclaim.json"
+    # Keep result files inside this run's HERMES_HOME. "/tmp/..." is not a
+    # portable absolute path — on Windows it resolves against the current
+    # drive (C:\tmp\...). Writer and reader agreed on the literal so the
+    # script worked, but every run leaked its files outside the temp home
+    # and never cleaned them up, and two concurrent runs of this script
+    # would silently overwrite each other's results.
+    worker_results = [
+        os.path.join(home, f"mixed_worker_{i}.json") for i in range(NUM_WORKERS)
+    ]
+    reclaim_result = os.path.join(home, "mixed_reclaim.json")
 
     procs = []
     start = time.monotonic()

@@ -352,3 +352,94 @@ class TestShowStatusXaiOAuth:
 
         assert "xAI OAuth" in out
         assert "not logged in (run: hermes auth add xai-oauth)" in out
+
+
+class TestPluginPlatformDepsProbe:
+    """Read-only "is this platform available?" callers must use the CHEAP probe.
+
+    For adapter plugins that defer a heavy SDK, ``check_fn`` is also the
+    *loader* — calling it imports the SDK. Feishu's
+    ``check_feishu_requirements()`` imports ``lark_oapi``, whose top-level
+    ``__init__`` eagerly pulls the whole ~10k-module package: measured on this
+    box at **238.2s and 404.9s on two consecutive runs** (the second warm, so
+    this is steady state, not a cold-compile artifact). Every submodule after
+    it is free, which is why the cost is invisible in a profile of the
+    submodule imports.
+
+    ``PlatformEntry.deps_available_fn`` exists for exactly this and answers in
+    ~0ms via ``PathFinder.find_spec``. ``gateway/config.py::_apply_env_overrides``
+    was already converted; the display/probe callers in status, gateway and
+    web_server were missed, so ``hermes status`` paid a multi-minute SDK import
+    to print one line. It also made
+    ``test_jobs_json_utf8_bom.py::test_status_scheduled_jobs_accepts_utf8_bom``
+    blow any per-test timeout, and because the suite runs
+    ``--timeout-method=thread`` that ``os._exit``s the WHOLE pytest process —
+    a single slow import aborting an entire tests/hermes_cli sweep.
+
+    The loader path (``platform_registry.py``'s adapter construction) must keep
+    using ``check_fn``: there, loading is the point.
+    """
+
+    def _entry(self, calls):
+        from gateway.platform_registry import PlatformEntry
+
+        def _expensive():
+            calls.append("check_fn")
+            return True
+
+        def _cheap():
+            calls.append("deps_available_fn")
+            return True
+
+        return PlatformEntry(
+            name="feishu-probe",
+            label="FeishuProbe",
+            adapter_factory=lambda cfg: None,
+            check_fn=_expensive,
+            deps_available_fn=_cheap,
+        )
+
+    def test_show_status_prefers_the_cheap_probe(self, monkeypatch, capsys):
+        from hermes_cli import status as status_mod
+        from gateway.platform_registry import platform_registry
+
+        calls = []
+        monkeypatch.setattr(
+            platform_registry, "plugin_entries",
+            lambda: [self._entry(calls)], raising=False,
+        )
+        try:
+            status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        except Exception:
+            pass  # unrelated sections may fail in a bare env; the probe is the contract
+        capsys.readouterr()
+
+        assert "deps_available_fn" in calls, (
+            "show_status never consulted deps_available_fn — a plugin whose "
+            "check_fn is also its SDK loader makes `hermes status` pay a "
+            "multi-minute import to print one line"
+        )
+        assert "check_fn" not in calls, (
+            f"show_status called the expensive loader anyway: {calls}"
+        )
+
+    def test_falls_back_to_check_fn_when_no_cheap_probe(self, monkeypatch, capsys):
+        """Plugins without a cheap probe must keep working unchanged."""
+        from hermes_cli import status as status_mod
+        from gateway.platform_registry import platform_registry
+
+        calls = []
+        entry = self._entry(calls)
+        object.__setattr__(entry, "deps_available_fn", None)
+        monkeypatch.setattr(
+            platform_registry, "plugin_entries", lambda: [entry], raising=False,
+        )
+        try:
+            status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        except Exception:
+            pass
+        capsys.readouterr()
+
+        assert "check_fn" in calls, (
+            "no deps_available_fn supplied, so check_fn must still be used"
+        )

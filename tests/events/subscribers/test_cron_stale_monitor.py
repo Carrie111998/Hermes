@@ -361,3 +361,144 @@ def test_ticker_check_failure_does_not_break_job_staleness_check(bus, monkeypatc
     mon.poll()  # must not raise
 
     assert _stale_events(bus) == []
+
+
+# =========================================================================
+# GATEWAY_STOPPED resolution (2026-08-16)
+#
+# gateway/run.py stamps every GATEWAY_STOPPED with the cron_started event_ids
+# of the runs it is about to kill (cron/inflight.py). Before this, a cron cut
+# short by a restart was indistinguishable from one that wedged: the monitor
+# kept it in _open_jobs and fired a generic HIGH-priority cron_stale ~20
+# minutes later. These pin the correct attribution and the suppression.
+# =========================================================================
+
+def _emit_gateway_stopped(bus, correlation_ids, exit_reason="graceful"):
+    return bus.emit(
+        event_type=EventType.GATEWAY_STOPPED,
+        source="gateway",
+        payload={
+            "exit_reason": exit_reason,
+            "inflight_cron_correlation_ids": list(correlation_ids),
+        },
+    )
+
+
+class TestGatewayStoppedResolution:
+    def test_resolves_the_inflight_job_and_attributes_the_shutdown(self, bus):
+        started_id = _emit_started(bus, "nightly-audit")
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+
+        evts = _stale_events(bus)
+        assert len(evts) == 1, "the killed run must be reported once, immediately"
+        payload = evts[0].payload
+        assert payload["job_id"] == "nightly-audit"
+        assert payload["scope"] == "gateway_stopped", (
+            "must be distinguishable from a wedge — mirrors the existing "
+            "scope='ticker' idiom"
+        )
+        assert payload["exit_reason"] == "graceful"
+        assert "nightly-audit" not in mon._open_jobs, "entry must be resolved"
+
+    def test_shutdown_report_is_not_a_high_priority_wedge_alarm(self, bus):
+        """A run killed by a deliberate restart is explained, not an emergency.
+        The generic wedge alert is HIGH; this one must be quieter."""
+        from events.schema import Priority
+
+        started_id = _emit_started(bus, "scout")
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+
+        evts = _stale_events(bus)
+        assert len(evts) == 1
+        assert evts[0].priority == Priority.NORMAL
+
+    def test_suppresses_the_later_generic_stale_alert(self, bus):
+        """The whole point: without this, the same run ALSO fires a generic
+        HIGH cron_stale once the threshold elapses — a false 'wedged' alarm
+        for a job the gateway itself killed."""
+        old = datetime.now(timezone.utc) - timedelta(seconds=99999)
+        started_id = _emit_started(bus, "long-job", started_at=old)
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+        mon.poll()  # a second sweep must not produce the generic alert
+
+        evts = _stale_events(bus)
+        assert len(evts) == 1, f"expected exactly one report, got {[e.payload for e in evts]}"
+        assert evts[0].payload["scope"] == "gateway_stopped"
+
+    def test_is_processed_even_though_it_carries_no_job_id(self, bus):
+        """Regression pin: handle() early-returns when payload has no job_id,
+        and GATEWAY_STOPPED has none. The shutdown branch must run BEFORE that
+        guard, or this feature is silently dead."""
+        started_id = _emit_started(bus, "job-x")
+        eid = _emit_gateway_stopped(bus, [started_id])
+        stopped = [e for e in bus.query() if e.event_id == eid][0]
+        assert "job_id" not in stopped.payload
+
+        mon = _monitor(bus)
+        mon.poll()
+
+        assert len(_stale_events(bus)) == 1
+
+    def test_unknown_correlation_id_is_silent(self, bus):
+        _emit_started(bus, "job-a")
+        _emit_gateway_stopped(bus, ["evt-never-seen"])
+        mon = _monitor(bus)
+
+        mon.poll()
+
+        assert _stale_events(bus) == []
+        assert "job-a" in mon._open_jobs, "an unrelated open job must be left alone"
+
+    def test_empty_or_missing_inflight_list_is_a_noop(self, bus):
+        _emit_started(bus, "job-a")
+        _emit_gateway_stopped(bus, [])
+        bus.emit(
+            event_type=EventType.GATEWAY_STOPPED,
+            source="gateway",
+            payload={"exit_reason": "restart"},  # key absent entirely
+        )
+        mon = _monitor(bus)
+
+        mon.poll()
+
+        assert _stale_events(bus) == []
+        assert "job-a" in mon._open_jobs
+
+    def test_completed_job_is_not_resolved_by_a_later_shutdown(self, bus):
+        """A run that finished normally is not 'killed by the shutdown'. Its
+        correlation id must stop resolving once a terminal event arrives."""
+        started_id = _emit_started(bus, "job-done")
+        bus.emit(
+            event_type=EventType.CRON_COMPLETED,
+            source="scheduler",
+            payload={"job_id": "job-done", "job_name": "job-done"},
+        )
+        _emit_gateway_stopped(bus, [started_id])
+        mon = _monitor(bus)
+
+        mon.poll()
+
+        assert _stale_events(bus) == []
+
+    def test_a_restart_resolves_only_the_runs_it_killed(self, bus):
+        started_a = _emit_started(bus, "job-killed")
+        _emit_started(bus, "job-still-running")
+        _emit_gateway_stopped(bus, [started_a])
+        mon = _monitor(bus)
+
+        mon.poll()
+
+        evts = _stale_events(bus)
+        assert len(evts) == 1
+        assert evts[0].payload["job_id"] == "job-killed"
+        assert "job-killed" not in mon._open_jobs
+        assert "job-still-running" in mon._open_jobs

@@ -15,6 +15,18 @@ from unittest.mock import patch
 
 import pytest
 
+
+class _ExitCalled(Exception):
+    """Sentinel raised by a patched ``os._exit`` so tests can observe the
+    forced-exit call without actually terminating the interpreter.
+
+    Mirrors the identical helper in ``test_gateway_process_exit.py``. It was
+    referenced at the ``fake_exit`` site below but never defined here, so if
+    that watchdog ever fired the handler raised ``NameError`` instead — latent
+    only because the sole test using this ``fake_exit`` disarms before firing.
+    """
+
+
 from gateway.shutdown_watchdog import (
     DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S,
     arm_shutdown_watchdog,
@@ -65,6 +77,50 @@ def test_arm_shutdown_watchdog_disarm_before_fire(tmp_path):
         time.sleep(0.5)
 
     assert exited == []
+
+
+def test_fake_exit_raises_exitcalled_when_watchdog_actually_fires(tmp_path):
+    """Regression: the watchdog fires with a ``fake_exit`` that raises
+    ``_ExitCalled`` — the exact path the disarm test never reaches.
+
+    ``os._exit`` is the final statement in the watchdog thread, so a raise
+    there propagates to ``threading.excepthook``. Before ``_ExitCalled`` was
+    defined in this module the handler raised ``NameError`` instead; capturing
+    the thread's exception proves the sentinel now resolves under a real fire.
+    """
+    done = threading.Event()
+    exited = []
+    captured: list[BaseException] = []
+
+    def fake_exit(code):
+        exited.append(code)
+        raise _ExitCalled(code)
+
+    def _hook(args):
+        captured.append(args.exc_value)
+
+    old_hook = threading.excepthook
+    threading.excepthook = _hook
+    try:
+        with patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit):
+            arm_shutdown_watchdog(
+                0.15,
+                done_event=done,
+                dump_path=tmp_path / "dump.log",
+                exit_code=7,
+            )
+            # Do NOT disarm — let it fire.
+            for _ in range(100):
+                if exited:
+                    break
+                time.sleep(0.02)
+    finally:
+        threading.excepthook = old_hook
+
+    assert exited == [7]
+    assert len(captured) == 1
+    assert isinstance(captured[0], _ExitCalled)
+    assert not isinstance(captured[0], NameError)
 
 
 def test_arm_shutdown_watchdog_fires_with_dump_and_exit(tmp_path):

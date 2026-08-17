@@ -1,37 +1,26 @@
-"""pytest config for the stress/ subdirectory.
+"""Pytest config for the stress/ subdirectory.
 
-These tests are slow (30s+), spawn subprocesses, and are not run by
-default. Enable via `pytest --run-stress` or by running the scripts
-directly.
+The stress scripts are ``__main__``-executable programs, not pytest
+modules: their logic lives under ``main()`` or behind a ``@scenario``
+decorator, and not one of them defines a module-level ``test_*`` function
+or ``Test*`` class. Collecting them directly would import eight modules,
+run their top-level code, and find zero tests.
 
-The scripts are primarily __main__-executable entry points; pytest
-isn't expected to collect individual test functions from them.
+So they stay ignored here, and ``test_stress_entrypoints.py`` is the one
+module pytest collects: it runs each script as a subprocess — the
+documented, supported way to run them — and asserts the exit code. Those
+tests carry the ``stress`` marker and are deselected by default; see
+``addopts`` in pyproject.toml. Run them with ``pytest tests/stress -m
+stress``.
 """
-import pytest
+from pathlib import Path
 
+_HERE = Path(__file__).parent
+_COLLECTED = {"conftest.py", "test_stress_entrypoints.py"}
 
-def pytest_collection_modifyitems(config, items):
-    if config.getoption("--run-stress", default=False):
-        return
-    skip_stress = pytest.mark.skip(
-        reason="stress test (opt-in via --run-stress or run script directly)"
-    )
-    for item in items:
-        if "tests/stress" in str(item.fspath):
-            item.add_marker(skip_stress)
-
-
-def pytest_addoption(parser):
-    parser.addoption(
-        "--run-stress",
-        action="store_true",
-        default=False,
-        help="Run the stress/battle-test suite (slow, spawns subprocesses).",
-    )
-
-
-collect_ignore_glob = [
-    # The stress scripts have top-level code and hard-coded paths; they're
-    # meant to run as `python tests/stress/<name>.py`, not as pytest modules.
-    "*.py",
-]
+# Ignore every other module in this directory by name, including any script
+# added later, so a new stress script can never silently become a
+# zero-test pytest module.
+collect_ignore = sorted(
+    p.name for p in _HERE.glob("*.py") if p.name not in _COLLECTED
+)

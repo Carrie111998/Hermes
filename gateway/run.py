@@ -9515,12 +9515,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._restart_requested:
                     _stop_payload["restart_detached"] = bool(self._restart_detached)
                     _stop_payload["restart_via_service"] = bool(self._restart_via_service)
-                # In-flight cron correlation_ids for spawn-task #1's
-                # CRON_ABORTED synthesizer to pick up. The cron tracker
-                # lives in cron/inflight.py (Codex's branch); fall back to
-                # an empty list if that module isn't on this branch yet.
+                # cron_started event_ids for every cron still in flight, so a
+                # consumer can tell which runs this shutdown cut short. Landed
+                # 2026-08-16: cron/inflight.py now exists and reads the Guard #3
+                # `_in_flight` registry in cron/scheduler.py. Before that the
+                # import always failed and this key shipped as [] on every
+                # GATEWAY_STOPPED since 2026-04-30.
+                #
+                # The try/except stays: this is the shutdown path, and the
+                # accessor is best-effort by contract (it returns [] rather
+                # than raising, but a failed import must not abort the emit).
                 try:
-                    from cron.inflight import current_inflight_correlation_ids  # type: ignore
+                    from cron.inflight import current_inflight_correlation_ids
                     _stop_payload["inflight_cron_correlation_ids"] = list(
                         current_inflight_correlation_ids()
                     )

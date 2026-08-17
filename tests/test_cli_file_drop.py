@@ -4,7 +4,8 @@ dragged/pasted absolute paths from being mistaken for slash commands."""
 
 import pytest
 
-from cli import _detect_file_drop
+from cli import _detect_file_drop, _resolve_attachment_path
+from tests.symlink_support import requires_symlinks
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +166,50 @@ class TestEscapedSpaces:
         assert result["path"] == tmp_image_with_spaces
         assert result["is_image"] is True
 
+    def test_file_uri_resolves_at_the_resolver(self, tmp_image_with_spaces):
+        """Pin the fix at the layer that owns it, not just via _detect_file_drop.
+
+        ``as_uri()`` on Windows yields ``file:///C:/...``; urlparse leaves the
+        path as ``/C:/...``. ``Path("/C:/x")`` has an empty drive on Windows, so
+        ``is_absolute()`` is False and the path gets joined onto the cwd — and
+        on POSIX the same leading slash blocks the ``/mnt/<drive>`` mapping.
+        """
+        assert _resolve_attachment_path(tmp_image_with_spaces.as_uri()) == tmp_image_with_spaces
+
+    def test_file_uri_without_spaces(self, tmp_image):
+        """Percent-decoding is not what makes the URI case work."""
+        assert _resolve_attachment_path(tmp_image.as_uri()) == tmp_image
+
+    def test_file_uri_with_drive_as_authority(self, tmp_image):
+        """``"file://" + windows_path`` puts the drive in the authority.
+
+        Naive string concatenation produces ``file://C:/x`` (two slashes, not
+        three), so urlparse reads ``C:`` as the netloc and leaves ``/x`` as the
+        path. On POSIX the same expression yields a well-formed
+        ``file:///tmp/...`` because the path already starts with a slash, so
+        this asserts the same resolution on both platforms.
+        """
+        uri = "file://" + str(tmp_image).replace("\\", "/")
+        assert _resolve_attachment_path(uri) == tmp_image
+
+    def test_file_uri_with_localhost_authority(self, tmp_image):
+        """RFC 8089: an authority of ``localhost`` means the local machine.
+
+        It must be treated as an empty authority, not spliced in as a UNC host.
+        """
+        uri = tmp_image.as_uri().replace("file://", "file://localhost", 1)
+        assert _resolve_attachment_path(uri) == tmp_image
+
+    def test_file_uri_unc_authority_is_not_mangled_into_a_local_path(self):
+        """A genuine UNC authority must stay a UNC reference, never a local path.
+
+        No such share exists here, so the observable contract is "returns None
+        rather than resolving to something local, and does not raise". The
+        string-level preservation of ``//server/share/...`` is covered by the
+        edge-case probe recorded in the commit message.
+        """
+        assert _resolve_attachment_path("file://server/share/a.png") is None
+
 
 # ---------------------------------------------------------------------------
 # Tests: edge cases
@@ -186,6 +231,7 @@ class TestEdgeCases:
         assert result is not None
         assert result["is_image"] is False
 
+    @requires_symlinks
     def test_symlink_to_file(self, tmp_image, tmp_path):
         link = tmp_path / "link.png"
         link.symlink_to(tmp_image)

@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests._home_isolation import redirect_home
+
 import tools.file_tools as ft
 import tools.terminal_tool as terminal_tool
 
@@ -101,7 +103,9 @@ class TestResolvePathUsesProfileHome:
         process_home = tmp_path / "process_home"
         process_home.mkdir()
 
-        monkeypatch.setenv("HOME", str(process_home))
+        # Redirect the resolver too: on Windows $HOME alone is not read by
+        # expanduser/Path.home(), which would make this negative control inert.
+        redirect_home(monkeypatch, process_home)
         monkeypatch.setattr(terminal_tool, "_session_cwd", {})
 
         with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):
@@ -117,7 +121,9 @@ class TestResolvePathUsesProfileHome:
         process_home = tmp_path / "process_home"
         process_home.mkdir()
 
-        monkeypatch.setenv("HOME", str(process_home))
+        # Redirect the resolver too: on Windows $HOME alone is not read by
+        # expanduser/Path.home(), which would make this negative control inert.
+        redirect_home(monkeypatch, process_home)
         monkeypatch.setattr(terminal_tool, "_session_cwd", {})
 
         with patch("hermes_constants.get_subprocess_home", return_value=str(profile_home)):

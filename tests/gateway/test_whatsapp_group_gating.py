@@ -439,3 +439,34 @@ def test_is_broadcast_chat_helper_recognizes_common_jids():
     assert WhatsAppAdapter._is_broadcast_chat("120363001234567890@g.us") is False
     assert WhatsAppAdapter._is_broadcast_chat("") is False
     assert WhatsAppAdapter._is_broadcast_chat(None) is False  # type: ignore[arg-type]
+
+
+# ---------------- WHATSAPP_MENTION_PATTERNS env parsing (F821 regression) ----
+
+def test_env_mention_patterns_parse_as_json_list(monkeypatch):
+    """Regression for the F821 NameError on bare ``json`` in the adapter.
+
+    ``json.loads`` sat inside a ``try/except Exception`` here, so the NameError
+    was swallowed and a JSON-list env var fell through to the newline/comma
+    splitter. The whole ``'["^chompy", "^hermes"]'`` string then compiled as a
+    single regex — and because it is bracket-delimited it became a *character
+    class*, matching almost any message and defeating ``require_mention``.
+    """
+    monkeypatch.setenv("WHATSAPP_MENTION_PATTERNS", json.dumps([r"^chompy", r"^hermes"]))
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    assert [p.pattern for p in adapter._mention_patterns] == [r"^chompy", r"^hermes"]
+    assert adapter._should_process_message(_group_message("chompy status")) is True
+    assert adapter._should_process_message(_group_message("hermes status")) is True
+    # The char-class failure mode matched this; correct parsing must not.
+    assert adapter._should_process_message(_group_message("completely unrelated")) is False
+
+
+def test_env_mention_patterns_accept_newline_separated_fallback(monkeypatch):
+    """Non-JSON env values still fall back to newline splitting."""
+    monkeypatch.setenv("WHATSAPP_MENTION_PATTERNS", "^chompy\n^hermes")
+    adapter = _make_adapter(require_mention=True, group_policy="open")
+
+    assert [p.pattern for p in adapter._mention_patterns] == [r"^chompy", r"^hermes"]
+    assert adapter._should_process_message(_group_message("chompy status")) is True
+    assert adapter._should_process_message(_group_message("completely unrelated")) is False

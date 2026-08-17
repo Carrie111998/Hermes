@@ -378,9 +378,14 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
-    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
-    reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
+    Also redirects HERMES_HOME to a per-test tempdir so code that reads
+    ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
     datetime/locale-sensitive tests are deterministic.
+
+    HOME is deliberately *not* redirected here (see step 3). A test that needs
+    its home isolated must do it itself via
+    ``tests._home_isolation.redirect_home`` — setting ``$HOME`` alone does not
+    isolate on Windows.
     """
     # 1. Blank every credential-shaped env var that's currently set.
     for name in list(os.environ.keys()):
@@ -404,8 +409,12 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    NOTE: We do NOT also redirect HOME. Doing so broke CI because
     #    some tests (and their transitive deps) spawn subprocesses that
     #    inherit HOME and expect it to be stable. If a test genuinely
-    #    needs HOME isolated, it should set it explicitly in its own
-    #    fixture. Any code in the codebase reading ``~/.hermes/*`` via
+    #    needs HOME isolated, it should do so in its own fixture via
+    #    ``tests._home_isolation.redirect_home`` -- setting ``$HOME`` on
+    #    its own is NOT isolation on Windows, where ``Path.home()`` and
+    #    ``os.path.expanduser`` read ``USERPROFILE`` and ignore ``HOME``
+    #    (which is typically unset there), so the real home still wins.
+    #    Any code in the codebase reading ``~/.hermes/*`` via
     #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
     #    is a bug to fix at the callsite.
     fake_hermes_home = tmp_path / "hermes_test"
@@ -682,6 +691,73 @@ def _reset_module_state():
         pass
 
     yield
+
+
+# ── hermes_logging file handlers — module-global, tmp_path-rooted ──────────
+
+def _live_hermes_logging():
+    """Return ``hermes_logging`` if it is imported AND is the real module.
+
+    Looked up in ``sys.modules`` rather than imported, for the same reason as
+    every block in ``_reset_module_state`` above: a module that was never
+    imported has no handlers to reset, and importing it here would charge its
+    cost (concurrent-log-handler, portalocker) to every test's fixture setup.
+
+    Several tests stub the name with a ``types.SimpleNamespace`` via
+    ``monkeypatch.setitem(sys.modules, "hermes_logging", ...)``; the attribute
+    check filters those out so we never call a stub.
+    """
+    mod = sys.modules.get("hermes_logging")
+    return mod if hasattr(mod, "_reset_queued_handlers") else None
+
+
+@pytest.fixture(autouse=True)
+def _reset_hermes_file_logging():
+    """Tear down hermes_logging's rotating file handlers around every test.
+
+    ``hermes_logging`` holds its file handlers in a module-global list
+    (``_queued_file_handlers``) that a background ``QueueListener`` thread
+    dispatches to. That global is correct in production — a process has one
+    HERMES_HOME for its whole life — but every test here gets a *different*
+    HERMES_HOME under its own ``tmp_path`` (see ``_hermetic_environment``),
+    and ``tmp_path_retention_policy = "failed"`` deletes that directory the
+    moment the test passes. A handler registered by one test therefore
+    outlives its log directory, and the next test in the process that emits a
+    record makes the listener thread write into a path that no longer exists::
+
+        --- Logging error ---
+        concurrent_log_handler ... FileNotFoundError: [Errno 2] No such file
+        or directory: '...\\pytest-NNN\\test_xxx0\\hermes_test\\logs\\.__errors.lock'
+
+    Because it is raised on the listener thread, that spew is attributed to no
+    test and fails nothing — it just corrupts the output of whatever ran next.
+
+    Resetting on *teardown* also lets pytest actually reclaim the tempdir: on
+    Windows ``concurrent-log-handler`` keeps its ``.__<name>.lock`` file open
+    for the handler's lifetime, and an open handle blocks the directory
+    removal that the "failed" retention policy is there to perform.
+
+    ``_logging_initialized`` is cleared alongside the handlers because
+    ``setup_logging()`` checks it *before* registering agent.log/errors.log:
+    left set with an empty handler list, the next test's ``setup_logging()``
+    call would silently attach nothing. The two are reset together in
+    tests/test_hermes_logging.py's own fixture for the same reason.
+
+    Pinned by tests/test_logging_handler_isolation.py.
+    """
+    def _reset(mod):
+        if mod is None:
+            return
+        mod._reset_queued_handlers()
+        mod._logging_initialized = False
+
+    # Capture at setup: a test may replace sys.modules["hermes_logging"] with a
+    # stub in its body, and monkeypatch's undo runs after this fixture's
+    # teardown, so the lookup below could otherwise come back empty.
+    captured = _live_hermes_logging()
+    _reset(captured)
+    yield
+    _reset(_live_hermes_logging() or captured)
 
 
 @pytest.fixture()
@@ -1073,8 +1149,23 @@ def _live_system_guard(request, monkeypatch):
     )
     # ``curl … | sh``-style one-liners: fetch a remote script, pipe it into a
     # shell. Provider-supplied memory-backend setup snippets take this shape.
-    _REMOTE_FETCH_HEADS = ("curl", "wget", "iwr", "invoke-webrequest")
+    # ``irm``/``invoke-restmethod`` are here because PowerShell's canonical
+    # download-and-execute one-liner uses them, not ``iwr`` — their absence
+    # was half of why the cua-driver installer walked straight past this guard
+    # (see _is_powershell_remote_exec for the other half).
+    _REMOTE_FETCH_HEADS = (
+        "curl", "wget", "iwr", "invoke-webrequest", "irm", "invoke-restmethod",
+    )
     _REMOTE_SHELL_HEADS = ("sh", "bash", "zsh", "dash", "iex", "invoke-expression")
+
+    # PowerShell download-and-execute: the Windows twin of ``curl … | sh``.
+    _PS_HEADS = ("powershell", "pwsh")
+    _PS_FETCH_CMDLETS = (
+        "irm", "invoke-restmethod", "iwr", "invoke-webrequest",
+        "downloadstring", "downloadfile", "start-bitstransfer",
+    )
+    _PS_EXEC_CMDLETS = ("iex", "invoke-expression")
+    _PS_B64_RE = re.compile(r"^[A-Za-z0-9+/]{16,}={0,2}$")
 
     def _exe_head(tok: str) -> str:
         head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
@@ -1237,6 +1328,64 @@ def _live_system_guard(request, monkeypatch):
             seg.split() and _exe_head(seg.split()[0]) in _REMOTE_SHELL_HEADS
             for seg in segments[1:]
         )
+
+    def _ps_decoded_payloads(tokens):
+        """Yield decoded ``-EncodedCommand`` payloads (base64 UTF-16LE).
+
+        Without this the guard is one flag away from being bypassed: the exact
+        same one-liner survives verbatim as
+        ``powershell -EncodedCommand <base64>``. Every token is tried rather
+        than parsing the flag name, because PowerShell accepts any unambiguous
+        prefix (``-e``, ``-en``, ``-enc``, …); a token that is not valid base64
+        UTF-16LE simply yields nothing. Only reached once the head is already
+        known to be PowerShell, so this costs nothing on other spawns.
+        """
+        import base64 as _b64
+
+        for tok in tokens:
+            if not _PS_B64_RE.match(tok):
+                continue
+            try:
+                raw = _b64.b64decode(tok, validate=True)
+            except Exception:
+                continue
+            yield raw.decode("utf-16-le", errors="ignore").lower()
+
+    def _is_powershell_remote_exec(cmd) -> bool:
+        """True if *cmd* is PowerShell fetching a remote script and running it.
+
+        ``_is_remote_installer_pipe`` cannot see this shape. It splits the
+        command on ``|`` and requires a fetch verb to HEAD a segment, but in
+        ``powershell -Command "irm … | iex"`` the whole pipeline sits inside a
+        single argv element, so segment 0 is headed by ``powershell`` and the
+        fetch verb heads nothing. ``iex (irm …)`` has no pipe at all.
+
+        This is the gap the 2026-08-16 incident fell through: a test stub
+        pointed at a not-yet-called seam let
+        ``hermes_cli/tools_config.py``'s real
+        ``powershell -Command "irm …/install.ps1 | iex"`` run against the
+        network and hang the session, with this guard sitting directly
+        underneath it saying nothing.
+
+        Requires ALL THREE of a URL, a fetch cmdlet and an exec cmdlet — so the
+        in-repo PowerShell callers that merely query CIM or format JSON
+        (``hermes_cli/claw.py``, ``session_bridge/mcp_server.py``,
+        ``tools/environments/local.py``) keep working. A command that only
+        mentions a URL is not blocked.
+        """
+        tokens = _cmd_words(cmd)
+        if not tokens or _exe_head(tokens[0]) not in _PS_HEADS:
+            return False
+        payloads = [" ".join(tokens[1:]).lower()]
+        payloads.extend(_ps_decoded_payloads(tokens[1:]))
+        for text in payloads:
+            if "://" not in text:
+                continue
+            if not any(f in text for f in _PS_FETCH_CMDLETS):
+                continue
+            if any(re.search(rf"\b{e}\b", text) for e in _PS_EXEC_CMDLETS):
+                return True
+        return False
 
     def _cmd_to_string(cmd) -> str:
         if cmd is None:
@@ -1476,6 +1625,24 @@ def _live_system_guard(request, monkeypatch):
                 "'<that module>.run_text_capture' instead. Mark with "
                 "@pytest.mark.live_system_guard_bypass only if a real "
                 "package install is genuinely the point."
+            )
+        if _is_powershell_remote_exec(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this is PowerShell's "
+                "download-and-execute one-liner (irm/iwr/DownloadString piped "
+                "or passed into iex). It runs whatever the remote host serves, "
+                "on this machine, from a test run. On 2026-08-16 exactly this "
+                "argv — hermes_cli/tools_config.py's cua-driver install, "
+                "'irm .../install.ps1 | iex' — escaped a stub that was pointed "
+                "at a seam the code did not call yet, reached the network, and "
+                "hung the session on the capture-pipe reader thread. Patch the "
+                "transport too: stub 'subprocess.Popen' (which every helper "
+                "bottoms out in) alongside "
+                "'hermes_cli._subprocess_compat.run_text_capture', so a dead "
+                "seam fails closed instead of shelling out. Mark with "
+                "@pytest.mark.live_system_guard_bypass only if genuinely "
+                "intended."
             )
         if _is_remote_installer_pipe(cmd):
             raise RuntimeError(

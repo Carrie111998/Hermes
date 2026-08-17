@@ -90,9 +90,17 @@ class TestCreateSessionDriverStamp:
 
 class TestDriverInSessionListing:
     def test_list_sessions_rich_exposes_driver(self, db, monkeypatch) -> None:
+        # detect_session_driver reads THREE markers, so clearing CLAUDECODE
+        # alone does not make a session undriven. Running this suite from a
+        # Claude Code session (the common case on a dev box) exports both
+        # CLAUDECODE and CLAUDE_CODE_ENTRYPOINT, and the leftover entrypoint
+        # made "s-undriven" stamp claude-code anyway. Isolate from the ambient
+        # environment first, exactly as test_no_driver_env_means_no_stamp does.
+        monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_DRIVER", raising=False)
         monkeypatch.setenv("CLAUDECODE", "1")
         db.create_session(session_id="s-driven", source="cli")
-        monkeypatch.delenv("CLAUDECODE")
+        monkeypatch.delenv("CLAUDECODE", raising=False)
         db.create_session(session_id="s-undriven", source="cli")
 
         rows = {

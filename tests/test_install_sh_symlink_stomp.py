@@ -20,6 +20,7 @@ import stat
 import subprocess
 from pathlib import Path
 
+from tests.symlink_support import requires_symlinks
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +58,7 @@ def test_setup_path_shim_block_removes_old_link_before_writing() -> None:
     )
 
 
+@requires_symlinks
 def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -> None:
     """Behavioral repro: simulate prior-install symlink + new-install heredoc.
 

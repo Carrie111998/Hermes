@@ -5576,8 +5576,14 @@ def _platform_status(platform: dict) -> str:
             # is defined and returned False; that would let "SDK is
             # installed" override "no token configured" and incorrectly
             # report the platform as ready.
+            # "Are deps present" is exactly what deps_available_fn answers, and
+            # it must be preferred: for adapters that defer a heavy SDK,
+            # check_fn *is* the loader (Feishu's imports lark_oapi, ~10k
+            # modules, measured 238-405s here). Falls back to check_fn for
+            # plugins that supply no cheap probe.
+            deps_probe = entry.deps_available_fn or entry.check_fn
             try:
-                configured = bool(entry.check_fn())
+                configured = bool(deps_probe())
             except Exception:
                 configured = False
         return "configured" if configured else "not configured"

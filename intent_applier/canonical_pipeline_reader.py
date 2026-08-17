@@ -28,6 +28,8 @@ import os
 from pathlib import Path
 from typing import Callable, Optional
 
+from hermes_constants import get_default_hermes_root
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,7 +61,16 @@ def load_canonical_business_states(path: Path) -> dict[str, str]:
 
 
 def _default_canonical_path() -> Path:
-    root = Path(os.environ.get("HERMES_ROOT", str(Path.home() / ".hermes")))
+    """Tracker canonical pipeline.json under the canonical ~/.hermes root.
+
+    ``HERMES_ROOT`` remains an explicit override; the fallback uses
+    ``get_default_hermes_root()`` instead of ``Path.home() / ".hermes"`` so a
+    test-scoped ``HERMES_HOME`` can redirect it. Production is unchanged —
+    both an unset and a profile-scoped ``HERMES_HOME`` resolve to ``~/.hermes``.
+    Mirrors the same fix in ``events/subscribers/tracker_intent_applier.py``.
+    """
+    override = os.environ.get("HERMES_ROOT")
+    root = Path(override) if override else get_default_hermes_root()
     return root / "profiles" / "tracker" / "workspace" / "pipeline.json"
 
 

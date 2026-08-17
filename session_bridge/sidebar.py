@@ -398,20 +398,20 @@ def _validated_hydration_payload(
         "source_hash": payload.source_hash,
         "source_session_id": source_id,
     }
-    for field in (
+    for key in (
         "bridge_id",
         "codex_thread_id",
         "source_cursor",
         "source_hash",
     ):
-        value = values[field]
+        value = values[key]
         if (
             not isinstance(value, str)
             or not value
             or value != value.strip()
             or _has_line_break(value)
         ):
-            raise ValueError(f"hydration marker {field} is malformed")
+            raise ValueError(f"hydration marker {key} is malformed")
     if payload.preview_version != 1:
         raise ValueError("hydration marker preview version must be 1")
     if _PREVIEW_DIGEST_RE.fullmatch(payload.preview_digest) is None:

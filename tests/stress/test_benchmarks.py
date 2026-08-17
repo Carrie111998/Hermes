@@ -210,8 +210,11 @@ def main():
     for r in results:
         print(f"{r['label']:<50} {r['min_ms']:>7.1f}ms {r['median_ms']:>7.1f}ms {r['max_ms']:>7.1f}ms")
 
-    # Save for future diffing.
-    out_path = "/tmp/kanban_bench_results.json"
+    # Save for future diffing. Deliberately the system temp dir, not this
+    # run's HERMES_HOME, which is deleted when the run ends — the point is
+    # to still be there next time. Not a literal "/tmp": on Windows that
+    # resolves against the current drive (C:\tmp\...).
+    out_path = os.path.join(tempfile.gettempdir(), "kanban_bench_results.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {out_path}")

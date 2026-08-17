@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 
 def _run_apply_profile_override(
@@ -127,6 +129,10 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
     def test_sudo_explicit_profile_resolves_invoking_users_profile(self, tmp_path, monkeypatch):
         """sudo elias ... should resolve `-p elias` under SUDO_USER, not root."""
+        # POSIX-only: the code under test (_resolve_sudo_user_profile_env) is
+        # itself gated behind `hasattr(os, "geteuid")` and imports pwd.
+        pwd = pytest.importorskip("pwd", reason="pwd is POSIX-only")
+
         root_home = tmp_path / "root"
         user_home = tmp_path / "home" / "hermes"
         profile_dir = user_home / ".hermes" / "profiles" / "elias"
@@ -138,8 +144,6 @@ class TestApplyProfileOverrideHermesHomeGuard:
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
         monkeypatch.setattr(sys, "argv", ["hermes", "-p", "elias", "gateway", "install", "--system"])
-
-        import pwd
 
         monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_dir=str(user_home)))
 

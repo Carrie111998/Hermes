@@ -10,33 +10,41 @@ sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
 sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
+import pytest
+
 import cron.scheduler as cron_scheduler
 import gateway.run as gateway_run
 import run_agent
 from gateway.config import Platform
 from gateway.session import SessionSource
 
-# Both tests below drive a real agent through ``cron_scheduler.run_job`` /
-# ``gateway_run``, which build a system prompt and run the conversation loop
-# inside a ThreadPoolExecutor. Measured on a dev box with --timeout=0:
+# ── Cold-import budget ─────────────────────────────────────────────────────
 #
-#   run 1   43.80s / 53.86s      run 2   26.41s / 13.90s
+# The live-I/O that used to dominate these tests is gone — see the
+# ``_no_live_host_probes`` fixture in tests/cron/conftest.py, which removed a
+# 9.60s host toolchain probe and a 2.48s authenticated GET to chatgpt.com.
+# Measured effect on ``pytest tests/cron``, same commit, same machine:
+# test_cron_run_job_codex_path_handles_internal_401_refresh 33.93s -> 12.98s.
 #
-# The 2-3x spread across runs of identical code is machine load, so no single
-# number is meaningful; what is stable is that this comfortably exceeds the
-# 30s cap in pyproject addopts. When it trips, ``--timeout-method=thread``
-# hard-exits the interpreter and the whole run loses its summary line — a
-# monolithic ``pytest tests/events tests/cron`` died exactly here at 59%.
+# What remains is cold third-party import cost, not live I/O. Building the
+# agent's OpenAI client reaches ``_build_keepalive_http_client``, which is the
+# first thing in a run to import httpx/h11, and ``init_agent`` similarly first
+# imports mcp and loads the certifi CA bundle. Whichever test triggers those
+# pays for them, inside its own call phase where pytest-timeout can see it.
+# Run order therefore decides the number: 12.98s when an earlier cron file had
+# already imported httpx, but >30s when this file runs first in the process.
 #
-# This is NOT the platform-SDK import tax that ``_iter_home_target_platforms``
-# used to pay (fixed separately). An import profile of this file shows the
+# It is also NOT the platform-SDK import tax that ``_iter_home_target_platforms``
+# used to pay (fixed separately): an import profile of this file shows the
 # second test spending 15.78s while importing just SIX modules, and imports on
-# non-main threads totalling 0.127s — the cost is real agent-bootstrap and
-# conversation-loop execution, not module loading. So this mark declares a
-# budget rather than papering over a removable cost; shrinking it means making
-# agent bootstrap cheaper, which is out of scope here.
+# non-main threads totalling 0.127s. So this mark declares a real budget rather
+# than papering over a removable cost.
 #
-# Not an xfail — every assertion below is unchanged and still enforced.
+# The 30s ``addopts`` cap is documented in pyproject.toml as the fallback
+# inside each per-file subprocess of scripts/run_tests_parallel.py, where the
+# import lands at collection time and pytest-timeout never sees it. This mark
+# gives the same budget to a monolithic ``pytest tests/events tests/cron``
+# run. Not an xfail — every assertion below is unchanged and still enforced.
 pytestmark = pytest.mark.timeout(180)
 
 
@@ -115,6 +123,50 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
 
         self._interruptible_api_call = _fake_api_call
         return super().run_conversation(user_message, conversation_history=conversation_history, task_id=task_id)
+
+
+class TestNoLiveHostProbes:
+    """Guards the ``_no_live_host_probes`` fixture in ``tests/cron/conftest.py``.
+
+    Both assertions fail if that autouse fixture is removed, which is the
+    regression that made this file's 401-refresh tests overrun the 30s
+    ``addopts`` timeout and hard-exit the whole pytest process.
+    """
+
+    def test_codex_context_resolution_does_not_reach_the_network(self, monkeypatch):
+        import agent.model_metadata as mm
+
+        # Record rather than raise: _fetch_codex_oauth_context_lengths wraps
+        # the request in `except Exception`, so a raising tripwire is
+        # swallowed and the test would pass even while calling out.
+        calls = []
+
+        def _record(*args, **kwargs):
+            calls.append(args[0] if args else kwargs.get("url"))
+            raise RuntimeError("blocked by test")
+
+        monkeypatch.setattr(mm.requests, "get", _record)
+        # An hour-long module cache would also suppress the request; clear it
+        # so this asserts the stub, not a warm cache.
+        monkeypatch.setattr(mm, "_codex_oauth_context_cache", {})
+        monkeypatch.setattr(mm, "_codex_oauth_context_cache_time", 0.0)
+
+        # Falls back to _CODEX_OAUTH_CONTEXT_FALLBACK, exactly as the live
+        # probe does when it fails.
+        assert mm._resolve_codex_oauth_context_length(
+            "gpt-5.3-codex", "codex-token"
+        ) == 272_000
+        assert calls == [], f"live outbound request(s) during a unit test: {calls}"
+
+    def test_env_probe_never_spawns_a_host_probe_thread(self):
+        from tools import env_probe
+
+        assert env_probe.get_environment_probe_line() == ""
+        assert env_probe._PROBE_THREAD is None, (
+            "env_probe started its worker thread — it shells out to "
+            "python3/pip on the developer's host and blocks system-prompt "
+            "construction for its full 10s wait timeout"
+        )
 
 
 def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):

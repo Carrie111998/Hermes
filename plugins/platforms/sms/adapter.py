@@ -25,7 +25,10 @@ import hmac
 import logging
 import os
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:  # imported lazily at runtime inside the webhook handler
+    import aiohttp
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -410,18 +413,19 @@ class SmsAdapter(BasePlatformAdapter):
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _strip_markdown_for_sms(message: str) -> str:
-    """Strip markdown — SMS renders it as literal characters."""
-    message = re.sub(r"\*\*(.+?)\*\*", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"\*(.+?)\*", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"__(.+?)__", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"_(.+?)_", r"\1", message, flags=re.DOTALL)
-    message = re.sub(r"```[a-z]*\n?", "", message)
-    message = re.sub(r"`(.+?)`", r"\1", message)
-    message = re.sub(r"^#{1,6}\s+", "", message, flags=re.MULTILINE)
-    message = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", message)
-    message = re.sub(r"\n{3,}", "\n\n", message)
-    return message.strip()
+# NOTE: the module-level ``_strip_markdown_for_sms`` that used to live here was
+# removed 2026-08-16.  It duplicated ``gateway.platforms.helpers.strip_markdown``
+# (already imported above and used by the adapter class at ``_format_message``)
+# but called ``re.sub`` without ``re`` ever being imported, so it raised
+# ``NameError`` on its FIRST substitution — unconditionally, for every message
+# on this path, not only markdown-bearing ones.  Caught by ruff F821 when the
+# Pyflakes F group was re-enabled; it had no test coverage at all.
+#
+# Replaced by the shared helper rather than repaired with ``import re``:
+# restoring the duplicate would have switched ON regexes measurably worse than
+# the shared ones (bare ``_(.+?)_`` collapses ``snake_case_names`` to
+# ``snakecasenames``; ``[a-z]*`` fences leave "Python"/"++" behind).  Both are
+# pinned in tests/gateway/test_sms.py::TestSmsStandaloneSendMarkdown.
 
 
 async def _standalone_send(
@@ -447,7 +451,7 @@ async def _standalone_send(
     if not account_sid or not auth_token or not from_number:
         return {"error": "SMS not configured (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER required)"}
 
-    message = _strip_markdown_for_sms(message)
+    message = strip_markdown(message)
 
     def _redacted_error(text):
         try:

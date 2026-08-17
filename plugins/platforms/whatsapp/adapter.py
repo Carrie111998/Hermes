@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -25,7 +26,10 @@ import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import TYPE_CHECKING, Dict, Optional, Any
+
+if TYPE_CHECKING:
+    import aiohttp
 
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (

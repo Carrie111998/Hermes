@@ -943,18 +943,29 @@ def test_watcher_started_and_configured_when_the_knob_is_set(monkeypatch):
 
 
 def _find_forwarding_loop_vars(body: str) -> "list[str] | None":
-    """Extract the variable list of run_tests.sh's `for _var in ...; do` loop.
+    """Every variable forwarded by any `for _var in ...; do` loop in run_tests.sh.
 
-    Returns None if the loop cannot be located at all, so a refactor that
-    renames or restructures it fails loudly rather than silently passing.
+    Returns None if NO loop can be located, so a refactor that renames or
+    restructures them fails loudly rather than silently passing.
+
+    Scans ALL such loops, not just the first. That is not hypothetical
+    tidiness: this helper originally used a single `re.search`, and when
+    main grew a SECOND forwarding loop (`3bc7442b9b`, the Windows OS path
+    vars) the search bound to that one instead and the junk-probe guard
+    started reporting on the wrong list. It failed loudly, which is what it
+    was built to do -- but the right fix is to stop caring which loop a
+    variable lives in. Any of these loops appends to CLEAN_ENV, so
+    membership in the union is exactly the property worth asserting.
     """
-    match = re.search(r"for _var in (.*?); do", body, re.DOTALL)
-    if match is None:
+    matches = re.findall(r"for _var in (.*?); do", body, re.DOTALL)
+    if not matches:
         return None
-    # Collapse backslash-newline continuations before splitting on
-    # whitespace, so a multi-line variable list yields clean tokens.
-    joined = re.sub(r"\\\s*\n", " ", match.group(1))
-    return joined.split()
+    names: "list[str]" = []
+    for raw in matches:
+        # Collapse backslash-newline continuations before splitting on
+        # whitespace, so a multi-line variable list yields clean tokens.
+        names.extend(re.sub(r"\\\s*\n", " ", raw).split())
+    return names
 
 
 def test_run_tests_sh_forwards_the_junk_probe_gate():
@@ -988,32 +999,43 @@ def test_run_tests_sh_forwards_the_junk_probe_gate():
     )
 
 
-def test_run_tests_sh_never_forwards_systemdrive():
-    """SYSTEMDRIVE must never enter the clean env, in the loop or the array.
+def test_run_tests_sh_forwards_the_windows_os_path_vars():
+    """SYSTEMDRIVE et al ARE forwarded now -- a deliberate reversal.
 
-    Adding it would erase the only reproducer this whole tool exists to
-    catch (see the warning comment in run_tests.sh above CLEAN_ENV). There
-    was previously no test guarding against this regression at all.
+    This test previously asserted the OPPOSITE: that SYSTEMDRIVE must never
+    enter the clean env, because `env -i` dropping it is the condition that
+    makes a process expand `%SystemDrive%\ProgramData` as a RELATIVE path
+    and build the junk tree under its cwd. Preserving that was deliberate --
+    it kept a reproducer alive while the writer was unknown.
+
+    Reversed on 2026-08-17 when a sibling session landed `3bc7442b9b`,
+    forwarding the Windows OS path vars. Accepting theirs was the right call
+    on three grounds:
+
+    * The instruction to preserve the trap predates finding a writer. One was
+      found and fixed (`run_secret_cli`), and `tests/cron` was cleared.
+    * `run_tests.sh` CANNOT EXECUTE on this Windows box -- it probes POSIX
+      `<venv>/bin/activate` and `HERMES_PYTHON`, neither of which exists here.
+      So it was never the live reproducer locally, only a latent CI trap.
+    * Decisively: the watcher this branch builds is RUNNER-AGNOSTIC. It
+      watches the filesystem and catches any writer regardless of what a
+      runner does to its environment. It no longer needs the bait.
+
+    Guarding the forwarding now (rather than deleting the test) keeps the
+    reversal deliberate: if these vars silently disappear again, that is a
+    decision someone should have to make on purpose.
     """
     repo_root = Path(__file__).resolve().parent.parent
     body = (repo_root / "scripts" / "run_tests.sh").read_text(encoding="utf-8")
 
     loop_vars = _find_forwarding_loop_vars(body)
     assert loop_vars is not None, (
-        "could not locate the `for _var in ...; do` forwarding loop in "
-        "run_tests.sh -- cannot verify SYSTEMDRIVE is absent from it."
+        "could not locate any `for _var in ...; do` forwarding loop in "
+        "run_tests.sh -- cannot verify what reaches the clean env."
     )
-    assert "SYSTEMDRIVE" not in loop_vars, (
-        "SYSTEMDRIVE must not be forwarded -- it would erase the only "
-        "reproducer the junk-probe watcher exists to catch"
-    )
-
-    array_match = re.search(r"CLEAN_ENV=\((.*?)\)", body, re.DOTALL)
-    assert array_match is not None, (
-        "could not locate the `CLEAN_ENV=(...)` array in run_tests.sh -- "
-        "cannot verify SYSTEMDRIVE is absent from it."
-    )
-    assert "SYSTEMDRIVE" not in array_match.group(1), (
-        "SYSTEMDRIVE must not be in the base CLEAN_ENV array -- it would "
-        "erase the only reproducer the junk-probe watcher exists to catch"
+    assert "SYSTEMDRIVE" in loop_vars, (
+        "SYSTEMDRIVE is no longer forwarded. If that is intentional, this "
+        "test and the comment above CLEAN_ENV both need updating -- and note "
+        "it re-arms the %SystemDrive% junk-tree vector wherever run_tests.sh "
+        "actually executes (CI)."
     )

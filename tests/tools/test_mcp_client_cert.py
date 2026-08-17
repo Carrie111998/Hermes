@@ -15,9 +15,12 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from tests._home_isolation import redirect_home
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +87,15 @@ class TestResolveClientCert:
     def test_tilde_expansion(self, tmp_path, monkeypatch):
         from tools.mcp_tool import _resolve_client_cert
 
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         pem = tmp_path / "client.pem"
         pem.write_text("dummy")
 
         result = _resolve_client_cert("srv", {"client_cert": "~/client.pem"})
-        assert result == str(pem)
+        # expanduser splices the home onto the literal "~/..." suffix, so on
+        # Windows the result carries a mixed separator (``C:\\tmp\\x/client.pem``).
+        # That path is valid; compare as paths rather than byte-identical strings.
+        assert Path(result) == pem
 
     def test_missing_file_raises(self, tmp_path):
         from tools.mcp_tool import _resolve_client_cert

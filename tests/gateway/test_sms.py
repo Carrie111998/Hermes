@@ -561,3 +561,164 @@ class TestWebhookSignatureEnforcement:
         request = self._mock_request(oversized, content_length=None)
         resp = await adapter._handle_webhook(request)
         assert resp.status == 413
+
+
+# ── Out-of-process cron delivery (_standalone_send) ──────────────────
+
+class TestSmsStandaloneSendMarkdown:
+    """Guards the markdown strip on the out-of-process SMS send path.
+
+    ``tools/send_message_tool.py`` reaches this path via the platform
+    registry (``_registry_standalone_send("sms", ...)``) for cron and
+    other out-of-process delivery.  It had NO test coverage, which is why
+    a missing ``import re`` sat here undetected: the strip helper raised
+    ``NameError`` on its first substitution, unconditionally, for every
+    outbound message — not just markdown-bearing ones.
+
+    The adapter class path already used the shared
+    ``gateway.platforms.helpers.strip_markdown``; only this module-level
+    duplicate had drifted.
+    """
+
+    def _strip(self, text: str) -> str:
+        from plugins.platforms.sms import adapter
+
+        return adapter.strip_markdown(text)
+
+    def test_strip_is_callable_and_does_not_raise(self):
+        """Regression: this raised NameError: name 're' is not defined."""
+        assert self._strip("**bold** and *italic*") == "bold and italic"
+
+    def test_strip_removes_common_markdown(self):
+        assert self._strip("# Heading\ntext") == "Heading\ntext"
+        assert self._strip("`code`") == "code"
+        assert self._strip("[label](https://example.com)") == "label"
+
+    def test_snake_case_identifiers_survive(self):
+        """The shared helper's word-boundary guards keep identifiers intact.
+
+        The module-level duplicate this replaced used bare ``_(.+?)_`` with
+        no boundary guards, so it collapsed ``snake_case_names`` to
+        ``snakecasenames`` — real corruption for any SMS discussing code.
+        Measured, both ways, before this test was written.
+
+        Pinned so a future "simplification" back to the naive pattern fails
+        here rather than silently in outbound messages.
+        """
+        assert self._strip("use snake_case_names") == "use snake_case_names"
+        assert self._strip("my_var and other_var") == "my_var and other_var"
+
+    def test_fenced_code_language_is_stripped(self):
+        """The duplicate's ``[a-z]*`` fence charset left residue behind.
+
+        ```` ```Python ```` kept the word "Python" in the message body and
+        ```` ```c++ ```` left "++"; the shared helper's
+        ``[a-zA-Z0-9_+-]*`` handles both.
+        """
+        assert self._strip("```Python\ncode\n```") == "code"
+        assert self._strip("```c++\nx\n```") == "x"
+
+    def test_dunder_is_still_flattened_known_limitation(self):
+        """``__init__`` → ``init`` in BOTH implementations.
+
+        Not a regression introduced here and not fixed here: it is
+        pre-existing ``strip_markdown`` behaviour shared with every other
+        plain-text platform (iMessage, Feishu).  Pinned so the limitation
+        is visible and any future fix is a deliberate, cross-platform
+        change rather than an accident.
+        """
+        assert self._strip("call __init__ first") == "call init first"
+
+
+# ── Out-of-process delivery, end to end ──────────────────────────────
+
+class _RecordingFormData:
+    """Stand-in for aiohttp.FormData that records the fields Twilio would get."""
+
+    def __init__(self):
+        self.fields = {}
+
+    def add_field(self, name, value, **kwargs):
+        self.fields[name] = value
+
+
+class _FakeResponse:
+    status = 201
+
+    async def json(self):
+        return {"sid": "SM_fake_123"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    last_data = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def post(self, url, data=None, headers=None, **kwargs):
+        _FakeSession.last_data = data
+        return _FakeResponse()
+
+
+class TestSmsStandaloneSendDelivery:
+    """Drives ``_standalone_send`` itself rather than the strip helper alone.
+
+    ``TestSmsStandaloneSendMarkdown`` above pins what the shared helper does
+    to a string.  These two pin that the send path actually *calls* it and
+    that the result reaches Twilio, which is the part that was broken: the
+    strip call sits outside ``_standalone_send``'s ``try/except``, so the
+    ``NameError`` aborted the send before any HTTP request was issued.
+    """
+
+    def test_standalone_strip_matches_in_process_format_message(self):
+        """Standalone and in-process SMS paths must render identically.
+
+        The out-of-process duplicate drifting away from the adapter class's
+        shared helper is the original defect; this is the invariant that
+        would have caught it without knowing the helper was missing ``re``.
+        """
+        from plugins.platforms.sms.adapter import SmsAdapter, strip_markdown
+
+        adapter = object.__new__(SmsAdapter)
+        adapter.config = PlatformConfig(enabled=True, api_key="tok")
+        adapter._platform = Platform.SMS
+        sample = "**b** _i_ `c`\n# H\n[l](https://e.com)\nkeep_this_name"
+        assert strip_markdown(sample) == adapter.format_message(sample)
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_strips_markdown_in_twilio_body(self):
+        """The Body posted to Twilio is stripped — and no NameError escapes."""
+        import aiohttp
+
+        from plugins.platforms.sms.adapter import _standalone_send
+
+        env = {
+            "TWILIO_ACCOUNT_SID": "ACtest123",
+            "TWILIO_PHONE_NUMBER": "+15551234567",
+        }
+        _FakeSession.last_data = None
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(aiohttp, "ClientSession", _FakeSession), \
+                patch.object(aiohttp, "FormData", _RecordingFormData), \
+                patch.object(aiohttp, "ClientTimeout", lambda **kw: None):
+            result = await _standalone_send(
+                PlatformConfig(enabled=True, api_key="token_abc"),
+                "+15559876543",
+                "**urgent** see `logs`",
+            )
+
+        assert result.get("success") is True, result
+        assert _FakeSession.last_data is not None, "Twilio POST was never issued"
+        assert _FakeSession.last_data.fields["Body"] == "urgent see logs"

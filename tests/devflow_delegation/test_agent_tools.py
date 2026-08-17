@@ -300,3 +300,81 @@ def test_run_tests_truncation_preserves_the_tail_not_just_the_head(worktree):
     assert "truncated" in result
     # The head is still present too -- this isn't a tail-only truncation.
     assert "n" * 100 in result
+
+
+class TestRunTestsCapturePipeHazard:
+    """``run_tests`` must not capture the target's test command through PIPES.
+
+    ``argv`` here is an allowlist-owned BUILD/TEST command -- pytest, ``npm
+    test`` -- so a grandchild is the norm, not the exception. On Windows a
+    grandchild inherits the capture pipe's write end and holds it open, so
+    ``subprocess.run``'s ``timeout`` never fires: it kills only the direct
+    child and then re-drains a pipe that can no longer reach EOF. A wedged
+    test command hangs the delegation tick forever instead of raising
+    ToolError after ``command_timeout_seconds``.
+
+    ``devflow_delegation/validator.py::validate_worktree`` was converted for
+    exactly this reason on 2026-08-11; this sibling in the same package, doing
+    the same thing to the same class of argv, was missed until the 2026-08-16
+    AST sweep. Hence the routing assertion rather than only a behavioural one.
+
+    Every test patches ``subprocess.Popen`` to fail closed: during RED the new
+    seam is by definition not called, so stubbing only it protects nothing --
+    that is how a stub in this repo once let a real network installer run.
+    """
+
+    @staticmethod
+    def _no_spawn(*args, **kwargs):
+        raise AssertionError(
+            f"real process spawn attempted in a unit test: {args!r} {kwargs!r}"
+        )
+
+    def test_uses_file_backed_capture_not_pipes(self, worktree, monkeypatch):
+        import subprocess as _sp
+
+        from devflow_delegation import agent_tools
+
+        seen = {}
+
+        def fake_capture(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["kwargs"] = kwargs
+            return _sp.CompletedProcess(list(argv), 0, "tests passed", "")
+
+        monkeypatch.setattr(agent_tools, "run_text_capture", fake_capture)
+        monkeypatch.setattr(_sp, "Popen", self._no_spawn)
+
+        target = _target(test_commands=(("python", "-c", "print('tests passed')"),))
+        out = run_tests(worktree, target)
+
+        assert "argv" in seen, (
+            "run_tests did not go through run_text_capture — on Popen+PIPE a "
+            "surviving test-runner grandchild makes command_timeout_seconds "
+            "unenforceable"
+        )
+        assert seen["argv"] == ["python", "-c", "print('tests passed')"]
+        assert seen["kwargs"]["cwd"] == str(worktree)
+        assert "timeout" in seen["kwargs"]
+        assert "tests passed" in out
+
+    def test_timeout_from_the_helper_still_raises_tool_error(self, worktree, monkeypatch):
+        import subprocess as _sp
+
+        from devflow_delegation import agent_tools
+
+        called = []
+
+        def fake_capture(argv, **kwargs):
+            called.append(list(argv))
+            raise _sp.TimeoutExpired(list(argv), kwargs["timeout"])
+
+        monkeypatch.setattr(agent_tools, "run_text_capture", fake_capture)
+        monkeypatch.setattr(_sp, "Popen", self._no_spawn)
+
+        target = _target(test_commands=(("python", "-c", "pass"),))
+        with pytest.raises(ToolError, match="timed out"):
+            run_tests(worktree, target, timeout_seconds=7)
+
+        # Vacuity guard: run_tests also wraps OSError into ToolError, so the
+        # raises() alone would pass if the seam were dead and _no_spawn fired.
+        assert called, "run_text_capture was never reached — the seam is dead"

@@ -165,6 +165,32 @@ class TestResolveOrigin:
         assert _resolve_origin(job) is None
 
 
+# ── Platform-plugin import budget ──────────────────────────────────────────
+#
+# ``_resolve_delivery_targets`` reaches ``_iter_home_target_platforms``, which
+# calls ``discover_plugins()`` + ``platform_registry.plugin_entries()``. That
+# runs ``PlatformRegistry._resolve_all()``, which executes EVERY deferred
+# platform loader — importing the real SDK behind each bundled adapter
+# (discord.py, slack_sdk, matrix, ...). It is a once-per-interpreter import
+# tax paid by whichever test in the process gets there first, and it is
+# heavily I/O-bound, so its cost tracks host load rather than the test body.
+#
+# Measured on the same commit, same machine, two runs of ``pytest tests/cron``:
+#   test_all_expands_to_every_connected_home_channel   11.43s -> 42.94s
+#   test_human_friendly_label_without_suffix_resolved   8.32s -> 32.65s
+#
+# The 30s ``addopts`` cap is documented in pyproject.toml as the fallback
+# inside each per-file subprocess spawned by scripts/run_tests_parallel.py.
+# Under that runner the import lands in a fresh, unloaded interpreter; in a
+# single monolithic ``pytest tests/events tests/cron`` process it does not.
+# When the cap is hit, ``--timeout-method=thread`` dumps thread stacks and
+# hard-exits, so the whole run loses its summary line over a slow import.
+#
+# These marks declare an honest budget for that import. They are NOT xfails
+# and they hide no failure: the tests still assert exactly what they did, and
+# still fail if the expansion logic breaks. The first test in the process to
+# touch the registry pays the tax, so both classes carry the mark.
+@pytest.mark.timeout(180)
 class TestResolveDeliveryTarget:
     def test_origin_delivery_preserves_thread_id(self):
         job = {
@@ -507,6 +533,9 @@ class TestResolveDeliveryTarget:
         assert _resolve_delivery_targets({"deliver": []}) == []
 
 
+# Same platform-plugin import budget as TestResolveDeliveryTarget above —
+# see the block comment there for the measurements and rationale.
+@pytest.mark.timeout(180)
 class TestRoutingIntents:
     """``all`` routing intent expands at fire time."""
 

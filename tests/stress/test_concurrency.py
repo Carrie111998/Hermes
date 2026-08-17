@@ -140,7 +140,14 @@ def main():
 
     # Spawn workers.
     ctx = mp.get_context("spawn")
-    result_files = [f"/tmp/concurrency_worker_{i}.json" for i in range(NUM_WORKERS)]
+    # Per-run IPC files belong inside this run's HERMES_HOME. "/tmp/..." is
+    # not a portable absolute path — on Windows it resolves against the
+    # current drive (C:\tmp\...), so the files leaked out of the run and two
+    # concurrent runs of this script would overwrite each other's results.
+    result_files = [
+        os.path.join(home, f"concurrency_worker_{i}.json")
+        for i in range(NUM_WORKERS)
+    ]
     procs = []
     start = time.monotonic()
     for i in range(NUM_WORKERS):

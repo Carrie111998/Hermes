@@ -672,3 +672,53 @@ def test_cli_status_reports_client_error(capsys, monkeypatch):
     data = json.loads(capsys.readouterr().out.strip())
     assert data["ok"] is False
     assert "connection refused" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# meet cli.py — the "node module unavailable" fallback
+# ---------------------------------------------------------------------------
+
+def _build_meet_parser_with_broken_node_import(monkeypatch):
+    """Build the ``hermes meet`` tree with the node module import forced to fail.
+
+    ``sys.modules[name] = None`` makes ``import name`` raise ImportError, which
+    is the optional-dependency-missing case the fallback exists to handle.
+    """
+    import sys
+
+    from plugins.google_meet.cli import register_cli as meet_register_cli
+
+    monkeypatch.setitem(sys.modules, "plugins.google_meet.node.cli", None)
+    parser = argparse.ArgumentParser(prog="meet-test")
+    meet_register_cli(parser)
+    return parser
+
+
+def test_node_unavailable_fallback_reports_the_error_not_a_nameerror(monkeypatch, capsys):
+    """Regression for the F821 NameError at plugins/google_meet/cli.py:97.
+
+    ``except Exception as e:`` compiles to an implicit ``del e`` at the end of
+    the block, which clears the closure cell. ``_node_unavailable`` is defined
+    inside that block but invoked LATER via argparse dispatch, so referencing
+    ``e`` raised NameError — turning the friendly "module unavailable" message
+    into the very crash it was written to prevent.
+    """
+    p = _build_meet_parser_with_broken_node_import(monkeypatch)
+
+    args = p.parse_args(["node"])
+    rc = args.func(args)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "module unavailable" in out
+    # The captured reason must survive into the message, not be swallowed.
+    assert "plugins.google_meet.node.cli" in out
+
+
+def test_node_subparser_still_registered_when_import_fails(monkeypatch):
+    """The fallback must keep the subcommand parseable, not drop it."""
+    p = _build_meet_parser_with_broken_node_import(monkeypatch)
+
+    args = p.parse_args(["node"])
+    assert args.meet_command == "node"
+    assert callable(args.func)

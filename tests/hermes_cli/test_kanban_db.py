@@ -4718,6 +4718,55 @@ def test_write_txn_raises_on_truncated_file(tmp_path):
     conn.close()
 
 
+def test_write_txn_tolerates_transient_wal_checkpoint_window(tmp_path):
+    """A mismatch that clears on re-read must NOT raise.
+
+    The kanban DB runs in WAL, where the main file is only brought current
+    by a checkpoint — and a checkpoint writes page 1 (which carries the new
+    page count) and extends the file as *separate* I/O. The guard's raw,
+    unlocked reads can land between the two and see header=N while the file
+    still holds N-1 pages. That is a checkpoint in progress, not a torn
+    extend, and since the check runs post-COMMIT, raising there fails an
+    already-durable transaction and strands the caller's work.
+
+    Measured before this guard learned to re-read: 13 spurious fires in
+    113,856 samples against a DB whose integrity_check and quick_check both
+    returned ok with every row present.
+    """
+    from hermes_cli.kanban_db import connect, write_txn
+    db = tmp_path / "test.db"
+    conn = connect(db_path=db)
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    original_getsize = os.path.getsize
+    calls = {"n": 0}
+
+    def flaky_getsize(path):
+        # Short on the first read only, exactly like a checkpoint that
+        # completes moments later.
+        calls["n"] += 1
+        real = original_getsize(path)
+        if calls["n"] == 1:
+            return max(0, real - page_size)
+        return real
+
+    with unittest.mock.patch(
+        "hermes_cli.kanban_db.os.path.getsize", side_effect=flaky_getsize
+    ):
+        with write_txn(conn) as c:
+            c.execute(
+                "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+                "VALUES ('t_wal01', 'wal window', 'tester', 'todo', 0, 1234567890)"
+            )
+
+    assert calls["n"] >= 2, (
+        "the guard raised (or returned) without re-reading; a transient "
+        "checkpoint window must be confirmed before it is called corruption"
+    )
+    row = conn.execute("SELECT title FROM tasks WHERE id='t_wal01'").fetchone()
+    assert row["title"] == "wal window"
+    conn.close()
+
+
 def test_write_txn_post_commit_check_fires_every_call(tmp_path):
     """The invariant check runs on every write_txn call."""
     from hermes_cli.kanban_db import connect, write_txn

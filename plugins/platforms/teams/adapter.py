@@ -27,8 +27,11 @@ import html
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from urllib.parse import quote
+
+if TYPE_CHECKING:
+    import httpx
 
 # httpx is imported lazily — only the ``_write_summary_via_incoming_webhook``
 # code path actually constructs an ``AsyncClient``. Top-level import here

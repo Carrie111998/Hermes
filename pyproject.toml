@@ -372,6 +372,7 @@ markers = [
     "characterization: pinning/oracle tests over the live agent loop (behavior-equivalence; see tests/run_agent/characterization/)",
     "real_concurrent_gate: opt out of the autouse stub that disables _detect_concurrent_hermes_instances",
     "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
+    "stress: long-running kanban stress scripts run out-of-process (tests/stress); ~25 min for the full set, deselected by default — run with `pytest tests/stress -m stress`",
 ]
 # pytest-timeout: per-test 30s hard cap.
 # This is the fallback inside each per-file pytest subprocess (see
@@ -381,7 +382,7 @@ markers = [
 # v0.15.1 catch-up (Windows): use the cross-platform "thread" method, not
 # "signal" — signal.SIGALRM is Unix-only and INTERNALERRORs every test on
 # Windows. The thread watchdog works on both platforms.
-addopts = "-m 'not integration' --timeout=30 --timeout-method=thread"
+addopts = "-m 'not integration and not stress' --timeout=30 --timeout-method=thread"
 
 # Reclaim tmp_path dirs for passing tests instead of pytest's "all" default.
 # Per-file isolation (scripts/run_tests_parallel.py) spawns one pytest process
@@ -399,23 +400,13 @@ python-version = "3.13"
 unknown-argument = "warn"
 redundant-cast = "ignore"
 
-[tool.ruff]
-preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
-
-[tool.ruff.lint]
-# All other lints are intentionally disabled (see comment history on this
-# file) while we wrangle typechecks — but PLW1514 is too load-bearing to
-# keep off.  Bare open()/read_text()/write_text() in text mode defaults to
-# the system locale encoding on Windows (cp1252 on US-locale installs),
-# which silently corrupts any non-ASCII file content.  We had three
-# separate Windows sandbox regressions in one debug session before
-# adding the explicit encoding.  This rule keeps new code honest.
-select = ["PLW1514"]
-
-[tool.ruff.lint.per-file-ignores]
-# Tests can intentionally exercise locale-encoding edge cases.
-"tests/**" = ["PLW1514"]
-# Skills and plugins are partially user-authored — their own conventions.
-"skills/**" = ["PLW1514"]
-"optional-skills/**" = ["PLW1514"]
-"plugins/**" = ["PLW1514"]
+# ruff configuration lives in ruff.toml at the repo root, NOT here.
+#
+# Do not add a [tool.ruff] table back to this file.  When ruff.toml exists,
+# ruff reads it in preference to pyproject.toml and ignores any [tool.ruff]
+# here SILENTLY -- no warning, no error -- so a table added back would be dead
+# config that still greps as live.  tests/test_lint_config.py enforces this.
+#
+# The split exists because ruff.toml carries a several-hundred-line
+# per-file-ignores sunset list that would more than double this file.
+# See docs/superpowers/specs/2026-08-16-ruff-f-group-reland-design.md

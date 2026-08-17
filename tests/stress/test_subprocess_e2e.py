@@ -10,6 +10,7 @@ This validates the IPC + lifecycle story that mocks can't:
   - crash detection works against a real dead PID
 """
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -20,6 +21,16 @@ import time
 WT = str(Path(__file__).resolve().parents[2])
 FAKE_WORKER = str(Path(__file__).parent / "_fake_worker.py")
 PY = sys.executable
+IS_WINDOWS = os.name == "nt"
+
+if WT not in sys.path:
+    sys.path.insert(0, WT)
+from tests.timeout_budget import scaled  # noqa: E402
+
+# The CLI the spawned workers must use. Passing this explicitly is what
+# makes the test hermetic: the worker runs *this* tree's hermes_cli.main
+# rather than whatever `hermes` sits on the host PATH.
+CLI_CMD = [PY, "-m", "hermes_cli.main"]
 
 
 def make_spawn_fn(home: str):
@@ -35,7 +46,10 @@ def make_spawn_fn(home: str):
             "PYTHONPATH": WT,
             "HERMES_KANBAN_TASK": task.id,
             "HERMES_KANBAN_WORKSPACE": workspace,
-            "PATH": f"{os.path.dirname(PY)}:{os.environ.get('PATH','')}",
+            "HERMES_CLI_CMD": json.dumps(CLI_CMD),
+            "PATH": os.pathsep.join(
+                [os.path.dirname(PY), os.environ.get("PATH", "")]
+            ),
         }
         log_f = open(log_path, "ab")
         # cwd pinned to the temp home: run_tests_parallel.py gives every pytest
@@ -64,17 +78,12 @@ def main():
     sys.path.insert(0, WT)
     from hermes_cli import kanban_db as kb
 
-    # Point the `hermes` CLI child processes will run at the worktree
-    # hermes_cli.main. We do this by putting a shim on PATH.
-    shim_dir = os.path.join(home, "bin")
-    os.makedirs(shim_dir, exist_ok=True)
-    shim_path = os.path.join(shim_dir, "hermes")
-    with open(shim_path, "w") as f:
-        f.write(f"""#!/bin/sh
-exec {PY} -m hermes_cli.main "$@"
-""")
-    os.chmod(shim_path, 0o755)
-    os.environ["PATH"] = f"{shim_dir}:{os.environ.get('PATH','')}"
+    # Child processes are pointed at this tree's hermes_cli.main through
+    # HERMES_CLI_CMD (see make_spawn_fn). This used to be a `#!/bin/sh`
+    # shim named `hermes` prepended to PATH, which silently did nothing on
+    # Windows — CreateProcess will not run an extensionless shell script,
+    # so the workers fell through to whatever `hermes` was installed on
+    # the host. An explicit argv is portable and provably hermetic.
 
     kb.init_db()
     conn = kb.connect()
@@ -101,8 +110,23 @@ exec {PY} -m hermes_cli.main "$@"
         spawned_pids.append(task.worker_pid)
         print(f"  task {tid}: pid={task.worker_pid} status={task.status}")
 
-    # Wait for all workers to complete (up to 10s).
-    deadline = time.monotonic() + 10
+    # Wait for all workers to complete. Incidental safety net, not the
+    # assertion (tests/timeout_budget.py rule 2): each worker makes five
+    # real CLI invocations and every one pays full interpreter + hermes
+    # import startup, so three concurrent workers need far more than the
+    # 10s this used to allow.
+    #
+    # The base is deliberately large because under-budgeting here does not
+    # report "too slow" — it reports status=running, a dangling
+    # current_run_id and a missing outcome, which looks exactly like a
+    # kernel bug and costs an investigation every time. Measured on this
+    # host: ~81s for the whole script on an idle box, 169s with a couple of
+    # sibling pytest sessions running, and a failure at 180s when the full
+    # stress lane ran alongside three of them. A bound that a healthy run
+    # comes within 6% of is not a safety net, so give it real headroom;
+    # rule 2 asks for a generous base precisely so contention cannot
+    # masquerade as a regression.
+    deadline = time.monotonic() + scaled(600)
     while time.monotonic() < deadline:
         statuses = [kb.get_task(conn, tid).status for tid in tids]
         if all(s == "done" for s in statuses):
@@ -150,6 +174,37 @@ exec {PY} -m hermes_cli.main "$@"
     print("B. Crashed worker (kill -9 mid-heartbeat)")
     print("=" * 60)
 
+    if IS_WINDOWS:
+        # This scenario is irreducibly POSIX: subprocess pass_fds is
+        # rejected on Windows, there is no `sleep` binary, and the
+        # double-fork orphaning it depends on has no Windows equivalent
+        # (no init to reparent to, so a killed child would be observed
+        # differently). Skipping keeps A and C meaningful here; the crash
+        # path stays covered on Linux.
+        print("  ↷ SKIP on Windows: pass_fds/double-fork orphaning is POSIX-only")
+    else:
+        _scenario_b(kb, conn)
+
+    # ============ SCENARIO C: worker log was captured ============
+    print()
+    print("=" * 60)
+    print("C. Worker log captured to disk")
+    print("=" * 60)
+    # Scenario A workers wrote to <home>/worker_*.log
+    import glob
+    logs = glob.glob(os.path.join(home, "worker_*.log"))
+    print(f"  {len(logs)} worker log files")
+    for lp in logs[:3]:
+        size = os.path.getsize(lp)
+        print(f"    {os.path.basename(lp)}: {size} bytes")
+        # Our fake worker is quiet (no prints); size=0 is fine
+
+    conn.close()
+    print("\n✔ ALL E2E SCENARIOS PASS")
+
+
+def _scenario_b(kb, conn):
+    """Crashed-worker detection. POSIX-only; see the guard in main()."""
     crash_tid = kb.create_task(
         conn, title="crash-e2e", assignee="default",
     )
@@ -185,7 +240,7 @@ exec {PY} -m hermes_cli.main "$@"
         os.close(r)
         return grandchild_pid
 
-    result = kb.dispatch_once(conn, spawn_fn=spawn_sleeper)
+    kb.dispatch_once(conn, spawn_fn=spawn_sleeper)
     task = kb.get_task(conn, crash_tid)
     print(f"  spawned sleeper pid={task.worker_pid} for {crash_tid}")
     # Kill the sleeper forcibly
@@ -211,23 +266,6 @@ exec {PY} -m hermes_cli.main "$@"
         print(f"  ✗ run outcome should be 'crashed', got {runs[0].outcome!r}")
         sys.exit(1)
     print("\n  ✔ Scenario B: crash detected, task re-queued, run outcome=crashed")
-
-    # ============ SCENARIO C: worker log was captured ============
-    print()
-    print("=" * 60)
-    print("C. Worker log captured to disk")
-    print("=" * 60)
-    # Scenario A workers wrote to /tmp/hermes_e2e_*/worker_*.log
-    import glob
-    logs = glob.glob(os.path.join(home, "worker_*.log"))
-    print(f"  {len(logs)} worker log files")
-    for lp in logs[:3]:
-        size = os.path.getsize(lp)
-        print(f"    {os.path.basename(lp)}: {size} bytes")
-        # Our fake worker is quiet (no prints); size=0 is fine
-
-    conn.close()
-    print("\n✔ ALL E2E SCENARIOS PASS")
 
 
 if __name__ == "__main__":

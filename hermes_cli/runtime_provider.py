@@ -796,20 +796,6 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
     return None
 
 
-def has_named_custom_provider(requested_provider: str) -> bool:
-    """Return True when config defines a custom provider matching the request.
-
-    Thin public wrapper around :func:`_get_named_custom_provider` so other
-    modules (e.g. the cronjob tool) can decide whether a provider name will
-    actually resolve to a configured ``providers:`` / ``custom_providers:``
-    entry — without reaching into a private helper or duplicating the scan.
-    """
-    try:
-        return _get_named_custom_provider(requested_provider) is not None
-    except Exception:
-        return False
-
-
 def find_custom_provider_identity(base_url: str) -> Optional[str]:
     """Map an endpoint URL back to its canonical ``custom:<name>`` menu key.
 

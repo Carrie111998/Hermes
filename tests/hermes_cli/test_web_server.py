@@ -18,6 +18,7 @@ from hermes_cli.config import (
     OPTIONAL_ENV_VARS,
     DEFAULT_CONFIG,
 )
+from tests._home_isolation import redirect_home
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +606,7 @@ class TestWebServerEndpoints:
 
     def test_memory_status_reports_honcho_needs_config_after_dependency_setup(self, monkeypatch, tmp_path):
         # Pin HOME so a developer's real ~/.honcho config can't flip the status.
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         import hermes_cli.web_server as web_server
 
         original_dependency_importable = web_server._dependency_importable
@@ -990,7 +991,7 @@ class TestWebServerEndpoints:
 
     def test_get_honcho_config_returns_safe_defaults(self, monkeypatch, tmp_path):
         # HOME isn't isolated by the suite; pin it so ~/.honcho can't leak in.
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
 
         resp = self.client.get("/api/memory/providers/honcho/config?surface=declared")
 
@@ -1016,7 +1017,7 @@ class TestWebServerEndpoints:
         assert fields["apiKey"]["is_set"] is False
 
     def test_put_honcho_writes_host_block_root_and_secret(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         monkeypatch.setenv("HONCHO_API_KEY", "guard")
         monkeypatch.delenv("HONCHO_API_KEY")
         self._seed_local_honcho()
@@ -1054,7 +1055,7 @@ class TestWebServerEndpoints:
         assert cfg["hosts"]["hermes"]["apiKey"] == "hch-test-key"
 
     def test_put_honcho_blank_text_clears_key(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         self._seed_local_honcho()
         from hermes_constants import get_hermes_home
 
@@ -1071,7 +1072,7 @@ class TestWebServerEndpoints:
         assert "workspace" not in cfg.get("hosts", {}).get("hermes", {})
 
     def test_put_honcho_partial_save_preserves_other_keys(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         self._seed_local_honcho()
         from hermes_constants import get_hermes_home
 
@@ -1089,7 +1090,7 @@ class TestWebServerEndpoints:
         assert host["peerName"] == "eri"
 
     def test_put_honcho_rejects_unsupported_select_value(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
 
         resp = self.client.put(
             "/api/memory/providers/honcho/config?surface=declared",
@@ -1099,7 +1100,7 @@ class TestWebServerEndpoints:
         assert resp.status_code == 400
 
     def test_get_honcho_config_does_not_return_secret(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         monkeypatch.setenv("HONCHO_API_KEY", "guard")
         monkeypatch.delenv("HONCHO_API_KEY")
         self._seed_local_honcho()
@@ -1119,7 +1120,7 @@ class TestWebServerEndpoints:
         assert "secret-value" not in json.dumps(data)
 
     def test_put_honcho_bool_stored_natively_and_false_survives(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         self._seed_local_honcho()
         from hermes_constants import get_hermes_home
 
@@ -1138,7 +1139,7 @@ class TestWebServerEndpoints:
         assert fields["dialecticDynamic"]["value"] == "true"
 
     def test_put_honcho_number_stored_as_native_number(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         self._seed_local_honcho()
         from hermes_constants import get_hermes_home
 
@@ -1157,7 +1158,7 @@ class TestWebServerEndpoints:
         assert fields["dialecticMaxChars"]["value"] == "1200"
 
     def test_put_honcho_json_round_trips_object(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         self._seed_local_honcho()
         from hermes_constants import get_hermes_home
 
@@ -1174,15 +1175,15 @@ class TestWebServerEndpoints:
 
     def test_put_honcho_first_save_merges_into_resolved_config(self, monkeypatch, tmp_path):
         # With no profile-local file, a save merges into the resolved global config.
-        monkeypatch.setenv("HOME", str(tmp_path))
         # resolve_global_config_path() is ``Path.home() / ".honcho" / ...``, and
         # Path.home() reads USERPROFILE on Windows — it ignores $HOME entirely.
         # Setting HOME alone therefore did NOT redirect the global config there,
         # so this test read and WROTE the developer's real ~/.honcho/config.json
         # (and then failed on the merge assertion because the seeded fixture
-        # lived in tmp_path). Patch the resolver's actual input so the isolation
-        # holds on every platform.
-        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        # lived in tmp_path). ``redirect_home`` pins HOME *and* USERPROFILE,
+        # drops HOMEDRIVE/HOMEPATH, and patches Path.home(), so both the
+        # resolver and ``os.path.expanduser`` land in tmp_path on every platform.
+        redirect_home(monkeypatch, tmp_path)
         from hermes_constants import get_hermes_home
 
         global_path = tmp_path / ".honcho" / "config.json"
@@ -1205,7 +1206,7 @@ class TestWebServerEndpoints:
 
     def test_put_honcho_updates_legacy_dot_form_host_block(self, monkeypatch, tmp_path):
         # The legacy dot-form block reads resolve is updated in place, not shadowed.
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes_work")
 
         path = self._seed_local_honcho({"hosts": {"hermes.work": {"workspace": "w", "peerName": "eri"}}})
@@ -1221,7 +1222,7 @@ class TestWebServerEndpoints:
         assert hosts["hermes.work"] == {"workspace": "w", "peerName": "eri", "sessionStrategy": "per-repo"}
 
     def test_put_honcho_api_key_never_overwrites_oauth_token(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         monkeypatch.setenv("HONCHO_API_KEY", "guard")
         monkeypatch.delenv("HONCHO_API_KEY")
         from hermes_cli.config import load_env
@@ -1240,7 +1241,7 @@ class TestWebServerEndpoints:
         assert load_env()["HONCHO_API_KEY"] == "manual-key"
 
     def test_put_honcho_tolerates_null_hosts(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
 
         path = self._seed_local_honcho({"hosts": None})
 
@@ -1255,7 +1256,7 @@ class TestWebServerEndpoints:
     def test_memory_provider_config_honors_profile_param(self, monkeypatch, tmp_path):
         # A ?profile= save must land in that profile's config, not the serving
         # process's — same contract as the skills/toolsets endpoints.
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
         # The suite pins HERMES_HONCHO_HOST=hermes; this test exercises
         # profile-driven host resolution, so drop the override explicitly.
         monkeypatch.delenv("HERMES_HONCHO_HOST", raising=False)
@@ -1288,7 +1289,7 @@ class TestWebServerEndpoints:
         assert fields["peerName"]["value"] == "eri"
 
     def test_put_honcho_rejects_malformed_number_and_json(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
+        redirect_home(monkeypatch, tmp_path)
 
         assert self.client.put(
             "/api/memory/providers/honcho/config?surface=declared",
@@ -5197,7 +5198,11 @@ class TestNewEndpoints:
         assert profiles["multi-agent"]["has_env"] is True
         assert profiles["multi-agent"]["skill_count"] == 1
 
-    def test_profiles_create_rename_delete_round_trip(self, monkeypatch):
+    def test_profiles_create_rename_delete_round_trip(self, monkeypatch, tmp_path):
+        # Profile creation writes wrapper scripts into _get_wrapper_dir(),
+        # i.e. ``Path.home()/".local"/"bin"`` -- isolate the home so it can't
+        # land in the developer's real ~/.local/bin.
+        redirect_home(monkeypatch, tmp_path)
         # Stub gateway service teardown so the test doesn't shell out to
         # launchctl/systemctl on the host.
         import hermes_cli.profiles as profiles_mod
@@ -5569,7 +5574,9 @@ class TestNewEndpoints:
         resp = self.client.delete("/api/profiles/does-not-exist")
         assert resp.status_code == 404
 
-    def test_profile_soul_round_trip(self, monkeypatch):
+    def test_profile_soul_round_trip(self, monkeypatch, tmp_path):
+        # Same wrapper-script write as above; keep it out of the real home.
+        redirect_home(monkeypatch, tmp_path)
         import hermes_cli.profiles as profiles_mod
         monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
 
@@ -8579,7 +8586,6 @@ class TestDashboardPluginManifestExtensions:
 # monkeypatch that hook.
 # ---------------------------------------------------------------------------
 
-import sys
 
 
 skip_on_windows = pytest.mark.skipif(

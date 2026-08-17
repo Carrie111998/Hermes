@@ -3408,7 +3408,10 @@ _COPILOT_MODEL_ALIASES = {
     "claude-sonnet-4-5": "claude-sonnet-4.5",
     "claude-haiku-4-5": "claude-haiku-4.5",
     "anthropic/claude-opus-4-6": "claude-opus-4.6",
-    "anthropic/claude-sonnet-5": "claude-sonnet-5",
+    # (no "anthropic/claude-sonnet-5" entry here: unlike the 4.6/4-6 pairs
+    # around it, sonnet-5 has no minor version, so its dash and dot spellings
+    # are the same string -- the dot-form entry above already covers it. The
+    # duplicate that used to sit here was flagged by ruff F601.)
     "anthropic/claude-sonnet-4-6": "claude-sonnet-4.6",
     "anthropic/claude-sonnet-4-0": "claude-sonnet-4",
     "anthropic/claude-sonnet-4-5": "claude-sonnet-4.5",

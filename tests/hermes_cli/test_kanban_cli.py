@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -22,6 +24,92 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+# ---------------------------------------------------------------------------
+# Process exit status
+# ---------------------------------------------------------------------------
+
+# Both shapes that reach ``hermes_cli.main:main`` in production: the
+# ``console_scripts`` wrapper generated for the ``hermes`` entry point
+# (``sys.exit(main())``) and ``python -m hermes_cli.main``. A status that
+# is produced by the handler but dropped by either shape is invisible to
+# every ``subprocess.run(..., check=True)`` caller.
+_LAUNCHERS = [
+    pytest.param(
+        ["-c", "from hermes_cli.main import main; raise SystemExit(main())"],
+        id="console-script",
+    ),
+    pytest.param(["-m", "hermes_cli.main"], id="python-module"),
+]
+
+
+def _run_cli(kanban_home, launcher, argv):
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(kanban_home)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(repo_root), env.get("PYTHONPATH")) if part
+    )
+    return subprocess.run(
+        [sys.executable, *launcher, *argv],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.parametrize("launcher", _LAUNCHERS)
+@pytest.mark.parametrize(
+    ("command", "expected_error"),
+    [
+        (["heartbeat", "t_missing"], "cannot heartbeat t_missing"),
+        (["complete", "t_missing"], "cannot complete t_missing"),
+    ],
+)
+def test_failed_lifecycle_command_exits_nonzero(
+    kanban_home, launcher, command, expected_error
+):
+    """A failing lifecycle command must exit non-zero.
+
+    ``kanban_command`` already returned 1 on these paths; the status was
+    dropped on the way out. tests/stress/_fake_worker.py wraps every CLI
+    call in ``subprocess.run(..., check=True)``, so a zero exit turned
+    every worker call into a silent no-op.
+    """
+    result = _run_cli(kanban_home, launcher, ["kanban", *command])
+    assert result.returncode == 1, (
+        f"expected exit 1, got {result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert expected_error in result.stderr
+
+
+@pytest.mark.parametrize("launcher", _LAUNCHERS)
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["kanban", "list"],
+        ["kanban", "boards", "list"],
+        ["kanban", "--help"],
+    ],
+    ids=["list", "boards-list", "help"],
+)
+def test_successful_command_still_exits_zero(kanban_home, launcher, argv):
+    """Guard the blast radius of propagating the handler's status.
+
+    ``main()`` returns whatever the handler returned and the wrapper feeds
+    it to ``sys.exit``. Any handler returning a truthy non-int would now
+    print that object and exit 1, turning working commands red. These are
+    the common success paths that must stay 0.
+    """
+    result = _run_cli(kanban_home, launcher, argv)
+    assert result.returncode == 0, (
+        f"{argv} regressed to exit {result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
 
 
 # ---------------------------------------------------------------------------
