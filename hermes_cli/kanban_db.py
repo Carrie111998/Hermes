@@ -2278,6 +2278,13 @@ def _sample_file_pages(path: str, page_size: int):
     Both reads are raw and unlocked, which is what makes a single sample
     untrustworthy while another connection is checkpointing.
     """
+    if not isinstance(path, str):
+        # ``open()`` accepts an int as a *file descriptor*, and a MagicMock
+        # satisfies ``__index__`` with 1 -- so a non-str path here opens fd 1
+        # and the ``with`` block then CLOSES it, destroying the process's
+        # stdout. ``os.path.getsize`` cannot be relied on to reject it first:
+        # ``os.stat`` also accepts an fd and happily stats fd 1.
+        return None
     file_size = os.path.getsize(path)
     with open(path, "rb") as f:
         f.seek(28)
@@ -2321,8 +2328,16 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
         if row is None:
             return
         path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
-        if not path_str:
-            return  # in-memory or unnamed DB; skip
+        if not isinstance(path_str, str) or not path_str:
+            # in-memory, unnamed, or not a path at all. isinstance, not just
+            # truthiness: a mocked connection returns a MagicMock here, which is
+            # truthy AND satisfies ``__index__()`` -> 1, so it sails into
+            # ``open(path, "rb")`` as ``open(1, "rb")`` -- a file object wrapping
+            # STDOUT with ``closefd=True``. Closing it killed fd 1 mid-pytest and
+            # truncated whole runs silently (2026-08-17). Anything that is not a
+            # real path string cannot be sampled, so bail. ``_sample_file_pages``
+            # re-checks the same thing at the boundary that does the ``open``.
+            return
         path = path_str
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
         sample = _sample_file_pages(path, page_size)

@@ -5594,6 +5594,17 @@ class TestRunConversation:
             patch("hermes_cli.kanban_db._record_task_failure",
                   mock_record_failure),
             patch("hermes_cli.kanban_db.connect", mock_connect),
+            # Setting HERMES_KANBAN_TASK above also arms the runtime->board
+            # heartbeat bridge in _touch_activity. Stub it: otherwise the REAL
+            # heartbeat_claim runs against the MagicMock connection and walks
+            # into kanban_db's file-length check with a mock standing in for a
+            # path -- which open() reads as file descriptor 1, closing this
+            # process's stdout and killing the whole pytest session
+            # (2026-08-17: two runs lost 504 and 2897 tests, both reporting
+            # zero failures). kanban_db now rejects a non-str path, but a unit
+            # test asserting on the iteration-budget path should never be
+            # reaching live DB code at all.
+            patch("tools.kanban_tools.heartbeat_current_worker_from_env"),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),

@@ -4829,6 +4829,70 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
     raw_conn.close()
 
 
+def test_check_file_length_invariant_never_opens_a_non_str_path():
+    """A mocked connection must not get its PRAGMA result fed to ``open()``.
+
+    ``MagicMock().__index__()`` returns ``1`` and ``open()`` accepts an integer
+    as a *file descriptor*, so ``open(<MagicMock>, "rb")`` yields a file object
+    wrapping **fd 1** with ``closefd=True``. Closing it destroys the process's
+    stdout. ``os.path.getsize`` does not catch the bad type first because
+    ``os.stat`` also accepts an fd and happily stats fd 1.
+
+    That is not hypothetical: a test that mocked ``kanban_db.connect`` but left
+    the real ``heartbeat_claim`` running reached here with a MagicMock ``conn``,
+    closed fd 1 mid-run, and pytest died with
+    ``INTERNALERROR OSError: [Errno 9] Bad file descriptor`` — writing a junit
+    file and summary that were internally consistent and silently short by 504
+    tests.
+
+    Pin the guarantee at the boundary: a non-``str`` path is ignored, and in
+    particular ``open`` is never called at all.
+    """
+    conn = unittest.mock.MagicMock()
+
+    with unittest.mock.patch("builtins.open") as mock_open:
+        kb._check_file_length_invariant(conn)
+
+    assert mock_open.call_count == 0, (
+        "open() was called with a value that came off a mocked connection; "
+        f"args={mock_open.call_args_list!r}. A MagicMock reaching open() is "
+        "read as file descriptor 1 and closing it kills stdout."
+    )
+    # And the real thing, unmocked: stdout must still be alive afterwards.
+    os.fstat(1)
+
+
+def test_sample_file_pages_rejects_a_file_descriptor_like_path():
+    """``_sample_file_pages`` must refuse anything that is not a real path.
+
+    Direct unit-level pin on the helper that actually performs the ``open``,
+    so the guarantee survives a refactor of its caller.
+    """
+    assert kb._sample_file_pages(unittest.mock.MagicMock(), 4096) is None
+    # fd 1 unharmed.
+    os.fstat(1)
+
+
+def test_check_file_length_invariant_still_runs_for_a_real_str_path(tmp_path):
+    """The non-str guard must not disarm the check on a healthy database.
+
+    The counterweight to the two tests above: a guard written slightly too
+    broadly would satisfy them by turning the file-length invariant off
+    entirely. A genuine on-disk path must still be sampled, as a ``str``.
+    """
+    db = tmp_path / "real.db"
+    conn = kb.connect(db_path=db)
+    try:
+        with unittest.mock.patch.object(
+            kb, "_sample_file_pages", return_value=None
+        ) as sampler:
+            kb._check_file_length_invariant(conn)
+        assert sampler.called, "the guard skipped a genuine on-disk path"
+        assert isinstance(sampler.call_args[0][0], str)
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # reap_worker_zombies() tests
 # ---------------------------------------------------------------------------
