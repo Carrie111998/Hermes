@@ -402,6 +402,17 @@ No Telegram configuration, credentials, allowlists, webhook state, or message
 content was changed or recorded. No new inbound polling, outbound delivery, or
 user-visible delivery claim is made by this deployment evidence.
 
+## Correction deployment evidence (2026-08-18)
+
+- Final implementation packet: `A4ACF68CF26E78AB84A2F01782FF5CBF21331370B4A945FB8BA7BCB01EEC280B`; one authenticated Claude reviewer and one authenticated AGY reviewer independently returned `PASS` on the byte-identical packet.
+- Implementation head: `bd295e1d910817ddcaeddc7d508c449c54529475`.
+- PR #38 was merged to `main` as `36c2d243461e7e9f9be7c8b98e8a9063eef8fd1c`.
+- Final CI run `32056603324`: 21 successful checks, 8 skipped, 1 neutral, and no failures.
+- Under the explicit deployment authorization, the merged mainline was deployed as immutable release `v2026.8.18-hermes-telegram-delivery-audit-fix-36c2d243` with effective drop-in `39-hermes-telegram-delivery-audit-fix-36c2d243.conf`.
+- Runtime health: `ActiveState=active`, `SubState=running`, MainPID `2601915`, `NRestarts=0`, `ExecMainStatus=0`; the effective working directory and `PYTHONPATH` matched the release, and a bounded ten-second stability check remained healthy. The bounded recent-journal error count was zero.
+- Rollback manifest was retained. The temporary staging directory and local deployment helpers were removed after verification. The primary dirty checkout was unchanged. Relay remains disabled.
+- This deployment did not send or retry a Telegram message. It does not close `INBOUND_POLLING`, `OUTBOUND_DELIVERY`, or `USER_VISIBLE_DELIVERY`; no user-visible delivery PASS is inferred from service health or prior screenshot evidence.
+
 ## Safety stop conditions
 
 Stop and record `BLOCKED` or `UNPROVEN` if:

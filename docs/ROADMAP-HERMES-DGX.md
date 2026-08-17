@@ -1,6 +1,6 @@
 # Hermes Architecture Roadmap
 
-> Snapshot: 2026-08-17 (Asia/Taipei). `main` is the canonical Hermes
+> Snapshot: 2026-08-18 (Asia/Taipei). `main` is the canonical Hermes
 > integration line; DGX release snapshots are deployable evidence only.
 > Runtime service health, Telegram inbound polling, outbound delivery, and
 > rollback remain separate gates.
@@ -17,12 +17,12 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| `main` runtime code baseline | `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea` | ARCH-004 merged via PR #33; later handover/roadmap commits are documentation-only. |
+| `main` runtime code baseline | `36c2d243461e7e9f9be7c8b98e8a9063eef8fd1c` | Telegram delivery audit correlation correction merged via PR #38; deployed evidence is recorded below. |
 | Primary laptop checkout | `D:/PROJECT/Hermes`, `ticket/hermes-auth-001`, HEAD `c192e863d8dc9df98c2bd9d066ce49bc4f9cb3e8` | Dirty audit checkout; preserve all pre-existing changes and untracked files. |
 | DGX live source checkout | `/home/cwliao/.hermes/hermes-agent`, clean HEAD `1c14d2b9df29da845fb2a56b2fbe12cf8ee507cb` | Deployment input only; do not reset or edit as active runtime source. |
-| DGX active release | `/home/cwliao/.hermes/releases/v2026.8.17-hermes-arch-004-e2f94e26` | Immutable runtime snapshot selected by drop-in `36-hermes-arch-004-e2f94e26.conf`; marker matches merge `e2f94e26...`. |
-| Gateway service | `active/running`, MainPID `1654068`, `NRestarts=0`, `ExecMainStatus=0` | Service/process health PASS after ARCH-004 restart and bounded post-start check; effective path matches ARCH-004 release. |
-| Rollback | ARCH-003 release/drop-in and earlier Telegram/ARCH-002 releases retained | Rollback evidence remains available under `/home/cwliao/.hermes/deploy-backups/hermes-arch-004-e2f94e26`; no prior release was deleted. |
+| DGX active release | `/home/cwliao/.hermes/releases/v2026.8.18-hermes-telegram-delivery-audit-fix-36c2d243` | Immutable runtime snapshot selected by drop-in `39-hermes-telegram-delivery-audit-fix-36c2d243.conf`; marker matches merge `36c2d243...`. |
+| Gateway service | `active/running`, MainPID `2601915`, `NRestarts=0`, `ExecMainStatus=0` | Service/process health PASS after authorized correction restart and bounded ten-second stability check; effective cwd/PYTHONPATH match the correction release. |
+| Rollback | Correction rollback manifest plus prior ARCH/Telegram releases retained | Rollback evidence remains available under the corresponding deployment-backups entry; no prior release was deleted. |
 
 ## Core engineering order
 
@@ -56,7 +56,7 @@
 | ARCH-002 | MERGED_DEPLOYED | PR #29 merge `3e9fd48d...`; 24 focused tests passed; CI `31937692260` PASS; AGY + Claude Opus implementation review PASS; immutable DGX release active. |
 | ARCH-003 | MERGED_DEPLOYED | PR #30; merge `e8cdfd1e...`; implementation review consensus PASS; CI run `31981532693` PASS after retrying an unrelated pre-existing stream-consumer slice; immutable DGX release active with rollback metadata. |
 | ARCH-004 | MERGED_DEPLOYED | PR #33; implementation commit `650a34808`; merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`; focused tests `32 passed`, compileall PASS; required CI run `31990198398` PASS; Claude + active DGX `.hermes` AGY implementation review PASS with no corrections; immutable DGX release active with rollback metadata. |
-| HERMES-TELEGRAM-DELIVERY-VERIFICATION-001 | NEXT_GATE | Repo-local verification gate because GitHub Issues are disabled. Prove an approved user-visible Telegram response/delivery path with metadata-only evidence; do not substitute service health, polling progress, `getMe`, `getWebhookInfo`, or empty `getUpdates`. |
+| HERMES-TELEGRAM-DELIVERY-VERIFICATION-001 | MERGED_DEPLOYED_RUNTIME_HEALTH_PASS_DELIVERY_UNPROVEN | PR #38 merged as `36c2d243...`; final CI run `32056603324` had no failures; authenticated Claude and AGY final review PASS. Correction release is deployed and healthy. Prove an explicitly authorized user-visible Telegram response/delivery path with metadata-only evidence; do not substitute service health, polling progress, `getMe`, `getWebhookInfo`, or empty `getUpdates`. |
 
 ## Current next lane
 
@@ -69,14 +69,14 @@ runtime implementation or DGX mutation is authorized by this roadmap entry.
 
 ## Runtime and deployment boundary
 
-The active release is selected through the ARCH-004 drop-in while the prior
-ARCH-003 and Telegram releases remain intact for rollback. The service
-restarted successfully and stayed active with zero restarts. The gateway has
-historical evidence of API reachability and repeated empty `getUpdates`
-progress after transient startup recovery, but this is inbound polling
-evidence, not user-visible delivery evidence. No Telegram credentials,
+The active release is selected through the correction drop-in while the prior
+ARCH-004, ARCH-003, and Telegram releases remain intact for rollback. The
+service restarted successfully and stayed active with zero restarts. The
+gateway has historical evidence of API reachability and repeated empty
+`getUpdates` progress after transient startup recovery, but this is inbound
+polling evidence, not user-visible delivery evidence. No Telegram credentials,
 allowlists, webhook state, or TLS verification were changed during the
-ARCH-004 deployment.
+correction deployment; no Telegram send or retry was issued.
 
 ## Ticket inventory note
 
