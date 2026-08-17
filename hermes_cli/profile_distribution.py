@@ -96,7 +96,7 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
 
 # Paths that are NEVER part of a distribution. These are user-owned and are
 # protected on update. Must stay consistent with
-# ``profiles.py::_DEFAULT_EXPORT_EXCLUDE_ROOT`` plus the ``local/``
+# ``profile_export.py::_DEFAULT_EXPORT_EXCLUDE_ROOT`` plus the ``local/``
 # convention for user customizations.
 USER_OWNED_EXCLUDE: frozenset = frozenset({
     # Credentials & runtime secrets

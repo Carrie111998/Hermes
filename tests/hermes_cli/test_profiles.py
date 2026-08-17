@@ -610,48 +610,81 @@ class TestExportImport:
         assert "default/memories/MEMORY.md" in names
 
 
-    def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):
-        """Broken symlinks inside allowed artifacts are preserved, not crashed (#58394).
-
-        ``shutil.copytree``'s default is ``symlinks=False``, which follows
-        symlinks and crashes on broken ones. Use ``symlinks=True`` so stale
-        symlinks inside *allowed* artifacts (e.g. ``skills/``) survive as
-        symlinks; the link and its target are both retained.
-        """
+    def test_export_default_rejects_broken_symlinks(self, profile_env, tmp_path):
+        """Broken links fail export instead of creating unrestorable archives."""
         default_dir = get_profile_dir("default")
         (default_dir / "config.yaml").write_text("ok")
-        # Place broken symlink *inside* the allowed ``skills/`` tree so the
-        # root-level allow-list passes the directory through; the
-        # symlinks=True flag must then preserve the link instead of
-        # following and crashing.
         broken_dir = default_dir / "skills" / "with-broken-links"
         broken_dir.mkdir(parents=True)
         (broken_dir / "broken_link").symlink_to("/nonexistent/path")
-        # Valid symlink for comparison
-        (broken_dir / "valid_target.txt").write_text("real data")
-        (broken_dir / "valid_link").symlink_to(
-            broken_dir / "valid_target.txt"
-        )
 
         output = tmp_path / "export" / "default.tar.gz"
         output.parent.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(
+            ValueError,
+            match=r"skills/with-broken-links/broken_link",
+        ):
+            export_profile("default", str(output))
+
+        assert not output.exists()
+
+    def test_export_default_ignores_symlink_in_excluded_checkout(
+        self, profile_env, tmp_path
+    ):
+        default_dir = get_profile_dir("default")
+        (default_dir / "config.yaml").write_text("model: test\n")
+        outside = tmp_path / "synthetic-python"
+        outside.write_text("DO_NOT_ARCHIVE_EXCLUDED_LINK_TARGET")
+        link = default_dir / "hermes-agent" / "venv" / "bin" / "python"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(outside)
+
+        output = tmp_path / "default-filtered-link.tar.gz"
         result = export_profile("default", str(output))
 
-        assert result.exists()
-        with tarfile.open(str(result), "r:gz") as tf:
+        with tarfile.open(result, "r:gz") as tf:
             names = set(tf.getnames())
-        # Allowed artifact survived
-        assert any(n.endswith("config.yaml") for n in names)
-        # Broken symlink inside an allowed dir was preserved as a symlink
-        # (without crashing) — tar entry name recorded as the link path.
-        assert any(
-            "with-broken-links/broken_link" in n for n in names
-        ), (
-            f"broken_link should survive; tarfile names: {sorted(names)[:30]}"
-        )
-        # Valid symlink + target also kept
-        assert any("valid_link" in n for n in names)
-        assert any("valid_target.txt" in n for n in names)
+            content = b"\n".join(
+                tf.extractfile(member).read()
+                for member in tf.getmembers()
+                if member.isfile()
+            )
+        assert not any("hermes-agent" in name for name in names)
+        assert b"DO_NOT_ARCHIVE_EXCLUDED_LINK_TARGET" not in content
+        assert link.is_symlink()
+
+    def test_symlink_free_profile_round_trips(self, profile_env, tmp_path):
+        source = get_profile_dir("portable")
+        source.mkdir(parents=True)
+        (source / "config.yaml").write_text("model: test\n")
+        notes = source / "workspace" / "notes.txt"
+        notes.parent.mkdir()
+        notes.write_text("portable data\n")
+
+        archive = export_profile("portable", str(tmp_path / "portable.tar.gz"))
+        restored = import_profile(str(archive), name="restored")
+
+        assert restored == get_profile_dir("restored")
+        assert (restored / "config.yaml").read_text() == "model: test\n"
+        assert (restored / "workspace" / "notes.txt").read_text() == "portable data\n"
+
+    @pytest.mark.parametrize("member_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+    def test_import_rejects_archive_link_members(
+        self, profile_env, tmp_path, member_type
+    ):
+        archive = tmp_path / "malicious.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            root = tarfile.TarInfo("unsafe")
+            root.type = tarfile.DIRTYPE
+            tf.addfile(root)
+            link = tarfile.TarInfo("unsafe/link")
+            link.type = member_type
+            link.linkname = "/synthetic/host/path"
+            tf.addfile(link)
+
+        with pytest.raises(ValueError, match="Unsupported archive member type"):
+            import_profile(str(archive), name="unsafe")
+        assert not get_profile_dir("unsafe").exists()
 
 
 
@@ -935,6 +968,4 @@ class TestProfilesToServe:
 
         assert set(serve) == {"default", "worker"}
         assert serve["worker"] == get_profile_dir("worker")
-
-
 

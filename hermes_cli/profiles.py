@@ -34,6 +34,23 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli.profile_export import (
+    _DEFAULT_EXPORT_EXCLUDE_ROOT,
+    _default_export_ignore,
+    _is_sensitive_export_entry,
+    _is_sensitive_export_name,
+    _is_sensitive_profile_credential_tree_entry,
+    _is_sensitive_profile_home_entry,
+    _is_transient_export_name,
+    _make_profile_archive,
+    _redact_profile_export_text,
+    _reject_profile_export_symlinks,
+    _scrub_export_secrets,
+    _snapshot_export_sqlite_databases,
+    _sqlite_sidecars_in_directory,
+    _strip_export_backup_suffixes,
+    _verify_compacted_sqlite_semantics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +110,7 @@ _CLONE_ALL_STRIP: list[str] = [
 #   bin           — installed binaries (tirith etc., ~10 MB) shared per-host
 #   node_modules  — npm packages (hundreds of MB)
 #
-# See ``_DEFAULT_EXPORT_EXCLUDE_ROOT`` below for the broader export-side
+# See ``profile_export._DEFAULT_EXPORT_EXCLUDE_ROOT`` for the broader export-side
 # exclusion list (export also drops logs / caches because the archive is a
 # portable snapshot; clone-all keeps those because the cloned profile is
 # meant to keep working immediately).
@@ -162,8 +179,8 @@ def _clone_all_copytree_ignore(source_dir: Path):
          are stale or regenerable (``__pycache__``, ``*.pyc``, ``*.pyo``)
          and runtime sockets / temp files (``*.sock``, ``*.tmp``).
 
-    The export-side ignore (``_default_export_ignore``) uses the same
-    two-tier pattern with the broader ``_DEFAULT_EXPORT_EXCLUDE_ROOT`` set
+    The export-side ignore (in ``profile_export``) uses the same two-tier
+    pattern with its broader ``_DEFAULT_EXPORT_EXCLUDE_ROOT`` set
     because the export archive is a portable snapshot rather than a live
     clone.
     """
@@ -199,56 +216,6 @@ def _clone_all_copytree_ignore(source_dir: Path):
 
     return _ignore
 
-
-# Directories/files to exclude when exporting the default (~/.hermes) profile.
-# The default profile contains infrastructure (repo checkout, worktrees, DBs,
-# caches, binaries) that named profiles don't have.  We exclude those so the
-# export is a portable, reasonable-size archive of actual profile data.
-_DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
-    # Infrastructure
-    "hermes-agent",         # repo checkout (multi-GB)
-    ".worktrees",           # git worktrees
-    "profiles",             # other profiles — never recursive-export
-    "bin",                  # installed binaries (tirith, etc.)
-    "node_modules",         # npm packages
-    # Databases & runtime state
-    "state.db", "state.db-shm", "state.db-wal",
-    "hermes_state.db",
-    "response_store.db", "response_store.db-shm", "response_store.db-wal",
-    "gateway.pid", "gateway_state.json", "processes.json",
-    "auth.json",            # API keys, OAuth tokens, credential pools
-    ".env",                 # API keys (dotenv)
-    "auth.lock", "active_profile", ".update_check",
-    "errors.log",
-    ".hermes_history",
-    # Caches (regenerated on use)
-    "image_cache", "audio_cache", "document_cache",
-    "browser_screenshots", "checkpoints",
-    "sandboxes",
-    "logs",                 # gateway logs
-})
-
-# Allow-list for ``export_profile("default")``: when HERMES_HOME equals the
-# cwd (Docker/custom deployments), the default profile home is the working
-# directory and contains arbitrary user files that should NOT be bundled
-# into the export. The set below identifies the *known Hermes profile
-# artifacts* at the root of HERMES_HOME; everything else is excluded.
-# Sensitive runtime infrastructure (``state.db``, ``logs/``, ``auth.*``,
-# other profiles) is intentionally *not* in this list so the export stays
-# a portable, credential-free snapshot of the user-facing surface
-# (#58394). Add new artifacts here when introduced in ``hermes_constants``.
-_DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
-    # Configuration / persona
-    "config.yaml", "SOUL.md", "MEMORY.md", "USER.md", "todo.json",
-    "system_prompt.md", "AGENTS.md", "CLAUDE.md", ".cursorrules",
-    # Desktop appearance/interface overlay (written by the desktop app's
-    # profile export; applied by its import — see desktop.json handling).
-    "desktop.json",
-    # User-facing skill, cron, and session artifacts
-    "skills", "cron", "scripts", "sessions",
-    # Plugin / memory surfaces (per-profile overrides live here)
-    "plugins", "memories", "knowledge", "preferences",
-})
 
 # Names that cannot be used as profile aliases
 _RESERVED_NAMES = frozenset({
@@ -1901,134 +1868,6 @@ def get_active_profile_name() -> str:
 # Export / Import
 # ---------------------------------------------------------------------------
 
-def _default_export_ignore(root_dir: Path):
-    """Return an *ignore* callable for :func:`shutil.copytree`.
-
-    Two-tier filtering:
-
-    * **Root-level allow-list** — only entries whose name appears in
-      ``_DEFAULT_EXPORT_INCLUDE_ROOT`` survive. Everything else (such as
-      an unrelated ``x11-dev/`` directory in a Docker deployment where
-      HERMES_HOME equals the cwd) is excluded. Blacklisting was tried
-      first and proved unable to anticipate every non-Hermes file the
-      user may have lying alongside HERMES_HOME (#58394).
-    * **Universal exclusions at any depth** — ``__pycache__``, sockets,
-      temp files; plus npm lockfiles, which may appear at the root.
-
-    Surviving text files are later force-redacted by
-    :func:`_scrub_export_secrets` before the archive is written.
-    """
-
-    def _ignore(directory: str, contents: list) -> set:
-        ignored: set = set()
-        for entry in contents:
-            # Universal exclusions (any depth)
-            if entry == "__pycache__" or entry.endswith((".sock", ".tmp")):
-                ignored.add(entry)
-            # npm lockfiles can appear at root
-            elif entry in {"package.json", "package-lock.json"}:
-                ignored.add(entry)
-        # Root-level allow-list: drop everything that isn't a known
-        # Hermes profile artifact.
-        if Path(directory) == root_dir:
-            ignored.update(
-                entry for entry in contents if entry not in _DEFAULT_EXPORT_INCLUDE_ROOT
-            )
-        return ignored
-
-    return _ignore
-
-
-def _make_profile_archive(base: str, root_dir: str, base_dir: str) -> str:
-    """Create ``<base>.tar.gz`` of ``root_dir/base_dir`` — GNU tar format.
-
-    Not :func:`shutil.make_archive`: that writes PAX (Python's tarfile default
-    since 3.8), whose fractional-mtime records macOS Archive Utility rejects —
-    double-clicking an exported profile threw "Error 94 - Bad message." GNU
-    format keeps long paths working (longlink extensions) and stays integer-
-    mtime, so Finder, bsdtar, and gnutar all extract it.
-    """
-    import tarfile
-
-    archive_path = f"{base}.tar.gz"
-    with tarfile.open(archive_path, "w:gz", format=tarfile.GNU_FORMAT) as tf:
-        tf.add(str(Path(root_dir) / base_dir), arcname=base_dir)
-    return archive_path
-
-
-# Text / config suffixes walked during export secret scrubbing. Binary DBs,
-# images, and other non-text artifacts are left alone (they may still leave
-# via named-profile export — scrubbing those is a separate concern).
-_EXPORT_REDACT_SUFFIXES = frozenset({
-    ".md", ".txt", ".yaml", ".yml", ".json", ".jsonl",
-    ".toml", ".ini", ".cfg", ".conf", ".py", ".sh",
-    ".bash", ".zsh", ".js", ".ts", ".tsx", ".jsx",
-    ".css", ".html", ".xml", ".csv",
-})
-# pathlib.Path(".cursorrules").suffix is "" — name-match these.
-# ``*.env.example`` uses endswith (suffix would be ``.example``).
-_EXPORT_REDACT_NAMES = frozenset({
-    ".cursorrules",
-})
-
-
-def _should_redact_export_file(path: Path) -> bool:
-    """True when *path* is a text-ish file we should secret-scrub on export."""
-    name = path.name
-    if name in _EXPORT_REDACT_NAMES:
-        return True
-    if name.lower().endswith(".env.example"):
-        return True
-    return path.suffix.lower() in _EXPORT_REDACT_SUFFIXES
-
-
-def _scrub_export_secrets(staged: Path) -> None:
-    """Force-redact secret-shaped strings in a staged export tree.
-
-    Same ``agent.redact.redact_sensitive_text(..., force=True)`` pass used by
-    ``hermes sessions export --redact``. Runs on the *staged copy only* so the
-    live profile is never rewritten. ``force=True`` ignores
-    ``security.redact_secrets`` / ``HERMES_REDACT_SECRETS`` — share archives
-    must not emit raw keys even when the user has disabled live redaction.
-
-    Symlinks to text files are materialized into regular files when their
-    content changes, so redaction never follows a link back into the source
-    profile (``copytree(..., symlinks=True)``).
-    """
-    from agent.redact import redact_sensitive_text
-
-    for path in staged.rglob("*"):
-        try:
-            is_link = path.is_symlink()
-        except OSError:
-            continue
-        if is_link:
-            # Skip broken links and symlinked directories.
-            try:
-                if not path.exists() or path.is_dir():
-                    continue
-            except OSError:
-                continue
-        elif not path.is_file():
-            continue
-
-        if not _should_redact_export_file(path):
-            continue
-
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            continue
-
-        redacted = redact_sensitive_text(text, force=True)
-        if redacted == text:
-            continue
-
-        if is_link:
-            path.unlink()
-        path.write_text(redacted, encoding="utf-8")
-
-
 def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
     """Export a profile to a tar.gz archive.
 
@@ -2056,8 +1895,41 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         for rel, content in (extra_files or {}).items():
             parts = _normalize_profile_archive_parts(rel)
             target = staged.joinpath(*parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+
+            if (
+                any(_is_transient_export_name(part) for part in parts)
+                or _is_sensitive_export_name(target.name)
+                or _is_sensitive_profile_credential_tree_entry(
+                    str(target.parent), target.name, staged
+                )
+                or _is_sensitive_profile_home_entry(
+                    str(target.parent), target.name, staged
+                )
+            ):
+                raise ValueError(f"Refusing sensitive profile export extra: {rel}")
+
+            underlying_name = _strip_export_backup_suffixes(target.name)
+            if (
+                underlying_name.endswith(".pem")
+                and "PRIVATE KEY-----" in content.upper()
+            ):
+                raise ValueError(f"Refusing private-key profile export extra: {rel}")
+
+            parent = staged
+            for part in parts[:-1]:
+                parent = parent / part
+                if parent.is_symlink():
+                    raise ValueError(f"Refusing symlinked profile export extra: {rel}")
+                parent.mkdir(exist_ok=True)
+            if target.is_symlink():
+                raise ValueError(f"Refusing symlinked profile export extra: {rel}")
+            target.write_text(
+                _redact_profile_export_text(content),
+                encoding="utf-8",
+            )
+
+    if profile_dir.is_symlink():
+        raise ValueError("Refusing profile export symlink: .")
 
     if canon == "default":
         # The default profile IS ~/.hermes itself — its parent is ~/ and its
@@ -2071,21 +1943,38 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
                 symlinks=True,
                 ignore=_default_export_ignore(profile_dir),
             )
+            _reject_profile_export_symlinks(staged)
+            _snapshot_export_sqlite_databases(profile_dir, staged)
             _stage_extras(staged)
             _scrub_export_secrets(staged)
             result = _make_profile_archive(base, tmpdir, "default")
             return Path(result)
 
-    # Named profiles — stage a filtered copy to exclude credentials
+    # Named profiles — stage a filtered copy that drops credentials,
+    # secrets, and credential backups (config.yaml.bak*, .env.bak*, …).
+    # Uses the same _is_sensitive_export_name() rules as the default path so
+    # the two export modes can't drift apart.
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
+
+        def _named_ignore(directory: str, contents: list) -> set:
+            ignored: set = set()
+            sqlite_sidecars = _sqlite_sidecars_in_directory(directory, contents)
+            for entry in contents:
+                if entry in sqlite_sidecars or _is_transient_export_name(entry):
+                    ignored.add(entry)
+                elif _is_sensitive_export_entry(directory, entry, profile_dir):
+                    ignored.add(entry)
+            return ignored
+
         shutil.copytree(
             profile_dir,
             staged,
             symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            ignore=_named_ignore,
         )
+        _reject_profile_export_symlinks(staged)
+        _snapshot_export_sqlite_databases(profile_dir, staged)
         _stage_extras(staged)
         _scrub_export_secrets(staged)
         result = _make_profile_archive(base, tmpdir, canon)
