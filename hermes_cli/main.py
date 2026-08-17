@@ -13811,6 +13811,22 @@ def main():
         "--yes", "-y", action="store_true", help="Skip confirmation"
     )
 
+    sessions_cold_verify = sessions_subparsers.add_parser(
+        "cold-verify",
+        help="Verify one archived terminal session lineage snapshot",
+    )
+    sessions_cold_verify.add_argument(
+        "root",
+        type=Path,
+        metavar="ROOT",
+        help="Existing local archive root containing the current snapshot",
+    )
+    sessions_cold_verify.add_argument(
+        "--session-id",
+        required=True,
+        help="Exact session ID or unique prefix to verify",
+    )
+
     sessions_subparsers.add_parser(
         "optimize",
         help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)",

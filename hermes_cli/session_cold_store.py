@@ -1,9 +1,4 @@
-"""Store-only local cold archive primitives.
-
-This first slice deliberately has no CLI registration and never deletes database
-rows. It validates the basic Mark → Store handoff against a caller-supplied
-``SessionDB`` and local archive root.
-"""
+"""Local cold archive Store and read-only Verify primitives."""
 
 from __future__ import annotations
 
@@ -32,6 +27,16 @@ _MAX_SQLITE_IN_PARAMS = 500
 @dataclass(frozen=True)
 class StoredLineage:
     """Identity and current local snapshot emitted by :func:`store_archived_lineage`."""
+
+    terminal_id: str
+    physical_ids: tuple[str, ...]
+    source_fingerprint: str
+    snapshot_dir: Path
+
+
+@dataclass(frozen=True)
+class VerifiedLineage:
+    """Identity of a current snapshot verified against its live Store plan."""
 
     terminal_id: str
     physical_ids: tuple[str, ...]
@@ -340,6 +345,7 @@ def _valid_existing_snapshot_at(
     terminal_id: str,
     lineage: tuple[str, ...],
     fingerprint: str,
+    record_count: int,
 ) -> bool | None:
     try:
         snapshot_fd = os.open(
@@ -370,7 +376,8 @@ def _valid_existing_snapshot_at(
             and metadata.get("terminal_id") == terminal_id
             and metadata.get("physical_ids") == list(lineage)
             and metadata.get("source_fingerprint") == fingerprint
-            and metadata.get("record_count") == len(records)
+            and type(metadata.get("record_count")) is int
+            and metadata.get("record_count") == record_count == len(records)
             and _fingerprint(records) == fingerprint
             and _directory_entry_matches(snapshot_parent_fd, snapshot_name, snapshot_fd)
         )
@@ -487,12 +494,119 @@ def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
     )
 
 
+def _read_store_plan(db: SessionDB, terminal_id: str) -> _StorePlan:
+    """Build one transactionally consistent Store plan using SELECTs only."""
+    conn = _connection(db)
+    with db._lock:
+        conn.execute("SAVEPOINT cold_store_snapshot")
+        try:
+            return _build_store_plan(conn, terminal_id)
+        finally:
+            conn.execute("RELEASE SAVEPOINT cold_store_snapshot")
+
+
 def plan_archived_lineage(db: SessionDB, terminal_id: str) -> None:
     """Run Store eligibility and source planning without writing any state."""
     _require_supported_platform()
-    conn = _connection(db)
-    with db._lock:
-        _build_store_plan(conn, terminal_id)
+    _read_store_plan(db, terminal_id)
+
+
+def _snapshot_location(
+    archive_root: Path, plan: _StorePlan
+) -> tuple[Path, str, tuple[str, ...]]:
+    terminal_date = datetime.fromtimestamp(plan.started_at, UTC)
+    snapshot_name = _safe_component(plan.terminal_id)
+    parent_parts = (
+        "sessions",
+        "started",
+        f"{terminal_date:%Y}",
+        f"{terminal_date:%m}",
+        f"{terminal_date:%d}",
+    )
+    return (
+        archive_root.joinpath(*parent_parts, snapshot_name),
+        snapshot_name,
+        parent_parts,
+    )
+
+
+def _open_existing_snapshot_parent(
+    archive_root: Path,
+    relative_parts: tuple[str, ...],
+    snapshot_dir: Path,
+) -> tuple[list[int], list[tuple[int, str, int, Path]]]:
+    """Open a no-follow parent chain without creating any filesystem entry."""
+    names = (*archive_root.parts[1:], *relative_parts)
+    descriptors = [os.open(os.sep, _directory_open_flags())]
+    edges: list[tuple[int, str, int, Path]] = []
+    current_path = Path(os.sep)
+    try:
+        for name in names:
+            current_path /= name
+            try:
+                descriptor = os.open(
+                    name, _directory_open_flags(), dir_fd=descriptors[-1]
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    f"cold-store snapshot not found: {snapshot_dir}"
+                ) from exc
+            except OSError as exc:
+                raise _unsafe_archive_parent(current_path, exc)
+            edges.append((descriptors[-1], name, descriptor, current_path))
+            descriptors.append(descriptor)
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+    return descriptors, edges
+
+
+def verify_archived_lineage(
+    db: SessionDB, terminal_id: str, archive_root: Path
+) -> VerifiedLineage:
+    """Verify one existing current snapshot against the live Store plan.
+
+    This primitive is strictly read-only: it performs no database writes and
+    opens only existing archive directories and payloads with no-follow flags.
+    """
+    _require_supported_platform()
+    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
+    plan = _read_store_plan(db, terminal_id)
+    snapshot_dir, snapshot_name, parent_parts = _snapshot_location(
+        archive_root, plan
+    )
+    descriptors, edges = _open_existing_snapshot_parent(
+        archive_root, parent_parts, snapshot_dir
+    )
+    try:
+        _validate_directory_chain(edges)
+        valid = _valid_existing_snapshot_at(
+            descriptors[-1],
+            snapshot_name,
+            plan.terminal_id,
+            plan.physical_ids,
+            plan.source_fingerprint,
+            len(plan.records),
+        )
+        if valid is None:
+            raise ValueError(f"cold-store snapshot not found: {snapshot_dir}")
+        if not valid:
+            raise ValueError(
+                "cold-store snapshot is corrupt or does not match the current "
+                "Store plan (metadata/JSONL/record count/fingerprint/physical IDs): "
+                f"{snapshot_dir}"
+            )
+        _validate_directory_chain(edges)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+    return VerifiedLineage(
+        plan.terminal_id,
+        plan.physical_ids,
+        plan.source_fingerprint,
+        snapshot_dir,
+    )
 
 
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:
@@ -505,34 +619,13 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     _require_supported_platform()
 
     archive_root = Path(os.path.abspath(os.fspath(archive_root)))
-    conn = _connection(db)
-    with db._lock:
-        conn.execute("SAVEPOINT cold_store_snapshot")
-        try:
-            plan = _build_store_plan(conn, terminal_id)
-        finally:
-            conn.execute("RELEASE SAVEPOINT cold_store_snapshot")
+    plan = _read_store_plan(db, terminal_id)
 
     lineage = plan.physical_ids
     records = plan.records
     fingerprint = plan.source_fingerprint
-    terminal_date = datetime.fromtimestamp(plan.started_at, UTC)
-    snapshot_name = _safe_component(terminal_id)
-    snapshot_dir = (
-        archive_root
-        / "sessions"
-        / "started"
-        / f"{terminal_date:%Y}"
-        / f"{terminal_date:%m}"
-        / f"{terminal_date:%d}"
-        / snapshot_name
-    )
-    snapshot_parent_parts = (
-        "sessions",
-        "started",
-        f"{terminal_date:%Y}",
-        f"{terminal_date:%m}",
-        f"{terminal_date:%d}",
+    snapshot_dir, snapshot_name, snapshot_parent_parts = _snapshot_location(
+        archive_root, plan
     )
     descriptors, edges = _open_snapshot_parent(archive_root, snapshot_parent_parts)
     snapshot_parent_fd = descriptors[-1]
@@ -547,6 +640,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
             terminal_id,
             lineage,
             fingerprint,
+            len(records),
         )
         if existing is True:
             return StoredLineage(terminal_id, lineage, fingerprint, snapshot_dir)
@@ -581,6 +675,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
             terminal_id,
             lineage,
             fingerprint,
+            len(records),
         ):
             raise ValueError("staged cold-store snapshot failed verification")
         _validate_directory_chain(edges)

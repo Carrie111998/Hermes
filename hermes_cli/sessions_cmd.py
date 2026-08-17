@@ -317,7 +317,7 @@ def cmd_sessions(args, sessions_parser=None):
     try:
         from hermes_state import SessionDB
 
-        db = SessionDB()
+        db = SessionDB(read_only=action == "cold-verify")
     except Exception as e:
         print(f"Error: Could not open session database: {e}")
         return 1
@@ -893,6 +893,30 @@ def cmd_sessions(args, sessions_parser=None):
         else:
             print(f"Session '{args.session_id}' not found.")
             return 1
+
+    elif action == "cold-verify":
+        resolved_session_id = db.resolve_session_id(args.session_id)
+        if not resolved_session_id:
+            print(f"Session '{args.session_id}' was not found or is ambiguous.")
+            db.close()
+            return 1
+
+        from hermes_cli.session_cold_store import verify_archived_lineage
+
+        try:
+            verified = verify_archived_lineage(
+                db, resolved_session_id, args.root.expanduser()
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Error: could not cold-verify session lineage: {exc}")
+            db.close()
+            return 1
+
+        print("Verified archived session lineage:")
+        print(f"  terminal ID: {verified.terminal_id}")
+        print(f"  physical IDs: {', '.join(verified.physical_ids)}")
+        print(f"  fingerprint: {verified.source_fingerprint}")
+        print(f"  verified snapshot: {verified.snapshot_dir}")
 
     elif action == "cold-store":
         resolved_session_id = db.resolve_session_id(args.session_id)

@@ -79,6 +79,8 @@ def _lineage_rows() -> list[tuple[str, int]]:
     [
         (("sessions", "cold-store"), "ROOT"),
         (("sessions", "cold-store", "archive"), "--session-id"),
+        (("sessions", "cold-verify"), "ROOT"),
+        (("sessions", "cold-verify", "archive"), "--session-id"),
     ],
 )
 def test_cold_store_requires_root_and_named_session_id(
@@ -132,6 +134,80 @@ def test_cold_store_yes_stores_exactly_one_resolved_lineage_and_reports_identity
         ("lineage-root", 1),
         ("lineage-terminal", 1),
     ]
+
+
+def test_cold_verify_successfully_checks_one_stored_lineage_read_only(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "cold-root"
+    store_code, _store_out, store_err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-store",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--yes",
+    )
+    assert store_code == 0
+    assert store_err == ""
+    before_rows = _lineage_rows()
+    before_files = sorted(
+        path.relative_to(archive_root) for path in archive_root.rglob("*")
+    )
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-verify",
+        str(archive_root),
+        "--session-id",
+        "lineage-term",
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "Verified archived session lineage:" in out
+    assert "terminal ID: lineage-terminal" in out
+    assert "physical IDs: lineage-root, lineage-terminal" in out
+    assert re.search(r"fingerprint: [0-9a-f]{64}\b", out)
+    snapshot_match = re.search(r"verified snapshot: (.+)$", out, re.MULTILINE)
+    assert snapshot_match is not None
+    assert Path(snapshot_match.group(1)).is_relative_to(archive_root)
+    assert _lineage_rows() == before_rows
+    assert sorted(
+        path.relative_to(archive_root) for path in archive_root.rglob("*")
+    ) == before_files
+
+
+def test_cold_verify_missing_snapshot_fails_without_creating_root(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "missing-cold-root"
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-verify",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "Error: could not cold-verify session lineage" in out
+    assert "snapshot not found" in out
+    assert not archive_root.exists()
 
 
 def test_cold_store_default_confirmation_warns_about_raw_transcript_and_cancels(

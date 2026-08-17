@@ -60,6 +60,100 @@ def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
         db.close()
 
 
+def test_verify_rejects_live_source_change_after_store(tmp_path: Path) -> None:
+    """Verify compares the current read-only Store plan with the snapshot."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="original")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        stored = store_archived_lineage(db, "terminal", archive_root)
+        db.append_message("terminal", role="assistant", content="changed after Store")
+        before_changes = db._conn.total_changes if db._conn is not None else -1
+
+        with pytest.raises(ValueError, match="fingerprint"):
+            cold_store.verify_archived_lineage(db, "terminal", archive_root)
+
+        assert db._conn is not None
+        assert db._conn.total_changes == before_changes
+        assert stored.snapshot_dir.is_dir()
+        assert "changed after Store" not in (
+            stored.snapshot_dir / "session.jsonl"
+        ).read_text(encoding="utf-8")
+    finally:
+        db.close()
+
+
+def test_verify_missing_snapshot_does_not_create_archive_root(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "missing-archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        before_changes = db._conn.total_changes if db._conn is not None else -1
+
+        with pytest.raises(ValueError, match="snapshot not found"):
+            cold_store.verify_archived_lineage(db, "terminal", archive_root)
+
+        assert not archive_root.exists()
+        assert db._conn is not None
+        assert db._conn.total_changes == before_changes
+    finally:
+        db.close()
+
+
+def test_verify_rejects_corrupt_snapshot_without_replacing_it(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        stored = store_archived_lineage(db, "terminal", archive_root)
+        metadata = stored.snapshot_dir / "metadata.json"
+        metadata.write_text("{corrupt\n", encoding="utf-8")
+        before_files = sorted(
+            path.relative_to(archive_root) for path in archive_root.rglob("*")
+        )
+
+        with pytest.raises(ValueError, match="snapshot is corrupt"):
+            cold_store.verify_archived_lineage(db, "terminal", archive_root)
+
+        assert metadata.read_text(encoding="utf-8") == "{corrupt\n"
+        assert sorted(
+            path.relative_to(archive_root) for path in archive_root.rglob("*")
+        ) == before_files
+    finally:
+        db.close()
+
+
+def test_verify_rejects_symlinked_snapshot_payload(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    outside = tmp_path / "outside-metadata.json"
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        stored = store_archived_lineage(db, "terminal", archive_root)
+        metadata = stored.snapshot_dir / "metadata.json"
+        original = metadata.read_text(encoding="utf-8")
+        outside.write_text(original, encoding="utf-8")
+        metadata.unlink()
+        metadata.symlink_to(outside)
+
+        with pytest.raises(ValueError, match="snapshot is corrupt"):
+            cold_store.verify_archived_lineage(db, "terminal", archive_root)
+
+        assert metadata.is_symlink()
+        assert outside.read_text(encoding="utf-8") == original
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("operation", ["store", "preflight"])
 def test_store_rejects_blob_message_content_before_writing(
     tmp_path: Path,
