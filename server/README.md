@@ -94,13 +94,17 @@ or other operational tenant data. The command is idempotent and refuses to
 replace a tenant once operational data exists.
 
 Store the account password in an owner-readable file and restrict it before
-running the command:
+running the command. A repository-local `.interfaze-credentials/` directory is
+ignored for operator convenience, but a deployment secret manager is preferred:
 
 ```bash
-chmod 600 /secure/path/demo-password.txt
+mkdir -p .interfaze-credentials
+chmod 700 .interfaze-credentials
+printf '%s\n' 'load-this-from-a-secret-manager' > .interfaze-credentials/demo-password
+chmod 600 .interfaze-credentials/demo-password
 python -m server provision-demo \
   --email demo-user@example.com \
-  --password-file /secure/path/demo-password.txt \
+  --password-file .interfaze-credentials/demo-password \
   --profile /secure/path/demo-profile.json
 ```
 
@@ -115,7 +119,61 @@ the public sources used during onboarding:
 ```
 
 The command output contains account identifiers and onboarding status only; it
-never includes the password.
+never includes the password. Provisioning does not import products, countries,
+leads, contacts, research, campaigns, messages, or outreach.
+
+## Import catalogs and the private candidate corpus
+
+Customers import their own product catalog from the WebUI. The accepted CSV
+columns include `product_name`, `category`, and `aliases`; JSON uses a
+top-level `products` array. Import is tenant-scoped and atomic.
+
+The kitchen-appliance candidate corpus is different: it is shared backend
+input, never tenant seed data and never uploaded by the customer WebUI. Load it
+on the application host before a research run:
+
+```bash
+python -m server import-candidates \
+  --dataset-id kitchen-appliances \
+  --version 2026-08 \
+  --file /secure/path/kitchen-appliance-candidates.csv
+```
+
+Importing candidates alone creates no tenant leads, countries, campaigns, or
+research results. A campaign materializes only evidence-backed results after a
+configured verifier succeeds.
+
+Bright Data is the optional live verifier. Put its API key in the deployment
+secret manager as `BRIGHTDATA_API_KEY`; enable it and select its non-secret
+zone in `interfaze_server` config:
+
+```yaml
+interfaze_server:
+  brightdata_enabled: true
+  brightdata_unlocker_zone: cli_unlocker
+```
+
+No Bright Data credential, candidate corpus, or customer catalog is bundled in
+the wheel or container.
+
+## Clean-demo release smoke
+
+After provisioning the account and loading the backend candidate corpus, run
+the post-deploy gate. The password value stays out of arguments and process
+listings:
+
+```bash
+python scripts/ci/interfaze_clean_demo_smoke.py \
+  --base-url https://interfaze.example.com \
+  --email demo-user@example.com \
+  --password-file .interfaze-credentials/demo-password
+```
+
+The gate requires an initially empty tenant, imports one test-only product,
+starts research with an available verifier, and verifies active/rejected
+separation plus HTTPS evidence. Use `--empty-only` only for the credential-free
+CI boot check; CI runs the complete research path with its injected test
+verifier in `tests/server/test_clean_demo_e2e.py`.
 
 ## Production / Supabase
 
@@ -147,8 +205,8 @@ admin in the product database. Documents use the private
   and single-use SSE stream capabilities.
 - `lead_research/` — canonical sectors/evidence, provider registry, immutable
   tenant snapshots, identity/eligibility, fit/confidence scoring, metrics, and
-  deterministic fixture acquisition. Cataloged external sources stay gated by
-  their real access mode instead of falling back to unsupported scraping.
+  Bright Data verification. Cataloged external sources stay gated by their
+  real access mode instead of falling back to fixtures or unsupported scraping.
 - `outreach_service.py` — immutable approval revisions, preflight QA,
   provider idempotency, send windows/caps, reply polling, and bounce circuit.
 - `email_providers/` — Gmail, Microsoft Graph, and test adapter.
@@ -166,6 +224,20 @@ tenant IDs, database IDs, approvals, or provider-send decisions.
 scripts/run_tests.sh tests/server/
 ```
 
-The local suite is credential-free. Release qualification additionally
-requires sandbox runs against Gmail, Microsoft Graph, WhatsApp Cloud, and a
-hosted Supabase project.
+The local release gate is credential-free:
+
+```bash
+python -m pytest tests/server -q
+node --test tests/server/webui/test_oauth_popup.mjs \
+  tests/server/webui/test_admin_provisioning.mjs \
+  tests/server/webui/test_product_import.mjs \
+  tests/server/webui/test_research_scoring.mjs \
+  tests/server/webui/test_research_results.mjs
+uv lock --check
+uv build
+```
+
+CI also installs the wheel and sdist outside the checkout, asserts removed
+demo/fixture paths are absent, and builds and boots `Dockerfile.interfaze-api`.
+Live Bright Data, OAuth/delivery providers, and hosted Supabase remain external
+qualification gates and require their own credentials.

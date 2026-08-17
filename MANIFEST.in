@@ -1,8 +1,15 @@
 graft skills
 graft optional-skills
-graft company-packs
 graft optional-mcps
 graft locales
+# Tenant company packs and removed demo/runtime fixtures are never release
+# inputs. The wheel is built from this sdist, so pruning here protects both
+# artifact types even if a local checkout still contains private pack files.
+prune company-packs
+prune server/demo_data
+prune server/webui/js/mocks
+exclude server/demo_seed.py
+exclude server/lead_research/providers/fixture.py
 # Bundled plugin manifests (plugin.yaml / plugin.yml). Without these the
 # PluginManager scan (hermes_cli/plugins.py) finds zero plugins on installs
 # built from the sdist (e.g. Homebrew, downstream packagers). package-data

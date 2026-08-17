@@ -37,7 +37,7 @@ on:
       - "MANIFEST.in"
       - "Dockerfile.interfaze-api"
       - "docker-compose.interfaze.yml"
-      - "scripts/ci/interfaze_*.sh"
+      - "scripts/ci/interfaze_*"
       - "skills/sales/lead-research/references/**"
       - ".github/workflows/interfaze-api.yml"
   pull_request:
@@ -49,7 +49,7 @@ on:
       - "MANIFEST.in"
       - "Dockerfile.interfaze-api"
       - "docker-compose.interfaze.yml"
-      - "scripts/ci/interfaze_*.sh"
+      - "scripts/ci/interfaze_*"
       - "skills/sales/lead-research/references/**"
       - ".github/workflows/interfaze-api.yml"
   workflow_dispatch:
@@ -91,6 +91,9 @@ jobs:
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         run: uv python install "${PYTHON_VERSION}"
 
+      - name: Verify the dependency lock
+        run: uv lock --check
+
       # `--locked` fails on a stale uv.lock instead of quietly resolving a
       # different dependency set than Dockerfile.interfaze-api ships.
       - name: Install interfaze-api and its extras
@@ -106,6 +109,20 @@ jobs:
           command -v interfaze-api
           command -v hermes
 
+      - name: Reject production demo and fixture artifacts
+        run: |
+          set -euo pipefail
+          test ! -e server/demo_seed.py
+          test ! -e server/demo_data/silverline.json
+          test ! -e server/webui/js/mocks/handlers.js
+          test ! -e server/lead_research/providers/fixture.py
+
+      - name: Run the clean-demo release gate
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest tests/server/test_clean_demo_e2e.py -q
+
       - name: Run server tests
         run: |
           set -euo pipefail
@@ -117,8 +134,12 @@ jobs:
       - name: Run WebUI browser tests
         run: |
           set -euo pipefail
-          node --test tests/server/webui/test_oauth_popup.mjs
-          node --test tests/server/webui/test_admin_provisioning.mjs
+          node --test \
+            tests/server/webui/test_oauth_popup.mjs \
+            tests/server/webui/test_admin_provisioning.mjs \
+            tests/server/webui/test_product_import.mjs \
+            tests/server/webui/test_research_scoring.mjs \
+            tests/server/webui/test_research_results.mjs
           node --input-type=module --check < server/webui/js/oauth-popup.js
           # pages/integrations.js was folded into pages/setup.js by 608f0f0b8;
           # the stale path made this whole step fail under `set -e`.
@@ -143,6 +164,16 @@ jobs:
           export INTERFAZE_PUBLIC_BASE_URL="http://127.0.0.1:8000"
           mkdir -p "${HERMES_HOME}"
 
+          password_file="${RUNNER_TEMP}/interfaze-demo-password"
+          profile_file="${RUNNER_TEMP}/interfaze-demo-profile.json"
+          install -m 600 /dev/null "${password_file}"
+          printf '%s\n' 'ci-clean-demo-password' > "${password_file}"
+          python -c 'import json,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps({"company_profile":{"name":"CI Clean Demo","website":"https://example.test"},"onboarding_sources":[{"url":"https://example.test/about","retrieved_at":1.0}]}), encoding="utf-8")' "${profile_file}"
+          python -m server provision-demo \
+            --email ci-demo@example.test \
+            --password-file "${password_file}" \
+            --profile "${profile_file}"
+
           # 0.0.0.0 is what the container binds (server/api_cli.py defaults to
           # 127.0.0.1, which is why the Dockerfile passes --host explicitly);
           # exercise the same argument path here.
@@ -154,6 +185,12 @@ jobs:
             kill "${api_pid}" 2>/dev/null || true
             exit 1
           fi
+
+          python scripts/ci/interfaze_clean_demo_smoke.py \
+            --base-url http://127.0.0.1:8000 \
+            --email ci-demo@example.test \
+            --password-file "${password_file}" \
+            --empty-only
 
           kill "${api_pid}" 2>/dev/null || true
           wait "${api_pid}" 2>/dev/null || true
@@ -207,6 +244,25 @@ jobs:
             "${RUNNER_TEMP}/venv-wheel" \
             8001
 
+      - name: Assert forbidden paths are absent from the installed wheel
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/venv-wheel/bin/python" - <<'PY'
+          from pathlib import Path
+          import server
+
+          root = Path(server.__file__).resolve().parent
+          forbidden = (
+              "demo_seed.py",
+              "demo_data/silverline.json",
+              "webui/js/mocks/handlers.js",
+              "lead_research/providers/fixture.py",
+          )
+          present = [path for path in forbidden if (root / path).exists()]
+          assert not present, f"forbidden runtime artifacts in installed wheel: {present}"
+          PY
+
       - name: Install and smoke-test the sdist in a clean venv
         run: |
           set -euo pipefail
@@ -214,6 +270,25 @@ jobs:
             "$(ls "${RUNNER_TEMP}"/dist/*.tar.gz)" \
             "${RUNNER_TEMP}/venv-sdist" \
             8002
+
+      - name: Assert forbidden paths are absent from the installed sdist
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/venv-sdist/bin/python" - <<'PY'
+          from pathlib import Path
+          import server
+
+          root = Path(server.__file__).resolve().parent
+          forbidden = (
+              "demo_seed.py",
+              "demo_data/silverline.json",
+              "webui/js/mocks/handlers.js",
+              "lead_research/providers/fixture.py",
+          )
+          present = [path for path in forbidden if (root / path).exists()]
+          assert not present, f"forbidden runtime artifacts in installed sdist: {present}"
+          PY
 
       - name: Minimize uv cache
         if: always()
@@ -253,6 +328,11 @@ jobs:
           push: false
           cache-from: type=gha,scope=interfaze-api
           cache-to: type=gha,scope=interfaze-api,mode=max
+
+      - name: Assert forbidden runtime paths are absent from the image
+        run: |
+          docker run --rm --entrypoint python interfaze-api:ci -c \
+            "from pathlib import Path; import server; root=Path(server.__file__).parent; forbidden=('demo_seed.py','demo_data/silverline.json','webui/js/mocks/handlers.js','lead_research/providers/fixture.py'); present=[p for p in forbidden if (root/p).exists()]; assert not present, present"
 
       - name: Boot the container and smoke-test /health
         run: |

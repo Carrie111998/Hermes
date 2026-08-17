@@ -173,5 +173,13 @@ test-results/
 # Local hermes runtime config (may carry provider credentials — never committed).
 .local-hermes/
 
+# Interfaze deployment secrets. Keep password/API-key material in the ignored
+# directory and pass paths (never values) to provisioning and smoke commands.
+.env.interfaze
+.env.interfaze.*
+.interfaze-credentials/
+*.interfaze-credential
+*.interfaze-password
+
 # Isolated feature worktrees created by the agent workflow.
 .worktrees/
