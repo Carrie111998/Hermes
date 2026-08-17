@@ -296,6 +296,10 @@ class TestBestOfNJudge(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(custom, "Prefer simpler code")
 
+        max_length, error = _normalize_best_of_n_judge("x" * 500)
+        self.assertIsNone(error)
+        self.assertEqual(len(max_length), 500)
+
         too_long, error = _normalize_best_of_n_judge("x" * 501)
         self.assertIsNone(too_long)
         self.assertIn("at most 500 characters", error)
