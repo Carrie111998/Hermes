@@ -325,7 +325,7 @@ export function invalidateStripTools() {
   $stripToolsRevision.set($stripToolsRevision.get() + 1)
 }
 
-/** Record the interacted zone (pointerdown / focusin). Idempotent. */
+/** Record the interacted zone (click / focusin). Idempotent. */
 export function noteActiveTreeGroup(groupId: null | string) {
   if (groupId !== $activeTreeGroup.get()) {
     $activeTreeGroup.set(groupId)
@@ -393,20 +393,30 @@ export function trackActiveTreeGroup(): () => void {
     }
   }
 
+  // `click` — not `pointerdown` — records the interacted zone. Pointerdown
+  // fires the instant a button is PRESSED, before the press has committed to
+  // anything, so switching `$activeTreeGroup` (and with it the derived
+  // `$focusedStoredSessionId`) on pointerdown made the focused session — and
+  // everything keyed off it (statusbar workspace label, sidebar row highlight)
+  // — flicker to another zone's tile for the whole duration of a held press.
+  // `click` keeps the same "last interacted zone" semantics for ⌘W (the click
+  // event's target is intact even when activeElement is `body` on
+  // non-focusable surfaces) but only after the press has completed.
+  //
   // `pointerover` fires on every element boundary crossing (not every mouse
   // move), so leaving the panes for the titlebar reports null and the override
   // lifts on its own.
   const trackHover = (event: Event) => noteHoveredTreeGroup(treeGroupOfEvent(event))
   const clearHover = () => noteHoveredTreeGroup(null)
 
-  window.addEventListener('pointerdown', trackActive, true)
+  window.addEventListener('click', trackActive, true)
   window.addEventListener('focusin', trackActive, true)
   window.addEventListener('pointerover', trackHover, true)
   document.documentElement.addEventListener('pointerleave', clearHover)
   window.addEventListener('blur', clearHover)
 
   return () => {
-    window.removeEventListener('pointerdown', trackActive, true)
+    window.removeEventListener('click', trackActive, true)
     window.removeEventListener('focusin', trackActive, true)
     window.removeEventListener('pointerover', trackHover, true)
     document.documentElement.removeEventListener('pointerleave', clearHover)
