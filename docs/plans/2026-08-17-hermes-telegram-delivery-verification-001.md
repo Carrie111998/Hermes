@@ -328,10 +328,14 @@ reconciliation.
 - `tests/gateway/test_telegram_delivery_audit.py` covers metadata propagation,
   successful correlated send evidence, inbound evidence, and no-correlation
   no-op behavior.
- - Targeted verification: 38 tests passed across the new audit tests,
+ - Targeted verification: 41 tests passed across the new audit tests,
    Telegram text batching, and Telegram final delivery; Ruff and `git diff
    --check` passed in both the Windows shared environment and the isolated
    WSL reviewer environment.
+ - CI correction: the first PR run exposed a legacy regression fixture using a
+   reduced event namespace without optional metadata fields. The audit hook now
+   uses `getattr` for those optional fields; the local targeted/regression suite
+   is `41 passed`.
 - First implementation review correction: authenticated Claude returned
   `REVISE` because native media paths lacked outbound audit records; the
   correction added audit coverage for native file/media sends and tests.
@@ -350,14 +354,22 @@ reconciliation.
    and orphaned batch correlation ids. Fallback auditing and batch metadata
    merging were corrected, with dedicated tests; the targeted suite is now
    `38 passed`.
- - Final implementation review reconciliation: `PASS` from one authenticated
-   Claude reviewer and one authenticated AGY reviewer, both reviewing the
-   byte-identical packet
+ - Final implementation review reconciliation (superseded by the CI
+   correction): `PASS` from one authenticated Claude reviewer and one
+   authenticated AGY reviewer, both reviewing the byte-identical packet
    `0F9A7B9C962BE656508926354EABB937EBFA308541D1D7A6B5AA11125E9C91F2`.
    Claude independently confirmed the fallback and batching traces and noted
    that its own environment could not rerun the suite; the same 38-test suite
    was reproduced in the isolated WSL environment and AGY also confirmed the
-   38-test result. No reviewer edited the worktree.
+    38-test result. No reviewer edited the worktree.
+ - CI correction review reconciliation: `PASS` from one authenticated Claude
+   reviewer and one authenticated AGY reviewer, both reviewing the identical
+   corrected packet
+   `7E72D5448F0D97585ADEC40AB0DA92FD40DDD2595DE61EE15B765F5930206487`.
+   Windows and isolated WSL both reproduced `41 passed`; Claude's own session
+   could not execute the suite because its environment lacked dependencies,
+   but found no implementation or privacy defect. No reviewer edited the
+   worktree.
 
 ## Safety stop conditions
 

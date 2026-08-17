@@ -843,8 +843,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._log_delivery_audit(
             phase="inbound",
             status="accepted",
-            metadata=event.metadata,
-            update_id=event.platform_update_id,
+            metadata=getattr(event, "metadata", None),
+            update_id=getattr(event, "platform_update_id", None),
         )
 
     def _audit_send_result(
