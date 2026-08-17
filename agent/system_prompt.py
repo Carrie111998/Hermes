@@ -847,12 +847,25 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line = f"Timezone: {', '.join(_zone_bits)}" if _zone_bits else ""
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
-    if agent.model:
-        timestamp_line += f"\nModel: {agent.model}"
-    if agent.provider:
-        timestamp_line += f"\nProvider: {agent.provider}"
-    if agent.platform:
-        timestamp_line += f"\nPlatform: {agent.platform}"
+    # Model / Provider / Platform identity lines are informational only —
+    # they are surfaced to the user through the platform footer, not read
+    # from the prompt. On implicit longest-prefix-cache backends (local
+    # llama.cpp / Ollama / LM Studio) any byte change in the system prompt
+    # invalidates the KV-cache prefix for the ENTIRE conversation history,
+    # so a /model switch that rewrites these lines forces a full
+    # reprocess (measured 408s on a ~45k-token session, issue #88087).
+    # Omit them when the provider has no explicit cache_control breakpoint
+    # API, keeping the prompt byte-identical across model switches and
+    # preserving the cached prefix. Explicit cache_control backends
+    # (Anthropic-style) keep the lines: their cache layers are keyed
+    # independently, so the volatile tail change is cheap.
+    if getattr(agent, "_use_native_cache_layout", False):
+        if agent.model:
+            timestamp_line += f"\nModel: {agent.model}"
+        if agent.provider:
+            timestamp_line += f"\nProvider: {agent.provider}"
+        if agent.platform:
+            timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
     return {
