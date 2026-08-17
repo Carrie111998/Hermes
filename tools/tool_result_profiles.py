@@ -13,9 +13,10 @@ Supported modes (``mode`` per tool in ``tool_result_profiles.tools``):
 - ``full`` — passthrough (the current behavior; also the behavior for any
   tool without a profile). Compatible with existing installs.
 - ``bounded_matches`` — search-like results. Keeps the first N matches and
-  the last N matches (works on both the verbose ``matches`` array and the
-  densified path-grouped ``matches_text`` block), summarizes the middle,
-  re-serializes the JSON envelope.
+  the last N matches of the verbose ``matches`` array (the densified
+  path-grouped ``matches_text`` block is trimmed by *lines*, since it has
+  no per-match boundaries), summarizes the middle, re-serializes the JSON
+  envelope.
 - ``tail_or_head`` — large read_file pages. Keeps the head and tail lines
   (function defs at the top, the answer near the bottom), drops the middle.
   Small reads pass through untouched (``full_if_under_chars``).
@@ -35,9 +36,12 @@ Design invariants:
 - **Complement, not replacement.** The mode filter runs before the size
   caps and persistence thresholds, so it can only *shrink* what enters
   context — never raise it above what ``tool_output`` already allows.
-- **Full output stays available where it already is.** Persist spill files
-  and ``full_output_path`` references are written before the filter runs
-  and are untouched by it.
+- **Full output stays available where it already is.** Tools that write
+  their own spill references (e.g. the terminal tool's
+  ``full_output_path``) do so before the result reaches the filter and
+  are untouched by it. Executor-level persistence runs *after* the filter,
+  so a result that still exceeds ``tool_output`` thresholds is spilled in
+  its filtered form.
 - **Process-lifetime cache.** Profiles are read from config once and cached
   (same pattern as ``tools/tool_output_limits.py``); tests reset the cache
   via ``_reset_tool_result_profiles_cache()``.
@@ -60,6 +64,7 @@ DEFAULT_PROFILES: Dict[str, Any] = {
             "first_matches": 5,
             "last_matches": 5,
             "middle_summary": "{omitted} additional matches omitted — use a narrower pattern or offset to page through them",
+            "middle_summary_lines": "{omitted} additional lines omitted — use a narrower pattern or offset to page through them",
         },
         "read_file": {
             "mode": "tail_or_head",
@@ -69,9 +74,13 @@ DEFAULT_PROFILES: Dict[str, Any] = {
         },
         "patch": {
             "mode": "summary",
+            "keep_keys": [],
+            "deny_keys": [],
         },
         "write_file": {
             "mode": "summary",
+            "keep_keys": [],
+            "deny_keys": [],
         },
         "terminal": {
             "mode": "smart_tail",
@@ -124,6 +133,18 @@ def _coerce_bool(value: Any, default: bool) -> bool:
         return bool(value)
     except Exception:
         return default
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Return ``value`` as a list of strings, dropping non-string entries.
+
+    Used for per-tool ``keep_keys``/``deny_keys`` overrides. Anything that
+    is not a list (or a list with garbage in it) resolves to ``[]`` — a
+    config typo must never raise during profile resolution.
+    """
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def _middle_note(template: str, omitted: int, suffix: str = "") -> str:
@@ -186,6 +207,20 @@ def get_tool_result_profiles() -> Dict[str, Any]:
                     "{omitted} additional matches omitted — use a narrower pattern or offset to page through them",
                 )
             )
+            profile["middle_summary_lines"] = str(
+                raw_profile.get("middle_summary_lines")
+                or defaults.get(
+                    "middle_summary_lines",
+                    "{omitted} additional lines omitted — use a narrower pattern or offset to page through them",
+                )
+            )
+        elif mode == "summary":
+            # Per-tool keep/deny escapes: ``keep_keys`` are preserved in
+            # addition to the default set; ``deny_keys`` are dropped even
+            # if a default would keep them. Lets new result fields surface
+            # (or legacy ones be hidden) without a code change.
+            profile["keep_keys"] = _coerce_str_list(raw_profile.get("keep_keys"))
+            profile["deny_keys"] = _coerce_str_list(raw_profile.get("deny_keys"))
         elif mode in ("tail_or_head", "smart_tail"):
             defaults = DEFAULT_PROFILES["tools"].get(tool_name, {})
             profile["head_lines"] = _coerce_int(
@@ -223,6 +258,9 @@ def _filter_bounded_matches(content: str, profile: Dict[str, Any]) -> str:
     if first_n <= 0 and last_n <= 0:
         return content
     middle_summary = profile.get("middle_summary", "")
+    middle_summary_lines = profile.get("middle_summary_lines", "")
+    if not middle_summary_lines:
+        middle_summary_lines = middle_summary
 
     payload = content
     hint = ""
@@ -258,12 +296,15 @@ def _filter_bounded_matches(content: str, profile: Dict[str, Any]) -> str:
         lines = matches_text.split("\n")
         if len(lines) > first_n + last_n:
             omitted = len(lines) - first_n - last_n
-            note = _middle_note(middle_summary, omitted)
+            note = _middle_note(middle_summary_lines, omitted)
             data["matches_text"] = "\n".join(
                 lines[:first_n] + [note] + lines[-last_n:]
             )
             data["truncated"] = True
-            data["_relevance"] = {"mode": "bounded_matches", "omitted": omitted}
+            data["_relevance"] = {
+                "mode": "bounded_matches",
+                "omitted_lines": omitted,
+            }
             changed = True
 
     if not changed:
@@ -300,7 +341,12 @@ def _filter_tail_or_head(content: str, profile: Dict[str, Any]) -> str:
 
 
 def _filter_summary(content: str, profile: Dict[str, Any]) -> str:
-    """patch/write_file: keep the compact JSON envelope, drop diffs."""
+    """patch/write_file: keep the compact JSON envelope, drop diffs.
+
+    The keep/deny sets are the built-in defaults plus any per-tool
+    ``keep_keys``/``deny_keys`` from config, so new result fields can
+    surface without a code change (and noisy ones can be suppressed).
+    """
     if not _looks_like_json(content):
         return content
     try:
@@ -309,8 +355,11 @@ def _filter_summary(content: str, profile: Dict[str, Any]) -> str:
         return content
     if not isinstance(data, dict):
         return content
-    keep = {k: v for k, v in data.items() if k in _SUMMARY_KEEP_KEYS}
-    dropped = sorted(set(data.keys()) - _SUMMARY_KEEP_KEYS)
+    keep_set = set(_SUMMARY_KEEP_KEYS)
+    keep_set |= set(profile.get("keep_keys") or ())
+    keep_set -= set(profile.get("deny_keys") or ())
+    keep = {k: v for k, v in data.items() if k in keep_set}
+    dropped = sorted(set(data.keys()) - keep_set)
     if not dropped:
         return content
     keep["_relevance"] = {"mode": "summary", "dropped_keys": dropped}

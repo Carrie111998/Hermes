@@ -764,6 +764,7 @@ tool_result_profiles:
       first_matches: 5
       last_matches: 5
       middle_summary: "{omitted} additional matches omitted — use a narrower pattern or offset to page through them"
+      middle_summary_lines: "{omitted} additional lines omitted — use a narrower pattern or offset to page through them"
     read_file:
       mode: tail_or_head        # large pages: head + tail, middle summarized
       head_lines: 50
@@ -771,8 +772,12 @@ tool_result_profiles:
       full_if_under_chars: 4000 # small reads pass through untouched
     patch:
       mode: summary             # compact envelope; diff bodies dropped
+      keep_keys: []             # extra keys to preserve (on top of defaults)
+      deny_keys: []             # default-kept keys to drop
     write_file:
       mode: summary
+      keep_keys: []
+      deny_keys: []
     terminal:
       mode: smart_tail          # head + tail of output; metadata kept
       head_lines: 50
@@ -782,25 +787,36 @@ tool_result_profiles:
 Per-tool modes:
 
 - **`bounded_matches`** (`search_files`) — keeps the first `first_matches`
-  and last `last_matches` matches (both the verbose `matches` array and the
-  densified path-grouped text are supported), marks the result `truncated`,
-  and records the omitted count in `_relevance` so the model can page with
-  `offset` for the middle.
+  and last `last_matches` matches of the verbose `matches` array and marks
+  the result `truncated`, recording the omitted count in `_relevance` so
+  the model can page with `offset` for the middle. The densified
+  path-grouped `matches_text` block has no per-match boundaries, so it is
+  trimmed by *lines* (`middle_summary_lines` renders that note; the
+  omitted count is recorded as `omitted_lines`).
 - **`tail_or_head`** (`read_file`) — for pages larger than
   `full_if_under_chars`, keeps the first `head_lines` and last `tail_lines`
   (function definitions near the top, the answer near the bottom) and
   inserts an omitted-lines notice. Small reads pass through untouched.
 - **`summary`** (`patch`, `write_file`) — keeps the compact JSON envelope
   (success/error, `files_modified`, `resolved_path`, warnings) and drops
-  verbose diff bodies the agent already knows about.
+  verbose diff bodies the agent already knows about. Concise by default,
+  but an escape hatch exists: `keep_keys` preserves additional result
+  fields (so new fields surface without a code change) and `deny_keys`
+  drops fields the built-in keep-list would preserve.
 - **`smart_tail`** (`terminal`) — trims the `output` field to the head and
   tail (banner/version at the top, errors at the bottom) while leaving all
   other result metadata (`exit_code`, spill paths, truncation notes) intact,
   and records the trimmed count in `relevance_note`.
 
 The filter is fail-open: malformed output, unknown tools, unparseable JSON,
-or a disabled section all pass results through unchanged. To disable the
-system entirely, set `tool_result_profiles.enabled: false`.
+or a disabled section all pass results through unchanged. The filter runs
+before the size caps and context-persistence thresholds, so an oversized
+result is relevance-filtered first and only then spilled or truncated if it
+still exceeds the `tool_output` limits. Profiles are read once per process
+and cached (the same pattern as the `tool_output` limits), so changes to
+`tool_result_profiles` in `config.yaml` require restarting the agent to
+take effect. To disable the system entirely, set
+`tool_result_profiles.enabled: false`.
 
 ## Global Toolset Disable
 

@@ -17,6 +17,11 @@ Covers:
      small output no-op, non-JSON passthrough.
 4. Fail-open contract: unknown tools, disabled config, non-string content,
    and malformed input never raise and never mutate the original.
+5. Config escapes: per-tool ``middle_summary_lines`` for the densified text
+   form (trimmed by lines, counted as lines) and ``keep_keys``/``deny_keys``
+   for the summary envelope.
+6. Executor ordering: the filter runs before the size caps/persistence, so
+   persistence always receives the already-filtered result.
 """
 
 from __future__ import annotations
@@ -157,9 +162,40 @@ class TestBoundedMatches:
         data = json.loads(out)
         text = data["matches_text"]
         assert text.startswith("src/a.py")
-        assert "9 additional matches omitted" in text
+        assert "9 additional lines omitted" in text
         assert "  11: line 11" in text  # last match kept
         assert data["truncated"] is True
+        assert data["_relevance"]["omitted_lines"] == 9
+
+    def test_densified_note_uses_middle_summary_lines_template(self):
+        cfg = _cfg_with({"enabled": True, "tools": {
+            "search_files": {
+                "mode": "bounded_matches",
+                "first_matches": 2,
+                "last_matches": 2,
+                "middle_summary_lines": "{omitted} lines hidden — page with offset",
+            },
+        }})
+        content = self._search_content(12, densify=True)
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = trp.apply_tool_result_filter("search_files", content)
+        data = json.loads(out)
+        assert "9 lines hidden — page with offset" in data["matches_text"]
+
+    def test_custom_tool_without_defaults_uses_provided_lines_template(self):
+        cfg = _cfg_with({"enabled": True, "tools": {
+            "my_search": {
+                "mode": "bounded_matches",
+                "first_matches": 2,
+                "last_matches": 2,
+                "middle_summary_lines": "{omitted} lines hidden — page with offset",
+            },
+        }})
+        content = json.dumps({"matches_text": "\n".join(f"l{i}" for i in range(12))})
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = trp.apply_tool_result_filter("my_search", content)
+        data = json.loads(out)
+        assert "8 lines hidden — page with offset" in data["matches_text"]
 
     def test_small_result_unchanged(self):
         content = self._search_content(3)
@@ -264,6 +300,65 @@ class TestSummary:
         content = "Some plain text confirmation"
         with patch("hermes_cli.config.load_config", return_value=self._cfg()):
             assert trp.apply_tool_result_filter("write_file", content) == content
+
+    def test_keep_keys_preserve_new_fields(self):
+        cfg = _cfg_with({"enabled": True, "tools": {
+            "patch": {
+                "mode": "summary",
+                "keep_keys": ["conflicts"],
+                "deny_keys": [],
+            },
+        }})
+        content = json.dumps({
+            "success": True,
+            "files_modified": ["src/a.py"],
+            "conflicts": ["src/b.py"],
+            "diff": "--- a\n+++ b\n",
+        })
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = trp.apply_tool_result_filter("patch", content)
+        data = json.loads(out)
+        assert data["success"] is True
+        assert data["conflicts"] == ["src/b.py"]  # new field surfaced via config
+        assert "diff" not in data
+        assert data["_relevance"]["dropped_keys"] == ["diff"]
+
+    def test_deny_keys_drop_default_kept_keys(self):
+        cfg = _cfg_with({"enabled": True, "tools": {
+            "patch": {
+                "mode": "summary",
+                "keep_keys": [],
+                "deny_keys": ["status", "files_modified"],
+            },
+        }})
+        content = json.dumps({
+            "success": True,
+            "status": "applied",
+            "files_modified": ["src/a.py"],
+            "diff": "--- a\n+++ b\n",
+        })
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = trp.apply_tool_result_filter("patch", content)
+        data = json.loads(out)
+        assert data["success"] is True
+        assert "status" not in data
+        assert "files_modified" not in data
+        assert data["_relevance"]["dropped_keys"] == ["diff", "files_modified", "status"]
+
+    def test_garbage_keep_deny_entries_are_ignored(self):
+        cfg = _cfg_with({"enabled": True, "tools": {
+            "write_file": {
+                "mode": "summary",
+                "keep_keys": "not-a-list",
+                "deny_keys": [123, None],
+            },
+        }})
+        content = json.dumps({"success": True, "diff": "--- a\n+++ b\n"})
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = trp.apply_tool_result_filter("write_file", content)
+        data = json.loads(out)
+        assert data["success"] is True
+        assert "diff" not in data  # built-in defaults still apply
 
 
 class TestSmartTail:
@@ -390,7 +485,7 @@ class TestExecutorWiring:
             ],
         }, ensure_ascii=False)
 
-    def _run_sequential(self, agent, function_name, result, profiles_cfg):
+    def _run_sequential(self, agent, function_name, result, profiles_cfg, persist_hook=None):
         from types import SimpleNamespace
 
         tool_call = SimpleNamespace(
@@ -401,11 +496,16 @@ class TestExecutorWiring:
         messages: list = []
         assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
 
+        def _fake_persist(**kwargs):
+            if persist_hook is not None:
+                persist_hook(kwargs["content"])
+            return kwargs["content"]
+
         with (
             patch("run_agent.handle_function_call", return_value=result),
             patch(
                 "agent.tool_executor.maybe_persist_tool_result",
-                side_effect=lambda **kwargs: kwargs["content"],
+                side_effect=_fake_persist,
             ),
             patch("hermes_cli.config.load_config", return_value=profiles_cfg),
         ):
@@ -428,6 +528,27 @@ class TestExecutorWiring:
         assert data["matches"][0]["line"] == 0
         assert data["matches"][-1]["line"] == 19
         assert data["truncated"] is True
+
+    def test_filter_runs_before_size_caps_and_persistence(self):
+        """The relevance filter must shrink the result BEFORE persistence
+        sees it — otherwise an oversized result is replaced by a preview
+        blob (no longer JSON) and the filter fails open, i.e. it is a no-op
+        exactly for the results it exists for."""
+        agent = _make_executor_agent()
+        cfg = {"tool_result_profiles": {"enabled": True, "tools": {
+            "search_files": {"mode": "bounded_matches", "first_matches": 2, "last_matches": 2},
+        }}}
+        seen_by_persist: list = []
+
+        def _capture(content: str) -> None:
+            seen_by_persist.append(content)
+
+        self._run_sequential(
+            agent, "search_files", self._big_search_result(), cfg, persist_hook=_capture
+        )
+        assert len(seen_by_persist) == 1
+        data = json.loads(seen_by_persist[0])
+        assert len(data["matches"]) == 4  # persistence received the filtered form
 
     def test_filter_skipped_when_disabled(self):
         agent = _make_executor_agent()

@@ -595,12 +595,18 @@ DEFAULT_CONFIG = {
     # - search_files ``bounded_matches``: keep the first N + last N matches
     #   (or densified text lines), summarize the middle. Most searches'
     #   signal lives in the first few matches + the boundary ones.
+    #   ``middle_summary`` renders the note for the verbose ``matches``
+    #   array (counts matches); ``middle_summary_lines`` renders the note
+    #   for the densified ``matches_text`` block (counts lines, since that
+    #   form has no per-match boundaries).
     # - read_file ``tail_or_head``: when a page is large, keep the head and
     #   tail (function defs at the top, the answer near the bottom) instead
     #   of the whole page. Small reads pass through untouched.
     # - patch / write_file ``summary``: the agent already knows what it asked
     #   for; keep the compact JSON envelope (success/files/targets), drop
-    #   verbose diff bodies.
+    #   verbose diff bodies. ``keep_keys``/``deny_keys`` extend or prune the
+    #   built-in keep-list per tool, so new result fields can surface (or be
+    #   hidden) without a code change.
     # - terminal ``smart_tail``: keep the head + tail of the output field
     #   (banner/version at the top, errors at the bottom), keep all other
     #   result metadata intact.
@@ -609,7 +615,9 @@ DEFAULT_CONFIG = {
     # passthrough). The filter runs BEFORE the size caps and persistence
     # thresholds, so nothing here raises context above what
     # ``tool_output`` already allows — it only fills the allowed size with
-    # the relevant parts. Disable the whole system with ``enabled: false``.
+    # the relevant parts. Profiles are cached for the process lifetime
+    # (same as ``tool_output``), so changes require a restart. Disable the
+    # whole system with ``enabled: false``.
     "tool_result_profiles": {
         "enabled": True,
         "tools": {
@@ -618,6 +626,7 @@ DEFAULT_CONFIG = {
                 "first_matches": 5,
                 "last_matches": 5,
                 "middle_summary": "{omitted} additional matches omitted — use a narrower pattern or offset to page through them",
+                "middle_summary_lines": "{omitted} additional lines omitted — use a narrower pattern or offset to page through them",
             },
             "read_file": {
                 "mode": "tail_or_head",
@@ -627,9 +636,13 @@ DEFAULT_CONFIG = {
             },
             "patch": {
                 "mode": "summary",
+                "keep_keys": [],
+                "deny_keys": [],
             },
             "write_file": {
                 "mode": "summary",
+                "keep_keys": [],
+                "deny_keys": [],
             },
             "terminal": {
                 "mode": "smart_tail",
