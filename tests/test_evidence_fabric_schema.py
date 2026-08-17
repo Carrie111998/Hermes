@@ -3,6 +3,7 @@ import sqlite3
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_common import SCHEMA_SQL
 
 
 def _objects(db_path):
@@ -54,16 +55,38 @@ def test_fresh_schema_has_evidence_fabric_objects_and_v27(tmp_path):
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
-def test_v26_database_upgrades_idempotently_without_losing_existing_rows(tmp_path):
+def test_real_pre_v27_database_upgrades_idempotently_without_losing_existing_rows(tmp_path):
     db_path = tmp_path / "state.db"
-    with SessionDB(db_path):
-        pass
     with sqlite3.connect(db_path) as connection:
-        connection.execute("UPDATE schema_version SET version = 26")
+        connection.executescript(SCHEMA_SQL)
+        connection.execute("INSERT INTO schema_version VALUES (26)")
         connection.execute("INSERT INTO sessions (id, source, started_at) VALUES ('legacy', 'test', 1)")
+        for table in ("claim_evidence_links", "claims", "evidence_records", "research_runs"):
+            connection.execute(f"DROP TABLE {table}")
+        for name in (
+            "ux_evidence_exact_uri_hash",
+            "ux_evidence_exact_raw_hash",
+            "idx_evidence_records_run",
+            "idx_claims_run",
+            "idx_claim_links_run",
+            "research_runs_terminal_status_guard",
+            "evidence_records_open_run_insert_guard",
+            "claims_open_run_insert_guard",
+            "links_open_run_insert_guard",
+            "evidence_records_terminal_update_guard",
+            "claims_terminal_update_guard",
+            "links_terminal_update_guard",
+        ):
+            connection.execute("DROP INDEX IF EXISTS \"%s\"" % name)
+            connection.execute("DROP TRIGGER IF EXISTS \"%s\"" % name)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN "
+            "('research_runs', 'evidence_records', 'claims', 'claim_evidence_links')"
+        ).fetchone()[0] == 0
 
-    with SessionDB(db_path):
-        pass
+    migrated = SessionDB(db_path)
+    assert migrated._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    migrated.close()
     with SessionDB(db_path):
         pass
 
@@ -74,6 +97,9 @@ def test_v26_database_upgrades_idempotently_without_losing_existing_rows(tmp_pat
         assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 27
         assert connection.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'research_runs'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'research_runs_terminal_status_guard'"
         ).fetchone()[0] == 1
 
 

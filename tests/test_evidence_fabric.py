@@ -6,6 +6,8 @@ from hermes_state import SessionDB
 from research.evidence_fabric import (
     ClaimStatus,
     EvidenceFabricService,
+    EvidenceIntegrityError,
+    EvidenceLifecycleError,
     EvidenceScope,
     EvidenceValidationError,
     ResearchRunStatus,
@@ -75,13 +77,13 @@ def test_all_terminal_run_graph_mutations_are_rejected(tmp_path):
         evidence = service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content="x", raw_reference="artifact:x").evidence
         claim = service.create_claim(run.id, "claim")
         service.transition_research_run(run.id, ResearchRunStatus.CANCELLED)
-        with pytest.raises(Exception):
+        with pytest.raises(EvidenceLifecycleError):
             service.add_evidence(run.id, source_type="FILE", retrieval_method="FILE_READ", content="y", raw_reference="artifact:y")
-        with pytest.raises(Exception):
+        with pytest.raises(EvidenceLifecycleError):
             service.create_claim(run.id, "late claim")
-        with pytest.raises(Exception):
+        with pytest.raises(EvidenceLifecycleError):
             service.link_evidence_to_claim(claim.id, evidence.id, "CONTEXT")
-        with pytest.raises(Exception):
+        with pytest.raises(EvidenceLifecycleError):
             service.set_claim_status(claim.id, ClaimStatus.SUPPORTED)
     finally:
         db.close()
@@ -118,7 +120,35 @@ def test_validation_rejects_bad_hash_uri_and_terminal_mutation(tmp_path):
         with pytest.raises(EvidenceValidationError):
             canonicalize_uri("relative/path")
         service.transition_research_run(run.id, ResearchRunStatus.COMPLETED)
-        with pytest.raises(Exception):
+        with pytest.raises(EvidenceLifecycleError):
             service.create_claim(run.id, "too late")
+    finally:
+        db.close()
+
+
+def test_research_run_rejects_open_to_open_and_terminal_transitions(tmp_path):
+    db, service = _service(tmp_path)
+    try:
+        run = service.create_research_run("objective")
+        with pytest.raises(EvidenceLifecycleError):
+            service.transition_research_run(run.id, ResearchRunStatus.OPEN)
+        service.transition_research_run(run.id, ResearchRunStatus.COMPLETED)
+        with pytest.raises(EvidenceLifecycleError):
+            service.transition_research_run(run.id, ResearchRunStatus.OPEN)
+        with pytest.raises(EvidenceLifecycleError):
+            service.transition_research_run(run.id, ResearchRunStatus.FAILED)
+    finally:
+        db.close()
+
+
+def test_cross_run_link_is_a_domain_integrity_error_not_a_lifecycle_error(tmp_path):
+    db, service = _service(tmp_path)
+    try:
+        run_a = service.create_research_run("a")
+        run_b = service.create_research_run("b")
+        evidence = service.add_evidence(run_a.id, source_type="FILE", retrieval_method="FILE_READ", content="a", raw_reference="artifact:a").evidence
+        claim = service.create_claim(run_b.id, "b")
+        with pytest.raises(EvidenceIntegrityError):
+            service.link_evidence_to_claim(claim.id, evidence.id, "CONTEXT")
     finally:
         db.close()
