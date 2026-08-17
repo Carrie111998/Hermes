@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { getHermesConfigRecord } from '@/hermes'
-import { queryClient, writeCache } from '@/lib/query-client'
+import { HERMES_CONFIG_QUERY_KEY, queryClient, writeCache } from '@/lib/query-client'
 import { normalizeProfileKey } from '@/store/profile'
 import type { HermesConfigRecord } from '@/types/hermes'
 
@@ -10,9 +10,13 @@ import type { HermesConfigRecord } from '@/types/hermes'
 // so a save in one shows in the others, and revisiting a tab paints the cache
 // instead of blanking on a fresh fetch.
 //
+// The key itself lives in lib/query-client.ts: on a profile/gateway switch the
+// store-level boundary (invalidateProfileScopedQueries) hard-resets this record
+// so no consumer can seed a draft from the previous profile's data.
+//
 // Distinct from session/hooks/use-hermes-config.ts, which is side-effecting —
 // it pushes personality/cwd/voice/… into the session stores for live chat.
-export const HERMES_CONFIG_KEY = ['hermes-config-record'] as const
+export const HERMES_CONFIG_KEY = HERMES_CONFIG_QUERY_KEY
 
 // Per-profile cache key. The base key (no profile suffix) is the app-wide
 // active profile, unchanged for every caller that passes nothing. An explicit
