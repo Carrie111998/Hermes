@@ -404,6 +404,7 @@ def _replace_media_refs(text: str, replacements: List[Tuple[int, int, str]]) -> 
     return cleaned.strip()
 
 
+
 def _load_nostr_auth():
     """Import the sibling nostr_auth module in a loader-agnostic way.
 
@@ -976,8 +977,18 @@ class BuzzAdapter(BasePlatformAdapter):
             self._set_fatal_error("config_missing", "BUZZ_RELAY_URL must be set", retryable=False)
             return False
         if not self.cli_path:
+            # retryable=True (OOF-208): a missing binary is an install-state
+            # problem, not a config contradiction — the operator can drop the
+            # binary in place while the gateway is up, and the reconnect
+            # watcher should then recover the platform. retryable=False here
+            # used to escalate to gateway_state=startup_failed + exit 78
+            # (whole gateway down) whenever Buzz was the only enabled
+            # platform. Normally this path is unreachable now that
+            # check_requirements() gates on the binary (create_adapter
+            # returns None instead), but it still guards the race where the
+            # binary disappears between that check and connect().
             logger.error("Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)")
-            self._set_fatal_error("cli_missing", "buzz CLI binary not found", retryable=False)
+            self._set_fatal_error("cli_missing", "buzz CLI binary not found", retryable=True)
             return False
         try:
             self._private_key = _resolve_private_key(self._extra)
