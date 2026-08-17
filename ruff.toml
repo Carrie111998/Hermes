@@ -43,25 +43,21 @@ select = ["F", "PLW1514"]
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
-# This script exec()s its sibling scripts (parseltongue.py, godmode_race.py)
-# into its own module globals, so names like score_response / escalate_encoding
-# exist at runtime but are invisible to static analysis -> spurious F821.
-"optional-skills/security/godmode/scripts/auto_jailbreak.py" = ["F821"]
 
 # --- F-group sunset list --------------------------------------------------
 # APPEND-NEVER, SHRINK-ONLY.  These 524 files carry the 979 F findings that
 # remain once the stage-2 defect fixes landed (2026-08-17).  Every other file in
-# the tree -- 3136 of 3660 tracked .py files -- is gated as of that commit, so
-# no new offender can enter a clean file.
+# the tree -- 3136 of 3660 tracked .py files -- is gated, so no new offender
+# can enter a clean file.
 #
 # Entries are per-RULE, not per-file blanket: a file exempted for F401 is still
 # gated on F821.  Burn-down deletes entries; it never adds or widens them.  When
 # this block is empty, delete it and the marker comments with it.
 #
 # F821 (undefined-name) and F822 (undefined-export) do not appear below at all:
-# both are clean tree-wide and gated in EVERY file.  The stage-2 fixes retired
-# the last of them, so a new F821/F822 is now a hard failure everywhere -- which
-# is the point.  Do not re-add either code to this list to unblock a commit.
+# both are clean tree-wide and gated in EVERY file, with no permanent exemption
+# either.  A new undefined name or bad __all__ export is a hard failure anywhere
+# in this repo.  Do not re-add either code here to unblock a commit.
 #
 # Burn-down order and per-stage counts: see the design doc.
 

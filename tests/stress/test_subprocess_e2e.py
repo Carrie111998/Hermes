@@ -232,7 +232,7 @@ def _scenario_b(kb, conn):
         os.close(r)
         return grandchild_pid
 
-    result = kb.dispatch_once(conn, spawn_fn=spawn_sleeper)
+    kb.dispatch_once(conn, spawn_fn=spawn_sleeper)
     task = kb.get_task(conn, crash_tid)
     print(f"  spawned sleeper pid={task.worker_pid} for {crash_tid}")
     # Kill the sleeper forcibly
