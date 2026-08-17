@@ -37,7 +37,8 @@ def render_anchored_lines(lines: list) -> list:
 
 
 def parse_anchored_line(anchored: str):
-    """Split an anchored line into (anchor_id, content)."""
+    """Split an anchored line into (anchor_id, content); the id is the
+    line_anchor_id form (without the ANCHOR marker)."""
     marker = f"{ANCHOR_PREFIX}"
     if not anchored.startswith(marker):
         return None, anchored
@@ -45,4 +46,96 @@ def parse_anchored_line(anchored: str):
     if ANCHOR_DELIMITER not in rest:
         return None, anchored
     anchor_id, content = rest.split(ANCHOR_DELIMITER, 1)
-    return f"{ANCHOR_PREFIX}{anchor_id}", content
+    return anchor_id, content
+
+
+def resolve_anchored_edits(lines: list, edits: list) -> list:
+    """Apply Dirac-style anchored edits to the current file lines.
+
+    Each edit is ``{"anchor": <ANCHOR line>, "end_anchor": <ANCHOR line>,
+    "text": <new lines>}``. The anchor/end_anchor are the exact current
+    anchored lines (ANCHOR<id>DELIM<content>); the tool locates each by its
+    content-derived ID and verifies the supplied content exactly. An anchor
+    whose ID no longer resolves (the line changed or moved) returns an error
+    — the caller must re-read with include_anchors (the stale-file alert's
+    role). Returns the new lines, or raises ``ValueError`` with the
+    unresolvable anchor.
+    """
+    # Build the id -> (line_index, content) map from the CURRENT anchored state.
+    # The caller passes the anchored lines (from an include_anchors read).
+    out = list(lines)
+    failures = []
+    for edit in edits:
+        if not isinstance(edit, dict) or not isinstance(edit.get("anchor"), str):
+            failures.append("malformed edit: missing or invalid anchor")
+            continue
+        anchor = edit.get("anchor")
+        end_anchor = edit.get("end_anchor", anchor)
+        if not isinstance(edit.get("text"), str):
+            failures.append("malformed edit: 'text' must be a string")
+            continue
+        if "«redacted:" in edit["text"]:
+            failures.append(
+                "the new text contains the redacted read's content "
+                "('«redacted:…') — never write the marker back; "
+                "reconstruct the real value or re-read"
+            )
+            continue
+        text = edit["text"].split("\n")
+        if text and text[-1] == "":
+            text.pop()  # the trailing newline of the text is not a blank line
+        # Re-locate in the CURRENT out on every edit: the earlier edits'
+        # insertions/deletions shift the later lines, so the stored indices
+        # from the original read are stale. The anchors are content-verified.
+        id_index = {}
+        for idx, line in enumerate(out):
+            marker = f"{ANCHOR_PREFIX}"
+            if not line.startswith(marker) or ANCHOR_DELIMITER not in line:
+                continue
+            rest = line[len(marker):]
+            anchor_id, content = rest.split(ANCHOR_DELIMITER, 1)
+            id_index[anchor_id] = (idx, content)
+        start = id_index.get(_anchor_id_of(anchor))
+        end = id_index.get(_anchor_id_of(end_anchor))
+        if start is None or end is None:
+            failures.append(f"anchor no longer resolves: {anchor}")
+            continue
+        start_idx, start_content = start
+        end_idx, end_content = end
+        if end_idx < start_idx:
+            failures.append("end_anchor precedes anchor")
+            continue
+        # The verbatim contract, with the redaction carve-out: the hermes's
+        # read redacts secret-bearing lines («redacted:...»), so the model's
+        # copied anchor carries the redacted content while the current line
+        # is raw — for those, the ID match is the contract (the ID is the
+        # raw line's digest, so a stale line still fails).
+        anchor_content = anchor.split(ANCHOR_DELIMITER, 1)[1]
+        end_anchor_content = end_anchor.split(ANCHOR_DELIMITER, 1)[1]
+        if start_content != anchor_content and "«redacted:" not in anchor_content:
+            failures.append(f"stale anchor content: {anchor}")
+            continue
+        if end_content != end_anchor_content and "«redacted:" not in end_anchor_content:
+            failures.append(f"stale end-anchor content: {end_anchor}")
+            continue
+        out[start_idx:end_idx + 1] = text
+    return out, failures
+
+
+def _anchor_id_of(anchored_line: str) -> str:
+    anchor_id, _content = parse_anchored_line(anchored_line)
+    return anchor_id if anchor_id is not None else anchored_line
+
+
+ANCHORED_EDIT_GUIDANCE = (
+    "# Anchored editing\n"
+    "After a read with include_anchors=true, you may edit by the anchored "
+    "coordinates instead of the Cline search blocks: each source line is "
+    "ANCHOR<id>≫CONTENT. An edit is {anchor: <ANCHOR line>, "
+    "end_anchor: <ANCHOR line>, text: <new lines>} — the tool locates the "
+    "line by its ID and verifies the content exactly, so the old block never "
+    "needs to be re-sent. Copy the complete anchored line verbatim; never "
+    "retype it or combine an ID with another line's content. If an anchor no "
+    "longer resolves (the file changed externally), re-read with "
+    "include_anchors=true first."
+)

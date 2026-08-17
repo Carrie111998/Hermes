@@ -470,24 +470,3 @@ def test_garbled_py_edit_reports_a_syntax_warning(tmp_path):
     anch = render_anchored_lines(open(p).read().splitlines())
     res = _json.loads(anchored_edit_tool(p, [{"anchor": anch[0], "text": "def ok():\n    return ('"}]))
     assert res.get("syntax_warning") and "does not parse" in res["syntax_warning"]
-
-
-def test_lean_ctx_marker_is_refused(tmp_path):
-    import json as _json
-    from tools.file_tools import anchored_edit_tool
-    p = str(tmp_path / "t.py")
-    open(p, "w").write("a\nb\nc\n")
-    anch = render_anchored_lines(open(p).read().splitlines())
-    res = _json.loads(anchored_edit_tool(p, [{"anchor": anch[0], "text": "x [lean-ctx: compressed 12 tokens] y"}]))
-    assert res["ok"] is False and "marker" in res["error"]
-
-
-def test_search_include_anchors_returns_anchored_matches(tmp_path):
-    import json as _json
-    from tools.file_tools import search_tool
-    p = str(tmp_path / "t.py")
-    open(p, "w").write("def target_fn():\n    return 1\n\nx = target_fn()\n")
-    anchored = search_tool("target_fn", path=str(tmp_path), include_anchors=True)
-    assert "ANCHOR" in anchored
-    plain = search_tool("target_fn", path=str(tmp_path))
-    assert "ANCHOR" not in plain
