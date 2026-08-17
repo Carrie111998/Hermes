@@ -194,11 +194,13 @@ class TestSessionOps:
                 {
                     "slug": "anthropic",
                     "name": "Anthropic",
+                    "authenticated": True,
                     "models": ["claude-sonnet-4-6", "claude-sonnet-4-6"],
                 },
                 {
                     "slug": "openai-codex",
                     "name": "OpenAI Codex",
+                    "authenticated": True,
                     "models": [
                         {"id": "gpt-5.4"},
                         "gpt-5.4-mini",
@@ -236,7 +238,7 @@ class TestSessionOps:
             picker_context,
             explicit_only=True,
             include_unconfigured=False,
-            picker_hints=False,
+            picker_hints=True,
             canonical_order=True,
             pricing=False,
             capabilities=False,
@@ -245,6 +247,80 @@ class TestSessionOps:
             probe_current_custom_provider=False,
             max_models=ACP_MAX_MODELS_PER_PROVIDER,
         )
+
+    @pytest.mark.asyncio
+    async def test_new_session_adds_valid_configured_model_for_inventory_provider(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="gpt-5.6-sol",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        picker_context = MagicMock()
+        picker_context.with_overrides.return_value = picker_context
+        payload = {
+            "providers": [
+                {
+                    "slug": "openai-codex",
+                    "name": "OpenAI Codex",
+                    "authenticated": True,
+                    "models": ["gpt-5.6-sol"],
+                },
+                {
+                    "slug": "zai",
+                    "name": "Z.AI",
+                    "authenticated": True,
+                    "models": ["glm-5.2"],
+                },
+                {"name": "Malformed", "authenticated": True, "models": []},
+                {
+                    "slug": "private-gateway",
+                    "name": "Private Gateway",
+                    "authenticated": False,
+                    "models": ["old-model"],
+                },
+            ],
+        }
+        config = {
+            "fallback_providers": [
+                {"provider": "zai", "model": "glm-5.2"},
+                {"provider": "zai", "model": "glm-5.3"},
+                {"provider": "private-gateway", "model": "gateway-model"},
+                {"provider": "   ", "model": "unexpected"},
+                {"provider": ["zai"], "model": "bad-provider"},
+                {"provider": "zai", "model": {"name": "bad-model"}},
+            ]
+        }
+
+        with (
+            patch("hermes_cli.inventory.load_picker_context", return_value=picker_context),
+            patch("hermes_cli.inventory.build_models_payload", return_value=payload),
+            patch("hermes_cli.config.load_config", return_value=config),
+            patch("acp_adapter.server._named_custom_provider_catalogs", return_value=[]),
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        ids = [model.model_id for model in resp.models.available_models]
+        assert "zai:glm-5.3" in ids
+        assert ids.count("zai:glm-5.2") == 1
+        assert "private-gateway:gateway-model" not in ids
+        assert "openrouter:unexpected" not in ids
+        assert all("bad-provider" not in model_id for model_id in ids)
+        assert all("bad-model" not in model_id for model_id in ids)
+
+    def test_explicit_current_provider_choice_bypasses_model_detection(self):
+        with patch(
+            "hermes_cli.models.detect_provider_for_model",
+            return_value=("anthropic", "claude-sonnet-4-6"),
+        ) as detect:
+            provider, model = HermesACPAgent._resolve_model_selection(
+                "ai-gateway:claude-sonnet-4-6", "ai-gateway"
+            )
+
+        assert (provider, model) == ("ai-gateway", "claude-sonnet-4-6")
+        detect.assert_not_called()
 
 
 

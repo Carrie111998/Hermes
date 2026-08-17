@@ -720,7 +720,7 @@ class HermesACPAgent(acp.Agent):
                 context,
                 explicit_only=True,
                 include_unconfigured=False,
-                picker_hints=False,
+                picker_hints=True,
                 canonical_order=True,
                 pricing=False,
                 capabilities=False,
@@ -732,13 +732,19 @@ class HermesACPAgent(acp.Agent):
 
             available_models: list[ModelInfo] = []
             seen_ids: set[str] = set()
+            inventory_provider_labels: dict[str, str] = {}
             for row in payload.get("providers") or []:
-                row_provider = normalize_provider(str(row.get("slug") or "").strip())
-                if not row_provider:
+                if not isinstance(row, dict):
                     continue
+                raw_slug = row.get("slug")
+                if not isinstance(raw_slug, str) or not raw_slug.strip():
+                    continue
+                row_provider = normalize_provider(raw_slug.strip())
                 provider_name = str(row.get("name") or "").strip() or provider_label(
                     row_provider
                 )
+                if row.get("authenticated") is True:
+                    inventory_provider_labels[row_provider] = provider_name
                 for model_entry in row.get("models") or []:
                     if isinstance(model_entry, dict):
                         rendered_model = str(
@@ -768,6 +774,52 @@ class HermesACPAgent(acp.Agent):
                         )
                     )
                     seen_ids.add(choice_id)
+
+            # A provider catalog can lag a model that the configured provider
+            # already serves. Add only strict provider/model entries for
+            # providers present in the authenticated inventory; custom route
+            # metadata remains outside this narrow ACP catalog-lag fallback.
+            try:
+                from hermes_cli.config import load_config
+
+                config = load_config()
+            except Exception:
+                config = {}
+            raw_fallbacks = (
+                config.get("fallback_providers") if isinstance(config, dict) else []
+            )
+            if not isinstance(raw_fallbacks, list):
+                raw_fallbacks = []
+            for fallback in raw_fallbacks:
+                if not isinstance(fallback, dict):
+                    continue
+                raw_provider = fallback.get("provider")
+                raw_model = fallback.get("model")
+                if not isinstance(raw_provider, str) or not isinstance(raw_model, str):
+                    continue
+                raw_provider = raw_provider.strip()
+                fallback_model = raw_model.strip()
+                if not raw_provider or not fallback_model:
+                    continue
+                fallback_provider = normalize_provider(raw_provider)
+                if fallback_provider not in inventory_provider_labels:
+                    continue
+                fallback_choice = self._encode_model_choice(
+                    fallback_provider, fallback_model
+                )
+                if not fallback_choice or fallback_choice in seen_ids:
+                    continue
+                fallback_label = inventory_provider_labels[fallback_provider]
+                available_models.append(
+                    ModelInfo(
+                        model_id=fallback_choice,
+                        name=f"{fallback_label} · {fallback_model}",
+                        description=(
+                            f"Provider: {fallback_label} • configured fallback"
+                        ),
+                    )
+                )
+                seen_ids.add(fallback_choice)
 
             # Named user-defined endpoints (providers: / custom_providers:)
             # are invisible to canonical provider enumeration — append them
@@ -829,8 +881,10 @@ class HermesACPAgent(acp.Agent):
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
+            original_model = new_model
             target_provider, new_model = parse_model_input(new_model, current_provider)
-            if target_provider == current_provider:
+            had_explicit_provider = new_model != original_model
+            if not had_explicit_provider and target_provider == current_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected
