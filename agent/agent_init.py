@@ -904,10 +904,10 @@ def init_agent(
             from hermes_cli.config import load_config_readonly as _load_cfg
             _model_cfg = _load_cfg().get("model", {}) or {}
             _cfg_temp = _model_cfg.get("temperature")
-            if isinstance(_cfg_temp, (int, float)):
+            if isinstance(_cfg_temp, (int, float)) and type(_cfg_temp) is not bool:
                 overrides["temperature"] = float(_cfg_temp)
-        except Exception:
-            pass
+        except Exception as _cfg_err:
+            logger.debug("Failed to load config.yaml for model.temperature: %s", _cfg_err)
     agent.request_overrides = overrides
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
