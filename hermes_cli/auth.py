@@ -1990,6 +1990,17 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     except Exception:
         pass
 
+    # 5. Subprocess-backed ACP providers (devin-acp, copilot-acp) are
+    # configured by installing the provider's CLI and/or setting the command
+    # env var. Treat them as explicitly configured when the executable is
+    # resolvable, so they survive explicit-only desktop pickers.
+    if pconfig and pconfig.auth_type == "external_process":
+        try:
+            resolve_external_process_provider_credentials(normalized)
+            return True
+        except Exception:
+            pass
+
     return False
 
 
