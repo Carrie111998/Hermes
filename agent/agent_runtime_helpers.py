@@ -3671,52 +3671,53 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             len(missing_results),
         )
 
-    # 3. Deduplicate tool_call_ids. Strict providers (DeepSeek) reject a
-    # payload where the same tool_call_id appears more than once with HTTP 400
-    # "Duplicate value for 'tool_call_id'" (#58327). Duplicates can arise from
-    # retries, crash/resume glitches, or a compression window that re-emits a
-    # tool result. This is the final pre-API chokepoint, so dedup defensively
-    # here even though repair_message_sequence also consumes matched ids.
+    # 3. Deduplicate tool_call_ids WITHIN the current assistant turn. The
+    # "Duplicate value for 'tool_call_id'" rejection (#58327) applies when the
+    # SAME call appears twice in one payload as a re-emission of the SAME
+    # logical call — retries, crash/resume glitches, or a compression window
+    # that re-emits a tool result. Identical call_ids across DISTINCT turns
+    # are legal: call_ids are deterministic (_deterministic_call_id hashes
+    # fn-name + args + index for prompt-cache prefix stability), so a
+    # multi-turn Responses-API session (chained via previous_response_id)
+    # legitimately re-issues the SAME tool with the SAME arguments every turn,
+    # producing identical call_ids in different assistant messages — DeepSeek
+    # v4 accepts such payloads (verified against api.deepseek.com). This is
+    # the final pre-API chokepoint, so dedup defensively here even though
+    # repair_message_sequence also consumes matched ids.
     #   (a) collapse duplicate tool_calls WITHIN an assistant message
     #   (b) drop later tool result messages reusing an already-seen id
     #
-    # NOTE (cross-turn id collision, #73412): the seen-sets are reset on
-    # EVERY assistant message. call_ids are deterministic
-    # (_deterministic_call_id hashes fn-name + args + index for prompt-cache
-    # prefix stability), so in a multi-turn Responses-API session the model
-    # legitimately re-issues the SAME tool with the SAME arguments across
-    # turns (e.g. every data-insight task replays skill_view + tool_describe
-    # probes), producing identical call_ids in different assistant messages.
-    # A single session-global seen-set misclassified those legal cross-turn
-    # calls as duplicates, deleted them, and left `tool_calls: []` on the
-    # message — HTTP 400 "Invalid 'messages[N].tool_calls': empty array" on
-    # strict providers. Scoping dedup to the current assistant message (and
-    # its tool results) preserves within-turn dedup while never collapsing
-    # distinct turns.
+    # The seen-sets are reset on EVERY assistant message, so the dedup scope
+    # is the CURRENT turn (message + its tool results): within-turn duplicates
+    # are still collapsed, while legal identical call_ids across distinct
+    # turns are preserved — never collapsing a turn down to `tool_calls: []`
+    # (HTTP 400 "Invalid 'messages[N].tool_calls': empty array" on strict
+    # providers).
     seen_assistant_call_ids: set = set()
     seen_result_call_ids: set = set()
     deduped: List[Dict[str, Any]] = []
     removed_dupes = 0
     for msg in messages:
         role = msg.get("role")
-        if role == "assistant" and msg.get("tool_calls"):
-            # Reset both seen-sets at each assistant turn boundary so the
-            # dedup scope is the CURRENT turn, not the whole session.
+        if role == "assistant":
+            # Reset both seen-sets at EVERY assistant message so the dedup
+            # scope is the CURRENT turn, not the whole session.
             seen_assistant_call_ids = set()
             seen_result_call_ids = set()
-            kept_tcs = []
-            for tc in msg.get("tool_calls") or []:
-                cid = _ra().AIAgent._get_tool_call_id_static(tc)
-                if cid and cid in seen_assistant_call_ids:
-                    removed_dupes += 1
-                    continue
-                if cid:
-                    seen_assistant_call_ids.add(cid)
-                kept_tcs.append(tc)
-            if kept_tcs:
-                msg = {**msg, "tool_calls": kept_tcs}
-            elif len(kept_tcs) != len(msg.get("tool_calls") or []):
-                msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+            if msg.get("tool_calls"):
+                kept_tcs = []
+                for tc in msg.get("tool_calls") or []:
+                    cid = _ra().AIAgent._get_tool_call_id_static(tc)
+                    if cid and cid in seen_assistant_call_ids:
+                        removed_dupes += 1
+                        continue
+                    if cid:
+                        seen_assistant_call_ids.add(cid)
+                    kept_tcs.append(tc)
+                if kept_tcs:
+                    msg = {**msg, "tool_calls": kept_tcs}
+                elif len(kept_tcs) != len(msg.get("tool_calls") or []):
+                    msg = {k: v for k, v in msg.items() if k != "tool_calls"}
             deduped.append(msg)
         elif role == "tool":
             cid = (msg.get("tool_call_id") or "").strip()
