@@ -171,6 +171,44 @@ class TestGenerateTitle:
         assert result == "Fix auth"
 
 
+    def test_prose_fallback_recovers_title_when_retry_returns_no_json(self):
+        """A provider that 400s on json_schema may also return plain prose
+        (no braces) on the retry — the loose-parse fallback must still title.
+        """
+
+        def _first_rejects_then_prose(*_args, **_kwargs):
+            if "response_format" in (_kwargs.get("extra_body") or {}):
+                raise RuntimeError(
+                    "HTTP 400: invalid_request_error: response_format type "
+                    "is unavailable now"
+                )
+            return MagicMock(choices=[MagicMock(message=MagicMock(content="Fix auth flow"))])
+
+        with patch("agent.title_generator.call_llm", side_effect=_first_rejects_then_prose):
+            result = generate_title("the auth is broken")
+
+        assert result == "Fix auth flow"
+
+
+    def test_non_response_format_error_is_not_retried(self):
+        """Errors that merely mention response_format (e.g. an unknown-parameter
+        typo, no 400/invalid_request_error signal) must propagate untouched.
+        """
+
+        def _unrelated_error(*_args, **_kwargs):
+            raise RuntimeError("provider returned unknown parameter response_format_extra")
+
+        captured = []
+        with patch("agent.title_generator.call_llm", side_effect=_unrelated_error):
+            result = generate_title(
+                "the auth is broken", failure_callback=lambda t, e: captured.append(e)
+            )
+
+        assert result is None
+        assert len(captured) == 1
+        assert "response_format_extra" in str(captured[0])
+
+
 
 
 

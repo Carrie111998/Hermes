@@ -419,13 +419,22 @@ def generate_title(
         except Exception as e:
             # Some gateways (e.g. OpenCode Zen "Console Go") reject the strict
             # json_schema response_format outright with HTTP 400 instead of
-            # ignoring it. The prompt already demands a {"title": ...} object
-            # and _extract_title_text falls back through a loose JSON scan, so
-            # retry once without the constraint rather than dropping the title.
+            # ignoring it. Retry once without the constraint: the prompt
+            # already demands a {"title": ...} object and _extract_title_text
+            # falls back through a loose JSON scan, so the retry still
+            # produces a title. Match on the 400 + invalid_request_error
+            # signal so an unrelated error that merely mentions
+            # "response_format" (e.g. an unknown-parameter typo) re-raises
+            # instead of being papered over.
             err = str(e)
-            if "response_format" in err or "invalid_request_error" in err:
-                logger.debug(
-                    "Title generation retrying without response_format after: %s", e
+            if (
+                "response_format" in err
+                and ("invalid_request_error" in err or "400" in err)
+            ):
+                logger.warning(
+                    "Title generation: provider rejected response_format "
+                    "(HTTP 400); retrying without structured output: %s",
+                    e,
                 )
                 content = _request_title({})
             else:
