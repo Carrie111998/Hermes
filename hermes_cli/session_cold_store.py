@@ -22,6 +22,10 @@ from typing import Any
 from hermes_state import SessionDB, resolved_max_export_messages
 
 
+_ARCHIVE_FORMAT = "hermes-cold-archive-store-spike/v1"
+_MAX_SQLITE_IN_PARAMS = 500
+
+
 @dataclass(frozen=True)
 class StoredLineage:
     """Identity and exact local revision emitted by :func:`store_archived_lineage`."""
@@ -58,15 +62,20 @@ def _enforce_message_limit(conn: sqlite3.Connection, physical_ids: tuple[str, ..
     limit = resolved_max_export_messages()
     if limit <= 0:
         return
-    placeholders = ",".join("?" for _ in physical_ids)
-    count = conn.execute(
-        f"SELECT COUNT(*) FROM messages WHERE session_id IN ({placeholders})",
-        physical_ids,
-    ).fetchone()[0]
-    if count > limit:
-        raise ValueError(
-            f"cold store lineage has {count} messages, exceeding the configured export limit {limit}"
-        )
+    seen = 0
+    for start in range(0, len(physical_ids), _MAX_SQLITE_IN_PARAMS):
+        ids = physical_ids[start : start + _MAX_SQLITE_IN_PARAMS]
+        placeholders = ",".join("?" for _ in ids)
+        remaining = limit + 1 - seen
+        rows = conn.execute(
+            f"SELECT 1 FROM messages WHERE session_id IN ({placeholders}) LIMIT ?",
+            (*ids, remaining),
+        ).fetchall()
+        seen += len(rows)
+        if seen > limit:
+            raise ValueError(
+                f"cold store lineage has more than the configured export limit {limit} messages"
+            )
 
 
 def _session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
@@ -209,7 +218,8 @@ def _valid_existing_revision(revision_dir: Path, terminal_id: str, lineage: tupl
     except (OSError, json.JSONDecodeError):
         return False
     return (
-        metadata.get("terminal_id") == terminal_id
+        metadata.get("format") == _ARCHIVE_FORMAT
+        and metadata.get("terminal_id") == terminal_id
         and metadata.get("physical_ids") == list(lineage)
         and metadata.get("source_fingerprint") == fingerprint
         and metadata.get("record_count") == len(records)
@@ -299,7 +309,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=revision_dir.parent))
     try:
         metadata = {
-            "format": "hermes-cold-archive-store-spike/v1",
+            "format": _ARCHIVE_FORMAT,
             "terminal_id": terminal_id,
             "physical_ids": list(lineage),
             "source_fingerprint": fingerprint,
