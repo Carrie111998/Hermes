@@ -1134,3 +1134,118 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_attach — content_file (local path) + content_base64 (legacy)
+# ---------------------------------------------------------------------------
+
+
+def test_attach_content_file_happy_path(worker_env, tmp_path):
+    """content_file reads a local file server-side and stores it byte-identical,
+    without the worker hand-assembling a base64 string."""
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    payload = b"content-file-payload-bytes"
+    src = tmp_path / "report.csv"
+    src.write_bytes(payload)
+
+    out = kt._handle_attach(
+        {"filename": "report.csv", "content_file": str(src), "content_type": "text/csv"}
+    )
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d["size"] == len(payload)
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["report.csv"]
+        assert atts[0].content_type == "text/csv"
+        assert Path(atts[0].stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+def test_attach_content_file_missing_returns_error(worker_env, tmp_path):
+    from tools import kanban_tools as kt
+
+    missing = tmp_path / "does-not-exist.bin"
+    out = kt._handle_attach({"filename": "x.bin", "content_file": str(missing)})
+    d = json.loads(out)
+    assert "error" in d
+    assert "not an existing file" in d["error"]
+
+
+def test_attach_content_file_unreadable_returns_error(worker_env, tmp_path, monkeypatch):
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "noperm.txt"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+
+    out = kt._handle_attach({"filename": "noperm.txt", "content_file": str(src)})
+    d = json.loads(out)
+    assert "error" in d
+    assert "not readable" in d["error"]
+
+
+def test_attach_content_file_and_base64_mutually_exclusive(worker_env, tmp_path):
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "a.txt"
+    src.write_bytes(b"x")
+    out = kt._handle_attach(
+        {"filename": "a.txt", "content_file": str(src), "content_base64": "eA=="}
+    )
+    d = json.loads(out)
+    assert "error" in d
+    assert "mutually exclusive" in d["error"]
+
+
+def test_attach_requires_one_content_source(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attach({"filename": "x.bin"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "content_file or content_base64" in d["error"]
+
+
+def test_attach_content_file_oversize_returns_error(worker_env, tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"12345")
+
+    out = kt._handle_attach({"filename": "big.bin", "content_file": str(src)})
+    d = json.loads(out)
+    assert "error" in d
+    assert "exceeds" in d["error"]
+
+
+def test_attach_content_base64_legacy_still_works(worker_env):
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    payload = b"legacy-base64-bytes"
+    out = kt._handle_attach(
+        {"filename": "legacy.txt", "content_base64": base64.b64encode(payload).decode()}
+    )
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d["size"] == len(payload)
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["legacy.txt"]
+    finally:
+        conn.close()
