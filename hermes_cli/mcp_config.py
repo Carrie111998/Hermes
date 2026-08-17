@@ -970,6 +970,17 @@ def cmd_mcp_configure(args):
     if not non_interactive and not _sys.stdin.isatty():
         print("Error: 'hermes mcp configure' requires an interactive terminal.", file=_sys.stderr)
         _sys.exit(1)
+    requested_names = None
+    if requested_tools is not None:
+        requested_names = list(dict.fromkeys(
+            part.strip() for part in requested_tools.split(",") if part.strip()
+        ))
+        if not requested_names:
+            print(
+                "Error: --tools requires at least one tool name.",
+                file=_sys.stderr,
+            )
+            _sys.exit(1)
     name = args.name
     servers = _get_mcp_servers()
 
@@ -1036,9 +1047,6 @@ def cmd_mcp_configure(args):
     print()
 
     if requested_tools is not None:
-        requested_names = list(dict.fromkeys(
-            part.strip() for part in requested_tools.split(",") if part.strip()
-        ))
         unknown = [tool for tool in requested_names if tool not in tool_names]
         if unknown:
             label = "tool" if len(unknown) == 1 else "tools"
@@ -1060,9 +1068,9 @@ def cmd_mcp_configure(args):
             pre_selected,
         )
 
-        if chosen == pre_selected:
-            _info("No changes made.")
-            return
+    if chosen == pre_selected:
+        _info("No changes made.")
+        return
 
     # Update config
     config = load_config()

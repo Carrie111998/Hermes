@@ -446,6 +446,41 @@ class TestMcpConfigure:
             "include": ["create_service"]
         }
 
+    @pytest.mark.parametrize("tools", ["", ",", " , "])
+    def test_empty_tools_fail_without_changing_config(
+        self, tools, tmp_path, capsys, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        self._mock_tools(monkeypatch)
+
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_mcp_configure(_make_args(name="ink", tools=tools))
+
+        assert exc_info.value.code == 1
+        assert "--tools requires at least one tool name" in capsys.readouterr().err
+        assert read_raw_config()["mcp_servers"]["ink"]["tools"] == {
+            "include": ["create_service"]
+        }
+
+    def test_unchanged_explicit_selection_does_not_write_config(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        self._mock_tools(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.save_config",
+            lambda config: pytest.fail("unchanged selection must not write config"),
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(_make_args(name="ink", tools="create_service"))
+
+        assert "No changes made." in capsys.readouterr().out
+
     def test_flagless_non_tty_still_fails_before_discovery(
         self, tmp_path, monkeypatch
     ):
