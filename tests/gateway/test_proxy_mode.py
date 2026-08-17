@@ -1,6 +1,9 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+import sys
+import types
 
 import pytest
 
@@ -279,6 +282,77 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_streaming_proxy_preserves_delivery_metadata(self, monkeypatch):
+        """The real proxy stream consumer must receive delivery metadata."""
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        runner.config.streaming = StreamingConfig(
+            enabled=True, edit_interval=0.01, buffer_threshold=1, cursor=""
+        )
+        adapter = MagicMock()
+        adapter.SUPPORTS_MESSAGE_EDITING = True
+        adapter.REQUIRES_EDIT_FINALIZE = False
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="stream-1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="stream-1")
+        )
+        adapter.send_typing = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        fake_aiohttp = types.ModuleType("aiohttp")
+        fake_aiohttp.ClientSession = None
+        fake_aiohttp.ClientTimeout = None
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="17585",
+        )
+
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"reply"}}]}\n\n',
+                "data: [DONE]\n\n",
+            ],
+        )
+        session = _FakeSession(resp)
+        expected_routing_metadata = {
+            "thread_id": "17585",
+            "telegram_delivery_correlation_id": "opaque-correlation",
+        }
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="hello",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session-stream-correlation",
+                        event_message_id="event-1",
+                        event_metadata={
+                            "telegram_delivery_correlation_id": "opaque-correlation",
+                        },
+                    )
+
+        assert result["final_response"] == "reply"
+        assert adapter.send.await_args_list
+        assert all(
+            all(call.kwargs["metadata"].get(key) == value for key, value in expected_routing_metadata.items())
+            for call in adapter.send.await_args_list
+        )
+        assert all(
+            all(call.kwargs["metadata"].get(key) == value for key, value in expected_routing_metadata.items())
+            for call in adapter.edit_message.await_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_handles_http_error(self, monkeypatch):
