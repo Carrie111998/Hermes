@@ -1531,10 +1531,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup_lock = threading.Lock()
         # Cross-profile dedup (issue #78514). The file is opened at connect,
         # not here, so an adapter that never runs (tests, a profile whose bot
-        # is idle) does not create one — but the PATH is resolved now, beside
-        # _dedup_state_path, so the store cannot land somewhere else if the
-        # environment shifts between construction and first use.
-        self._shared_dedup_path = get_default_hermes_root() / "feishu_seen_messages.db"
+        # is idle) does not create one. The path resolves on first access and
+        # is cached for the adapter's life (see _shared_dedup_path), so the
+        # store still cannot land somewhere else if the environment shifts
+        # after that first resolution.
+        self._shared_dedup_path_cache: Optional[Path] = None
         self._shared_dedup: Optional["SharedMessageDedupStore"] = None
         self._shared_dedup_ready = False
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
@@ -1577,6 +1578,28 @@ class FeishuAdapter(BasePlatformAdapter):
         # already recorded the message currently being checked, and importing
         # that would make the very first sighting look like a duplicate.
         self._legacy_dedup_seed: Dict[str, float] = dict(self._seen_message_ids)
+
+    @property
+    def _shared_dedup_path(self) -> Path:
+        """Where the cross-profile dedup store lives, resolved once.
+
+        Deliberately not resolved in ``__init__``: ``get_default_hermes_root()``
+        reads the environment, and on Windows it falls through to
+        ``Path.home()``, which raises ``RuntimeError`` when the environment has
+        been blanked — the condition ``tests/conftest.py`` and the many
+        ``patch.dict(os.environ, {}, clear=True)`` cases in the Feishu suite
+        create. Linux has a ``pwd`` fallback and never notices; constructing an
+        adapter must not depend on that difference.
+
+        Resolving on first access (at connect, beside the store being opened)
+        and caching keeps the original guarantee: the store cannot relocate if
+        the environment shifts later in the adapter's life.
+        """
+        if self._shared_dedup_path_cache is None:
+            self._shared_dedup_path_cache = (
+                get_default_hermes_root() / "feishu_seen_messages.db"
+            )
+        return self._shared_dedup_path_cache
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -4667,10 +4690,11 @@ class FeishuAdapter(BasePlatformAdapter):
             from plugins.platforms.feishu.dedup_store import SharedMessageDedupStore
 
             store = SharedMessageDedupStore(
-                # Resolved in __init__ from the Hermes ROOT, not
-                # get_hermes_home() — the latter resolves to
-                # <root>/profiles/<name> under multiplexing, which is exactly
-                # the per-profile split this store exists to close (#78514).
+                # Resolved from the Hermes ROOT, not get_hermes_home() — the
+                # latter resolves to <root>/profiles/<name> under
+                # multiplexing, which is exactly the per-profile split this
+                # store exists to close (#78514). First access resolves and
+                # caches it; see the _shared_dedup_path property.
                 self._shared_dedup_path,
                 namespace=f"feishu:{self._app_id or 'unknown'}",
                 ttl_seconds=_FEISHU_DEDUP_TTL_SECONDS,
