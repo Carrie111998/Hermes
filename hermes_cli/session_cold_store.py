@@ -281,15 +281,18 @@ def _read_regular_text_at(directory_fd: int, name: str) -> str | None:
     try:
         descriptor = os.open(
             name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=directory_fd,
         )
     except OSError:
         return None
-    with os.fdopen(descriptor, "r", encoding="utf-8") as source:
-        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             return None
-        return source.read()
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as source:
+            return source.read()
+    finally:
+        os.close(descriptor)
 
 
 def _valid_existing_snapshot_at(
@@ -399,9 +402,12 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
                 raise ValueError("all compression lineage rows must be marked archived")
             if any(row.get("pinned") for row in rows):
                 raise ValueError("pinned sessions are not cold-store candidates")
+            started_at = rows[-1].get("started_at")
             ended_at = rows[-1].get("ended_at")
             if ended_at is None or rows[-1].get("end_reason") == "compression":
                 raise ValueError("terminal session must be ended and non-compression before cold storage")
+            if started_at is None:
+                raise ValueError("terminal session must have a start time before cold storage")
 
             _enforce_message_limit(conn, lineage)
             records = _records(conn, lineage)
@@ -409,12 +415,12 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
         finally:
             conn.execute("RELEASE SAVEPOINT cold_store_snapshot")
 
-    terminal_date = datetime.fromtimestamp(float(ended_at), UTC)
+    terminal_date = datetime.fromtimestamp(float(started_at), UTC)
     snapshot_name = _safe_component(terminal_id)
     snapshot_dir = (
         archive_root
         / "sessions"
-        / "ended"
+        / "started"
         / f"{terminal_date:%Y}"
         / f"{terminal_date:%m}"
         / f"{terminal_date:%d}"
@@ -422,7 +428,7 @@ def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) 
     )
     snapshot_parent_parts = (
         "sessions",
-        "ended",
+        "started",
         f"{terminal_date:%Y}",
         f"{terminal_date:%m}",
         f"{terminal_date:%d}",

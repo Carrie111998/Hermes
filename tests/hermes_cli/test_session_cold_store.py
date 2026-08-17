@@ -2,7 +2,9 @@
 
 import json
 from datetime import UTC, datetime
+import os
 from pathlib import Path
+import signal
 
 import pytest
 
@@ -32,14 +34,14 @@ def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
         assert result.physical_ids == ("root", "terminal")
         terminal = db.get_session("terminal")
         assert terminal is not None
-        ended = datetime.fromtimestamp(float(terminal["ended_at"]), UTC)
+        started = datetime.fromtimestamp(float(terminal["started_at"]), UTC)
         expected_snapshot = (
             archive_root
             / "sessions"
-            / "ended"
-            / f"{ended:%Y}"
-            / f"{ended:%m}"
-            / f"{ended:%d}"
+            / "started"
+            / f"{started:%Y}"
+            / f"{started:%m}"
+            / f"{started:%d}"
             / "terminal"
         )
         assert result.revision_dir == expected_snapshot
@@ -163,6 +165,80 @@ def test_store_rejects_post_store_source_mutation_without_changing_db_or_snapsho
         db.close()
 
 
+def test_store_uses_started_date_when_terminal_ended_at_changes(tmp_path: Path) -> None:
+    """A reopened terminal keeps one snapshot identity even if it ends again later."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    started_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC).timestamp()
+    first_ended_at = datetime(2026, 2, 3, 4, 5, tzinfo=UTC).timestamp()
+    second_ended_at = datetime(2026, 3, 4, 5, 6, tzinfo=UTC).timestamp()
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="immutable")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (started_at, first_ended_at, "terminal"),
+        )
+
+        result = store_archived_lineage(db, "terminal", archive_root)
+        conn.execute(
+            "UPDATE sessions SET ended_at = ? WHERE id = ?",
+            (second_ended_at, "terminal"),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"archival boundary.*source changed after Store",
+        ):
+            store_archived_lineage(db, "terminal", archive_root)
+
+        assert result.revision_dir == (
+            archive_root / "sessions" / "started" / "2026" / "01" / "02" / "terminal"
+        )
+        assert list(archive_root.rglob("terminal")) == [result.revision_dir]
+    finally:
+        db.close()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo") or not hasattr(signal, "setitimer"),
+    reason="requires POSIX FIFOs and interval timers",
+)
+@pytest.mark.parametrize("payload_name", ["metadata.json", "session.jsonl"])
+def test_store_rejects_fifo_payload_without_blocking(
+    tmp_path: Path,
+    payload_name: str,
+) -> None:
+    """A damaged snapshot payload that is a FIFO is invalid, not a blocking read."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        result = store_archived_lineage(db, "terminal", tmp_path / "archive")
+        payload = result.revision_dir / payload_name
+        payload.unlink()
+        os.mkfifo(payload)
+
+        def fail_if_blocked(*_args: object) -> None:
+            raise AssertionError("cold-store validation blocked while opening a FIFO")
+
+        previous_handler = signal.signal(signal.SIGALRM, fail_if_blocked)
+        signal.setitimer(signal.ITIMER_REAL, 2.0)
+        try:
+            with pytest.raises(ValueError, match="existing snapshot is invalid"):
+                store_archived_lineage(db, "terminal", tmp_path / "archive")
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, previous_handler)
+    finally:
+        db.close()
+
+
 def test_store_rejects_snapshot_parent_symlink_swap_before_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -188,7 +264,7 @@ def test_store_rejects_snapshot_parent_symlink_swap_before_staging(
         ) -> None:
             nonlocal swapped
             if not swapped and Path(path).name.startswith(".staging-"):
-                snapshot_parent = next(archive_root.glob("sessions/ended/*/*/*"))
+                snapshot_parent = next(archive_root.glob("sessions/started/*/*/*"))
                 snapshot_parent.rename(snapshot_parent.with_name("day-displaced"))
                 snapshot_parent.symlink_to(outside, target_is_directory=True)
                 swapped = True
