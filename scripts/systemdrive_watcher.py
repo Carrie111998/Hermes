@@ -646,6 +646,13 @@ class Watcher:
         that is left. Writing to a same-directory temp file and replacing it
         means the path is always either the previous complete write or the
         new complete write, never a partial one.
+
+        A failure here must be at least as loud as ``write_record``'s own
+        ("could not write log") -- this snapshot holds the raw ring, i.e.
+        the cmdlines, which is the MORE valuable artifact of the two
+        (``SIGHTING`` names it as evidence but does not carry it inline). A
+        reader who sees ``ring_size: 31, snapshot_file: null`` on a SIGHTING
+        record can infer the loss, but should not have to.
         """
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -655,7 +662,11 @@ class Watcher:
             )
             os.replace(tmp, path)
             return path
-        except OSError:
+        except OSError as exc:  # a diagnostic must never take the run down
+            print(
+                f"  [junk-watcher] could not write snapshot {path}: {exc}",
+                file=sys.stderr, flush=True,
+            )
             return None
 
     def on_hit(self, root: Path, backend: str) -> None:

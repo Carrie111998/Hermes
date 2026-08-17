@@ -263,8 +263,15 @@ recorded as `preexisting` and blames nobody.
   the CRITICAL 1 fix above makes a mid-sweep kill non-catastrophic (the ring is already
   durable before the sweep starts), this is no longer a correctness bug — but it is
   still wasteful to needlessly truncate a sweep that was about to finish on its own. The
-  wait is now `_WATCHER_STOP_GRACE_SECS = 35`, i.e. `DEFAULT_LIVE_SWEEP_SECS + 5`,
-  matching the watcher's own internal `_await_in_flight_sweeps` grace period.
+  wait was set to `_WATCHER_STOP_GRACE_SECS = 35`, i.e. `DEFAULT_LIVE_SWEEP_SECS + 5`,
+  matching the watcher's own internal `_await_in_flight_sweeps` grace period exactly —
+  and a **minor fix, same review pass**, corrected that: an equal value still lets the
+  `done` record get truncated exactly at the boundary, since the runner's wait and the
+  watcher's internal grace timer do not start from the same instant (stop-file detection
+  happens on the watcher's sampler cadence, not instantly). The wait is now
+  `_WATCHER_STOP_GRACE_SECS = 40`, strictly greater than the watcher's `35`s worst case,
+  with a comment at the constant's definition stating the relationship so a future edit
+  to either number does not silently re-create the tie.
 - **A sidecar that dies mid-run is now reported, not silent — 2026-08-17.** Previously
   `_stop_junk_watcher` returned silently whenever `proc.poll() is not None` at shutdown
   time, which is also true of a watcher that *crashed* seconds into a multi-hour run —
@@ -570,6 +577,50 @@ cadence, a process class living under ~100 ms (the 1/8 total-miss case, and part
 the 2/8 unreadable case) is attributable only probabilistically, not guaranteed — a
 faster cadence would narrow but not close that gap, at proportionally higher constant
 CPU cost on a box with documented memory-pressure problems.
+
+## Known limitations (residual)
+
+**One state can still produce a clean NEGATIVE while something was genuinely missed:
+a tree that appears and is then deleted before teardown, when the `ReadDirectoryChangesW`
+backend missed the creation event.** Found by final review, 2026-08-17. Not fixed here —
+documented so it is a known limitation rather than a silent one.
+
+Every blocker `done` currently checks (CRITICAL 2, above) is either a point-in-time check
+at shutdown (`systemdrive_present_on_disk`) or a counter of things that already announced
+themselves (`watch_thread_errors`, `watch_buffer_overflows`, `preexisting_roots`). None of
+them *latches* "the tree was ever seen, even briefly" — so a tree that comes and goes
+between two of those checkpoints, without ever tripping a counter, leaves no trace for
+`done` to consult.
+
+Reaching this state needs all three of the following at once:
+
+1. **The fast backend is in use for the root** (`ReadDirectoryChangesW`), and it misses the
+   creation notification outright — not the documented overflow case (`watch_buffer_overflow`
+   already covers that and blocks the NEGATIVE), but a genuine missed event with no signal
+   that anything was dropped.
+2. **The tree is created inside the arm window before the watch thread's first
+   `ReadDirectoryChangesW` call actually takes effect** — i.e. the creation lands in the
+   short gap between `_start_backends()` returning and the kernel call actually arming,
+   which is the only window in which a notification-based backend can miss a creation
+   without an overflow being involved.
+3. **The tree is deleted again before `done` runs** its `_systemdrive_present_now()` check,
+   so the point-in-time disk check at shutdown also finds nothing.
+
+This is narrow: the junk trees this watcher hunts are known to *persist* on disk (that is
+how every sighting to date, including the ones that motivated this design, was found) rather
+than self-delete, so a self-deleting tree would itself be a novel and interesting finding.
+The polling backend does not have this gap — it re-checks `exists()` every tick, so it would
+catch the tree at some point between creation and deletion regardless of what it missed at
+the exact creation instant — so this is specific to roots using the fast backend.
+
+**Cheap closure if it ever matters:** the 100 ms sampler thread is already running for every
+armed watch (it drives the process-creation ring buffer). It could additionally `exists()`-poll
+each root on the same cadence and latch a per-root `ever_present` flag the first time it sees
+the tree, independent of which detection backend is in use. `done` would then check that flag
+alongside the existing blockers. Not implemented now because the gap above is narrow enough
+that the added per-root disk-stat cost on every sampler tick was judged not worth it without a
+concrete sighting motivating it — but the closure is cheap precisely because the sampler
+infrastructure already exists and already runs at a cadence fast enough to catch this.
 
 ## Out of scope
 

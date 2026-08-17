@@ -1214,12 +1214,20 @@ _WATCHER_ORPHAN_BUDGET_SECS = 6 * 3600
 # less catastrophic than it used to be -- the watcher now writes the raw
 # ring to its snapshot file BEFORE the sweep starts (see on_hit()'s
 # CRITICAL 1 fix), so a force-terminate here only costs the best-effort
-# SIGHTING_LIVE enrichment, never the ring. We still raise this to
-# DEFAULT_LIVE_SWEEP_SECS + 5 (matching the watcher's own internal
-# `_await_in_flight_sweeps` grace period) so that in the common case the
-# runner does not needlessly truncate a sweep that was about to finish on
-# its own.
-_WATCHER_STOP_GRACE_SECS = 35
+# SIGHTING_LIVE enrichment, never the ring.
+#
+# MUST STAY STRICTLY GREATER than the watcher's own worst-case graceful
+# shutdown, which is `DEFAULT_LIVE_SWEEP_SECS + 5` = 35s (the watcher's own
+# `_await_in_flight_sweeps` grace period -- see systemdrive_watcher.py). An
+# equal value still lets `done` get truncated exactly at the boundary: the
+# runner's timer and the watcher's internal grace timer start from slightly
+# different moments (stop-file detection happens on the watcher's sampler
+# cadence, not instantly), so a tie is not actually simultaneous in
+# practice and the runner can fire first. Kept a clean 5s above that
+# worst case rather than the bare tie it used to be; if either number
+# changes, keep this one strictly larger than
+# `DEFAULT_LIVE_SWEEP_SECS + 5`, not merely equal to it.
+_WATCHER_STOP_GRACE_SECS = 40
 
 _watcher_proc: "subprocess.Popen | None" = None
 _watcher_stop_file: "Path | None" = None

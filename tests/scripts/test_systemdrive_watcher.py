@@ -348,8 +348,49 @@ def test_run_emits_the_negative_when_nothing_appears(tmp_path: Path):
     assert "backend_by_root" in rows[0]
     done = [r for r in rows if r["event"] == "done"][0]
     assert done["sightings"] == 0
-    assert "NEGATIVE" in done["note"]
+    # A substring check alone is vacuous here: the UNKNOWN note is literally
+    # "UNKNOWN - a clean NEGATIVE cannot be claimed: ..." and CONTAINS
+    # "NEGATIVE". `startswith` plus an explicit absence of "UNKNOWN" is what
+    # actually discriminates the two outcomes -- see
+    # test_run_emits_unknown_when_a_blocker_is_present below for the paired
+    # falsifier that proves this test can fail.
+    assert done["note"].startswith("NEGATIVE")
+    assert "UNKNOWN" not in done["note"]
     assert done["watched_secs"] >= 0
+
+
+def test_run_emits_unknown_when_a_blocker_is_present(tmp_path: Path):
+    """Companion to test_run_emits_the_negative_when_nothing_appears.
+
+    Proves the OTHER direction: a genuine blocker (here, a %SystemDrive%
+    tree already on disk at arm time, which record_preexisting() latches so
+    it can NEVER produce a SIGHTING) must demote `done` to UNKNOWN rather
+    than let `sightings == 0` alone earn a clean NEGATIVE.
+
+    Without this test, the suite has only ever exercised the "everything
+    clean" path through `done`'s note -- a watcher permanently stuck at
+    UNKNOWN (e.g. blockers forced non-empty unconditionally) would be just
+    as useless as one that always claims NEGATIVE, and nothing here would
+    catch it. This test is that catch: it fails against exactly that
+    mutation (see the task's falsification requirement).
+    """
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    (root / JUNK_NAME).mkdir(parents=True)
+    watcher = Watcher([root], log=log, secs=0.3, poll_ms=20, sample_ms=20,
+                       force_polling=True)
+    assert watcher.run() == 0
+    rows = _rows(log)
+    done = [r for r in rows if r["event"] == "done"][0]
+    assert done["sightings"] == 0
+    # The note DOES contain the substring "NEGATIVE" ("a clean NEGATIVE
+    # cannot be claimed") -- that is exactly the trap the sibling test's old
+    # `assert "NEGATIVE" in done["note"]` fell into. `startswith` is what
+    # actually tells the two outcomes apart.
+    assert done["note"].startswith("UNKNOWN")
+    # The structured fields, not just the prose note, must show WHY.
+    assert done["systemdrive_present_on_disk"] == [str(root.resolve())]
+    assert done["preexisting_roots"] == [str(root.resolve())]
 
 
 def test_run_stops_early_when_the_stop_file_appears(tmp_path: Path):
