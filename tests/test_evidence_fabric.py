@@ -44,8 +44,10 @@ def test_service_creates_run_evidence_claim_link_and_status_provenance(tmp_path)
         updated = service.set_claim_status(claim.id, ClaimStatus.SUPPORTED)
         assert run.status is ResearchRunStatus.OPEN
         assert link.created_by_agent == "agent"
+        assert link.created_by_profile == "profile"
         assert updated.status is ClaimStatus.SUPPORTED
         assert updated.updated_by_agent == "agent"
+        assert updated.updated_by_profile == "profile"
     finally:
         db.close()
 
