@@ -11319,7 +11319,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "pets", "plugins", "portal", "profile",
-        "project", "proxy",
+        "project", "proxy", "providers",
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
@@ -12114,6 +12114,148 @@ def main():
         help="Remove all fallback entries",
     )
     fallback_parser.set_defaults(func=cmd_fallback)
+
+    # =========================================================================
+    # providers command — provider availability + value-for-money comparison
+    # =========================================================================
+    from hermes_cli.providers_cmd import cmd_providers
+
+    providers_parser = subparsers.add_parser(
+        "providers",
+        help="List usable providers and compare models by value-for-money",
+        description=(
+            "Show which providers Hermes can actually use (and which have "
+            "credentials configured), then rank models by value using live "
+            "OpenRouter pricing or the bundled models.dev catalog. See: "
+            "https://hermes-agent.nousresearch.com/docs/reference/cli-commands"
+        ),
+    )
+    providers_subparsers = providers_parser.add_subparsers(dest="providers_command")
+    providers_subparsers.add_parser(
+        "list",
+        aliases=["ls"],
+        help="Show all supported providers and their auth status",
+    )
+    compare_parser = providers_subparsers.add_parser(
+        "compare",
+        aliases=["cmp"],
+        help="Rank OpenRouter models by value-for-money (live pricing)",
+    )
+    compare_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use the bundled models.dev catalog instead of the live OpenRouter API",
+    )
+    compare_parser.add_argument(
+        "--top", type=int, default=10, help="Show top N models (default 10)"
+    )
+    compare_parser.add_argument(
+        "--min-context", type=int, default=0, help="Minimum context length in tokens"
+    )
+    compare_parser.add_argument(
+        "--task",
+        choices=["chat", "code", "reasoning"],
+        default=None,
+        help="Task preset (adds capability filters)",
+    )
+    compare_parser.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Include models without tool-calling support",
+    )
+    search_parser = providers_subparsers.add_parser(
+        "search", help="Search models by name/lab"
+    )
+    search_parser.add_argument(
+        "query", help="Substring to match against model id/name/lab"
+    )
+    search_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use the bundled models.dev catalog instead of the live OpenRouter API",
+    )
+    search_parser.add_argument(
+        "--top", type=int, default=10, help="Show top N matches (default 10)"
+    )
+    best_parser = providers_subparsers.add_parser(
+        "best",
+        help="Show best-value models for a task, with apply commands",
+    )
+    best_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use the bundled models.dev catalog instead of the live OpenRouter API",
+    )
+    best_parser.add_argument(
+        "--top", type=int, default=5, help="Show top N models (default 5)"
+    )
+    best_parser.add_argument(
+        "--min-context", type=int, default=0, help="Minimum context length in tokens"
+    )
+    best_parser.add_argument(
+        "--task",
+        choices=["chat", "code", "reasoning"],
+        default="chat",
+        help="Task preset (default chat)",
+    )
+    best_parser.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Include models without tool-calling support",
+    )
+    endpoints_parser = providers_subparsers.add_parser(
+        "endpoints",
+        aliases=["endpoint"],
+        help="List providers serving a model (per-provider pricing/latency/uptime)",
+    )
+    endpoints_parser.add_argument(
+        "model", help="OpenRouter model id, e.g. deepseek/deepseek-v4-flash"
+    )
+    route_parser = providers_subparsers.add_parser(
+        "route",
+        help="Show or set provider_routing (sort/order/only/ignore)",
+    )
+    route_parser.add_argument(
+        "--sort",
+        choices=["price", "throughput", "latency"],
+        default=None,
+        help='"price" routes to the cheapest available provider first',
+    )
+    route_parser.add_argument(
+        "--order",
+        metavar="P1,P2",
+        default=None,
+        help="Force provider priority order (comma-separated)",
+    )
+    route_parser.add_argument(
+        "--only",
+        metavar="P1,P2",
+        default=None,
+        help="Only use these providers (comma-separated)",
+    )
+    route_parser.add_argument(
+        "--ignore",
+        metavar="P1,P2",
+        default=None,
+        help="Never use these providers (comma-separated)",
+    )
+    route_parser.add_argument(
+        "--require-parameters",
+        action="store_true",
+        help="Only route to providers supporting every request parameter",
+    )
+    route_parser.add_argument(
+        "--data-collection",
+        choices=["allow", "deny"],
+        default=None,
+        help="Control whether providers may use your prompts for training",
+    )
+    route_parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Remove all provider_routing settings (back to OpenRouter default)",
+    )
+    providers_parser.set_defaults(func=cmd_providers)
 
     # =========================================================================
     # secrets command — external secret managers (Bitwarden, 1Password)

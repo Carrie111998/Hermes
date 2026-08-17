@@ -42,6 +42,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes model` | Interactively choose the default provider and model. |
 | `hermes moa` | Configure named Mixture of Agents presets selectable from the model picker. |
 | `hermes fallback` | Manage fallback providers tried when the primary model errors. |
+| `hermes providers` | List usable providers (and their auth status) and compare models by value-for-money. |
 | `hermes gateway` | Run or manage the messaging gateway service. |
 | `hermes proxy` | Local OpenAI-compatible proxy that attaches OAuth provider credentials. See [Subscription Proxy](../user-guide/features/subscription-proxy.md). |
 | `hermes egress` | Outbound credential-injection firewall for remote terminal sandboxes (iron-proxy). Disabled by default. See [Egress proxy](../user-guide/egress/iron-proxy.md). |
@@ -1276,6 +1277,39 @@ Manage the fallback provider chain. Fallback providers are tried in order when t
 | `clear` | Remove all fallback entries |
 
 See [Fallback Providers](../user-guide/features/fallback-providers.md).
+
+## `hermes providers`
+
+```bash
+hermes providers <subcommand>
+```
+
+See which providers Hermes can actually use (and which have credentials
+configured), then rank models by value-for-money. `compare`, `search`, and
+`best` use live OpenRouter pricing by default; pass `--offline` to use the
+bundled models.dev catalog instead (no network).
+
+| Subcommand | Description |
+|------------|-------------|
+| `list` (alias: `ls`) | Show every supported provider with auth status, transport, and curated model count (default when no subcommand) |
+| `compare` (alias: `cmp`) | Rank OpenRouter models by value: agentic-capable (tool-calling), cheapest first. Flags: `--top N`, `--min-context N`, `--task chat\|code\|reasoning`, `--include-all`, `--offline` |
+| `search <query>` | Case-insensitive substring match on model id/name/lab. Flags: `--top N`, `--offline` |
+| `best` | Top-value models for a task plus the exact `hermes config set` commands to apply the top pick. Flags: `--top N` (default 5), `--min-context N`, `--task` (default `chat`), `--include-all`, `--offline` |
+| `endpoints <model>` (alias: `endpoint`) | List the providers serving a model (e.g. `deepseek/deepseek-v4-flash`) with per-provider pricing, discount, context, latency, throughput, and uptime — the same table as the OpenRouter model page |
+| `route` | Show or set the `provider_routing` config section: `--sort price\|throughput\|latency` (auto-rank; `price` = cheapest first), `--order P1,P2` (force provider priority), `--only P1,P2`, `--ignore P1,P2`, `--require-parameters`, `--data-collection allow\|deny`, `--clear`. See [Provider Routing](../user-guide/features/provider-routing.md) |
+
+`providers best` output, for example:
+
+```bash
+hermes providers best --task code --top 5
+# Best-value models for task='code' (agentic-capable, cheapest first) — source: live OpenRouter API
+# MODEL                                    CONTEXT    IN $/M  OUT $/M  CAPS
+# nvidia/nemotron-3-ultra-550b-a55b:free   1,000,000  free    free     tools+reasoning
+# ...
+# To apply the top pick:
+#   hermes config set model.provider openrouter
+#   hermes config set model.default nvidia/nemotron-3-ultra-550b-a55b:free
+```
 
 ## `hermes hooks`
 

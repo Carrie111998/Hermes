@@ -10883,6 +10883,99 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
 
+    def _show_provider_route(self) -> None:
+        """Print the current session-level OpenRouter provider routing."""
+        values = [
+            ("sort", getattr(self, "_provider_sort", None)),
+            ("order", getattr(self, "_providers_order", None)),
+            ("only", getattr(self, "_providers_only", None)),
+            ("ignore", getattr(self, "_providers_ignore", None)),
+            ("require_parameters", getattr(self, "_provider_require_params", False)),
+            ("data_collection", getattr(self, "_provider_data_collection", None)),
+        ]
+        active = [(key, val) for key, val in values if val not in (None, False)]
+        if active:
+            _cprint("  Current OpenRouter provider routing:")
+            for key, val in active:
+                _cprint(f"    {key}: {val}")
+        else:
+            _cprint("  No provider routing set — OpenRouter default (no preference).")
+            _cprint("  Try: /provider DeepInfra   or   /provider sort price")
+
+    def _handle_provider_route(self, cmd_original: str) -> None:
+        """Handle /provider — session-scoped OpenRouter provider routing.
+
+        Usage:
+            /provider                          — show current session routing
+            /provider DeepInfra                — force that provider (OpenRouter)
+            /provider DeepInfra, Decart        — force a priority list
+            /provider sort price               — auto-rank cheapest first
+            /provider only A,B                 — allowlist providers
+            /provider ignore A,B               — blocklist providers
+            /provider require-parameters       — only providers supporting all params
+            /provider data-collection deny     — block providers' training use
+            /provider clear                    — back to OpenRouter default
+            append --global to also persist to config.yaml
+        """
+        from hermes_cli.providers_cmd import (
+            apply_session_provider_routing,
+            parse_provider_slash_args,
+        )
+
+        parts = cmd_original.split(None, 1)
+        arg_str = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            parsed = parse_provider_slash_args(arg_str)
+        except ValueError as exc:
+            _cprint(f"  {_DIM}✗ {exc}{_RST}")
+            return
+
+        changes = apply_session_provider_routing(self, self.agent, parsed)
+
+        if not changes:
+            _cprint("")
+            self._show_provider_route()
+            _cprint(f"  {_DIM}OpenRouter / Nous Portal routes only.{_RST}")
+            return
+
+        _cprint("")
+        _cprint(f"  {_DIM}OpenRouter provider routing (session){_RST}")
+        for line in changes:
+            _cprint(f"    ✓ {line}")
+
+        persisted = False
+        if parsed.get("global"):
+            try:
+                from hermes_cli.config import load_config, save_config
+
+                cfg = load_config()
+                pr = {
+                    key: val
+                    for key, val in (
+                        ("sort", getattr(self, "_provider_sort", None)),
+                        ("order", getattr(self, "_providers_order", None)),
+                        ("only", getattr(self, "_providers_only", None)),
+                        ("ignore", getattr(self, "_providers_ignore", None)),
+                        ("require_parameters", getattr(self, "_provider_require_params", False)),
+                        ("data_collection", getattr(self, "_provider_data_collection", None)),
+                    )
+                    if val not in (None, False)
+                }
+                if pr:
+                    cfg["provider_routing"] = pr
+                else:
+                    cfg.pop("provider_routing", None)
+                save_config(cfg)
+                persisted = True
+            except Exception as exc:
+                _cprint(f"  {_DIM}✗ Could not persist routing: {exc}{_RST}")
+
+        if persisted:
+            _cprint("  ✓ persisted to config.yaml (provider_routing)")
+        else:
+            _cprint(f"  {_DIM}session-only — append --global to persist to config.yaml{_RST}")
+        _cprint(f"  {_DIM}OpenRouter / Nous Portal routes only; applies from the next API call.{_RST}")
+
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
         if not text or has_images or not _looks_like_slash_command(text):
@@ -11313,6 +11406,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_sessions_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "provider":
+            self._handle_provider_route(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
 
