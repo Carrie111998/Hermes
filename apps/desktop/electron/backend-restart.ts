@@ -12,6 +12,12 @@ export function isBackendExitPending(child: Pick<BackendChildProcess, 'exitCode'
   return Boolean(child && child.exitCode === null && child.signalCode === null)
 }
 
+/**
+ * Wait for observed child exit. This helper never escalates by itself;
+ * callers that own termination must provide `onTimeout`. Without it, the
+ * helper resolves after the bounded grace period even if the child remains
+ * alive.
+ */
 export async function waitForBackendExit(
   child: BackendChildProcess | null | undefined,
   {
@@ -81,6 +87,9 @@ export async function restartLocalBackend({
 
     return { ok: true, mode: 'local' }
   } catch (error) {
+    // Keep the renderer re-home notification on startup failure: it clears
+    // stale session state and lets the boot/reconnect path report recovery
+    // failure without treating this notification as readiness.
     notifyApplied()
 
     return { ok: false, reason: 'restart-failed', message: errorMessage(error) }
