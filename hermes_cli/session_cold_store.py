@@ -319,6 +319,8 @@ def _valid_existing_snapshot_at(
             if metadata_text is None or payload_text is None:
                 return False
             metadata = json.loads(metadata_text)
+            if not isinstance(metadata, dict):
+                return False
             records = [json.loads(line) for line in payload_text.splitlines()]
             artifacts_fd = os.open("artifacts", _directory_open_flags(), dir_fd=snapshot_fd)
             os.close(artifacts_fd)

@@ -239,6 +239,22 @@ def test_store_rejects_fifo_payload_without_blocking(
         db.close()
 
 
+def test_store_rejects_non_object_snapshot_metadata(tmp_path: Path) -> None:
+    """Valid JSON scalars/lists are still invalid archive metadata envelopes."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        result = store_archived_lineage(db, "terminal", tmp_path / "archive")
+        (result.revision_dir / "metadata.json").write_text("[]\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="existing snapshot is invalid"):
+            store_archived_lineage(db, "terminal", tmp_path / "archive")
+    finally:
+        db.close()
+
+
 def test_store_rejects_snapshot_parent_symlink_swap_before_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
