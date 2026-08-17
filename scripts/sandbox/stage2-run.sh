@@ -204,6 +204,11 @@ fi
 # pointing it at the real bundle made npm reject the proxy's certs
 # (UNABLE_TO_VERIFY_LEAF_SIGNATURE) and the proxy log the abort as an
 # SSLEOFError. curl/git/openssl get the same ca.pem via their own vars.
+# One asymmetry to note: the *_FILE vars replace the trust store, but
+# NODE_EXTRA_CA_CERTS is additive -- Node keeps its built-in bundle --
+# so a Node process that somehow bypassed the proxy could still reach
+# public CAs directly. The *_PROXY vars are the enforcement; the CA
+# vars are only the trust plumbing.
 
 exec bwrap \
   --unshare-pid \
