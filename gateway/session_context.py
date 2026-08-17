@@ -36,7 +36,8 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
-from contextvars import ContextVar
+import os
+from contextvars import ContextVar, Token
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -66,6 +67,89 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+
+# Cron-session marker — set inside the cron scheduler's per-job asyncio task
+# so downstream consumers (``tools/approval.py`` branch on it) only see "yes,
+# cron" inside the actual job, not in subsequent user-driven sessions spawned
+# from the same process tree. Replaces the previous ``os.environ`` write,
+# which leaked across sessions.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+
+
+def get_cron_session() -> str:
+    """Return the active cron-session marker for the current task, or ``""``.
+
+    Only consults the ``contextvars.ContextVar`` — does NOT consult
+    ``os.environ``. The previous behaviour (falling back to
+    ``os.environ["HERMES_CRON_SESSION"]``) was the source of the
+    process-tree leak: any subprocess spawned after the cron scheduler
+    had set the env var inherited "yes, cron" and silently broke
+    tools like ``execute_code`` in user-driven sessions.
+
+    After the migration, the *only* writer of this marker is
+    ``cron/scheduler.py`` via ``set_cron_session``, and it is reset
+    inside the per-job ``finally:`` block. Any process that still
+    sets the env var at boot is effectively legacy.
+    """
+    val = _CRON_SESSION.get()
+    if val is _UNSET:
+        return ""
+    return val
+
+
+def set_cron_session(value: str = "1") -> Token:
+    """Mark the current asyncio task as a cron session. Returns a reset token.
+
+    Each ``set`` builds on whatever value the prior ``set`` left in the
+    same task — the returned ``Token`` is the canonical handle to revert
+    to that prior value. Tests / fixtures that need a hard reset back to
+    ``_UNSET`` should call :func:`force_reset_cron_session`.
+    """
+    token = _CRON_SESSION.set(value)
+    _ACTIVE_CRON_SESSION_TOKENS.append(token)
+    return token
+
+
+def reset_cron_session(token: Token) -> None:
+    """Clear the cron-session marker for the current task."""
+    _CRON_SESSION.reset(token)
+    # Drop matching token from the active list so a subsequent
+    # ``force_reset_cron_session`` does not try to reuse a spent handle.
+    try:
+        _ACTIVE_CRON_SESSION_TOKENS.remove(token)
+    except ValueError:
+        pass
+
+
+# Stack of tokens handed out by ``set_cron_session`` since module
+# import. ``force_reset_cron_session`` walks this list backwards,
+# resetting each token in turn — because each token reverts to the
+# value the var held *just before* that ``set`` call, the cumulative
+# effect is to march back through all sets to ``_UNSET``.
+_ACTIVE_CRON_SESSION_TOKENS: list[Token] = []
+
+
+def force_reset_cron_session() -> None:
+    """Reset the cron-session marker to its default ``_UNSET`` value.
+
+    Walks every active ``set_cron_session`` token in reverse order,
+    calling ``reset`` on each. Because each ``reset`` reverts to the
+    value active at the time of the corresponding ``set``, the net
+    effect is to revert all the way back to ``_UNSET``.
+
+    Intended for test fixtures and shutdown handlers. Production
+    code should pair ``set_cron_session`` with ``reset_cron_session``
+    in a ``try``/``finally`` block (mirroring the pattern used in
+    ``cron/scheduler.py:run_job``) so tokens compose safely.
+    """
+    while _ACTIVE_CRON_SESSION_TOKENS:
+        token = _ACTIVE_CRON_SESSION_TOKENS.pop()
+        try:
+            _CRON_SESSION.reset(token)
+        except (ValueError, RuntimeError):
+            # Token already consumed (e.g. by a prior ``reset``).
+            pass
+
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,

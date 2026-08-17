@@ -25,6 +25,32 @@ from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
 
 
+def _enter_cron_session(monkeypatch, value: str = "1"):
+    """Set the cron-session marker on both the ContextVar and the env var.
+
+    Matches the post-fix ``cron/scheduler.py`` behaviour: the ContextVar
+    is the runtime source of truth (consulted first by
+    ``env_var_enabled``), and the env var is preserved for any code path
+    that still reads it directly via ``os.getenv``.
+
+    Companion teardown: the autouse ``_reset_cron_session_after`` fixture
+    clears the marker between tests.
+    """
+    from gateway.session_context import set_cron_session
+    set_cron_session(value)
+    monkeypatch.setenv("HERMES_CRON_SESSION", value)
+
+
+@pytest.fixture(autouse=True)
+def _reset_cron_session_after():
+    yield
+    from gateway.session_context import force_reset_cron_session
+    try:
+        force_reset_cron_session()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 1. Context + callback propagation helper
 # ---------------------------------------------------------------------------
@@ -158,7 +184,7 @@ def test_guard_headless_local_approved(monkeypatch):
 
 
 def test_guard_cron_deny_blocks(monkeypatch):
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    _enter_cron_session(monkeypatch)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
     monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
@@ -333,7 +359,7 @@ def test_execute_code_entry_blocks_before_spawn_when_guard_denies(monkeypatch, t
     from tools import terminal_tool as TT
 
     marker = tmp_path / "child-ran.marker"
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    _enter_cron_session(monkeypatch)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")

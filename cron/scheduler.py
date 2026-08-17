@@ -1491,9 +1491,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     agent = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
+    # Routed through a ``contextvars.ContextVar`` so the marker is scoped
+    # to this asyncio task — it cannot leak into user-driven sessions
+    # spawned later from the same process tree, which would otherwise
+    # inherit the value via ``os.environ`` (``#16743`` style leak:
+    # ``execute_code`` reporting "Cron jobs run without a user present" in
+    # otherwise-cron-free sessions). Consumers (e.g. ``tools/approval.py``)
+    # read it via ``env_var_enabled("HERMES_CRON_SESSION")``, which now
+    # consults ``gateway.session_context.get_cron_session()`` first and
+    # falls back to ``os.environ`` only when the var was baked in at boot
+    # (e.g. older cron builds).
+    from gateway.session_context import set_cron_session, reset_cron_session
+    _cron_session_token = set_cron_session("1")
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -1925,6 +1934,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        # Clear the cron-session marker for this task. Safe no-op if it was
+        # never set (parallel jobs each got their own token at line 1496).
+        try:
+            reset_cron_session(_cron_session_token)
+        except Exception:
+            # Token may be stale if set_cron_session raised, or unrelated
+            # test paths may not initialize it.
+            pass
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected

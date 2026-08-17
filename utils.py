@@ -29,8 +29,26 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
 
 
 def env_var_enabled(name: str, default: str = "") -> bool:
-    """Return True when an environment variable is set to a truthy value."""
-    return is_truthy_value(os.getenv(name, default), default=False)
+    """Return True when an environment variable is set to a truthy value.
+
+    For ``HERMES_CRON_SESSION`` specifically, consult the
+    ``contextvars.ContextVar`` set by the cron scheduler first so a stale
+    ``os.environ`` value from a leaked scheduler tick cannot poison a
+    later user-driven session spawned from the same process tree. Falls
+    back to ``os.environ`` for backward compatibility with processes
+    that set the env var at boot (e.g. older cron builds, or test
+    harnesses).
+    """
+    if name == "HERMES_CRON_SESSION":
+        try:
+            from gateway.session_context import get_cron_session
+            value = get_cron_session()
+        except Exception:
+            # Gateway module unavailable (some import paths). Fall back.
+            value = os.getenv(name, default)
+    else:
+        value = os.getenv(name, default)
+    return is_truthy_value(value, default=False)
 
 
 def _preserve_file_mode(path: Path) -> "int | None":
