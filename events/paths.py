@@ -146,6 +146,21 @@ def code_drift_state_path(repo_name: Optional[str] = None) -> Path:
     return notifications_home() / f"code_drift_state.{slug}.json"
 
 
+def ruff_gate_state_path() -> Path:
+    """RuffGateProbe episode persistence (2026-08-17).
+
+    Holds {"alerting", "last_emit_wall", "last_shape"} so the probe alerts on
+    the RISING edge of a red lint gate rather than once per 15-minute tick
+    (96 Telegram messages a day for one unfixed violation).
+
+    Cross-profile and canonical-root like every other notification file: the
+    probe runs as a Windows Scheduled Task OUTSIDE the gateway process, so a
+    profile-scoped path would give the probe and any in-gateway reader
+    different views of the same episode.
+    """
+    return notifications_home() / "ruff_gate_state.json"
+
+
 def cron_trigger_log_path() -> Path:
     """Per-job rolling log of off-schedule cron fires (cron_triggered events).
 
