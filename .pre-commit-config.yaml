@@ -29,13 +29,15 @@ repos:
   # commit hides the change from the diff the author is reviewing, and the
   # F841 autofix in particular can delete side-effecting statements.
   #
-  # The RULES stay in sync via ruff.toml, but the ruff BINARIES do not, and
-  # nothing pins them to each other: this hook runs the rev below inside
-  # pre-commit's own isolated env, the local CLI is whatever is on PATH
-  # (0.15.10 on 2026-08-17), and both lint.yml jobs do a bare
-  # `uv tool install ruff` -- i.e. latest at run time. So a rule whose
-  # behavior changed between those versions can pass in one place and fail in
-  # another. Bump this rev deliberately; it tracks nothing on its own.
+  # The RULES stay in sync via ruff.toml; the ruff BINARIES are aligned only by
+  # hand. The local CLI was bumped to 0.15.12 on 2026-08-17 to match the rev
+  # below, so the two agree TODAY -- but nothing enforces it, and both lint.yml
+  # jobs still do a bare `uv tool install ruff` (latest at run time). Whoever
+  # bumps this rev must bump the local CLI in the same breath:
+  # `python -m pip install "ruff==<rev>"`. The local binary is not just a
+  # convenience -- events/producers/ruff_gate_probe.py shells out to it every
+  # 15 minutes, so a drift here makes the alarm and this gate disagree about
+  # the same tree.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.12 # the ruff pre-commit runs -- see the version note above
     hooks:
