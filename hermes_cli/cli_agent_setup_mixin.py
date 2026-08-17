@@ -611,10 +611,9 @@ class CLIAgentSetupMixin:
         falls back to design defaults when it's absent.
         """
         try:
-            import concurrent.futures
             from agent.quota_warnings import (
                 clear_quota_cache,
-                fetch_quota_snapshot,
+                fetch_quota_snapshot_bounded,
                 startup_warning_lines,
             )
             # Fresh snapshot per session — never reuse a warm cache from a
@@ -632,18 +631,9 @@ class CLIAgentSetupMixin:
                 # test_cli_provider_resolution.py::test_runtime_resolution_failure_is_not_sticky).
                 return
             config = getattr(self, "config", None)
-            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                snapshot = _pool.submit(
-                    fetch_quota_snapshot, provider,
-                    base_url=base_url, api_key=api_key,
-                ).result(timeout=10.0)
-            except Exception:
-                snapshot = None
-            finally:
-                # wait=False: a stuck provider fetch must never block the main
-                # thread past the .result() timeout (review finding).
-                _pool.shutdown(wait=False, cancel_futures=True)
+            snapshot = fetch_quota_snapshot_bounded(
+                provider, base_url=base_url, api_key=api_key, timeout=10.0
+            )
             for line in startup_warning_lines(snapshot, config):
                 print(line)
         except Exception:

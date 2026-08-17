@@ -5,6 +5,7 @@ Pure unit tests over plain dict configs — never touch load_config()
 ``agent.quota_warnings.*`` so the module's own namespace is the seam.
 """
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
@@ -12,6 +13,7 @@ from agent.quota_warnings import (
     QuotaThresholds,
     clear_quota_cache,
     fetch_quota_snapshot,
+    fetch_quota_snapshot_bounded,
     get_quota_warnings,
     quota_thresholds,
     quota_warning_lines,
@@ -469,3 +471,103 @@ def test_quota_warning_lines_boolean_true_suppressed():
     cfg = {"quota": {"suppress_warnings": True}}
     snap = _snapshot(windows=[_window(used_percent=98)])
     assert quota_warning_lines(snap, config=cfg) == []
+
+
+# ── fetch_quota_snapshot_bounded: in-flight future reuse ────────────────
+
+
+def test_bounded_fetch_reuses_in_flight_future(monkeypatch):
+    """A probe whose previous fetch for the same key is still running must
+    reuse that future, not spawn a second executor/thread (review feedback:
+    per-turn executors stacked one stuck worker per turn)."""
+    calls = []
+    gate = threading.Event()
+
+    def slow_fetch(provider, *, base_url=None, api_key=None):
+        calls.append((provider, base_url, api_key))
+        gate.wait(timeout=5.0)
+        return _make_fake_snapshot()
+
+    monkeypatch.setattr("agent.quota_warnings.fetch_quota_snapshot", slow_fetch)
+    clear_quota_cache()
+    try:
+        # First probe: fetch starts and blocks past the wait bound.
+        s1 = fetch_quota_snapshot_bounded(
+            "openai-codex", base_url="https://x", api_key="key-a", timeout=0.1
+        )
+        assert s1 is None  # timed out, fetch still in flight
+        assert len(calls) == 1
+        # Second probe while the first fetch is still stuck: must reuse the
+        # in-flight future — no second fetch, no second thread.
+        s2 = fetch_quota_snapshot_bounded(
+            "openai-codex", base_url="https://x", api_key="key-a", timeout=0.1
+        )
+        assert s2 is None
+        assert len(calls) == 1  # the reuse assertion
+    finally:
+        gate.set()  # unblock the worker so it exits (no thread leak)
+
+
+def test_bounded_fetch_replaces_completed_future(monkeypatch):
+    """A completed future must be replaced (and its idle worker shut down),
+    so finished probes leave no lingering executor threads and the next probe
+    fetches fresh rather than reusing a stale future forever."""
+    calls = []
+
+    def fast_fetch(provider, *, base_url=None, api_key=None):
+        calls.append(provider)
+        return _make_fake_snapshot()
+
+    monkeypatch.setattr("agent.quota_warnings.fetch_quota_snapshot", fast_fetch)
+    clear_quota_cache()
+    s1 = fetch_quota_snapshot_bounded("openai-codex", timeout=5.0)
+    s2 = fetch_quota_snapshot_bounded("openai-codex", timeout=5.0)
+    assert s1 is not None
+    assert s2 is not None
+    assert len(calls) == 2  # second probe started a fresh fetch
+
+
+def test_clear_quota_cache_shuts_down_in_flight(monkeypatch):
+    """Session reset must shut down in-flight probes: the next probe starts
+    fresh instead of reusing (or being blocked by) the pre-clear future."""
+    calls = []
+    gate = threading.Event()
+
+    def slow_fetch(provider, *, base_url=None, api_key=None):
+        calls.append(provider)
+        gate.wait(timeout=5.0)
+        return _make_fake_snapshot()
+
+    monkeypatch.setattr("agent.quota_warnings.fetch_quota_snapshot", slow_fetch)
+    clear_quota_cache()
+    try:
+        assert fetch_quota_snapshot_bounded("openai-codex", timeout=0.1) is None
+        assert len(calls) == 1
+        clear_quota_cache()
+        assert fetch_quota_snapshot_bounded("openai-codex", timeout=0.1) is None
+        assert len(calls) == 2  # fresh fetch after clear, dead entry not reused
+    finally:
+        gate.set()  # release both blocked workers
+
+
+def test_bounded_fetch_per_key_isolation(monkeypatch):
+    """Distinct credential triples must NOT share an in-flight future: a
+    blocked fetch for one key must not prevent another key from fetching
+    (per-key isolation — a global single worker would wedge all probes)."""
+    calls = []
+    gate = threading.Event()
+
+    def slow_fetch(provider, *, base_url=None, api_key=None):
+        calls.append((provider, api_key))
+        gate.wait(timeout=5.0)
+        return _make_fake_snapshot()
+
+    monkeypatch.setattr("agent.quota_warnings.fetch_quota_snapshot", slow_fetch)
+    clear_quota_cache()
+    try:
+        fetch_quota_snapshot_bounded("provider-a", api_key="k1", timeout=0.1)
+        fetch_quota_snapshot_bounded("provider-b", api_key="k2", timeout=0.1)
+        assert len(calls) == 2  # each key fetches independently
+    finally:
+        gate.set()
+

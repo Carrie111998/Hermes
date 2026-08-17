@@ -11826,6 +11826,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         The snapshot is TTL-cached (≤10 min) by the engine; ``/quota``
         intentionally uses the cached fetch (fast explicit query) — the
         display rendered here is still the full account-usage block + warnings.
+
+        Unlike the advisory pre-turn/startup probes, ``/quota`` is an explicit
+        user command, so it probes whenever a provider is set even if the
+        credentials are not already resolved — the fetch may then perform
+        credential resolution (env/config/credential-pool) as a side effect.
+        That is intentional: an explicit command may resolve; background
+        probes never do.
         """
         agent = self.agent
         provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
@@ -11833,25 +11840,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
         # Lazy import — pulls the account_usage → auth chain, only needed here.
         from agent.quota_warnings import (
-            fetch_quota_snapshot,
+            fetch_quota_snapshot_bounded,
             startup_warning_lines,
         )
         from agent.account_usage import render_account_usage_lines
 
         snapshot = None
         if provider:
-            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                snapshot = _pool.submit(
-                    fetch_quota_snapshot, provider,
-                    base_url=base_url, api_key=api_key,
-                ).result(timeout=10.0)
-            except Exception:
-                snapshot = None
-            finally:
-                # wait=False: a stuck provider fetch must never block the main
-                # thread past the .result() timeout (review finding).
-                _pool.shutdown(wait=False, cancel_futures=True)
+            snapshot = fetch_quota_snapshot_bounded(
+                provider, base_url=base_url, api_key=api_key, timeout=10.0
+            )
 
         if not provider or snapshot is None:
             print("  No quota data for the current provider — /usage shows session usage and rate limits.")
@@ -11889,21 +11887,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # test_cli_provider_resolution.py::test_runtime_resolution_failure_is_not_sticky).
                 return
             from agent.quota_warnings import (
-                fetch_quota_snapshot,
+                fetch_quota_snapshot_bounded,
                 quota_warning_lines,
             )
-            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                snapshot = _pool.submit(
-                    fetch_quota_snapshot, provider,
-                    base_url=base_url, api_key=api_key,
-                ).result(timeout=2.0)  # 2s bound: the probe is advisory and runs on the main thread before every turn — a slow provider must not delay the prompt (cross-vendor review).
-            except Exception:
-                snapshot = None
-            finally:
-                # wait=False: a stuck provider fetch must never block the main
-                # thread past the .result() timeout (review finding).
-                _pool.shutdown(wait=False, cancel_futures=True)
+            snapshot = fetch_quota_snapshot_bounded(
+                provider, base_url=base_url, api_key=api_key, timeout=2.0
+            )
             for line in quota_warning_lines(snapshot, CLI_CONFIG):
                 print(line)
         except Exception:

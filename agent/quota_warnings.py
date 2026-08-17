@@ -9,7 +9,8 @@ and adds:
 * a *pre-turn* suppression gate (``quota.suppress_warnings``) for the
   steady-state turns, and a startup variant that always fires,
 * a small module-level TTL cache so the pre-turn probe doesn't hit the
-  provider network on every turn.
+  provider network on every turn, plus an in-flight-future registry so a
+  stuck probe can never stack up one worker thread per turn.
 
 All threshold logic is pure: ``get_quota_warnings`` takes a snapshot +
 thresholds and returns lines.  The config-aware wrappers
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import math
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Optional
@@ -247,6 +249,15 @@ def startup_warning_lines(
 _quota_cache: dict[tuple, tuple[float, AccountUsageSnapshot]] = {}
 _quota_cache_lock = threading.Lock()
 
+# In-flight probe registry: {(provider, base_url, api_key): (future, executor)}.
+# ``fetch_quota_snapshot_bounded`` reuses a still-running future for the same
+# credential triple instead of spawning a fresh executor/thread per probe, so
+# an unhealthy provider can stack at most one stuck worker (review feedback,
+# PR #84946).  Per-key isolation is deliberate: a shared single-worker
+# executor would queue every later probe behind one hung fetch.
+_in_flight: dict[tuple, tuple[Future, ThreadPoolExecutor]] = {}
+_in_flight_lock = threading.Lock()
+
 
 def fetch_quota_snapshot(
     provider: Optional[str],
@@ -293,11 +304,77 @@ def fetch_quota_snapshot(
 
 
 def clear_quota_cache() -> None:
-    """Empty the quota TTL cache.
+    """Empty the quota TTL cache and shut down in-flight probe fetches.
 
     Called at REPL session start so each fresh session re-probes the provider
     instead of reusing the warm cache from a previous session (design-review
-    requirement).
+    requirement).  In-flight probes are shut down (``wait=False``) so a stuck
+    fetch from a previous session cannot linger past its own fetch timeout;
+    the next probe for the same key starts fresh.
     """
     with _quota_cache_lock:
         _quota_cache.clear()
+    with _in_flight_lock:
+        for _, executor in _in_flight.values():
+            # cancel_futures=False: these executors never hold pending work
+            # (one submit per executor), so there is nothing to cancel — the
+            # shutdown only wakes idle workers; a running fetch is never
+            # interrupted and exits by itself at its httpx timeout.
+            executor.shutdown(wait=False, cancel_futures=False)
+        _in_flight.clear()
+
+
+def fetch_quota_snapshot_bounded(
+    provider: Optional[str],
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout: float,
+) -> Optional[AccountUsageSnapshot]:
+    """Bounded snapshot fetch for the CLI warning surfaces (advisory probes).
+
+    Runs the TTL-cached fetch on a short-lived single-worker executor and
+    waits at most ``timeout`` seconds; returns ``None`` on timeout or error
+    (fail-open — never raises into the main thread).
+
+    Thread hygiene (review feedback, PR #84946): at most one in-flight fetch
+    per credential triple.  A probe whose previous fetch for the same key is
+    still running reuses that future instead of spawning another executor and
+    thread, so a slow provider can stack at most one stuck worker, and only
+    while a fetch is genuinely in flight.  Once the previous future is done
+    its idle worker is shut down (the shutdown wake-up exits it) and a fresh
+    executor is created — finished probes leave no lingering threads, and a
+    still-running work item is never interrupted (its thread exits by itself
+    once the underlying fetch returns; the fetches carry httpx timeouts).
+
+    A shared single-worker executor is deliberately NOT used: one hung fetch
+    would queue every later probe behind it and wedge all providers.
+    """
+    key = (provider, base_url, api_key)
+    with _in_flight_lock:
+        entry = _in_flight.get(key)
+        if entry is not None:
+            fut, executor = entry
+            if not fut.done():
+                pass  # reuse the still-running fetch
+            else:
+                # Previous fetch finished; its worker is idle.  Shut it down
+                # (the wake-up exits the idle worker) and start a fresh one.
+                executor.shutdown(wait=False)
+                executor = ThreadPoolExecutor(max_workers=1)
+                fut = executor.submit(
+                    fetch_quota_snapshot, provider,
+                    base_url=base_url, api_key=api_key,
+                )
+                _in_flight[key] = (fut, executor)
+        else:
+            executor = ThreadPoolExecutor(max_workers=1)
+            fut = executor.submit(
+                fetch_quota_snapshot, provider,
+                base_url=base_url, api_key=api_key,
+            )
+            _in_flight[key] = (fut, executor)
+    try:
+        return fut.result(timeout=timeout)
+    except Exception:
+        return None
