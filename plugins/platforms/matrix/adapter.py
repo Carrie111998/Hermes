@@ -1437,7 +1437,16 @@ class MatrixAdapter(BasePlatformAdapter):
             return bool(
                 verify_signature_json(serialized, user_id, device_id, ed25519)
             )
-        except Exception:
+        except Exception as exc:
+            # Fail closed stays deliberate: any error means "not verifiably
+            # valid". Log at debug so a broken install (e.g. ImportError) or
+            # a malformed record is diagnosable instead of indistinguishable
+            # from a genuine signature failure.
+            logger.debug(
+                "Matrix: device self-signature verification raised: %s",
+                exc,
+                exc_info=True,
+            )
             return False
 
     async def _reverify_keys_after_upload(
@@ -1691,12 +1700,20 @@ class MatrixAdapter(BasePlatformAdapter):
             or not signature_valid
         ):
             invalid_reason = (
-                "identity key mismatch"
-                if server_ed25519 != local_ed25519
+                "identity key missing from server record"
+                if not server_ed25519
                 else (
-                    "encryption key mismatch"
-                    if server_curve25519 != local_curve25519
-                    else "invalid device self-signature"
+                    "identity key mismatch"
+                    if server_ed25519 != local_ed25519
+                    else (
+                        "encryption key missing from server record"
+                        if not server_curve25519
+                        else (
+                            "encryption key mismatch"
+                            if server_curve25519 != local_curve25519
+                            else "invalid device self-signature"
+                        )
+                    )
                 )
             )
             if olm.account.shared:
