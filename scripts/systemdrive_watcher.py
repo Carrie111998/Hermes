@@ -292,6 +292,7 @@ class Watcher:
         secs: float = DEFAULT_SECS,
         stop_file: "Path | None" = None,
         force_polling: bool = False,
+        live_sweep_secs: float = 30.0,
     ) -> None:
         self.roots = [Path(r).resolve() for r in roots]
         self.log = log or log_path()
@@ -300,6 +301,11 @@ class Watcher:
         self.force_polling = force_polling
         self._sample_s = sample_ms / 1000.0
         self._poll_s = poll_ms / 1000.0
+        # Time budget for on_hit()'s live-process sweep. Measured on this box:
+        # describe_pid() costs ~204ms/process against ~968 live processes, so
+        # an unbounded sweep takes 60-200s. This caps the wait for the
+        # (best-effort, secondary) SIGHTING_LIVE record; see on_hit().
+        self.live_sweep_secs = live_sweep_secs
         # Kept as its own attribute rather than read back off the deque's
         # maxlen: the `armed` record reports it, and reaching into another
         # object's private state to report your own config is a trap.
@@ -334,9 +340,34 @@ class Watcher:
     def on_hit(self, root: Path, backend: str) -> None:
         """Record the first absent->present transition for ``root``.
 
-        Ordering is the whole point: the ring buffer is dumped FIRST because
-        it is already in memory, then the live table is enumerated. Ancestry
-        is the perishable part; the directory is not.
+        Ordering is the whole point, and it is now two stages:
+
+        1. Dump the ring buffer (already in memory, instant) and write the
+           durable SIGHTING record IMMEDIATELY -- before any live-table
+           enumeration.
+        2. Only THEN enumerate the live process table (bounded by
+           ``self.live_sweep_secs``) and write a second, best-effort
+           SIGHTING_LIVE record.
+
+        Why the live sweep must come AFTER the write, not before: measured
+        on this box, ``describe_pid()`` costs ~204ms per process against
+        ~968 live processes, so a full sweep takes 60-200 SECONDS (this is
+        not a Python-loop-overhead problem -- ``psutil.Process.ppid()`` and
+        ``.create_time()`` each force a fresh full-table snapshot per call on
+        Windows, making the sweep effectively quadratic; batching via
+        ``psutil.process_iter(attrs=[...])`` was measured too and gave NO
+        speedup, 112.87s for 919 processes -- there is no cheap batched
+        path). This class of run gets killed, timed out, or loses its
+        terminal -- that is the entire reason ``write_record`` exists to
+        write at the moment of the event rather than at exit (see its
+        docstring). If the live sweep ran BEFORE the SIGHTING write, a kill
+        during those 60-200s would destroy the only copy of the sighting
+        itself, reproducing exactly the failure this watcher exists to
+        prevent. Do NOT reorder the live enumeration above the write below.
+
+        Ancestry (the ring + eventually the live table) is the perishable
+        part; the directory on disk is not -- which is why the ring dump
+        still happens first, before anything else.
         """
         key = str(root)
         with self._lock:
@@ -346,7 +377,28 @@ class Watcher:
             self.sightings += 1
 
         ring = self._ring.dump()                      # in memory, instant
-        live = [describe_pid(pid) for pid in psutil.pids()]
+
+        # Durable the moment we know -- see the docstring above for why this
+        # write must precede the live sweep rather than follow it.
+        write_record(
+            self.log, "SIGHTING",
+            root=key,
+            path=str(root / JUNK_NAME),
+            backend=backend,
+            # The falsifier for the whole mechanism story. A sighting recorded
+            # while SYSTEMDRIVE IS present kills the missing-SYSTEMDRIVE
+            # explanation and restarts the hunt.
+            watcher_has_systemdrive="SYSTEMDRIVE" in os.environ,
+            ring_cwd_matches=[e for e in ring if cwd_matches(e, root)],
+            ring_size=len(ring),
+            # A reader of a killed run's log needs to be able to tell "the
+            # live sweep never got to run" apart from "it ran and found
+            # nothing". This field is that signal; SIGHTING_LIVE supersedes
+            # it once (if) the sweep completes or times out.
+            live_sweep="pending",
+        )
+
+        live, live_total, live_truncated, live_elapsed = self._live_sweep()
 
         snapshot: "Path | None" = self.log.with_name(
             f"systemdrive-sighting-{datetime.now():%Y%m%d-%H%M%S-%f}.json"
@@ -361,20 +413,42 @@ class Watcher:
             snapshot = None
 
         write_record(
-            self.log, "SIGHTING",
+            self.log, "SIGHTING_LIVE",
             root=key,
-            path=str(root / JUNK_NAME),
-            backend=backend,
-            # The falsifier for the whole mechanism story. A sighting recorded
-            # while SYSTEMDRIVE IS present kills the missing-SYSTEMDRIVE
-            # explanation and restarts the hunt.
-            watcher_has_systemdrive="SYSTEMDRIVE" in os.environ,
             live_cwd_matches=[e for e in live if cwd_matches(e, root)],
-            ring_cwd_matches=[e for e in ring if cwd_matches(e, root)],
             live_process_count=len(live),
-            ring_size=len(ring),
+            # Never report a partial sweep as complete -- these three fields
+            # make truncation unmistakable rather than silent.
+            live_process_total=live_total,
+            live_sweep_truncated=live_truncated,
+            live_sweep_secs=round(live_elapsed, 3),
             snapshot_file=str(snapshot) if snapshot else None,
         )
+
+    def _live_sweep(self) -> "tuple[List[dict], int, bool, float]":
+        """Enumerate the live process table, bounded by ``live_sweep_secs``.
+
+        Returns ``(entries, total_pids, truncated, elapsed_secs)``. Never
+        raises: per-process failures are already handled inside
+        ``describe_pid``, and a failure to even list pids is reported as an
+        empty, truncated sweep rather than propagating -- a diagnostic must
+        never take the watch down.
+        """
+        started = time.monotonic()
+        try:
+            pids = list(psutil.pids())
+        except Exception:
+            return [], 0, True, time.monotonic() - started
+        total = len(pids)
+        entries: List[dict] = []
+        truncated = False
+        for pid in pids:
+            if time.monotonic() - started >= self.live_sweep_secs:
+                truncated = True
+                break
+            entries.append(describe_pid(pid))
+        elapsed = time.monotonic() - started
+        return entries, total, truncated, elapsed
 
     def stop(self) -> None:
         self._stop.set()

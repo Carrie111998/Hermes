@@ -13,8 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 from scripts.systemdrive_watcher import JUNK_NAME, build_parser, write_record, ProcessRing, cwd_matches, describe_pid
 
 
@@ -200,20 +198,20 @@ def _rows(log: Path) -> list[dict]:
 
 
 # These two tests exercise on_hit()'s real (unmocked) `psutil.pids()` +
-# `describe_pid()` walk of the FULL live process table, by design (see
-# on_hit's docstring: ancestry is the perishable part). On this box that
-# walk is measured at ~70-200s (~900 live processes at ~80-90ms/describe_pid
-# under load), well past the repo's global 30s pytest-timeout default
-# (pyproject.toml addopts --timeout=30). That is real, reproducible
-# environmental latency -- not a hang and not a defect in on_hit -- so the
-# per-test cap is raised rather than mocking away the behavior under test.
-@pytest.mark.timeout(240)
+# `describe_pid()` walk of the live process table, by design (see on_hit's
+# docstring: ancestry is the perishable part). describe_pid() is measured at
+# ~204ms/process against ~968 live processes on this box, so an UNBOUNDED
+# walk takes 60-200s -- well past the repo's global 30s pytest-timeout
+# default (pyproject.toml addopts --timeout=30). Fix 2 put a time budget
+# (`live_sweep_secs`) on that walk specifically so callers -- including these
+# tests -- are not held hostage to the full table; passing a small budget
+# here keeps the test fast while still exercising the real, unmocked sweep.
 def test_on_hit_writes_the_sighting_before_returning(tmp_path: Path):
     """Requirement 4: JSONL at the MOMENT of the sighting, not at exit."""
     log = tmp_path / "w.jsonl"
     root = tmp_path / "root"
     root.mkdir()
-    watcher = Watcher([root], log=log)
+    watcher = Watcher([root], log=log, live_sweep_secs=0.5)
     watcher.on_hit(root.resolve(), "test")
     assert log.exists()
     sightings = [r for r in _rows(log) if r["event"] == "SIGHTING"]
@@ -221,22 +219,65 @@ def test_on_hit_writes_the_sighting_before_returning(tmp_path: Path):
     rec = sightings[0]
     assert rec["backend"] == "test"
     assert "watcher_has_systemdrive" in rec
-    assert "live_cwd_matches" in rec
     assert "ring_cwd_matches" in rec
-    assert rec["live_process_count"] > 0
+    assert rec["live_sweep"] == "pending"
+    live_sightings = [r for r in _rows(log) if r["event"] == "SIGHTING_LIVE"]
+    assert len(live_sightings) == 1
+    live_rec = live_sightings[0]
+    assert "live_cwd_matches" in live_rec
+    assert live_rec["live_process_count"] > 0
+    assert live_rec["live_process_total"] > 0
+    assert "live_sweep_truncated" in live_rec
 
 
-@pytest.mark.timeout(240)
 def test_on_hit_reports_only_the_first_transition(tmp_path: Path):
     """Later ticks would re-report the same tree and bury the original."""
     log = tmp_path / "w.jsonl"
     root = tmp_path / "root"
     root.mkdir()
-    watcher = Watcher([root], log=log)
+    watcher = Watcher([root], log=log, live_sweep_secs=0.5)
     watcher.on_hit(root.resolve(), "test")
     watcher.on_hit(root.resolve(), "test")
     assert len([r for r in _rows(log) if r["event"] == "SIGHTING"]) == 1
     assert watcher.sightings == 1
+
+
+def test_sighting_record_is_durable_before_the_live_sweep(tmp_path: Path, monkeypatch):
+    """Locks Fix 1's actual guarantee: SIGHTING lands before the live sweep.
+
+    describe_pid is monkeypatched to sleep, making the live sweep measurably
+    slow, then on_hit is called and the JSONL file is inspected: SIGHTING
+    must be the FIRST row, carrying the ring fields, with SIGHTING_LIVE
+    (carrying the live fields) written only afterward. Against the OLD
+    ordering -- live enumeration before the write -- this test would time
+    out waiting on write_record's caller and/or never see a SIGHTING row
+    ahead of a slow live sweep; that is the failure this test exists to
+    catch.
+    """
+    import scripts.systemdrive_watcher as w
+
+    real_describe_pid = w.describe_pid
+
+    def slow_describe_pid(pid):
+        time.sleep(0.05)
+        return real_describe_pid(pid)
+
+    monkeypatch.setattr(w, "describe_pid", slow_describe_pid)
+
+    log = tmp_path / "w.jsonl"
+    root = tmp_path / "root"
+    root.mkdir()
+    watcher = w.Watcher([root], log=log, live_sweep_secs=2.0)
+    watcher.on_hit(root.resolve(), "test")
+
+    rows = _rows(log)
+    assert rows[0]["event"] == "SIGHTING", "SIGHTING must be the first record written"
+    assert rows[0]["live_sweep"] == "pending"
+    assert "ring_cwd_matches" in rows[0]
+    assert "ring_size" in rows[0]
+    live_index = next(i for i, r in enumerate(rows) if r["event"] == "SIGHTING_LIVE")
+    assert live_index > 0, "SIGHTING_LIVE must follow SIGHTING, not precede or replace it"
+    assert rows[live_index]["live_sweep_secs"] > 0
 
 
 def test_preexisting_tree_is_recorded_and_blames_nobody(tmp_path: Path):
