@@ -40,6 +40,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
+from hermes_constants import get_default_hermes_root
 from obs import get_tracer
 from obs.oauth_llm import codex_structured_invoke
 
@@ -83,10 +84,47 @@ logger = logging.getLogger(__name__)
 # obs.oauth_llm.get_codex_chat_model() bridges langchain to chatgpt.com/backend-api/codex
 # (Responses API). Per-graph override via HERMES_JOBFLOW_MODEL.
 DEFAULT_MODEL = os.environ.get("HERMES_JOBFLOW_MODEL", "gpt-5.5")
-CHECKPOINT_DB = Path.home() / ".hermes" / "graphs" / "checkpoints.db"
-APPROVAL_LOG = Path.home() / ".hermes" / "graphs" / "approval-log.jsonl"
-APPLY_LOG = Path.home() / ".hermes" / "graphs" / "apply-log.jsonl"
-TRACKER_LOG = Path.home() / ".hermes" / "graphs" / "tracker-log.jsonl"
+# On-disk locations. FUNCTIONS, not module constants, and resolved through
+# get_default_hermes_root() rather than Path.home() -- both halves are load-bearing:
+#
+#   * Path.home() BYPASSES the HERMES_HOME redirect tests/conftest.py installs, so
+#     anything that reached these writes landed in the developer's real
+#     ~/.hermes/graphs -- which holds live job-application records.
+#   * A module-level constant is resolved at IMPORT time, and conftest sets
+#     HERMES_HOME in an autouse fixture that runs AFTER import. So the correct
+#     resolver in a constant would still have snapshotted the wrong root.
+#
+# get_default_hermes_root() and NOT get_hermes_home(): these files live at the
+# ROOT (~/.hermes/graphs), while get_hermes_home() returns <root>/profiles/<name>
+# under a profile-scoped HERMES_HOME -- using it would silently relocate live data
+# into the profile dir. Same root-vs-profile rule as the notification layer.
+# Production paths are unchanged; only tests move. Pinned by
+# tests/graphs/test_jobflow_paths.py.
+
+
+def _graphs_dir() -> Path:
+    return get_default_hermes_root() / "graphs"
+
+
+def checkpoint_db_path() -> Path:
+    return _graphs_dir() / "checkpoints.db"
+
+
+def approval_log_path() -> Path:
+    return _graphs_dir() / "approval-log.jsonl"
+
+
+def apply_log_path() -> Path:
+    return _graphs_dir() / "apply-log.jsonl"
+
+
+def tracker_log_path() -> Path:
+    return _graphs_dir() / "tracker-log.jsonl"
+
+
+def main_inbox_path() -> Path:
+    """The mailbox the APPLY_PACKET is dropped into."""
+    return get_default_hermes_root() / "mailbox" / "main" / "inbox"
 
 
 # ---------------------------------------------------------------------------
@@ -408,8 +446,9 @@ def approval_hitl_node(state: JobFlowState) -> dict:
             "cover_preview": (state.get("cover_paragraph") or "")[:200],
             "auto_resolved": auto,
         }
-        APPROVAL_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(APPROVAL_LOG, "a", encoding="utf-8") as f:
+        approval_log = approval_log_path()
+        approval_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(approval_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(req, default=str) + "\n")
 
         if auto:
@@ -524,15 +563,16 @@ def apply_node(state: JobFlowState) -> dict:
             "logged_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
-        APPLY_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(APPLY_LOG, "a", encoding="utf-8") as f:
+        apply_log = apply_log_path()
+        apply_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(apply_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(receipt, default=str) + "\n")
 
         # iter2: write APPLY_PACKET to mailbox/main/inbox + emit event.
         if approved:
             try:
-                MAIN_INBOX = Path.home() / ".hermes" / "mailbox" / "main" / "inbox"
-                MAIN_INBOX.mkdir(parents=True, exist_ok=True)
+                main_inbox = main_inbox_path()
+                main_inbox.mkdir(parents=True, exist_ok=True)
                 ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
                 msg = {
                     "type": "APPLY_PACKET",
@@ -543,7 +583,7 @@ def apply_node(state: JobFlowState) -> dict:
                     "correlation_id": str(uuid.uuid4()),
                     "payload": receipt,
                 }
-                packet_path = MAIN_INBOX / f"{ts}_{jid}_APPLY_PACKET_jobflow.json"
+                packet_path = main_inbox / f"{ts}_{jid}_APPLY_PACKET_jobflow.json"
                 packet_path.write_text(json.dumps(msg, indent=2, default=str), encoding="utf-8")
                 event_id = _emit_event(
                     "apply_packet",
@@ -618,8 +658,9 @@ def tracker_update_node(state: JobFlowState) -> dict:
             "approval": approval,
             "applied": applied,
         }
-        TRACKER_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(TRACKER_LOG, "a", encoding="utf-8") as f:
+        tracker_log = tracker_log_path()
+        tracker_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(tracker_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=str) + "\n")
 
         # iter2: emit STAGE_TRANSITION event to event bus. The DevFlow bridge
@@ -777,14 +818,15 @@ def build_full_graph(use_checkpointer: bool = True):
         try:
             from langgraph.checkpoint.sqlite import SqliteSaver
 
-            CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_db = checkpoint_db_path()
+            checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
             # SqliteSaver.from_conn_string returns a CM; for library-use we want a
             # plain object with __call__-able methods. The v1.x API:
             #   with SqliteSaver.from_conn_string(":memory:") as saver: ...
             # For a persistent file, we manage the connection ourselves.
             import sqlite3
 
-            conn = sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False)
+            conn = sqlite3.connect(str(checkpoint_db), check_same_thread=False)
             saver = SqliteSaver(conn)
             return g.compile(checkpointer=saver)
         except Exception:  # pragma: no cover
