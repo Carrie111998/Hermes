@@ -459,3 +459,49 @@ it never deletes a statement that is alone in its block (that leaves `else:` wit
 the real config and `--isolated`; F811 and F821 remain zero tree-wide. `pytest --collect-only`
 is unchanged at **51655/51730 collected, 0 collection errors**, measured against a worktree
 pinned at the pre-stage commit rather than against a remembered number.
+
+All 130 modified test files were then run twice — once on this tree, once on that pinned
+worktree, same invocation and same machine:
+
+| | tests | failures |
+|---|---|---|
+| stage 5 | 8812 | 95 |
+| pre-stage baseline | 8812 | 96 |
+
+**Zero new failures**, and an identical test count, so nothing was silently dropped. The 95
+are pre-existing platform baselines that cluster by cause rather than by anything this stage
+touched: 42 tirith (binary absent, so the scanner fails open), 16 clipboard (macOS/Linux
+dispatch paths on Windows), 8 minimax (no credentials), 8 `socket has no attribute AF_UNIX`,
+7 Windows path shape. Exactly one *failing* test is one this stage edited at all, and that
+edit is inert. The lone failure on the **baseline** side only
+(`test_check_for_updates_official_ssh_origin_uses_https_probe`) was not fixed here either —
+its test was not edited, and update-flow tests reach real-host seams.
+
+Not covered on this box, and not claimed to be: `tests/hermes_cli/test_gateway_service.py`
+skips all 189 tests via `importorskip pwd/grp` on Windows, and `tests/stress/` is behind a
+marker. Those files' edits were reviewed by hand instead.
+
+## Stage 6 — how to reconcile the two branches
+
+Stages 4 and 5 were done in parallel by sessions that could not see each other, so **neither
+is on `main`** and both edit `ruff.toml`. That diff conflicts textually and reconciles
+trivially, because the two stages delete **disjoint rule codes from the same table**.
+
+The merge rule is code-wise intersection, not line-wise: an entry survives only if *both*
+branches still list it *for the same code*.
+
+| | entries | sunset entries |
+|---|---|---|
+| stage 4 (`claude/ruff-stage4-f401`) | 175 | 171, all `F841` |
+| stage 5 (`claude/laughing-chatelet-efdb45`) | 385 | 381, all `F401`/`F541` |
+| permanent `PLW1514`, on both | 4 | — |
+
+30 paths appear on both sides, and on each side with the *other* stage's code — `["F401"]` on
+stage 5, `["F841"]` on stage 4. Their code sets are disjoint, so every one of the 30 empties.
+The arithmetic closes exactly: **381 + 171 − 30 = 522**, the sunset count stage 3 left behind.
+
+So the landed result is a sunset list of **zero**, and Stage 6 is what the design always said
+it would be: delete the block and its marker comments, keep the four permanent `PLW1514`
+exemptions above it, and tighten `tests/test_lint_config.py` to assert no `F` code appears in
+`per-file-ignores` at all. Do **not** hand-merge the two `ruff.toml` files line by line;
+derive the result and check it against that arithmetic.
