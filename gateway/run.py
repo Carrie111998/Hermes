@@ -2506,6 +2506,7 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    active_turn_owner_alive,
     build_session_context,
     build_session_context_prompt,
     build_channel_continuity_note,
@@ -11746,6 +11747,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
+
+            # Per-session exclusivity (#85207): never spawn a second loop on a
+            # session whose previous turn is STILL running in another gateway
+            # process.  A detached restart launches the new gateway while the
+            # old one is still draining, so the old loop can outlive this boot
+            # and deliver its own final response.  The durable active-turn
+            # marker records the owning PID; when that process is alive the old
+            # loop owns the session — skip the auto-resume (fail-closed) and
+            # let the session continue on the next real user message, by which
+            # time the old process is gone.  Only a POSITIVE liveness proof
+            # skips; a broken/absent marker proceeds exactly as before.
+            try:
+                if active_turn_owner_alive(entry):
+                    logger.warning(
+                        "Skipping auto-resume for %s: previous gateway process "
+                        "(pid %s) still owns an in-flight turn on this session "
+                        "(#85207) — refusing to start a second parallel loop",
+                        entry.session_key,
+                        getattr(entry, "active_turn_pid", None),
+                    )
+                    continue
+            except Exception as exc:  # pragma: no cover — helper is defensive
+                logger.debug(
+                    "Auto-resume exclusivity check failed for %s, proceeding: %s",
+                    entry.session_key,
+                    exc,
+                )
 
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.

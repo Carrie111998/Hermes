@@ -861,6 +861,12 @@ class SessionEntry:
     # exact interrupted session instead of guessing from ``updated_at``.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
+    # Gateway process PID that wrote the marker above.  Lets a booting gateway
+    # tell "the previous loop is STILL running in the old process" (detached
+    # restart overlap, #85207) apart from "the previous process is dead": a
+    # live owner must never be resumed into a second parallel conversation
+    # loop on the same session.
+    active_turn_pid: Optional[int] = None
 
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
@@ -904,6 +910,7 @@ class SessionEntry:
                 if self.active_turn_started_at
                 else None
             ),
+            "active_turn_pid": self.active_turn_pid,
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -947,11 +954,17 @@ class SessionEntry:
             except (TypeError, ValueError):
                 active_turn_started_at = None
         active_turn_token = data.get("active_turn_token")
+        active_turn_pid = data.get("active_turn_pid")
+        if not isinstance(active_turn_pid, int) or active_turn_pid <= 0:
+            # Malformed/missing owner PID (legacy marker) — cannot prove the
+            # owner process is alive, so liveness checks treat it as dead.
+            active_turn_pid = None
         if not isinstance(active_turn_token, str) or not active_turn_token:
             # The token/timestamp pair is written atomically.  A partial or
             # malformed pair is not trustworthy enough to auto-resume.
             active_turn_token = None
             active_turn_started_at = None
+            active_turn_pid = None
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -997,6 +1010,7 @@ class SessionEntry:
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
+            active_turn_pid=active_turn_pid,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -1233,6 +1247,37 @@ class AsyncSessionStore:
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded
+
+
+def active_turn_owner_alive(entry: "SessionEntry") -> bool:
+    """True when ``entry``'s durable active-turn marker is held by a LIVE process.
+
+    The marker is stamped with the owning gateway's PID (``mark_turn_active``).
+    A detached gateway restart boots the new process while the old one is still
+    draining its in-flight turn (#85207), so a boot-time recovery must not
+    treat that marker as a crash leftover: promoting it and auto-resuming
+    would run a SECOND conversation loop on the same session and deliver a
+    duplicate (divergent) final response.
+
+    Fails safe in both directions that matter:
+    - No marker or no usable PID (legacy marker written by an older binary)
+      => False: nothing can be proven live, recovery proceeds as before.
+    - The probe itself errors => False (the check must never wedge recovery).
+    Only a POSITIVE liveness proof skips recovery — never 2 loops on a session
+    whose previous loop is still running.
+    """
+    if not getattr(entry, "active_turn_token", None):
+        return False
+    pid = getattr(entry, "active_turn_pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        from gateway.status import _pid_exists
+
+        return bool(_pid_exists(pid))
+    except Exception:
+        logger.debug("Could not probe active-turn owner pid %s", pid, exc_info=True)
+        return False
 
 
 class SessionStore:
@@ -2974,6 +3019,7 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = token
             candidate["active_turn_started_at"] = now.isoformat()
+            candidate["active_turn_pid"] = os.getpid()
             # Keep the legacy 120-second startup heuristic effective during a
             # rolling downgrade/upgrade window where an older binary cannot
             # understand the exact marker fields.
@@ -2988,6 +3034,7 @@ class SessionStore:
             )
             entry.active_turn_token = token
             entry.active_turn_started_at = now
+            entry.active_turn_pid = os.getpid()
             entry.updated_at = now
         return token
 
@@ -3004,6 +3051,7 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = None
             candidate["active_turn_started_at"] = None
+            candidate["active_turn_pid"] = None
 
             # Keep the live token until the clear is durable.  A failed write
             # therefore remains retryable instead of becoming a false mismatch.
@@ -3014,6 +3062,7 @@ class SessionStore:
             )
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.active_turn_pid = None
         return True
 
     def recover_interrupted_turns(
@@ -3054,6 +3103,23 @@ class SessionStore:
                     marker_is_stale = True
 
                 if not marker_is_stale and not entry.suspended:
+                    if active_turn_owner_alive(entry):
+                        # The previous gateway process is STILL RUNNING this
+                        # turn (detached-restart overlap, #85207).  Do NOT
+                        # promote or clear the marker: the old loop owns the
+                        # session, and a second loop would deliver a duplicate
+                        # (divergent) final response.  Startup auto-resume is
+                        # skipped for the same reason; the session continues
+                        # once the old process dies (next boot / next message).
+                        logger.warning(
+                            "Active-turn marker for %s belongs to live process "
+                            "pid %s — keeping it untouched and skipping "
+                            "recovery so the previous loop stays the only loop "
+                            "on this session (#85207)",
+                            entry.session_key,
+                            entry.active_turn_pid,
+                        )
+                        continue
                     if entry.resume_pending:
                         # A drain-timeout marker is more specific than the
                         # generic crash reason; preserve it and its freshness.
@@ -3069,6 +3135,7 @@ class SessionStore:
 
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                entry.active_turn_pid = None
                 changed = True
 
             if changed:
