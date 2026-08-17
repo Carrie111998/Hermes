@@ -2750,7 +2750,15 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     model_cfg = _get_model_config()
-    max_tokens = model_cfg.get("max_tokens") if isinstance(model_cfg, dict) else None
+    max_tokens = None
+    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
+    if _env_mt:
+        try:
+            max_tokens = int(_env_mt)
+        except (ValueError, TypeError):
+            max_tokens = None
+    elif isinstance(model_cfg, dict):
+        max_tokens = model_cfg.get("max_tokens")
     if not isinstance(max_tokens, int) or max_tokens <= 0:
         max_tokens = runtime.get("max_output_tokens")
     if not isinstance(max_tokens, int) or max_tokens <= 0:
