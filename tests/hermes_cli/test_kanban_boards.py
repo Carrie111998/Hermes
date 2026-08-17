@@ -29,6 +29,42 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from tests.timeout_budget import scaled
+
+
+# ── CLI child deadlines ──────────────────────────────────────────────────────
+#
+# Only ``TestCLI`` spawns anything; everything above it is in-process and
+# keeps the tight global ``--timeout=30`` from pyproject.toml.
+#
+# Each ``_cli()`` call is a fresh interpreter running ``python -m
+# hermes_cli.main kanban …``. That is not a cheap process: importing
+# ``hermes_cli.config`` alone pulls in yaml, urllib.request, rich, asyncio and
+# agent.lsp, and ``-X importtime`` puts one idle invocation at ~2.5s on this
+# box. Under the CPU/memory contention of a real suite run the same spawn
+# measured ~5s.
+#
+# ``test_per_board_task_isolation_via_cli`` serializes SEVEN of them, so it
+# measured 33-43s across four runs here — i.e. it blew the 30s global cap on
+# every single run. With ``--timeout-method=thread`` that kill takes the
+# summary line with it, so any broader run containing this file reported no
+# pass/fail counts at all and no baseline could be taken. Nothing was
+# deadlocked: with the cap lifted the file is 56 passed. (Verified
+# pre-existing — the same test measured 34.6s/37.9s with ``kanban_db.py``
+# reverted to 3fde49424a, i.e. before the init-lock narrowing.)
+#
+# Both bounds below are safety nets against a *wedged* child, never
+# assertions — no test here claims the CLI is fast — so they take a generous
+# base scaled by ``HERMES_TEST_TIMEOUT_SCALE``. See ``tests/timeout_budget.py``.
+# They are ordered ``_CLI_TIMEOUT < _TEST_TIMEOUT`` so one stuck invocation
+# surfaces as a pointed ``subprocess.TimeoutExpired`` naming the command,
+# instead of a pytest-timeout kill that names nothing.
+_CLI_TIMEOUT = scaled(60.0)
+# Highest ``_cli()`` count in any one test (test_per_board_task_isolation_via_cli).
+_MAX_CLI_CALLS_PER_TEST = 7
+_TEST_TIMEOUT = _CLI_TIMEOUT * _MAX_CLI_CALLS_PER_TEST + scaled(30.0)
+
+spawns_cli = pytest.mark.timeout(_TEST_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +520,11 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
         capture_output=True,
         text=True,
         cwd=str(_WORKTREE),
-        timeout=30,
+        timeout=_CLI_TIMEOUT,
     )
 
 
+@spawns_cli
 class TestCLI:
     def test_boards_list_default_only(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
