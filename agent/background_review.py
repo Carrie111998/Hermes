@@ -168,6 +168,21 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # the user-message that the forked review agent receives.  AIAgent exposes
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
+#
+# Shared skill-write policy. Both skill-capable prompts interpolate this
+# block so the gate cannot drift between them.
+_DURABLE_PROCEDURE_GATE = (
+    "DURABLE PROCEDURE GATE — apply this before every skill write:\n"
+    "  • The learning must directly change how a future agent performs this "
+    "class of work: its steps, decision rules, constraints, scripts, "
+    "templates, verification, or pitfalls.\n"
+    "  • Require evidence from an explicit user correction, a working method "
+    "verified in the session, or a stable recurring workflow. Complexity, "
+    "tool-call count, and usefulness as documentation are not evidence.\n"
+    "  • If the session produced facts or reports but no durable procedure, "
+    "say 'Nothing to save.' and stop."
+)
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Focus on:\n"
@@ -185,15 +200,8 @@ _SKILL_REVIEW_PROMPT = (
     "complex, successful, or expensive session does not necessarily require "
     "a skill update. 'Nothing to save.' is a complete and successful review "
     "outcome.\n\n"
-    "DURABLE PROCEDURE GATE — apply this before every skill write:\n"
-    "  • The learning must directly change how a future agent performs this "
-    "class of work: its steps, decision rules, constraints, scripts, "
-    "templates, verification, or pitfalls.\n"
-    "  • Require evidence from an explicit user correction, a working method "
-    "verified in the session, or a stable recurring workflow. Complexity, "
-    "tool-call count, and usefulness as documentation are not evidence.\n"
-    "  • If the session produced facts or reports but no durable procedure, "
-    "say 'Nothing to save.' and stop.\n\n"
+    + _DURABLE_PROCEDURE_GATE
+    + "\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
@@ -328,13 +336,8 @@ _COMBINED_REVIEW_PROMPT = (
     "complex, successful, or expensive session does not necessarily require "
     "a skill update. 'Nothing to save.' is a complete and successful review "
     "outcome.\n\n"
-    "DURABLE PROCEDURE GATE — apply this before every skill write:\n"
-    "  • The learning must directly change future execution: steps, decision "
-    "rules, constraints, scripts, templates, verification, or pitfalls.\n"
-    "  • Require an explicit user correction, a working method verified in "
-    "the session, or a stable recurring workflow. Complexity, tool-call "
-    "count, and usefulness as documentation are not evidence.\n"
-    "  • Facts or reports without a durable procedure are not skills.\n\n"
+    + _DURABLE_PROCEDURE_GATE
+    + "\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
@@ -1165,6 +1168,7 @@ def spawn_background_review_thread(
 
 
 __all__ = [
+    "_DURABLE_PROCEDURE_GATE",
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
