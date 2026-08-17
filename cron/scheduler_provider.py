@@ -100,12 +100,13 @@ class CronScheduler(ABC):
         logger = logging.getLogger("cron.scheduler_provider")
         records = recover_interrupted_execution_records()
         for record in records:
+            # started_at is when the side effects began; a claimed-but-
+            # never-started attempt only has claimed_at.
+            ran_at = record.get("started_at") or record["claimed_at"]
             try:
                 mark_job_interrupted(
                     record["job_id"],
-                    # started_at is when the side effects began; a claimed-but-
-                    # never-started attempt only has claimed_at.
-                    ran_at=record.get("started_at") or record["claimed_at"],
+                    ran_at=ran_at,
                     error=record.get("error"),
                 )
             except Exception as e:
@@ -115,7 +116,151 @@ class CronScheduler(ABC):
                     "Could not stamp interrupted run onto job %s: %s",
                     record.get("job_id"), e,
                 )
+            # Independent of the stamp above: an unwritable jobs.json must not
+            # also cost the notification layer its only record of the kill.
+            self._emit_interrupted_cron_stale(record, ran_at=ran_at)
         return len(records)
+
+    @staticmethod
+    def _shutdown_attribution_exists(bus: Any, job_id: str, ran_at: str) -> bool:
+        """Has the bus-query reconstruction already reported this run?
+
+        ``CronStaleMonitor.startup()`` (main ``517cc56c97``) rebuilds shutdown
+        attributions from durable bus rows and emits ``scope='gateway_stopped'``
+        for every run a GATEWAY_STOPPED named. It covers the common force-kill,
+        because the in-flight snapshot is taken early in ``_stop_impl_body`` —
+        before the drain — so the event is usually out before the kill lands.
+        This ledger path is for the deaths that leave no GATEWAY_STOPPED at all:
+        a crash, an OOM, a power-off, or a kill preceding the emit.
+
+        The window floor is THIS run's start, so an attribution belonging to an
+        earlier run of the same job cannot swallow this one's report.
+
+        **``ran_at`` must be converted to UTC first.** The ledger stamps local
+        wall-clock with a local offset (``cron/executions.py`` via
+        ``hermes_time.now()`` -> ``datetime.now().astimezone()``, ``-04:00``
+        here) while every bus row is ``datetime.now(timezone.utc).isoformat()``
+        (``+00:00``), and ``query(since=...)`` compares them as STRINGS. Passing
+        the raw value widens the window by the offset — four hours on this box.
+        """
+        from datetime import datetime, timezone
+
+        from events.schema import EventType
+
+        try:
+            # A naive stamp (offset lost somewhere upstream) is interpreted as
+            # local by astimezone(), which is what it was.
+            since = datetime.fromisoformat(ran_at).astimezone(timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            # Cannot bound the window, so cannot prove this is a duplicate.
+            # Report it: a duplicate is noisy, a miss loses the only record
+            # that this run was killed at all.
+            return False
+
+        for event in bus.query(event_type=EventType.CRON_STALE, since=since):
+            payload = event.payload
+            if (payload.get("scope") == "gateway_stopped"
+                    and payload.get("job_id") == job_id):
+                return True
+        return False
+
+    @classmethod
+    def _emit_interrupted_cron_stale(cls, record: dict[str, Any], *, ran_at: str) -> None:
+        """Announce one recovered run on the event bus. Never raises.
+
+        CronStaleMonitor attributes a killed cron only when the dying gateway
+        both emits GATEWAY_STOPPED and lives long enough for
+        ``events/gateway_integration.py:shutdown()`` to flush the reports it
+        staged. On Windows neither is guaranteed: ``hermes gateway stop`` hands
+        the gateway ``_windows_stop_drain_timeout()`` — clamped to 30s at
+        ``hermes_cli/gateway_windows.py:1593`` — and then force-kills the PID,
+        while the flush runs in ``start_gateway()``'s teardown tail, well past
+        the drain. A cron mid-LLM-call routinely needs more than 30s, so the
+        kill lands first and the staged report dies with the process. The
+        2026-08-12 census recorded 3 of 6 shutdowns emitting no GATEWAY_STOPPED
+        at all, and 2026-08-17 lost three staged runs exactly this way.
+
+        This is the successor's backstop and the only path that survives that
+        kill, because it runs in the NEXT process off durable state. It needs no
+        deduplication of its own: ``recover_interrupted_execution_records()``
+        flips each row under ``WHERE id=? AND status IN ('claimed','running')``
+        and returns only rows whose UPDATE changed something, so a run is
+        recovered — and therefore announced — exactly once.
+
+        ``age_seconds`` is deliberately absent. Its sibling on the
+        ``gateway_stopped`` attribution means "how far into the run did the
+        shutdown land", measured against the shutdown event. Nothing here can
+        reconstruct that: the only clock available is now-minus-``ran_at``,
+        which silently includes however long the box was down. An omitted field
+        is honest; a redefined one is not. ``ran_at`` is carried instead.
+        """
+        import logging
+
+        logger = logging.getLogger("cron.scheduler_provider")
+        try:
+            from events.gateway_integration import get_bus
+            from events.schema import EventType, Priority
+
+            bus = get_bus()
+            if bus is None:
+                # Recovery also runs from `hermes cron` CLI paths and from
+                # Chronos, where no gateway EventBus exists. The ledger and
+                # jobs.json are already correct; silence is the right answer.
+                return
+
+            job_id = record["job_id"]
+            if cls._shutdown_attribution_exists(bus, job_id, ran_at):
+                # Already reported by CronStaleMonitor.startup()'s bus-query
+                # reconstruction (main 517cc56c97), which the gateway runs
+                # BEFORE the cron ticker — runner.start() at gateway/run.py:23733
+                # vs cron_thread.start() at :23818. Emitting again would
+                # deterministically double-report every force-kill that still
+                # managed to emit GATEWAY_STOPPED.
+                return
+
+            try:
+                from cron.jobs import get_job
+
+                job = get_job(job_id)
+            except Exception:
+                job = None
+            job_name = (job or {}).get("name") or job_id
+
+            bus.emit(
+                event_type=EventType.CRON_STALE,
+                source="cron-recovery",
+                payload={
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    # Distinct from 'gateway_stopped' (a shutdown that reported
+                    # its own kills) and from the generic wedge alert. All this
+                    # claims is that the owner died without a terminal state —
+                    # whether a stop, a crash, or an OOM did it is unknown, and
+                    # so is whether the side effects ran.
+                    "scope": "owner_exited",
+                    "execution_id": record.get("id"),
+                    "ran_at": ran_at,
+                    "error": record.get("error"),
+                },
+                # An interrupted run explained by a restart is not a wedge
+                # emergency — matches the gateway_stopped attribution, which is
+                # deliberately quieter than the HIGH generic alert.
+                priority=Priority.NORMAL,
+            )
+            logger.warning(
+                "Cron '%s' (%s) was interrupted at %s and recovered by this "
+                "process — reported to the event bus as scope=owner_exited",
+                job_name, job_id, ran_at,
+            )
+        except Exception:
+            # This runs on the ticker startup path, where a raised exception
+            # costs the gateway its entire scheduler (the 2026-08-11 5h08m
+            # outage). Recovery is already durable in the ledger before the
+            # emit is attempted, so losing the announcement is the cheap half.
+            logger.warning(
+                "Could not announce interrupted run for job %s on the event bus",
+                record.get("job_id"), exc_info=True,
+            )
 
     def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
