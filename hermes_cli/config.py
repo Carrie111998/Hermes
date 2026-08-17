@@ -5293,6 +5293,23 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+    # YAML parse fallback for complex types (lists/dicts).  Without this,
+    # multi-line YAML input like custom_providers is stored as a raw string
+    # because argparse always delivers a str.  Only attempt a parse when the
+    # value looks like structured YAML -- contains a newline or starts with a
+    # YAML collection indicator -- and only adopt the parsed value when it is
+    # not itself a plain string.  Scalar coercion above already handled
+    # bool/int/float, so this only fires on values that remained strings.
+    if isinstance(value, str) and (
+        "\n" in value
+        or value.lstrip().startswith(("-", "{", "["))
+    ):
+        try:
+            parsed = yaml.safe_load(value)
+            if not isinstance(parsed, str):
+                value = parsed
+        except yaml.YAMLError:
+            pass  # keep coerced value
     # Normalize a scalar ``model`` key before writing sub-keys so that
     # ``hermes config set model.provider openai`` doesn't silently
     # destroy the model id when ``model`` is a bare string shorthand
