@@ -23,7 +23,13 @@ const FALLBACK_STATUS = getAutoStatus(false, false, false, false, undefined)
  * cache miss keeps identity stable for settled turns, which is what lets the
  * runtime reconcile detect that only the tail moved.
  */
-export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMessageRepository {
+export type RuntimeRepositoryOperation = 'append' | 'finalize-tail' | 'replace-tail' | 'reset'
+export type RuntimeMessageRepository = ExportedMessageRepository & { operation: RuntimeRepositoryOperation }
+
+export function useRuntimeMessageRepository(
+  messages: ChatMessage[],
+  operation: RuntimeRepositoryOperation = 'reset'
+): RuntimeMessageRepository {
   const cacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
   const toolMergeCacheRef = useRef(createToolMergeCache())
 
@@ -73,6 +79,6 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
       }
     }
 
-    return { headId, messages: items }
-  }, [messages])
+    return { headId, messages: items, operation }
+  }, [messages, operation])
 }

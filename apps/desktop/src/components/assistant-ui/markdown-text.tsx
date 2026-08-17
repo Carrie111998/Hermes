@@ -17,7 +17,6 @@ import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { detectArtifact } from '@/lib/artifact-detect'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
-import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import {
@@ -38,20 +37,39 @@ import { cn } from '@/lib/utils'
 import { ArtifactCard } from './artifact-card'
 import { SessionRefLink } from './directive-text'
 import { detectEmbed, extractAlert, MarkdownAlert, RichCodeBlock, UrlEmbed } from './embeds'
+import type { mathPlugin as streamdownMath } from './markdown-math'
 
-// Math rendering plugin (KaTeX). Configured once at module scope — the
-// plugin is stateless beyond its internal cache so re-creating per-render
-// would needlessly thrash. We use a memoizing wrapper around rehype-katex
-// (see lib/katex-memo.ts) so that during streaming we re-katex only the
-// equations whose source actually changed since the last token. With the
-// stock @streamdown/math plugin every equation re-renders on every token,
-// which throttles UI updates badly for math-heavy responses; the memoized
-// plugin keeps the steady-state work proportional to "new equations
-// arriving" rather than "equations × tokens-per-second".
-//
-// `singleDollarTextMath: true` enables `$x^2$` for inline math (de-facto
-// LLM convention). The default false-setting only accepts `$$...$$`.
-const mathPlugin = createMemoizedMathPlugin({ singleDollarTextMath: true })
+type MathPlugin = typeof streamdownMath
+let mathPluginCache: MathPlugin | null = null
+
+// Keep ordinary prose off the KaTeX graph. The signal is intentionally broad:
+// false positives only defer-load math for unusual dollar-heavy prose, while a
+// false negative would leave visible TeX unrendered.
+function containsMath(text: string): boolean {
+  return /\$\$|\\[([]|```\s*math\b|\[math\]|\$[^\s$][^\n$]*\$/m.test(text)
+}
+
+function useMathPlugin(text: string): MathPlugin | null {
+  const needed = containsMath(text)
+  const [plugin, setPlugin] = useState(mathPluginCache)
+
+  useEffect(() => {
+    if (!needed || plugin) {return}
+
+    let cancelled = false
+    void import('./markdown-math').then(module => {
+      mathPluginCache = module.mathPlugin
+
+      if (!cancelled) {setPlugin(module.mathPlugin)}
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [needed, plugin])
+
+  return needed ? plugin : null
+}
 
 // `@streamdown/code` statically imports ALL of shiki (every grammar + theme —
 // the single largest chunk in the renderer), so it must never sit on the
@@ -476,7 +494,8 @@ function MarkdownTextSurface({
   // `SyntaxHighlighter` below when `isStreaming` is true, and the code plugin
   // itself arrives async (useCodePlugin) so shiki never blocks cold start.
   const code = useCodePlugin()
-  const plugins = useMemo(() => (code ? { math: mathPlugin, code } : { math: mathPlugin }), [code])
+  const math = useMathPlugin(text)
+  const plugins = useMemo(() => ({ ...(code ? { code } : {}), ...(math ? { math } : {}) }), [code, math])
 
   const components = useMemo(
     () =>

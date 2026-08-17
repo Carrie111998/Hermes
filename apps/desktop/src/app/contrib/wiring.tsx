@@ -83,7 +83,6 @@ import { useHudHandoff } from '../hud/handoff'
 import { ModelPickerOverlay } from '../model-picker-overlay'
 import { ModelVisibilityOverlay } from '../model-visibility-overlay'
 import { mainChatOccupied, openSession } from '../open-session'
-import { PetGenerateOverlay } from '../pet-generate/pet-generate-overlay'
 import { FileActionDialogs } from '../right-sidebar/file-actions'
 import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
@@ -147,6 +146,11 @@ const CronView = lazy(async () => ({ default: (await import('../cron')).CronView
 const WebhooksView = lazy(async () => ({ default: (await import('../webhooks')).WebhooksView }))
 const ProfilesView = lazy(async () => ({ default: (await import('../profiles')).ProfilesView }))
 const SettingsView = lazy(async () => ({ default: (await import('../settings')).SettingsView }))
+
+const PetGenerateOverlay = lazy(async () => ({
+  default: (await import('../pet-generate/pet-generate-overlay')).PetGenerateOverlay
+}))
+
 const StarmapView = lazy(async () => ({ default: (await import('../starmap')).StarmapView }))
 
 // Surfaces (the four wired panes), the render context + WiredPane, and the
@@ -1075,7 +1079,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
       <CommandPalette />
-      <PetGenerateOverlay />
+      <Suspense fallback={null}>
+        <PetGenerateOverlay />
+      </Suspense>
       <SessionSwitcher />
       <FileActionDialogs />
       <McpInstallDeepLinkDialog />

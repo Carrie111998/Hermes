@@ -20,8 +20,8 @@ import {
   petProfile,
   setPetInfo
 } from '@/store/pet'
-import { resetPetGallery, setPetScale } from '@/store/pet-gallery'
 import { $petOverlayActive, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
+import { setPetScale } from '@/store/pet-scale'
 import { $gatewayState } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
@@ -273,7 +273,7 @@ export function FloatingPet() {
   // profile's pet (its config + pets dir resolve per-profile on the backend).
   useOnProfileSwitch(() => {
     setPetInfo({ enabled: false })
-    resetPetGallery()
+    void import('@/store/pet-gallery').then(({ resetPetGallery }) => resetPetGallery())
   })
 
   // Wire the overlay control channel once, only in the primary window — the

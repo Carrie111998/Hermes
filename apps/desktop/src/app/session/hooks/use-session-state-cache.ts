@@ -340,7 +340,7 @@ export function useSessionStateCache({
       // Publishing to $sessionStates automatically fires transition side-effects
       // (watchdog, settle grace, unread marker, compression id rotation) inside
       // publishSessionState — no manual transition call needed.
-      publishSessionState(sessionId, next)
+      publishSessionState(sessionId, next, previous)
       sessionStateCache.prune()
       syncSessionStateToView(sessionId, next)
 

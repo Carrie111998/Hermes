@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $selectedStoredSessionId } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
@@ -12,6 +13,7 @@ import {
   focusedSessionNeedsRoute,
   markSelectionRestore,
   orderTilesByTree,
+  publishSessionState,
   releaseSessionTranscript,
   resetTileRuntimeBindings,
   selectionHomesToWorkspace,
@@ -49,6 +51,30 @@ describe('resetTileRuntimeBindings', () => {
 
     expect(() => resetTileRuntimeBindings()).not.toThrow()
     expect($sessionTiles.get()[0]?.runtimeId).toBeUndefined()
+  })
+})
+
+describe('publishSessionState', () => {
+  afterEach(() => {
+    $sessionStates.set({})
+  })
+
+  it('does not republish the global lifecycle index for a token-only update', () => {
+    const first = createClientSessionState()
+    first.busy = true
+    first.messages = [{ id: 'tail', role: 'assistant', parts: [{ type: 'text', text: 'a' }] }]
+    publishSessionState('runtime', first)
+    const listener = vi.fn()
+    const unlisten = $sessionStates.listen(listener)
+    listener.mockClear()
+
+    publishSessionState('runtime', {
+      ...first,
+      messages: [{ ...first.messages[0], parts: [{ type: 'text', text: 'ab' }] }]
+    })
+
+    expect(listener).not.toHaveBeenCalled()
+    unlisten()
   })
 })
 

@@ -1,8 +1,8 @@
 import { useEffect, useRef } from 'react'
 
 import { setPetActivity } from '@/store/pet'
-import { setPetScale } from '@/store/pet-gallery'
 import { setPetOverlayOpenAppHandler, setPetOverlayScaleHandler, setPetOverlaySubmitHandler } from '@/store/pet-overlay'
+import { setPetScale } from '@/store/pet-scale'
 import { $sessions } from '@/store/session'
 import { $attentionSessionIds } from '@/store/session-states'
 import { isAuxiliaryWindow } from '@/store/windows'

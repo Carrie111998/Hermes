@@ -32,8 +32,11 @@ function chain(messages: ThreadMessage[]) {
   }))
 }
 
-function exported(items: { message: ThreadMessage; parentId: string | null }[]): ExportedMessageRepository {
-  return { headId: items.at(-1)?.message.id ?? null, messages: items }
+function exported(
+  items: { message: ThreadMessage; parentId: string | null }[],
+  operation: 'append' | 'finalize-tail' | 'replace-tail' | 'reset' = 'reset'
+): ExportedMessageRepository {
+  return { headId: items.at(-1)?.message.id ?? null, messages: items, operation } as ExportedMessageRepository
 }
 
 describe('syncRepositoryIncrementally', () => {
@@ -43,19 +46,25 @@ describe('syncRepositoryIncrementally', () => {
     const runtime = runtimeWith(items)
     const repository = (runtime as unknown as { repository: MessageRepository }).repository
 
+    // Seed the persistent incoming index. Subsequent publications use explicit
+    // tail operations and must not export/scan the repository.
+    syncRepositoryIncrementally(runtime, exported(items))
+
     const addOrUpdate = vi.spyOn(repository, 'addOrUpdateMessage')
     const resetHead = vi.spyOn(repository, 'resetHead')
+    const exportRepository = vi.spyOn(repository, 'export')
 
     // One streamed delta: the tail grows, every settled message keeps identity.
     const nextTail = message('m-199', 'body 199 + delta')
     const nextItems = [...items.slice(0, -1), { message: nextTail, parentId: 'm-198' }]
 
-    const result = syncRepositoryIncrementally(runtime, exported(nextItems))
+    const result = syncRepositoryIncrementally(runtime, exported(nextItems, 'replace-tail'))
 
     expect(addOrUpdate).toHaveBeenCalledTimes(1)
     expect(addOrUpdate).toHaveBeenCalledWith('m-198', nextTail)
     // The head did not move, so the descendant-pruning reset is skipped.
     expect(resetHead).not.toHaveBeenCalled()
+    expect(exportRepository).not.toHaveBeenCalled()
     expect(result).toHaveLength(200)
     expect(result.at(-1)).toBe(nextTail)
   })
@@ -65,13 +74,16 @@ describe('syncRepositoryIncrementally', () => {
     const runtime = runtimeWith(items)
     const repository = (runtime as unknown as { repository: MessageRepository }).repository
 
+    syncRepositoryIncrementally(runtime, exported(items))
     const addOrUpdate = vi.spyOn(repository, 'addOrUpdateMessage')
     const deleteMessage = vi.spyOn(repository, 'deleteMessage')
+    const exportRepository = vi.spyOn(repository, 'export')
 
-    syncRepositoryIncrementally(runtime, exported(items))
+    syncRepositoryIncrementally(runtime, exported(items, 'replace-tail'))
 
     expect(addOrUpdate).not.toHaveBeenCalled()
     expect(deleteMessage).not.toHaveBeenCalled()
+    expect(exportRepository).not.toHaveBeenCalled()
   })
 
   it('appends a new message through the full path', () => {
@@ -79,10 +91,14 @@ describe('syncRepositoryIncrementally', () => {
     const items = chain([first])
     const runtime = runtimeWith(items)
 
+    syncRepositoryIncrementally(runtime, exported(items))
+    const repository = (runtime as unknown as { repository: MessageRepository }).repository
+    const exportRepository = vi.spyOn(repository, 'export')
     const second = message('b', 'two')
-    const result = syncRepositoryIncrementally(runtime, exported(chain([first, second])))
+    const result = syncRepositoryIncrementally(runtime, exported(chain([first, second]), 'append'))
 
     expect(result.map(item => item.id)).toEqual(['a', 'b'])
+    expect(exportRepository).not.toHaveBeenCalled()
   })
 
   it('honours an authoritative deletion', () => {
