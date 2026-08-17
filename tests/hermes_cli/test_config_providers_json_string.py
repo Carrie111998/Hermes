@@ -19,8 +19,12 @@ import json
 import os
 from unittest.mock import patch
 
+import logging
+
 from agent.image_routing import _supports_vision_override
+from hermes_cli import config as config_mod
 from hermes_cli.config import _normalize_providers_string, load_config
+from hermes_cli.managed_scope import apply_managed_overlay
 
 
 class TestNormalizeProvidersString:
@@ -53,6 +57,27 @@ class TestNormalizeProvidersString:
         cfg = {"providers": "{}"}
         _normalize_providers_string(cfg)
         assert cfg["providers"] == "{}"  # caller's dict untouched
+
+    def test_whitespace_only_is_empty_without_warning(self, caplog):
+        # ``providers: '   '`` is an empty value, not corruption — no warning.
+        config_mod._PROVIDERS_STRING_WARNED.clear()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            out = _normalize_providers_string({"providers": "   "})
+        assert out["providers"] == {}
+        assert not caplog.records
+
+    def test_malformed_payload_warns_once_per_payload(self, caplog):
+        # ``_load_config_impl`` re-runs on every cache-signature change; a
+        # persistently-broken payload must log once, not on every load.
+        config_mod._PROVIDERS_STRING_WARNED.clear()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            for _ in range(3):
+                _normalize_providers_string({"providers": "{not json"})
+        assert sum("malformed 'providers'" in r.message for r in caplog.records) == 1
+        # A *different* broken payload still surfaces after the first is seen.
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            _normalize_providers_string({"providers": "[1, 2, 3]"})
+        assert sum("malformed 'providers'" in r.message for r in caplog.records) == 2
 
 
 class TestLoadConfigDecodesProvidersString:
@@ -108,3 +133,38 @@ class TestLoadConfigDecodesProvidersString:
             config = load_config()
 
             assert config["providers"] == {}
+
+
+class TestManagedOverlayDecodesProvidersString:
+    """``managed_scope.apply_managed_overlay`` is a third config path whose
+    docstring pledges to "Mirror _load_config_impl's managed merge exactly";
+    it must decode a JSON-string ``providers`` too, or a managed string would
+    _deep_merge over — and drop — a valid user ``providers`` mapping."""
+
+    def test_managed_overlay_decodes_json_string_providers(self):
+        managed = {"providers": '{"custom": {"base_url": "http://managed:1/v1"}}'}
+        with patch(
+            "hermes_cli.managed_scope.load_managed_config", return_value=managed
+        ):
+            merged = apply_managed_overlay({"providers": {"other": {}}})
+        assert merged["providers"]["custom"]["base_url"] == "http://managed:1/v1"
+
+    def test_managed_string_providers_does_not_clobber_user_mapping(self):
+        # Managed wins at the leaf, so an *undecoded* string would replace the
+        # user's whole ``providers`` dict. Decoded, it merges per-leaf instead.
+        managed = {"providers": '{"custom": {"base_url": "http://managed:1/v1"}}'}
+        user = {"providers": {"mine": {"base_url": "http://user:2/v1"}}}
+        with patch(
+            "hermes_cli.managed_scope.load_managed_config", return_value=managed
+        ):
+            merged = apply_managed_overlay(user)
+        assert merged["providers"]["mine"]["base_url"] == "http://user:2/v1"
+        assert merged["providers"]["custom"]["base_url"] == "http://managed:1/v1"
+
+    def test_env_refs_inside_managed_providers_string_expand(self):
+        managed = {"providers": '{"custom": {"api_key": "${MANAGED_KEY}"}}'}
+        with patch(
+            "hermes_cli.managed_scope.load_managed_config", return_value=managed
+        ), patch.dict(os.environ, {"MANAGED_KEY": "managed-secret"}):
+            merged = apply_managed_overlay({"providers": {}})
+        assert merged["providers"]["custom"]["api_key"] == "managed-secret"

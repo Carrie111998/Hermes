@@ -3013,6 +3013,13 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+# Payloads already warned about, so a persistently-broken ``providers`` scalar
+# logs once rather than on every ``_load_config_impl`` re-run (each cache-signature
+# change / fresh process). Keyed on the raw payload so a *different* broken value,
+# introduced after the first is fixed, is still surfaced.
+_PROVIDERS_STRING_WARNED: set = set()
+
+
 def _normalize_providers_string(config: Dict[str, Any]) -> Dict[str, Any]:
     """Decode a JSON-string-typed ``providers`` value into a dict.
 
@@ -3037,6 +3044,12 @@ def _normalize_providers_string(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw, str):
         return config
     config = dict(config)
+    # A whitespace-only scalar (``providers: '   '``) is an empty value, not
+    # corruption: treat it as "no providers" silently instead of routing it
+    # through the malformed-payload warning below.
+    if not raw.strip():
+        config["providers"] = {}
+        return config
     try:
         decoded = json.loads(raw)
     except (ValueError, TypeError):
@@ -3044,12 +3057,14 @@ def _normalize_providers_string(config: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(decoded, dict):
         config["providers"] = decoded
     else:
-        logger.warning(
-            "Ignoring malformed 'providers' config: expected a mapping but got "
-            "a %s-typed value; treating it as empty. Custom providers and "
-            "per-model overrides will not resolve until this is fixed.",
-            "JSON string decoding to non-dict" if decoded is not None else "string",
-        )
+        if raw not in _PROVIDERS_STRING_WARNED:
+            _PROVIDERS_STRING_WARNED.add(raw)
+            logger.warning(
+                "Ignoring malformed 'providers' config: expected a mapping but "
+                "got a %s-typed value; treating it as empty. Custom providers "
+                "and per-model overrides will not resolve until this is fixed.",
+                "JSON string decoding to non-dict" if decoded is not None else "string",
+            )
         config["providers"] = {}
     return config
 
