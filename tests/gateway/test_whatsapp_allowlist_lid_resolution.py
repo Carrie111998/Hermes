@@ -17,7 +17,6 @@ import json
 from unittest.mock import AsyncMock
 
 from gateway.config import Platform, PlatformConfig
-from hermes_constants import get_hermes_home
 
 
 PHONE = "351912345678"
@@ -50,37 +49,56 @@ def _make_adapter(dm_policy=None, allow_from=None, group_policy=None, group_allo
     return adapter
 
 
-def _write_lid_mapping(phone=PHONE, lid=LID):
-    """Mirror what the JS bridge writes: phone→lid and lid→phone (reverse)."""
-    session_dir = get_hermes_home() / "whatsapp" / "session"
+def _write_lid_mapping(tmp_path, monkeypatch, phone=PHONE, lid=LID):
+    """Mirror what the JS bridge writes: phone→lid and lid→phone (reverse).
+
+    Unlike the strict-allowlist helpers below — which hand the adapter an
+    explicit ``session_dir`` — the DM/group gate reaches
+    ``gateway.whatsapp_identity.expand_whatsapp_aliases``, which resolves the
+    directory itself from ``HERMES_HOME``. So the only way to point it at a
+    temp dir is to set ``HERMES_HOME`` here rather than to pass a path.
+
+    ``tests/conftest.py``'s autouse ``_hermetic_environment`` fixture already
+    redirects ``HERMES_HOME`` per test, so this is belt-and-braces — but it
+    keeps the isolation of a helper that *writes files* visible at its own
+    callsite instead of depending on an ambient fixture two directories up.
+
+    Writes the modern ``platforms/whatsapp/session`` layout that
+    ``get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")``
+    prefers on a fresh install; the read side has to resolve the same way for
+    these tests to pass. Returns the session directory.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session_dir = tmp_path / "platforms" / "whatsapp" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / f"lid-mapping-{phone}.json").write_text(json.dumps(lid), encoding="utf-8")
     (session_dir / f"lid-mapping-{lid}_reverse.json").write_text(
         json.dumps(phone), encoding="utf-8"
     )
+    return session_dir
 
 
 # --------------------------------------------------------------------- DM gate
 
-def test_dm_phone_allowlist_matches_lid_sender():
+def test_dm_phone_allowlist_matches_lid_sender(tmp_path, monkeypatch):
     """allow_from has the phone number; inbound sender arrives as @lid (the bug)."""
-    _write_lid_mapping()
+    _write_lid_mapping(tmp_path, monkeypatch)
     adapter = _make_adapter(dm_policy="allowlist", allow_from=[PHONE])
 
     assert adapter._is_dm_allowed(f"{LID}@lid") is True
 
 
-def test_dm_phone_with_plus_allowlist_matches_lid_sender():
+def test_dm_phone_with_plus_allowlist_matches_lid_sender(tmp_path, monkeypatch):
     """A ``+``-prefixed phone allowlist entry still resolves to the LID sender."""
-    _write_lid_mapping()
+    _write_lid_mapping(tmp_path, monkeypatch)
     adapter = _make_adapter(dm_policy="allowlist", allow_from=[f"+{PHONE}"])
 
     assert adapter._is_dm_allowed(f"{LID}@lid") is True
 
 
-def test_dm_lid_allowlist_matches_phone_sender():
+def test_dm_lid_allowlist_matches_phone_sender(tmp_path, monkeypatch):
     """Reverse direction: allow_from has the LID, sender arrives as phone JID."""
-    _write_lid_mapping()
+    _write_lid_mapping(tmp_path, monkeypatch)
     adapter = _make_adapter(dm_policy="allowlist", allow_from=[LID])
 
     assert adapter._is_dm_allowed(f"{PHONE}@s.whatsapp.net") is True
@@ -99,8 +117,8 @@ def test_dm_wildcard_allows_any_sender():
     assert adapter._is_dm_allowed(f"{LID}@lid") is True
 
 
-def test_dm_unlisted_lid_sender_blocked():
-    _write_lid_mapping()
+def test_dm_unlisted_lid_sender_blocked(tmp_path, monkeypatch):
+    _write_lid_mapping(tmp_path, monkeypatch)
     adapter = _make_adapter(dm_policy="allowlist", allow_from=[PHONE])
 
     assert adapter._is_dm_allowed("99999999999999@lid") is False
@@ -112,8 +130,8 @@ def test_dm_empty_allowlist_blocks_everyone():
     assert adapter._is_dm_allowed(f"{LID}@lid") is False
 
 
-def test_dm_disabled_policy_blocks_even_allowlisted():
-    _write_lid_mapping()
+def test_dm_disabled_policy_blocks_even_allowlisted(tmp_path, monkeypatch):
+    _write_lid_mapping(tmp_path, monkeypatch)
     adapter = _make_adapter(dm_policy="disabled", allow_from=[PHONE])
 
     assert adapter._is_dm_allowed(f"{LID}@lid") is False
@@ -153,9 +171,9 @@ def test_group_unlisted_jid_blocked():
 
 # ------------------------------------------------------ end-to-end intake gate
 
-def test_should_process_message_dm_phone_allowlist_lid_sender():
+def test_should_process_message_dm_phone_allowlist_lid_sender(tmp_path, monkeypatch):
     """Full intake path: a DM from a phone-allowlisted contact arriving as @lid."""
-    _write_lid_mapping()
+    _write_lid_mapping(tmp_path, monkeypatch)
     adapter = _make_adapter(dm_policy="allowlist", allow_from=[PHONE])
 
     data = {
