@@ -118,7 +118,7 @@ LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 # DeepInfra STT base URL now resolved via hermes_cli.models.deepinfra_base_url (shared).
@@ -3265,8 +3265,11 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
     openai_cfg = stt_config.get("openai") or {}
     cfg_api_key = openai_cfg.get("api_key", "")
     cfg_base_url = openai_cfg.get("base_url", "")
+    env_base_url = str(
+        get_env_value("STT_OPENAI_BASE_URL") or OPENAI_BASE_URL
+    ).strip()
     if cfg_api_key:
-        return cfg_api_key, (cfg_base_url or OPENAI_BASE_URL)
+        return cfg_api_key, (cfg_base_url or env_base_url)
 
     # A local OpenAI-compatible server needs no key — send a placeholder so
     # the SDK doesn't refuse to construct a client (#25193, credit @nnnet).
@@ -3275,7 +3278,7 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
 
     direct_api_key = resolve_openai_audio_api_key()
     if direct_api_key:
-        return direct_api_key, OPENAI_BASE_URL
+        return direct_api_key, env_base_url
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:
