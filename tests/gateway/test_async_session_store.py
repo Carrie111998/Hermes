@@ -1,7 +1,6 @@
 """Async SessionStore boundary for gateway event-loop safety."""
 
 import ast
-import asyncio
 import threading
 from pathlib import Path
 

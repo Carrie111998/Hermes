@@ -13,7 +13,6 @@ typically empty on an interrupt, so the placeholder text is used rather than
 an empty-content assistant turn.
 """
 
-import pytest
 
 from agent.turn_finalizer import finalize_turn
 

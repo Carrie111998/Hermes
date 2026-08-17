@@ -7657,7 +7657,6 @@ class TestAnthropicInterruptHandler:
         Replaces the former source-reading assertion (which asserted the old,
         now-removed rebuild-on-interrupt behavior) with a behavior test.
         """
-        import threading
         import time
         from unittest.mock import MagicMock
         from run_agent import AIAgent

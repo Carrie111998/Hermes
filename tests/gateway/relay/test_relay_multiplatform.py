@@ -205,7 +205,7 @@ async def test_adapter_stamps_per_frame_platform_from_inbound(monkeypatch):
 async def test_adapter_untagged_when_chat_platform_unknown(monkeypatch):
     """A reply to a chat we never saw inbound for carries no per-frame platform
     (the connector falls back to the session default)."""
-    from gateway.config import Platform, PlatformConfig
+    from gateway.config import PlatformConfig
     from gateway.relay.adapter import RelayAdapter
     from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 

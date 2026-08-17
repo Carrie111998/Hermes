@@ -1,5 +1,4 @@
 import sys
-from pathlib import Path
 
 from devflow_delegation.allowlist import TargetConfig
 from devflow_delegation.validator import validate_worktree

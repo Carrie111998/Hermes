@@ -12,7 +12,6 @@ the session cost as advisor-fan-out only.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 

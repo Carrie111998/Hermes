@@ -6,13 +6,12 @@ import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
-from pathlib import Path
 
 import pytest
 from rich.console import Console
 
 from tools.skills_guard import SCANNER_VERSION, scan_skill_cached
-from tools.skills_hub import GitHubAuth, GitHubSource, HubLockFile, SkillBundle, UrlSource
+from tools.skills_hub import GitHubAuth, GitHubSource, HubLockFile, UrlSource
 
 
 SKILL_MD = """---

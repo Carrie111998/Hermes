@@ -1,7 +1,6 @@
 """Tests for browser_camofox._get_command_timeout — config-driven timeout."""
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 class TestCamofoxCommandTimeout:

@@ -6,7 +6,6 @@ Two layers:
 """
 
 import json
-from pathlib import Path
 
 import pytest
 

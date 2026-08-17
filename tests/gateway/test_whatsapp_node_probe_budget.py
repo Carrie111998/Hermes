@@ -21,7 +21,6 @@ code whenever the box happened to be idle.
 
 import subprocess
 
-import pytest
 
 from plugins.platforms.whatsapp import adapter as wa
 

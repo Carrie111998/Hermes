@@ -15,8 +15,6 @@ Three fixes under test:
    "already being fired".
 """
 
-import json
-import os
 import threading
 import time
 from datetime import timedelta

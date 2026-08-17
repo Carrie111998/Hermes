@@ -21,7 +21,6 @@ import threading
 import time
 from unittest.mock import patch
 
-import pytest
 
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):

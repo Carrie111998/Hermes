@@ -13,7 +13,6 @@ hosted agents don't expose). It must:
     background, returning 202.
 """
 
-import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli import web_server

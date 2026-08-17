@@ -15,11 +15,8 @@ meaningful recovery):
 
 from __future__ import annotations
 
-import os
-import types
 from unittest.mock import patch
 
-import pytest
 
 
 class _ConnErr(Exception):

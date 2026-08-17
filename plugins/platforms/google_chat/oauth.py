@@ -63,7 +63,6 @@ import os
 import re
 import secrets
 import stat
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, List, Optional, Tuple

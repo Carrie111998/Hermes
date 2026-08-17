@@ -347,7 +347,10 @@ from cron.jobs import (
     advance_next_run,
     claim_dispatch,
     get_due_and_skipped_jobs,
-    get_due_jobs,
+    # Unused here, but tests/cron/test_scheduler.py does
+    # patch("cron.scheduler.get_due_jobs"); patching a name this module
+    # never bound raises AttributeError.
+    get_due_jobs,  # noqa: F401
     heartbeat_run_claim,
     load_jobs,
     mark_job_run,

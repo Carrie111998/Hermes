@@ -19,7 +19,6 @@ Two failure amplifiers when the auxiliary compression route times out:
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 
 from agent.auxiliary_client import _fallback_entry_timeout, _call_fallback_candidate_sync
 from agent.context_compressor import ContextCompressor

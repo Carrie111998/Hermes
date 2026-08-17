@@ -223,7 +223,7 @@ def main(argv: List[str] | None = None) -> int:
     print(f"triaged (REQUESTED→TRIAGED): {result['triaged']}")
     print(f"skipped (already TRIAGED): {result['skipped_already_triaged']}")
     print(f"errors: {result['errors']}")
-    print(f"\nVerify: python -m devflow_delegation.cli status")
+    print("\nVerify: python -m devflow_delegation.cli status")
     print("Reverse: DELETE FROM requests WHERE source_agent = 'ddp.historical-adoption';")
     return 0 if result["errors"] == 0 else 1
 

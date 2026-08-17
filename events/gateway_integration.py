@@ -34,7 +34,6 @@ from events.subscribers.telegram_notifier import TelegramNotifier
 from events.subscribers.whatsapp_escalator import WhatsAppEscalator
 from events.subscribers.digest_composer import DigestComposer, DIGEST_SCHEDULE_HOURS
 from events.subscribers.memory_writer import MemoryWriter
-from events.subscribers.telegram_mirror import TelegramMirror
 from events.subscribers.jobflow_dispatcher import JobFlowDispatcher
 from events.subscribers.mailbox_translator import MailboxTranslator
 from events.subscribers.cron_stale_monitor import CronStaleMonitor
@@ -43,7 +42,6 @@ from events.subscribers.tracker_intent_applier import (
     tracker_partial_dir,
 )
 from events.subscribers.critic_trigger import CriticSubscriber
-from events.subscribers.scribe_realtime import ScribeRealtime
 from events.subscribers.scribe_action_telemetry import ScribeActionTelemetry
 from events.subscribers.scribe_voice_tuning import ScribeVoiceTuning
 

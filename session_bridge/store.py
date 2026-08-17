@@ -4222,7 +4222,6 @@ class SessionBridgeStore:
     def _recorded_worktree_snapshots(
         self, source_session_ids: Sequence[str]
     ) -> dict[str, WorktreeSnapshot]:
-        from .worktree import WorktreeSnapshot
 
         key_to_source = {
             _worktree_snapshot_state_key(source_id): source_id

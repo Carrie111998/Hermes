@@ -14,7 +14,6 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from events.bus import EventBus
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
 

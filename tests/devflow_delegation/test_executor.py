@@ -2,7 +2,6 @@ import json
 import subprocess
 from pathlib import Path
 
-import pytest
 
 from devflow_delegation.allowlist import Allowlist, TargetConfig
 from devflow_delegation.contract import parse_request

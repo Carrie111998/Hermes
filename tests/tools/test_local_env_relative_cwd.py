@@ -1,6 +1,5 @@
 """Regression tests for local terminal initial cwd normalization."""
 
-from pathlib import Path
 
 from tools.environments.local import LocalEnvironment, _resolve_local_initial_cwd
 

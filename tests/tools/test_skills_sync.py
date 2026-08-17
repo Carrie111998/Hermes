@@ -202,7 +202,7 @@ class TestRmtreeWritableScopeGuard:
 
     def test_refuses_root_path(self, tmp_path):
         """``Path('/')`` is the entire filesystem — must always be rejected."""
-        from tools.skills_sync import _rmtree_writable, SKILLS_DIR
+        from tools.skills_sync import _rmtree_writable
 
         skills = tmp_path / "skills"
         skills.mkdir()

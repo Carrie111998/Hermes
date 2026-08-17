@@ -1,12 +1,11 @@
 """Integration test — end-to-end event flow from emit to subscriber consumption."""
 
 import json
-from pathlib import Path
 
 import pytest
 
 from events.bus import EventBus
-from events.schema import EventType, Priority
+from events.schema import EventType
 from events.producers.cron_emitter import CronEventEmitter
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher

@@ -2,7 +2,6 @@
 
 import json
 import time
-import pytest
 
 import plugins.memory.mem0 as mem0_plugin
 from plugins.memory.mem0 import Mem0MemoryProvider

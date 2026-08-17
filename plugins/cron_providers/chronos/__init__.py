@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from cron.scheduler_provider import CronScheduler
 

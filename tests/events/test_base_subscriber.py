@@ -2,7 +2,6 @@
 
 import time
 
-import pytest
 
 from events.bus import EventBus
 from events.schema import EventType, Priority

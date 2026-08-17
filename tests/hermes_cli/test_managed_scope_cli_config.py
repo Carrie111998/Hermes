@@ -6,7 +6,6 @@ applied in BOTH places or the interactive CLI/TUI surface (skin, display prefs)
 silently ignores administrator-pinned values while `hermes config`/`doctor`
 honor them. This locks the cli.py path.
 """
-import importlib
 
 import pytest
 

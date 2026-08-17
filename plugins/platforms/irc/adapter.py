@@ -165,7 +165,7 @@ class IRCAdapter(BasePlatformAdapter):
 
         # Prevent two profiles from using the same IRC identity
         try:
-            from gateway.status import acquire_scoped_lock, release_scoped_lock
+            from gateway.status import acquire_scoped_lock, release_scoped_lock  # noqa: F401 - availability probe; the import IS the test
             lock_key = f"{self.server}:{self.nickname}"
             if not acquire_scoped_lock("irc", lock_key):
                 logger.error("IRC: %s@%s already in use by another profile", self.nickname, self.server)

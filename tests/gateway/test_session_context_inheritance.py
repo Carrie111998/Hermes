@@ -26,7 +26,6 @@ strips safe instead of leaking the sibling's. The handler then binds its own
 session a few steps later.
 """
 import asyncio
-from contextvars import copy_context
 
 import pytest
 

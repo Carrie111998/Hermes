@@ -6,7 +6,7 @@ user.
 """
 from __future__ import annotations
 
-from tests.docker.conftest import docker_exec, docker_exec_sh, start_container
+from tests.docker.conftest import docker_exec_sh, start_container
 
 
 def test_config_migration_runs_on_boot(

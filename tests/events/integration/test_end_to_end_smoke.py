@@ -3,7 +3,6 @@ import json
 
 from events.bus import EventBus
 from events.producers.mailbox_watcher import MailboxWatcher
-from events.schema import EventType
 from events.subscribers.mailbox_translator import MailboxTranslator
 from events.subscribers.telegram_notifier import TelegramNotifier
 

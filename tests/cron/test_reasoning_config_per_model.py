@@ -1,6 +1,5 @@
 """Tests for per-model reasoning_effort override in cron scheduler."""
 
-import pytest
 
 
 class TestCronPerModelReasoningConfig:

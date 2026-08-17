@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from ai_usage.contract import (
-    PROVIDERS, WINDOW_LABEL_TO_ID, BILLING_PROVIDER_ALIASES, TOKEN_WINDOWS, iso,
+    PROVIDERS, WINDOW_LABEL_TO_ID, TOKEN_WINDOWS, iso,
 )
 
 

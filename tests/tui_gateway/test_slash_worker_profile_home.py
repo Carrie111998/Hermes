@@ -1,11 +1,8 @@
 """Tests for TUI gateway slash_worker profile_home propagation (#40677)."""
 
-import os
-import subprocess
 import sys
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 def test_slash_worker_accepts_profile_home():

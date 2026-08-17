@@ -7,13 +7,11 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sqlite3
 import threading
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)

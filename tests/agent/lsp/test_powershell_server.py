@@ -7,7 +7,6 @@ two-prerequisite spawn logic (pwsh host + module bundle).
 """
 from __future__ import annotations
 
-import os
 
 import agent.lsp.servers as srv
 from agent.lsp.install import detect_status

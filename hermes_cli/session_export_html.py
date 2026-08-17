@@ -6,7 +6,6 @@ No remote dependencies.
 Enhanced with UI-UX-PRO-MAX design intelligence.
 """
 
-import json
 import datetime
 import secrets
 from typing import Any, Dict, List
@@ -708,7 +707,7 @@ def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
         chevron_html = ICON_CHEVRON_RIGHT.replace('class="', 'class="chevron ')
         
         html = f'<div class="{msg_class}"{delay_style}>'
-        html += f'  <div class="message-header">'
+        html += '  <div class="message-header">'
         html += f'    <div class="role-badge">{chevron_html} {role_icon} {safe_role}</div>'
         html += f'    <div class="timestamp">{timestamp}</div>'
         html += '  </div>'

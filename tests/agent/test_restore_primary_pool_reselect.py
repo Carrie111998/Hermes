@@ -8,12 +8,9 @@ construction-time snapshot. The next turn immediately hits the same error,
 exhausting remaining entries and falling through to cross-provider fallback.
 """
 
-import json
-import logging
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 from agent.credential_pool import (
     AUTH_TYPE_OAUTH,

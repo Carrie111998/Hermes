@@ -7,7 +7,7 @@ in ``GatewayRunner._running_agents`` — so a zero-agent drain must still wait
 for cron to finish (or time out and take the interrupt/kill path).
 """
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

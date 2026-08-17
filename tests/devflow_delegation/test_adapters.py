@@ -38,7 +38,6 @@ def test_roadmap_row_preserves_sr_idempotency(emitter):
     r = roadmap.delegate_roadmap_row(emitter, row, "architecture-blueprint/roadmap/simplification-roadmap.md")
     assert r.status == "queued" and r.reason == "dry_run"
     # idempotency must match the legacy producer's key exactly
-    from devflow_delegation import contract
     kw = roadmap._roadmap_kwargs(row, "architecture-blueprint/roadmap/simplification-roadmap.md")
     assert kw["idempotency_key"] == "roadmap:sr-470:v1"
 

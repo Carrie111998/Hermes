@@ -19,7 +19,6 @@ import logging
 import threading
 import time
 
-import pytest
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager

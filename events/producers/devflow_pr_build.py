@@ -26,10 +26,10 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, Optional
 
 from events.bus import EventBus
-from events.schema import EventType, Priority
+from events.schema import EventType
 
 logger = logging.getLogger(__name__)
 

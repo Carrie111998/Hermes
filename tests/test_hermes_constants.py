@@ -17,7 +17,6 @@ from hermes_constants import (
     get_hermes_dir,
     get_hermes_home,
     get_process_hermes_home,
-    heal_hermes_managed_node,
     hermes_managed_node_tree_present,
     iter_hermes_node_dirs,
     is_container,
@@ -927,7 +926,7 @@ class TestReasoningOverridesDefaultConfig:
     def test_load_config_preserves_user_reasoning_overrides(self, tmp_path, monkeypatch):
         """User-added reasoning_overrides are preserved through load_config()."""
         import yaml
-        from hermes_cli.config import load_config, get_config_path
+        from hermes_cli.config import load_config
 
         user_config = {
             "agent": {

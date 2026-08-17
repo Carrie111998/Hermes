@@ -12,7 +12,6 @@ Salvaged from PR #4097 (@tjp2021); adapted to the post-refactor layout
 accepts extra_headers).
 """
 
-import pytest
 
 from run_agent import AIAgent
 

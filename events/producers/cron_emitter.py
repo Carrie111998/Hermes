@@ -12,7 +12,6 @@ Domain events (job_discovered, job_scored, etc.) come from MailboxTranslator
 consuming mailbox_message events — see events/subscribers/mailbox_translator.py.
 """
 
-import json
 import logging
 from typing import Any, Dict, Optional
 

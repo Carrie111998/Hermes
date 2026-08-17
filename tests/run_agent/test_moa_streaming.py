@@ -7,7 +7,6 @@ complete-response path and must stay byte-identical.
 """
 from types import SimpleNamespace
 
-import pytest
 
 
 def _response(content="done", *, tool_calls=None):

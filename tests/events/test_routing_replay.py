@@ -1,7 +1,7 @@
 import json
 
 from events.routing_replay import replay_audit
-from events.schema import Event, EventType, Priority
+from events.schema import Event, EventType
 
 
 def _event(event_type, payload=None, *, priority=None, source="test"):

@@ -1,15 +1,10 @@
 """Unit tests for curator.orchestrator."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
 
-import pytest
 
-from curator import orchestrator
 from curator.orchestrator import (
     AGENTS,
-    BackfillResult,
     run_backfill,
 )
 

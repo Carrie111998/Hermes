@@ -9,7 +9,7 @@ Three invariants on the messaging-gateway surface, mirroring the TUI rules:
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

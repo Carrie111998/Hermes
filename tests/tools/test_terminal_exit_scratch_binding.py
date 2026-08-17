@@ -25,13 +25,11 @@ Two things make the leak worse than stray directories:
     delete a *running* process's overlays.
 """
 
-import os
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
-import pytest
 
 import tools.terminal_tool as terminal_tool
 

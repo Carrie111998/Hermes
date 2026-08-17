@@ -427,7 +427,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     """delegate_task(background=True) returns a handle without running the
     child synchronously, and the child completes on the background thread.
     A single task is dispatched as a one-item background batch unit."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
     import tools.delegate_tool as dt
 
     parent = MagicMock()
@@ -555,7 +555,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     parallel and join; the consolidated results come back as a single
     completion event when ALL of them finish."""
     import json
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
     import tools.delegate_tool as dt
 
     parent = MagicMock()

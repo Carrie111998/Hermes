@@ -105,7 +105,7 @@ def _import_elevenlabs():
     error-handling paths keep working.
     """
     try:
-        from tools.lazy_deps import FeatureUnavailable, ensure
+        from tools.lazy_deps import FeatureUnavailable, ensure  # noqa: F401 - availability probe; the import IS the test
         ensure("tts.elevenlabs", prompt=False)
     except ImportError:
         # lazy_deps module itself missing — fall through to the raw import
@@ -1987,7 +1987,6 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     ~500MB model in a separate process that exits after synthesis.
     Outputs WAV; the caller handles conversion for Telegram if needed.
     """
-    import sys
 
     neutts_config = tts_config.get("neutts") or {}
     ref_audio = neutts_config.get("ref_audio", "") or _default_neutts_ref_audio()

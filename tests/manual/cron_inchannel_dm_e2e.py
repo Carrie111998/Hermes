@@ -28,9 +28,7 @@ No real names. Uses a throwaway HERMES_HOME.
 
 import asyncio
 import os
-import sys
 import tempfile
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="cron_dm_e2e_")

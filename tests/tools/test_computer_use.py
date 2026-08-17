@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import sys
 from typing import Any, Dict, List, Optional, cast
 from unittest.mock import MagicMock, patch
 
@@ -2631,7 +2630,6 @@ class TestZIndexSorting:
     def test_frontmost_window_selected_by_higher_z_index(self):
         """The frontmost window (highest z_index) should be the one
         capture() selects as its target."""
-        from tools.computer_use.cua_backend import CuaDriverBackend
 
         windows = [
             {"app_name": "Terminal", "pid": 100, "window_id": 1,
@@ -3439,7 +3437,7 @@ class TestSessionLifecycle:
         assert args["session"] == backend._session_id
 
     def test_stop_invokes_end_session_before_disconnect(self):
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
         from tools.computer_use.cua_backend import CuaDriverBackend
 
         backend = CuaDriverBackend()

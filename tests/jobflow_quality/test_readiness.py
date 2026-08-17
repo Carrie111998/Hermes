@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from jobflow_quality.qc import CandidateIdentity
 from jobflow_quality.readiness import submission_block_reason

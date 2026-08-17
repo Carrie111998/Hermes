@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
 
 from tui_gateway.loop_noise import (
     _is_benign_teardown,

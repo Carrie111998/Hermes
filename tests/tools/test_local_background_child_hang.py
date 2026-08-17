@@ -18,7 +18,6 @@ so a timed-out foreground child can't outlive the kill holding the
 inherited pipe write-end.  This file guards both mechanisms and runs on
 every platform.
 """
-import json
 import os
 import subprocess
 import time

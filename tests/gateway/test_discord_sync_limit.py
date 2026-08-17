@@ -1,7 +1,7 @@
 """Test Discord slash command sync respects the 100-command hard limit."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 import sys
 
 import pytest
