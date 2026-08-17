@@ -15,6 +15,7 @@ import contextvars
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -46,6 +47,68 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_TRANSIENT_RETRY_DELAYS = (60.0, 180.0, 600.0)
+
+
+def _cron_transient_retry_delays() -> tuple[float, ...]:
+    """Return job-level retry delays for transient provider failures.
+
+    An explicit empty list disables job-level retries. Invalid values fall
+    back to the safe default instead of silently disabling resilience.
+    """
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        raw = cron_cfg.get(
+            "transient_retry_delays_seconds",
+            _DEFAULT_TRANSIENT_RETRY_DELAYS,
+        )
+        if raw == [] or raw == ():
+            return ()
+        if not isinstance(raw, (list, tuple)) or len(raw) > 10:
+            raise ValueError("expected a list of at most 10 delays")
+        delays = tuple(float(value) for value in raw)
+        if any(value < 0 or value > 3600 for value in delays):
+            raise ValueError("delays must be between 0 and 3600 seconds")
+        return delays
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid cron.transient_retry_delays_seconds; using default %s",
+            list(_DEFAULT_TRANSIENT_RETRY_DELAYS),
+        )
+        return _DEFAULT_TRANSIENT_RETRY_DELAYS
+
+
+def _is_transient_cron_error(error: str | None) -> bool:
+    """Whether a failed cron attempt should be retried as a fresh job run."""
+    text = (error or "").lower()
+    if not text:
+        return False
+    if any(marker in text for marker in (
+        "overloaded",
+        "server_is_overloaded",
+        "service unavailable",
+        "service_unavailable",
+        "at capacity",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+    )):
+        return True
+    return bool(re.search(r"\b(429|500|502|503|504|529)\b", text))
+
+
+def _wait_for_cron_retry(job_id: str, delay: float) -> bool:
+    """Wait interruptibly. Return False if shutdown interrupted the job."""
+    deadline = time.monotonic() + delay
+    while True:
+        if _is_interrupted(job_id):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(1.0, remaining))
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -3445,18 +3508,48 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
-            )
-        except BaseException:
-            # run_job's finally still hands back the agent when it raises; tear
-            # it down here so a failed run never leaks its async resources
-            # (#10200), then re-raise into the outer handler. BaseException
-            # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
-            # still triggers teardown before propagating.
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
-            raise
+            retry_delays = _cron_transient_retry_delays()
+            retry_index = 0
+            while True:
+                attempt_agents: list = []
+                try:
+                    success, output, final_response, error = run_job(
+                        job, defer_agent_teardown=attempt_agents
+                    )
+                except BaseException:
+                    # run_job's finally still hands back the agent when it raises.
+                    for deferred_agent in attempt_agents:
+                        _teardown_cron_agent(deferred_agent, job["id"])
+                    raise
+
+                if (
+                    success
+                    or retry_index >= len(retry_delays)
+                    or not _is_transient_cron_error(error)
+                ):
+                    # Keep only the final attempt live until delivery. Failed
+                    # intermediate attempts are torn down before the backoff.
+                    _deferred_agents.extend(attempt_agents)
+                    break
+
+                for deferred_agent in attempt_agents:
+                    _teardown_cron_agent(deferred_agent, job["id"])
+
+                base_delay = retry_delays[retry_index]
+                retry_index += 1
+                delay = base_delay * random.uniform(0.8, 1.2)
+                logger.warning(
+                    "Job '%s': transient provider failure; retrying fresh job run "
+                    "in %.1fs (job retry %d/%d): %s",
+                    job.get("name", job["id"]),
+                    delay,
+                    retry_index,
+                    len(retry_delays),
+                    error,
+                )
+                if not _wait_for_cron_retry(job["id"], delay):
+                    error = "Interrupted during transient provider retry backoff."
+                    break
         finally:
             reset_secret_scope(_scope_token)
 

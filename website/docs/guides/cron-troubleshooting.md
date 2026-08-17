@@ -159,6 +159,12 @@ Likely a delivery target issue (see Delivery Failures above), no output, or a re
 **Job hangs or times out**
 The scheduler uses an inactivity-based timeout (default 600s, configurable via `HERMES_CRON_TIMEOUT` env var, `0` for unlimited). The agent can run as long as it's actively calling tools — the timer only fires after sustained inactivity. Long-running jobs should use scripts to handle data collection and deliver only the result.
 
+**Provider overload, rate limit, or 5xx**
+After the agent's normal request retries are exhausted, cron starts fresh job
+attempts after 1, 3, and 10 minutes by default (with jitter). Configure the
+delays with `cron.transient_retry_delays_seconds`; set it to `[]` to disable.
+Only the final attempt is delivered and recorded as the run result.
+
 ### Check 3: Lock contention
 
 The scheduler uses file-based locking to prevent overlapping ticks. If two gateway instances are running (or a CLI session conflicts with a gateway), jobs may be delayed or skipped.

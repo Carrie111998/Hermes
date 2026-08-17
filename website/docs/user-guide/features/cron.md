@@ -225,6 +225,23 @@ On each tick Hermes:
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
 
+### Transient provider retries
+
+If the agent exhausts its normal request retries because the model provider is
+overloaded, rate-limited, or returning a 5xx response, cron retries the whole
+job in a fresh agent session. The default delays are 1, 3, and 10 minutes, each
+with ±20% jitter. Intermediate failures are not delivered or marked as the
+job's final result.
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  transient_retry_delays_seconds: [60, 180, 600]
+```
+
+Set the list to `[]` to disable job-level retries. Authentication, billing,
+invalid-request, tool, and script failures are not retried by this mechanism.
+
 ## Delivery options
 
 When scheduling jobs, you specify where the output goes:

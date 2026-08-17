@@ -100,6 +100,128 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     assert mark == ("mark", "j5", False)
 
 
+def test_run_one_job_retries_transient_provider_failures_before_delivery(monkeypatch):
+    """A provider overload gets fresh job attempts with delayed backoff, while
+    only the final successful attempt is saved, delivered, and marked."""
+    calls = []
+    outcomes = iter([
+        (False, "failed-1", "", "Our servers are currently overloaded."),
+        (False, "failed-2", "", "HTTP 503 service unavailable"),
+        (True, "success-output", "final response", None),
+    ])
+
+    class FakeAgent:
+        def __init__(self, attempt):
+            self.attempt = attempt
+
+        def close(self):
+            calls.append(("close", self.attempt))
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        attempt = 1 + len([c for c in calls if c[0] == "run_job"])
+        calls.append(("run_job", attempt))
+        assert defer_agent_teardown is not None
+        defer_agent_teardown.append(FakeAgent(attempt))
+        return next(outcomes)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "_cron_transient_retry_delays", lambda: (60.0, 180.0, 600.0))
+    monkeypatch.setattr(s.random, "uniform", lambda low, high: 1.0)
+    monkeypatch.setattr(
+        s,
+        "_wait_for_cron_retry",
+        lambda job_id, delay: calls.append(("wait", delay)) or True,
+    )
+    monkeypatch.setattr(
+        s, "save_job_output",
+        lambda jid, output: calls.append(("save", output)) or f"/tmp/{jid}.txt",
+    )
+    monkeypatch.setattr(
+        s, "_deliver_result",
+        lambda job, content, adapters=None, loop=None: calls.append(("deliver", content)),
+    )
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: calls.append(("mark", ok)),
+    )
+    import agent.auxiliary_client as aux
+    monkeypatch.setattr(aux, "cleanup_stale_async_clients", lambda: None)
+
+    assert s.run_one_job({"id": "retry-job", "name": "retry job"}) is True
+
+    assert [c for c in calls if c[0] == "run_job"] == [
+        ("run_job", 1), ("run_job", 2), ("run_job", 3)
+    ]
+    assert [c for c in calls if c[0] == "wait"] == [
+        ("wait", 60.0), ("wait", 180.0)
+    ]
+    assert [c for c in calls if c[0] == "save"] == [("save", "success-output")]
+    assert [c for c in calls if c[0] == "deliver"] == [("deliver", "final response")]
+    assert [c for c in calls if c[0] == "mark"] == [("mark", True)]
+    assert [c for c in calls if c[0] == "close"] == [
+        ("close", 1), ("close", 2), ("close", 3)
+    ]
+
+
+def test_run_one_job_does_not_retry_permanent_failure(monkeypatch):
+    """Authentication and other permanent failures keep the existing immediate
+    failure behavior."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        final="",
+        error="HTTP 401 authentication failed",
+    )
+    monkeypatch.setattr(s, "_cron_transient_retry_delays", lambda: (60.0, 180.0, 600.0))
+    monkeypatch.setattr(
+        s,
+        "_wait_for_cron_retry",
+        lambda job_id, delay: calls.append(("wait", delay)) or True,
+    )
+
+    assert s.run_one_job({"id": "permanent-job", "name": "permanent"}) is True
+
+    assert [c for c in calls if c[0] == "run_job"] == [("run_job", "permanent-job")]
+    assert not [c for c in calls if c[0] == "wait"]
+    assert [c for c in calls if c[0] == "mark"] == [("mark", "permanent-job", False)]
+
+
+def test_transient_cron_error_classification():
+    transient = [
+        "Our servers are currently overloaded.",
+        "HTTP 429 too many requests",
+        "HTTP 500 internal server error",
+        "HTTP 502 bad gateway",
+        "HTTP 503 service unavailable",
+        "HTTP 504 gateway timeout",
+        "HTTP 529",
+    ]
+    permanent = [
+        "HTTP 401 authentication failed",
+        "HTTP 402 billing exhausted",
+        "HTTP 400 invalid request",
+        "tool call failed",
+        None,
+    ]
+
+    assert all(s._is_transient_cron_error(error) for error in transient)
+    assert not any(s._is_transient_cron_error(error) for error in permanent)
+
+
+def test_transient_retry_delays_are_configurable_and_disableable(monkeypatch):
+    monkeypatch.setattr(
+        s, "load_config",
+        lambda: {"cron": {"transient_retry_delays_seconds": [2, 5]}},
+    )
+    assert s._cron_transient_retry_delays() == (2.0, 5.0)
+
+    monkeypatch.setattr(
+        s, "load_config",
+        lambda: {"cron": {"transient_retry_delays_seconds": []}},
+    )
+    assert s._cron_transient_retry_delays() == ()
+
+
 def test_run_one_job_exception_marks_failure(monkeypatch):
     """If run_job raises, the helper marks the run failed and returns False
     rather than propagating."""

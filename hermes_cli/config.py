@@ -2690,6 +2690,10 @@ DEFAULT_CONFIG = {
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
         "max_parallel_jobs": None,
+        # Fresh job-level retries after the agent's normal per-request retries
+        # are exhausted by transient provider failures (429, overload, 5xx).
+        # Each delay gets ±20% jitter. Set [] to disable.
+        "transient_retry_delays_seconds": [60, 180, 600],
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
