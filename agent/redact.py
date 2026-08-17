@@ -389,6 +389,152 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     return text
 
 
+# Placeholder written in place of a value whose *key* marks it sensitive.
+# Distinct from _mask_token's head/tail masking: a key-matched value is
+# replaced wholesale, because we cannot assume its shape is recognisable.
+REDACTED_PLACEHOLDER = "[REDACTED]"
+
+# Depth cap for redact_object. Deep enough for any real request body; a
+# structure past this is either pathological or adversarial, and is replaced
+# rather than walked.
+_MAX_REDACT_DEPTH = 64
+
+
+def _is_sensitive_key(key) -> bool:
+    """Exact-match a mapping key against _SENSITIVE_BODY_KEYS.
+
+    Case-insensitive, and ``-`` is normalised to ``_`` so ``api-key`` matches
+    ``api_key``. Deliberately EXACT, not substring: ``token_count`` and
+    ``session_id`` must not match.
+    """
+    if not isinstance(key, str):
+        return False
+    return key.strip().lower().replace("-", "_") in _SENSITIVE_BODY_KEYS
+
+
+def redact_object(
+    obj,
+    *,
+    force: bool = True,
+    code_file: bool = False,
+    max_depth: int = _MAX_REDACT_DEPTH,
+):
+    """Recursively redact secrets from a nested dict/list/scalar structure.
+
+    ``redact_sensitive_text`` only handles ``str``. Request bodies, session
+    logs, and transcript entries are nested containers, so redacting them
+    requires walking the structure and redacting each string leaf. This is
+    that walker.
+
+    Two mechanisms, both applied:
+
+    1. **Key-based** — a mapping key matching :data:`_SENSITIVE_BODY_KEYS`
+       has its value replaced with :data:`REDACTED_PLACEHOLDER` wholesale,
+       without inspecting it. This catches opaque credentials that match no
+       vendor prefix and no entropy heuristic.
+    2. **Value-based** — every remaining string leaf goes through
+       ``redact_sensitive_text``, reusing the existing curated matchers.
+
+    ``force`` defaults to **True**, unlike ``redact_sensitive_text``. Callers
+    of this function are persistence boundaries — data is about to be written
+    to disk, where it stays. That must not depend on the operator's global
+    logging preference, nor on whether the ``security.redact_secrets`` →
+    ``HERMES_REDACT_SECRETS`` bridge in ``hermes_cli/main.py`` ran before
+    ``agent.redact`` was imported. Same rationale as
+    ``hermes_cli/debug.py``'s upload-bound ``force=True``.
+
+    Values of unknown type are converted with ``str()`` and then redacted.
+    This is deliberate: these structures are serialised with
+    ``json.dumps(..., default=str)``, so an object whose ``__repr__`` carries
+    a secret would otherwise be stringified *after* redaction and land in the
+    file unredacted.
+
+    Containers are copied — the input is never mutated in place, so the
+    caller's live in-memory conversation state is unaffected.
+    """
+    return _redact_obj(
+        obj,
+        force=force,
+        code_file=code_file,
+        depth=0,
+        max_depth=max_depth,
+        seen=set(),
+    )
+
+
+def _redact_obj(obj, *, force, code_file, depth, max_depth, seen):
+    if depth > max_depth:
+        return "[REDACTED: max depth exceeded]"
+
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+
+    if isinstance(obj, str):
+        return redact_sensitive_text(obj, force=force, code_file=code_file)
+
+    if isinstance(obj, (bytes, bytearray)):
+        # Not safely pattern-matchable and not JSON-native. Preserve length
+        # only — it is the debugging signal that matters here.
+        return f"[REDACTED BYTES len={len(obj)}]"
+
+    # Path-based cycle detection: a node is "seen" only while it is on the
+    # current recursion path, so a shared (DAG) child is still walked once
+    # per parent, while a true cycle terminates.
+    marker = id(obj)
+
+    if isinstance(obj, dict):
+        if marker in seen:
+            return "[REDACTED: circular reference]"
+        seen.add(marker)
+        try:
+            out = {}
+            for key, value in obj.items():
+                if _is_sensitive_key(key):
+                    out[key] = None if value is None else REDACTED_PLACEHOLDER
+                else:
+                    out[key] = _redact_obj(
+                        value,
+                        force=force,
+                        code_file=code_file,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                        seen=seen,
+                    )
+            return out
+        finally:
+            seen.discard(marker)
+
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        if marker in seen:
+            return "[REDACTED: circular reference]"
+        seen.add(marker)
+        try:
+            items = [
+                _redact_obj(
+                    item,
+                    force=force,
+                    code_file=code_file,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    seen=seen,
+                )
+                for item in obj
+            ]
+            # Sets are not JSON-serialisable; every caller here serialises to
+            # JSON, so normalise them to lists rather than reconstructing.
+            if isinstance(obj, tuple):
+                return tuple(items)
+            return items
+        finally:
+            seen.discard(marker)
+
+    # Unknown type — mirror json.dumps(default=str) and redact the result.
+    try:
+        return redact_sensitive_text(str(obj), force=force, code_file=code_file)
+    except Exception:  # pragma: no cover — a __str__ that raises
+        return f"[REDACTED UNSERIALISABLE {type(obj).__name__}]"
+
+
 class RedactingFormatter(logging.Formatter):
     """Log formatter that redacts secrets from all log messages."""
 
