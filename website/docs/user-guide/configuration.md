@@ -1383,7 +1383,7 @@ The semaphore wraps the entire call including retries and fallbacks, so a single
 
 ### OpenRouter routing & Pareto Code for auxiliary tasks
 
-When an auxiliary task resolves to OpenRouter or Nous Portal, it inherits the main agent's validated `provider_routing` settings (`only`, `ignore`, `order`, `sort`, `require_parameters`, and `data_collection`). This keeps provider allow/deny policy consistent across the main conversation, compression, title generation, vision, and other auxiliary requests.
+When an auxiliary task resolves to OpenRouter or a Nous Portal chat-completions route, it inherits the main agent's validated `provider_routing` settings (`only`, `ignore`, `order`, `sort`, `require_parameters`, and `data_collection`). This keeps provider allow/deny policy consistent across the main conversation, compression, title generation, vision, and other auxiliary requests. Native Anthropic Messages routes do not accept this OpenAI-wire routing field, so Hermes omits it there.
 
 To override provider routing for one auxiliary task, set `extra_body.provider` for that task. The explicit task value replaces the inherited routing object. `openrouter.min_coding_score` remains task-specific, so configure the [Pareto Code router](/integrations/providers#openrouter-pareto-code-router) through `extra_body.plugins`:
 

@@ -2280,6 +2280,43 @@ class TestStaleBaseUrlWarning:
 
 
 class TestAuxiliaryTaskExtraBody:
+    def test_nous_native_anthropic_route_omits_openai_provider_routing(self):
+        from agent.auxiliary_client import (
+            AnthropicAuxiliaryClient,
+            _inherit_provider_preferences,
+        )
+
+        client = object.__new__(AnthropicAuxiliaryClient)
+        client.base_url = "https://inference-api.nousresearch.com/v1"
+        extra_body = {}
+
+        _inherit_provider_preferences(
+            extra_body,
+            {"provider_preferences": {"ignore": ["digitalocean"]}},
+            "nous",
+            client,
+            client.base_url,
+        )
+
+        assert "provider" not in extra_body
+
+    def test_nous_chat_completions_route_inherits_provider_routing(self):
+        from agent.auxiliary_client import _inherit_provider_preferences
+
+        client = MagicMock()
+        client.base_url = "https://inference-api.nousresearch.com/v1"
+        extra_body = {}
+
+        _inherit_provider_preferences(
+            extra_body,
+            {"provider_preferences": {"ignore": ["digitalocean"]}},
+            "nous",
+            client,
+            client.base_url,
+        )
+
+        assert extra_body["provider"] == {"ignore": ["digitalocean"]}
+
     def test_sync_call_inherits_main_provider_routing_for_openrouter(self):
         client = MagicMock()
         client.base_url = OPENROUTER_BASE_URL

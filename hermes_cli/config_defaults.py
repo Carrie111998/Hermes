@@ -931,7 +931,8 @@ DEFAULT_CONFIG = {
     #
     # extra_body: forwarded verbatim as request body fields on every aux call
     # for that task. Use this to set provider-specific knobs. OpenRouter/Nous
-    # auxiliary calls inherit the main agent's provider_routing by default;
+    # auxiliary chat-completions calls inherit the main agent's
+    # provider_routing by default;
     # an explicit extra_body.provider here overrides it for this task. The
     # Pareto Code coding-score floor remains task-specific. Example:
     #

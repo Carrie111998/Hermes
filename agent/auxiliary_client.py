@@ -3954,6 +3954,9 @@ def _inherit_provider_preferences(
         isinstance(provider_preferences, dict)
         and provider_preferences
         and "provider" not in extra_body
+        and not isinstance(
+            client, (AnthropicAuxiliaryClient, AsyncAnthropicAuxiliaryClient)
+        )
         and (
             _is_openrouter_client(client)
             or request_provider == "nous"
