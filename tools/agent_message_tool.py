@@ -47,6 +47,7 @@ from tools.bot_mode_probe import (
     peer_names,
     sender_handle,
 )
+from tools.environments.local import hermes_subprocess_env
 from tools.registry import registry, tool_error
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -307,7 +308,13 @@ def agent_message_tool(args: dict, **_kw) -> str:
     except RuntimeError as exc:
         return _json_error(str(exc))
 
-    env = os.environ.copy()
+    # The child is a Hermes CLI that will drive a model, so it needs provider
+    # credentials — but not this agent's gateway bot tokens, GitHub auth or
+    # internal routing secrets, which hermes_subprocess_env strips in tier 1
+    # regardless. HERMES_HOME is then dropped: the helper bridges *our* home
+    # in, and the child has to resolve the TARGET profile's home from
+    # --profile instead.
+    env = hermes_subprocess_env(inherit_credentials=True)
     env.pop("HERMES_HOME", None)
 
     try:
