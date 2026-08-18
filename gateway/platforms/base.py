@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from gateway.routing_identity import routing_identity_adapter_entrypoint
 
 logger = logging.getLogger(__name__)
 
@@ -6037,6 +6038,7 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    @routing_identity_adapter_entrypoint
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -7193,6 +7195,36 @@ class BasePlatformAdapter(ABC):
         # In-process transport provenance is deliberately not serialized by
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
+        # Resolve credential ownership before adapter-local batching creates
+        # a session key. A route may choose a different runtime profile while
+        # this adapter remains the one credential authorised to deliver.
+        if profile_route_rejected is not True:
+            from gateway.routing_identity import (
+                RoutingIdentityRejected,
+                attach_identity_to_source,
+                canonicalize_routing_identity,
+            )
+
+            runner = getattr(self, "gateway_runner", None)
+            owner = getattr(self, "_multiplex_profile_name", None)
+            if not isinstance(owner, str) or not owner.strip():
+                candidate = getattr(runner, "_primary_profile_name", None)
+                owner = candidate if isinstance(candidate, str) else None
+            active = owner or "default"
+            try:
+                identity = canonicalize_routing_identity(
+                    source_profile=getattr(source, "profile", None),
+                    credential_owner=owner,
+                    active_profile=active,
+                )
+                attach_identity_to_source(source, identity)
+            except RoutingIdentityRejected as exc:
+                logger.warning(
+                    "Rejecting inbound source with conflicting routing identity: %s",
+                    exc,
+                )
+                profile_route_rejected = True
+
         source._transport_adapter_ref = weakref.ref(self)
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
