@@ -59,6 +59,17 @@ def _agent_with_close(close_fn):
     )
 
 
+# How many heartbeat ticks must land while close() is blocked. Reached under a
+# DEADLINE, never counted inside a fixed wall-clock window -- see the comment in
+# test_cleanup_off_loop_does_not_block_event_loop for why that distinction is
+# the whole difference between this test and a flaky one.
+_TICKS_REQUIRED = 5
+# Each bounded wait must stay comfortably under slow_close()'s 5s block: in an
+# inline-cleanup regression the loop is frozen for that whole block, so a
+# deadline shorter than it is what turns the freeze into a TimeoutError.
+_WAIT_BUDGET_S = 2.0
+
+
 @pytest.mark.asyncio
 async def test_cleanup_off_loop_does_not_block_event_loop():
     """A slow agent.close() must NOT freeze the loop. A concurrent heartbeat
@@ -67,11 +78,13 @@ async def test_cleanup_off_loop_does_not_block_event_loop():
     stall the runtime-status updated_at heartbeat, #53175)."""
     runner, executor = _make_runner()
     close_started = threading.Event()
+    close_returned = threading.Event()
     release = threading.Event()
 
     def slow_close():
         close_started.set()
         release.wait(timeout=5)  # block the WORKER thread, not the loop
+        close_returned.set()
 
     agent = _agent_with_close(slow_close)
 
@@ -83,31 +96,58 @@ async def test_cleanup_off_loop_does_not_block_event_loop():
             ticks["n"] += 1
             await asyncio.sleep(0.005)
 
+    async def _until(pred):
+        while not pred():
+            await asyncio.sleep(0.005)
+
+    async def _advance(n):
+        target = ticks["n"] + n
+        while ticks["n"] < target:
+            await asyncio.sleep(0.005)
+
     hb = asyncio.create_task(_heartbeat())
     cleanup_task = asyncio.create_task(
         runner._cleanup_agent_resources_off_loop(agent, context="test")
     )
 
-    for _ in range(200):
-        if close_started.is_set():
-            break
-        await asyncio.sleep(0.005)
-    assert close_started.is_set(), "close() never ran"
-
-    ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
-    ticks_during_block = ticks["n"] - ticks_at_block
-
-    release.set()
-    await cleanup_task
-    stop.set()
-    await hb
-    executor.shutdown(wait=False)
-
-    assert ticks_during_block >= 5, (
-        f"event loop was blocked during agent cleanup (#53175): only "
-        f"{ticks_during_block} ticks while close() was running"
-    )
+    # Wait for a tick COUNT under a deadline; do NOT count ticks inside a fixed
+    # wall-clock window. `asyncio.sleep(0.005)` is nominally 20 ticks per 100ms,
+    # but Windows' ProactorEventLoop timer granularity delivers ~7 on an IDLE
+    # box and 3 under the nightly gate's 12 workers -- so the old
+    # "ticks in 0.1s >= 5" form was asserting timer resolution, not loop
+    # liveness, on a 1.4x margin. It went RED on 2026-08-17 at 3 ticks. Reaching
+    # 5 ticks costs ~60ms of a 2s budget, a ~33x margin, and measures the
+    # property the test is actually named for.
+    try:
+        await asyncio.wait_for(
+            _until(close_started.is_set), timeout=_WAIT_BUDGET_S
+        )
+        await asyncio.wait_for(
+            _advance(_TICKS_REQUIRED), timeout=_WAIT_BUDGET_S
+        )
+        # Both waits above already fail closed on an inline regression (a frozen
+        # loop leaves their deadlines long overdue by the time it resumes). This
+        # asserts the same thing positively: the ticks were sampled while
+        # close() was STILL in flight, not after it had returned. Without it the
+        # test passes an inline cleanup, because a frozen loop cannot observe
+        # close_started until close() has already finished.
+        assert not close_returned.is_set(), (
+            "close() had already returned before the heartbeat was sampled "
+            "(#53175): the loop was frozen for the whole cleanup, so ticking "
+            "afterwards proves nothing"
+        )
+    except asyncio.TimeoutError:
+        raise AssertionError(
+            f"event loop was blocked during agent cleanup (#53175): the "
+            f"heartbeat did not reach {_TICKS_REQUIRED} ticks within "
+            f"{_WAIT_BUDGET_S}s while close() was running"
+        ) from None
+    finally:
+        release.set()
+        stop.set()
+        await cleanup_task
+        await hb
+        executor.shutdown(wait=False)
 
 
 @pytest.mark.asyncio
