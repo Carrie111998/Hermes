@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -127,5 +128,60 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
     assert captured["key"] == build_session_key(_make_source())
     assert captured["generation"] == 1
     assert runner._running_agents == {}
+
+
+@pytest.mark.asyncio
+async def test_multiplex_claimed_turn_completion_stays_in_routed_scope(
+    tmp_path, monkeypatch
+):
+    """Post-turn hooks and cleanup must not fall back to the adapter owner."""
+    from agent import secret_scope
+    from gateway import run as run_mod
+    from hermes_constants import get_hermes_home
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "fitness"
+    root.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    (root / ".env").write_text("ROUTE_SCOPE_TOKEN=owner\n", encoding="utf-8")
+    (profile / ".env").write_text("ROUTE_SCOPE_TOKEN=routed\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(run_mod, "get_hermes_home", lambda: root)
+
+    runner, _adapter = _make_runner()
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = lambda _source: profile
+    event = _make_event("hello")
+    event.source.profile = "fitness"
+    observed = []
+
+    def _assert_routed(stage):
+        assert Path(get_hermes_home()) == profile
+        assert secret_scope.get_secret("ROUTE_SCOPE_TOKEN") == "routed"
+        observed.append(stage)
+
+    async def _agent(_event, _source, _key, _generation):
+        _assert_routed("agent")
+        return {"final_response": "", "messages": []}
+
+    async def _post_turn(**_kwargs):
+        _assert_routed("post-turn")
+
+    async def _clear(_event):
+        _assert_routed("cleanup")
+        return True
+
+    runner._handle_message_with_agent = _agent
+    runner._run_post_turn_hooks = _post_turn
+    runner._clear_durable_active_turn = _clear
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        result = await runner._handle_message(event)
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert result == {"final_response": "", "messages": []}
+    assert observed == ["agent", "post-turn", "cleanup"]
 
 
