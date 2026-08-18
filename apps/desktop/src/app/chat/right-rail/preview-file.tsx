@@ -10,8 +10,6 @@ import type {
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Streamdown } from 'streamdown'
 
-import { createMemoizedMathPlugin } from '@/lib/katex-memo'
-import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import { requestComposerFocus, requestComposerInsertRefs } from '@/app/chat/composer/focus'
 import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
 import { HERMES_PATHS_MIME } from '@/app/chat/hooks/use-composer-actions'
@@ -33,7 +31,9 @@ import {
   writeDesktopFileText
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
+import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
+import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
@@ -423,9 +423,14 @@ const MARKDOWN_COMPONENTS = {
   a: MarkdownLink
 }
 
+// KaTeX math plugin, same setup as the chat renderer (markdown-text.tsx):
+// created once at module scope - the plugin is stateless beyond its LRU
+// cache - and memoized so only equations whose source changed re-render.
+// `singleDollarTextMath: true` enables `$x^2$` inline math (de-facto LLM
+// convention) alongside `$$...$$` blocks.
 const mathPlugin = createMemoizedMathPlugin({ singleDollarTextMath: true })
 
-function MarkdownPreview({ text }: { text: string }) {
+export function MarkdownPreview({ text }: { text: string }) {
   const processed = useMemo(() => {
     try {
       return preprocessMarkdown(text)
