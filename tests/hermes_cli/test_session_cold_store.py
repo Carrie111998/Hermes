@@ -809,7 +809,10 @@ def test_store_keeps_purged_snapshot_when_source_db_is_replaced_at_same_path(
 
 
 @pytest.mark.skipif(
-    not hasattr(os, "mkfifo") or not hasattr(signal, "setitimer"),
+    not all(
+        hasattr(module, name)
+        for module, name in ((os, "mkfifo"), (signal, "setitimer"), (signal, "SIGALRM"))
+    ),
     reason="requires POSIX FIFOs and interval timers",
 )
 @pytest.mark.parametrize("payload_name", ["metadata.json", "session.jsonl"])
@@ -831,13 +834,15 @@ def test_store_replaces_fifo_payload_without_blocking(
         def fail_if_blocked(*_args: object) -> None:
             raise AssertionError("cold-store validation blocked while opening a FIFO")
 
-        previous_handler = signal.signal(signal.SIGALRM, fail_if_blocked)
+        sigalrm = getattr(signal, "SIGALRM", None)
+        assert sigalrm is not None
+        previous_handler = signal.signal(sigalrm, fail_if_blocked)
         signal.setitimer(signal.ITIMER_REAL, 2.0)
         try:
             replacement = store_archived_lineage(db, "terminal", tmp_path / "archive")
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
-            signal.signal(signal.SIGALRM, previous_handler)
+            signal.signal(sigalrm, previous_handler)
 
         assert (replacement.snapshot_dir / payload_name).is_file()
     finally:
