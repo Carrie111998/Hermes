@@ -684,6 +684,40 @@ class TestExtractReasoning:
         msg = _mock_assistant_msg()
         assert agent._extract_reasoning(msg) is None
 
+    # A non-str reasoning value used to reach the newline-join of
+    # reasoning_parts and raise TypeError out of extract_reasoning ->
+    # build_assistant_message -> run_conversation, killing the turn. Seen live
+    # 2026-08-18 as two "Outer loop error in API call #89" failures reporting
+    # `expected str instance, MagicMock found`. Not mock-specific: dict, list
+    # and int crashed identically, so any provider sending a non-string here
+    # took the conversation down.
+
+    def test_non_str_reasoning_is_skipped_not_joined(self, agent):
+        from unittest.mock import MagicMock
+        msg = _mock_assistant_msg(reasoning=MagicMock())
+        assert agent._extract_reasoning(msg) is None
+
+    @pytest.mark.parametrize("bogus", [{"a": 1}, ["x"], 5, object()])
+    def test_non_str_reasoning_of_any_type_is_skipped(self, agent, bogus):
+        msg = _mock_assistant_msg(reasoning=bogus)
+        assert agent._extract_reasoning(msg) is None
+
+    def test_non_str_reasoning_content_is_skipped(self, agent):
+        from unittest.mock import MagicMock
+        msg = _mock_assistant_msg(reasoning_content=MagicMock())
+        assert agent._extract_reasoning(msg) is None
+
+    def test_non_str_reasoning_details_summary_is_skipped(self, agent):
+        from unittest.mock import MagicMock
+        msg = _mock_assistant_msg(reasoning_details=[{"summary": MagicMock()}])
+        assert agent._extract_reasoning(msg) is None
+
+    def test_valid_reasoning_survives_alongside_a_bad_sibling(self, agent):
+        """The good field must still be extracted, not discarded with the bad one."""
+        from unittest.mock import MagicMock
+        msg = _mock_assistant_msg(reasoning=MagicMock(), reasoning_content="real thought")
+        assert agent._extract_reasoning(msg) == "real thought"
+
     def test_combined_reasoning(self, agent):
         msg = _mock_assistant_msg(
             reasoning="part1",
