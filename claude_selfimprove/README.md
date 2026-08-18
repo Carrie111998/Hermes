@@ -102,6 +102,35 @@ model that classified it.
 A conflicting candidate never applies. This check has no threshold that
 overrides it.
 
+## Scope: the pipeline prefers the weaker claim
+
+When the classifier decides a lesson applies everywhere ("global") instead
+of to the one repository it was observed in ("repo"), it is generalizing
+from one piece of evidence to a rule meant to hold in every future
+session. Two papers on hypothesis choice, both by Michael Timothy
+Bennett — "The Optimal Choice of Hypothesis Is the Weakest, Not the
+Shortest" ([arXiv:2301.12987](https://arxiv.org/abs/2301.12987)) and its
+corrigendum "Optimal Policy Is Weakest Policy" — found that the
+hypothesis most likely to generalize correctly is not the shortest or
+most sweeping one the evidence could support, but the weakest one: the
+one that claims the least beyond what was actually observed. A short,
+unqualified rule such as "Never use `--no-verify`" is the *stronger*
+claim — it constrains every future repository. The same rule scoped to
+the one script where it was said is the *weaker* claim, and the weaker
+claim is the one more likely to still hold once real evidence tells the
+cases apart. The corrigendum adds a condition this pipeline cannot check
+from a single observation: preferring the weaker claim is only known to
+be optimal when future cases are not already known to skew toward the
+broader one — which a single observation, by itself, never establishes.
+
+This pipeline acts on that finding directly: when the evidence names a
+specific repository, script, file, or task, the pipeline classifies the
+candidate as `repo` scope even if the model's own answer was `global`.
+The classification prompt already asks the model to prefer the narrower
+scope; the code check exists because a prompt instruction cannot be
+proven to hold against a real model in a test, so the narrower scope is
+also enforced mechanically. See `llm.py`'s `_looks_narrowly_scoped`.
+
 ## Safety rules
 
 - Every write makes a backup first. Roll back any write with the

@@ -43,6 +43,33 @@ not re-scanned (the checkpoint already advanced), but the *heuristic*
 signal will resurface on the next paraphrase or repeat occurrence in a
 future session. Losing one batch's LLM polish is an acceptable trade for
 never corrupting pipeline state on a bad model response.
+
+Scope classification prefers the weaker generalization
+--------------------------------------------------------
+Choosing ``scope: "global"`` from one narrow observation is a generalization
+problem: infer, from a single example, a rule meant to hold for every
+future Claude Code session. Bennett, "The Optimal Choice of Hypothesis Is
+the Weakest, Not the Shortest" (arXiv:2301.12987) and its corrigendum
+"Optimal Policy Is Weakest Policy" show that the hypothesis most likely to
+generalize correctly is not the shortest or most sweeping one consistent
+with the evidence, but the *weakest* one — the one that claims the least
+beyond what was actually observed. A short, unqualified rule such as
+"Never use --no-verify" is a strong claim: it constrains every future
+session in every repository. A rule scoped to the one script or repository
+where it was actually said is weak: it constrains less, and is
+correspondingly more likely to still be true once real evidence
+distinguishes the cases where it applies from the cases where it does not.
+The corrigendum adds one condition this pipeline cannot verify from a
+single occurrence: that preference is *necessary* for optimal
+generalization only when future contexts are not known in advance to
+skew toward the broader claim. A lesson observed in one script, in one
+repository, carries no such evidence. ``_looks_narrowly_scoped`` below is
+the mechanical form of that preference: when the evidence names a specific
+repository, script, file, or task, the classification is held to "repo"
+scope even if the model answered "global" — the model is asked to prefer
+the narrower scope too (see ``_build_prompt``), but this is enforced in
+code because a prompt instruction cannot be tested against a real model in
+this test suite, only a deterministic check can be.
 """
 
 from __future__ import annotations
@@ -68,6 +95,30 @@ _DEFAULT_TIMEOUT_SECONDS = 180
 # A read-only Hermes toolset with no file/terminal/memory mutation
 # capability. See the module docstring for why this is not "" or omitted.
 _SAFE_TOOLSET = "session_search"
+
+# Phrases in the RAW evidence (not the model's write-up of it) that name a
+# specific repository, script, file, or task rather than describing general
+# practice. Evidence shaped like this supports only a repo-scoped claim,
+# regardless of how the model classified it — see the module docstring.
+_NARROW_CONTEXT_MARKERS = re.compile(
+    r"(?i)\b(?:"
+    r"this (?:repo|repository|project|script|codebase|file|branch|pr|"
+    r"pull request|worktree|hotfix|migration|service|package)"
+    r"|in this (?:case|situation|instance)"
+    r"|for this (?:repo|repository|project|task)"
+    r"|only (?:in|for|on) this"
+    r")\b"
+)
+
+
+def _looks_narrowly_scoped(*texts: str) -> bool:
+    """True when the raw evidence itself names a specific repo/script/task.
+
+    Checked against the evidence, never against the model's own title/body
+    — the question is what the *source material* supports, not how the
+    model chose to phrase its conclusion.
+    """
+    return any(_NARROW_CONTEXT_MARKERS.search(t) for t in texts if t)
 
 
 @dataclass(frozen=True)
@@ -149,6 +200,12 @@ def _build_prompt(batch: list[RawCandidate]) -> str:
         'happened in. "claude_md_block" is for a short critical policy '
         'statement, "rule" for a longer detailed rule, "skill" for a '
         "reusable multi-step procedure.",
+        "Prefer the narrower, weaker claim the evidence actually supports "
+        "over the broadest claim it could be stretched to support. If the "
+        "snippet names a specific repository, script, file, or task, "
+        "classify it as \"repo\" even if the wording sounds like a general "
+        "rule — one observation in one place is not evidence that a rule "
+        "holds everywhere.",
         "",
         "SNIPPETS:",
     ]
@@ -203,6 +260,11 @@ def _validate_item(item: object, batch: list[RawCandidate]) -> ClassifiedCandida
     scope = str(item.get("scope") or "").strip().lower()
     if scope not in _VALID_SCOPES:
         return None
+    if scope == "global" and _looks_narrowly_scoped(raw.text, raw.context_text):
+        # The model claimed this holds everywhere; the evidence itself
+        # names one repo/script/task. Hold the weaker, evidence-supported
+        # claim rather than trust the stronger one (see module docstring).
+        scope = "repo"
 
     target_kind = str(item.get("target_kind") or "").strip().lower()
     if target_kind not in _VALID_TARGET_KINDS:
