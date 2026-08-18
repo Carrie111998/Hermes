@@ -2516,6 +2516,12 @@ export const zh: Translations = {
         description: '讲解所选代码的工作方式，并链接到关键文件。',
         text: '请解释这是如何工作的，并指给我关键文件。'
       }
+    },
+    githubIssueDeepLink: {
+      task: '请在当前工作区中调查这个 GitHub 议题。阅读该议题及其评论，复现问题，然后实现并验证一个有针对性的修复：',
+      errorTitle: 'GitHub 议题链接已拒绝',
+      errorUrl: '仅允许规范的 https://github.com/owner/repo/issues/123 链接。',
+      errorTooLarge: '链接超过 2KB 上限。'
     }
   },
 

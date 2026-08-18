@@ -1971,6 +1971,12 @@ export const zhHant = defineLocale({
         description: '說明所選程式碼的運作方式，並連結到關鍵檔案。',
         text: '請解釋這是如何運作的，並告訴我關鍵檔案在哪裡。'
       }
+    },
+    githubIssueDeepLink: {
+      task: '請在目前的工作區中調查這個 GitHub 議題。閱讀該議題及其留言，重現問題，然後實作並驗證一個有針對性的修正：',
+      errorTitle: 'GitHub 議題連結已拒絕',
+      errorUrl: '僅允許標準的 https://github.com/owner/repo/issues/123 連結。',
+      errorTooLarge: '連結超過 2KB 上限。'
     }
   },
 

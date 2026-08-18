@@ -4,6 +4,7 @@ import { closeActiveTab } from '@/app/chat/close-tab'
 import { commandFocusedPreview } from '@/app/chat/right-rail/preview-nav'
 import { openSession } from '@/app/open-session'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
+import { requestGithubIssueTaskFromDeepLink } from '@/store/github-issue-deeplink-open'
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
 import { startMcpHealthChecker, stopMcpHealthChecker } from '@/store/mcp-health'
 import { respondToApprovalAction } from '@/store/native-notifications'
@@ -194,9 +195,11 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // hermes:// deep links -> a reviewable /blueprint command in the composer,
-  // or (hermes://mcp/install) a pending MCP install awaiting explicit
-  // confirmation in McpInstallDeepLinkDialog. Never auto-installs.
+  // hermes:// deep links -> a reviewable /blueprint command in the composer, a
+  // reviewable investigation task (hermes://github-issue/open), or
+  // (hermes://mcp/install) a pending MCP install awaiting explicit
+  // confirmation in McpInstallDeepLinkDialog. Never auto-installs, never
+  // auto-sends; each kind's module validates its own hostile params.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
       if (!payload) {
@@ -205,6 +208,12 @@ export function useDesktopIntegrations({
 
       if (payload.kind === 'mcp' && payload.name === 'install') {
         requestMcpInstallFromDeepLink(payload.params || {})
+
+        return
+      }
+
+      if (payload.kind === 'github-issue' && payload.name === 'open') {
+        requestGithubIssueTaskFromDeepLink(payload.params || {})
 
         return
       }

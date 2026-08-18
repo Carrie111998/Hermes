@@ -1,6 +1,7 @@
 import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { onComposerInsertRequest } from '@/app/chat/composer/focus'
 import { _resetLegacyDiscardForTests } from '@/store/session'
 import type * as WindowsStore from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
@@ -30,6 +31,13 @@ vi.mock('@/store/windows', async importOriginal => {
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 const initialHermesDesktop = desktopWindow.hermesDesktop
+
+/** Mirrors the `onDeepLink` payload the preload bridge delivers. */
+interface DeepLinkPayload {
+  kind: string
+  name: string
+  params: Record<string, string>
+}
 
 const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
   archived: false,
@@ -309,6 +317,45 @@ describe('useDesktopIntegrations', () => {
 
       // And no navigation should happen (the per-profile keys were empty).
       expect(navigate).not.toHaveBeenCalled()
+    })
+  })
+
+  // This hook owns the deep-link listener, so it owns the routing: a
+  // github-issue payload has to reach its module at all. Validation and the
+  // composer/toast behavior are covered where they live
+  // (lib/github-issue-deeplink, store/github-issue-deeplink-open).
+  describe('deep-link routing', () => {
+    it('routes a github-issue payload to the composer', async () => {
+      const ISSUE_URL = 'https://github.com/NousResearch/hermes-agent/issues/63169'
+      const listeners: ((payload: DeepLinkPayload) => void)[] = []
+      const inserted: string[] = []
+
+      desktopWindow.hermesDesktop = {
+        ...desktopWindow.hermesDesktop,
+        onDeepLink: (callback: (payload: DeepLinkPayload) => void) => {
+          listeners.push(callback)
+
+          return () => undefined
+        }
+      } as unknown as Window['hermesDesktop']
+
+      const stopListening = onComposerInsertRequest(({ text }) => inserted.push(text))
+
+      try {
+        render({ profileReady: true })
+
+        const [deliver] = listeners
+
+        expect(deliver).toBeTypeOf('function')
+        deliver?.({ kind: 'github-issue', name: 'open', params: { url: ISSUE_URL } })
+        // The composer bus dispatches on a macrotask.
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+
+        expect(inserted).toHaveLength(1)
+        expect(inserted[0]).toContain(ISSUE_URL)
+      } finally {
+        stopListening()
+      }
     })
   })
 

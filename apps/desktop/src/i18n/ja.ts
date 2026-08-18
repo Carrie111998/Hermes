@@ -2034,6 +2034,12 @@ export const ja = defineLocale({
         description: '選択したコードがどのように機能するかを説明し、主要なファイルにリンクします。',
         text: 'これがどのように機能するか説明し、主要なファイルを教えてください。'
       }
+    },
+    githubIssueDeepLink: {
+      task: 'このワークスペースで、この GitHub Issue を調査してください。Issue とそのコメントを読み、問題を再現し、焦点を絞った修正を実装して検証してください:',
+      errorTitle: 'GitHub Issue リンクを拒否しました',
+      errorUrl: '正規の https://github.com/owner/repo/issues/123 形式のリンクのみ許可されます。',
+      errorTooLarge: 'リンクが 2KB の上限を超えています。'
     }
   },
 
