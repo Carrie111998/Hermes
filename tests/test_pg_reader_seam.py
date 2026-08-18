@@ -547,3 +547,96 @@ class TestCrossProfileReadSeam:
             "state.db exists for profile-b — the test setup is incorrect; "
             "the old code would incorrectly read this file"
         )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard / web_server chokepoint
+#
+# All of hermes_cli/web_routers/profiles.py's cross-profile readers funnel
+# through hermes_cli.web_server._open_session_db_for_profile. Routing that one
+# function through the seam fixes the whole class; these tests pin both arms of
+# the branch so a regression in either direction is caught.
+# ---------------------------------------------------------------------------
+
+
+class TestWebServerProfileChokepoint:
+    """_open_session_db_for_profile must honour the target profile's backend."""
+
+    def test_postgres_profile_is_routed_through_the_seam(self, monkeypatch):
+        """A peer profile on Postgres must NOT be read from a local state.db."""
+        from hermes_cli import web_server
+
+        sentinel = object()
+        seam_calls: list = []
+
+        def fake_open(profile, read_only=False):
+            seam_calls.append((profile, read_only))
+            return sentinel
+
+        monkeypatch.setattr(
+            web_server, "_profile_selects_postgres", lambda p: True
+        )
+        monkeypatch.setattr(
+            hermes_state_postgres, "open_store_for_profile", fake_open
+        )
+        monkeypatch.setattr(
+            web_server, "_cron_profile_home", lambda p: (p, "/nonexistent")
+        )
+
+        def _explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError(
+                "SQLite path was taken for a Postgres-backed profile — "
+                "the dashboard would show empty/stale history"
+            )
+
+        monkeypatch.setattr(web_server, "_open_session_db_at_path", _explode)
+
+        result = web_server._open_session_db_for_profile("peer", read_only=True)
+
+        assert result is sentinel
+        assert seam_calls == [("peer", True)], (
+            f"seam called with {seam_calls}; reads must stay read-only"
+        )
+
+    def test_sqlite_profile_keeps_the_existing_path(self, monkeypatch):
+        """A peer profile on SQLite must keep the bootstrap/heal reader path.
+
+        Routing SQLite profiles through the seam would silently drop the
+        one-time schema-heal behaviour the polling dashboard readers rely on.
+        """
+        from hermes_cli import web_server
+
+        sentinel = object()
+        at_path_calls: list = []
+
+        monkeypatch.setattr(
+            web_server, "_profile_selects_postgres", lambda p: False
+        )
+        monkeypatch.setattr(
+            web_server, "_cron_profile_home", lambda p: (p, "/tmp/peer-home")
+        )
+
+        def fake_at_path(db_path, *, read_only):
+            at_path_calls.append((str(db_path), read_only))
+            return sentinel
+
+        monkeypatch.setattr(web_server, "_open_session_db_at_path", fake_at_path)
+
+        def _explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("SQLite profile was diverted through the seam")
+
+        monkeypatch.setattr(
+            hermes_state_postgres, "open_store_for_profile", _explode
+        )
+
+        result = web_server._open_session_db_for_profile("peer", read_only=True)
+
+        assert result is sentinel
+        assert at_path_calls == [("/tmp/peer-home/state.db", True)]
+
+    def test_unreadable_peer_config_degrades_to_sqlite(self, tmp_path, monkeypatch):
+        """A missing/unreadable peer config must not break a roster listing."""
+        from hermes_cli import web_server
+
+        # No such profile -> helper soft-fails to False rather than raising.
+        assert web_server._profile_selects_postgres("no-such-profile-xyz") is False

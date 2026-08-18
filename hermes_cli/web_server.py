@@ -12153,17 +12153,64 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             return _open_probed()
 
 
+def _profile_selects_postgres(profile: str) -> bool:
+    """True when *profile*'s own config selects the PostgreSQL state backend.
+
+    Reads the TARGET profile's ``config.yaml`` — never the active process's
+    env vars, which describe this process's backend rather than the peer's.
+    Soft-fails to False so an unreadable or absent peer config keeps the
+    existing SQLite reader path instead of breaking a roster listing.
+    """
+    try:
+        from pathlib import Path as _Path
+
+        from hermes_cli import profiles as _profiles_mod
+
+        canon = _profiles_mod.normalize_profile_name(profile)
+        if not _profiles_mod.profile_exists(canon):
+            return False
+        config_path = _Path(_profiles_mod.get_profile_dir(canon)) / "config.yaml"
+        if not config_path.is_file():
+            return False
+        import yaml as _yaml
+
+        with open(config_path, encoding="utf-8") as _f:
+            loaded = _yaml.safe_load(_f)
+        if not isinstance(loaded, dict):
+            return False
+        backend = str(
+            ((loaded.get("sessions") or {}).get("state_backend") or "")
+        ).strip().lower()
+        return backend in ("postgres", "postgresql", "pg")
+    except Exception:
+        return False
+
+
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     """Open a SessionDB with an explicit access mode for a profile.
 
     ``profile`` None/empty selects this process's own ``state.db``. A named
-    profile opens that profile's on-disk store directly. Access-mode
-    semantics are documented on :func:`_open_session_db_at_path`.
+    profile is resolved through the backend seam so a profile configured for
+    PostgreSQL is read from PostgreSQL rather than from a stale/empty local
+    ``state.db`` — the dashboard roster and sidebar would otherwise silently
+    show empty history for a migrated profile. Profiles on the default SQLite
+    backend keep the existing on-disk path exactly, including the bootstrap and
+    one-time schema-heal behaviour documented on
+    :func:`_open_session_db_at_path`.
     """
     from hermes_state import _default_db_path
 
     if profile:
         _name, home = _cron_profile_home(profile)
+        # Only DIVERT when the target profile actually selects Postgres. The
+        # seam also serves SQLite profiles, but routing those through it would
+        # bypass the bootstrap / one-time schema-heal behaviour below that the
+        # dashboard's polling readers depend on — so SQLite keeps its existing
+        # path byte for byte.
+        if _profile_selects_postgres(profile):
+            from hermes_state_postgres import open_store_for_profile
+
+            return open_store_for_profile(profile, read_only=read_only)
         db_path = Path(home) / "state.db"
     else:
         db_path = Path(_default_db_path())
