@@ -540,6 +540,20 @@ export const host = {
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
 export {
+  type AttachmentAddResult,
+  type AttachmentController,
+  AttachmentControllerError,
+  type AttachmentControllerErrorCode,
+  type AttachmentControllerItem,
+  type AttachmentControllerOptions,
+  type AttachmentControllerSnapshot,
+  type AttachmentPickerOptions,
+  type AttachmentStageResult,
+  type AttachmentStageTarget,
+  createAttachmentController,
+  type StagedAttachment
+} from '@/app/chat/attachment-controller'
+export {
   COMPOSER_AREAS,
   type ComposerAtCompletionItem,
   type ComposerAtCompletionSource,

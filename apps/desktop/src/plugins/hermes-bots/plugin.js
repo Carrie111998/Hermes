@@ -72,6 +72,15 @@ const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
 
+// SDK CopyButton is the single clipboard authority (CP-01: prefer the SDK
+// component over any hand-rolled clipboard write). Feature-detected: older
+// desktops simply omit the copy affordance rather than fall back.
+const SdkCopyButton = typeof sdk === 'undefined' ? undefined : sdk.CopyButton
+
+// Attachment seam (AT-01): optional SDK capability — older builds disable the
+// attach action with an explanation, never a raw file transport fallback.
+const SdkCreateAttachmentController = typeof sdk === 'undefined' ? undefined : sdk.createAttachmentController
+
 const ID = 'hermes-bots'
 const ROSTER_KEY = [ID, 'roster']
 const ROUTINES_KEY = [ID, 'routines']
@@ -185,6 +194,17 @@ const $groupChats = atom({})
 const $groupChatWorkspace = atom(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
+/** First-class channel records: channel-owned membership, separate from
+ *  botMeta.group. Persisted under plugin storage key 'channels' as
+ *  { [channelId]: { id, name, members: [botKey...], createdAt } }. A bot may
+ *  belong to many channels; roster groups are untouched. */
+const $channels = atom({})
+/** Runtime-only attachment staging state (CB-02): immutable snapshots keyed
+ *  by `${group}\u0000${epoch}` so a newer send invalidates the older one,
+ *  and per-room controllers so the turn loop can stage into each member's
+ *  own session/route. Never persisted — no source paths leave the process. */
+const pendingAttachmentSnapshots = new Map()
+const roomAttachmentControllers = new Map()
 
 function handleSessionsGatewayTransition() {
   $sessionsGatewayGeneration.set($sessionsGatewayGeneration.get() + 1)
@@ -3210,6 +3230,130 @@ function groupMembershipPatch(meta, group, enabled) {
   return { groups, group: groups[0] || null }
 }
 
+// ── channels: first-class rooms with channel-owned membership ────────────────
+// Channel records live under plugin storage key 'channels' (separate from
+// botMeta.group). A bot may belong to many channels; roster groups are
+// untouched (CH-02).
+
+const CHANNEL_NAME_RE = /^[a-z0-9][a-z0-9 _-]{0,63}$/i
+
+/** Channel-name validation: non-blank, no leading/trailing whitespace, no
+ *  duplicate against existing channels, and only safe characters. Returns
+ *  null when valid, else a human message. Pure — unit-testable. */
+function validateChannelName(name, existingChannels) {
+  const trimmed = String(name || '').trim()
+
+  if (!trimmed) {
+    return 'Channel name is required.'
+  }
+
+  if (!CHANNEL_NAME_RE.test(trimmed)) {
+    return 'Use letters, numbers, spaces, dashes, or underscores (max 64 chars).'
+  }
+
+  if ((existingChannels || []).some(channel => channel.toLowerCase() === trimmed.toLowerCase())) {
+    return `A channel named “${trimmed}” already exists.`
+  }
+
+  return null
+}
+
+function channelIdFor(name) {
+  return slugify(name) || `ch-${Date.now().toString(36)}`
+}
+
+/** All channel names, alphabetical — feeds validation and the roster. */
+function knownChannels(channels) {
+  return Object.values(channels || {})
+    .map(channel => channel?.name || '')
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+}
+
+/** Create a channel: single-flight per name, awaits the authoritative result
+ *  (storage write), and reports success/failure honestly. Returns
+ *  { ok: true, channel } or { ok: false, error }. */
+async function createChannel(name, memberKeys) {
+  const trimmed = String(name || '').trim()
+  const validation = validateChannelName(trimmed, knownChannels($channels.get()))
+
+  if (validation) {
+    return { ok: false, error: validation }
+  }
+
+  if (!Array.isArray(memberKeys) || memberKeys.length < 2) {
+    return { ok: false, error: 'Pick at least 2 bots for the channel.' }
+  }
+
+  const id = channelIdFor(trimmed)
+  const channel = { id, name: trimmed, members: [...new Set(memberKeys)], createdAt: Date.now() }
+  const next = { ...$channels.get(), [id]: channel }
+  $channels.set(next)
+
+  try {
+    await Promise.resolve(pluginCtx?.storage?.set?.('channels', next))
+  } catch {
+    return { ok: false, error: 'Could not persist the channel — try again.' }
+  }
+
+  return { ok: true, channel }
+}
+
+/** Delete a channel: remove the record, clear its room log, and persist.
+ *  Bots and their roster groups are untouched (CH-02). */
+async function deleteChannel(name) {
+  const trimmed = String(name || '').trim()
+  const all = { ...$channels.get() }
+  const entry = Object.entries(all).find(([, channel]) => channel?.name === trimmed)
+
+  if (!entry) {
+    return { ok: false, error: 'Channel not found.' }
+  }
+
+  const [id] = entry
+  delete all[id]
+  $channels.set(all)
+
+  // Clear the room log so the deleted channel can't rehydrate history.
+  const rooms = { ...$groupChats.get() }
+
+  if (rooms[trimmed]) {
+    delete rooms[trimmed]
+    $groupChats.set(rooms)
+  }
+
+  if ($groupChatWorkspace.get() === trimmed) {
+    $groupChatWorkspace.set(null)
+  }
+
+  closeGroupChatMainTab(trimmed)
+
+  try {
+    await Promise.resolve(pluginCtx?.storage?.set?.('channels', all))
+    await Promise.resolve(pluginCtx?.storage?.set?.('group-chats', rooms))
+  } catch {
+    return { ok: false, error: 'Could not persist the deletion — try again.' }
+  }
+
+  return { ok: true }
+}
+
+/** Members seated in a channel: local roster rows whose key is in the
+ *  channel's member list, plus stored remote descriptors. */
+function channelMemberBots(channel, roster, metaByName) {
+  const members = []
+
+  for (const key of channel?.members || []) {
+    const bot = (roster || []).find(candidate => botRosterKey(candidate) === key)
+
+    if (bot) {
+      members.push(bot)
+    }
+  }
+
+  return members
+}
+
 /** Group chats that should hold a roster row: every group named in bot meta
  *  (local members) plus every room record that still has stored members or
  *  log — cross-connection rooms whose members can't ride bot-meta. */
@@ -3674,6 +3818,58 @@ async function runGroupChatMemberTurn(group, member, prompt, thread) {
 
   if (!runtime) {
     return null
+  }
+
+  // CB-02: stage this send's attachments into THIS member's own session and
+  // route (never a hard-coded local target). The snapshot is immutable and
+  // keyed by send; a newer send replaces the key, so stale completions are
+  // ignored. Failure preserves the draft (already in the room log) and
+  // reports honestly — an unknown outcome is never retried.
+  const room = $groupChats.get()[group] || {}
+  const attachKey = room.pendingAttachKey
+  const snapshot = attachKey ? pendingAttachmentSnapshots.get(attachKey) : null
+  let refs = []
+
+  if (snapshot && snapshot.attachments.length) {
+    const controller = roomAttachmentControllers.get(group) || (SdkCreateAttachmentController
+      ? (roomAttachmentControllers.set(group, SdkCreateAttachmentController({ contextKey: `${ID}:${group}` })), roomAttachmentControllers.get(group))
+      : null)
+
+    if (controller) {
+      try {
+        const route = botConnectionRoute(member)
+        const staged = await controller.stage(snapshot, {
+          remote: Boolean(route),
+          requestGateway: route
+            ? (method, params) => host.requestProfile(route, method, params)
+            : (method, params) => host.request(method, params),
+          routeKey: route ? `${route.connectionId}:${route.profile}` : 'local:default',
+          sessionId: runtime,
+          storedSessionId: stored || null
+        })
+
+        refs = staged.attachments.map(item => item.refText)
+      } catch {
+        // Unknown outcome: never retried; the room log already carries the
+        // user's text, and the failed attachment is surfaced next turn.
+        appendGroupChatEntry(
+          group,
+          { kind: 'user', name: 'You' },
+          '⚠️ Attachment staging failed — the file was not sent. Your message above is kept.'
+        )
+      }
+    }
+
+    // Consume the key either way: one send, one staging attempt per member.
+    pendingAttachmentSnapshots.delete(attachKey)
+    updateGroupChat(group, r => {
+      delete r.pendingAttachKey
+      return r
+    })
+  }
+
+  if (refs.length) {
+    prompt = `${prompt}\n\nAttachments for you:\n${refs.join('\n')}`
   }
 
   // Baseline: how many messages exist before our submit.
@@ -7429,6 +7625,132 @@ function GroupDialog({ bot, onClose }) {
   })
 }
 
+/** Discord-style channel creation: pick 2+ bots via checkboxes (with
+ *  search), name the channel, create. Channels are first-class rooms with
+ *  channel-owned membership — separate from roster groups (CH-02). */
+function CreateChannelDialog({ open, roster, onClose }) {
+  const allMeta = useValue($botMeta)
+  const [query, setQuery] = useState('')
+  const [checked, setChecked] = useState({})
+  const [name, setName] = useState('')
+  const [error, setError] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  // Reset per open so a cancelled draft doesn't leak into the next one.
+  useEffect(() => {
+    if (open) {
+      setQuery('')
+      setChecked({})
+      setName('')
+      setError(null)
+      setBusy(false)
+    }
+  }, [open])
+
+  const selected = roster.filter(bot => checked[botRosterKey(bot)])
+  const visible = filterBots(roster, allMeta, query)
+  const atCap = selected.length >= GROUP_CHAT_MAX_MEMBERS
+
+  const create = async () => {
+    if (busy) {
+      return
+    }
+
+    setBusy(true)
+    setError(null)
+
+    const result = await createChannel(name, selected.map(bot => botRosterKey(bot)))
+
+    if (!result.ok) {
+      setError(result.error)
+      setBusy(false)
+      return
+    }
+
+    host.notify({ kind: 'success', message: `Channel “${result.channel.name}” created` })
+    onClose()
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'New Channel' }),
+            jsx(DialogDescription, {
+              children: 'Name the channel and pick at least 2 bots. Channels are separate from roster groups — a bot can be in many channels.'
+            })
+          ]
+        }),
+        jsx(Input, {
+          autoFocus: true,
+          'aria-label': 'Channel name',
+          placeholder: 'Channel name (e.g. Ops Standup)',
+          value: name,
+          onChange: event => {
+            setName(event.target.value)
+            setError(null)
+          }
+        }),
+        error
+          ? jsx('div', {
+              'aria-live': 'polite',
+              className: 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+              children: error
+            })
+          : null,
+        jsx(SearchField, {
+          'aria-label': 'Search bots to add',
+          containerClassName: 'w-full',
+          inputClassName: 'w-full',
+          placeholder: 'Search bots to add…',
+          value: query,
+          onChange: setQuery
+        }),
+        jsx('div', {
+          className: 'grid max-h-48 gap-0.5 overflow-y-auto',
+          children: visible.map(bot => {
+            const key = botRosterKey(bot)
+            const isChecked = Boolean(checked[key])
+            const disabled = !isChecked && atCap
+
+            return jsxs('label', {
+              className:
+                'flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-xs text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)' +
+                (disabled ? ' opacity-50' : ''),
+              children: [
+                jsx(Checkbox, {
+                  checked: isChecked,
+                  disabled,
+                  onCheckedChange: value => {
+                    setChecked(current => ({ ...current, [key]: Boolean(value) }))
+                    setError(null)
+                  }
+                }),
+                jsx('span', { className: 'min-w-0 flex-1 truncate', children: displayName(bot, botRosterMeta(bot, allMeta)) }),
+                jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: `@${botHandle(bot.name, bot)}` })
+              ]
+            }, key)
+          })
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'ghost', size: 'sm', onClick: onClose, disabled: busy, children: 'Cancel' }),
+            jsx(Button, { size: 'sm', onClick: () => void create(), disabled: busy, children: busy ? 'Creating…' : 'Create Channel' })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 /** Discord-style group chat creation: pick 2+ bots via checkboxes (with
  *  search), name the group, create. Assignment appends to each local bot's
  *  group membership list, so the room appears in the roster and syncs
@@ -7842,6 +8164,34 @@ function GroupChatWorkspace({ group, members, onBack }) {
   const [openThreads, setOpenThreads] = useState({})
   const [replyThread, setReplyThread] = useState(null)
   const [replyDrafts, setReplyDrafts] = useState({})
+  // Channel-aware room: the group path disbands; a channel deletes (CH-02 —
+  // deleting a channel never touches roster groups).
+  const channels = useValue($channels)
+  const isChannel = Object.values(channels || {}).some(candidate => candidate?.name === group)
+
+  // Attachment capability (AT-01): feature-detected seam. Absent → the
+  // attach action is disabled with an explanation; never a raw fallback.
+  const attachmentControllerRef = useRef(null)
+
+  if (SdkCreateAttachmentController && !attachmentControllerRef.current) {
+    attachmentControllerRef.current = SdkCreateAttachmentController({ contextKey: `${ID}:${group}` })
+  }
+
+  const attachmentController = attachmentControllerRef.current
+  const [attachments, setAttachments] = useState([])
+  const [attachBusy, setAttachBusy] = useState(false)
+  const [attachError, setAttachError] = useState(null)
+
+  useEffect(() => {
+    if (!attachmentController) {
+      return undefined
+    }
+
+    return attachmentController.$attachments.listen(items => {
+      setAttachments([...items])
+      setAttachError(null)
+    })
+  }, [attachmentController])
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -7854,7 +8204,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
       }),
       jsx('div', {
         className: 'min-w-0 flex-1 truncate text-sm font-semibold',
-        children: `${group} — group chat`
+        children: `${group} — ${isChannel ? 'channel' : 'group chat'}`
       }),
       // Member faces: the room's roster at a glance, matching each bot's
       // avatar in the sidebar. Falls back to the count for the title tooltip.
@@ -7880,7 +8230,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
         variant: 'ghost',
         size: 'sm',
         className: 'shrink-0 text-(--ui-text-tertiary) hover:text-destructive',
-        title: `Disband the ${group} group chat`,
+        title: isChannel ? `Delete the ${group} channel` : `Disband the ${group} group chat`,
         onClick: () => setConfirmDisband(true),
         children: jsx(Codicon, { name: 'trash' })
       })
@@ -7893,14 +8243,36 @@ function GroupChatWorkspace({ group, members, onBack }) {
       title: (b.remoteSource ? '' : allMeta[b.name]?.title) || b.title || ''
     }))
 
-  const submit = () => {
+  const submit = async () => {
     const text = draft.trim()
 
-    if (!text) {
+    if (!text && !attachments.length) {
       return
     }
 
+    // CB-02: block send while any attachment is pending or errored.
+    if (attachments.some(item => item.status === 'staging' || item.status === 'error')) {
+      setAttachError('Wait for attachments to finish staging, or remove the failed one.')
+      return
+    }
+
+    // Immutable send snapshot: capture the exact attachment set + context
+    // now; stale completions after this point are ignored by the controller.
+    const snapshot = attachmentController ? attachmentController.snapshot() : null
+    const attachKey = snapshot && snapshot.attachments.length ? `${group}\u0000${Date.now()}` : null
+
+    if (attachKey) {
+      // The turn loop stages per member into that member's own session and
+      // route (CB-02) — never a hard-coded local target.
+      pendingAttachmentSnapshots.set(attachKey, snapshot)
+      updateGroupChat(group, r => {
+        r.pendingAttachKey = attachKey
+        return r
+      })
+    }
+
     setDraft('')
+    attachmentController?.clear()
     // Main composer = START A NEW THREAD with the whole group (Slack shape).
     // Full descriptors ride into the turn loop: remote members keep their
     // connection fields so their turns route to their own machines.
@@ -8000,7 +8372,17 @@ function GroupChatWorkspace({ group, members, onBack }) {
                               jsx('span', {
                                 className: 'text-[0.625rem] text-(--ui-text-quaternary)',
                                 children: relativeTime(entry.at)
-                              })
+                              }),
+                              SdkCopyButton
+                                ? jsx(SdkCopyButton, {
+                                    appearance: 'icon',
+                                    buttonSize: 'sm',
+                                    text: entry.text,
+                                    label: `Copy message from ${label}`,
+                                    title: 'Copy message text',
+                                    className: 'ml-auto shrink-0'
+                                  })
+                                : null
                             ]
                           }),
                           jsx('div', {
@@ -8176,32 +8558,117 @@ function GroupChatWorkspace({ group, members, onBack }) {
               value: draft,
               onChange: setDraft
             }),
-            jsx(Button, { type: 'submit', size: 'sm', disabled: !draft.trim(), children: 'New Thread' })
+            attachmentController
+              ? jsx(Tip, {
+                  label: attachBusy ? 'Adding…' : 'Attach a file',
+                  children: jsx('button', {
+                    type: 'button',
+                    'aria-label': 'Attach a file',
+                    disabled: attachBusy,
+                    className:
+                      'flex size-6 shrink-0 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:opacity-50',
+                    onClick: () => {
+                      setAttachBusy(true)
+                      void attachmentController
+                        .pickFiles()
+                        .then(() => setAttachBusy(false))
+                        .catch(() => {
+                          setAttachBusy(false)
+                          setAttachError('Could not open the file picker.')
+                        })
+                    },
+                    children: jsx(Codicon, { name: 'attach' })
+                  })
+                })
+              : jsx(Tip, {
+                  label: 'Attachments need a newer Hermes Desktop',
+                  children: jsx('button', {
+                    type: 'button',
+                    'aria-label': 'Attachments unavailable',
+                    disabled: true,
+                    className:
+                      'flex size-6 shrink-0 cursor-not-allowed items-center justify-center rounded-md text-(--ui-text-quaternary)',
+                    children: jsx(Codicon, { name: 'attach' })
+                  })
+                }),
+            attachments.length
+              ? jsx('div', {
+                  className: 'flex max-w-40 flex-wrap gap-1',
+                  children: attachments.map(item =>
+                    jsxs('span', {
+                      className:
+                        'flex max-w-full items-center gap-1 rounded-full bg-(--chrome-action-hover) px-1.5 py-0.5 text-[0.625rem] text-(--ui-text-secondary)',
+                      title: item.status === 'error' ? item.error : item.status === 'staging' ? 'Staging…' : item.label,
+                      children: [
+                        jsx('span', { className: 'truncate', children: item.label }),
+                        item.status === 'staging'
+                          ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: '…' })
+                          : item.status === 'error'
+                            ? jsx('span', { className: 'text-destructive', children: '!' })
+                            : null,
+                        jsx('button', {
+                          type: 'button',
+                          'aria-label': `Remove ${item.label}`,
+                          className: 'text-(--ui-text-quaternary) hover:text-foreground',
+                          onClick: () => attachmentController.remove(item.id),
+                          children: jsx(Codicon, { name: 'close' })
+                        })
+                      ]
+                    }, item.id)
+                  )
+                })
+              : null,
+            attachError
+              ? jsx('span', {
+                  'aria-live': 'polite',
+                  className: 'text-[0.625rem] text-destructive',
+                  children: attachError
+                })
+              : null,
+            jsx(Button, {
+              type: 'submit',
+              size: 'sm',
+              disabled: !draft.trim() && !attachments.length,
+              children: 'New Thread'
+            })
           ]
         })
       }),
       jsx(ConfirmDialog, {
         open: confirmDisband,
-        title: 'Disband group chat?',
-        description: jsxs('span', {
-          children: [
-            'This removes the ',
-            jsx('span', { className: 'font-medium text-foreground', children: group }),
-            ' grouping from its ',
-            String(members.length),
-            ' bots and clears the shared room log. The bots themselves and their “Group: ',
-            group,
-            '” sessions are kept — you can still open those from each bot’s session browser.'
-          ]
-        }),
+        title: isChannel ? 'Delete channel?' : 'Disband group chat?',
+        description: isChannel
+          ? jsxs('span', {
+              children: [
+                'This deletes the ',
+                jsx('span', { className: 'font-medium text-foreground', children: group }),
+                ' channel and clears its room log. The bots themselves and their roster groups are untouched.'
+              ]
+            })
+          : jsxs('span', {
+              children: [
+                'This removes the ',
+                jsx('span', { className: 'font-medium text-foreground', children: group }),
+                ' grouping from its ',
+                String(members.length),
+                ' bots and clears the shared room log. The bots themselves and their “Group: ',
+                group,
+                '” sessions are kept — you can still open those from each bot’s session browser.'
+              ]
+            }),
         destructive: true,
-        confirmLabel: 'Disband',
-        busyLabel: 'Disbanding…',
-        doneLabel: 'Disbanded',
+        confirmLabel: isChannel ? 'Delete' : 'Disband',
+        busyLabel: isChannel ? 'Deleting…' : 'Disbanding…',
+        doneLabel: isChannel ? 'Deleted' : 'Disbanded',
         onClose: () => setConfirmDisband(false),
         onConfirm: async () => {
-          await disbandGroupChat(group, members)
-          host.notify({ kind: 'success', message: `Disbanded “${group}”` })
+          if (isChannel) {
+            await deleteChannel(group)
+            host.notify({ kind: 'success', message: `Deleted channel “${group}”` })
+          } else {
+            await disbandGroupChat(group, members)
+            host.notify({ kind: 'success', message: `Disbanded “${group}”` })
+          }
         }
       })
     ]
@@ -8237,6 +8704,44 @@ function GroupChatMainView({ group }) {
   const members = groupChatMemberBots(group, roster, allMeta)
 
   return jsx(GroupChatWorkspace, { group, members, onBack: () => closeGroupChatMainTab(group) })
+}
+
+/** Open a channel the same way as a group chat: a tab taking over the MAIN
+ *  chat window (host.openWorkspace, newer desktops), falling back to the
+ *  in-panel room view on desktops whose SDK predates the main-area door.
+ *  The room record is keyed by channel name, so history and membership
+ *  survive reload/reopen (CH-02). */
+function openChannel(channelName) {
+  if (typeof host.openWorkspace === 'function') {
+    try {
+      const close = host.openWorkspace(`${ID}:channel:${slugify(channelName)}`, {
+        title: channelName,
+        minWidth: '24rem',
+        render: () => jsx(ChannelMainView, { channelName }),
+        onClose: () => groupChatMainTabs.delete(channelName)
+      })
+
+      groupChatMainTabs.set(channelName, close)
+
+      return
+    } catch {
+      // Fall through to the in-panel room below.
+    }
+  }
+
+  $groupChatWorkspace.set(channelName)
+}
+
+/** Main-window wrapper for a channel room: seats the channel's own member
+ *  roster (channel-owned membership, separate from roster groups). */
+function ChannelMainView({ channelName }) {
+  const allMeta = useValue($botMeta)
+  const channels = useValue($channels)
+  const roster = useValue($lastRoster)
+  const channel = Object.values(channels || {}).find(candidate => candidate?.name === channelName)
+  const members = channel ? channelMemberBots(channel, roster, allMeta) : []
+
+  return jsx(GroupChatWorkspace, { group: channelName, members, onBack: () => closeGroupChatMainTab(channelName) })
 }
 
 /** Open a group chat the Discord way: a tab taking over the MAIN chat window
@@ -8372,6 +8877,7 @@ function BotsPane() {
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
   const [createOpen, setCreateOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
+  const [channelOpen, setChannelOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
   const [grouping, setGrouping] = useState(null)
@@ -8381,6 +8887,7 @@ function BotsPane() {
   const groupChatName = useValue($groupChatWorkspace)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
+  const channels = useValue($channels)
 
   // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
   // retry immediately instead of waiting out the poll interval.
@@ -8444,9 +8951,21 @@ function BotsPane() {
       members: groupChatMemberBots(name, roster, allMeta),
       activity: groupLastActivity(groupRooms[name])
     }))
+  // Channels are first-class roster rows too (CH-02): one row per channel,
+  // opening the same room view with the channel's own membership. Channel
+  // activity is the newest room-log line, same recency ordering as groups.
+  const channelRows = Object.values(channels || {})
+    .filter(channel => channel && channel.name && (!needle || channel.name.toLowerCase().includes(needle)))
+    .map(channel => ({
+      kind: 'channel',
+      channel,
+      members: channelMemberBots(channel, roster, allMeta),
+      activity: groupLastActivity(groupRooms[channel.name])
+    }))
   const rosterRows = [
     ...filteredRoster.map(bot => ({ kind: 'bot', bot, pinned: isPinned(bot), activity: activityOf(bot) })),
-    ...groupRows
+    ...groupRows,
+    ...channelRows
   ].sort((a, b) => {
     const pa = a.pinned ? 1 : 0
     const pb = b.pinned ? 1 : 0
@@ -8475,7 +8994,11 @@ function BotsPane() {
     return jsx(ProfileSessionsWorkspace, { bot: sessionsWorkspaceBot })
   }
 
-  const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
+  const groupChatMembers = groupChatName
+    ? Object.values(channels || {}).some(candidate => candidate?.name === groupChatName)
+      ? channelMemberBots(Object.values(channels).find(candidate => candidate?.name === groupChatName), roster, allMeta)
+      : groupChatMemberBots(groupChatName, roster, allMeta)
+    : []
 
   if (groupChatName && groupChatMembers.length) {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
@@ -8559,6 +9082,11 @@ function BotsPane() {
                         disabled: activeSourceRoster.length < 2,
                         onSelect: () => setGroupCreateOpen(true),
                         children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
+                      }),
+                      jsxs(DropdownMenuItem, {
+                        disabled: activeSourceRoster.length < 2,
+                        onSelect: () => setChannelOpen(true),
+                        children: [jsx(Codicon, { name: 'comment', className: 'mr-1.5' }), 'New Channel']
                       })
                     ]
                   })
@@ -8698,11 +9226,22 @@ function BotsPane() {
                             },
                             `group:${row.name}`
                           )
-                        : jsx(
-                            BotRow,
-                            { bot: row.bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping },
-                            botRosterKey(row.bot)
-                          )
+                        : row.kind === 'channel'
+                          ? jsx(
+                              GroupRow,
+                              {
+                                group: row.channel.name,
+                                members: row.members,
+                                needsYou: false,
+                                onOpen: openChannel
+                              },
+                              `channel:${row.channel.id}`
+                            )
+                          : jsx(
+                              BotRow,
+                              { bot: row.bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping },
+                              botRosterKey(row.bot)
+                            )
                     )
                   })
                 }),
@@ -8730,6 +9269,11 @@ function BotsPane() {
         roster,
         onClose: () => setGroupCreateOpen(false),
         onCreated: groupName => openGroupChat(groupName)
+      }),
+      jsx(CreateChannelDialog, {
+        open: channelOpen,
+        roster,
+        onClose: () => setChannelOpen(false)
       }),
       jsx(EditProfileDialog, {
         bot: editing,
@@ -8917,6 +9461,34 @@ export default {
         .catch(() => undefined)
     } catch {
       /* no storage — rooms start empty */
+    }
+
+    // Hydrate first-class channel records (channel-owned membership,
+    // separate from botMeta.group). Rehydrates on every load so channels
+    // survive plugin reload/restart.
+    try {
+      Promise.resolve(ctx.storage?.get?.('channels'))
+        .then(value => {
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            const channels = {}
+
+            for (const [id, channel] of Object.entries(value)) {
+              if (channel && typeof channel === 'object' && channel.name && Array.isArray(channel.members)) {
+                channels[id] = {
+                  id: channel.id || id,
+                  name: String(channel.name),
+                  members: channel.members.filter(member => typeof member === 'string'),
+                  createdAt: channel.createdAt || 0
+                }
+              }
+            }
+
+            $channels.set({ ...channels, ...$channels.get() })
+          }
+        })
+        .catch(() => undefined)
+    } catch {
+      /* no storage — channels start empty */
     }
 
     // Routines follow the chat you're in: track the live gateway profile.
