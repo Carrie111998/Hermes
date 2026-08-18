@@ -14,6 +14,10 @@ Behavior-changing request or execution wrappers are outside this observer
 contract. Observer hooks should report what happened; they should not replace
 provider requests, tool arguments, or execution callbacks.
 
+Hermes also has a first-party NeMo Relay shared-metrics path. It uses these
+lifecycle boundaries directly and does not require enabling an observability
+plugin. See [Relay shared metrics](relay-shared-metrics.md).
+
 ## Contract
 
 Plugins register observer callbacks from `register(ctx)`:
@@ -51,7 +55,7 @@ behavior-affecting hooks:
 | Hook | Return behavior |
 | --- | --- |
 | `pre_llm_call` | May return a string or `{"context": "..."}` to inject ephemeral context into the current user message. |
-| `pre_tool_call` | May return `{"action": "block", "message": "..."}` to block a tool before execution. |
+| `pre_tool_call` | May return `{"action": "block", "message": "..."}` to block a tool before execution, or `{"action": "modify", "args": {...}}` to transform the tool's input arguments. |
 | `transform_tool_result` | May return a replacement tool result string after `post_tool_call`. |
 | `transform_llm_output` | May return a replacement final assistant text string. |
 
