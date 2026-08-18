@@ -4173,6 +4173,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+            except Exception as exc:
+                # PostgreSQL serialization failures (40001) and deadlocks
+                # (40P01) are transient: the correct retry unit is the WHOLE
+                # transaction (re-run fn from scratch), NOT an individual
+                # method call. This handler is reached only on the Postgres
+                # backend because sqlite3.* exceptions are caught above;
+                # non-retryable Postgres errors propagate unchanged.
+                if self._is_postgres:
+                    try:
+                        from hermes_state_postgres import is_postgres_retryable
+                    except ImportError:
+                        raise exc
+                    if is_postgres_retryable(exc) and self._sleep_before_write_retry(
+                        deadline, patience_s
+                    ):
+                        continue
+                raise
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
