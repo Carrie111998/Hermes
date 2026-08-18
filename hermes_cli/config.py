@@ -2193,7 +2193,10 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
     """
-    env_file = load_env()
+    try:
+        env_file = load_env()
+    except Exception:
+        env_file = {}
     messaging_cwd = env_file.get("MESSAGING_CWD") or os.environ.get("MESSAGING_CWD")
     terminal_cwd_env = env_file.get("TERMINAL_CWD") or os.environ.get("TERMINAL_CWD")
 
