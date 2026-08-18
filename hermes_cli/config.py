@@ -2193,8 +2193,9 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
     """
-    messaging_cwd = os.environ.get("MESSAGING_CWD")
-    terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+    env_file = load_env()
+    messaging_cwd = env_file.get("MESSAGING_CWD") or os.environ.get("MESSAGING_CWD")
+    terminal_cwd_env = env_file.get("TERMINAL_CWD") or os.environ.get("TERMINAL_CWD")
 
     if config is None:
         try:
@@ -2204,8 +2205,15 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 
     terminal_cfg = config.get("terminal", {})
     config_cwd = terminal_cfg.get("cwd", ".") if isinstance(terminal_cfg, dict) else "."
-    # Only warn if config.yaml doesn't have an explicit path
-    config_has_explicit_cwd = config_cwd not in {".", "auto", "cwd", ""}
+    # If TERMINAL_CWD is not defined in .env and matches the local process working directory,
+    # it was bridged by CLI/TUI startup for the local backend (terminal.cwd = .) — do not warn (#89016).
+    terminal_in_dot_env = "TERMINAL_CWD" in env_file
+    is_bridged_local_cwd = (
+        not terminal_in_dot_env
+        and terminal_cwd_env == os.getcwd()
+        and (config_cwd in {".", "auto", "cwd", ""} or (isinstance(terminal_cfg, dict) and "cwd" in terminal_cfg))
+    )
+    config_has_explicit_cwd = config_cwd not in {".", "auto", "cwd", ""} or is_bridged_local_cwd
 
     lines: list[str] = []
     if messaging_cwd:
