@@ -6958,6 +6958,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    child_priority: Optional[int] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -6973,6 +6974,8 @@ def decompose_triage_task(
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
             "parents": [0, 2],                 # indices into this same children list
+            "priority": 10,                    # optional; falls back to child_priority,
+                                               # which itself defaults to the root's stored priority
         }
 
     Returns the list of created child task ids (in input order) on
@@ -6984,6 +6987,12 @@ def decompose_triage_task(
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
+
+    Priority resolution per child: per-child ``priority`` (if a valid int)
+    wins, else ``child_priority`` if given, else the root task's stored
+    priority at read time. ``None`` is only used when the root itself
+    has ``priority IS NULL`` — the schema default is 0, so a missing
+    value is treated as 0 to match the existing column contract.
     """
     if not children:
         return None
@@ -7043,8 +7052,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "priority FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -7058,6 +7067,15 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        # Priority inheritance: child_priority (caller-supplied) wins;
+        # otherwise use the root's stored priority. The schema default
+        # is 0, so COALESCE ensures we store an int even when the root
+        # has NULL priority (treated as 0 — same column contract as
+        # before this change).
+        root_priority = root_row["priority"] if root_row["priority"] is not None else 0
+        effective_child_priority = (
+            int(child_priority) if child_priority is not None else int(root_priority)
+        )
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7089,11 +7107,17 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Per-child priority override > effective_child_priority (caller
+            # flag/root default). Stored exactly as resolved; no coalesce
+            # at this layer so callers see what they asked for.
+            child_pri = child.get("priority")
+            if not isinstance(child_pri, int):
+                child_pri = effective_child_priority
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, priority, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7102,6 +7126,7 @@ def decompose_triage_task(
                     child_ws_kind,
                     child_ws_path,
                     tenant,
+                    child_pri,
                     now,
                     (author or "decomposer"),
                 ),
