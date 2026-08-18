@@ -5220,9 +5220,17 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # The raised ceiling above is dead code if the fallback gate
+                # below still switches providers at the default transport
+                # threshold — `overloaded` counts as a transport failure, so
+                # Hermes bails to the fallback chain at retry 2 (~seconds)
+                # and the 30/60/90/120s adaptive schedule never runs. Let a
+                # Z.AI coding overload run to its raised ceiling; ordinary
+                # transport failures keep the original threshold of 2.
+                _fallback_threshold = max_retries if _is_zai_coding_overload else 2
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (_is_transport_failure and retry_count >= _fallback_threshold)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
