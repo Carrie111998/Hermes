@@ -154,6 +154,7 @@ type KanbanMessages = {
   noAttachments: string
   uploadAttachment: string
   attachmentPreview: string
+  attachmentPreviewLoading: string
   attachmentPreviewUnavailable: string
   taskActions: string
   copyTaskId: string
@@ -372,6 +373,7 @@ export const en: KanbanMessages = {
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
   attachmentPreview: 'Attachment preview',
+  attachmentPreviewLoading: 'Loading…',
   attachmentPreviewUnavailable: 'Could not preview attachment',
   taskActions: 'Task actions',
   copyTaskId: 'Copy task id',
@@ -585,6 +587,7 @@ const ja: KanbanMessages = {
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
   attachmentPreview: '添付プレビュー',
+  attachmentPreviewLoading: '読み込み中…',
   attachmentPreviewUnavailable: '添付をプレビューできませんでした',
   taskActions: 'タスクの操作',
   copyTaskId: 'タスク ID をコピー',
@@ -796,6 +799,7 @@ const zh: KanbanMessages = {
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
   attachmentPreview: '附件预览',
+  attachmentPreviewLoading: '加载中…',
   attachmentPreviewUnavailable: '无法预览附件',
   taskActions: '任务操作',
   copyTaskId: '复制任务 ID',
@@ -1006,6 +1010,7 @@ const zhHant: KanbanMessages = {
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',
   attachmentPreview: '附件預覽',
+  attachmentPreviewLoading: '載入中…',
   attachmentPreviewUnavailable: '無法預覽附件',
   taskActions: '任務操作',
   copyTaskId: '複製任務 ID',

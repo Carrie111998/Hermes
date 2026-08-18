@@ -247,7 +247,7 @@ export const uploadAttachment = (id: string, upload: { filename: string; content
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
 export const previewAttachment = (id: number | string) =>
-  call<{ data_url: string; filename: string }>(withBoard(`/attachments/${id}/preview`))
+  call<{ content_type: string; data_url: string; filename: string }>(withBoard(`/attachments/${id}/preview`))
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
