@@ -93,7 +93,8 @@ class TestClearCommand:
     def test_clear_one_by_provider_model_removes_only_that_one(self, capsys):
         from hermes_cli.overrides_cmd import cmd_overrides_clear
 
-        with patch("hermes_cli.overrides_cmd.clear_override", return_value=True) as mock_clear:
+        with patch("hermes_cli.overrides_cmd.clear_override",
+                   return_value=(True, "ok")) as mock_clear:
             rc = cmd_overrides_clear(
                 types.SimpleNamespace(provider="anthropic", model="claude-sonnet-4-6", all=False)
             )
@@ -111,7 +112,8 @@ class TestClearCommand:
     def test_clear_nonexistent_reports_nothing_matched_not_success(self, capsys):
         from hermes_cli.overrides_cmd import cmd_overrides_clear
 
-        with patch("hermes_cli.overrides_cmd.clear_override", return_value=False):
+        with patch("hermes_cli.overrides_cmd.clear_override",
+                   return_value=(False, "not_found")):
             rc = cmd_overrides_clear(
                 types.SimpleNamespace(provider="nope", model="nope-model", all=False)
             )
@@ -124,6 +126,37 @@ class TestClearCommand:
         claims_cleared = "cleared" in out.lower() and "not cleared" not in out.lower()
         assert not claims_cleared or rc not in (0, None)
 
+    def test_clear_persistence_failure_is_not_reported_as_nothing_matched(self, capsys):
+        """N1: a record that WAS found but whose removal did not persist to
+        disk must never render as "nothing matched" — that phrase means
+        "there was nothing to revoke", and here the override is still on
+        disk and still routing traffic in every other process. Collapsing
+        the two states is the exact lying-revocation defect this guards
+        against (the same class the I2 fix eliminated for set_override).
+
+        Mutation check: replacing the `reason == "not_found"` branch check
+        with a bare `if not ok:` collapses this back into "Nothing matched"
+        and fails this test.
+        """
+        from hermes_cli.overrides_cmd import cmd_overrides_clear
+        from events.model_override import CLEAR_PERSIST_FAILURE_REASON
+
+        with patch("hermes_cli.overrides_cmd.clear_override",
+                   return_value=(False, CLEAR_PERSIST_FAILURE_REASON)):
+            rc = cmd_overrides_clear(
+                types.SimpleNamespace(provider="deepseek", model="deepseek-v4-pro",
+                                       all=False)
+            )
+
+        out = capsys.readouterr().out
+        assert rc not in (0, None), "a persistence failure must exit non-zero"
+        assert "nothing matched" not in out.lower(), (
+            "the override was FOUND -- reporting 'nothing matched' is an "
+            "affirmatively false statement"
+        )
+        assert CLEAR_PERSIST_FAILURE_REASON in out
+        assert "still active" in out.lower() or "not cleared" in out.lower()
+
     def test_clear_all_clears_everything(self, capsys):
         from hermes_cli.overrides_cmd import cmd_overrides_clear
 
@@ -132,7 +165,8 @@ class TestClearCommand:
             _record(provider="openai", model="gpt-5.4"),
         ]
         with patch("hermes_cli.overrides_cmd.list_overrides", return_value=records), \
-             patch("hermes_cli.overrides_cmd.clear_override", return_value=True) as mock_clear:
+             patch("hermes_cli.overrides_cmd.clear_override",
+                   return_value=(True, "ok")) as mock_clear:
             rc = cmd_overrides_clear(types.SimpleNamespace(provider=None, model=None, all=True))
 
         assert rc in (0, None)
@@ -143,6 +177,43 @@ class TestClearCommand:
         assert cleared_pairs == {("anthropic", "claude-sonnet-4-6"), ("openai", "gpt-5.4")}
         out = capsys.readouterr().out
         assert "2" in out
+
+    def test_clear_all_partial_failure_reports_honestly_and_exits_nonzero(self, capsys):
+        """N1: `clear --all` with 2-of-3 persisting must not print "Cleared
+        2 override(s)" and exit 0 while one override is still live — that
+        silently tells the operator "all clear" on a partial failure.
+
+        Mutation check: reverting to the old "only append successes, always
+        return 0 if cleared is non-empty" loop passes the old
+        test_clear_all_clears_everything but fails this one (rc would be 0
+        and the failure would never appear in the output).
+        """
+        from hermes_cli.overrides_cmd import cmd_overrides_clear
+        from events.model_override import CLEAR_PERSIST_FAILURE_REASON
+
+        records = [
+            _record(provider="anthropic", model="claude-sonnet-4-6"),
+            _record(provider="openai", model="gpt-5.4"),
+            _record(provider="deepseek", model="deepseek-v4-pro"),
+        ]
+        results = {
+            ("anthropic", "claude-sonnet-4-6"): (True, "ok"),
+            ("openai", "gpt-5.4"): (True, "ok"),
+            ("deepseek", "deepseek-v4-pro"): (False, CLEAR_PERSIST_FAILURE_REASON),
+        }
+
+        def _fake_clear(*, provider, model, cleared_by):  # noqa: ARG001
+            return results[(provider, model)]
+
+        with patch("hermes_cli.overrides_cmd.list_overrides", return_value=records), \
+             patch("hermes_cli.overrides_cmd.clear_override", side_effect=_fake_clear):
+            rc = cmd_overrides_clear(types.SimpleNamespace(provider=None, model=None, all=True))
+
+        out = capsys.readouterr().out
+        assert rc not in (0, None), "a partial failure must exit non-zero"
+        assert "2" in out  # the two that DID clear
+        assert "deepseek" in out and "deepseek-v4-pro" in out
+        assert CLEAR_PERSIST_FAILURE_REASON in out
 
     def test_clear_all_with_no_overrides_reports_nothing_to_clear(self, capsys):
         from hermes_cli.overrides_cmd import cmd_overrides_clear
@@ -159,7 +230,8 @@ class TestClearCommand:
         one — cleared_by must be a non-empty, CLI-identifying string."""
         from hermes_cli.overrides_cmd import cmd_overrides_clear
 
-        with patch("hermes_cli.overrides_cmd.clear_override", return_value=True) as mock_clear:
+        with patch("hermes_cli.overrides_cmd.clear_override",
+                   return_value=(True, "ok")) as mock_clear:
             cmd_overrides_clear(
                 types.SimpleNamespace(provider="anthropic", model="claude-sonnet-4-6", all=False)
             )
@@ -173,7 +245,8 @@ class TestClearCommand:
 
         records = [_record(provider="anthropic", model="claude-sonnet-4-6")]
         with patch("hermes_cli.overrides_cmd.list_overrides", return_value=records), \
-             patch("hermes_cli.overrides_cmd.clear_override", return_value=True) as mock_clear:
+             patch("hermes_cli.overrides_cmd.clear_override",
+                   return_value=(True, "ok")) as mock_clear:
             cmd_overrides_clear(types.SimpleNamespace(provider=None, model=None, all=True))
 
         _, kwargs = mock_clear.call_args
@@ -313,7 +386,8 @@ class TestUnreadableStore:
         args = types.SimpleNamespace(all=False, provider="deepseek",
                                      model="deepseek-v4-pro")
         with (
-            patch("hermes_cli.overrides_cmd.clear_override", return_value=False),
+            patch("hermes_cli.overrides_cmd.clear_override",
+                  return_value=(False, "not_found")),
             patch("hermes_cli.overrides_cmd.store_status",
                   return_value={"readable": False, "path": "C:/x/model_overrides.json"}),
         ):

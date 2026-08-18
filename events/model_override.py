@@ -69,6 +69,20 @@ logger = logging.getLogger(__name__)
 # rejecting an over-long request.
 MAX_TTL_SECONDS = 24 * 3600
 
+# Reason string returned by set_override()/clear_override() specifically
+# when the write reached _save_store() and failed there, or the store was
+# already known unreadable (_store_reliable() False) -- as opposed to a
+# VALIDATION rejection (self-target, divert-into-a-wall, not-found). Both
+# are PERSISTENCE failures: the state a caller asked for did not reach
+# disk, but nothing about the REQUEST itself was wrong, so a retry once the
+# transient condition (disk full, an AV/indexer sharing violation, or the
+# _READ_FAILURE_RETRY_SECONDS backoff window) clears could succeed. Callers
+# that need to tell "retry might work" apart from "retry will never work"
+# match on this constant rather than parsing prose out of the human-
+# readable reason string.
+SET_PERSIST_FAILURE_REASON = "could not persist the override"
+CLEAR_PERSIST_FAILURE_REASON = "could not persist the removal"
+
 # Bound on how often a FAILED read is retried once the marker has been left
 # deliberately unanchored. Mirrors rate_limit_signal.py's
 # _READ_FAILURE_RETRY_SECONDS -- see that module's docstring for the full
@@ -451,7 +465,7 @@ def set_override(
                 provider, model, replacement_provider, replacement_model,
                 _store_path(),
             )
-            return False, "could not persist the override"
+            return False, SET_PERSIST_FAILURE_REASON
 
         # A non-positive ttl_seconds writes a record whose expires_at is
         # already <= now; _reap_expired() drops it on the very next load, so
@@ -476,15 +490,29 @@ def set_override(
 
 def clear_override(
     *, provider: str, model: str, cleared_by: str = "", bus: Any = None
-) -> bool:
-    """Remove an active override. Returns True only if the removal PERSISTED.
+) -> Tuple[bool, str]:
+    """Remove an active override. Returns (ok, reason).
 
-    False therefore means either "there was nothing to remove" or "the
-    removal could not be written to disk" -- both are states in which the
-    caller must not tell the operator that traffic is un-diverted. A clear
-    that only happened in this process's memory would leave every other
-    process still reading the record off the file; see the module docstring
-    on why this store refuses unpersisted mutations.
+    ``ok`` is True only if a record existed AND its removal PERSISTED to
+    disk. ``reason`` distinguishes the two ways ``ok`` can be False, which
+    a caller must NOT collapse into one message:
+
+      * ``"not_found"`` -- there was nothing to remove. Safe to tell the
+        operator "nothing matched".
+      * ``CLEAR_PERSIST_FAILURE_REASON`` -- a record existed and was
+        removed from the in-memory copy, but the write that would persist
+        that removal failed (disk full, an AV/indexer sharing violation,
+        or the store was already known unreadable). The override is STILL
+        on disk and still live in every other process. Reporting this as
+        "nothing matched" is an affirmatively false statement: it tells the
+        operator traffic is no longer diverted when it still is.
+      * any other string -- an internal error caught by the blanket
+        ``except`` below. Treat like a persistence failure: the request
+        was not proven safe to declare "nothing matched".
+
+    A clear that only happened in this process's memory would leave every
+    other process still reading the record off the file; see the module
+    docstring on why this store refuses unpersisted mutations.
 
     Emits MODEL_OVERRIDE_SET only when a record was actually removed -- a
     no-op clear (nothing to remove) leaves nothing behind, so it must not
@@ -506,7 +534,7 @@ def clear_override(
         store = dict(_load_store())
         removed = store.get(key)
         if removed is None:
-            return False
+            return False, "not_found"
         del store[key]
 
         saved = _save_store(store) if _store_reliable() else False
@@ -515,15 +543,15 @@ def clear_override(
             # that never reached disk is worse than reporting failure --
             # the operator walks away believing traffic is un-diverted while
             # every other process still reads the record off the file and
-            # keeps routing to the replacement. Return False so the caller
-            # says so.
+            # keeps routing to the replacement. Return (False, reason) so
+            # the caller can tell this apart from "not_found" and says so.
             logger.warning(
                 "model_override: could not persist the clear of %s/%s "
                 "(store %s); the override is still on disk and still live "
                 "in every other process",
                 provider, model, _store_path(),
             )
-            return False
+            return False, CLEAR_PERSIST_FAILURE_REASON
 
         payload = {
             "provider": provider,
@@ -546,10 +574,10 @@ def clear_override(
             "action": "cleared",
         }
         _emit_audit(payload, bus)
-        return True
+        return True, "ok"
     except Exception:
         logger.debug("model_override.clear_override failed (swallowed)", exc_info=True)
-        return False
+        return False, "internal error clearing override"
 
 
 def list_overrides() -> List[Dict[str, Any]]:

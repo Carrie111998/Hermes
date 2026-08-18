@@ -183,23 +183,39 @@ def cmd_overrides_clear(args) -> int:
             return 0
 
         cleared: List[tuple] = []
+        failed: List[tuple] = []
         for record in records:
             p, m = record.get("provider"), record.get("model")
             if not p or not m:
                 continue
-            if clear_override(provider=p, model=m, cleared_by=cleared_by):
+            ok, reason = clear_override(provider=p, model=m, cleared_by=cleared_by)
+            if ok:
                 cleared.append((p, m))
+            else:
+                failed.append((p, m, reason))
 
         print()
         if cleared:
             print(f"  Cleared {len(cleared)} override(s):")
             for p, m in cleared:
                 print(f"    - {p}/{m}")
+        if failed:
+            # A record we just listed as active a moment ago is STILL live
+            # on disk and still routing traffic in every other process --
+            # reporting only the successes (the old behavior) told the
+            # operator "all clear" on a PARTIAL failure. Never silently
+            # drop these from the count or the exit code.
+            print(f"  FAILED to clear {len(failed)} override(s) — still active:")
+            for p, m, reason in failed:
+                print(f"    - {p}/{m}: {reason}")
             print()
-            return 0
-        print("  Nothing matched — no overrides were cleared.")
+            return 1
+        if not cleared:
+            print("  Nothing matched — no overrides were cleared.")
+            print()
+            return 1
         print()
-        return 1
+        return 0
 
     if not provider or not model:
         print(
@@ -209,18 +225,33 @@ def cmd_overrides_clear(args) -> int:
         )
         return 2
 
-    ok = clear_override(provider=provider, model=model, cleared_by=cleared_by)
+    ok, reason = clear_override(provider=provider, model=model, cleared_by=cleared_by)
     if ok:
         print()
         print(f"  Cleared override: {provider}/{model}")
         print()
         return 0
-    status = store_status()
-    if not status.get("readable", True):
-        _print_store_unreadable(status)
+
+    if reason == "not_found":
+        status = store_status()
+        if not status.get("readable", True):
+            _print_store_unreadable(status)
+            return 1
+        print()
+        print(f"  Nothing matched — no active override found for {provider}/{model}.")
+        print()
         return 1
+
+    # The override WAS found (reason is not "not_found") but the removal
+    # did not persist -- e.g. a disk-full write failure or an unreadable
+    # store. This must never render as "nothing matched": that phrase means
+    # "there is nothing to revoke", and here the opposite is true -- the
+    # override is still on disk and still routing traffic in every other
+    # process. See events/model_override.py's clear_override docstring.
     print()
-    print(f"  Nothing matched — no active override found for {provider}/{model}.")
+    print(f"  NOT cleared — {provider}/{model} is still active: {reason}")
+    print("  The override was found but the removal did not persist to disk.")
+    print("  Retry `hermes overrides clear`, or check `hermes overrides list`.")
     print()
     return 1
 

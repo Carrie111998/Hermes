@@ -84,9 +84,9 @@ def test_clear_and_list(ov):
                  replacement_model="gpt-5.6-sol",
                  ttl_seconds=3600, set_by="test")
     assert len(list_overrides()) == 1
-    assert clear_override(provider="deepseek", model="deepseek-v4-pro") is True
+    assert clear_override(provider="deepseek", model="deepseek-v4-pro") == (True, "ok")
     assert list_overrides() == []
-    assert clear_override(provider="deepseek", model="deepseek-v4-pro") is False
+    assert clear_override(provider="deepseek", model="deepseek-v4-pro") == (False, "not_found")
 
 
 def test_target_with_an_open_episode_is_rejected(ov, monkeypatch):
@@ -214,7 +214,7 @@ def test_clear_override_emits_audit_event_when_something_removed(ov):
                  ttl_seconds=3600, set_by="test")
     bus = _FakeBus()
     assert clear_override(provider="deepseek", model="deepseek-v4-pro",
-                          bus=bus) is True
+                          bus=bus) == (True, "ok")
     assert len(bus.emitted) == 1
     et, source, payload, _ = bus.emitted[0]
     assert et is EventType.MODEL_OVERRIDE_SET
@@ -229,7 +229,7 @@ def test_clear_override_does_not_emit_when_nothing_removed(ov):
     from events.model_override import clear_override
     bus = _FakeBus()
     assert clear_override(provider="deepseek", model="deepseek-v4-pro",
-                          bus=bus) is False
+                          bus=bus) == (False, "not_found")
     assert bus.emitted == []
 
 
@@ -254,7 +254,7 @@ def test_clear_override_still_succeeds_when_bus_explodes(ov):
                  replacement_model="gpt-5.6-sol",
                  ttl_seconds=3600, set_by="test")
     assert clear_override(provider="deepseek", model="deepseek-v4-pro",
-                          bus=_ExplodingBus()) is True
+                          bus=_ExplodingBus()) == (True, "ok")
     assert get_override("deepseek", "deepseek-v4-pro") is None
 
 
@@ -279,7 +279,7 @@ def test_clear_records_who_cleared_it(ov):
                  ttl_seconds=3600, set_by="telegram:diego")
     bus = _FakeBus()
     assert clear_override(provider="deepseek", model="deepseek-v4-pro",
-                          cleared_by="telegram:diego2", bus=bus) is True
+                          cleared_by="telegram:diego2", bus=bus) == (True, "ok")
     assert len(bus.emitted) == 1
     et, source, payload, _ = bus.emitted[0]
     assert et is EventType.MODEL_OVERRIDE_SET
@@ -299,7 +299,7 @@ def test_clear_without_actor_is_still_legible(ov):
                  replacement_model="gpt-5.6-sol",
                  ttl_seconds=3600, set_by="telegram:diego")
     assert clear_override(provider="deepseek", model="deepseek-v4-pro",
-                          bus=bus) is True
+                          bus=bus) == (True, "ok")
     _, _, payload, _ = bus.emitted[0]
     assert payload["set_by"] == "telegram:diego"
     assert payload["cleared_by"] != "telegram:diego"
@@ -420,9 +420,18 @@ class TestUnpersistedWrites:
 
         monkeypatch.setattr(model_override, "_save_store", lambda store: False)
         bus = _FakeBus()
-        assert model_override.clear_override(
+        ok, reason = model_override.clear_override(
             provider="deepseek", model="deepseek-v4-pro",
-            cleared_by="cli:diego", bus=bus) is False
+            cleared_by="cli:diego", bus=bus)
+        assert ok is False
+        # N1: a persistence failure must be DISTINGUISHABLE from "nothing
+        # was there to remove" -- collapsing both into one signal is
+        # exactly the lying-revocation defect this test guards against.
+        # Mutation check: swap this for == "not_found" and the assertion
+        # still passes on a naive `bool(reason)`-only signal, but fails
+        # here because "not_found" != CLEAR_PERSIST_FAILURE_REASON.
+        assert reason == model_override.CLEAR_PERSIST_FAILURE_REASON
+        assert reason != "not_found"
         assert bus.emitted == []
         # Still there -- which is the truth on disk.
         assert model_override.get_override("deepseek", "deepseek-v4-pro")
