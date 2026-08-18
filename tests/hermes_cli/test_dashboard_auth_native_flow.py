@@ -181,6 +181,56 @@ def test_native_authorize_rejects_non_loopback_redirect(gated_client):
     assert "loopback" in r.json()["detail"].lower()
 
 
+def test_native_authorize_auto_selects_oauth_provider_with_password_provider_present():
+    """Provider-less native login must work when a password provider is
+    registered alongside the OAuth provider.
+
+    The desktop's native PKCE flow never sends ``provider``; the gateway
+    auto-selects it. With several session providers registered, only the
+    brokerable (non-password) ones are candidates — a password provider
+    has no IDP round trip to broker and must not defeat the auto-select
+    (regression: multi-provider gateways 404'd with "Unknown provider: ''").
+    """
+    from tests.hermes_cli.test_dashboard_auth_password_login import (
+        PasswordProvider,
+    )
+
+    clear_providers()
+    register_provider(PasswordProvider())
+    register_provider(StubAuthProvider())
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.bound_host = "fly-app.fly.dev"
+    web_server.app.state.bound_port = 443
+    web_server.app.state.auth_required = True
+    client = TestClient(
+        web_server.app, base_url="https://fly-app.fly.dev",
+        follow_redirects=False,
+    )
+    try:
+        _verifier, challenge = _make_pkce()
+        # No ``provider`` param — exactly what the desktop sends.
+        r = client.get(
+            "/auth/native/authorize",
+            params={
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "redirect_uri": "http://127.0.0.1:54321/callback",
+                "state": "s",
+            },
+        )
+        assert r.status_code == 302, r.text
+        # The redirect must be the OAuth provider's IDP round trip, not the
+        # password provider (which has no start_login).
+        assert "stub_code" in r.headers["location"]
+    finally:
+        clear_providers()
+        web_server.app.state.bound_host = prev_host
+        web_server.app.state.bound_port = prev_port
+        web_server.app.state.auth_required = prev_required
+
+
 # ---------------------------------------------------------------------------
 # Cookieless bearer auth of a gated route — the core deliverable
 # ---------------------------------------------------------------------------

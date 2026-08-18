@@ -318,11 +318,21 @@ async def auth_native_authorize(
     # Resolve the provider. With exactly one session provider registered
     # (the common hosted case) an empty ``provider`` selects it, mirroring
     # the auto-SSO convenience so the desktop needn't hardcode the name.
+    # When several providers are registered, auto-select among the
+    # brokerable (non-password) ones only: native PKCE brokering is
+    # meaningless for a password provider (rejected below), so a password
+    # provider registered alongside the OAuth provider must not defeat
+    # the desktop's provider-less native login.
     p = get_provider(provider) if provider else None
     if p is None and not provider:
-        sess_providers = list_session_providers()
-        if len(sess_providers) == 1:
-            p = sess_providers[0]
+        brokerable = [
+            sp
+            for sp in list_session_providers()
+            if getattr(sp, "supports_session", True)
+            and not getattr(sp, "supports_password", False)
+        ]
+        if len(brokerable) == 1:
+            p = brokerable[0]
     if p is None:
         raise HTTPException(
             status_code=404, detail=f"Unknown provider: {provider!r}"
