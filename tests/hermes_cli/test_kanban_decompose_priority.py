@@ -52,6 +52,23 @@ def _seed_triage(conn, *, priority: int) -> str:
     return new_id
 
 
+def _seed_triage_nullable(conn) -> str:
+    """C4 helper: parent with ``priority IS NULL`` so the contract's
+    COALESCE fallback path is exercised.
+    """
+    new_id = kb._new_task_id()  # type: ignore[attr-defined]
+    import time
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, body, assignee, status, workspace_kind, "
+        " workspace_path, tenant, priority, created_at, created_by) "
+        "VALUES (?, ?, ?, ?, 'triage', 'scratch', NULL, ?, NULL, ?, 'test')",
+        (new_id, "ParentNull", "body", None, "default-test-board", now),
+    )
+    return new_id
+
+
 def _seed_board(conn, slug: str) -> None:
     """Ensure the board row exists (the DB init does this lazily on
     connect, but our connect path may not run before the test reads
@@ -178,6 +195,154 @@ class PriorityInheritanceTests(unittest.TestCase):
         self.assertEqual(by_title["A"], 20)
         self.assertEqual(by_title["B"], 99)
         self.assertEqual(by_title["C"], 20)
+
+    # ---- C4-C10: extended coverage added by OPS-PROBE fixture ----
+
+    def test_C4_parent_null_priority_coalesces_to_zero(self) -> None:
+        """A parent with ``priority IS NULL`` must produce children at 0.
+
+        The spec-layer COALESCE happens inside
+        ``decompose_triage_task``: when ``root_priority`` is missing the
+        function falls back to 0 (the schema default) so children
+        never inherit ``NULL``.
+        """
+        with kb.connect_closing() as conn:
+            parent = _seed_triage_nullable(conn)
+            child_ids = kb.decompose_triage_task(
+                conn, parent,
+                root_assignee=None,
+                children=[{"title": "A"}, {"title": "B"}],
+            )
+            rows = conn.execute(
+                "SELECT title, priority FROM tasks WHERE id IN ("
+                + ",".join("?" * len(child_ids))
+                + ") ORDER BY title",
+                list(child_ids),
+            ).fetchall()
+        by_title = {r["title"]: r["priority"] for r in rows}
+        self.assertEqual(by_title["A"], 0)
+        self.assertEqual(by_title["B"], 0)
+
+    def test_C6_db_layer_does_not_clamp_lower_child_priority(self) -> None:
+        """DB layer has NO clamp: per-child ``priority=0`` passes through.
+
+        Spec-layer clamping is the spec writer's responsibility
+        (``_resolve_child_priority``); the DB layer is a dumb pipe
+        that stores whatever the dict says (when the value is a clean
+        int).
+        """
+        with kb.connect_closing() as conn:
+            parent = _seed_triage(conn, priority=10)
+            child_ids = kb.decompose_triage_task(
+                conn, parent,
+                root_assignee=None,
+                children=[
+                    {"title": "A", "priority": 0},
+                    {"title": "B", "priority": 3},
+                ],
+            )
+            rows = conn.execute(
+                "SELECT title, priority FROM tasks WHERE id IN ("
+                + ",".join("?" * len(child_ids))
+                + ") ORDER BY title",
+                list(child_ids),
+            ).fetchall()
+        by_title = {r["title"]: r["priority"] for r in rows}
+        self.assertEqual(by_title["A"], 0)
+        self.assertEqual(by_title["B"], 3)
+
+    def test_C7_db_layer_stores_priority_with_reason(self) -> None:
+        """Per-child priority=3 with a ``priority_reason`` is stored
+        verbatim at the DB layer; the reason field is informational."""
+        with kb.connect_closing() as conn:
+            parent = _seed_triage(conn, priority=10)
+            child_ids = kb.decompose_triage_task(
+                conn, parent,
+                root_assignee=None,
+                children=[
+                    {"title": "B", "priority": 3,
+                     "priority_reason": "bg cleanup"},
+                ],
+            )
+            rows = conn.execute(
+                "SELECT priority FROM tasks WHERE id = ?",
+                (child_ids[0],),
+            ).fetchone()
+        self.assertEqual(rows["priority"], 3)
+
+    def test_C8_db_layer_accepts_bool_subclass_int(self) -> None:
+        """``True`` is a subclass of ``int`` in Python; the DB layer's
+        ``isinstance(child_pri, int)`` check accepts it and stores 1.
+        The spec layer (``_resolve_child_priority``) explicitly rejects
+        bool — see the OPS-PROBE test_C8_spec_layer_rejects_bool
+        coverage.
+        """
+        with kb.connect_closing() as conn:
+            parent = _seed_triage(conn, priority=7)
+            child_ids = kb.decompose_triage_task(
+                conn, parent,
+                root_assignee=None,
+                children=[
+                    {"title": "A", "priority": "10"},
+                    {"title": "B", "priority": True},
+                ],
+            )
+            rows = conn.execute(
+                "SELECT title, priority FROM tasks WHERE id IN ("
+                + ",".join("?" * len(child_ids))
+                + ") ORDER BY title",
+                list(child_ids),
+            ).fetchall()
+        by_title = {r["title"]: r["priority"] for r in rows}
+        # ``"10"`` (str) is rejected by isinstance(int), falls back to root.
+        self.assertEqual(by_title["A"], 7)
+        # ``True`` passes isinstance(int), stored as 1.
+        self.assertEqual(by_title["B"], 1)
+
+    def test_C9_flag_overrides_with_per_child_exception(self) -> None:
+        """``child_priority`` flag sets every unspecified child to the
+        flag value; an explicit per-child ``priority`` still wins.
+        """
+        with kb.connect_closing() as conn:
+            parent = _seed_triage(conn, priority=10)
+            child_ids = kb.decompose_triage_task(
+                conn, parent,
+                root_assignee=None,
+                children=[
+                    {"title": "A"},
+                    {"title": "B", "priority": 99},
+                    {"title": "C"},
+                ],
+                child_priority=20,
+            )
+            rows = conn.execute(
+                "SELECT title, priority FROM tasks WHERE id IN ("
+                + ",".join("?" * len(child_ids))
+                + ") ORDER BY title",
+                list(child_ids),
+            ).fetchall()
+        by_title = {r["title"]: r["priority"] for r in rows}
+        self.assertEqual(by_title["A"], 20)
+        self.assertEqual(by_title["B"], 99)
+        self.assertEqual(by_title["C"], 20)
+
+    def test_C10_per_child_zero_passes_through_at_db(self) -> None:
+        """An explicit per-child ``priority=0`` is stored verbatim at
+        the DB layer. Only the spec layer's resolver clamps it back to
+        the parent's value; the direct DB call has no such safety net.
+        """
+        with kb.connect_closing() as conn:
+            parent = _seed_triage(conn, priority=10)
+            child_ids = kb.decompose_triage_task(
+                conn, parent,
+                root_assignee=None,
+                children=[{"title": "A", "priority": 0}],
+            )
+            row = conn.execute(
+                "SELECT priority FROM tasks WHERE id = ?",
+                (child_ids[0],),
+            ).fetchone()
+        self.assertEqual(row["priority"], 0)
 
 
 if __name__ == "__main__":
