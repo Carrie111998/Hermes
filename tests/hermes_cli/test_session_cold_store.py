@@ -745,6 +745,69 @@ def test_store_isolates_same_id_and_generation_from_distinct_source_stores(
         second_db.close()
 
 
+def test_store_keeps_purged_snapshot_when_source_db_is_replaced_at_same_path(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    archive_root = tmp_path / "archive"
+    started_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC).timestamp()
+    first_db = SessionDB(db_path=db_path)
+    second_db: SessionDB | None = None
+    try:
+        first_db.create_session("same-id", source="cli")
+        first_db.append_message("same-id", role="user", content="first database")
+        first_db.end_session("same-id", "completed")
+        assert first_db.set_session_archived("same-id", True)
+        assert first_db._conn is not None
+        first_db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (started_at, "same-id"),
+        )
+        first_db._conn.commit()
+        first = store_archived_lineage(first_db, "same-id", archive_root)
+        purge_archived_lineage(first_db, "same-id", archive_root)
+        first_db.close()
+        first_file_identity = (os.stat(db_path).st_dev, os.stat(db_path).st_ino)
+
+        replacement_path = tmp_path / "replacement.db"
+        replacement_db = SessionDB(db_path=replacement_path)
+        try:
+            replacement_db.create_session("same-id", source="cli")
+            replacement_db.append_message(
+                "same-id", role="user", content="replacement database"
+            )
+            replacement_db.end_session("same-id", "completed")
+            assert replacement_db.set_session_archived("same-id", True)
+            assert replacement_db._conn is not None
+            replacement_db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (started_at, "same-id"),
+            )
+            replacement_db._conn.commit()
+        finally:
+            replacement_db.close()
+
+        for suffix in ("-wal", "-shm"):
+            (db_path.parent / f"{db_path.name}{suffix}").unlink(missing_ok=True)
+        os.replace(replacement_path, db_path)
+        assert (os.stat(db_path).st_dev, os.stat(db_path).st_ino) != first_file_identity
+
+        second_db = SessionDB(db_path=db_path)
+        second = store_archived_lineage(second_db, "same-id", archive_root)
+
+        assert first.snapshot_dir != second.snapshot_dir
+        assert "first database" in (first.snapshot_dir / "session.jsonl").read_text(
+            encoding="utf-8"
+        )
+        assert "replacement database" in (
+            second.snapshot_dir / "session.jsonl"
+        ).read_text(encoding="utf-8")
+    finally:
+        if second_db is not None:
+            second_db.close()
+        first_db.close()
+
+
 @pytest.mark.skipif(
     not hasattr(os, "mkfifo") or not hasattr(signal, "setitimer"),
     reason="requires POSIX FIFOs and interval timers",

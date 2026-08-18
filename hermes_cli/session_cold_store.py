@@ -94,7 +94,15 @@ def _source_store_key(conn: sqlite3.Connection) -> str:
         database_path = row[2]
         if not isinstance(database_path, str) or not database_path:
             break
-        return sha256(os.fsencode(os.path.abspath(database_path))).hexdigest()[:16]
+        canonical_path = os.path.abspath(database_path)
+        try:
+            file_identity = os.stat(canonical_path)
+        except OSError as exc:
+            raise ValueError("cold store cannot identify the SQLite source store") from exc
+        namespace = (
+            f"{canonical_path}\x00{file_identity.st_dev}:{file_identity.st_ino}"
+        )
+        return sha256(os.fsencode(namespace)).hexdigest()[:16]
     raise ValueError("cold store requires a file-backed SQLite source store")
 
 
