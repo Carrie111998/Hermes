@@ -111,6 +111,9 @@ def _(rid, params: dict) -> dict:
                     "resolved_id": tip,
                     "title": tip_row.get("title") or "",
                     "preview": preview,
+                    "model": tip_row.get("model") or row.get("model") or "",
+                    "input_tokens": tip_row.get("input_tokens") or row.get("input_tokens") or 0,
+                    "output_tokens": tip_row.get("output_tokens") or row.get("output_tokens") or 0,
                     "started_at": tip_row.get("started_at") or row.get("started_at") or 0,
                     "last_active": (
                         tip_row.get("last_activity_at")
@@ -156,6 +159,9 @@ def _(rid, params: dict) -> dict:
                         "id": s["id"],
                         "title": s.get("title") or "",
                         "preview": s.get("preview") or "",
+                        "model": s.get("model") or "",
+                        "input_tokens": s.get("input_tokens") or 0,
+                        "output_tokens": s.get("output_tokens") or 0,
                         "started_at": s.get("started_at") or 0,
                         "last_active": s.get("last_active") or s.get("started_at") or 0,
                         "message_count": s.get("message_count") or 0,

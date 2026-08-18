@@ -9004,7 +9004,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 for key in (
                     "id", "ended_at", "end_reason", "message_count",
                     "tool_call_count", "title", "last_active", "preview",
-                    "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+                    "model", "input_tokens", "output_tokens", "system_prompt", "cwd",
+                    "git_branch", "git_repo_root",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]

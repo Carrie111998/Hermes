@@ -47,12 +47,16 @@ def _db(profile_dir):
 
 
 def _add_session(db, sid, *, source="cli", title="", ts, text, hidden=False,
-                 parent=None, end_reason=None):
+                 parent=None, end_reason=None, model=None, input_tokens=0,
+                 output_tokens=0):
     """Create one session with a single user message at an exact timestamp."""
     db.create_session(sid, source, parent_session_id=parent)
     db.append_message(sid, "user", text, timestamp=ts)
     with db._lock:
-        db._conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, sid))
+        db._conn.execute(
+            "UPDATE sessions SET title = ?, model = ?, input_tokens = ?, output_tokens = ? WHERE id = ?",
+            (title, model, input_tokens, output_tokens, sid),
+        )
         if end_reason:
             # Mark ended AFTER appending: the DB (correctly) refuses writes
             # to a compression-closed session.
@@ -94,6 +98,28 @@ def test_preferred_session_summarizes_pin_not_latest(home):
     assert "pinned chat content" in pref["preview"]
     # last_session keeps its own contract: the most recently active session.
     assert row["last_session"]["id"] == "other1"
+
+
+def test_session_summaries_include_model_and_token_counts(home):
+    db = _db(home)
+    _add_session(
+        db,
+        "usage1",
+        title="Bot Chat",
+        ts=1000,
+        text="usage content",
+        model="anthropic/claude-sonnet-4",
+        input_tokens=1200,
+        output_tokens=345,
+    )
+    db.close()
+
+    row = _row(_profiles({"preferred_session_ids": {"default": "usage1"}}), "default")
+
+    for summary in (row["last_session"], row["preferred_session"]):
+        assert summary["model"] == "anthropic/claude-sonnet-4"
+        assert summary["input_tokens"] == 1200
+        assert summary["output_tokens"] == 345
 
 
 def test_preferred_session_resolves_hidden_pin(home):
@@ -162,6 +188,40 @@ def test_preferred_session_resolves_compression_tip(home):
 # ---------------------------------------------------------------------------
 # Contract guards
 # ---------------------------------------------------------------------------
+
+
+def test_last_session_projection_keeps_compression_tip_usage(home):
+    db = _db(home)
+    _add_session(
+        db,
+        "root-usage",
+        title="Bot Chat",
+        ts=1000,
+        text="pre-compression content",
+        end_reason="compression",
+        model="old-model",
+        input_tokens=100,
+        output_tokens=20,
+    )
+    _add_session(
+        db,
+        "tip-usage",
+        title="Bot Chat (continued)",
+        ts=3000,
+        text="post-compression content",
+        parent="root-usage",
+        model="new-model",
+        input_tokens=1200,
+        output_tokens=345,
+    )
+    db.close()
+
+    last = _row(_profiles({}), "default")["last_session"]
+
+    assert last["id"] == "tip-usage"
+    assert last["model"] == "new-model"
+    assert last["input_tokens"] == 1200
+    assert last["output_tokens"] == 345
 
 
 def test_no_param_omits_preferred_key(home):
