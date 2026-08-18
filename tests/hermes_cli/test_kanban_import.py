@@ -93,6 +93,38 @@ def test_import_is_idempotent_and_mirrors_terminal_state(import_env):
         ).fetchone()[0] == 1
 
 
+def test_writeback_preserves_user_frontmatter_formatting_and_body(import_env):
+    path = import_env / "formatted.md"
+    path.write_text(
+        "---\n"
+        "id: 'ext-1' # stable external id\n"
+        "title: \"One\"\n"
+        "status: pending # lifecycle\n"
+        "assignee: worker\n"
+        "skills:\n"
+        "  - github-code-review # keep this layout\n"
+        "---\n"
+        "Body with trailing spaces.  \n\n"
+        "Second paragraph.\n",
+        encoding="utf-8",
+    )
+    original = path.read_text(encoding="utf-8")
+
+    with kb.connect_closing() as conn:
+        result = sync_import(
+            conn, adapter=MarkdownAdapter(import_env), import_id="pool",
+        )
+
+    assert result[0].action == "imported"
+    updated = path.read_text(encoding="utf-8")
+    assert "id: 'ext-1' # stable external id" in updated
+    assert 'title: "One"' in updated
+    assert "status: imported # lifecycle" in updated
+    assert "  - github-code-review # keep this layout" in updated
+    assert updated[updated.index("---\n", 4) + 4:] == original[original.index("---\n", 4) + 4:]
+    assert _read(path)["hermes_kanban"]["task_id"] == result[0].task_id
+
+
 def test_import_maps_dependency_graph(import_env):
     _write(import_env, "parent", {
         "id": "parent", "title": "Parent", "status": "pending", "assignee": "worker",
@@ -305,6 +337,58 @@ def test_watch_mirrors_lifecycle_changes_without_manual_rerun(import_env, monkey
     )
     assert kc._cmd_import(args) == 0
     assert _read(path)["status"] == "done"
+
+
+def test_watch_continues_after_record_conflict_to_mirror_other_tasks(import_env, monkeypatch):
+    first_path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    second_path = _write(import_env, "two", {
+        "id": "ext-2", "title": "Two", "status": "pending", "assignee": "worker",
+    })
+    with kb.connect_closing() as conn:
+        imported = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool")
+    task_ids = {result.source_id: result.task_id for result in imported}
+    first_metadata = _read(first_path)
+    first_metadata["status"] = "pending"
+    _write(import_env, "one", first_metadata)
+    sleeps = 0
+
+    def advance(_interval):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            with kb.connect_closing() as conn:
+                conn.execute(
+                    "UPDATE tasks SET status='done', completed_at=1 WHERE id=?",
+                    (task_ids["ext-2"],),
+                )
+                conn.commit()
+        else:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(kc.time, "sleep", advance)
+    args = argparse.Namespace(
+        source=str(import_env), assignee_map=None, adapter="markdown",
+        import_id="pool", dry_run=False, watch=True, interval=0.01, json=False,
+    )
+    assert kc._cmd_import(args) == 0
+    assert sleeps == 2
+    assert _read(second_path)["status"] == "done"
+
+
+def test_watch_stops_on_source_wide_scan_error(import_env, monkeypatch):
+    (import_env / "bad.md").write_text("not frontmatter\n", encoding="utf-8")
+    monkeypatch.setattr(
+        kc.time,
+        "sleep",
+        lambda _interval: pytest.fail("scan failure must stop the watch"),
+    )
+    args = argparse.Namespace(
+        source=str(import_env), assignee_map=None, adapter="markdown",
+        import_id="pool", dry_run=False, watch=True, interval=0.01, json=False,
+    )
+    assert kc._cmd_import(args) == 1
 
 
 def test_cli_conflict_returns_nonzero(import_env):

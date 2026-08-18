@@ -1551,7 +1551,9 @@ def _cmd_import(args: argparse.Namespace) -> int:
                 )
             if not args.watch:
                 break
-            if any(result.action in {"error", "conflict"} for result in results):
+            # A source-wide scan failure cannot recover records this cycle.
+            # Record-level failures must not stop unrelated lifecycle mirrors.
+            if any(result.action == "error" and not result.source_id for result in results):
                 break
             time.sleep(args.interval)
     except KeyboardInterrupt:

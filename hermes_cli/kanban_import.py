@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 import yaml
+from yaml.nodes import MappingNode, ScalarNode
 
 from hermes_cli import kanban_db as kb
 
@@ -186,18 +187,80 @@ class MarkdownAdapter:
             metadata=metadata,
         )
 
+    @staticmethod
+    def _dump_value(value: Any) -> str:
+        rendered = yaml.safe_dump(
+            value,
+            allow_unicode=True,
+            default_flow_style=True,
+            sort_keys=False,
+        ).strip()
+        if rendered.endswith("\n..."):
+            rendered = rendered[:-4]
+        return rendered
+
+    @classmethod
+    def _patch_frontmatter(
+        cls,
+        text: str,
+        path: Path,
+        updates: dict[str, Any],
+    ) -> str:
+        lines = text.splitlines(keepends=True)
+        if not lines or lines[0].strip() != "---":
+            raise ValueError(f"{path.name}: missing YAML frontmatter")
+        try:
+            end_line = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+        except StopIteration as exc:
+            raise ValueError(f"{path.name}: unterminated YAML frontmatter") from exc
+
+        content_start = len(lines[0])
+        content_end = sum(len(line) for line in lines[:end_line])
+        frontmatter = text[content_start:content_end]
+        try:
+            document = yaml.compose(frontmatter)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"{path.name}: invalid YAML frontmatter: {exc}") from exc
+        if not isinstance(document, MappingNode):
+            raise ValueError(f"{path.name}: YAML frontmatter must be an object")
+
+        replacements: list[tuple[int, int, str]] = []
+        found: set[str] = set()
+        for key_node, value_node in document.value:
+            if not isinstance(key_node, ScalarNode) or key_node.value not in updates:
+                continue
+            found.add(key_node.value)
+            replacements.append((
+                value_node.start_mark.index,
+                value_node.end_mark.index,
+                cls._dump_value(updates[key_node.value]),
+            ))
+        for start, end, replacement in reversed(replacements):
+            frontmatter = frontmatter[:start] + replacement + frontmatter[end:]
+
+        missing = [key for key in updates if key not in found]
+        if missing:
+            newline = "\r\n" if lines[0].endswith("\r\n") else "\n"
+            if frontmatter and not frontmatter.endswith(("\n", "\r")):
+                frontmatter += newline
+            frontmatter += "".join(
+                f"{key}: {cls._dump_value(updates[key])}{newline}"
+                for key in missing
+            )
+        return text[:content_start] + frontmatter + text[content_end:]
+
     def write_state(self, task: ExternalTask, state: str, marker: dict[str, Any]) -> None:
-        current = self._read(task.path)
-        metadata = dict(current.metadata)
-        metadata["status"] = state
-        metadata["hermes_kanban"] = marker
-        text = "---\n" + yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True).rstrip()
-        text += "\n---\n"
-        if current.body:
-            text += current.body + "\n"
+        self._read(task.path)
+        with task.path.open("r", encoding="utf-8", newline="") as source:
+            original = source.read()
+        text = self._patch_frontmatter(
+            original,
+            task.path,
+            {"status": state, "hermes_kanban": marker},
+        )
         fd, temp_name = tempfile.mkstemp(prefix=f".{task.path.name}.", dir=task.path.parent)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                 handle.write(text)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -220,6 +283,7 @@ class MarkdownAdapter:
                     if os.name == "nt":
                         import msvcrt
                         handle.seek(0)
+                        # Windows byte-range locks require one byte to exist.
                         if handle.read(1) == b"":
                             handle.seek(0)
                             handle.write(b"0")
