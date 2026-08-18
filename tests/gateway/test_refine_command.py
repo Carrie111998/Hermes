@@ -41,6 +41,7 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
     runner.hooks = SimpleNamespace(emit=MagicMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.peek_session_id.return_value = session_entry.session_id
     runner.session_store.load_transcript.return_value = []
     runner._running_agents = {}
     runner._agent_cache = {}
@@ -73,10 +74,23 @@ async def test_refine_cold_cache_with_persisted_turns_asks_to_resume():
 
     result = await runner._handle_refine_command(_make_event("/refine"))
 
-    assert "2 persisted messages" in result
+    assert "2 persisted user/assistant messages" in result
     assert "resume" in result.lower() or "wake the session first" in result
     assert "Nothing to refine yet" not in result
     runner.session_store.load_transcript.assert_called_once_with(entry.session_id)
+
+
+@pytest.mark.asyncio
+async def test_refine_cold_cache_unknown_session_does_not_create_one():
+    entry = _session_entry()
+    runner = _make_runner(entry)
+    runner.session_store.peek_session_id.return_value = None
+
+    result = await runner._handle_refine_command(_make_event())
+
+    assert result == "Nothing to refine yet — send a message first."
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner.session_store.load_transcript.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -2849,24 +2849,20 @@ class GatewaySlashCommandsMixin:
         )
 
     async def _load_refine_persisted_transcript(
-        self, event: "MessageEvent"
+        self, session_key: str
     ) -> tuple[Optional[list], Optional[str]]:
-        """Load the durable transcript for /refine.
+        """Load the durable transcript for /refine without creating a session.
 
         Returns ``(history, None)`` on success (history may be empty), or
         ``(None, error_message)`` when the transcript cannot be read. A read
         failure must NOT be treated as zero turns — that reintroduces the
         cold-cache false-emptiness claim.
         """
-        if event.source is None:
-            return [], None
         try:
-            session_entry = await self.async_session_store.get_or_create_session(
-                event.source
-            )
-            history = await self.async_session_store.load_transcript(
-                session_entry.session_id
-            )
+            session_id = await self.async_session_store.peek_session_id(session_key)
+            if not session_id:
+                return [], None
+            history = await self.async_session_store.load_transcript(session_id)
         except Exception:
             logger.debug(
                 "failed to load persisted /refine transcript", exc_info=True
@@ -2911,13 +2907,13 @@ class GatewaySlashCommandsMixin:
                 cached = self._agent_cache.get(quick_key)
                 agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
         if agent is None:
-            history, read_err = await self._load_refine_persisted_transcript(event)
+            history, read_err = await self._load_refine_persisted_transcript(quick_key)
             if read_err:
                 return read_err
             n = self._count_refine_persisted_turns(history or [])
             if n > 0:
                 return (
-                    f"This session has {n} persisted messages, but the live "
+                    f"This session has {n} persisted user/assistant messages, but the live "
                     "agent isn't cached. Send a message (or /resume) to wake "
                     "the session first, then /refine."
                 )
@@ -2925,7 +2921,7 @@ class GatewaySlashCommandsMixin:
 
         snapshot = list(getattr(agent, "_session_messages", None) or [])
         if not snapshot:
-            history, read_err = await self._load_refine_persisted_transcript(event)
+            history, read_err = await self._load_refine_persisted_transcript(quick_key)
             if read_err:
                 return read_err
             if self._count_refine_persisted_turns(history or []) > 0:
