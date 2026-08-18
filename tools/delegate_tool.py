@@ -5237,14 +5237,11 @@ def _build_top_level_description() -> str:
         max_per_session = _DEFAULT_MAX_CHILDREN_PER_SESSION
     if max_per_session == 0:
         session_budget_clause = (
-            "SESSION BUDGET: unlimited; set delegation.max_children_per_session "
-            "to a positive value to cap total children per parent session.\n\n"
+            "SESSION BUDGET: unlimited; positive config enables the cap.\n\n"
         )
     else:
         session_budget_clause = (
-            f"SESSION BUDGET: up to {max_per_session} children total per parent "
-            "session across all delegate_task calls; set "
-            "delegation.max_children_per_session=0 for unlimited.\n\n"
+            f"SESSION BUDGET: {max_per_session}/parent session; 0=unlimited.\n\n"
         )
 
     # The child-restrictions rule renders per config: on nesting-enabled
