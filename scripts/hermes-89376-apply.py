@@ -1,0 +1,53 @@
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    if old not in text:
+        raise SystemExit(f"anchor not found in {path}: {old[:120]!r}")
+    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+JOBS = "cron/jobs.py"
+SCHEDULER = "cron/scheduler.py"
+
+replace_once(
+    JOBS,
+    '''def clear_drift_alerted(job_id: str) -> None:\n    """Clear the drift alert-dedup marker (resolution matches again)."""\n    _set_alert_flag(job_id, "drift_alerted", False)\n\n\n''',
+    '''def clear_drift_alerted(job_id: str) -> None:\n    """Clear the drift alert-dedup marker (resolution matches again)."""\n    _set_alert_flag(job_id, "drift_alerted", False)\n\n\ndef set_provider_backoff(job_id: str, retry_after_seconds: float) -> Optional[str]:\n    """Persist a provider-requested cooldown and return its expiry.\n\n    The scheduler uses this for quota/rate-limit failures with an explicit\n    retry-after. A later, shorter retry-after must never pull an existing\n    cooldown earlier.\n    """\n    try:\n        seconds = float(retry_after_seconds)\n    except (TypeError, ValueError):\n        return None\n    if seconds <= 0:\n        return None\n\n    with _jobs_lock():\n        jobs = load_jobs()\n        now = _hermes_now()\n        requested_until = now + timedelta(seconds=seconds)\n        for job in jobs:\n            if job.get("id") != job_id:\n                continue\n\n            existing_raw = job.get("provider_backoff_until")\n            if existing_raw:\n                try:\n                    existing_until = _ensure_aware(\n                        datetime.fromisoformat(str(existing_raw))\n                    )\n                    if existing_until > requested_until:\n                        return existing_until.isoformat()\n                except (TypeError, ValueError):\n                    pass\n\n            job["provider_backoff_until"] = requested_until.isoformat()\n            save_jobs(jobs)\n            return job["provider_backoff_until"]\n    return None\n\n\n''',
+)
+
+replace_once(
+    JOBS,
+    '''                if success:\n                    job.pop("preflight_alerted", None)\n                    job.pop("drift_alerted", None)\n                    # The fire hand-off demonstrably works again — clear the\n''',
+    '''                if success:\n                    job.pop("preflight_alerted", None)\n                    job.pop("drift_alerted", None)\n                    job.pop("provider_backoff_until", None)\n                    # The fire hand-off demonstrably works again — clear the\n''',
+)
+
+replace_once(
+    JOBS,
+    '''                continue\n\n            # Cross-process running-claim guard (#59229): if another scheduler\n''',
+    '''                continue\n\n            # Provider-requested retry-after backoff (#89376): once every\n            # configured provider/fallback has told us the quota window is\n            # closed, do not keep dispatching the same guaranteed failure on\n            # every schedule tick. Persisting the expiry makes the suppression\n            # survive gateway restarts. Expired/malformed values are cleared\n            # lazily and normal due/catch-up semantics resume immediately.\n            provider_backoff_until = job.get("provider_backoff_until")\n            if provider_backoff_until:\n                try:\n                    backoff_until = _ensure_aware(\n                        datetime.fromisoformat(str(provider_backoff_until))\n                    )\n                except (TypeError, ValueError):\n                    backoff_until = None\n                if backoff_until is not None and backoff_until > now:\n                    continue\n                job.pop("provider_backoff_until", None)\n                for rj in raw_jobs:\n                    if rj.get("id") == job.get("id"):\n                        rj.pop("provider_backoff_until", None)\n                        needs_save = True\n                        break\n\n            # Cross-process running-claim guard (#59229): if another scheduler\n''',
+)
+
+replace_once(
+    SCHEDULER,
+    '''def _failure_streak_nudge(job: dict) -> str:\n''',
+    '''def _provider_retry_after_seconds(error: Exception) -> Optional[float]:\n    """Extract retry-after seconds from a structured rate-limit AuthError.\n\n    Codex currently preserves retry-after in the AuthError message (for\n    example ``retry after 123518s``). Keep the text parse narrowly gated by\n    ``is_rate_limited_auth_error`` so unrelated errors cannot suppress jobs.\n    """\n    try:\n        from hermes_cli.auth import is_rate_limited_auth_error\n    except Exception:\n        return None\n    if not is_rate_limited_auth_error(error):\n        return None\n\n    match = re.search(\n        r"\\bretry[\\s-]+after\\s*[:=]?\\s*(\\d+(?:\\.\\d+)?)\\s*"\n        r"(?:s|sec|secs|second|seconds)\\b",\n        str(error),\n        flags=re.IGNORECASE,\n    )\n    if not match:\n        return None\n    try:\n        seconds = float(match.group(1))\n    except (TypeError, ValueError):\n        return None\n    return seconds if seconds > 0 else None\n\n\ndef _failure_streak_nudge(job: dict) -> str:\n''',
+)
+
+replace_once(
+    SCHEDULER,
+    '''            is_auth = isinstance(resolve_exc, AuthError)\n            is_transient_net = _is_transient_provider_resolve_error(resolve_exc)\n''',
+    '''            is_auth = isinstance(resolve_exc, AuthError)\n            is_transient_net = _is_transient_provider_resolve_error(resolve_exc)\n            provider_retry_after = _provider_retry_after_seconds(resolve_exc)\n''',
+)
+
+replace_once(
+    SCHEDULER,
+    '''                except Exception as fb_exc:\n                    logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)\n            if runtime is None:\n                raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc\n''',
+    '''                except Exception as fb_exc:\n                    fb_retry_after = _provider_retry_after_seconds(fb_exc)\n                    if fb_retry_after is not None:\n                        provider_retry_after = max(\n                            provider_retry_after or 0.0, fb_retry_after\n                        )\n                    logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)\n            if runtime is None:\n                if provider_retry_after is not None:\n                    try:\n                        from cron.jobs import set_provider_backoff\n\n                        backoff_until = set_provider_backoff(\n                            job_id, provider_retry_after\n                        )\n                        if backoff_until:\n                            logger.warning(\n                                "Job '%s': provider retry-after backoff active "\n                                "until %s (%.0fs); scheduled fires are suppressed "\n                                "until then.",\n                                job_id,\n                                backoff_until,\n                                provider_retry_after,\n                            )\n                    except Exception:\n                        logger.debug(\n                            "Job '%s': could not persist provider retry-after backoff",\n                            job_id,\n                            exc_info=True,\n                        )\n                raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc\n''',
+)
+
+TEST = '''"""Regression tests for cron provider retry-after backoff (#89376)."""\n\nfrom datetime import datetime, timedelta, timezone\n\nfrom cron.jobs import (\n    create_job,\n    get_due_jobs,\n    get_job,\n    mark_job_run,\n    set_provider_backoff,\n    update_job,\n    use_cron_store,\n)\nfrom cron.scheduler import _provider_retry_after_seconds\nfrom hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE\n\n\ndef test_retry_after_parser_accepts_codex_quota_error():\n    exc = AuthError(\n        "Codex provider quota exhausted (429); retry after 123518s. "\n        "Credentials are still valid.",\n        provider="openai-codex",\n        code=CODEX_RATE_LIMITED_CODE,\n    )\n    assert _provider_retry_after_seconds(exc) == 123518\n\n\ndef test_retry_after_parser_rejects_non_rate_limit_auth_error():\n    exc = AuthError(\n        "temporary auth problem; retry after 3600s",\n        provider="openai-codex",\n        code="token_expired",\n        relogin_required=True,\n    )\n    assert _provider_retry_after_seconds(exc) is None\n\n\ndef test_due_scan_suppresses_job_until_provider_backoff_expires(\n    tmp_path, monkeypatch\n):\n    now = datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc)\n    clock = {"now": now}\n    monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock["now"])\n\n    with use_cron_store(tmp_path):\n        job = create_job(\n            prompt="quota-sensitive job",\n            schedule="every 1m",\n            deliver="local",\n        )\n        update_job(\n            job["id"],\n            {"next_run_at": (now - timedelta(minutes=1)).isoformat()},\n        )\n\n        expiry = set_provider_backoff(job["id"], 3600)\n        assert expiry == (now + timedelta(hours=1)).isoformat()\n        assert get_due_jobs() == []\n\n        persisted = get_job(job["id"])\n        assert persisted["provider_backoff_until"] == expiry\n\n        clock["now"] = now + timedelta(hours=1, seconds=1)\n        due = get_due_jobs()\n        assert [item["id"] for item in due] == [job["id"]]\n        assert get_job(job["id"]).get("provider_backoff_until") is None\n\n\ndef test_provider_backoff_never_shortens_and_success_clears_it(\n    tmp_path, monkeypatch\n):\n    now = datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc)\n    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)\n\n    with use_cron_store(tmp_path):\n        job = create_job(\n            prompt="quota-sensitive job",\n            schedule="every 5m",\n            deliver="local",\n        )\n        long_expiry = set_provider_backoff(job["id"], 7200)\n        short_expiry = set_provider_backoff(job["id"], 60)\n\n        assert short_expiry == long_expiry\n        assert get_job(job["id"])["provider_backoff_until"] == long_expiry\n\n        assert mark_job_run(job["id"], success=True)\n        assert get_job(job["id"]).get("provider_backoff_until") is None\n'''
+
+Path("tests/cron/test_provider_retry_backoff.py").write_text(TEST, encoding="utf-8")
