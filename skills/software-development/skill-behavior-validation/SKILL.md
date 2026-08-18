@@ -2,7 +2,7 @@
 name: skill-behavior-validation
 description: Replay a prior case to validate a skill's behavior change.
 version: 0.1.0
-author: Hermes Agent
+author: chelsealong, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:

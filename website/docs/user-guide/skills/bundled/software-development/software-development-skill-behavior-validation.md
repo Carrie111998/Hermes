@@ -17,7 +17,7 @@ Replay a prior case to validate a skill's behavior change.
 | Source | Bundled (installed by default) |
 | Path | `skills/software-development/skill-behavior-validation` |
 | Version | `0.1.0` |
-| Author | Hermes Agent |
+| Author | chelsealong, Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `skills`, `validation`, `review`, `replay`, `regression` |
