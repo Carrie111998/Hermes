@@ -37,7 +37,7 @@ _EXPLICIT_OBSERVATIONS_SECTION = re.compile(
 )
 
 _MEMORY_DEDUCTION_GUIDANCE = (
-    "## How to treat memory deductions\n"
+    "## Adhere to memory guidance\n"
     "IMPORTANT: If the implicit conclusions section concluded that the user has "
     "some kind of general preference, you should try to follow that preference "
     "in your interactions with them if you can."
