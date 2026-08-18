@@ -296,6 +296,14 @@ def _find_cli() -> Optional[List[str]]:
             direct = shutil.which("browser-use", path=probe_path)
             if direct:
                 return [direct]
+    # Sealed images must never turn a missing image dependency into an
+    # implicit uvx resolve/download at request time. A direct image-owned or
+    # user-installed binary remains valid; only the zero-install fallback is
+    # disabled. This keeps immutable runtimes deterministic and avoids
+    # misleading "available" detection when uvx itself exists but the tool
+    # is absent from its cache.
+    if is_truthy_value(os.getenv("HERMES_DISABLE_LAZY_INSTALLS"), default=False):
+        return None
     for probe_path in probe_paths:
         if probe_path is None or probe_path:
             uvx = shutil.which("uvx", path=probe_path)
@@ -606,7 +614,11 @@ def browser_exec(
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no
     # local Chrome/CDP endpoint is reachable (their API key authenticates it)
-    if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
+    if (
+        "BU_AUTOSPAWN" not in env
+        and not (env.get("BU_CDP_URL") or env.get("BU_CDP_WS"))
+        and is_legacy_browser_use_cloud_config(_read_browser_cfg())
+    ):
         env["BU_AUTOSPAWN"] = "1"
 
     try:

@@ -26,6 +26,7 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
     yield
 
 
@@ -196,6 +197,26 @@ class TestFindCli:
         )
         assert bu_cli._find_cli_unpatched() == ["/usr/local/bin/uvx", "browser-use"]
 
+    def test_sealed_runtime_does_not_treat_uvx_as_installed_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.setattr(
+            bu_cli.shutil,
+            "which",
+            lambda name, path=None: "/usr/local/bin/uvx" if name == "uvx" else None,
+        )
+        assert bu_cli._find_cli_unpatched() is None
+
+    def test_sealed_runtime_still_uses_direct_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.setattr(
+            bu_cli.shutil,
+            "which",
+            lambda name, path=None: "/opt/hermes/bin/browser-use"
+            if name == "browser-use"
+            else None,
+        )
+        assert bu_cli._find_cli_unpatched() == ["/opt/hermes/bin/browser-use"]
+
     def test_none_when_neither_available(self, monkeypatch):
         monkeypatch.setattr(bu_cli.shutil, "which", lambda name, path=None: None)
         assert bu_cli._find_cli_unpatched() is None
@@ -301,6 +322,23 @@ class TestLegacyCloudMigration:
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)"))
         assert "autospawn:1" in result["output"]
+
+    def test_resolved_cdp_suppresses_legacy_cloud_autospawn(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: self._LEGACY)
+        monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
+        cli = _fake_cli(
+            tmp_path,
+            'cat > /dev/null\necho "autospawn:[$BU_AUTOSPAWN] cdp:$BU_CDP_URL"\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        def resolve_local_cdp(env, task_id, session_name=""):
+            env["BU_CDP_URL"] = "http://127.0.0.1:9222"
+
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", resolve_local_cdp)
+        result = json.loads(bu_cli.browser_exec("print(1)"))
+        assert "autospawn:[]" in result["output"]
+        assert "cdp:http://127.0.0.1:9222" in result["output"]
 
     def test_explicit_backend_does_not_set_bu_autospawn(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
