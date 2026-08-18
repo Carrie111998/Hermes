@@ -53,6 +53,17 @@ class ConfidenceMemoryStore:
         except Exception:
             pass
         self.conn.executescript(SCHEMA)
+        self._secure_database_files()
+
+    def _secure_database_files(self) -> None:
+        """Keep memory data and SQLite sidecars readable only by the owner."""
+        for path in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ):
+            if path.exists():
+                path.chmod(0o600)
 
     def close(self) -> None:
         self.conn.close()

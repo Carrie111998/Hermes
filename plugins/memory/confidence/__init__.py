@@ -105,7 +105,7 @@ class ConfidenceMemoryProvider(MemoryProvider):
             logger.debug("Failed to save confidence memory config", exc_info=True)
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        hermes_home = str(get_hermes_home())
+        hermes_home = str(kwargs.get("hermes_home") or get_hermes_home())
         db_path = self._config.get("db_path") or "$HERMES_HOME/confidence_memory.db"
         if isinstance(db_path, str):
             db_path = db_path.replace("$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)

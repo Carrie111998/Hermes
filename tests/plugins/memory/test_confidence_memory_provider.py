@@ -1,4 +1,5 @@
 from datetime import timedelta
+import stat
 
 from plugins.memory import load_memory_provider
 from plugins.memory.confidence import ConfidenceMemoryProvider
@@ -14,6 +15,27 @@ def test_provider_is_discoverable():
     provider = load_memory_provider("confidence")
     assert isinstance(provider, ConfidenceMemoryProvider)
     assert provider.is_available()
+
+
+def test_provider_default_db_uses_injected_profile_home(tmp_path):
+    profile_home = tmp_path / "profiles" / "work"
+    provider = ConfidenceMemoryProvider(config={})
+
+    provider.initialize("session-1", hermes_home=str(profile_home))
+
+    assert provider._store is not None
+    assert provider._store.db_path == profile_home / "confidence_memory.db"
+    assert provider._store.db_path.exists()
+    provider.shutdown()
+
+
+def test_store_database_is_owner_only(tmp_path):
+    db_path = tmp_path / "confidence.db"
+
+    store = ConfidenceMemoryStore(db_path)
+
+    assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+    store.close()
 
 
 def test_store_confirmed_profile_injection_and_tentative_exclusion(tmp_path):
