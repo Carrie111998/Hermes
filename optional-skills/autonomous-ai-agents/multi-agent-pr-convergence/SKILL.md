@@ -60,6 +60,8 @@ Never use `idle`, `done`, process exit, or a pane label as a release state.
 3. Remove already-upstream scope before any writer starts. File true upstream
    regressions separately instead of rebuilding the same feature.
 4. Record the canonical repo, base SHA, classifications, and excluded scope.
+5. Repeat the upstream classification before **every candidate freeze**, not
+   only before the PR. A long implementation can become redundant mid-flight.
 
 Done when every requested behavior has evidence from current upstream and no
 writer is implementing a duplicate.
@@ -88,6 +90,13 @@ writer is implementing a duplicate.
 
 4. Quarantine unknown-writer artifacts. Preserve them for provenance, but never
    include internal registers or forensic packets in the product PR.
+5. Treat the packet as a writer lease: record writer identity, allowed paths,
+   lease epoch, and last heartbeat. Before each mutation, compare worktree state
+   with the last writer-owned snapshot. A foreign or unexplained delta revokes
+   the lease and returns the task to `BLOCKED / authority-unproven`.
+6. Freeze owner-approved scope as a versioned list. Scope changes require a new
+   explicit owner decision and packet version; checker comments alone cannot
+   silently expand or shrink the product request.
 
 Done when one writer, one worktree, one base, and one authority packet are
 unambiguous.
@@ -133,9 +142,12 @@ Run independent lanes in parallel on the exact candidate SHA:
   minimal diff.
 
 For stateful controllers, test the real lifecycle: create → snapshot → stage →
-multi-consumer → finalize → retry/overlap. Source regex tests may supplement but
-never replace mounted executable tests. For every repaired bug class, prove a
-mutation or revert makes the regression test fail.
+multi-consumer → finalize → retry/overlap. Include executable coverage for
+identity rename/re-key, teardown/disband, same-name recreation, multi-responder
+fan-out, attachment-only submission, and overlapping sends whenever those
+transitions exist. Source regex tests may supplement but never replace mounted
+executable tests. For every repaired bug class, prove a mutation or revert makes
+the regression test fail.
 
 Done when all required lanes independently report `PROVEN` on the same SHA, or
 one deduplicated blocker packet is returned.

@@ -70,6 +70,13 @@ def test_convergence_invariants_are_explicit():
         "mutation or revert",
         "Fetch the remote again",
         "merge_authorized",
+        "every candidate freeze",
+        "writer lease",
+        "lease epoch",
+        "explicit owner decision",
+        "identity rename/re-key",
+        "same-name recreation",
+        "overlapping sends",
     )
     for phrase in required:
         assert phrase in body, f"missing convergence invariant: {phrase}"
