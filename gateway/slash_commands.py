@@ -405,6 +405,12 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_homebase_status_command(self, event: MessageEvent) -> str:
+        """Handle /homebase-status without invoking the model."""
+        from hermes_cli.homebase_status import format_homebase_status
+
+        return await asyncio.to_thread(format_homebase_status)
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 

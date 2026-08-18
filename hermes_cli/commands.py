@@ -233,6 +233,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info",
                busy_policy="dispatch", execute="profile"),
+    CommandDef("homebase-status", "Show Wizard Tower gateway, UPS, disk, thermal, backup, Mainframe, and maintenance status", "Info",
+               busy_policy="dispatch"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",

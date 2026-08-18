@@ -811,6 +811,14 @@ class CLICommandsMixin:
         print(f"  Home:    {display}")
         print()
 
+    def _handle_homebase_status_command(self):
+        """Display the read-only Wizard Tower operational snapshot."""
+        from hermes_cli.homebase_status import format_homebase_status
+
+        print()
+        print(format_homebase_status())
+        print()
+
     def _handle_handoff_command(self, cmd_original: str) -> bool:
         """Handle ``/handoff <platform>`` — transfer this CLI session to a gateway platform.
 

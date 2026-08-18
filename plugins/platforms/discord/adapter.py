@@ -5900,6 +5900,10 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_status(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/status", "Status sent~")
 
+        @tree.command(name="homebase-status", description="Show Wizard Tower operational status")
+        async def slash_homebase_status(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/homebase-status")
+
         @tree.command(name="sethome", description="Set this chat as the home channel")
         async def slash_sethome(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/sethome")

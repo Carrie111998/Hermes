@@ -12029,6 +12029,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_whoami_command()
         elif canonical == "profile":
             self._handle_profile_command()
+        elif canonical == "homebase-status":
+            self._handle_homebase_status_command()
         elif canonical == "tools":
             self._handle_tools_command(cmd_original)
         elif canonical == "toolsets":

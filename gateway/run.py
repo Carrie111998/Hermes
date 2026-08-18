@@ -16486,6 +16486,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "help": self._handle_help_command,
                 "commands": self._handle_commands_command,
                 "profile": self._handle_profile_command,
+                "homebase-status": self._handle_homebase_status_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
             }.get(name)
@@ -17626,6 +17627,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
+
+        if canonical == "homebase-status":
+            return await self._handle_homebase_status_command(event)
 
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
