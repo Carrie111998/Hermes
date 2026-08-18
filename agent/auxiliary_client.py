@@ -3944,24 +3944,15 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
 def _inherit_provider_preferences(
     extra_body: Dict[str, Any],
     main_runtime: Dict[str, Any],
-    request_provider: str,
     client: Any,
-    base_url: str,
 ) -> None:
-    """Apply the main routing policy to aggregator aux calls unless overridden."""
+    """Apply the main routing policy to OpenRouter calls unless overridden."""
     provider_preferences = main_runtime.get("provider_preferences")
     if (
         isinstance(provider_preferences, dict)
         and provider_preferences
         and "provider" not in extra_body
-        and not isinstance(
-            client, (AnthropicAuxiliaryClient, AsyncAnthropicAuxiliaryClient)
-        )
-        and (
-            _is_openrouter_client(client)
-            or request_provider == "nous"
-            or base_url_host_matches(base_url, "inference-api.nousresearch.com")
-        )
+        and _is_openrouter_client(client)
     ):
         extra_body["provider"] = copy.deepcopy(provider_preferences)
 
@@ -5106,9 +5097,7 @@ def _call_fallback_candidate_sync(
     _inherit_provider_preferences(
         fallback_extra_body,
         main_runtime or {},
-        destination.provider,
         fb_client,
-        destination.base_url,
     )
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
@@ -5156,9 +5145,7 @@ def _call_fallback_candidate_sync(
                 _inherit_provider_preferences(
                     retry_extra_body,
                     main_runtime or {},
-                    retry_destination.provider,
                     retry_client,
-                    retry_destination.base_url,
                 )
                 retry_kwargs = _build_call_kwargs(
                     retry_destination.provider,
@@ -5229,9 +5216,7 @@ async def _call_fallback_candidate_async(
     _inherit_provider_preferences(
         fallback_extra_body,
         main_runtime or {},
-        destination.provider,
         fb_client,
-        destination.base_url,
     )
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
@@ -5280,9 +5265,7 @@ async def _call_fallback_candidate_async(
                 _inherit_provider_preferences(
                     retry_extra_body,
                     main_runtime or {},
-                    retry_destination.provider,
                     retry_client,
-                    retry_destination.base_url,
                 )
                 retry_kwargs = _build_call_kwargs(
                     retry_destination.provider,
@@ -9387,7 +9370,7 @@ def _call_llm_impl(
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     primary_extra_body = copy.deepcopy(effective_extra_body)
     _inherit_provider_preferences(
-        primary_extra_body, main_runtime, request_provider, client, _base_info
+        primary_extra_body, main_runtime, client
     )
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
@@ -10181,7 +10164,7 @@ async def _async_call_llm_impl(
     _client_base = str(getattr(client, "base_url", "") or "")
     primary_extra_body = copy.deepcopy(effective_extra_body)
     _inherit_provider_preferences(
-        primary_extra_body, main_runtime, request_provider, client, _client_base
+        primary_extra_body, main_runtime, client
     )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,

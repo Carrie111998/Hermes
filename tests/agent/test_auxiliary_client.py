@@ -2293,14 +2293,12 @@ class TestAuxiliaryTaskExtraBody:
         _inherit_provider_preferences(
             extra_body,
             {"provider_preferences": {"ignore": ["digitalocean"]}},
-            "nous",
             client,
-            client.base_url,
         )
 
         assert "provider" not in extra_body
 
-    def test_nous_chat_completions_route_inherits_provider_routing(self):
+    def test_nous_chat_completions_route_omits_provider_routing(self):
         from agent.auxiliary_client import _inherit_provider_preferences
 
         client = MagicMock()
@@ -2310,12 +2308,10 @@ class TestAuxiliaryTaskExtraBody:
         _inherit_provider_preferences(
             extra_body,
             {"provider_preferences": {"ignore": ["digitalocean"]}},
-            "nous",
             client,
-            client.base_url,
         )
 
-        assert extra_body["provider"] == {"ignore": ["digitalocean"]}
+        assert "provider" not in extra_body
 
     def test_sync_call_inherits_main_provider_routing_for_openrouter(self):
         client = MagicMock()
