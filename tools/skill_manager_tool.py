@@ -1449,6 +1449,13 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     if decision.blocked:
         return tool_error(decision.message, success=False)
 
+    # Validate BEFORE staging so invalid skill content is rejected immediately
+    # instead of failing later when an approval replays the staged write.
+    if action in {"create", "edit"} and payload_kwargs.get("content"):
+        err = _validate_frontmatter(payload_kwargs["content"], new_skill=(action == "create"))
+        if err:
+            return tool_error(err, success=False)
+
     # stage — record the full skill_manage kwargs so approval can replay it.
     payload = {"action": action, "name": name}
     payload.update({k: v for k, v in payload_kwargs.items() if v is not None})

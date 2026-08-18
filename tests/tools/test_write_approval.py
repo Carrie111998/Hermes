@@ -145,6 +145,28 @@ _SKILL = (
 )
 
 
+def test_invalid_skill_is_rejected_before_staging(hermes_home):
+    """An invalid skill must fail immediately, not sit in pending until approval."""
+    from tools.skill_manager_tool import skill_manage
+    from tools import write_approval as wa
+
+    _set_approval("skills", True)
+    long_description = "Use when " + "doing a very specific deployment task " * 8
+    invalid_skill = (
+        "---\n"
+        "name: invalid-skill\n"
+        f"description: {long_description}\n"
+        "---\n\n"
+        "# Invalid\nbody\n"
+    )
+
+    result = json.loads(skill_manage("create", "invalid-skill", content=invalid_skill))
+
+    assert result["success"] is False
+    assert "60-char system-prompt budget" in result["error"]
+    assert wa.pending_count("skills") == 0
+
+
 # ---------------------------------------------------------------------------
 # Pending store CRUD
 # ---------------------------------------------------------------------------
