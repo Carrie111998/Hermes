@@ -416,8 +416,8 @@ class XAIVideoGenProvider(VideoGenProvider):
         except Exception:
             storage_notice = ""
         tag = (
-            "grok-imagine-video for text/reference; "
-            "grok-imagine-video-1.5 for image-to-video; "
+            "grok-imagine-video for legacy text/reference; "
+            "grok-imagine-video-1.5 for 1080p text/image; "
             "edit/extend: pass the stored public HTTPS MP4 (`video` / "
             "`public_url` from a prior Imagine result); uses xAI Grok OAuth "
             "or XAI_API_KEY"
