@@ -3393,21 +3393,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3438,6 +3423,20 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # Check idempotency after BEGIN IMMEDIATE so concurrent
+                # creators serialize before either can insert a duplicate.
+                # Archived rows intentionally do not satisfy the lookup: an
+                # archived request may be created again.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -4614,6 +4613,114 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _case_insensitive_filesystem(path: str) -> bool:
+    """Return whether the volume containing ``path`` aliases by case.
+
+    Missing workspace paths cannot be compared with ``samefile`` directly.
+    On macOS, ``pathconf(_PC_CASE_SENSITIVE)`` reports the case policy of the
+    volume containing the nearest existing ancestor. This matters for a
+    mounted case-sensitive volume below a case-insensitive ``/Volumes``
+    namespace: probing the mountpoint's spelling would report the parent
+    namespace instead of the mounted volume. Other platforms retain the
+    bounded samefile probe as a conservative fallback.
+    """
+    probe = os.path.abspath(path)
+    for _ in range(64):
+        if os.path.exists(probe):
+            break
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return False
+        probe = parent
+
+    if sys.platform == "darwin":
+        try:
+            # Darwin exposes _PC_CASE_SENSITIVE as pathconf name 11. Python's
+            # os.pathconf_names omits Darwin-only names, but the integer API
+            # remains available and returns 1 for case-sensitive volumes.
+            case_sensitive = os.pathconf(probe, 11)
+            if case_sensitive in (0, 1):
+                return case_sensitive == 0
+        except (OSError, ValueError):
+            pass
+
+    for _ in range(64):
+        if os.path.exists(probe):
+            name = os.path.basename(os.path.normpath(probe))
+            alternate_name = name.swapcase()
+            if alternate_name != name:
+                alternate = os.path.join(
+                    os.path.dirname(probe), alternate_name,
+                )
+                try:
+                    return os.path.samefile(probe, alternate)
+                except OSError:
+                    return False
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return False
+
+
+def _canonical_explicit_workspace(path: Optional[str]) -> Optional[frozenset[tuple]]:
+    """Canonicalize a persistent workspace for collision checks only.
+
+    ``realpath`` deliberately uses ``strict=False`` semantics: a deleted
+    workspace still compares equal by its path, and symlink aliases resolve to
+    the same target. Existing paths also carry their filesystem identity so
+    case aliases compare equal on case-insensitive filesystems without
+    folding paths on case-sensitive filesystems. The stored user path is
+    never rewritten.
+    """
+    if not path:
+        return None
+    try:
+        canonical = os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(path)))
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+    identities: set[tuple] = {("path", canonical)}
+    try:
+        stat = os.stat(canonical)
+    except OSError:
+        stat = None
+    if stat is not None and stat.st_dev and stat.st_ino:
+        identities.add(("inode", int(stat.st_dev), int(stat.st_ino)))
+    elif _case_insensitive_filesystem(canonical):
+        identities.add(("casefolded-path", canonical.casefold()))
+    return frozenset(identities)
+
+
+def _workspace_conflict_task_id(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the active writer occupying a candidate's persistent workspace."""
+    candidate = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks "
+        "WHERE id = ? AND status IN ('ready', 'review') AND claim_lock IS NULL",
+        (task_id,),
+    ).fetchone()
+    if candidate is None or candidate["workspace_kind"] == "scratch":
+        return None
+    candidate_path = _canonical_explicit_workspace(candidate["workspace_path"])
+    if candidate_path is None:
+        return None
+
+    active = conn.execute(
+        "SELECT id, workspace_path FROM tasks "
+        "WHERE id != ? AND status = 'running' AND claim_lock IS NOT NULL "
+        "AND workspace_kind != 'scratch' AND workspace_path IS NOT NULL",
+        (task_id,),
+    ).fetchall()
+    for row in active:
+        active_path = _canonical_explicit_workspace(row["workspace_path"])
+        if active_path is not None and candidate_path & active_path:
+            return row["id"]
+    return None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4653,6 +4760,15 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
+            )
+            return None
+        conflict_task_id = _workspace_conflict_task_id(conn, task_id)
+        if conflict_task_id is not None:
+            _append_event(
+                conn,
+                task_id,
+                "workspace_busy",
+                {"conflicting_task_id": conflict_task_id},
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -4774,6 +4890,15 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        conflict_task_id = _workspace_conflict_task_id(conn, task_id)
+        if conflict_task_id is not None:
+            _append_event(
+                conn,
+                task_id,
+                "workspace_busy",
+                {"conflicting_task_id": conflict_task_id},
+            )
             return None
         cur = conn.execute(
             """
@@ -8049,6 +8174,9 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    workspace_busy: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks deferred because an active writer holds the same canonical
+    persistent workspace, as ``(task_id, conflicting_task_id)`` pairs."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -10215,17 +10343,20 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        workspace_conflict = _workspace_conflict_task_id(conn, row["id"])
+        if workspace_conflict is not None:
+            result.workspace_busy.append((row["id"], workspace_conflict))
         if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
-            spawned += 1
-            # Increment per-profile counter even in dry_run so the cap
-            # check sees the would-be spawn on subsequent iterations.
-            # Without this, dry_run reports every task as spawnable and
-            # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
-                )
+            if workspace_conflict is None:
+                result.spawned.append((row["id"], row_assignee, ""))
+                # Increment per-profile counter even in dry_run so the cap
+                # check sees the would-be spawn on subsequent iterations.
+                # Without this, dry_run reports every task as spawnable and
+                # under-reports the capped subset (#21582).
+                if _per_profile_cap is not None and row_assignee:
+                    _per_profile_running[row_assignee] = (
+                        _per_profile_running.get(row_assignee, 0) + 1
+                    )
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -10328,6 +10459,18 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        workspace_conflict = _workspace_conflict_task_id(conn, row["id"])
+        if workspace_conflict is not None:
+            result.workspace_busy.append((row["id"], workspace_conflict))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "workspace_busy",
+                        {"conflicting_task_id": workspace_conflict},
+                    )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)

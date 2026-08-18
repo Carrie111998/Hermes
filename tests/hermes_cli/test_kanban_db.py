@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -170,6 +171,540 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
+def test_concurrent_idempotent_creators_return_one_non_archived_task(
+    kanban_home, monkeypatch,
+):
+    """Concurrent creators must converge on one task inside the write txn."""
+    ready = threading.Barrier(2)
+    original_new_task_id = kb._new_task_id
+
+    def synchronized_new_task_id():
+        ready.wait(timeout=5)
+        return original_new_task_id()
+
+    monkeypatch.setattr(kb, "_new_task_id", synchronized_new_task_id)
+
+    def create_one():
+        conn = kb.connect()
+        try:
+            return kb.create_task(
+                conn,
+                title="same request",
+                assignee="worker",
+                tenant="tenant-a",
+                idempotency_key="request-123",
+            )
+        finally:
+            conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        task_ids = list(pool.map(lambda _unused: create_one(), range(2)))
+
+    assert task_ids[0] == task_ids[1]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived'",
+            ("request-123",),
+        ).fetchone()[0] == 1
+
+
+def test_archived_idempotency_key_can_be_created_again(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="archived request",
+            assignee="worker",
+            idempotency_key="archive-and-retry",
+        )
+        assert kb.claim_task(conn, first, claimer="writer:first") is not None
+        assert kb.complete_task(conn, first, result="done") is True
+        assert kb.archive_task(conn, first) is True
+
+        second = kb.create_task(
+            conn,
+            title="retried request",
+            assignee="worker",
+            idempotency_key="archive-and-retry",
+        )
+        assert second != first
+        second_task = kb.get_task(conn, second)
+        assert second_task is not None
+        assert second_task.status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Claim / workspace isolation
+# ---------------------------------------------------------------------------
+def test_claim_defers_second_writer_on_same_explicit_workspace(
+    kanban_home, tmp_path,
+):
+    shared = tmp_path / "shared-workspace"
+    shared.mkdir()
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="first writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn,
+            title="second writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+
+        assert kb.claim_task(conn, first, claimer="writer:first") is not None
+        assert kb.claim_task(conn, second, claimer="writer:second") is None
+        second_task = kb.get_task(conn, second)
+        assert second_task is not None
+        assert second_task.status == "ready"
+        assert second_task.consecutive_failures == 0
+        events = kb.list_events(conn, second)
+        busy = [event for event in events if event.kind == "workspace_busy"]
+        assert len(busy) == 1
+        assert busy[0].payload == {"conflicting_task_id": first}
+
+
+def test_case_aliases_conflict_on_case_insensitive_filesystem(
+    kanban_home, tmp_path,
+):
+    target = tmp_path / "CaseProbe"
+    target.mkdir()
+    alias = tmp_path / "caseprobe"
+    if not os.path.exists(alias):
+        pytest.skip("filesystem is case-sensitive")
+    assert os.path.samefile(target, alias)
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="case-sensitive spelling",
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        second = kb.create_task(
+            conn,
+            title="case-alias spelling",
+            workspace_kind="dir",
+            workspace_path=str(alias),
+        )
+
+        assert kb.claim_task(conn, first, claimer="writer:first") is not None
+        assert kb.claim_task(conn, second, claimer="writer:second") is None
+        second_task = kb.get_task(conn, second)
+        assert second_task is not None
+        assert second_task.status == "ready"
+
+
+def test_deleted_case_aliases_conflict_on_case_insensitive_filesystem(
+    kanban_home, tmp_path,
+):
+    target = tmp_path / "DeletedCaseProbe"
+    target.mkdir()
+    alias = tmp_path / "deletedcaseprobe"
+    if not os.path.exists(alias):
+        pytest.skip("filesystem is case-sensitive")
+    assert os.path.samefile(target, alias)
+    target.rmdir()
+    assert not target.exists()
+    assert not alias.exists()
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="deleted case-sensitive spelling",
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        second = kb.create_task(
+            conn,
+            title="deleted case-alias spelling",
+            workspace_kind="dir",
+            workspace_path=str(alias),
+        )
+
+        assert kb.claim_task(conn, first, claimer="writer:first") is not None
+        assert kb.claim_task(conn, second, claimer="writer:second") is None
+        second_task = kb.get_task(conn, second)
+        assert second_task is not None
+        assert second_task.status == "ready"
+
+
+def test_dispatch_reports_workspace_busy_without_claiming_second_writer(
+    kanban_home, tmp_path, monkeypatch,
+):
+    shared = tmp_path / "shared-workspace"
+    shared.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="first writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn,
+            title="second writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        assert kb.claim_task(conn, first, claimer="writer:first") is not None
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail(
+                "workspace-busy task must not spawn"
+            ),
+        )
+
+        assert result.workspace_busy == [(second, first)]
+        second_task = kb.get_task(conn, second)
+        assert second_task is not None
+        assert second_task.status == "ready"
+
+
+def test_direct_review_claim_defers_on_busy_workspace(kanban_home, tmp_path):
+    shared = tmp_path / "shared-review-workspace"
+    shared.mkdir()
+
+    with kb.connect() as conn:
+        writer = kb.create_task(
+            conn,
+            title="first writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        review = kb.create_task(
+            conn,
+            title="review task",
+            assignee="critic",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+
+        assert kb.claim_task(conn, writer, claimer="writer:first") is not None
+        assert kb.claim_review_task(conn, review, claimer="critic:review") is None
+
+        review_task = kb.get_task(conn, review)
+        assert review_task is not None
+        assert review_task.status == "review"
+        assert review_task.consecutive_failures == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (review,)
+        ).fetchone()[0] == 0
+        busy = [
+            event for event in kb.list_events(conn, review)
+            if event.kind == "workspace_busy"
+        ]
+        assert len(busy) == 1
+        assert busy[0].payload == {"conflicting_task_id": writer}
+
+
+def test_review_dispatch_defers_on_busy_workspace_without_spawning(
+    kanban_home, tmp_path, monkeypatch,
+):
+    shared = tmp_path / "shared-review-workspace"
+    shared.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+
+    with kb.connect() as conn:
+        writer = kb.create_task(
+            conn,
+            title="first writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        review = kb.create_task(
+            conn,
+            title="review task",
+            assignee="critic",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+        assert kb.claim_task(conn, writer, claimer="writer:first") is not None
+
+        spawned: list[str] = []
+
+        def spawn(task, _workspace):
+            spawned.append(task.id)
+            return 12345
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+        assert result.workspace_busy == [(review, writer)]
+        assert spawned == []
+        review_task = kb.get_task(conn, review)
+        assert review_task is not None
+        assert review_task.status == "review"
+        assert review_task.consecutive_failures == 0
+
+
+def test_review_dispatch_claims_after_writer_completion(
+    kanban_home, tmp_path, monkeypatch,
+):
+    shared = tmp_path / "shared-review-workspace"
+    shared.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+
+    with kb.connect() as conn:
+        writer = kb.create_task(
+            conn,
+            title="first writer",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        review = kb.create_task(
+            conn,
+            title="review task",
+            assignee="critic",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+        assert kb.claim_task(conn, writer, claimer="writer:first") is not None
+        assert kb.complete_task(conn, writer, result="done") is True
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: 12345,
+        )
+
+        assert result.workspace_busy == []
+        assert result.spawned == [(review, "critic", str(shared))]
+        review_task = kb.get_task(conn, review)
+        assert review_task is not None
+        assert review_task.status == "running"
+
+
+def test_case_sensitive_existing_missing_and_deleted_variants_remain_distinct(
+    kanban_home, tmp_path,
+):
+    existing = tmp_path / "CaseProbe"
+    existing.mkdir()
+    existing_alias = tmp_path / "caseprobe"
+    if os.path.exists(existing_alias):
+        pytest.skip("filesystem is case-insensitive")
+
+    missing = tmp_path / "MissingCaseProbe"
+    missing_alias = tmp_path / "missingcaseprobe"
+    deleted = tmp_path / "DeletedCaseProbe"
+    deleted.mkdir()
+    deleted_alias = tmp_path / "deletedcaseprobe"
+    deleted.rmdir()
+    assert not deleted.exists()
+    assert not deleted_alias.exists()
+
+    with kb.connect() as conn:
+        existing_task = kb.create_task(
+            conn,
+            title="existing case-sensitive spelling",
+            workspace_kind="dir",
+            workspace_path=str(existing),
+        )
+        existing_alias_task = kb.create_task(
+            conn,
+            title="existing case-distinct spelling",
+            workspace_kind="dir",
+            workspace_path=str(existing_alias),
+        )
+        missing_task = kb.create_task(
+            conn,
+            title="missing case-sensitive spelling",
+            workspace_kind="dir",
+            workspace_path=str(missing),
+        )
+        missing_alias_task = kb.create_task(
+            conn,
+            title="missing case-distinct spelling",
+            workspace_kind="dir",
+            workspace_path=str(missing_alias),
+        )
+        deleted_task = kb.create_task(
+            conn,
+            title="deleted case-sensitive spelling",
+            workspace_kind="dir",
+            workspace_path=str(deleted),
+        )
+        deleted_alias_task = kb.create_task(
+            conn,
+            title="deleted case-distinct spelling",
+            workspace_kind="dir",
+            workspace_path=str(deleted_alias),
+        )
+
+        for task_id in (
+            existing_task,
+            existing_alias_task,
+            missing_task,
+            missing_alias_task,
+            deleted_task,
+            deleted_alias_task,
+        ):
+            assert kb.claim_task(conn, task_id, claimer=f"writer:{task_id}") is not None
+
+
+def test_workspace_alias_and_deleted_paths_still_conflict(
+    kanban_home, tmp_path,
+):
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    deleted = tmp_path / "deleted"
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="symlink target",
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        second = kb.create_task(
+            conn,
+            title="symlink alias",
+            workspace_kind="dir",
+            workspace_path=str(alias),
+        )
+        assert kb.claim_task(conn, first, claimer="writer:first") is not None
+        assert kb.claim_task(conn, second, claimer="writer:second") is None
+
+        third = kb.create_task(
+            conn,
+            title="deleted workspace",
+            workspace_kind="dir",
+            workspace_path=str(deleted),
+        )
+        fourth = kb.create_task(
+            conn,
+            title="same deleted workspace",
+            workspace_kind="dir",
+            workspace_path=str(deleted),
+        )
+        assert kb.claim_task(conn, third, claimer="writer:third") is not None
+        assert not deleted.exists()
+        assert kb.claim_task(conn, fourth, claimer="writer:fourth") is None
+
+
+def test_different_workspaces_and_boards_remain_claimable(
+    kanban_home, tmp_path,
+):
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="first workspace",
+            workspace_kind="dir",
+            workspace_path=str(first_workspace),
+        )
+        second = kb.create_task(
+            conn,
+            title="second workspace",
+            workspace_kind="dir",
+            workspace_path=str(second_workspace),
+        )
+        assert kb.claim_task(conn, first, claimer="writer:first") is not None
+        assert kb.claim_task(conn, second, claimer="writer:second") is not None
+
+    board_a = tmp_path / "board-a.db"
+    board_b = tmp_path / "board-b.db"
+    kb.init_db(board_a)
+    kb.init_db(board_b)
+    with kb.connect(board_a) as conn_a, kb.connect(board_b) as conn_b:
+        task_a = kb.create_task(
+            conn_a,
+            title="board a",
+            workspace_kind="dir",
+            workspace_path=str(first_workspace),
+            idempotency_key="same-key-on-each-board",
+        )
+        task_b = kb.create_task(
+            conn_b,
+            title="board b",
+            workspace_kind="dir",
+            workspace_path=str(first_workspace),
+            idempotency_key="same-key-on-each-board",
+        )
+        assert task_a != task_b
+        assert kb.claim_task(conn_a, task_a, claimer="writer:a") is not None
+        assert kb.claim_task(conn_b, task_b, claimer="writer:b") is not None
+
+
+def test_completed_writer_releases_workspace_for_dependent_critic(
+    kanban_home, tmp_path,
+):
+    shared = tmp_path / "shared-workspace"
+    shared.mkdir()
+
+    with kb.connect() as conn:
+        writer = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        critic = kb.create_task(
+            conn,
+            title="independent verification",
+            assignee="critic",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+            parents=[writer],
+        )
+        assert kb.claim_task(conn, writer, claimer="writer:implementation") is not None
+        assert kb.complete_task(conn, writer, result="implementation complete") is True
+        critic_task = kb.get_task(conn, critic)
+        assert critic_task is not None
+        assert critic_task.status == "ready"
+        assert kb.claim_task(conn, critic, claimer="critic:verification") is not None
+
+
+# ---------------------------------------------------------------------------
+# Test isolation
+# ---------------------------------------------------------------------------
+def test_kanban_smoke_uses_temp_board_without_touching_live_board(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    live_board = Path(os.path.expanduser("~")) / ".hermes" / "kanban.db"
+    before = (
+        (live_board.exists(), live_board.stat().st_size, live_board.stat().st_mtime_ns)
+        if live_board.exists()
+        else (False, None, None)
+    )
+
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="isolated smoke")
+        assert kb.get_task(conn, task_id) is not None
+
+    temp_board = kb.kanban_db_path().resolve()
+    assert temp_board.is_relative_to(home.resolve())
+    after = (
+        (live_board.exists(), live_board.stat().st_size, live_board.stat().st_mtime_ns)
+        if live_board.exists()
+        else (False, None, None)
+    )
+    assert after == before
 
 
 # ---------------------------------------------------------------------------
