@@ -245,9 +245,14 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
-    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
-    reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
-    datetime/locale-sensitive tests are deterministic.
+    Redirects HERMES_HOME to a per-test tempdir so code that reads
+    ``~/.hermes/*`` via ``get_hermes_home()`` can't touch the real one, and
+    pins TZ/LANG so datetime/locale-sensitive tests are deterministic.
+
+    Does NOT redirect HOME -- see the note in step 3 below. Anything reading
+    the real home by another route (``expanduser("~")``, ``Path.home()``,
+    ``~/.ssh``, ``~/.zshrc``) is NOT isolated by this fixture and must set
+    HOME in its own fixture. ``tests/security/conftest.py`` does exactly that.
     """
     # 1. Blank every credential-shaped env var that's currently set.
     for name in list(os.environ.keys()):

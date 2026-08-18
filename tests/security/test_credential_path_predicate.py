@@ -94,16 +94,18 @@ def test_denies_hermes_home_env(tmp_path, monkeypatch):
     assert is_credential_read_denied(str(tmp_path / ".env")) is True
 
 
-def test_denies_ssh_directory_contents(tmp_path):
-    home = os.path.realpath(os.path.expanduser("~"))
+def test_denies_ssh_directory_contents(_hermetic_credential_environment):
+    """Uses the synthetic home explicitly, so hermeticity is stated rather
+    than inherited by accident from the autouse fixture."""
+    home = os.path.realpath(str(_hermetic_credential_environment))
     assert is_credential_read_denied(os.path.join(home, ".ssh", "id_rsa")) is True
     assert is_credential_read_denied(os.path.join(home, ".aws", "credentials")) is True
 
 
 @pytest.mark.parametrize("rel", [".bashrc", ".zshrc", ".profile", ".zprofile"])
-def test_shell_rc_files_stay_readable(rel):
+def test_shell_rc_files_stay_readable(rel, _hermetic_credential_environment):
     """C1's accepted cost, asserted so it cannot regress silently."""
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = os.path.realpath(str(_hermetic_credential_environment))
     assert is_credential_read_denied(os.path.join(home, rel)) is False
 
 
