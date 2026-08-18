@@ -450,6 +450,12 @@ async def test_session_chat_stream_treats_pre_existing_poisoned_row_as_no_model(
                 json={"message": "hi"},
             )
             assert resp.status == 200
+            # Drain the SSE body: the client sees status 200 as soon as
+            # headers are prepared (response.prepare()), which races the
+            # background _run_and_signal() task that actually invokes
+            # _run_agent(). Every other SSE test in this file reads the
+            # body before asserting on the mock, for the same reason.
+            await resp.text()
 
     _, kwargs = mock_run.call_args
     assert kwargs["session_model"] is None

@@ -30,6 +30,7 @@ Nothing in this module touches the agent's system prompt or toolset.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -666,12 +667,30 @@ _DB_CACHE: Dict[str, Any] = {}
 _DB_BOOTSTRAP_LOCK = threading.Lock()
 _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
 
+# Persistent (never torn down) worker pool for off-loop SessionDB bootstrap.
+# A bare ``threading.Thread(...).start()`` per cold-cache miss pays OS
+# thread-creation cost on the critical path of the grace window below --
+# under scheduler contention (busy CI hosts, pytest-xdist workers competing
+# for CPU) that creation latency alone can eat the whole window before
+# SessionDB.__init__ ever starts, degrading a perfectly healthy DB to None
+# (observed as intermittent goal-persistence loss under CI load). Reusing
+# pooled worker threads removes that variable from the race: once warm, a
+# submitted bootstrap starts executing immediately instead of waiting on
+# thread creation/scheduling.
+_DB_BOOTSTRAP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="goals-sessiondb-bootstrap"
+)
+
 # How long a loop-thread caller waits for the background bootstrap before
 # degrading to None. Normal SessionDB init is ~10-100ms, so the common case
 # still returns a real DB (no silently dropped goal writes); a contended
 # init (locked state.db mid-migration) blows past this and the caller
-# degrades, with the loop stalled far under the watchdog's probe window.
-_DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
+# degrades, with the loop stalled far under the watchdog's probe window
+# (DEFAULT_LOOP_WATCHDOG_TIMEOUT_S=10s x DEFAULT_LOOP_WATCHDOG_MAX_STRIKES=3
+# in gateway/shutdown_watchdog.py). 0.6s keeps a wide safety margin below
+# that while giving the (now pool-warmed) bootstrap materially more
+# breathing room than the original 0.25s afforded under load.
+_DB_BOOTSTRAP_LOOP_WAIT_S = 0.6
 
 
 def _bootstrap_session_db(home: str, done: threading.Event) -> None:
@@ -739,12 +758,7 @@ def _get_session_db() -> Optional[Any]:
             if done is None:
                 done = threading.Event()
                 _DB_BOOTSTRAP_INFLIGHT[home] = done
-                threading.Thread(
-                    target=_bootstrap_session_db,
-                    args=(home, done),
-                    name="goals-sessiondb-bootstrap",
-                    daemon=True,
-                ).start()
+                _DB_BOOTSTRAP_EXECUTOR.submit(_bootstrap_session_db, home, done)
         # Grace window: a healthy init finishes in tens of ms, so waiting
         # briefly keeps goal/heartbeat persistence working on the very first
         # loop-thread call instead of silently dropping it. A contended init
