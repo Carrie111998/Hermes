@@ -5,10 +5,16 @@ services:
     runtime: python
     plan: starter
     buildCommand: uv sync --frozen --extra web
-    startCommand: uv run uvicorn hermes_cli.web_server:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
+    startCommand: uv run hermes gateway run --no-supervise
+    healthCheckPath: /v1/models
     envVars:
-      - key: LIN_HERMES_RUNTIME_TOKEN
+      - key: API_SERVER_ENABLED
+        value: "true"
+      - key: API_SERVER_HOST
+        value: 0.0.0.0
+      - key: API_SERVER_PORT
+        value: "$PORT"
+      - key: API_SERVER_KEY
         sync: false
       - key: HERMES_HOME
         value: /var/data/hermes
