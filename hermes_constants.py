@@ -869,13 +869,19 @@ def find_node_executable(command: str) -> str | None:
     This is for Hermes-owned subprocesses that should not be broken by a bad,
     missing, or elevation-triggering system Node/npm on PATH. When a managed
     tree exists but cannot be healed, returns ``None`` instead of falling back
-    to system npm on PATH.
+    to system npm on PATH — UNLESS the requested command (like npm) is completely
+    absent from the managed tree, in which case we fall back to system PATH.
     """
     managed = find_hermes_node_executable(command)
     if managed:
         return managed
     if hermes_managed_node_tree_present():
-        return None
+        # Only block if the specific command binary is present in the managed tree but broken
+        names = set(_candidate_node_command_names(command))
+        for directory in iter_hermes_node_dirs():
+            for name in names:
+                if (directory / name).is_file():
+                    return None
     return find_node_executable_on_path(command)
 
 
