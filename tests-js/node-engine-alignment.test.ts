@@ -19,7 +19,8 @@ function readJson<T>(relativePath: string): T {
 }
 
 function parseVersion(version: string): [number, number, number] {
-  const [major = 0, minor = 0, patch = 0] = version.split('-', 1)[0].split('.').map(Number)
+  assert.match(version, /^\d+(?:\.\d+){0,2}$/, `unsupported semver version: ${version}`)
+  const [major = 0, minor = 0, patch = 0] = version.split('.').map(Number)
   return [major, minor, patch]
 }
 
@@ -36,6 +37,7 @@ function compare(left: string, right: string): number {
 }
 
 function satisfiesClause(version: string, clause: string): boolean {
+  assert.match(clause, /^(?:\^|>=|<=|>|<|=)?\d+(?:\.\d+){0,2}$/, `unsupported semver clause: ${clause}`)
   if (clause.startsWith('^')) {
     const bound = clause.slice(1)
     return parseVersion(version)[0] === parseVersion(bound)[0] && compare(version, bound) >= 0
@@ -95,4 +97,11 @@ describe('Node engine alignment', () => {
     assert.equal(nodeRange(lockfile.packages?.[''] ?? {}, 'root lock entry'), rootRange)
     assert.equal(nodeRange(lockfile.packages?.['apps/desktop'] ?? {}, 'desktop lock entry'), desktopRange)
   })
+
+  test.each(['~22.22.0', '22.x', '>=26.0.0-rc.1'])(
+    'the alignment helper rejects unsupported semver clause %s instead of misclassifying it',
+    clause => {
+      assert.throws(() => satisfiesRange('26.0.0', clause), /unsupported semver clause/)
+    }
+  )
 })
