@@ -29,6 +29,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
   ConfirmDialog,
+  CopyButton,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -7978,7 +7979,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
                   return jsxs('div', {
                     className: cn(
-                      'flex items-start gap-2',
+                      'group flex items-start gap-2',
                       isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1'
                     ),
                     children: [
@@ -7998,7 +7999,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                         className: 'min-w-0 flex-1',
                         children: [
                           jsxs('div', {
-                            className: 'flex items-baseline gap-2',
+                            className: 'flex items-center gap-2',
                             children: [
                               isUser
                                 ? jsx('span', {
@@ -8016,7 +8017,19 @@ function GroupChatWorkspace({ group, members, onBack }) {
                               jsx('span', {
                                 className: 'text-[0.625rem] text-(--ui-text-quaternary)',
                                 children: relativeTime(entry.at)
-                              })
+                              }),
+                              entry.text.trim()
+                                ? jsx('div', {
+                                    className:
+                                      'ml-auto shrink-0 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100',
+                                    children: jsx(CopyButton, {
+                                      appearance: 'icon',
+                                      buttonSize: 'icon',
+                                      stopPropagation: true,
+                                      text: entry.text
+                                    })
+                                  })
+                                : null
                             ]
                           }),
                           jsx('div', {
