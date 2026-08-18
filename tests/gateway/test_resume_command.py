@@ -883,3 +883,103 @@ class TestSameMatrixRoomThreadScoping:
         caller = self._msrc(thread_id="thread-a")
         victim_origin = self._msrc(thread_id="thread-b")
         assert runner._same_matrix_room(caller, victim_origin) is False
+
+
+# ---------------------------------------------------------------------------
+# Regression: /resume ordering + pre-filter widening (#88222)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeOrderingAndPrefilterLimit:
+    """Regression for #88222: /resume must order by last-active and widen the
+    pre-filter limit so untitled session_switch shells cannot starve titled
+    rows out of the 10-row window."""
+
+    @pytest.mark.asyncio
+    async def test_list_passes_order_by_last_active_true(self):
+        """The _list_titled_sessions helper must ask the session DB to sort by
+        last-active (matching the desktop TUI / web dashboard / CLI search)."""
+        runner = _make_runner(session_db=MagicMock())
+        # Wrap AsyncSessionDB.list_sessions_rich in an AsyncMock that we can
+        # inspect after the call.
+        runner._session_db.list_sessions_rich = AsyncMock(return_value=[])
+
+        event = _make_event(text="/resume")
+        await runner._handle_resume_command(event)
+
+        runner._session_db.list_sessions_rich.assert_awaited()
+        kwargs = runner._session_db.list_sessions_rich.await_args.kwargs
+        assert kwargs.get("order_by_last_active") is True, (
+            "/resume must sort by last-active, matching the desktop TUI / "
+            "dashboard / CLI search. Got: %r" % (kwargs,)
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_passes_widened_pre_filter_limit(self):
+        """The pre-filter limit must be wider than the visible 10-row window
+        so untitled session_switch shells do not consume slots and starve
+        titled rows before the title filter runs."""
+        runner = _make_runner(session_db=MagicMock())
+        runner._session_db.list_sessions_rich = AsyncMock(return_value=[])
+
+        event = _make_event(text="/resume")
+        await runner._handle_resume_command(event)
+
+        kwargs = runner._session_db.list_sessions_rich.await_args.kwargs
+        assert kwargs.get("limit", 0) > 10, (
+            "Pre-filter limit must be widened past 10 so untitled rows cannot "
+            "starve titled rows out of the user-visible window. Got: %r"
+            % (kwargs,)
+        )
+
+    @pytest.mark.asyncio
+    async def test_old_but_active_titled_session_appears_first(self, tmp_path):
+        """An old-but-actively-used titled session must surface before newer
+        untitled session_switch shells, even when the title filter runs after
+        the SQL LIMIT."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/resume")
+        lane_key = _session_key_for_event(event)
+
+        # Old titled session, created first but with the freshest activity.
+        db.create_session(
+            "sess_old", "telegram", session_key=lane_key,
+            user_id="12345", chat_id="67890",
+        )
+        db.set_session_title("sess_old", "Daily Research")
+
+        # Many newer untitled session_switch shells — these would otherwise
+        # fill the 10-row window when ordered by started_at DESC.
+        for i in range(15):
+            db.create_session(
+                f"sess_shell_{i:02d}", "telegram", session_key=lane_key,
+                user_id="12345", chat_id="67890",
+            )
+            # No title set on these — they are session_switch shells.
+
+        # Bump sess_old's last_activity well past every shell so it ranks #1
+        # under order_by_last_active=True.
+        db.touch_session_activity("sess_old", ts=10_000_000.0)
+        for i in range(15):
+            db.touch_session_activity(
+                f"sess_shell_{i:02d}", ts=1_000_000.0 + i,
+            )
+
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_resume_command(event)
+
+        # The active titled session must surface as the first entry.
+        assert "Daily Research" in result, (
+            "Old-but-active titled session must surface in /resume; got: %r"
+            % (result,)
+        )
+        # And its numbered position must be 1.
+        lines = result.splitlines()
+        numbered = [ln for ln in lines if ln.lstrip().startswith(("1.", "2.", "3."))]
+        assert numbered, "Expected at least one numbered list entry in:\n" + result
+        assert numbered[0].lstrip().startswith("1."), (
+            "Active titled session must be first in /resume; got: %r" % (numbered,)
+        )
+        assert "Daily Research" in numbered[0]
+        db.close()

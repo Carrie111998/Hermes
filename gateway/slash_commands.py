@@ -4776,10 +4776,19 @@ class GatewaySlashCommandsMixin:
         async def _list_titled_sessions() -> list[dict]:
             user_source = source.platform.value if source.platform else None
             widen = allow_all and self._resume_caller_is_admin(source)
+            # order_by_last_active=True keeps /resume aligned with the desktop
+            # TUI / web dashboard / CLI search (which all sort by last activity
+            # and would otherwise list the same conversation in a different
+            # order — or not at all). The pre-filter limit is widened so that
+            # untitled session_switch shells created by /new do not starve
+            # titled rows out of the 10-row window before the title filter
+            # runs; the post-filter slice still caps the user-visible list
+            # at 10 entries.
             sessions = await self._session_db.list_sessions_rich(
                 source=user_source,
                 session_key=None if widen else session_key,
-                limit=10,
+                limit=50,
+                order_by_last_active=True,
             )
             return [s for s in sessions if s.get("title")][:10]
 
