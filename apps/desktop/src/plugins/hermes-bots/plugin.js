@@ -3437,6 +3437,100 @@ function formatGroupChatLine(entry, viewerName) {
   return `${groupSpeakerLabel(entry.from.name)}${suffix}${source}: ${entry.text}`
 }
 
+/** A `MEDIA:/abs/path` token embedded in a group-chat message. The path is the
+ *  ORIGINAL on-disk location (approach A — no copy), so the bot reads it in
+ *  place with read_file / vision_analyze. */
+const GROUP_MEDIA_TOKEN_RE = /MEDIA:(\/[^\s]+|[A-Za-z]:\\[^\s]+)/g
+
+/** Split a message into text runs and MEDIA tokens, preserving order, so the
+ *  renderer can swap tokens for file chips while the stored text stays intact. */
+function parseGroupMediaTokens(text) {
+  const parts = []
+  let last = 0
+  const source = String(text || '')
+
+  for (const match of source.matchAll(GROUP_MEDIA_TOKEN_RE)) {
+    if (match.index > last) {
+      parts.push({ kind: 'text', value: source.slice(last, match.index) })
+    }
+
+    parts.push({ kind: 'media', path: match[1] })
+    last = match.index + match[0].length
+  }
+
+  if (last < source.length) {
+    parts.push({ kind: 'text', value: source.slice(last) })
+  }
+
+  return parts
+}
+
+/** Basename of a path, tolerant of both POSIX and Windows separators. */
+function groupMediaFileName(path) {
+  const p = String(path || '')
+  const idx = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
+  return idx >= 0 ? p.slice(idx + 1) : p
+}
+
+/** True when the path's extension looks like an image (for the chip icon). */
+function groupMediaIsImage(path) {
+  return /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i.test(String(path || ''))
+}
+
+/** Build the `MEDIA:` token string a message carries for one attachment. */
+function groupMediaToken(path) {
+  return `MEDIA:${path}`
+}
+
+/** Render a group-chat message body: `MEDIA:` tokens become clickable file
+ *  chips (approach A — original path, no copy), the rest flows through the
+ *  normal markdown renderer. The stored text is never mutated. */
+function renderGroupChatBody(text) {
+  const parts = parseGroupMediaTokens(text)
+
+  if (parts.length === 1 && parts[0].kind === 'text') {
+    return Streamdown ? jsx(Streamdown, { children: parts[0].value }) : parts[0].value
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: parts.map((part, i) => {
+      if (part.kind === 'text') {
+        if (!part.value.trim()) {
+          return null
+        }
+
+        return Streamdown
+          ? jsx(Streamdown, { children: part.value }, `t${i}`)
+          : jsx('span', { children: part.value }, `t${i}`)
+      }
+
+      const name = groupMediaFileName(part.path)
+      const isImage = groupMediaIsImage(part.path)
+
+      return jsx('button', {
+        type: 'button',
+        className:
+          'inline-flex w-fit items-center gap-1.5 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-quaternary) px-2 py-1 text-left text-[0.7rem] text-(--ui-text-secondary) transition-colors hover:bg-(--ui-control-hover-background)',
+        title: `Open ${name}`,
+        onClick: () => {
+          const os = pluginCtx?.os
+          if (os?.revealPath) {
+            void os.revealPath(part.path)
+          } else if (os?.openExternal) {
+            void os.openExternal(`file://${part.path}`)
+          }
+        },
+        children: [
+          jsx(Codicon, { name: isImage ? 'file-media' : 'file', className: 'text-[0.8rem]' }),
+          jsx('span', { className: 'max-w-56 truncate', children: name }),
+          jsx('span', { className: 'text-(--ui-text-quaternary)', children: '열기 ↗' })
+        ]
+      }, `m${i}`)
+    })
+  })
+}
+
 /** The full per-turn payload for one member: participation rules + the room
  *  delta. Rules travel in the turn payload (not SOUL) so every existing bot
  *  can join a group chat without a profile migration. */
@@ -3460,7 +3554,8 @@ function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLines }) {
     '- Reply with ONE conversational message ONLY if you have something new worth adding: build on what was just said, claim or hand off work, answer a question aimed at you, or report a real result. Keep chatter short (1-3 sentences) — but when you are delivering a result, an answer the user asked for, or substantive work, give it at full quality and length; never thin out real content to fit the room.',
     '- If you have nothing new to add, reply with exactly "(pass)". Passing is good — it lets the conversation settle.',
     '- Mention a teammate as @name to pull them in; mention @user only for a judgment call or a result the user needs. Do not repeat points already made.',
-    '- Never reveal content from your private 1:1 chats. Your reply text goes to the room verbatim — no preamble, no meta-commentary.'
+    '- Never reveal content from your private 1:1 chats. Your reply text goes to the room verbatim — no preamble, no meta-commentary.',
+    '- If a message contains a `MEDIA:` token, it is a file attachment: read that file with read_file (or vision_analyze for images) before replying, and treat it as part of the message.'
   ].join('\n')
 }
 
@@ -7842,6 +7937,33 @@ function GroupChatWorkspace({ group, members, onBack }) {
   const [openThreads, setOpenThreads] = useState({})
   const [replyThread, setReplyThread] = useState(null)
   const [replyDrafts, setReplyDrafts] = useState({})
+  // Pending attachments for the MAIN composer (approach A: original paths, no
+  // copy). Each entry is the absolute path the user picked; on submit they are
+  // rendered as `MEDIA:` tokens ahead of the typed text.
+  const [pendingAttachments, setPendingAttachments] = useState([])
+  const fileInputRef = useRef(null)
+
+  const pickAttachments = async () => {
+    const bridge = typeof window !== 'undefined' ? window.hermesDesktop : null
+
+    if (!bridge?.selectPaths) {
+      host.notify({ kind: 'error', message: 'File picking is unavailable in this build.' })
+      return
+    }
+
+    try {
+      const paths = await bridge.selectPaths({ multiple: true })
+      if (Array.isArray(paths) && paths.length) {
+        setPendingAttachments(prev => [...prev, ...paths])
+      }
+    } catch {
+      host.notify({ kind: 'error', message: 'Could not pick files.' })
+    }
+  }
+
+  const removePendingAttachment = path => {
+    setPendingAttachments(prev => prev.filter(p => p !== path))
+  }
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -7895,16 +8017,22 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
   const submit = () => {
     const text = draft.trim()
+    const attachments = pendingAttachments.map(groupMediaToken).join('\n')
 
-    if (!text) {
+    if (!text && !attachments) {
       return
     }
 
+    // Attachments ride as `MEDIA:` tokens ahead of the typed text. The stored
+    // message stays a plain string; the renderer swaps tokens for file chips.
+    const fullText = attachments ? `${attachments}\n${text}`.trim() : text
+
     setDraft('')
+    setPendingAttachments([])
     // Main composer = START A NEW THREAD with the whole group (Slack shape).
     // Full descriptors ride into the turn loop: remote members keep their
     // connection fields so their turns route to their own machines.
-    const minted = sendToGroupChat(group, memberDescriptors(), text)
+    const minted = sendToGroupChat(group, memberDescriptors(), fullText)
 
     if (minted) {
       setOpenThreads(prev => ({ ...prev, [minted]: true }))
@@ -8006,7 +8134,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                           jsx('div', {
                             className:
                               'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0 [&_ul]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_pre]:overflow-x-auto',
-                            children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
+                            children: renderGroupChatBody(entry.text)
                           })
                         ]
                       })
@@ -8162,21 +8290,64 @@ function GroupChatWorkspace({ group, members, onBack }) {
       }),
       jsx('div', {
         className: 'border-t border-(--ui-stroke-secondary) p-2',
-        children: jsxs('form', {
-          className: 'flex items-center gap-1.5',
-          onSubmit: event => {
-            event.preventDefault()
-            submit()
-          },
+        children: jsxs('div', {
+          className: 'flex flex-col gap-1.5',
           children: [
-            jsx(GroupMentionInput, {
-              'aria-label': `Message ${group}`,
-              placeholder: `New thread in ${group}… (@name to direct, @everyone for all)`,
-              members,
-              value: draft,
-              onChange: setDraft
-            }),
-            jsx(Button, { type: 'submit', size: 'sm', disabled: !draft.trim(), children: 'New Thread' })
+            pendingAttachments.length
+              ? jsx('div', {
+                  className: 'flex flex-wrap items-center gap-1.5',
+                  children: pendingAttachments.map(path =>
+                    jsxs('span', {
+                      className:
+                        'inline-flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-quaternary) px-1.5 py-0.5 text-[0.7rem] text-(--ui-text-secondary)',
+                      children: [
+                        jsx(Codicon, {
+                          name: groupMediaIsImage(path) ? 'file-media' : 'file',
+                          className: 'text-[0.7rem]'
+                        }),
+                        jsx('span', { className: 'max-w-40 truncate', children: groupMediaFileName(path) }),
+                        jsx('button', {
+                          type: 'button',
+                          className: 'ml-0.5 text-(--ui-text-quaternary) hover:text-foreground',
+                          title: 'Remove attachment',
+                          onClick: () => removePendingAttachment(path),
+                          children: jsx(Codicon, { name: 'close', className: 'text-[0.7rem]' })
+                        })
+                      ]
+                    }, path)
+                  )
+                }, 'pending-attachments')
+              : null,
+            jsxs('form', {
+              className: 'flex items-center gap-1.5',
+              onSubmit: event => {
+                event.preventDefault()
+                submit()
+              },
+              children: [
+                jsx(Button, {
+                  type: 'button',
+                  variant: 'ghost',
+                  size: 'sm',
+                  title: 'Attach files',
+                  onClick: pickAttachments,
+                  children: jsx(Codicon, { name: 'add' })
+                }),
+                jsx(GroupMentionInput, {
+                  'aria-label': `Message ${group}`,
+                  placeholder: `New thread in ${group}… (@name to direct, @everyone for all)`,
+                  members,
+                  value: draft,
+                  onChange: setDraft
+                }),
+                jsx(Button, {
+                  type: 'submit',
+                  size: 'sm',
+                  disabled: !draft.trim() && !pendingAttachments.length,
+                  children: 'New Thread'
+                })
+              ]
+            })
           ]
         })
       }),
