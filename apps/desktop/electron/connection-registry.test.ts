@@ -17,6 +17,7 @@ import {
   buildAgentRoster,
   connectionDialFieldsChanged,
   connectionIdForLabel,
+  isBackendScopeKey,
   labelKey,
   labelSlug,
   LOCAL_CONNECTION_ID,
@@ -128,6 +129,25 @@ test('backendScopeKey: non-local connections get an unambiguous composite', () =
   assert.ok(backendScopeKey('homelab', 'research').startsWith(backendScopePrefix('homelab')))
   assert.ok(!backendScopeKey('homelab-2', 'research').startsWith(backendScopePrefix('homelab')))
   assert.ok(!'research'.startsWith(backendScopePrefix('homelab')))
+})
+
+// --- isBackendScopeKey (composite scope key vs bare profile name) ---
+
+test('isBackendScopeKey: true only for composite conn:<id>::<profile> keys', () => {
+  // Every composite the builder can emit is detected...
+  assert.equal(isBackendScopeKey(backendScopeKey('homelab', 'research')), true)
+  assert.equal(isBackendScopeKey(backendScopeKey('homelab', '')), true)
+  assert.equal(isBackendScopeKey('conn:yun3d::default'), true)
+  assert.equal(isBackendScopeKey('conn:local::default'), true)
+  // ...while bare profile names (v1 / settings callers) are not, so their
+  // connectionScopeKey fallback is preserved.
+  assert.equal(isBackendScopeKey('research'), false)
+  assert.equal(isBackendScopeKey('default'), false)
+  assert.equal(isBackendScopeKey(''), false)
+  assert.equal(isBackendScopeKey(null), false)
+  assert.equal(isBackendScopeKey(undefined), false)
+  // The local/primary connection keeps the BARE profile key — not a composite.
+  assert.equal(isBackendScopeKey(backendScopeKey(LOCAL_CONNECTION_ID, 'research')), false)
 })
 
 // --- resolveRegistryLocalRoute (registry 'local' entry vs the v1 route) ---

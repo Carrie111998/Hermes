@@ -96,6 +96,7 @@ import {
   backendScopePrefix,
   buildAgentRoster,
   connectionDialFieldsChanged,
+  isBackendScopeKey,
   mergeConnectionInput,
   migrateV1ToRegistry,
   normalizeConnectionInput,
@@ -8844,7 +8845,17 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     const lifecycle = platform.os === 'Windows' ? connectWindowsRemote : remoteLifecycle.connect
     result = await lifecycle({
       ssh,
-      profile: sshConfig.remoteProfile || connectionScopeKey(profile) || '',
+      // The remote --profile value. Registry dials pass the composite scope key
+      // (`conn:<id>::<profile>`) as `profile`; that key must never reach the
+      // remote CLI (it rejects it as an invalid subcommand). The registry path
+      // already resolved the real remote profile into sshConfig.remoteProfile
+      // (empty = let the remote pick its own active_profile), so fall back to ''
+      // for a composite instead of forwarding the scope key. Bare-name callers
+      // (v1 per-profile / settings overrides) keep the connectionScopeKey path.
+      profile:
+        sshConfig.remoteProfile ||
+        (isBackendScopeKey(profile) ? '' : connectionScopeKey(profile)) ||
+        '',
       remoteHermesPath: sshConfig.remoteHermesPath || '',
       ownershipId: sshOwnershipKey(profile),
       reuseToken: reuseToken || '',

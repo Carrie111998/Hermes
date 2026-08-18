@@ -170,6 +170,24 @@ export function backendScopePrefix(connectionId: string): string {
   return `conn:${String(connectionId).trim()}::`
 }
 
+/**
+ * True when `key` is a composite backend scope key (`conn:<id>::<profile>`)
+ * rather than a bare profile name.
+ *
+ * The composite doubles as a pool/ssh scope so each (connection, profile) pair
+ * owns its own backend — but it is NOT a profile name and must never leak into
+ * a place that expects one. In particular the remote SSH `--profile` value: a
+ * remote `hermes --profile 'conn:<id>::<profile>' serve …` makes the remote CLI
+ * reject the composite as an invalid subcommand (colons are invalid in profile
+ * names), so the backend never starts. Callers use this to fall back to the
+ * empty/real profile instead of forwarding the scope key.
+ */
+export function isBackendScopeKey(key: null | string | undefined): boolean {
+  const s = String(key ?? '')
+
+  return s.startsWith('conn:') && s.includes('::')
+}
+
 export interface RegistryLocalRoute {
   /** Reuse the legacy v1 ensureBackend path — it already resolves to the
    * app's own local runtime, so single-source behavior stays byte-identical. */
