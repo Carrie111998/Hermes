@@ -67,6 +67,22 @@ describe('preview page viewport extraction', () => {
     expect(result.visible_text).not.toContain('Clipped nested copy')
   })
 
+  it('excludes text clipped by the element that directly owns it', () => {
+    document.body.innerHTML = '<div id="clip" style="overflow: hidden">Direct clipped copy</div>'
+    const clip = document.querySelector('#clip')!
+
+    place(clip, rect(0, 100, 400, 150))
+    vi.spyOn(document, 'createRange').mockReturnValue({
+      detach: vi.fn(),
+      getClientRects: () => [rect(0, 200, 400, 220)],
+      selectNodeContents: vi.fn()
+    } as unknown as Range)
+
+    const result = Function(`return ${PREVIEW_PAGE_EXTRACT_SCRIPT}`)() as ExtractedPreviewPage
+
+    expect(result.visible_text).not.toContain('Direct clipped copy')
+  })
+
   it('hard-caps every variable-length viewport field in the guest payload', () => {
     const headings = Array.from({ length: PREVIEW_VISIBLE_HEADING_LIMIT + 4 }, (_, index) => {
       const heading = document.createElement('h2')

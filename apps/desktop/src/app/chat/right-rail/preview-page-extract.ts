@@ -56,7 +56,7 @@ export function extractPreviewPage(): ExtractedPreviewPage {
       return false
     }
 
-    for (let ancestor = element.parentElement; ancestor && ancestor !== body; ancestor = ancestor.parentElement) {
+    for (let ancestor: Element | null = element; ancestor && ancestor !== body; ancestor = ancestor.parentElement) {
       const style = window.getComputedStyle(ancestor)
 
       if (style.display === 'none' || style.visibility === 'hidden') {
