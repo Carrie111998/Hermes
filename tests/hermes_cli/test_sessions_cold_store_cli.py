@@ -110,9 +110,11 @@ def _snapshot_files(archive_root: Path) -> dict[Path, bytes]:
     }
 
 
-def _write_legacy_route(session_home: Path, session_id: str) -> Path:
-    sessions_file = session_home / "sessions" / "sessions.json"
-    sessions_file.parent.mkdir(exist_ok=True)
+def _write_legacy_route(
+    session_home: Path, session_id: str, *, sessions_dir: Path | None = None
+) -> Path:
+    sessions_file = (sessions_dir or session_home / "sessions") / "sessions.json"
+    sessions_file.parent.mkdir(parents=True, exist_ok=True)
     sessions_file.write_text(
         json.dumps(
             {
@@ -282,6 +284,48 @@ def test_cold_archive_dry_run_rejects_legacy_route_without_mutation(
     _seed_archived_lineage(unrelated=True)
     archive_root = session_home.parent / "new-cold-root"
     sessions_file = _write_legacy_route(session_home, "lineage-root")
+    before_route = sessions_file.read_bytes()
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-archive",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--dry-run",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "could not plan cold archive" in out
+    assert "sessions.json legacy route" in out
+    assert not archive_root.exists()
+    assert sessions_file.read_bytes() == before_route
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+
+
+def test_cold_archive_dry_run_rejects_legacy_route_in_configured_sessions_dir(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage(unrelated=True)
+    archive_root = session_home.parent / "new-cold-root"
+    configured_sessions_dir = session_home.parent / "gateway-sessions"
+    (session_home / "gateway.json").write_text(
+        json.dumps({"sessions_dir": str(configured_sessions_dir)}),
+        encoding="utf-8",
+    )
+    sessions_file = _write_legacy_route(
+        session_home,
+        "lineage-root",
+        sessions_dir=configured_sessions_dir,
+    )
     before_route = sessions_file.read_bytes()
     before_sessions = _session_rows()
     before_messages = _message_rows()

@@ -957,8 +957,7 @@ def cmd_sessions(args, sessions_parser=None):
                     print(f"Error: cold archive Store failed: {exc}")
                     print(
                         "The source rows were retained; no verified local snapshot was "
-                        "produced by this run, and any pre-existing snapshot was left "
-                        "unchanged."
+                        "produced by this run, and no Purge was attempted."
                     )
                     db.close()
                     return 1

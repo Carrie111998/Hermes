@@ -747,10 +747,15 @@ def _reject_gateway_routing_references(
 
 
 def _reject_legacy_routing_references(physical_ids: tuple[str, ...]) -> None:
-    """Fail closed when the legacy sessions.json routes to this lineage."""
-    from hermes_constants import get_hermes_home
+    """Fail closed when the configured legacy sessions.json routes to this lineage."""
+    from gateway.config import load_gateway_config
 
-    sessions_file = get_hermes_home() / "sessions" / "sessions.json"
+    try:
+        sessions_file = Path(load_gateway_config().sessions_dir) / "sessions.json"
+    except Exception as exc:
+        raise ValueError(
+            "cold purge cannot resolve the configured gateway sessions directory"
+        ) from exc
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         descriptor = os.open(sessions_file, flags)
