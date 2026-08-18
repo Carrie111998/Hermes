@@ -12445,6 +12445,11 @@ _E_PROJECTS = 5061  # generic failure
 _E_NO_PROJECT = 5062  # id resolved to nothing
 _E_PROJECT_ARG = 5063  # invalid argument (e.g. bad name/slug)
 
+# One lock owns every transition between a durable project-agent binding and
+# its live resident marker. Without it, delete and open can interleave into an
+# unbound session that ordinary disconnect/idle reapers keep forever.
+_project_agent_open_lock = threading.Lock()
+
 
 class _NoProject(Exception):
     """Raised inside a projects handler when ``params['id']`` resolves to None."""
@@ -12576,7 +12581,16 @@ def _(rid, params, pdb, conn) -> dict:
 @_projects_method("projects.delete")
 def _(rid, params, pdb, conn) -> dict:
     proj = _require_project(pdb, conn, params)
-    pdb.delete_project(conn, proj.id)
+    with _project_agent_open_lock:
+        pdb.delete_project(conn, proj.id)
+        # The projects.db cascade removes the durable return address. Revoke
+        # residency from the corresponding live record too; an attached or
+        # running chat stays usable, but becomes eligible for normal cleanup
+        # after it disconnects instead of leaking until process shutdown.
+        with _sessions_lock:
+            for session in _sessions.values():
+                if session.get("project_agent_id") == proj.id:
+                    session.pop("project_agent_id", None)
     return _ok(rid, _projects_payload(conn))
 
 
@@ -12584,9 +12598,6 @@ def _(rid, params, pdb, conn) -> dict:
 def _(rid, params, pdb, conn) -> dict:
     pdb.set_active(conn, _require_project(pdb, conn, params).id if params.get("id") else None)
     return _ok(rid, {"active_id": pdb.get_active_id(conn)})
-
-
-_project_agent_open_lock = threading.Lock()
 
 
 def _mark_project_agent(payload: dict, project_id: str, *, reused: bool) -> dict:
@@ -12697,19 +12708,45 @@ def _(rid, params, pdb, conn) -> dict:
         if session is None:
             return _err(rid, _E_PROJECTS, "project agent session was not registered")
 
-        # Unlike an ordinary abandoned draft, a project agent has explicit
-        # durable intent from the moment it is opened. Persist the empty row now
-        # so the binding remains resumable after a gateway restart.
-        _ensure_session_db_row(session)
         stored = str(session.get("session_key") or "")
-        with _session_db(session) as session_db:
-            if not stored or session_db is None or not session_db.get_session(stored):
-                return _err(rid, _E_PROJECTS, "project agent session could not be persisted")
-            session_db.set_session_title(stored, f"{project.name} · Project Agent")
-        session["pending_title"] = None
-        pdb.set_agent_session_id(conn, project.id, stored)
-        payload["stored_session_id"] = stored
-        return _ok(rid, payload)
+        bound = False
+        try:
+            # Unlike an ordinary abandoned draft, a project agent has explicit
+            # durable intent from the moment it is opened. Persist the empty row
+            # now so the binding remains resumable after a gateway restart.
+            _ensure_session_db_row(session)
+            with _session_db(session) as session_db:
+                if not stored or session_db is None or not session_db.get_session(stored):
+                    return _err(
+                        rid,
+                        _E_PROJECTS,
+                        "project agent session could not be persisted",
+                    )
+                session_db.set_session_title(stored, f"{project.name} · Project Agent")
+            session["pending_title"] = None
+            pdb.set_agent_session_id(conn, project.id, stored)
+            bound = True
+            payload["stored_session_id"] = stored
+            return _ok(rid, payload)
+        finally:
+            if not bound:
+                # The client never received this runtime id, and no durable
+                # binding can lead back to it. Tear it down rather than leaving
+                # project_agent_id to exempt an unreachable draft from both
+                # ordinary reapers. Remove the eagerly-created empty row too.
+                _close_session_by_id(
+                    payload["session_id"], end_reason="project_agent_open_failed"
+                )
+                if stored:
+                    try:
+                        with _session_db(session) as session_db:
+                            if session_db is not None:
+                                session_db.delete_session(stored)
+                    except Exception:
+                        logger.debug(
+                            "failed deleting unbound project-agent session row",
+                            exc_info=True,
+                        )
 
 
 @_projects_method("projects.for_cwd")

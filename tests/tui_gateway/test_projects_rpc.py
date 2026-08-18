@@ -277,6 +277,43 @@ def test_project_agent_open_resumes_same_binding_after_runtime_teardown(monkeypa
         server._close_session_by_id(resumed["session_id"], end_reason="test_cleanup")
 
 
+def test_project_agent_open_failure_discards_unbound_resident(monkeypatch, tmp_path):
+    project = _call(
+        "projects.create", {"name": "Unbound", "folders": [str(tmp_path)]}
+    )["project"]
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    before = set(server._sessions)
+
+    response = server._methods["projects.agent.open"](1, {"id": project["id"]})
+
+    assert response["error"]["message"] == "project agent session could not be persisted"
+    assert set(server._sessions) == before
+
+
+def test_delete_project_revokes_live_agent_residency(monkeypatch, tmp_path):
+    project = _call(
+        "projects.create", {"name": "Disposable", "folders": [str(tmp_path)]}
+    )["project"]
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    opened = _call("projects.agent.open", {"id": project["id"]})
+    sid = opened["session_id"]
+    session = server._sessions[sid]
+    session["agent_ready"].set()
+
+    try:
+        _call("projects.delete", {"id": project["id"]})
+        session["transport"] = server._detached_ws_transport
+
+        assert "project_agent_id" not in session
+        assert server._ws_session_is_orphaned(session) is True
+        assert server._session_is_evictable(sid, session, float("inf")) is True
+    finally:
+        server._close_session_by_id(sid, end_reason="test_cleanup")
+
+
 def test_add_folder_and_for_cwd(tmp_path):
     folder = tmp_path / "repo"
     folder.mkdir()
