@@ -232,8 +232,8 @@ class TestDelegateToDevin(unittest.TestCase):
         self.assertIn("timeout_seconds", entry["error"])
 
     def test_timeout_with_model_override_shows_override_hint(self):
-        """When the model supplied a timeout override, the error hint should
-        mention the override, not just the config knob."""
+        """When the model supplied a timeout override that actually shortens
+        the effective timeout, the error hint should mention the override."""
         p1, p2, p3 = self._patch_env(cfg={"enabled": True, "timeout_seconds": 1800})
         proc = _mock_popen()
         proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["devin"], timeout=120)
@@ -244,6 +244,24 @@ class TestDelegateToDevin(unittest.TestCase):
         entry = result["results"][0]
         self.assertEqual(entry["status"], "timeout")
         self.assertIn("override", entry["error"].lower())
+
+    def test_timeout_with_override_at_ceiling_shows_config_hint(self):
+        """When the model override is at/above the config ceiling, the resolved
+        timeout equals the config default — the hint should point to config,
+        not mention the override."""
+        p1, p2, p3 = self._patch_env(cfg={"enabled": True, "timeout_seconds": 300})
+        proc = _mock_popen()
+        proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["devin"], timeout=300)
+        with p1, p2, p3, \
+             patch.object(mod.subprocess, "Popen", return_value=proc), \
+             patch.object(mod, "_kill_process_group", lambda p: None):
+            # Override at ceiling → resolved = 300 = config default
+            result = json.loads(delegate_to_devin(goal="do thing", timeout=99999))
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "timeout")
+        # Should show config hint, not override hint
+        self.assertIn("timeout_seconds", entry["error"])
+        self.assertNotIn("override", entry["error"].lower())
 
     def test_truncation_flag_when_stdout_exceeds_limit(self):
         p1, p2, p3 = self._patch_env(cfg={"enabled": True, "max_result_chars": 256})

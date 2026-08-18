@@ -388,9 +388,13 @@ def delegate_to_devin(
             except Exception:
                 stdout, stderr = "", ""
             duration = time.monotonic() - start
-            # Tailor the error hint: if the model supplied a timeout override,
-            # raising the config default won't help — the model chose this cap.
-            if timeout is not None:
+            # Tailor the error hint: only show the "override" message when the
+            # model's timeout actually shortened the effective timeout (i.e.,
+            # the resolved timeout is less than the config default). If the
+            # override was invalid or at/above the ceiling, _resolve_timeout
+            # returns the config default and the "override" hint is misleading.
+            config_default = _resolve_timeout(cfg, None)
+            if timeout is not None and timeout_seconds < config_default:
                 timeout_hint = (
                     "The model supplied a shorter timeout override; ask it to "
                     "retry without the timeout parameter or raise "
