@@ -1299,6 +1299,70 @@ def drop_thinking_only_and_merge_users(
 
 
 
+def _revert_stale_init_override(agent) -> bool:
+    """Put an init-diverted agent back on its TRULY configured primary.
+
+    ``agent_init._apply_model_override`` runs BEFORE the ``_primary_runtime``
+    snapshot, so for a process that started while an override was active the
+    snapshot IS the replacement.  That makes the override re-check in
+    ``restore_primary_runtime`` below structurally inert for exactly the case
+    read #1 creates: it looks up ``get_override(rt.provider, rt.model)`` with
+    the REPLACEMENT's key, which by construction never has a record, so it
+    always returns None.
+
+    The consequence is not cosmetic.  The gateway caches agents in
+    ``_agent_cache`` and evicts them only on the idle sweep, so a session
+    diverted at init would keep routing to the replacement after the override
+    expired AND after ``hermes overrides clear`` -- defeating the 24h TTL cap
+    ("no permanent override is expressible through this API") for precisely
+    the long-lived process the file-backed store exists for.
+
+    ``_apply_model_override`` therefore stashes ``agent._override_origin`` =
+    {provider, model, runtime, config_context_length} keyed by the ORIGINAL
+    (provider, model).  This re-checks THAT key:
+
+      * override still active -> return False, leave everything alone (the
+        replacement is still the intended route).
+      * override gone/expired -> restore ``_primary_runtime`` to the
+        pre-override snapshot and return True, so the caller runs its normal
+        restore body against the configured primary.
+      * lookup failed -> return False (fail open; retried next turn).
+
+    Returns True only when it rewrote ``_primary_runtime``.
+    """
+    origin = getattr(agent, "_override_origin", None)
+    if not isinstance(origin, dict):
+        return False
+    runtime = origin.get("runtime")
+    if not isinstance(runtime, dict):
+        # Malformed stash: drop it rather than re-evaluating it every turn.
+        agent._override_origin = None
+        return False
+
+    try:
+        from events import model_override
+        still_active = model_override.get_override(
+            str(origin.get("provider") or ""), str(origin.get("model") or ""),
+        )
+    except Exception:
+        # Fail open in the SAFE direction here: an unreadable store must not
+        # yank a working reroute out from under a live session. The next turn
+        # re-checks.
+        return False
+
+    if still_active:
+        return False
+
+    agent._primary_runtime = dict(runtime)
+    agent._config_context_length = origin.get("config_context_length")
+    agent._override_origin = None
+    logger.info(
+        "Model override for %s/%s is gone; restoring the configured primary",
+        origin.get("provider"), origin.get("model"),
+    )
+    return True
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
@@ -1321,8 +1385,18 @@ def restore_primary_runtime(agent) -> bool:
     back onto it.  Gone/expired -> proceed with the normal restore below.
     Central invariant: with no override, this check is a no-op and the
     restore is byte-identical to before.
+
+    Two lookups make that work, not one.  ``_revert_stale_init_override``
+    (above) handles the case where the snapshot itself IS a replacement --
+    it must run BEFORE the ``_fallback_activated`` gate, because an agent
+    diverted at init has no fallback activated and would otherwise return
+    here every turn forever.  The ``rt``-keyed lookup further down handles
+    the other case (agent created before the override existed, then diverted
+    mid-session by ``try_activate_fallback``).
     """
-    if not agent._fallback_activated:
+    reverted = _revert_stale_init_override(agent)
+
+    if not agent._fallback_activated and not reverted:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
         # called but returned False (chain exhausted or provider not
@@ -1333,8 +1407,12 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
-        return False  # primary still in rate-limit cooldown, stay on fallback
+    if not reverted and getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+        # Primary still in rate-limit cooldown, stay on fallback.  Skipped
+        # when ``reverted`` is set: that cooldown was recorded against the
+        # REPLACEMENT, and the primary we are now restoring is the
+        # configured one, which this process never called.
+        return False
 
     rt = agent._primary_runtime
 
@@ -2291,6 +2369,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # stream is even attempted.
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
+
+    # ── Retire any init-override stash ──
+    # An explicit /model switch supersedes the reroute: without this,
+    # _revert_stale_init_override() would later clobber the user's deliberate
+    # choice with the pre-override snapshot the moment the override expires.
+    agent._override_origin = None
 
     # ── Update _primary_runtime so the change persists across turns ──
     _cc = agent.context_compressor if hasattr(agent, "context_compressor") and agent.context_compressor else None
