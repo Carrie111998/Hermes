@@ -4640,10 +4640,11 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const activeProfile = useValue(host.state.profile)
+  const activeGroup = useValue($groupChatWorkspace)
   const meta = botRosterMeta(bot, useValue($botMeta))
   const groups = botGroups(meta)
   const last = bot.last_session
-  const isActive = !bot.remoteSource && bot.name === activeProfile
+  const isActive = !activeGroup && !bot.remoteSource && bot.name === activeProfile
   const { shape, color, image } = botAppearance(bot.name, meta)
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
@@ -4698,6 +4699,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const open = async () => {
     const generation = ++botOpenGeneration
     haptic('tap')
+    $groupChatWorkspace.set(null)
     $selectedBot.set(bot.name)
 
     if (bot.remoteSource) {
@@ -9093,6 +9095,10 @@ function closeGroupChatMainTab(group) {
 
   groupChatMainTabs.delete(group)
 
+  if ($groupChatWorkspace.get() === group) {
+    $groupChatWorkspace.set(null)
+  }
+
   if (typeof close === 'function') {
     try {
       close()
@@ -9120,6 +9126,7 @@ function GroupChatMainView({ group }) {
  *  view on desktops whose SDK predates the main-area door. */
 function openGroupChat(group) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
+  $groupChatWorkspace.set(group)
 
   if (typeof host.openWorkspace === 'function') {
     try {
@@ -9127,7 +9134,13 @@ function openGroupChat(group) {
         title: group,
         minWidth: '24rem',
         render: () => jsx(GroupChatMainView, { group }),
-        onClose: () => groupChatMainTabs.delete(group)
+        onClose: () => {
+          groupChatMainTabs.delete(group)
+
+          if ($groupChatWorkspace.get() === group) {
+            $groupChatWorkspace.set(null)
+          }
+        }
       })
 
       groupChatMainTabs.set(group, close)
@@ -9138,7 +9151,8 @@ function openGroupChat(group) {
     }
   }
 
-  $groupChatWorkspace.set(group)
+  // The selected-group atom was set before trying the main-window door, so
+  // older desktops naturally render the in-panel room as the fallback.
 }
 
 /** One group chat as ONE roster row — the Discord shape: stacked member
@@ -9146,7 +9160,7 @@ function openGroupChat(group) {
  *  (markdown flattened), relative time of the last activity, and the
  *  needs-you badge on the row itself. Sorts into the same recency ordering
  *  as bot rows; clicking opens the room in the main chat window. */
-function GroupRow({ group, members, needsYou, onOpen }) {
+function GroupRow({ active, group, members, needsYou, onOpen }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [] }
@@ -9166,7 +9180,8 @@ function GroupRow({ group, members, needsYou, onOpen }) {
     },
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
-      'hover:bg-(--chrome-action-hover)'
+      'hover:bg-(--chrome-action-hover)',
+      active && 'bg-(--ui-row-active-background)'
     ),
     children: [
       // Room picture when the user set one; else a composite avatar of up to
@@ -9591,6 +9606,7 @@ function BotsPane() {
                         ? jsx(
                             GroupRow,
                             {
+                              active: groupChatName === row.name,
                               group: row.name,
                               members: row.members,
                               needsYou: Boolean(groupNeedsYou[row.name]),
