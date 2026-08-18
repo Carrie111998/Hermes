@@ -45,9 +45,21 @@ if __name__ == "__main__":
     os.environ.setdefault("HERMES_HOME", str(hermes_home))
     os.environ.setdefault("HERMES_INFERENCE_PROVIDER", "openrouter")
     os.environ.setdefault("HERMES_INFERENCE_MODEL", "qwen/qwen3.7-plus")
-    os.environ.setdefault(
-        "HERMES_INTERNAL_KEY",
-        values.get("HERMES_INTERNAL_KEY", "gradeos-local-dev-token"),
+    teacher_service_token = values.get("HERMES_AGENT_SERVICE_TOKEN", "").strip()
+    student_service_token = values.get("HERMES_STUDENT_AGENT_SERVICE_TOKEN", "").strip()
+    if teacher_service_token and student_service_token and teacher_service_token != student_service_token:
+        raise RuntimeError(
+            "Local Hermes uses one internal key; HERMES_AGENT_SERVICE_TOKEN and "
+            "HERMES_STUDENT_AGENT_SERVICE_TOKEN must match."
+        )
+    # CODEX CHANGE: the local smoke service accepts one bearer key for both
+    # assistant routes, so inherit GradeOS's configured service token instead
+    # of falling back to an unrelated default token.
+    os.environ["HERMES_INTERNAL_KEY"] = (
+        values.get("HERMES_INTERNAL_KEY", "").strip()
+        or teacher_service_token
+        or student_service_token
+        or "gradeos-local-dev-token"
     )
     os.environ.setdefault(
         "GRADEOS_INTERNAL_API_BASE_URL",
