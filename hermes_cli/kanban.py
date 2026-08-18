@@ -268,7 +268,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Keep reconciling native lifecycle changes until interrupted")
     p_import.add_argument("--interval", type=float, default=5.0,
                           help="Seconds between watch reconciliations (default: 5)")
-    p_import.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_import.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON output (one JSON array per line in watch mode)",
+    )
 
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
@@ -1555,7 +1558,9 @@ def _cmd_import(args: argparse.Namespace) -> int:
             )
             had_failures = had_failures or cycle_failed
             if args.watch:
-                _emit_import_results(results, json_output=bool(args.json))
+                _emit_import_results(
+                    results, json_output=bool(args.json), streaming=True,
+                )
             if not args.watch:
                 break
             # A source-wide scan failure cannot recover records this cycle.
@@ -1573,10 +1578,15 @@ def _cmd_import(args: argparse.Namespace) -> int:
     return 1 if any(result.action in {"error", "conflict"} for result in results) else 0
 
 
-def _emit_import_results(results, *, json_output: bool) -> None:
+def _emit_import_results(results, *, json_output: bool, streaming: bool = False) -> None:
     payload = [result.__dict__ for result in results]
     if json_output:
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(json.dumps(
+            payload,
+            indent=None if streaming else 2,
+            ensure_ascii=False,
+            separators=(",", ":") if streaming else None,
+        ))
     else:
         for result in results:
             detail = f" -> {result.task_id}" if result.task_id else ""

@@ -527,6 +527,15 @@ def sync_import(
     while unresolved:
         progressed = False
         for source_id, task in list(unresolved.items()):
+            ambiguous = [dep for dep in task.depends_on if dep in duplicate_ids]
+            if ambiguous:
+                results.append(ImportResult(
+                    source_id,
+                    "error",
+                    error=f"ambiguous duplicate dependencies: {', '.join(ambiguous)}",
+                ))
+                del unresolved[source_id]
+                continue
             missing = [dep for dep in task.depends_on if dep not in by_id]
             if missing:
                 results.append(ImportResult(source_id, "error", error=f"unknown dependencies: {', '.join(missing)}"))

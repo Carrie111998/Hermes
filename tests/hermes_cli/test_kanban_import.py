@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import stat
 import threading
@@ -267,11 +268,18 @@ def test_duplicate_source_ids_skip_existing_import_reconciliation(import_env):
         _write(import_env, "two", {
             "id": "same", "title": "Two", "status": "pending", "assignee": "worker",
         })
+        _write(import_env, "child", {
+            "id": "child", "title": "Child", "status": "pending", "assignee": "worker",
+            "depends_on": ["same"],
+        })
         before = first_path.read_bytes()
         result = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool")
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
-    assert [(row.source_id, row.action) for row in result] == [("same", "error")]
+    assert [(row.source_id, row.action) for row in result] == [
+        ("same", "error"), ("child", "error"),
+    ]
     assert result[0].error == "duplicate source id"
+    assert result[1].error == "ambiguous duplicate dependencies: same"
     assert first_path.read_bytes() == before
     assert imported[0].task_id is not None
 
@@ -573,6 +581,31 @@ def test_watch_stops_on_source_wide_scan_error(import_env, monkeypatch):
         import_id="pool", dry_run=False, watch=True, interval=0.01, json=False,
     )
     assert kc._cmd_import(args) == 1
+
+
+def test_watch_json_emits_one_compact_array_per_line(import_env, monkeypatch, capsys):
+    _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    sleeps = 0
+
+    def stop_after_two_cycles(_interval):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(kc.time, "sleep", stop_after_two_cycles)
+    args = argparse.Namespace(
+        source=str(import_env), assignee_map=None, adapter="markdown",
+        import_id="pool", dry_run=False, watch=True, interval=0.01, json=True,
+    )
+    assert kc._cmd_import(args) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    payloads = [json.loads(line) for line in lines]
+    assert payloads[0][0]["action"] == "imported"
+    assert payloads[1][0]["action"] == "unchanged"
 
 
 def test_cli_conflict_returns_nonzero(import_env):
