@@ -16,6 +16,7 @@ import logging
 import os
 import html as _html
 import re
+import tempfile
 import threading
 import time
 from contextvars import ContextVar
@@ -9313,7 +9314,21 @@ class TelegramAdapter(BasePlatformAdapter):
         taken from the resolved ``File.file_path`` for consistent local caching.
         """
         last_err: Exception | None = None
-        timeout = _MEDIA_DOWNLOAD_TIMEOUT
+        file_size = 0
+        try:
+            file_size = int(getattr(source, "file_size", 0) or 0)
+        except (TypeError, ValueError):
+            file_size = 0
+        duration = 0
+        try:
+            duration = int(getattr(source, "duration", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        timeout = float(_MEDIA_DOWNLOAD_TIMEOUT)
+        if file_size > 0:
+            timeout = min(300.0, max(timeout, (file_size / (1024 * 1024)) * 12.0))
+        elif duration >= 90:
+            timeout = min(300.0, max(timeout, duration / 15.0))
         for attempt in range(1, attempts + 1):
             try:
                 file_obj = await source.get_file(
@@ -9324,14 +9339,34 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 if file_obj is None:
                     raise RuntimeError("Telegram get_file returned None")
-                data = bytes(
-                    await file_obj.download_as_bytearray(
-                        read_timeout=timeout,
-                        write_timeout=timeout,
-                        connect_timeout=15.0,
-                        pool_timeout=timeout,
+                use_disk = file_size >= 3 * 1024 * 1024 or duration >= 90
+                if use_disk:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+                    tmp.close()
+                    try:
+                        await file_obj.download_to_drive(
+                            custom_path=tmp.name,
+                            read_timeout=timeout,
+                            write_timeout=timeout,
+                            connect_timeout=15.0,
+                            pool_timeout=timeout,
+                        )
+                        with open(tmp.name, "rb") as fh:
+                            data = fh.read()
+                    finally:
+                        try:
+                            os.unlink(tmp.name)
+                        except OSError:
+                            pass
+                else:
+                    data = bytes(
+                        await file_obj.download_as_bytearray(
+                            read_timeout=timeout,
+                            write_timeout=timeout,
+                            connect_timeout=15.0,
+                            pool_timeout=timeout,
+                        )
                     )
-                )
                 if not data:
                     raise RuntimeError("Telegram media download returned 0 bytes")
                 filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
@@ -9940,6 +9975,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # Download voice/audio messages to cache for STT transcription
         if msg.voice:
             try:
+                duration = int(getattr(msg.voice, "duration", 0) or 0)
+                if duration >= 90:
+                    mins = max(1, duration // 60)
+                    aviso = (
+                        f"Áudio de {mins} min recebido. Transcrevendo em partes — "
+                        "pode levar alguns minutos. Não manda de novo."
+                    )
+                    if duration >= 9000:
+                        aviso += " Se o Telegram recusar (>20 MB), manda em blocos de 1h."
+                    try:
+                        await msg.reply_text(aviso)
+                    except Exception:
+                        logger.debug("[Telegram] long-voice ack failed", exc_info=True)
                 allowed, note = self._telegram_media_size_allowed(msg.voice, "voice message")
                 if not allowed:
                     event.text = self._append_observed_note(event.text, note or "")

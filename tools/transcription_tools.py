@@ -3150,6 +3150,37 @@ def _dispatch_stt_provider(
     }
 
 
+def _transcribe_long_audio_if_needed(
+    file_path: str,
+    model: Optional[str],
+    source: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Chunk 1h+ voice notes so cloud STT does not refuse or invent."""
+    try:
+        import importlib.util
+        from pathlib import Path as _Path
+
+        candidato = _Path.home() / "keli-cerebro/.agents/source/hermes/voz_longa.py"
+        if not candidato.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location("keli_voz_longa", candidato)
+        if spec is None or spec.loader is None:
+            return None
+        modulo = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(modulo)
+        if not modulo.precisa_fatiar_path(file_path):
+            return None
+        logger.info("Long audio detected (%s); transcribing in chunks", file_path)
+
+        def _chunk(path: str) -> Dict[str, Any]:
+            return _transcribe_prepared_audio(path, model, source)
+
+        return modulo.transcrever(file_path, _chunk)
+    except Exception as exc:
+        logger.warning("Long-audio pipeline failed; falling back to single shot: %s", exc)
+        return None
+
+
 def transcribe_audio(
     file_path: str,
     model: Optional[str] = None,
@@ -3169,6 +3200,10 @@ def transcribe_audio(
     blocked = get_read_block_error(file_path)
     if blocked:
         return {"success": False, "transcript": "", "error": blocked}
+
+    long_result = _transcribe_long_audio_if_needed(file_path, model, source)
+    if long_result is not None:
+        return long_result
 
     # Cap .silk sources before the decoder runs (decoder safety). For all
     # other inputs the remote-upload size cap is provider-scoped and enforced
