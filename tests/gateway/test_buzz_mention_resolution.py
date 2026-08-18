@@ -159,6 +159,12 @@ class TestMentionTokenMatching:
         assert await self._resolve("@@Fizz") == []
 
     @pytest.mark.asyncio
+    async def test_left_boundary_is_unicode_aware(self):
+        # 山 is a word character: "山田@Fizz" is email-shaped text in a
+        # non-ASCII script, not a mention.
+        assert await self._resolve("山田@Fizz") == []
+
+    @pytest.mark.asyncio
     async def test_no_at_sign_short_circuits_without_cli_calls(self):
         adapter = _make_adapter()
         cli = _wire(adapter, _ScriptedCli())
@@ -191,6 +197,43 @@ class TestMentionTokenMatching:
             profiles={SELF_PUBKEY: "Chip", FIZZ_PUBKEY: "Fizz"},
         )
         assert result == [FIZZ_PUBKEY]
+
+
+# ── caching ───────────────────────────────────────────────────────────────
+
+
+class TestResolutionCaching:
+
+    @pytest.mark.asyncio
+    async def test_member_list_cached_within_ttl(self):
+        adapter = _make_adapter()
+        cli = _wire(adapter, _ScriptedCli())
+        cli.script("channels", "members", _members(FIZZ_PUBKEY))
+        cli.script("users", "get", _profile(FIZZ_PUBKEY, "Fizz"))
+
+        assert await adapter._mention_pubkeys_for(CHANNEL, "@Fizz one") == [FIZZ_PUBKEY]
+        assert await adapter._mention_pubkeys_for(CHANNEL, "@Fizz two") == [FIZZ_PUBKEY]
+
+        member_calls = [c for c in cli.calls if (c[0][0], c[0][1]) == ("channels", "members")]
+        assert len(member_calls) == 1, "second resolve must hit the member cache"
+
+    @pytest.mark.asyncio
+    async def test_profile_name_expires_after_ttl(self, monkeypatch):
+        adapter = _make_adapter()
+        cli = _wire(adapter, _ScriptedCli())
+        cli.script("channels", "members", _members(FIZZ_PUBKEY))
+        cli.script("users", "get", _profile(FIZZ_PUBKEY, "Fizz"))
+        cli.script("users", "get", _profile(FIZZ_PUBKEY, "FizzRenamed"))
+
+        clock = [1000.0]
+        monkeypatch.setattr(_buzz_mod.time, "monotonic", lambda: clock[0])
+
+        assert await adapter._mention_pubkeys_for(CHANNEL, "@Fizz hi") == [FIZZ_PUBKEY]
+        # Inside both TTLs: rename not visible yet, no new lookups needed.
+        assert await adapter._mention_pubkeys_for(CHANNEL, "@FizzRenamed hi") == []
+        # Past the name TTL (and member TTL): the rename resolves.
+        clock[0] += _buzz_mod._PROFILE_NAME_TTL + 1
+        assert await adapter._mention_pubkeys_for(CHANNEL, "@FizzRenamed hi") == [FIZZ_PUBKEY]
 
 
 # ── send() recovery paths ─────────────────────────────────────────────────

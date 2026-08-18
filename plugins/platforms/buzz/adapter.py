@@ -100,6 +100,12 @@ _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
 
+# Mention-resolution caches: member lists are cheap to refetch but hit on
+# every publish containing "@", so a short TTL amortizes the CLI round-trip;
+# display names change rarely, but must not survive a rename forever.
+_MEMBER_CACHE_TTL = 60.0
+_PROFILE_NAME_TTL = 300.0
+
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
@@ -608,7 +614,19 @@ class BuzzAdapter(BasePlatformAdapter):
         to harvesting recent channel traffic (authors plus prior mention
         tags), which can over-approximate; ``send()`` recovers from any
         resulting non-member mention by retrying without mention flags.
+
+        The member list is cached per channel for ``_MEMBER_CACHE_TTL``
+        seconds so a chatty agent doesn't pay a CLI round-trip on every
+        publish; membership drift inside the TTL window is covered by the
+        same ``send()`` recovery retry.
         """
+        cache: Dict[str, Tuple[float, List[str]]] = getattr(
+            self, "_member_cache", {}
+        )
+        self._member_cache = cache
+        cached = cache.get(str(chat_id))
+        if cached is not None and (time.monotonic() - cached[0]) < _MEMBER_CACHE_TTL:
+            return list(cached[1])
         code, out, _err = await self._run_cli(
             ["channels", "members", "--channel", str(chat_id)]
         )
@@ -624,6 +642,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 if pk and pk not in pks:
                     pks.append(pk)
             if pks:
+                cache[str(chat_id)] = (time.monotonic(), list(pks))
                 return pks
         candidates: List[str] = []
         code, out, _err = await self._run_cli(
@@ -642,19 +661,25 @@ class BuzzAdapter(BasePlatformAdapter):
                                 candidates.append(tpk)
             except ValueError:
                 pass
+        if candidates:
+            cache[str(chat_id)] = (time.monotonic(), list(candidates))
         return candidates
 
     async def _profile_display_name(self, pubkey: str) -> str:
         """Display name for *pubkey* via ``users get --pubkey``, cached.
 
         Bare ``users get`` may return only our own profile
-        (relay-dependent), so lookups are per-pubkey.
+        (relay-dependent), so lookups are per-pubkey.  Entries expire after
+        ``_PROFILE_NAME_TTL`` seconds so a renamed member resolves under
+        their new display name without a process restart.
         """
-        cache: Dict[str, str] = getattr(self, "_profile_name_cache", {})
+        cache: Dict[str, Tuple[float, str]] = getattr(
+            self, "_profile_name_cache", {}
+        )
         self._profile_name_cache = cache
-        name = cache.get(pubkey)
-        if name is not None:
-            return name
+        cached = cache.get(pubkey)
+        if cached is not None and (time.monotonic() - cached[0]) < _PROFILE_NAME_TTL:
+            return cached[1]
         name = ""
         code, out, _err = await self._run_cli(["users", "get", "--pubkey", pubkey])
         if code == 0:
@@ -673,7 +698,7 @@ class BuzzAdapter(BasePlatformAdapter):
                         ).strip()
                     except ValueError:
                         pass
-        cache[pubkey] = name
+        cache[pubkey] = (time.monotonic(), name)
         return name
 
     async def _mention_pubkeys_for(self, chat_id: str, content: str) -> List[str]:
@@ -687,12 +712,13 @@ class BuzzAdapter(BasePlatformAdapter):
         while downgrading everything unresolvable to presentation-only text.
 
         Matching is mention-token semantics, not substring, bounded on both
-        sides: the ``@`` must start a token ("email@Fizz", "x@Fizz", and
-        "@@Fizz" do NOT wake Fizz) and the name must be followed by a
-        non-word character or end-of-text ("@Riley!!" tags Riley;
-        "@FizzBuzz" does NOT tag a member named Fizz).  Longer names match
-        first and consume their span, so "@Hermes Matt" prefers the member
-        "Hermes Matt" over a member "Hermes".
+        sides with Unicode-aware word classes: the ``@`` must start a token
+        ("email@Fizz", "x@Fizz", "@@Fizz", and "山田@Fizz" do NOT wake
+        Fizz) and the name must be followed by a non-word character or
+        end-of-text ("@Riley!!" tags Riley; "@FizzBuzz" does NOT tag a
+        member named Fizz).  Longer names match first and consume their
+        span, so "@Hermes Matt" prefers the member "Hermes Matt" over a
+        member "Hermes".
 
         Duplicate display names are ambiguous: the span is consumed but no
         one is tagged (presentation-only), mirroring how Buzz treats
@@ -718,7 +744,7 @@ class BuzzAdapter(BasePlatformAdapter):
         text = content
         for key in sorted(by_name, key=len, reverse=True):
             pattern = re.compile(
-                r"(?<![0-9A-Za-z_@])@" + re.escape(display[key]) + r"(?![0-9A-Za-z_])",
+                r"(?<![\w@])@" + re.escape(display[key]) + r"(?!\w)",
                 re.IGNORECASE,
             )
             if pattern.search(text):
