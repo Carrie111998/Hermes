@@ -35,7 +35,7 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
-import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
+import { $sessionTiles, $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
 
@@ -76,7 +76,11 @@ function sessionsToKeep(scope?: string): Set<string> {
   const keep = new Set<string>([
     ...$workingSessionIds.get(),
     ...$pinnedSessionIds.get(),
-    ...getRecentlySettledSessionIds()
+    ...getRecentlySettledSessionIds(),
+    // Open tabs that aged off the recents page must stay in `$sessions`.
+    // Otherwise `tileStoredRow` / workspace title miss the row and the tab
+    // falls back to SessionDraftTitle — typing then renames every open tab.
+    ...$sessionTiles.get().map(tile => tile.storedSessionId)
   ])
 
   const active = $selectedStoredSessionId.get()

@@ -34,6 +34,7 @@ import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
+import { shouldUseDraftTabTitle } from '@/lib/draft-title'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -603,7 +604,15 @@ export const watchSessionTiles = paneMirror<SessionTile>({
   ),
   // Until the first turn lists a row there is no title to register, so the tab
   // takes its name from the composer instead — live, without re-registering.
-  tabTitle: storedSessionId => (tileStoredRow(storedSessionId) ? null : <SessionDraftTitle scope={storedSessionId} />),
+  // A listed / titled / already-used row is not a draft even if `$sessions`
+  // momentarily omitted it.
+  tabTitle: storedSessionId => {
+    const stored = tileStoredRow(storedSessionId)
+
+    return shouldUseDraftTabTitle({ listedRow: stored, storedSessionId }) ? (
+      <SessionDraftTitle scope={storedSessionId} />
+    ) : null
+  },
   render: storedSessionId => <SessionTilePane storedSessionId={storedSessionId} />,
   tabWrap: (storedSessionId, tab) => (
     <SessionTabMenu

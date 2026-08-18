@@ -42,3 +42,34 @@ export function deriveDraftTitle(text: string): string {
 
   return `${kept.replace(/[\s,.;:—-]+$/, '')}…`
 }
+
+/** When a tab may take its name from unsent composer text.
+ *
+ *  Draft titles exist only for a true new chat (no stored id yet) or an unused
+ *  + / ⌘T tab that has never listed a row and has no transcript. The moment a
+ *  session is listed, has a title, or already has messages — including a
+ *  compression ancestor whose recents row vanished — overlaying `deriveDraftTitle`
+ *  makes every open tab look like "New session" / the typed fragment. */
+export function shouldUseDraftTabTitle(opts: {
+  storedSessionId: string | null
+  listedRow?: { message_count?: null | number; title?: null | string } | null
+  hasMessages?: boolean
+}): boolean {
+  const id = opts.storedSessionId?.trim() ?? ''
+
+  if (!id) {
+    return true
+  }
+
+  const row = opts.listedRow
+
+  if (row && ((row.message_count ?? 0) > 0 || Boolean(row.title?.trim()))) {
+    return false
+  }
+
+  if (opts.hasMessages) {
+    return false
+  }
+
+  return true
+}

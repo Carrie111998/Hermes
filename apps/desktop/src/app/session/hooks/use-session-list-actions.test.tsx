@@ -18,6 +18,8 @@ import {
   setSessionsLoading
 } from '@/store/session'
 
+import { $sessionTiles } from '@/store/session-states'
+
 import { useSessionListActions } from './use-session-list-actions'
 
 // Sidebar refresh hygiene: a content-identical refresh (turn complete,
@@ -105,6 +107,7 @@ beforeEach(() => {
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
   setSessionsLoading(false)
+  $sessionTiles.set([])
 })
 
 afterEach(() => {
@@ -115,6 +118,7 @@ afterEach(() => {
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
   setSessionsLoading(false)
+  $sessionTiles.set([])
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
@@ -653,5 +657,25 @@ describe('messaging profile scope', () => {
 
     expect(listAllProfileSessions).not.toHaveBeenCalled()
     expect($messagingPlatformTotals.get()).toEqual({ 'work:signal': 12 })
+  })
+})
+
+describe('refreshSessions keeps open tabs', () => {
+  it('keeps an open session tile that aged off the recents page', async () => {
+    // Repro: four tabs open, recents page only returns the newest two.
+    // Without keeping tile ids, the older tabs lose their `$sessions` row and
+    // SessionDraftTitle paints them as "New session" the moment you type.
+    setSessions([row('open-tile', { last_active: 900 }), row('recent', { last_active: 1000 })])
+    $sessionTiles.set([{ storedSessionId: 'open-tile' }])
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('recent', { last_active: 1000 })] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(session => session.id)).toEqual(['recent', 'open-tile'])
+    expect($sessions.get().find(session => session.id === 'open-tile')?.title).toBe('Chat open-tile')
   })
 })
