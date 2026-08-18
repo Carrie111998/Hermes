@@ -276,6 +276,105 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _apply_model_override(agent) -> None:
+    """Redirect a fresh process onto a Telegram-tap rate-limit reroute.
+
+    Phase 2's central invariant: routing changes if and only if a valid,
+    unexpired override matches the (provider, model) being resolved.
+    Nothing else here may alter routing.
+
+    Must run BEFORE ``agent._primary_runtime`` is snapshotted (see the call
+    site below).  Every cron run is a fresh process — if the override were
+    applied after the snapshot, the snapshot would record the rate-limited
+    primary, and the next turn's ``restore_primary_runtime()`` would undo the
+    reroute right back onto the model that is still 429ing.  If applied
+    before the snapshot, the snapshot captures the replacement as primary and
+    the process never pays the 429 at all.
+
+    Swaps the client too, not just the model/provider strings — leaving
+    ``agent.client`` pointed at the old provider would send the replacement
+    model name to the wrong endpoint. Mirrors the client-construction shape
+    of ``try_activate_fallback`` in ``agent/chat_completion_helpers.py``
+    (resolve via the centralized router, derive api_mode from the resolved
+    base URL/provider) without duplicating that function's turn-scoped
+    concerns (credential pool rebinding, prompt-cache re-evaluation, context
+    compressor limits) — this runs once at init, not on every failover.
+
+    Fail-open by design: any failure here (bad override record, unresolvable
+    replacement provider, network hiccup) must leave the agent on its
+    configured primary and must never break agent init.
+    """
+    try:
+        from events import model_override
+
+        current_provider = getattr(agent, "provider", "") or ""
+        current_model = getattr(agent, "model", "") or ""
+        override = model_override.get_override(current_provider, current_model)
+        if not override:
+            return
+
+        replacement_provider = str(override.get("replacement_provider") or "").strip()
+        replacement_model = str(override.get("replacement_model") or "").strip()
+        if not replacement_provider or not replacement_model:
+            return
+
+        from agent.auxiliary_client import resolve_provider_client
+
+        new_client, resolved_model = resolve_provider_client(
+            replacement_provider, model=replacement_model, raw_codex=True,
+        )
+        if new_client is None:
+            logger.warning(
+                "Model override %s/%s -> %s/%s could not be resolved to a "
+                "working client; staying on configured primary",
+                current_provider, current_model,
+                replacement_provider, replacement_model,
+            )
+            return
+
+        replacement_model = resolved_model or replacement_model
+        new_base_url = str(getattr(new_client, "base_url", "") or "")
+
+        # Same api_mode derivation shape as try_activate_fallback's
+        # client-construction block, trimmed to the cases the reroute store
+        # actually accepts (see events/model_override.py) -- full parity
+        # with every provider-specific edge case there lives in that
+        # function, not duplicated here.
+        if replacement_provider == "openai-codex":
+            new_api_mode = "codex_responses"
+        elif (
+            replacement_provider == "anthropic"
+            or new_base_url.rstrip("/").lower().endswith("/anthropic")
+        ):
+            new_api_mode = "anthropic_messages"
+        else:
+            new_api_mode = "chat_completions"
+
+        agent.model = replacement_model
+        agent.provider = replacement_provider
+        agent.base_url = new_base_url
+        agent.api_mode = new_api_mode
+        agent.api_key = getattr(new_client, "api_key", getattr(agent, "api_key", ""))
+        agent.client = new_client
+        if hasattr(agent, "_client_kwargs"):
+            agent._client_kwargs = {
+                "api_key": getattr(new_client, "api_key", ""),
+                "base_url": new_base_url,
+            }
+
+        logger.info(
+            "Model override active: %s/%s -> %s/%s",
+            current_provider, current_model,
+            replacement_provider, replacement_model,
+        )
+    except Exception:
+        logger.warning(
+            "Model override application failed; continuing on configured "
+            "primary",
+            exc_info=True,
+        )
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -2168,6 +2267,15 @@ def init_agent(
     # ``ensure_compression_feasibility_checked`` (called from
     # ``run_conversation``'s preflight) runs it at most once per agent.
     agent._compression_feasibility_checked = False
+
+    # Apply any active Telegram-tap rate-limit reroute BEFORE the primary
+    # runtime is snapshotted below. This is the whole point of Task 3: a
+    # cron run is a fresh process, so if the override lands after the
+    # snapshot, the snapshot records the rate-limited model as primary and
+    # the next turn's restore_primary_runtime() undoes the reroute. Landing
+    # it here means the snapshot captures the replacement as primary and the
+    # process never pays the 429 at all.
+    _apply_model_override(agent)
 
     # Snapshot primary runtime for per-turn restoration.  When fallback
     # activates during a turn, the next turn restores these values so the
