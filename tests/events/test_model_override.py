@@ -304,3 +304,175 @@ def test_clear_without_actor_is_still_legible(ov):
     assert payload["set_by"] == "telegram:diego"
     assert payload["cleared_by"] != "telegram:diego"
     assert payload["cleared_by"] == "unknown"
+
+
+class TestUnpersistedWrites:
+    """I2: a failed disk write must never become an unrevocable ghost.
+
+    Phase 1's ``_publish_unsaved`` semantics were mirrored here too
+    faithfully. They are correct for a TELEMETRY store (keep counting
+    locally, self-heals) and wrong for a CONTROL store whose entire value is
+    cross-process: an override adopted in memory only makes Telegram answer
+    "Diverted 6h", writes MODEL_OVERRIDE_SET to the audit trail and reroutes
+    the gateway, while no cron sees it, ``hermes overrides list`` shows
+    nothing, and ``hermes overrides clear`` says "Nothing matched" -- for the
+    full 6h, with no revocation path short of a gateway restart. That is the
+    direct inverse of the spec's "visible and reversible" containment
+    requirement.
+
+    This host has hit 0 free bytes on C:, so "the write failed" is not a
+    hypothetical here.
+    """
+
+    def test_failed_save_returns_not_ok_with_a_reason(self, ov, monkeypatch):
+        from events import model_override
+
+        monkeypatch.setattr(model_override, "_save_store", lambda store: False)
+        ok, reason = model_override.set_override(
+            provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex",
+            replacement_model="gpt-5.6-sol",
+            ttl_seconds=6 * 3600, set_by="telegram:diego")
+
+        assert ok is False
+        assert reason and reason != "ok"
+        assert "persist" in reason.lower()
+
+    def test_failed_save_emits_no_audit_event(self, ov, monkeypatch):
+        """An audit trail that records an override nothing can see or revoke
+        is worse than no record at all."""
+        from events import model_override
+
+        monkeypatch.setattr(model_override, "_save_store", lambda store: False)
+        bus = _FakeBus()
+        ok, _ = model_override.set_override(
+            provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex",
+            replacement_model="gpt-5.6-sol",
+            ttl_seconds=6 * 3600, set_by="telegram:diego", bus=bus)
+
+        assert ok is False
+        assert bus.emitted == []
+
+    def test_failed_save_leaves_no_ghost_in_this_process(self, ov, monkeypatch):
+        """The gateway must not route on an override no other process can
+        see. Mutation check: restoring the _publish_unsaved() call makes this
+        get_override return a record."""
+        from events import model_override
+
+        monkeypatch.setattr(model_override, "_save_store", lambda store: False)
+        model_override.set_override(
+            provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex",
+            replacement_model="gpt-5.6-sol",
+            ttl_seconds=6 * 3600, set_by="telegram:diego")
+
+        assert model_override.get_override("deepseek", "deepseek-v4-pro") is None
+
+    def test_unreliable_store_also_refuses_the_write(self, ov, monkeypatch):
+        """The other half of the same branch: when the last read failed,
+        writes are skipped entirely (``_store_reliable`` is False) -- that
+        skip must fail the call, not silently succeed."""
+        from events import model_override
+
+        monkeypatch.setattr(model_override, "_store_reliable", lambda: False)
+        bus = _FakeBus()
+        ok, reason = model_override.set_override(
+            provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex",
+            replacement_model="gpt-5.6-sol",
+            ttl_seconds=6 * 3600, set_by="telegram:diego", bus=bus)
+
+        assert ok is False
+        assert "persist" in reason.lower()
+        assert bus.emitted == []
+        assert model_override.get_override("deepseek", "deepseek-v4-pro") is None
+
+    def test_successful_save_is_unchanged(self, ov):
+        """THE CENTRAL INVARIANT: with a working disk, nothing about
+        set_override changed."""
+        from events import model_override
+
+        bus = _FakeBus()
+        ok, reason = model_override.set_override(
+            provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex",
+            replacement_model="gpt-5.6-sol",
+            ttl_seconds=6 * 3600, set_by="telegram:diego", bus=bus)
+
+        assert (ok, reason) == (True, "ok")
+        assert len(bus.emitted) == 1
+        rec = model_override.get_override("deepseek", "deepseek-v4-pro")
+        assert rec["replacement_model"] == "gpt-5.6-sol"
+
+    def test_failed_clear_reports_failure(self, ov, monkeypatch):
+        """Inverted, same defect: telling the operator traffic is un-diverted
+        while the record is still on disk (and still live in every other
+        process) is the ghost in reverse."""
+        from events import model_override
+
+        model_override.set_override(
+            provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex",
+            replacement_model="gpt-5.6-sol",
+            ttl_seconds=3600, set_by="telegram:diego")
+        assert model_override.get_override("deepseek", "deepseek-v4-pro")
+
+        monkeypatch.setattr(model_override, "_save_store", lambda store: False)
+        bus = _FakeBus()
+        assert model_override.clear_override(
+            provider="deepseek", model="deepseek-v4-pro",
+            cleared_by="cli:diego", bus=bus) is False
+        assert bus.emitted == []
+        # Still there -- which is the truth on disk.
+        assert model_override.get_override("deepseek", "deepseek-v4-pro")
+
+
+class TestStoreStatus:
+    """I4: a corrupt override file must not be indistinguishable from
+    "no overrides" for callers that REPORT state."""
+
+    def test_readable_store_reports_readable(self, ov):
+        from events import model_override
+
+        status = model_override.store_status()
+        assert status["readable"] is True
+        assert status["path"]
+
+    def test_corrupt_store_reports_unreadable(self, ov):
+        from events import model_override
+
+        ov.write_text("{not json at all", encoding="utf-8")
+        model_override.reset_cache()
+
+        # Routing callers still fail open -- that part must NOT change.
+        assert model_override.get_override("deepseek", "deepseek-v4-pro") is None
+        assert model_override.list_overrides() == []
+        # ...but a reporting caller can now tell the difference.
+        assert model_override.store_status()["readable"] is False
+
+    def test_absent_store_is_readable_not_broken(self, ov):
+        """A legitimately missing file is normal empty state, not a fault --
+        otherwise every fresh install would warn."""
+        from events import model_override
+
+        assert not ov.exists()
+        assert model_override.store_status()["readable"] is True
+
+    def test_unreadable_store_warns_once_per_backoff_window(self, ov, monkeypatch, caplog):
+        """WARNING, not debug -- but bounded by the existing read backoff, so
+        a persistently broken file does not log on every single call."""
+        import logging
+        from events import model_override
+
+        ov.write_text("{not json at all", encoding="utf-8")
+        model_override.reset_cache()
+
+        with caplog.at_level(logging.WARNING, logger="events.model_override"):
+            for _ in range(5):
+                model_override.get_override("deepseek", "deepseek-v4-pro")
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, (
+            "expected exactly one warning per backoff window, got %d" % len(warnings))
+        assert "could not be read" in warnings[0].getMessage()

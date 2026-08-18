@@ -19,10 +19,7 @@ docstring for the full reasoning. Summary:
   * The cache is anchored to the file's identity marker
     ``(st_mtime_ns, st_size)`` as of the last moment this process was in
     sync with the file.
-  * Marker matches the anchor -> the cache IS the truth. This is what keeps
-    a FAILED WRITE from being silently discarded: re-reading the file after
-    a failed write would hand back the pre-mutation state and make the
-    caller think the write never happened even though it locally applied.
+  * Marker matches the anchor -> the cache IS the truth.
   * Marker has moved -> a foreign process (a different cron, the gateway)
     wrote the file; reload so its override becomes visible here.
   * A FAILED READ must NOT anchor the marker. Anchoring on a transient
@@ -32,6 +29,19 @@ docstring for the full reasoning. Summary:
     Instead the marker is left mismatched so the next call retries, bounded
     by _READ_FAILURE_RETRY_SECONDS so a persistently broken file is not
     retried on every single call.
+
+Where this DIVERGES from rate_limit_signal.py
+---------------------------------------------
+That module is a TELEMETRY store: a write that misses the disk is adopted
+in memory (``_publish_unsaved``) because local counting still has value and
+self-heals on the next successful write. This one is a CONTROL store whose
+entire value is cross-process -- the gateway, every cron, and the CLI must
+agree on it. An override adopted in memory only would reroute the gateway
+while no cron sees it, ``hermes overrides list`` shows nothing, and
+``hermes overrides clear`` reports "Nothing matched": an unrevocable ghost
+for the full TTL, the direct inverse of the spec's "visible and reversible"
+containment requirement. So here a write that did not persist FAILS, and
+says why.
 
 Fail-open contract: ``get_override`` returns ``None`` for missing,
 malformed, unreadable, or expired input and NEVER raises -- an override
@@ -206,8 +216,19 @@ def _load_store() -> Dict[str, Any]:
             # NOT be anchored to it. Fail open to {} for this call, but
             # leave the marker mismatched so the next call retries, bounded
             # by the backoff above.
-            logger.debug(
-                "model_override: store read failed (swallowed)", exc_info=True
+            # WARNING, not debug: an unreadable store is indistinguishable
+            # from "no overrides" at every call site -- get_override() fails
+            # open to None, list_overrides() to [], and _store_reliable()
+            # then permanently SKIPS every write. The feature is dead and
+            # nothing else says so. This is not per-call spam: a failed read
+            # arms _store_read_retry_at, and the backoff branch above skips
+            # the read entirely until it elapses, so this fires at most once
+            # per _READ_FAILURE_RETRY_SECONDS window.
+            logger.warning(
+                "model_override: override store at %s could not be read; "
+                "treating as EMPTY and skipping writes until the next "
+                "successful read (retry in %ss)",
+                _store_path(), _READ_FAILURE_RETRY_SECONDS, exc_info=True,
             )
             _store_cache = {}
             _store_read_ok = False
@@ -222,16 +243,30 @@ def _load_store() -> Dict[str, Any]:
     return _store_cache
 
 
-def _publish_unsaved(store: Dict[str, Any]) -> None:
-    """Adopt a mutation the disk rejected, WITHOUT re-anchoring the marker.
+def store_status() -> Dict[str, Any]:
+    """Report whether the override store is actually readable, plus its path.
 
-    See events/rate_limit_signal.py::_publish_unsaved -- same anti-flood
-    reasoning: the write failed, the file (and its marker) are unchanged,
-    so the next _load_store() would otherwise hand back the pre-mutation
-    state and silently discard this call's effect.
+    Every ROUTING caller fails open: ``get_override`` -> None,
+    ``list_overrides`` -> []. That is correct for routing (an untrusted store
+    must never block a model call) but it makes a corrupt/unreadable file
+    byte-identical to "there are no overrides" for a REPORTING caller --
+    ``hermes overrides list`` would print "No active model overrides." while
+    the feature is dark and every write is being silently skipped
+    (``_store_reliable``). Reporting callers use this to tell those apart.
+
+    Never raises; an unreadable status is itself reported as unreadable.
     """
-    global _store_cache
-    _store_cache = store
+    try:
+        _load_store()
+        readable = _store_reliable()
+    except Exception:
+        logger.debug("model_override.store_status probe failed", exc_info=True)
+        readable = False
+    try:
+        path = str(_store_path())
+    except Exception:
+        path = ""
+    return {"readable": bool(readable), "path": path}
 
 
 def _save_store(store: Dict[str, Any]) -> bool:
@@ -400,12 +435,23 @@ def set_override(
 
         saved = _save_store(store) if _store_reliable() else False
         if not saved:
-            # See _publish_unsaved(): adopt the mutation locally even though
-            # the disk write failed (or was skipped because the last read
-            # was unreliable), so this process's own next read reflects the
-            # override it just believes it set, instead of silently
-            # discarding it.
-            _publish_unsaved(store)
+            # An override that did not reach disk must FAIL, loudly. Adopting
+            # it in memory (the telemetry-store reflex -- see
+            # _publish_unsaved) would make Telegram answer "Diverted 6h",
+            # write MODEL_OVERRIDE_SET to the audit trail and reroute the
+            # gateway, while no cron ever sees it and neither `hermes
+            # overrides list` nor `hermes overrides clear` can find it:
+            # an unrevocable ghost for the full TTL. Nothing is published,
+            # nothing is audited, and the caller gets a reason it can show
+            # the operator.
+            logger.warning(
+                "model_override: could not persist override %s/%s -> %s/%s "
+                "(store %s); refusing it rather than routing on an "
+                "override no other process can see or revoke",
+                provider, model, replacement_provider, replacement_model,
+                _store_path(),
+            )
+            return False, "could not persist the override"
 
         # A non-positive ttl_seconds writes a record whose expires_at is
         # already <= now; _reap_expired() drops it on the very next load, so
@@ -431,7 +477,14 @@ def set_override(
 def clear_override(
     *, provider: str, model: str, cleared_by: str = "", bus: Any = None
 ) -> bool:
-    """Remove an active override. Returns True only if something was removed.
+    """Remove an active override. Returns True only if the removal PERSISTED.
+
+    False therefore means either "there was nothing to remove" or "the
+    removal could not be written to disk" -- both are states in which the
+    caller must not tell the operator that traffic is un-diverted. A clear
+    that only happened in this process's memory would leave every other
+    process still reading the record off the file; see the module docstring
+    on why this store refuses unpersisted mutations.
 
     Emits MODEL_OVERRIDE_SET only when a record was actually removed -- a
     no-op clear (nothing to remove) leaves nothing behind, so it must not
@@ -458,7 +511,19 @@ def clear_override(
 
         saved = _save_store(store) if _store_reliable() else False
         if not saved:
-            _publish_unsaved(store)
+            # Same reasoning as set_override, inverted: reporting a clear
+            # that never reached disk is worse than reporting failure --
+            # the operator walks away believing traffic is un-diverted while
+            # every other process still reads the record off the file and
+            # keeps routing to the replacement. Return False so the caller
+            # says so.
+            logger.warning(
+                "model_override: could not persist the clear of %s/%s "
+                "(store %s); the override is still on disk and still live "
+                "in every other process",
+                provider, model, _store_path(),
+            )
+            return False
 
         payload = {
             "provider": provider,

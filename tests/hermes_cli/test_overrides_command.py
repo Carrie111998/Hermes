@@ -257,3 +257,85 @@ class TestArgparseWiring:
         out = result.stdout + result.stderr
         assert "Traceback" not in out
         assert "No active" in out or "no active" in out
+
+
+# ---------------------------------------------------------------------------
+# I4: a corrupt override file must not read as "no overrides"
+# ---------------------------------------------------------------------------
+
+class TestUnreadableStore:
+    """``list_overrides()`` fails open to [] for a corrupt/unreadable file --
+    correct for routing, wrong for the one caller whose whole job is to
+    REPORT state. Printing "No active model overrides." for a store that is
+    in fact dark (reads blank, writes permanently skipped) means the feature
+    is broken and nothing says so.
+    """
+
+    def test_list_says_so_when_the_store_is_unreadable(self, capsys):
+        from hermes_cli.overrides_cmd import cmd_overrides_list
+
+        with (
+            patch("hermes_cli.overrides_cmd.list_overrides", return_value=[]),
+            patch("hermes_cli.overrides_cmd.store_status",
+                  return_value={"readable": False, "path": "C:/x/model_overrides.json"}),
+        ):
+            rc = cmd_overrides_list(types.SimpleNamespace())
+
+        out = capsys.readouterr().out
+        assert rc != 0, "an unreadable store is not a clean empty state"
+        assert "could not be read" in out
+        assert "model_overrides.json" in out
+        assert "No active model overrides." not in out
+
+    def test_list_empty_readable_store_is_still_the_friendly_message(self, capsys):
+        """THE CENTRAL INVARIANT: a genuinely empty, readable store reports
+        exactly as before."""
+        from hermes_cli.overrides_cmd import cmd_overrides_list
+
+        with (
+            patch("hermes_cli.overrides_cmd.list_overrides", return_value=[]),
+            patch("hermes_cli.overrides_cmd.store_status",
+                  return_value={"readable": True, "path": "C:/x/model_overrides.json"}),
+        ):
+            rc = cmd_overrides_list(types.SimpleNamespace())
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "No active model overrides." in out
+        assert "could not be read" not in out
+
+    def test_clear_distinguishes_unreadable_from_nothing_matched(self, capsys):
+        """"Nothing matched" tells the operator there is nothing to revoke.
+        For an unreadable store that is a lie: there may well be a live
+        override on disk that simply cannot be read."""
+        from hermes_cli.overrides_cmd import cmd_overrides_clear
+
+        args = types.SimpleNamespace(all=False, provider="deepseek",
+                                     model="deepseek-v4-pro")
+        with (
+            patch("hermes_cli.overrides_cmd.clear_override", return_value=False),
+            patch("hermes_cli.overrides_cmd.store_status",
+                  return_value={"readable": False, "path": "C:/x/model_overrides.json"}),
+        ):
+            rc = cmd_overrides_clear(args)
+
+        out = capsys.readouterr().out
+        assert rc != 0
+        assert "could not be read" in out
+        assert "Nothing matched" not in out
+
+    def test_clear_all_says_so_when_the_store_is_unreadable(self, capsys):
+        from hermes_cli.overrides_cmd import cmd_overrides_clear
+
+        args = types.SimpleNamespace(all=True, provider=None, model=None)
+        with (
+            patch("hermes_cli.overrides_cmd.list_overrides", return_value=[]),
+            patch("hermes_cli.overrides_cmd.store_status",
+                  return_value={"readable": False, "path": "C:/x/model_overrides.json"}),
+        ):
+            rc = cmd_overrides_clear(args)
+
+        out = capsys.readouterr().out
+        assert rc != 0
+        assert "could not be read" in out
+        assert "nothing to clear" not in out.lower()

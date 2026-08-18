@@ -26,7 +26,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from events.model_override import clear_override, list_overrides
+from events.model_override import clear_override, list_overrides, store_status
 
 
 def _cli_actor() -> str:
@@ -114,10 +114,34 @@ def _sorted_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # Subcommands
 # ---------------------------------------------------------------------------
 
+def _print_store_unreadable(status: Dict[str, Any]) -> None:
+    """Say so when the store is dark, instead of "No active model overrides."
+
+    ``list_overrides()`` fails open to [] for a corrupt/unreadable file, which
+    renders identically to a genuinely empty store — so the CLI safety valve
+    would cheerfully report "nothing to worry about" for a feature that is in
+    fact dead (reads blank, writes skipped). This is the one caller that
+    reports state rather than routing on it, so it is the one caller that has
+    to tell the two apart.
+    """
+    path = status.get("path") or "the override store"
+    print()
+    print("  WARNING: the model-override store could not be read.")
+    print(f"    {path}")
+    print("    Overrides cannot be listed, set, or cleared while this")
+    print("    persists — every read returns empty and every write is")
+    print("    skipped. Inspect/repair or delete that file, then retry.")
+    print()
+
+
 def cmd_overrides_list(args) -> int:  # noqa: ARG001
     """Show every active override: what's avoided, what it routes to, expiry, who set it."""
     records = list_overrides()
     if not records:
+        status = store_status()
+        if not status.get("readable", True):
+            _print_store_unreadable(status)
+            return 1
         print()
         print("  No active model overrides.")
         print()
@@ -149,6 +173,10 @@ def cmd_overrides_clear(args) -> int:
 
         records = list_overrides()
         if not records:
+            status = store_status()
+            if not status.get("readable", True):
+                _print_store_unreadable(status)
+                return 1
             print()
             print("  No active overrides — nothing to clear.")
             print()
@@ -182,11 +210,16 @@ def cmd_overrides_clear(args) -> int:
         return 2
 
     ok = clear_override(provider=provider, model=model, cleared_by=cleared_by)
-    print()
     if ok:
+        print()
         print(f"  Cleared override: {provider}/{model}")
         print()
         return 0
+    status = store_status()
+    if not status.get("readable", True):
+        _print_store_unreadable(status)
+        return 1
+    print()
     print(f"  Nothing matched — no active override found for {provider}/{model}.")
     print()
     return 1
