@@ -12,10 +12,15 @@ const MOBILE_WIDTHS = [320, 360, 390, 430] as const
 const LONG_TITLE = 'Synthetic review card with an intentionally long unbroken-token-safe title for drawer and clipping validation'
 
 function runBoardScript(hermesHome: string, source: string) {
+  const env: Record<string, string | undefined> = { ...process.env, HERMES_HOME: hermesHome, PYTHONPATH: REPO_ROOT }
+  delete env.HERMES_KANBAN_BOARD
+  delete env.HERMES_KANBAN_DB
+  delete env.HERMES_KANBAN_TASK
+
   const result = spawnSync(process.env.PYTHON ?? 'python', ['-c', source], {
     cwd: REPO_ROOT,
     encoding: 'utf8',
-    env: { ...process.env, HERMES_HOME: hermesHome, PYTHONPATH: REPO_ROOT }
+    env
   })
 
   if (result.status !== 0) {throw new Error(`Kanban fixture failed: ${result.stderr}`)}
