@@ -23,7 +23,7 @@ import {
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
-import { clearAllPrompts } from '@/store/prompts'
+import { clearAllPromptsForActiveSource } from '@/store/prompts'
 import {
   $busy,
   $connection,
@@ -691,7 +691,7 @@ export function usePromptActions({
     // raised. Drop this session's pending clarify / approval / sudo / secret so
     // a dead panel (and the sidebar "needs input" dot) can't linger and accept
     // an answer the backend will reject.
-    clearAllPrompts(sessionId)
+    clearAllPromptsForActiveSource(sessionId)
     clearClarifyRequest(undefined, sessionId)
 
     try {

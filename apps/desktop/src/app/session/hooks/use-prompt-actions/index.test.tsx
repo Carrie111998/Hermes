@@ -11,6 +11,7 @@ import { $composerAttachments, $composerDraft, type ComposerAttachment, setCompo
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
+import { clearAllPrompts, sessionApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import {
   $busy,
   $connection,
@@ -3503,6 +3504,37 @@ describe('usePromptActions sleep/wake session recovery', () => {
       interrupted: true,
       turnStartedAt: null
     })
+  })
+
+  it('interrupt cleanup preserves a foreign-source approval with the same session id', async () => {
+    clearAllPrompts()
+    setApprovalRequest({ command: '', description: 'active', requestId: 'active-request', sessionId: RUNTIME_SESSION_ID })
+    setApprovalRequest({
+      command: '',
+      connectionId: 'remote-b',
+      description: 'foreign',
+      profile: 'research',
+      requestId: 'foreign-request',
+      sessionId: RUNTIME_SESSION_ID
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.cancelRun()
+
+    expect(sessionApprovalRequest(RUNTIME_SESSION_ID, { connectionId: null, profile: 'default' }).get()).toBeNull()
+    expect(
+      sessionApprovalRequest(RUNTIME_SESSION_ID, { connectionId: 'remote-b', profile: 'research' }).get()?.requestId
+    ).toBe('foreign-request')
+    clearAllPrompts()
   })
 
   it('surfaces the original error (no resume) when the failure is not "session not found"', async () => {

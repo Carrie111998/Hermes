@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $gateway } from './gateway'
+vi.mock('./gateway', async () => {
+  const { atom } = await import('nanostores')
+
+  return { $gateway: atom(null), activeGatewayConnectionId: vi.fn(() => null), requestGatewayForAgent: vi.fn() }
+})
+
+import { requestGatewayForAgent } from './gateway'
 import {
   dispatchNativeNotification,
   dispatchPluginNativeNotification,
@@ -11,7 +17,8 @@ import {
   setNativeNotifyKind
 } from './native-notifications'
 import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from './notify-baseline'
-import { $approvalRequest, setApprovalRequest } from './prompts'
+import { $activeGatewayProfile } from './profile'
+import { clearAllPrompts, sessionApprovalRequest, setApprovalRequest } from './prompts'
 import { $activeSessionId, setActiveSessionId } from './session'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -100,6 +107,23 @@ describe('dispatchNativeNotification focus gating', () => {
     expect(notify).not.toHaveBeenCalled()
   })
 
+  it('fires a foreign-source approval sharing the focused active session id', () => {
+    setWindowState({ focused: true, hidden: false })
+    setActiveSessionId('shared-session')
+    $activeGatewayProfile.set('default')
+
+    dispatchNativeNotification({
+      approvalConnectionId: 'remote-b',
+      approvalProfile: 'research',
+      approvalRequestId: 'request-b',
+      kind: 'approval',
+      sessionId: 'shared-session',
+      title: 'approve'
+    })
+
+    expect(notify).toHaveBeenCalledTimes(1)
+  })
+
   it('fires a global completion notification while away with no active session (pet gen)', () => {
     setActiveSessionId(null)
     dispatchNativeNotification({ global: true, kind: 'backgroundDone', title: 'Your pet hatched' })
@@ -138,6 +162,26 @@ describe('dispatchNativeNotification preferences', () => {
     dispatchNativeNotification({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
     expect(notify).toHaveBeenCalledWith(
       expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+    )
+  })
+
+  it('forwards the opaque approval request id to the native action context', () => {
+    const background = freshSession()
+    setActiveSessionId('foreground')
+    dispatchNativeNotification({
+      approvalConnectionId: 'remote-a',
+      approvalProfile: 'research',
+      approvalRequestId: 'request-a',
+      kind: 'approval',
+      sessionId: background,
+      title: 'approve'
+    })
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        approvalConnectionId: 'remote-a',
+        approvalProfile: 'research',
+        approvalRequestId: 'request-a'
+      })
     )
   })
 })
@@ -207,6 +251,30 @@ describe('dispatchNativeNotification throttle', () => {
     dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done again' })
     expect(notify).toHaveBeenCalledTimes(1)
   })
+
+  it('does not collapse approvals from distinct source authorities sharing a session id', () => {
+    const sessionId = freshSession()
+    setActiveSessionId('another-session')
+
+    dispatchNativeNotification({
+      approvalConnectionId: 'remote-a',
+      approvalProfile: 'research',
+      approvalRequestId: 'request-a',
+      kind: 'approval',
+      sessionId,
+      title: 'A'
+    })
+    dispatchNativeNotification({
+      approvalConnectionId: 'remote-b',
+      approvalProfile: 'research',
+      approvalRequestId: 'request-b',
+      kind: 'approval',
+      sessionId,
+      title: 'B'
+    })
+
+    expect(notify).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('sendTestNativeNotification', () => {
@@ -226,40 +294,100 @@ describe('$activeSessionId wiring', () => {
 })
 
 describe('respondToApprovalAction', () => {
-  const request = vi.fn().mockResolvedValue({ resolved: true })
+  const routedRequest = vi.mocked(requestGatewayForAgent)
+  const source = { connectionId: 'remote-a', profile: 'research' }
 
   beforeEach(() => {
-    request.mockClear()
-    $gateway.set({ request } as unknown as ReturnType<typeof $gateway.get>)
-  })
-
-  afterEach(() => {
-    $gateway.set(null)
-  })
-
-  it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
+    clearAllPrompts()
+    routedRequest.mockReset()
+    routedRequest.mockImplementation(async (_connectionId, _profile, method) =>
+      method === 'approval.respond' ? ({ resolved: 1 } as never) : ({ approvals: [] } as never)
+    )
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
-
-    await respondToApprovalAction('bg', 'approve')
-
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
-    expect($approvalRequest.get()).toBeNull()
   })
 
-  it('rejects via approval.respond {choice: "deny"}', async () => {
-    await respondToApprovalAction('bg', 'reject')
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+  it('approves the exact notification request id and clears only that prompt', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ ...source, command: '', description: 'redacted', requestId: 'test-request-id', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'test-request-id', 'approve', source)
+
+    expect(routedRequest).toHaveBeenNthCalledWith(1, 'remote-a', 'research', 'approval.respond', {
+      choice: 'once',
+      request_id: 'test-request-id',
+      session_id: 'bg'
+    })
+    expect(routedRequest).toHaveBeenNthCalledWith(2, 'remote-a', 'research', 'approval.pending', {
+      session_id: 'bg'
+    })
+    expect(sessionApprovalRequest('bg', source).get()).toBeNull()
+  })
+
+  it('parks the replayed approval under the original notification source', async () => {
+    const sessionId = freshSession()
+
+    $activeGatewayProfile.set('default')
+    routedRequest.mockImplementation(async (_connectionId, _profile, method) => {
+      if (method === 'approval.respond') {
+        return { resolved: 1 } as never
+      }
+
+      return {
+        approvals: [{ description: 'next approval', request_id: 'next-request-id' }]
+      } as never
+    })
+    setApprovalRequest({ ...source, command: '', description: 'current', requestId: 'current-request-id', sessionId })
+
+    await respondToApprovalAction(sessionId, 'current-request-id', 'approve', source)
+
+    expect(sessionApprovalRequest(sessionId, source).get()?.requestId).toBe('next-request-id')
+    expect(sessionApprovalRequest(sessionId, { connectionId: null, profile: 'default' }).get()).toBeNull()
+  })
+
+  it('does not let a stale notification action clear a newer prompt', async () => {
+    setApprovalRequest({ ...source, command: '', description: 'newer', requestId: 'new-request-id', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'old-request-id', 'approve', source)
+
+    expect(routedRequest).toHaveBeenNthCalledWith(1, 'remote-a', 'research', 'approval.respond', {
+      choice: 'once',
+      request_id: 'old-request-id',
+      session_id: 'bg'
+    })
+    expect(sessionApprovalRequest('bg', source).get()?.requestId).toBe('new-request-id')
+  })
+
+  it('keeps the exact prompt parked when the backend resolves nothing', async () => {
+    routedRequest.mockResolvedValueOnce({ resolved: 0 } as never)
+    setApprovalRequest({ ...source, command: '', description: 'redacted', requestId: 'test-request-id', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'test-request-id', 'reject', source)
+
+    expect(sessionApprovalRequest('bg', source).get()?.requestId).toBe('test-request-id')
+    expect(routedRequest).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects with the exact notification request id', async () => {
+    await respondToApprovalAction('bg', 'test-request-id', 'reject', source)
+
+    expect(routedRequest).toHaveBeenNthCalledWith(1, 'remote-a', 'research', 'approval.respond', {
+      choice: 'deny',
+      request_id: 'test-request-id',
+      session_id: 'bg'
+    })
   })
 
   it('ignores unknown action ids', async () => {
-    await respondToApprovalAction('bg', 'snooze')
-    expect(request).not.toHaveBeenCalled()
+    await respondToApprovalAction('bg', 'test-request-id', 'snooze', source)
+    expect(routedRequest).not.toHaveBeenCalled()
   })
 
-  it('no-ops without a gateway', async () => {
-    $gateway.set(null)
-    await respondToApprovalAction('bg', 'approve')
-    expect(request).not.toHaveBeenCalled()
+  it('leaves the prompt parked when the source-scoped gateway rejects', async () => {
+    routedRequest.mockRejectedValueOnce(new Error('source unavailable'))
+    setApprovalRequest({ ...source, command: '', description: 'redacted', requestId: 'test-request-id', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'test-request-id', 'approve', source)
+
+    expect(sessionApprovalRequest('bg', source).get()?.requestId).toBe('test-request-id')
   })
 })

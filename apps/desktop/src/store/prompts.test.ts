@@ -6,12 +6,18 @@ import {
   $approvalRequest,
   $secretRequest,
   $sudoRequest,
+  activeSessionApprovalRequest,
   clearAllPrompts,
+  clearAllPromptsForActiveSource,
   clearApprovalRequest,
   clearSecretRequest,
   clearSudoRequest,
+  hasBlockingPromptRequest,
   receiveApprovalRequest,
   replayPendingApproval,
+  sessionApprovalRequest,
+  sessionAwaitingInput,
+  sessionBlockingPrompt,
   setApprovalRequest,
   setSecretRequest,
   setSudoRequest
@@ -31,12 +37,13 @@ afterEach(() => {
 })
 
 describe('approval prompt store', () => {
-  it('holds the active session-keyed approval request', () => {
-    setApprovalRequest({ command: 'rm -rf /tmp/x', description: 'recursive delete', sessionId: 's1' })
+  it('holds an opaque request id with the active session-keyed approval request', () => {
+    setApprovalRequest({ command: '', description: 'redacted', requestId: 'test-request-id', sessionId: 's1' })
 
     expect($approvalRequest.get()).toEqual({
-      command: 'rm -rf /tmp/x',
-      description: 'recursive delete',
+      command: '',
+      description: 'redacted',
+      requestId: 'test-request-id',
       sessionId: 's1'
     })
   })
@@ -50,6 +57,38 @@ describe('approval prompt store', () => {
     // … but surfaces once the user switches to the session that raised it.
     $activeSessionId.set('s2')
     expect($approvalRequest.get()?.sessionId).toBe('s2')
+  })
+
+  it('selects a background tile approval from the active backend source', () => {
+    setApprovalRequest({
+      command: 'dangerous',
+      connectionId: null,
+      description: 'tile approval',
+      profile: 'default',
+      requestId: 'tile-request',
+      sessionId: 'tile-session'
+    })
+
+    expect($activeSessionId.get()).toBe('s1')
+    expect(activeSessionApprovalRequest('tile-session').get()?.requestId).toBe('tile-request')
+  })
+
+  it('does not surface a lone foreign-source approval in the active source', () => {
+    setApprovalRequest({
+      command: 'remote only',
+      connectionId: 'remote-b',
+      description: 'foreign approval',
+      profile: 'research',
+      requestId: 'remote-request',
+      sessionId: 's1'
+    })
+
+    expect(activeSessionApprovalRequest('s1').get()).toBeNull()
+    expect($approvalRequest.get()).toBeNull()
+    expect($activeSessionAwaitingInput.get()).toBe(false)
+    expect(hasBlockingPromptRequest('s1')).toBe(false)
+    expect(sessionBlockingPrompt('s1').get()).toBe(false)
+    expect(sessionAwaitingInput('s1').get()).toBe(false)
   })
 
   it('clears the active session prompt', () => {
@@ -77,6 +116,40 @@ describe('approval prompt store', () => {
     expect($approvalRequest.get()?.requestId).toBe('r1')
     clearApprovalRequest('s1', 'r1')
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('keys identical session ids by connection and profile authority', () => {
+    const sourceA = { connectionId: 'remote-a', profile: 'research' }
+    const sourceB = { connectionId: 'remote-b', profile: 'research' }
+
+    setApprovalRequest({ ...sourceA, command: 'a', description: 'A', requestId: 'r-a', sessionId: 's1' })
+    setApprovalRequest({ ...sourceB, command: 'b', description: 'B', requestId: 'r-b', sessionId: 's1' })
+
+    expect(sessionApprovalRequest('s1', sourceA).get()?.requestId).toBe('r-a')
+    expect(sessionApprovalRequest('s1', sourceB).get()?.requestId).toBe('r-b')
+
+    clearApprovalRequest('s1', undefined, sourceB)
+
+    expect(sessionApprovalRequest('s1', sourceA).get()?.requestId).toBe('r-a')
+    expect(sessionApprovalRequest('s1', sourceB).get()).toBeNull()
+  })
+
+  it('active-source interrupt cleanup preserves another source with the same session id', () => {
+    const sourceB = { connectionId: 'remote-b', profile: 'research' }
+
+    setApprovalRequest({ command: '', description: 'local A', requestId: 'request-a', sessionId: 's1' })
+    setApprovalRequest({
+      ...sourceB,
+      command: '',
+      description: 'remote B',
+      requestId: 'request-b',
+      sessionId: 's1'
+    })
+
+    clearAllPromptsForActiveSource('s1')
+
+    expect(sessionApprovalRequest('s1', { connectionId: null, profile: 'default' }).get()).toBeNull()
+    expect(sessionApprovalRequest('s1', sourceB).get()?.requestId).toBe('request-b')
   })
 
   it('acknowledges an approval only after parking it', async () => {
@@ -121,9 +194,16 @@ describe('approval prompt store', () => {
       }
     }
 
-    await replayPendingApproval(gateway, 's1')
+    await replayPendingApproval(gateway, 's1', { connectionId: 'remote-a', profile: 'research' })
 
-    expect($approvalRequest.get()?.requestId).toBe('r1')
+    expect(
+      sessionApprovalRequest('s1', { connectionId: 'remote-a', profile: 'research' }).get()
+    ).toMatchObject({
+      connectionId: 'remote-a',
+      profile: 'research',
+      requestId: 'r1'
+    })
+    expect($approvalRequest.get()).toBeNull()
     expect(calls).toEqual([
       ['approval.pending', { session_id: 's1' }],
       ['approval.received', { request_id: 'r1', session_id: 's1' }]

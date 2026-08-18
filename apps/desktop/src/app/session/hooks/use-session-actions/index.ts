@@ -13,6 +13,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { normalizeChoices, setClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+import { activeGatewayConnectionId } from '@/store/gateway'
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -30,7 +31,7 @@ import {
   tombstoneSessions,
   untombstoneSessions
 } from '@/store/projects'
-import { setApprovalRequest } from '@/store/prompts'
+import { type PromptSource, setApprovalRequest } from '@/store/prompts'
 import {
   $activeSessionStoredIdRotation,
   $currentCwd,
@@ -219,7 +220,7 @@ interface FreshSessionDraftOptions {
   workspaceTarget?: NewChatWorkspaceTarget
 }
 
-function restorePendingApproval(response: SessionResumeResponse, sessionId: string): boolean {
+function restorePendingApproval(response: SessionResumeResponse, sessionId: string, source: PromptSource): boolean {
   const pending = response.pending_approval
 
   if (!pending) {
@@ -230,7 +231,9 @@ function restorePendingApproval(response: SessionResumeResponse, sessionId: stri
     allowPermanent: pending.allow_permanent !== false,
     choices: pending.choices,
     command: pending.command ?? '',
+    connectionId: source.connectionId,
     description: pending.description ?? 'dangerous command',
+    profile: source.profile,
     requestId: typeof pending.request_id === 'string' ? pending.request_id : undefined,
     sessionId,
     smartDenied: pending.smart_denied === true
@@ -736,6 +739,11 @@ export function useSessionActions({
 
       await ensureGatewayProfile(sessionProfile)
 
+      const resumeSource = {
+        connectionId: activeGatewayConnectionId(),
+        profile: normalizeProfileKey($activeGatewayProfile.get())
+      }
+
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
       // purges a cross-wired mapping before we trust the fast-path.
@@ -841,7 +849,7 @@ export function useSessionActions({
               sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
               dropSessionState(cachedRuntimeId)
             } else {
-              const pendingApproval = restorePendingApproval(activated, cachedRuntimeId)
+              const pendingApproval = restorePendingApproval(activated, cachedRuntimeId, resumeSource)
               const pendingClarify = restorePendingClarify(activated, cachedRuntimeId)
               const runtimeInfo = applyRuntimeInfo(activated.info)
 
@@ -1223,7 +1231,7 @@ export function useSessionActions({
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
-        const pendingApproval = restorePendingApproval(resumed, resumed.session_id)
+        const pendingApproval = restorePendingApproval(resumed, resumed.session_id, resumeSource)
         const pendingClarify = restorePendingClarify(resumed, resumed.session_id)
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 

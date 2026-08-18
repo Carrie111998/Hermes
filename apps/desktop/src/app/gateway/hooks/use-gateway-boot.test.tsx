@@ -2,10 +2,11 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
-import { closeSecondaryGateways, isActivePrimary } from '@/store/gateway'
+import { closeSecondaryGateways, emitLocalGatewayEvent, isActivePrimary } from '@/store/gateway'
 import { reconnectGateway } from '@/store/gateway-reconnect'
 import { $activeGatewayProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
 import { $connection, $currentCwd, $gatewayState } from '@/store/session'
+import { clearAllSessionStates, recordSessionEventScope } from '@/store/session-states'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useGatewayBoot } from './use-gateway-boot'
@@ -161,6 +162,7 @@ beforeEach(() => {
   }
 
   closeSecondaryGateways()
+  clearAllSessionStates()
   $activeGatewayProfile.set('default')
   $connection.set(null)
   $profiles.set([])
@@ -199,6 +201,7 @@ afterEach(() => {
   }
 
   closeSecondaryGateways()
+  clearAllSessionStates()
   $activeGatewayProfile.set('default')
   $connection.set(null)
   $profiles.set([])
@@ -226,6 +229,30 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('forwards registry events without pre-claiming their runtime scope', async () => {
+    render(<Harness />)
+    await flushAsync()
+
+    act(() =>
+      emitLocalGatewayEvent({
+        connectionId: 'remote-b',
+        profile: 'research',
+        session_id: 'colliding-runtime-id',
+        type: 'message.complete'
+      })
+    )
+
+    // The central message handler owns source registration. If the registry
+    // fan-in records first, this independent source claim is rejected.
+    expect(
+      recordSessionEventScope({
+        connectionId: 'remote-a',
+        profile: 'default',
+        session_id: 'colliding-runtime-id'
+      })
+    ).toBe(true)
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

@@ -18,9 +18,10 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { AlertCircle, ChevronDown, Loader2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { $gateway } from '@/store/gateway'
+import { $gateway, requestGatewayForAgent } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import {
+  activeSessionApprovalRequest,
   type ApprovalRequest,
   clearApprovalRequest,
   registerApprovalInlineAnchor,
@@ -53,7 +54,7 @@ export const PendingToolApproval: FC<{ part: ToolPart }> = ({ part }) => {
   // The tool row lives in whichever session's transcript rendered it — read
   // THAT session's approval (works for the primary and every tile).
   const sessionId = useStore(useSessionView().$runtimeId)
-  const $request = useMemo(() => sessionApprovalRequest(sessionId), [sessionId])
+  const $request = useMemo(() => activeSessionApprovalRequest(sessionId), [sessionId])
   const request = useStore($request)
 
   if (!request || !APPROVAL_TOOLS.has(part.toolName)) {
@@ -72,7 +73,7 @@ const InlineApprovalBar: FC<{ request: ApprovalRequest }> = ({ request }) => {
 export const PendingApprovalFallback: FC = () => {
   const { t } = useI18n()
   const sessionId = useStore(useSessionView().$runtimeId)
-  const $request = useMemo(() => sessionApprovalRequest(sessionId), [sessionId])
+  const $request = useMemo(() => activeSessionApprovalRequest(sessionId), [sessionId])
   const $inlineVisible = useMemo(() => sessionApprovalInlineVisible(sessionId), [sessionId])
   const request = useStore($request)
   const inlineVisible = useStore($inlineVisible)
@@ -127,14 +128,29 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
 
   const respond = useCallback(
     async (choice: ApprovalChoice) => {
+      const source = request.profile
+        ? { connectionId: request.connectionId ?? null, profile: request.profile }
+        : undefined
+
       // Another bar (or the keyboard path) may have already resolved this
       // approval; the map is the single source of truth, so bail if this
       // session's request is gone.
-      if (busy || !sessionApprovalRequest(request.sessionId).get()) {
+      const currentRequest = source
+        ? sessionApprovalRequest(request.sessionId, source).get()
+        : activeSessionApprovalRequest(request.sessionId).get()
+
+      if (busy || !currentRequest) {
         return
       }
 
-      if (!gateway) {
+      const approvalGateway = source
+        ? {
+            request: <T,>(method: string, params: Record<string, unknown>) =>
+              requestGatewayForAgent<T>(source.connectionId, source.profile, method, params)
+          }
+        : gateway
+
+      if (!approvalGateway) {
         notifyError(new Error(copy.gatewayDisconnected), copy.sendFailed)
 
         return
@@ -143,20 +159,36 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       setSubmitting(choice)
 
       try {
-        await gateway.request<{ resolved?: boolean }>('approval.respond', {
+        const result = await approvalGateway.request<{ resolved?: number }>('approval.respond', {
           choice,
           request_id: request.requestId,
           session_id: request.sessionId ?? undefined
         })
+
+        if (result?.resolved !== 1) {
+          setSubmitting(null)
+
+          return
+        }
+
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
-        clearApprovalRequest(request.sessionId, request.requestId)
-        void replayPendingApproval(gateway, request.sessionId).catch(() => undefined)
+        clearApprovalRequest(request.sessionId, request.requestId, source)
+        void replayPendingApproval(approvalGateway, request.sessionId, source).catch(() => undefined)
       } catch (error) {
         notifyError(error, copy.sendFailed)
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.requestId, request.sessionId]
+    [
+      busy,
+      copy.gatewayDisconnected,
+      copy.sendFailed,
+      gateway,
+      request.connectionId,
+      request.profile,
+      request.requestId,
+      request.sessionId
+    ]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.

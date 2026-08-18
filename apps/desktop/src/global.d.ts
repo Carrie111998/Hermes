@@ -358,8 +358,27 @@ declare global {
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
-      onFocusSession?: (callback: (sessionId: string) => void) => () => void
-      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      onFocusSession?: (
+        callback: (
+          payload:
+            | string
+            | {
+                connectionId?: null | string
+                profile?: string
+                requestId?: string
+                sessionId?: string
+              }
+        ) => void
+      ) => () => void
+      onNotificationAction?: (
+        callback: (payload: {
+          actionId: string
+          connectionId?: null | string
+          profile?: string
+          requestId?: string
+          sessionId?: string
+        }) => void
+      ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
@@ -1051,6 +1070,11 @@ export interface HermesNotification {
   /** Dedupe discriminator for session-less notifications (e.g. plugin id). */
   tag?: string
   actions?: { id: string; text: string }[]
+  /** Opaque approval request authority echoed only with a native action. */
+  approvalRequestId?: string
+  /** Immutable backend source paired with approvalRequestId. */
+  approvalConnectionId?: null | string
+  approvalProfile?: string
 }
 
 export interface HermesPreviewTarget {

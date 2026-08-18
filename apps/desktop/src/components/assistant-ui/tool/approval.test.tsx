@@ -1,9 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { atom } from 'nanostores'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
+import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import type { HermesGateway } from '@/hermes'
-import { $gateway } from '@/store/gateway'
-import { $approvalRequest, clearAllPrompts, setApprovalRequest } from '@/store/prompts'
+import * as gatewayStore from '@/store/gateway'
+import { $activeGatewayProfile } from '@/store/profile'
+import { $approvalRequest, clearAllPrompts, sessionApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import { $activeSessionId } from '@/store/session'
 
 import { PendingApprovalFallback, PendingToolApproval } from './approval'
@@ -33,15 +36,21 @@ function part(toolName: string): ToolPart {
 function setRequest(
   command = 'rm -rf /tmp/x',
   allowPermanent?: boolean,
-  extra: { choices?: string[]; smartDenied?: boolean } = {}
+  extra: {
+    choices?: string[]
+    connectionId?: null | string
+    profile?: string
+    requestId?: string
+    smartDenied?: boolean
+  } = {}
 ) {
   $activeSessionId.set('sess-1')
   setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
 }
 
 function mockGateway() {
-  const request = vi.fn().mockResolvedValue({ resolved: true })
-  $gateway.set({ request } as unknown as HermesGateway)
+  const request = vi.fn().mockResolvedValue({ resolved: 1 })
+  gatewayStore.$gateway.set({ request } as unknown as HermesGateway)
 
   return request
 }
@@ -50,7 +59,9 @@ afterEach(() => {
   cleanup()
   clearAllPrompts()
   $activeSessionId.set(null)
-  $gateway.set(null)
+  $activeGatewayProfile.set('default')
+  gatewayStore.$gateway.set(null)
+  vi.restoreAllMocks()
 })
 
 describe('PendingToolApproval', () => {
@@ -75,17 +86,151 @@ describe('PendingToolApproval', () => {
     expect(screen.getByRole('button', { name: /Reject/ })).toBeTruthy()
   })
 
-  it('sends approval.respond {choice: "once"} and clears the request on Run', async () => {
+  it('keeps the active-source approval actionable when another source shares its session id', async () => {
+    mockGateway()
+
+    const routedRequest = vi.spyOn(gatewayStore, 'requestGatewayForAgent').mockImplementation(
+      async (_connectionId, _profile, method) =>
+        method === 'approval.respond' ? ({ resolved: 1 } as never) : ({ approvals: [] } as never)
+    )
+
+    setRequest('', undefined, { connectionId: null, profile: 'default', requestId: 'request-a' })
+    setApprovalRequest({
+      command: '',
+      connectionId: 'remote-b',
+      description: 'source B',
+      profile: 'research',
+      requestId: 'request-b',
+      sessionId: 'sess-1'
+    })
+    $activeSessionId.set('primary-session')
+
+    const tileView: SessionView = {
+      ...({} as SessionView),
+      $runtimeId: atom<null | string>('sess-1'),
+      kind: 'tile'
+    }
+
+    render(
+      <SessionViewProvider value={tileView}>
+        <PendingToolApproval part={part('terminal')} />
+      </SessionViewProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() =>
+      expect(routedRequest).toHaveBeenCalledWith(null, 'default', 'approval.respond', {
+        choice: 'once',
+        request_id: 'request-a',
+        session_id: 'sess-1'
+      })
+    )
+  })
+
+  it('sends the stored opaque request id with approval on Run', async () => {
     const request = mockGateway()
-    setRequest()
+    setRequest('', undefined, { requestId: 'test-request-id' })
     render(<PendingToolApproval part={part('terminal')} />)
 
     fireEvent.click(screen.getByRole('button', { name: /Run/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        choice: 'once',
+        request_id: 'test-request-id',
+        session_id: 'sess-1'
+      })
     })
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('responds and replays through the parked request source, not the active gateway', async () => {
+    const activeRequest = mockGateway()
+    let resolveResponse: ((value: { resolved: number }) => void) | undefined
+
+    const response = new Promise<{ resolved: number }>(resolve => {
+      resolveResponse = resolve
+    })
+
+    const routedRequest = vi.spyOn(gatewayStore, 'requestGatewayForAgent').mockImplementation(
+      async (_connectionId, _profile, method) =>
+        method === 'approval.respond'
+          ? (response as never)
+          : ({ approvals: [{ description: 'next approval', request_id: 'next-request-id' }] } as never)
+    )
+
+    $activeGatewayProfile.set('research')
+    setRequest('', undefined, {
+      connectionId: null,
+      profile: 'research',
+      requestId: 'test-request-id'
+    })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() =>
+      expect(routedRequest).toHaveBeenNthCalledWith(1, null, 'research', 'approval.respond', {
+        choice: 'once',
+        request_id: 'test-request-id',
+        session_id: 'sess-1'
+      })
+    )
+
+    // The response can resolve after the user switches profile. Replay must
+    // retain the request's captured source rather than consulting mutable UI.
+    $activeGatewayProfile.set('default')
+    resolveResponse?.({ resolved: 1 })
+
+    await waitFor(() =>
+      expect(routedRequest).toHaveBeenNthCalledWith(2, null, 'research', 'approval.pending', {
+        session_id: 'sess-1'
+      })
+    )
+    expect(sessionApprovalRequest('sess-1', { connectionId: null, profile: 'research' }).get()?.requestId).toBe(
+      'next-request-id'
+    )
+    expect(sessionApprovalRequest('sess-1', { connectionId: null, profile: 'default' }).get()).toBeNull()
+    expect(activeRequest).not.toHaveBeenCalled()
+  })
+
+  it('keeps legacy ID-free FIFO responses bound to the parked request source', async () => {
+    const activeRequest = mockGateway()
+
+    const routedRequest = vi.spyOn(gatewayStore, 'requestGatewayForAgent').mockImplementation(
+      async (_connectionId, _profile, method) =>
+        method === 'approval.respond' ? ({ resolved: 1 } as never) : ({ approvals: [] } as never)
+    )
+
+    setRequest('', undefined, { connectionId: null, profile: 'default' })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() =>
+      expect(routedRequest).toHaveBeenNthCalledWith(1, null, 'default', 'approval.respond', {
+        choice: 'once',
+        request_id: undefined,
+        session_id: 'sess-1'
+      })
+    )
+    expect(routedRequest).toHaveBeenNthCalledWith(2, null, 'default', 'approval.pending', {
+      session_id: 'sess-1'
+    })
+    expect(activeRequest).not.toHaveBeenCalled()
+  })
+
+  it('keeps the prompt parked when the backend resolves no matching request', async () => {
+    const request = mockGateway()
+    request.mockResolvedValueOnce({ resolved: 0 })
+    setRequest('', undefined, { requestId: 'test-request-id' })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalled())
+    expect($approvalRequest.get()?.requestId).toBe('test-request-id')
   })
 
   it('reveals the full command inline when the Command toggle is clicked', () => {
@@ -101,15 +246,19 @@ describe('PendingToolApproval', () => {
     expect(screen.getByText(longCommand)).toBeTruthy()
   })
 
-  it('sends choice "deny" on Reject', async () => {
+  it('sends the stored opaque request id with denial on Reject', async () => {
     const request = mockGateway()
-    setRequest()
+    setRequest('', undefined, { requestId: 'test-request-id' })
     render(<PendingToolApproval part={part('terminal')} />)
 
     fireEvent.click(screen.getByRole('button', { name: /Reject/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        choice: 'deny',
+        request_id: 'test-request-id',
+        session_id: 'sess-1'
+      })
     })
   })
 

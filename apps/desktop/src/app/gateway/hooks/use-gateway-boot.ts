@@ -52,7 +52,6 @@ import {
   $attentionSessionIds,
   $workingSessionIds,
   liveSessionScopes,
-  recordSessionEventScope,
   resetTileRuntimeBindings
 } from '@/store/session-states'
 import { windowProfileOverride } from '@/store/windows'
@@ -467,15 +466,11 @@ export function useGatewayBoot({
     callbacksRef.current.onGatewayReady(gateway)
     setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
     // Secondary (background-profile) sockets funnel into the same handler.
-    // Record each event's source scope first: registry-tagged events feed the
-    // (connectionId, profile) keep-set so two sources exposing the same
-    // profile name (every source has a 'default') can't collide.
+    // The handler records source scope only after it has protected active
+    // runtime ownership, so a foreign first event cannot poison a colliding id.
     configureGatewayRegistry({
       onActiveConnectionChanged: publish,
-      onEvent: event => {
-        recordSessionEventScope(event)
-        callbacksRef.current.handleGatewayEvent(event)
-      },
+      onEvent: event => callbacksRef.current.handleGatewayEvent(event),
       onActiveConnectionInvalidated: (fallbackProfile, invalidationEpoch) => {
         $activeGatewayProfile.set(fallbackProfile)
         void desktop
