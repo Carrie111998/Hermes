@@ -1721,13 +1721,14 @@ class PluginContext:
         previous = terminal_backend_registry.get(definition.name)
         previous_owner = terminal_backend_registry.owner(definition.name)
         terminal_backend_registry.register(definition, owner=plugin_id)
+        hosted = terminal_backend_registry.get(definition.name)
         self._manager._plugin_terminal_backend_names.setdefault(plugin_id, set()).add(
             definition.name
         )
 
         def _restore(replacement: Any) -> bool:
             current = terminal_backend_registry.get(definition.name)
-            if current is not None and current is not replacement and current is not definition:
+            if current is not hosted:
                 return False
             terminal_backend_registry.unregister(definition.name, owner=plugin_id)
             names = self._manager._plugin_terminal_backend_names.get(plugin_id)
@@ -1735,15 +1736,16 @@ class PluginContext:
                 names.discard(definition.name)
                 if not names:
                     self._manager._plugin_terminal_backend_names.pop(plugin_id, None)
-            if previous is not None and previous_owner:
-                terminal_backend_registry.register(previous, owner=previous_owner)
+            if replacement is not None:
+                owner = previous_owner or plugin_id
+                terminal_backend_registry.register(replacement, owner=owner)
             return True
 
         handle = self._track_replacement(
             "terminal_backend",
             definition.name,
             slot=("terminal_backend", definition.name),
-            current=definition,
+            current=hosted,
             previous=previous,
             restore=_restore,
         )
