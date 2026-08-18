@@ -66,6 +66,17 @@ logger = logging.getLogger("run_agent")
 # fire on every turn.
 _warned_unavailable_providers: set[str] = set()
 
+_OPENROUTER_ROUTING_LIST_FIELDS = {"only", "ignore", "order", "quantizations"}
+_OPENROUTER_ROUTING_BOOL_FIELDS = {"require_parameters", "allow_fallbacks"}
+_OPENROUTER_ROUTING_FIELDS = (
+    _OPENROUTER_ROUTING_LIST_FIELDS
+    | _OPENROUTER_ROUTING_BOOL_FIELDS
+    | {"sort", "data_collection"}
+)
+_OPENROUTER_ROUTING_SORT_VALUES = {"price", "throughput", "latency"}
+_OPENROUTER_DATA_COLLECTION_VALUES = {"allow", "deny"}
+_INVALID_OPENROUTER_ROUTING_VALUE = object()
+
 
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn (once per provider) when a configured memory provider is unavailable.
@@ -265,6 +276,112 @@ def _context_route_mismatch(
 def _normalize_custom_provider_name(value: Any) -> str:
     """Mirror runtime normalization for a requested custom-provider identity."""
     return str(value or "").strip().lower().replace(" ", "-")
+
+
+def _normalized_openrouter_routing_value(key: str, value: Any) -> Any:
+    """Normalize routing; None clears, sentinel means invalid and is ignored."""
+    if value is None:
+        return None
+    if key in _OPENROUTER_ROUTING_LIST_FIELDS:
+        if not isinstance(value, list):
+            return _INVALID_OPENROUTER_ROUTING_VALUE
+        # Reject the whole list when any entry is blank: ambiguous locks fail closed.
+        if any(not isinstance(item, str) or not item.strip() for item in value):
+            return _INVALID_OPENROUTER_ROUTING_VALUE
+        normalized = [item.strip() for item in value]
+        return normalized or None
+    if key in _OPENROUTER_ROUTING_BOOL_FIELDS:
+        return value if isinstance(value, bool) else _INVALID_OPENROUTER_ROUTING_VALUE
+    if key == "sort":
+        normalized = value.strip().lower() if isinstance(value, str) else ""
+        return (
+            normalized
+            if normalized in _OPENROUTER_ROUTING_SORT_VALUES
+            else _INVALID_OPENROUTER_ROUTING_VALUE
+        )
+    if key == "data_collection":
+        normalized = value.strip().lower() if isinstance(value, str) else ""
+        return (
+            normalized
+            if normalized in _OPENROUTER_DATA_COLLECTION_VALUES
+            else _INVALID_OPENROUTER_ROUTING_VALUE
+        )
+    return _INVALID_OPENROUTER_ROUTING_VALUE
+
+
+def _validate_resolved_openrouter_routing(resolved: Dict[str, Any]) -> None:
+    """Reject contradictory values after global/model routing has merged."""
+    only = resolved.get("only")
+    if resolved.get("allow_fallbacks") is False and (
+        not isinstance(only, list) or not only
+    ):
+        raise ValueError(
+            "provider_routing.allow_fallbacks=false requires a non-empty "
+            "provider_routing.only list"
+        )
+    ignore = resolved.get("ignore")
+    if isinstance(ignore, list):
+        for allow_key in ("only", "order"):
+            allowed = resolved.get(allow_key)
+            if not isinstance(allowed, list):
+                continue
+            conflicts = sorted(set(ignore).intersection(allowed))
+            if conflicts:
+                raise ValueError(
+                    f"provider_routing.{allow_key} and provider_routing.ignore "
+                    f"cannot appear in both for the same provider tags: {conflicts}"
+                )
+
+
+def _resolve_openrouter_provider_routing(
+    *,
+    provider: str,
+    model: str,
+    routing: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve current provider/model routing from global and model settings."""
+    routing = routing if isinstance(routing, dict) else {}
+    is_openrouter = str(provider or "").strip().lower() == "openrouter"
+    if not is_openrouter:
+        return {}
+    resolved: Dict[str, Any] = {}
+    for key in _OPENROUTER_ROUTING_FIELDS:
+        normalized = _normalized_openrouter_routing_value(key, routing.get(key))
+        if normalized is _INVALID_OPENROUTER_ROUTING_VALUE:
+            raise ValueError(f"provider_routing.{key} must be a list of strings")
+        if normalized is not None:
+            resolved[key] = normalized
+
+    overrides = routing.get("model_overrides")
+    openrouter_overrides = overrides.get("openrouter") if isinstance(overrides, dict) else None
+    if not isinstance(openrouter_overrides, dict):
+        _validate_resolved_openrouter_routing(resolved)
+        return resolved
+
+    model_key = str(model or "").strip()
+    override = openrouter_overrides.get(model_key)
+    if override is None and model_key.startswith("openrouter/"):
+        override = openrouter_overrides.get(model_key.removeprefix("openrouter/"))
+    if not isinstance(override, dict):
+        _validate_resolved_openrouter_routing(resolved)
+        return resolved
+
+    for key, value in override.items():
+        if key not in _OPENROUTER_ROUTING_FIELDS:
+            continue
+        # Explicit null or empty list clears an inherited restriction.
+        normalized = _normalized_openrouter_routing_value(key, value)
+        if normalized is _INVALID_OPENROUTER_ROUTING_VALUE:
+            raise ValueError(
+                f"provider_routing.model_overrides.openrouter.{model_key}.{key} "
+                "must be a list of strings"
+            )
+        if normalized is None:
+            resolved.pop(key, None)
+        else:
+            resolved[key] = normalized
+    _validate_resolved_openrouter_routing(resolved)
+    return resolved
 
 
 def _custom_provider_runtime_ids(value: Any) -> set[str]:
@@ -902,6 +1019,8 @@ def init_agent(
     agent.provider_sort = provider_sort
     agent.provider_require_parameters = provider_require_parameters
     agent.provider_data_collection = provider_data_collection
+    agent.provider_quantizations = None
+    agent.provider_allow_fallbacks = None
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
     # Store toolset filtering options
@@ -1709,6 +1828,41 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    # Resolve exact-model OpenRouter routing after config is loaded. Existing
+    # constructor fields remain authoritative for backward compatibility; new
+    # fields and model overrides come from provider_routing in config.yaml.
+    _routing_cfg = _agent_cfg.get("provider_routing", {})
+    _routing_cfg = dict(_routing_cfg) if isinstance(_routing_cfg, dict) else {}
+    for _key, _value in (
+        ("only", agent.providers_allowed),
+        ("ignore", agent.providers_ignored),
+        ("order", agent.providers_order),
+        ("sort", agent.provider_sort),
+        ("data_collection", agent.provider_data_collection),
+    ):
+        if _value is not None:
+            _routing_cfg[_key] = _value
+    if agent.provider_require_parameters:
+        _routing_cfg["require_parameters"] = True
+    # Keep the unflattened routing config so request construction can resolve
+    # against the agent's current provider/model after model switches.
+    agent._provider_routing_config = dict(_routing_cfg)
+    _resolved_routing = _resolve_openrouter_provider_routing(
+        provider=agent.provider,
+        model=agent.model,
+        routing=_routing_cfg,
+    )
+    agent.providers_allowed = _resolved_routing.get("only")
+    agent.providers_ignored = _resolved_routing.get("ignore")
+    agent.providers_order = _resolved_routing.get("order")
+    agent.provider_sort = _resolved_routing.get("sort")
+    agent.provider_require_parameters = bool(
+        _resolved_routing.get("require_parameters", False)
+    )
+    agent.provider_data_collection = _resolved_routing.get("data_collection")
+    agent.provider_quantizations = _resolved_routing.get("quantizations")
+    agent.provider_allow_fallbacks = _resolved_routing.get("allow_fallbacks")
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as

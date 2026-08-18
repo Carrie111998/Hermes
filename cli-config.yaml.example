@@ -272,6 +272,26 @@ model:
 #
 #   # Data policy: "allow" (default) or "deny" to exclude providers that may store data
 #   # data_collection: "deny"
+#
+#   # Optional global endpoint constraints
+#   # quantizations: ["fp8"]
+#   # allow_fallbacks: true
+#
+#   # Exact-model OpenRouter overrides. Missing fields inherit globals; [] clears
+#   # an inherited list; false is preserved; null omits the field. Automatic mode
+#   # is represented by deleting the model entry entirely.
+#   model_overrides:
+#     openrouter:
+#       "deepseek/deepseek-v4-flash":
+#         # Ignore is model-scoped too and composes with only/order.
+#         # ignore: ["fireworks"]
+#         only: ["baidu/fp8"]
+#         quantizations: ["fp8"]
+#         allow_fallbacks: false
+#
+#   # Desktop discovers eligible endpoints dynamically. If discovery is unavailable,
+#   # use the manual provider-tag and quantization fields. Selecting Automatic
+#   # deletes this exact model entry instead of saving empty lists.
 
 # =============================================================================
 # OpenRouter Response Caching (only applies when using OpenRouter)

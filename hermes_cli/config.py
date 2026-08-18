@@ -2011,6 +2011,15 @@ _VALID_CUSTOM_PROVIDER_FIELDS = {
 # Fields that look like they should be inside custom_providers, not at root
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
 
+_OPENROUTER_ROUTING_LIST_FIELDS = {"only", "ignore", "order", "quantizations"}
+_OPENROUTER_ROUTING_BOOL_FIELDS = {"require_parameters", "allow_fallbacks"}
+_OPENROUTER_ROUTING_VALUE_FIELDS = (
+    _OPENROUTER_ROUTING_LIST_FIELDS
+    | _OPENROUTER_ROUTING_BOOL_FIELDS
+    | {"sort", "data_collection"}
+)
+_OPENROUTER_ROUTING_ROOT_FIELDS = _OPENROUTER_ROUTING_VALUE_FIELDS | {"model_overrides"}
+
 
 @dataclass
 class ConfigIssue:
@@ -2019,6 +2028,238 @@ class ConfigIssue:
     severity: str  # "error", "warning"
     message: str
     hint: str
+
+
+def _validate_openrouter_routing_values(
+    mapping: Dict[str, Any],
+    *,
+    path: str,
+    allowed_fields: Set[str],
+    issues: List["ConfigIssue"],
+) -> None:
+    unknown = sorted(set(mapping) - allowed_fields)
+    if unknown:
+        issues.append(ConfigIssue(
+            "error",
+            f"{path} contains unknown routing keys: {unknown}",
+            f"Supported keys: {', '.join(sorted(allowed_fields))}",
+        ))
+
+    for key in _OPENROUTER_ROUTING_LIST_FIELDS & set(mapping):
+        value = mapping[key]
+        if value is None:
+            continue
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            issues.append(ConfigIssue(
+                "error",
+                f"{path}.{key} must be a list of non-empty strings or null",
+                f"Example: {key}: [\"provider-tag\"]",
+            ))
+            continue
+
+    for key in _OPENROUTER_ROUTING_BOOL_FIELDS & set(mapping):
+        value = mapping[key]
+        if value is not None and not isinstance(value, bool):
+            issues.append(ConfigIssue(
+                "error",
+                f"{path}.{key} must be true, false, or null",
+                f"Set {key}: true, {key}: false, or {key}: null",
+            ))
+
+    if "sort" in mapping and mapping["sort"] is not None:
+        value = mapping["sort"]
+        if not isinstance(value, str) or value.strip().lower() not in {
+            "price", "throughput", "latency"
+        }:
+            issues.append(ConfigIssue(
+                "error",
+                f"{path}.sort must be price, throughput, latency, or null",
+                "Use one of OpenRouter's supported provider sort strategies",
+            ))
+
+    if "data_collection" in mapping and mapping["data_collection"] is not None:
+        value = mapping["data_collection"]
+        if not isinstance(value, str) or value.strip().lower() not in {"allow", "deny"}:
+            issues.append(ConfigIssue(
+                "error",
+                f"{path}.data_collection must be allow, deny, or null",
+                "Use allow or deny",
+            ))
+
+    ignore = mapping.get("ignore")
+    if isinstance(ignore, list) and all(isinstance(item, str) for item in ignore):
+        for allow_key in ("only", "order"):
+            allowed = mapping.get(allow_key)
+            if not isinstance(allowed, list) or not all(
+                isinstance(item, str) for item in allowed
+            ):
+                continue
+            conflicts = sorted(set(ignore).intersection(allowed))
+            if conflicts:
+                issues.append(ConfigIssue(
+                    "error",
+                    f"{path}.{allow_key} and {path}.ignore cannot appear in both for the same provider tags: {conflicts}",
+                    f"Remove {conflicts} from either {allow_key} or ignore",
+                ))
+
+
+def _validate_provider_routing_config(
+    provider_routing: Any,
+    issues: List["ConfigIssue"],
+) -> None:
+    if provider_routing is None:
+        return
+    if not isinstance(provider_routing, dict):
+        issues.append(ConfigIssue(
+            "error",
+            "provider_routing must be a mapping",
+            "Use provider_routing: followed by indented routing fields",
+        ))
+        return
+
+    _validate_openrouter_routing_values(
+        provider_routing,
+        path="provider_routing",
+        allowed_fields=_OPENROUTER_ROUTING_ROOT_FIELDS,
+        issues=issues,
+    )
+    _validate_empty_openrouter_lock(
+        provider_routing,
+        path="provider_routing",
+        override={},
+        issues=issues,
+    )
+    overrides = provider_routing.get("model_overrides")
+    if overrides is None:
+        return
+    if not isinstance(overrides, dict):
+        issues.append(ConfigIssue(
+            "error",
+            "provider_routing.model_overrides must be a mapping",
+            "Nest overrides under model_overrides.openrouter.<model-id>",
+        ))
+        return
+
+    unknown_scopes = sorted(set(overrides) - {"openrouter"})
+    if unknown_scopes:
+        issues.append(ConfigIssue(
+            "error",
+            f"provider_routing.model_overrides contains unknown provider scopes: {unknown_scopes}",
+            "Only the openrouter provider scope is supported",
+        ))
+    openrouter_overrides = overrides.get("openrouter")
+    if openrouter_overrides is None:
+        return
+    if not isinstance(openrouter_overrides, dict):
+        issues.append(ConfigIssue(
+            "error",
+            "provider_routing.model_overrides.openrouter must be a mapping",
+            "Map exact model IDs to routing override mappings",
+        ))
+        return
+    for model, override in openrouter_overrides.items():
+        model_path = f"provider_routing.model_overrides.openrouter.{model}"
+        if not isinstance(model, str) or not model.strip():
+            issues.append(ConfigIssue(
+                "error",
+                "provider_routing.model_overrides.openrouter contains an empty model ID",
+                "Use an exact OpenRouter model ID such as deepseek/deepseek-v4-flash",
+            ))
+            continue
+        if not isinstance(override, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"{model_path} must be a mapping",
+                "Use routing fields such as only, order, quantizations, and allow_fallbacks",
+            ))
+            continue
+        _validate_openrouter_routing_values(
+            override,
+            path=model_path,
+            allowed_fields=_OPENROUTER_ROUTING_VALUE_FIELDS,
+            issues=issues,
+        )
+        _validate_merged_openrouter_override(
+            provider_routing,
+            model_path=model_path,
+            override=override,
+            issues=issues,
+        )
+
+
+def _validate_merged_openrouter_override(
+    provider_routing: Dict[str, Any],
+    *,
+    model_path: str,
+    override: Dict[str, Any],
+    issues: List["ConfigIssue"],
+) -> None:
+    """Validate contradictions after global and exact-model fields merge."""
+
+    def _normalized_list(value: Any) -> List[str] | None:
+        if not isinstance(value, list):
+            return None
+        normalized = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        return normalized or None
+
+    merged: Dict[str, List[str]] = {}
+    for key in _OPENROUTER_ROUTING_LIST_FIELDS:
+        global_value = _normalized_list(provider_routing.get(key))
+        if global_value is not None:
+            merged[key] = global_value
+        if key in override:
+            value = _normalized_list(override[key])
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+
+    ignore = merged.get("ignore", [])
+    for allow_key in ("only", "order"):
+        conflicts = sorted(set(ignore).intersection(merged.get(allow_key, [])))
+        if conflicts:
+            issues.append(ConfigIssue(
+                "error",
+                f"{model_path}.{allow_key} and {model_path}.ignore cannot appear in both "
+                f"for the same provider tags after merging: {conflicts}",
+                f"Remove {conflicts} from either {allow_key} or ignore",
+            ))
+
+    _validate_empty_openrouter_lock(
+        provider_routing,
+        path=model_path,
+        override=override,
+        issues=issues,
+    )
+
+
+def _validate_empty_openrouter_lock(
+    provider_routing: Dict[str, Any],
+    *,
+    path: str,
+    override: Dict[str, Any],
+    issues: List["ConfigIssue"],
+) -> None:
+    def _normalized_only(value: Any) -> List[str] | None:
+        if not isinstance(value, list):
+            return None
+        normalized = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        return normalized or None
+
+    allow_fallbacks = override.get(
+        "allow_fallbacks", provider_routing.get("allow_fallbacks")
+    )
+    only = _normalized_only(provider_routing.get("only"))
+    if "only" in override:
+        only = _normalized_only(override.get("only"))
+    if allow_fallbacks is False and not only:
+        issues.append(ConfigIssue(
+            "error",
+            f"{path}.allow_fallbacks=false requires a non-empty only list",
+            f"Set {path}.only to a provider tag list or enable allow_fallbacks",
+        ))
 
 
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
@@ -2036,6 +2277,9 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── OpenRouter provider routing ────────────────────────────────────────
+    _validate_provider_routing_config(config.get("provider_routing"), issues)
 
     # ── voice.submit_mode: direct | draft ────────────────────────────────
     voice_cfg = config.get("voice")

@@ -49,6 +49,7 @@ from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
+_warned_invalid_openrouter_routing: set[tuple[str, str, str, str]] = set()
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
@@ -561,21 +562,86 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
 
 
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
-    """Build the validated provider-routing object shared by request paths."""
+    """Build routing from the current provider/model at request time."""
+    routing_config = getattr(agent, "_provider_routing_config", None)
+    if isinstance(routing_config, dict):
+        from agent.agent_init import _resolve_openrouter_provider_routing
+
+        provider = getattr(agent, "provider", "")
+        model = getattr(agent, "model", "")
+        try:
+            resolved = _resolve_openrouter_provider_routing(
+                provider=provider,
+                model=model,
+                routing=routing_config,
+            )
+        except ValueError as exc:
+            warning_key = ("override", str(provider), str(model), str(exc))
+            if warning_key not in _warned_invalid_openrouter_routing:
+                _warned_invalid_openrouter_routing.add(warning_key)
+                logger.warning(
+                    "Invalid OpenRouter routing for provider=%s model=%s; "
+                    "using global routing defaults: %s",
+                    provider,
+                    model,
+                    exc,
+                )
+            global_routing = dict(routing_config)
+            global_routing.pop("model_overrides", None)
+            try:
+                resolved = _resolve_openrouter_provider_routing(
+                    provider=provider,
+                    model=model,
+                    routing=global_routing,
+                )
+            except ValueError as global_exc:
+                global_warning_key = ("global", str(provider), str(model), str(global_exc))
+                if global_warning_key not in _warned_invalid_openrouter_routing:
+                    _warned_invalid_openrouter_routing.add(global_warning_key)
+                    logger.warning(
+                        "Invalid global OpenRouter routing for provider=%s model=%s; "
+                        "sending no provider preferences: %s",
+                        provider,
+                        model,
+                        global_exc,
+                    )
+                resolved = {}
+        providers_allowed = resolved.get("only")
+        providers_ignored = resolved.get("ignore")
+        providers_order = resolved.get("order")
+        provider_sort_value = resolved.get("sort")
+        provider_require_parameters = bool(resolved.get("require_parameters", False))
+        provider_data_collection = resolved.get("data_collection")
+        provider_quantizations = resolved.get("quantizations")
+        provider_allow_fallbacks = resolved.get("allow_fallbacks")
+    else:
+        providers_allowed = agent.providers_allowed
+        providers_ignored = agent.providers_ignored
+        providers_order = agent.providers_order
+        provider_sort_value = agent.provider_sort
+        provider_require_parameters = agent.provider_require_parameters
+        provider_data_collection = agent.provider_data_collection
+        provider_quantizations = getattr(agent, "provider_quantizations", None)
+        provider_allow_fallbacks = getattr(agent, "provider_allow_fallbacks", None)
+
     preferences: Dict[str, Any] = {}
-    if agent.providers_allowed:
-        preferences["only"] = agent.providers_allowed
-    if agent.providers_ignored:
-        preferences["ignore"] = agent.providers_ignored
-    if agent.providers_order:
-        preferences["order"] = agent.providers_order
-    provider_sort = _validated_openrouter_provider_sort(agent.provider_sort)
+    if providers_allowed:
+        preferences["only"] = providers_allowed
+    if providers_ignored:
+        preferences["ignore"] = providers_ignored
+    if providers_order:
+        preferences["order"] = providers_order
+    provider_sort = _validated_openrouter_provider_sort(provider_sort_value)
     if provider_sort:
         preferences["sort"] = provider_sort
-    if agent.provider_require_parameters:
+    if provider_require_parameters:
         preferences["require_parameters"] = True
-    if agent.provider_data_collection:
-        preferences["data_collection"] = agent.provider_data_collection
+    if provider_data_collection:
+        preferences["data_collection"] = provider_data_collection
+    if provider_quantizations:
+        preferences["quantizations"] = provider_quantizations
+    if provider_allow_fallbacks is not None:
+        preferences["allow_fallbacks"] = provider_allow_fallbacks
     return preferences
 
 
