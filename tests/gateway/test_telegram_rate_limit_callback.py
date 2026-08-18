@@ -494,3 +494,107 @@ class TestRateLimitChooseAndDismiss:
         assert get_override("deepseek", "deepseek-v4-pro") is None
         query.edit_message_text.assert_called_once()
         assert query.edit_message_text.call_args[1]["reply_markup"] is None
+
+
+class TestRateLimitTransientPersistFailure:
+    """N2 (Phase 2 re-review): I2 widened set_override's False return to
+    cover a write that reached _save_store() and failed there (disk full,
+    an AV/indexer sharing violation, or the store's backoff window) --  not
+    just a PERMANENT validation rejection (self-target, blank target).
+    Before I2, False only ever meant "this can never succeed, retiring the
+    button is correct." After I2 it can ALSO mean "this failed only this
+    time" -- and there is no `hermes overrides set`, only list/clear, so a
+    burned button on a transient failure meant no way to retry until the
+    next MODEL_RATE_LIMITED alert minted a fresh token.
+    """
+
+    @pytest.mark.asyncio
+    async def test_persist_failure_leaves_token_usable_and_keyboard_intact(self):
+        from events.model_override import get_override, SET_PERSIST_FAILURE_REASON
+        from events import override_callback_state
+
+        adapter = _make_adapter()
+        _record_target("tok-transient")
+        query = _make_query("rl:divert:tok-transient")
+        update = _make_update(query)
+
+        with (
+            patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False),
+            patch("events.model_override.set_override",
+                  return_value=(False, SET_PERSIST_FAILURE_REASON)),
+        ):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert get_override("deepseek", "deepseek-v4-pro") is None
+        query.answer.assert_called_once()
+        toast = query.answer.call_args[1]["text"]
+        assert "not diverted" in toast.lower()
+        assert SET_PERSIST_FAILURE_REASON in toast
+
+        # THE POINT: a transient failure must not retire the button.
+        query.edit_message_text.assert_not_called()
+        # And the token must be re-armed so a second tap can retry -- pop()
+        # returning something proves it was re-recorded (an unarmed token
+        # returns None, same as "already resolved").
+        assert override_callback_state.pop("tok-transient") is not None, (
+            "the token must be re-armed after a persistence failure so a "
+            "second tap can retry"
+        )
+
+    @pytest.mark.asyncio
+    async def test_second_tap_after_transient_failure_succeeds(self):
+        """The full retry loop this exists for: first tap fails to
+        persist, second tap (write now succeeding) writes the override."""
+        from events.model_override import get_override, SET_PERSIST_FAILURE_REASON
+
+        adapter = _make_adapter()
+        _record_target("tok-retry")
+
+        with (
+            patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False),
+            patch("events.model_override.set_override",
+                  return_value=(False, SET_PERSIST_FAILURE_REASON)),
+        ):
+            query1 = _make_query("rl:divert:tok-retry")
+            await adapter._handle_callback_query(_make_update(query1), MagicMock())
+
+        assert get_override("deepseek", "deepseek-v4-pro") is None
+        query1.edit_message_text.assert_not_called()
+
+        # Second tap, SAME token -- the write now succeeds for real (no
+        # patch this time, so it goes through the real set_override against
+        # the isolated tmp_path store).
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            query2 = _make_query("rl:divert:tok-retry")
+            await adapter._handle_callback_query(_make_update(query2), MagicMock())
+
+        rec = get_override("deepseek", "deepseek-v4-pro")
+        assert rec is not None, "the retry tap must write the override"
+        assert rec["replacement_provider"] == "openai-codex"
+        assert rec["replacement_model"] == "gpt-5.6-sol"
+        # A successful divert DOES retire the buttons.
+        query2.edit_message_text.assert_called_once()
+        assert query2.edit_message_text.call_args[1]["reply_markup"] is None
+
+    @pytest.mark.asyncio
+    async def test_validation_rejection_still_burns_the_button(self):
+        """Contrast case, regression guard: a VALIDATION rejection
+        (self-target -- can never succeed on retry) must still retire the
+        button, unlike a persistence failure. Guards against the
+        SET_PERSIST_FAILURE_REASON check accidentally widening to treat
+        every failure as retryable."""
+        from events.model_override import get_override
+
+        adapter = _make_adapter()
+        _record_target(
+            "tok-self-retry", provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="deepseek", replacement_model="deepseek-v4-pro",
+        )
+        query = _make_query("rl:divert:tok-self-retry")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(_make_update(query), MagicMock())
+
+        assert get_override("deepseek", "deepseek-v4-pro") is None
+        query.edit_message_text.assert_called_once()
+        assert query.edit_message_text.call_args[1]["reply_markup"] is None

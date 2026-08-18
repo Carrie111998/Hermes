@@ -6185,6 +6185,24 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 user_display = getattr(query.from_user, "first_name", "User")
+                # Set only on a TRANSIENT set_override failure (disk full, a
+                # Windows AV/indexer sharing violation, or the store's
+                # backoff window) -- see the SET_PERSIST_FAILURE_REASON
+                # branch below. It gates both re-arming the token and
+                # skipping the button-retiring edit_message_text: before
+                # the I2 fix (events/model_override.py), set_override only
+                # ever returned False for a PERMANENT rejection (self-
+                # target, blank fallback target), where burning the button
+                # is correct -- retrying can never succeed. I2 widened the
+                # False path to also cover a write that simply didn't reach
+                # disk this time, which retrying COULD fix. Popping the
+                # token unconditionally and always retiring the buttons
+                # (the pre-I2 assumption, still baked into the code below)
+                # would strand the operator: there is no `hermes overrides
+                # set`, only list/clear, so a burned button meant no way to
+                # retry until the next MODEL_RATE_LIMITED alert minted a
+                # fresh one.
+                retry_persist_failure = False
 
                 if action == "dismiss":
                     label = "❌ Dismissed"
@@ -6194,7 +6212,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         # fallback target -- e.g. a detector emitted
                         # MODEL_RATE_LIMITED with outcome="diverted" but
                         # omitted fallback_provider/fallback_model (the
-                        # default rate_limit_signal.record() shape).
+                        # default rate_limit_signal.record() shape). This
+                        # is a VALIDATION problem with the token's own
+                        # data, not a transient write failure -- a retry
+                        # would hit the exact same blank fields every time,
+                        # so the button must still burn.
                         # set_override does not itself reject an empty
                         # target, so calling it here would silently write
                         # a "/" override that enforcement read #2
@@ -6206,7 +6228,10 @@ class TelegramAdapter(BasePlatformAdapter):
                         # "show the reason" toast path below.
                         ok, reason = False, "no fallback target recorded for this alert"
                     else:
-                        from events.model_override import set_override
+                        from events.model_override import (
+                            SET_PERSIST_FAILURE_REASON,
+                            set_override,
+                        )
                         ok, reason = set_override(
                             provider=target["provider"],
                             model=target["model"],
@@ -6215,21 +6240,48 @@ class TelegramAdapter(BasePlatformAdapter):
                             ttl_seconds=6 * 3600,
                             set_by=f"telegram:{caller_id}",
                         )
+                        if not ok and reason == SET_PERSIST_FAILURE_REASON:
+                            retry_persist_failure = True
                     if ok:
                         label = (
                             f"✅ Diverted 6h → {target['replacement_provider']}/"
                             f"{target['replacement_model']}"
                         )
+                    elif retry_persist_failure:
+                        # Re-arm the token under the SAME string so the
+                        # button on the still-visible message keeps working
+                        # -- the tap only failed to persist, it was never
+                        # invalid. Without this, pop() already consumed the
+                        # token above and the next tap would find nothing
+                        # and answer "already resolved" instead of retrying.
+                        from events import override_callback_state
+                        override_callback_state.record(
+                            token,
+                            provider=target["provider"],
+                            model=target["model"],
+                            replacement_provider=target["replacement_provider"],
+                            replacement_model=target["replacement_model"],
+                        )
+                        label = f"⚠️ Not diverted (temporary — tap Divert again): {reason}"
                     else:
                         # A rejected write (self-target, divert-into-a-wall,
-                        # internal error) must surface its reason — a
-                        # button that silently does nothing is the failure
-                        # mode this whole design exists to prevent.
+                        # blank target, internal error) must surface its
+                        # reason — a button that silently does nothing is
+                        # the failure mode this whole design exists to
+                        # prevent.
                         label = f"⚠️ Not diverted: {reason}"
                 else:
                     label = "Resolved"
 
                 await query.answer(text=label)
+
+                if retry_persist_failure:
+                    # Leave the message and its keyboard exactly as they
+                    # were -- editing it (even just the text, with
+                    # reply_markup=None as every other branch does) would
+                    # retire the only working control before the operator
+                    # gets a chance to tap it again.
+                    return
 
                 # Retire the buttons so a stale message can't be tapped
                 # twice (the token is already consumed either way).
