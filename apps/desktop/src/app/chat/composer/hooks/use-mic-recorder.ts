@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
+import { setUserSpeaking } from '@/store/voice-lifecycle'
+
 type BrowserAudioContext = typeof AudioContext
 
 export interface MicRecorderOptions {
@@ -79,6 +81,8 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
 
   const cleanup = () => {
+    setUserSpeaking(false, 'voice-capture')
+
     if (animationRef.current) {
       window.cancelAnimationFrame(animationRef.current)
       animationRef.current = null
@@ -138,6 +142,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
 
         if (speechThreshold > 0 && options.onSilence && !silenceTriggeredRef.current) {
           if (normalized >= speechThreshold) {
+            if (!heardSpeechRef.current) {
+              setUserSpeaking(true, 'voice-capture')
+            }
+
             heardSpeechRef.current = true
             silenceStartedAtRef.current = null
           } else if (heardSpeechRef.current && silenceMs > 0) {
@@ -145,6 +153,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
 
             if (now - silenceStartedAtRef.current >= silenceMs) {
               silenceTriggeredRef.current = true
+              setUserSpeaking(false, 'voice-capture')
               options.onSilence()
 
               return

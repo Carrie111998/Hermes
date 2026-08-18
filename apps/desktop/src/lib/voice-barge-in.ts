@@ -19,6 +19,8 @@
 // - Detection is a windowed majority (>=80% of the last SUSTAINED_MS above
 //   trigger) so intra-word energy dips don't reset progress.
 
+import { setUserSpeaking } from '@/store/voice-lifecycle'
+
 const CALIBRATION_MS = 400
 const SUSTAINED_MS = 300
 const SUSTAINED_MAJORITY = 0.8
@@ -63,6 +65,7 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
 
   const cleanup = () => {
     disposed = true
+    setUserSpeaking(false, 'barge-in')
 
     if (frame !== null) {
       window.cancelAnimationFrame(frame)
@@ -280,6 +283,7 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
             tripped = true
             trippedAt = now
             quietSince = null
+            setUserSpeaking(true, 'barge-in')
             callbacks.onSpeech()
 
             if (!callbacks.onUtterance || !recorder) {

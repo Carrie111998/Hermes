@@ -71,6 +71,7 @@ import {
   $sessionStates
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
+import { $voiceLifecycle, onVoiceLifecycleEvent, type VoiceLifecycleState } from '@/store/voice-lifecycle'
 import type { UsageStats } from '@/types/hermes'
 
 // -- state: readonly views over the app's live atoms -------------------------
@@ -233,7 +234,10 @@ export const host = {
     /** Profile the live gateway is routed to. */
     profile: readonlyAtom<string>($activeGatewayProfile),
     /** Window geometry ({ width, height, narrow }). */
-    viewport: readonlyAtom<ViewportRect>($viewport)
+    viewport: readonlyAtom<ViewportRect>($viewport),
+    /** Provider-neutral voice activity from the authoritative VAD/TTS seams.
+     *  No audio, transcript, prompt, or tool payload is exposed. */
+    voiceLifecycle: readonlyAtom<VoiceLifecycleState>($voiceLifecycle)
   },
 
   /** Toast into the app's notification stack. */
@@ -475,6 +479,12 @@ export const host = {
    *  activity, …) by event type — `'*'` for everything. Returns a disposer.
    *  Listeners are isolated; a throw can't affect app dispatch. */
   onEvent: onGatewayEvent,
+
+  /** Subscribe to provider-neutral local voice transitions. Event types are
+   *  `user_speech_started`, `user_speech_ended`, `tts_started`, and
+   *  `tts_ended`; `'*'` subscribes to all four. Events intentionally carry no
+   *  audio, transcript, prompt, or tool payload. */
+  onVoiceEvent: onVoiceLifecycleEvent,
 
   /** Restart the backend gateway (progress surfaces in the core statusbar). */
   restartGateway: async () => runGatewayRestart(),
@@ -728,6 +738,7 @@ export {
   type TranscriptDirectiveProps
 } from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
+export type { VoiceLifecycleEvent, VoiceLifecycleEventType, VoiceLifecycleState } from '@/store/voice-lifecycle'
 export { THEMES_AREA } from '@/themes/user-themes'
 export type { RpcEvent, StatusResponse } from '@/types/hermes'
 /** Subscribe a component to a `host.state` atom. */

@@ -544,6 +544,39 @@ const busy = useValue(host.state.busy)
 For token-level detail, listen with `host.onEvent` (`message.start`,
 `message.delta`, `message.complete`).
 
+### Voice lifecycle
+
+Reactive plugins can subscribe to provider-neutral voice transitions without
+reading audio, transcripts, DOM labels, or Desktop internals:
+
+```javascript
+const off = host.onVoiceEvent('*', ({ type }) => {
+  if (type === 'user_speech_started') showListening()
+  if (type === 'user_speech_ended') stopListening()
+  if (type === 'tts_started') animateSpeaking()
+  if (type === 'tts_ended') stopSpeaking()
+})
+```
+
+The four stable event types are `user_speech_started`, `user_speech_ended`,
+`tts_started`, and `tts_ended`. Events intentionally carry no audio,
+transcript, prompt, or tool payload. The user-speech pair comes from the same
+VAD threshold and silence boundary used by Desktop voice capture. The TTS pair
+comes from actual playback: `tts_started` fires on the first playable PCM chunk
+(or when fallback audio starts), and `tts_ended` fires after drain, stop, or
+failure cleanup.
+
+Read `host.state.voiceLifecycle` for the current snapshot. This avoids missing
+an earlier start event when a plugin mounts during active speech:
+
+```javascript
+const voice = useValue(host.state.voiceLifecycle)
+// { userSpeaking: boolean, ttsSpeaking: boolean }
+```
+
+Feature-detect `host.onVoiceEvent` and `host.state.voiceLifecycle` when keeping
+compatibility with Desktop versions that predate this additive SDK surface.
+
 `host.onEvent` streams live gateway events (message deltas,
 session lifecycle, tool activity). Listeners are isolated — a throw in your
 listener can't affect app dispatch. Every `host` door is async-safe: a sync throw

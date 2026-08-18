@@ -1,5 +1,7 @@
 import { atom } from 'nanostores'
 
+import { setTtsSpeaking } from './voice-lifecycle'
+
 export type VoicePlaybackSource = 'read-aloud' | 'voice-conversation'
 export type VoicePlaybackStatus = 'idle' | 'preparing' | 'speaking'
 
@@ -20,5 +22,6 @@ export const $voicePlayback = atom<VoicePlaybackState>({
 })
 
 export function setVoicePlaybackState(next: VoicePlaybackState) {
+  setTtsSpeaking(next.status === 'speaking')
   $voicePlayback.set(next)
 }
