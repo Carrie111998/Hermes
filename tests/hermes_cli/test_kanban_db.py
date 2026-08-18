@@ -803,6 +803,134 @@ def test_dispatch_blocks_before_spawn_when_parent_custody_file_is_missing(
     assert "outside custody or missing" in child.last_failure_error
 
 
+def test_dispatch_blocks_when_manifest_exists_but_custody_row_is_deleted(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    spawned = []
+    with kb.connect() as conn:
+        parent_id, attachment = _complete_parent_output(conn)
+        completed = [
+            event for event in kb.list_events(conn, parent_id) if event.kind == "completed"
+        ][-1]
+        assert completed.payload["artifact_manifest"][0]["capture_key"] == attachment.capture_key
+        conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment.id,))
+        conn.commit()
+        child_id = kb.create_task(
+            conn,
+            title="reject incomplete custody",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+        result = kb._dispatch_once_locked(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        child = kb.get_task(conn, child_id)
+
+    assert spawned == []
+    assert result.auto_blocked == [child_id]
+    assert child.status == "blocked"
+    assert "does not match its artifact manifest" in child.last_failure_error
+
+
+def test_completed_run_manifest_preserves_expected_output_if_event_is_missing(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    observed = []
+    with kb.connect() as conn:
+        parent_id, _attachment = _complete_parent_output(conn)
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (parent_id,),
+        )
+        conn.commit()
+        child_id = kb.create_task(
+            conn,
+            title="hydrate from run manifest",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+
+        def inspect_spawn(task, workspace):
+            observed.append((Path(workspace) / "candidate.html").read_bytes())
+            return 12345
+
+        result = kb._dispatch_once_locked(conn, spawn_fn=inspect_spawn)
+        child = kb.get_task(conn, child_id)
+
+    assert [row[0] for row in result.spawned] == [child_id], child.last_failure_error
+    assert observed == [b"candidate"]
+
+
+def test_dispatch_blocks_and_releases_claim_on_malformed_custody_metadata(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    with kb.connect() as conn:
+        parent_id, attachment = _complete_parent_output(conn)
+        conn.execute(
+            "UPDATE task_attachments SET size = 'not-an-integer' WHERE id = ?",
+            (attachment.id,),
+        )
+        conn.commit()
+        child_id = kb.create_task(
+            conn,
+            title="reject malformed custody",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+        result = kb._dispatch_once_locked(conn, spawn_fn=lambda task, workspace: 12345)
+        child = kb.get_task(conn, child_id)
+
+    assert result.spawned == []
+    assert result.auto_blocked == [child_id]
+    assert child.status == "blocked"
+    assert child.claim_lock is None
+    assert child.worker_pid is None
+    assert "malformed metadata" in child.last_failure_error
+
+
+def test_dispatch_defensively_blocks_on_unexpected_hydration_exception(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    with kb.connect() as conn:
+        parent_id, _attachment = _complete_parent_output(conn)
+        child_id = kb.create_task(
+            conn,
+            title="defensive hydration boundary",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+        monkeypatch.setattr(
+            kb,
+            "hydrate_parent_attachments",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("injected")),
+        )
+        result = kb._dispatch_once_locked(conn, spawn_fn=lambda task, workspace: 12345)
+        child = kb.get_task(conn, child_id)
+
+    assert result.spawned == []
+    assert result.auto_blocked == [child_id]
+    assert child.status == "blocked"
+    assert child.claim_lock is None
+    assert "ValueError: injected" in child.last_failure_error
+
+
 def test_dispatch_rejects_symlinked_successor_destination_without_touching_target(
     kanban_home,
     monkeypatch,
@@ -829,6 +957,96 @@ def test_dispatch_rejects_symlinked_successor_destination_without_touching_targe
     assert result.auto_blocked == [child_id]
     assert child.status == "blocked"
     assert ambient.read_text() == "do-not-touch"
+
+
+def test_dispatch_preserves_destination_created_during_atomic_materialization(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    original_link = kb.os.link
+    raced = False
+
+    def racing_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
+        nonlocal raced
+        if not raced:
+            raced = True
+            fd = kb.os.open(
+                dst,
+                kb.os.O_WRONLY | kb.os.O_CREAT | kb.os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            with kb.os.fdopen(fd, "wb") as handle:
+                handle.write(b"racer")
+        return original_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    with kb.connect() as conn:
+        parent_id, _attachment = _complete_parent_output(conn)
+        child_id = kb.create_task(
+            conn,
+            title="atomic no-replace",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        workspace = kb.resolve_workspace(kb.get_task(conn, child_id))
+        kb.recompute_ready(conn)
+        monkeypatch.setattr(kb.os, "link", racing_link)
+        monkeypatch.setattr(kb, "_secure_parent_hydration_available", lambda: True)
+        result = kb._dispatch_once_locked(conn, spawn_fn=lambda task, workspace: 12345)
+        child = kb.get_task(conn, child_id)
+
+    assert raced
+    assert result.spawned == []
+    assert result.auto_blocked == [child_id]
+    assert child.status == "blocked"
+    assert (workspace / "candidate.html").read_bytes() == b"racer"
+
+
+def test_hydration_receipt_is_idempotent_within_run_and_reissued_for_retry(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    contexts = []
+    with kb.connect() as conn:
+        parent_id, _attachment = _complete_parent_output(conn)
+        child_id = kb.create_task(
+            conn,
+            title="run-bound provenance",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+
+        def capture_context(task, workspace):
+            contexts.append(kb.build_worker_context(conn, task.id))
+            return 12345
+
+        first = kb._dispatch_once_locked(conn, spawn_fn=capture_context)
+        first_run = kb.get_task(conn, child_id).current_run_id
+        assert first.spawned
+        assert kb._record_spawn_failure(conn, child_id, "retry", failure_limit=99) is False
+        second = kb._dispatch_once_locked(conn, spawn_fn=capture_context)
+        second_run = kb.get_task(conn, child_id).current_run_id
+        assert second.spawned
+        receipts = [
+            event for event in kb.list_events(conn, child_id)
+            if event.kind == "parent_attachments_hydrated"
+        ]
+
+    assert first_run != second_run
+    assert [event.run_id for event in receipts] == [first_run, second_run]
+    assert len(contexts) == 2
+    assert all("## Hydrated parent artifacts" in context for context in contexts)
 
 
 def test_parent_without_captured_output_preserves_existing_scratch_dispatch(

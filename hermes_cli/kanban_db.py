@@ -4218,6 +4218,14 @@ def _secure_dir_fd_custody_available() -> bool:
     )
 
 
+def _secure_parent_hydration_available() -> bool:
+    """Whether atomic descriptor-relative no-replace hydration is available."""
+    return (
+        _secure_dir_fd_custody_available()
+        and os.link in os.supports_dir_fd
+    )
+
+
 def _sha256_fd(fd: int) -> str:
     """Return SHA-256 for an already-open regular-file descriptor."""
     digest = hashlib.sha256()
@@ -5685,6 +5693,7 @@ def complete_task(
                 metadata=None,
             )
         closing_run_id = _current_run_id(conn, task_id) or preallocated_run_id
+        artifact_manifest: list[dict[str, Any]] = []
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(
                 conn,
@@ -5692,7 +5701,21 @@ def complete_task(
                 metadata,
                 source_run_id=closing_run_id,
             )
-            for staged_artifact in metadata.pop("_staged_artifacts", []):
+            staged_artifacts = metadata.pop("_staged_artifacts", [])
+            artifact_manifest = [
+                {
+                    "filename": staged_artifact["filename"],
+                    "size": staged_artifact["size"],
+                    "sha256": staged_artifact["sha256"],
+                    "source_run_id": staged_artifact["source_run_id"],
+                    "artifact_role": staged_artifact["artifact_role"],
+                    "capture_key": staged_artifact["capture_key"],
+                }
+                for staged_artifact in staged_artifacts
+            ]
+            if artifact_manifest:
+                metadata["artifact_manifest"] = artifact_manifest
+            for staged_artifact in staged_artifacts:
                 _insert_completion_attachment(
                     conn,
                     task_id,
@@ -5766,6 +5789,7 @@ def complete_task(
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            "artifact_manifest": artifact_manifest,
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
@@ -9830,30 +9854,171 @@ def hydrate_parent_attachments(
     for parent in parent_rows:
         if parent["status"] not in ("done", "archived"):
             raise ParentAttachmentHydrationError(f"parent {parent['id']} is not complete")
+
+        completed_event = conn.execute(
+            "SELECT payload, run_id FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+            (parent["id"],),
+        ).fetchone()
+        manifest_present = False
+        manifest: list[dict[str, Any]] = []
+        completion_run_id: Optional[int] = None
+        event_manifest: Optional[list[dict[str, Any]]] = None
+        if completed_event is not None:
+            completion_run_id = completed_event["run_id"]
+            try:
+                completion_payload = json.loads(completed_event["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} has malformed completion evidence"
+                ) from exc
+            if "artifact_manifest" in completion_payload:
+                manifest_present = True
+                raw_manifest = completion_payload["artifact_manifest"]
+                if not isinstance(raw_manifest, list):
+                    raise ParentAttachmentHydrationError(
+                        f"parent {parent['id']} has malformed artifact manifest"
+                    )
+                event_manifest = raw_manifest
+
+        completed_run = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+            "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
+            (parent["id"],),
+        ).fetchone()
+        run_manifest: Optional[list[dict[str, Any]]] = None
+        if completed_run is not None and completed_run["metadata"]:
+            try:
+                run_metadata = json.loads(completed_run["metadata"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} has malformed completed-run metadata"
+                ) from exc
+            if isinstance(run_metadata, dict) and "artifact_manifest" in run_metadata:
+                raw_run_manifest = run_metadata["artifact_manifest"]
+                if not isinstance(raw_run_manifest, list):
+                    raise ParentAttachmentHydrationError(
+                        f"parent {parent['id']} has malformed completed-run artifact manifest"
+                    )
+                run_manifest = raw_run_manifest
+                if completion_run_id is None:
+                    completion_run_id = int(completed_run["id"])
+                elif completion_run_id != int(completed_run["id"]):
+                    raise ParentAttachmentHydrationError(
+                        f"parent {parent['id']} completion evidence has conflicting run lineage"
+                    )
+
+        if event_manifest is not None and run_manifest is not None:
+            if event_manifest != run_manifest:
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} completion artifact manifests disagree"
+                )
+            manifest = event_manifest
+            manifest_present = True
+        elif event_manifest is not None:
+            manifest = event_manifest
+            manifest_present = True
+        elif run_manifest is not None:
+            manifest = run_manifest
+            manifest_present = True
+
         attachments = conn.execute(
             "SELECT id, filename, stored_path, size, sha256, source_run_id, "
             "artifact_role, capture_key FROM task_attachments "
             "WHERE task_id = ? AND capture_key IS NOT NULL "
-            "AND uploaded_by = 'kanban_complete' ORDER BY created_at, id",
-            (parent["id"],),
+            "AND uploaded_by = 'kanban_complete' "
+            + ("AND source_run_id = ? " if manifest_present else "")
+            + "ORDER BY created_at, id",
+            ((parent["id"], completion_run_id) if manifest_present else (parent["id"],)),
         ).fetchall()
+
+        if manifest_present:
+            if completion_run_id is None:
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} artifact manifest has no run lineage"
+                )
+            expected_by_key: dict[str, dict[str, Any]] = {}
+            for item in manifest:
+                if not isinstance(item, dict):
+                    raise ParentAttachmentHydrationError(
+                        f"parent {parent['id']} has malformed artifact manifest entry"
+                    )
+                capture_key = item.get("capture_key")
+                if not isinstance(capture_key, str) or not re.fullmatch(
+                    r"[0-9a-f]{64}", capture_key
+                ):
+                    raise ParentAttachmentHydrationError(
+                        f"parent {parent['id']} has malformed artifact manifest key"
+                    )
+                if capture_key in expected_by_key:
+                    raise ParentAttachmentHydrationError(
+                        f"parent {parent['id']} artifact manifest has duplicate entries"
+                    )
+                expected_by_key[capture_key] = item
+            actual_keys = [str(row["capture_key"] or "") for row in attachments]
+            if len(actual_keys) != len(set(actual_keys)):
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} custody has duplicate capture rows"
+                )
+            if set(actual_keys) != set(expected_by_key):
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} custody does not match its artifact manifest"
+                )
+
         for attachment in attachments:
             filename = str(attachment["filename"] or "")
             digest = str(attachment["sha256"] or "")
             artifact_role = str(attachment["artifact_role"] or "")
+            capture_key = str(attachment["capture_key"] or "")
             if (
                 not filename
                 or Path(filename).name != filename
                 or filename in (".", "..")
                 or not re.fullmatch(r"[0-9a-f]{64}", digest)
-                or attachment["source_run_id"] is None
+                or not re.fullmatch(r"[0-9a-f]{64}", capture_key)
                 or not artifact_role
             ):
                 raise ParentAttachmentHydrationError(
                     f"parent {parent['id']} attachment {filename!r} has incomplete provenance"
                 )
+            try:
+                attachment_id = int(attachment["id"])
+                admitted_size = int(attachment["size"])
+                source_run_id = int(attachment["source_run_id"])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} attachment {filename!r} has malformed metadata"
+                ) from exc
+            if (
+                attachment_id <= 0
+                or admitted_size < 0
+                or admitted_size > KANBAN_ATTACHMENT_MAX_BYTES
+                or source_run_id <= 0
+            ):
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} attachment {filename!r} has invalid metadata"
+                )
+            if manifest_present:
+                expected = expected_by_key[capture_key]
+                expected_fields = {
+                    "filename": filename,
+                    "size": admitted_size,
+                    "sha256": digest,
+                    "source_run_id": source_run_id,
+                    "artifact_role": artifact_role,
+                    "capture_key": capture_key,
+                }
+                if any(expected.get(key) != value for key, value in expected_fields.items()):
+                    raise ParentAttachmentHydrationError(
+                        f"parent {parent['id']} custody metadata does not match its artifact manifest"
+                    )
             root = Path(os.path.abspath(task_attachments_dir(parent["id"], board=board)))
-            source = Path(os.path.abspath(Path(attachment["stored_path"])))
+            stored_path = attachment["stored_path"]
+            if not isinstance(stored_path, str) or not stored_path:
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} attachment {filename!r} has malformed storage metadata"
+                )
+            source = Path(os.path.abspath(Path(stored_path)))
             try:
                 source.relative_to(root)
                 source_fd = _open_existing_path_nofollow(source)
@@ -9867,7 +10032,7 @@ def hydrate_parent_attachments(
             finally:
                 os.close(source_fd)
             size = int(source_stat.st_size)
-            if size != int(attachment["size"]):
+            if size != admitted_size:
                 raise ParentAttachmentHydrationError(
                     f"parent {parent['id']} attachment {filename} size drifted"
                 )
@@ -9877,8 +10042,8 @@ def hydrate_parent_attachments(
                 )
             origin = {
                 "parent_task_id": parent["id"],
-                "attachment_id": int(attachment["id"]),
-                "source_run_id": int(attachment["source_run_id"]),
+                "attachment_id": attachment_id,
+                "source_run_id": source_run_id,
                 "artifact_role": artifact_role,
             }
             prior = planned.get(filename)
@@ -9899,7 +10064,7 @@ def hydrate_parent_attachments(
     if not planned:
         return []
 
-    if not _secure_dir_fd_custody_available():
+    if not _secure_parent_hydration_available():
         raise ParentAttachmentHydrationError(
             "secure descriptor-relative parent artifact hydration is unavailable"
         )
@@ -9944,13 +10109,21 @@ def hydrate_parent_attachments(
                             raise ParentAttachmentHydrationError(
                                 f"custody verification failed while hydrating {filename}"
                             )
-                        os.replace(
-                            temporary,
-                            filename,
-                            src_dir_fd=workspace_fd,
-                            dst_dir_fd=workspace_fd,
-                        )
+                        try:
+                            os.link(
+                                temporary,
+                                filename,
+                                src_dir_fd=workspace_fd,
+                                dst_dir_fd=workspace_fd,
+                                follow_symlinks=False,
+                            )
+                        except FileExistsError as exc:
+                            raise ParentAttachmentHydrationError(
+                                f"destination {filename} appeared during hydration"
+                            ) from exc
                         created.append(filename)
+                        os.fsync(workspace_fd)
+                        os.unlink(temporary, dir_fd=workspace_fd)
                         os.fsync(workspace_fd)
                     finally:
                         os.close(source_fd)
@@ -9996,11 +10169,12 @@ def hydrate_parent_attachments(
         ],
     }
     with write_txn(conn):
+        hydration_run_id = _current_run_id(conn, task_id)
         replayed = False
         for row in conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? "
-            "AND kind='parent_attachments_hydrated' ORDER BY id",
-            (task_id,),
+            "AND kind='parent_attachments_hydrated' AND run_id IS ? ORDER BY id",
+            (task_id, hydration_run_id),
         ).fetchall():
             try:
                 if json.loads(row["payload"] or "{}") == event_payload:
@@ -10014,7 +10188,7 @@ def hydrate_parent_attachments(
                 task_id,
                 "parent_attachments_hydrated",
                 event_payload,
-                run_id=_current_run_id(conn, task_id),
+                run_id=hydration_run_id,
             )
     return hydrated
 
@@ -10933,11 +11107,11 @@ def _dispatch_once_locked(
                     Path(workspace),
                     board=board,
                 )
-            except (ParentAttachmentHydrationError, OSError) as exc:
+            except Exception as exc:
                 blocked = _record_task_failure(
                     conn,
                     claimed.id,
-                    f"parent_artifact_hydration: {exc}",
+                    f"parent_artifact_hydration: {type(exc).__name__}: {exc}",
                     outcome="spawn_failed",
                     failure_limit=failure_limit,
                     force_trip=True,
@@ -11786,10 +11960,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
         lines.append("")
 
+    context_run_id = _current_run_id(conn, task_id)
     hydration_row = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'parent_attachments_hydrated' ORDER BY id DESC LIMIT 1",
-        (task_id,),
+        "AND kind = 'parent_attachments_hydrated' AND run_id IS ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, context_run_id),
     ).fetchone()
     if hydration_row is not None:
         try:
