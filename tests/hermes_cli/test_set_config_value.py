@@ -221,6 +221,25 @@ class TestConfigGetUnset:
         reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
         assert "glm-5.3" not in reloaded.get("model_overrides", {}).get("zai", {})
 
+        model_key = "model_overrides.zai.glm-5.3"
+        set_config_value(model_key, '{"context_window": 1000000}')
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["model_overrides"]["zai"]["glm-5.3"] == {
+            "context_window": 1_000_000,
+        }
+
+        capsys.readouterr()
+        config_command(
+            argparse.Namespace(config_command="get", key=model_key, json=True)
+        )
+        assert json.loads(capsys.readouterr().out) == {
+            "context_window": 1_000_000,
+        }
+
+        config_command(argparse.Namespace(config_command="unset", key=model_key))
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert "glm-5.3" not in reloaded.get("model_overrides", {}).get("zai", {})
+
 
 # ---------------------------------------------------------------------------
 # List navigation — regression tests for #17876

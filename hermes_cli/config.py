@@ -1013,11 +1013,13 @@ def _split_config_key_path(dotted_key: str) -> list[str]:
     """Split a config path while preserving dotted model override IDs."""
     parts = dotted_key.split(".")
     if (
-        len(parts) >= 5
+        len(parts) >= 3
         and parts[0] == "model_overrides"
-        and parts[-1] in _MODEL_OVERRIDE_METADATA_KEYS
+        and parts[1] != "_default"
     ):
-        return [parts[0], parts[1], ".".join(parts[2:-1]), parts[-1]]
+        if len(parts) >= 4 and parts[-1] in _MODEL_OVERRIDE_METADATA_KEYS:
+            return [parts[0], parts[1], ".".join(parts[2:-1]), parts[-1]]
+        return [parts[0], parts[1], ".".join(parts[2:])]
     return parts
 
 
