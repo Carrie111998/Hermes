@@ -93,7 +93,7 @@ def is_autonomous_silence_response(response: Any) -> bool:
         return False
 
     def _is_token(line: str) -> bool:
-        return _canonical_silence_candidate(line) in LIVE_GATEWAY_SILENT_MARKERS
+        return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(line))
 
     # Whole response is exactly a token.
     if _is_token(stripped):
@@ -105,8 +105,10 @@ def is_autonomous_silence_response(response: Any) -> bool:
         return True
     # Bracketed sentinel used as a same-line prefix — the documented pattern
     # "[SILENT] No changes detected".  Restricted to the bracketed form so a
-    # bare word like "Silent retry succeeded" is NOT swallowed.
-    if stripped.upper().startswith("[SILENT]"):
+    # bare word like "Silent retry succeeded" is NOT swallowed.  Edge
+    # punctuation (markdown bold/italics, quotes) is tolerated first so
+    # "**[SILENT] No changes**" still suppresses.
+    if _strip_edge_silence_punctuation(stripped).upper().startswith("[SILENT]"):
         return True
     return False
 

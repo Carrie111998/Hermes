@@ -1470,6 +1470,22 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
+    def test_markdown_decorated_marker_suppresses_delivery(self):
+        """Model wraps the marker in markdown bold/italics/quotes —
+        **[SILENT]** / *[SILENT]* / "[SILENT]" / **[SILENT] No changes**
+        must still suppress delivery (regression: Aug 18 2026 Proactive
+        Check-In delivered the literal bolded marker to the user)."""
+        from cron.scheduler import tick
+        for response in ("**[SILENT]**", "*[SILENT]*", '"[SILENT]"', "**[SILENT] No changes**"):
+            with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+                 patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+                 patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+                 patch("cron.scheduler._deliver_result") as deliver_mock, \
+                 patch("cron.scheduler.mark_job_run"):
+                tick(verbose=False)
+            deliver_mock.assert_not_called()
+
     def test_bracketless_silent_variants_suppress(self):
         """Bracketless near-markers the model emits when it drops brackets
         must still suppress delivery (#51438, #46917)."""
