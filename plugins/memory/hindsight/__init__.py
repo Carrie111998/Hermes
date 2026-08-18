@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -67,6 +68,100 @@ class _RecallResult:
 
     text: str
     count: int
+
+
+# ---------------------------------------------------------------------------
+# Recall dedup — collapse restated facts without merging contradictions
+# ---------------------------------------------------------------------------
+# With retain_every_n low (e.g. 1), a judgement the user restates across turns
+# is stored as several near-identical facts, and recall then injects all of
+# them — measuring 39-52% of rows on duplicate-heavy queries being restatements.
+# Dedup happens HERE, at recall formatting time, because Hindsight's own
+# consolidation_dedup_threshold only compares observation-to-observation and
+# extraction is blind across calls. We collapse near-identical text runs while
+# ALWAYS keeping first occurrence, and we refuse to merge a negation of the same
+# assertion (a near-duplicate whose polarity flips is a contradiction, not a
+# restatement — merging it would silently corrupt memory).
+
+# Similarity threshold above which two recalled facts count as the same
+# assertion. Similarity is containment-based (see _recall_similarity), so a
+# restatement that drops/adds a few words — e.g. "user prefers dark mode" vs
+# "the user prefers dark mode" — still matches; genuinely different facts score
+# low and are never collapsed.
+_RECALL_DEDUP_SIMILARITY_THRESHOLD = 0.75
+
+# Negation markers: if two near-duplicate facts differ in whether they carry
+# negation, they assert opposite things (e.g. "user likes X" vs "user doesn't
+# like X") — keep both, don't merge. Independent of the similarity score.
+_NEGATION_RE = re.compile(
+    r"\b(?:n't|not|never|no|none|nothing|without|neither|nor|isn't|aren't|"
+    r"wasn't|weren't|don't|doesn't|didn't|won't|can't|cannot|shouldn't)\b",
+    re.IGNORECASE,
+)
+
+
+def _recall_token_set(text: str) -> set[str]:
+    """Lowercased word tokens of a recalled fact (for order-insensitive compare)."""
+    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _recall_is_negation(text: str) -> bool:
+    """True when the recalled fact carries a negation marker."""
+    return bool(_NEGATION_RE.search(text or ""))
+
+
+def _recall_similarity(a: str, b: str) -> float:
+    """Containment similarity between two recalled facts (0..1).
+
+    One fact is a restatement of the other when they share nearly all of their
+    tokens (e.g. "user prefers dark mode" vs "the user prefers dark mode").
+    Symmetric max directional overlap: the fraction of the smaller token set
+    contained in the larger. Order-insensitive.
+    """
+    ta = _recall_token_set(a)
+    tb = _recall_token_set(b)
+    if not ta and not tb:
+        return 1.0 if (a or "") == (b or "") else 0.0
+    inter = len(ta & tb)
+    if not inter:
+        return 0.0
+    # Which fact is the smaller one? The restatement keeps the shorter fact's
+    # tokens; containment = fraction of the smaller set that's shared.
+    union = len(ta | tb)
+    smaller = min(len(ta), len(tb))
+    return inter / smaller if smaller else 0.0
+
+
+def _recall_should_collapse(candidate: str, keep: str) -> bool:
+    """Should `candidate` be dropped because `keep` already represents it?
+
+    Collapses when the two are near-identical restatements, EXCEPT when their
+    polarity differs (one negates the other) — that's a contradiction and both
+    facts are preserved.
+    """
+    if _recall_similarity(keep, candidate) < _RECALL_DEDUP_SIMILARITY_THRESHOLD:
+        return False
+    # Same assertion but opposite polarity -> contradiction, keep both.
+    if _recall_is_negation(keep) != _recall_is_negation(candidate):
+        return False
+    return True
+
+
+def _dedup_recalled_texts(texts: list[str]) -> list[str]:
+    """Drop near-duplicate restatements from an ordered recall list, first-wins.
+
+    Preserves order; the first occurrence of each distinct assertion is kept.
+    Contradictory near-duplicates (negation polarity differs) are both kept.
+    """
+    kept: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        if any(_recall_should_collapse(text, k) for k in kept):
+            continue
+        kept.append(text)
+    return kept
+
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
@@ -1882,9 +1977,13 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
-            logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+            results = _dedup_recalled_texts([r.text for r in resp.results if r.text]) if resp.results else []
+            num_results = len(results)
+            logger.debug("Recall: returned %d results (%d raw, %d after dedup)",
+                         num_results,
+                         len(resp.results) if resp.results else 0,
+                         len(resp.results) - num_results if resp.results else 0)
+            text = "\n".join(f"- {t}" for t in results)
             return _RecallResult(text, num_results)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
@@ -2215,11 +2314,15 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
-                logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
+                results = _dedup_recalled_texts([r.text for r in resp.results if r.text]) if resp.results else []
+                num_results = len(results)
+                logger.debug("Tool hindsight_recall: %d results (%d raw, %d after dedup)",
+                             num_results,
+                             len(resp.results) if resp.results else 0,
+                             len(resp.results) - num_results if resp.results else 0)
+                if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = [f"{i}. {t}" for i, t in enumerate(results, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
