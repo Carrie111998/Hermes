@@ -1,6 +1,6 @@
 ---
 name: drive-electron-apps
-description: "Use when driving an Electron/desktop Chromium app (Obsidian, Slack, VS Code…). Attach over CDP for exact DOM control with zero focus steal."
+description: "Use when driving Electron desktop apps (Obsidian, Slack)."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
