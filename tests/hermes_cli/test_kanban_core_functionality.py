@@ -1368,6 +1368,40 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         conn.close()
 
 
+def test_protocol_violation_surfaces_worker_final_output(kanban_home):
+    """Regression for #88603: a worker that recognized an impossible
+    instruction and explained why in its final response must have that
+    explanation surface on the board, not a bare canned diagnostic.
+
+    Quiet-mode workers print only their final response before exiting,
+    redirected to the per-task log file. On a clean-exit protocol
+    violation, ``detect_crashed_workers`` must fold that text into both
+    the failure error and the reap event payload.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="handoff", assignee="worker")
+        diagnosis = (
+            "the board protocol requires reassigning this card to "
+            "orchestrator, but the native kanban_* tools available here "
+            "have no reassignment operation."
+        )
+        log_path = kb.worker_log_path(tid)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(diagnosis + "\n\nsession_id: abc123\n")
+
+        _drive_protocol_violation(conn, tid, 991100)
+
+        task = kb.get_task(conn, tid)
+        assert diagnosis in (task.last_failure_error or "")
+
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "protocol_violation"]
+        assert len(events) == 1
+        assert (events[0].payload or {}).get("worker_output") == diagnosis
+    finally:
+        conn.close()
+
+
 
 
 
