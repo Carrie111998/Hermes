@@ -716,7 +716,7 @@ When the agent calls the `clarify` tool — to ask which approach you prefer, ge
 
 Click a numbered button to answer, or click **Other** to type a free-form response (the next message you send in that channel becomes the answer). Open-ended `clarify` calls (no preset choices) skip the buttons and just capture your next message.
 
-The buttons disable themselves once a choice is made so duplicate clicks don't double-resolve the prompt. Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `600` seconds). If you don't respond within the timeout, the agent unblocks with a sentinel message and adapts rather than hanging.
+The buttons disable themselves once a choice is made so duplicate clicks don't double-resolve the prompt. Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `3600` seconds). Timeout behavior is controlled by `agent.clarify_on_timeout`: `proceed` (the default) unblocks the agent with an adaptive response, while `abort` returns a tool error meaning approval was not granted. An individual `clarify` call can override that default with `on_timeout`.
 
 ## Home Channel
 
@@ -927,5 +927,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 

@@ -4131,6 +4131,49 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
     return (now - queued_at) >= _RECONNECT_ATTENTION_AFTER_SECONDS
 
 
+def _clarify_no_response(
+    on_timeout: str,
+    proceed_response: str,
+    *,
+    timed_out: bool,
+) -> str:
+    """Resolve a clarify path where no user response can be returned.
+
+    ``proceed`` preserves each caller's historical sentinel exactly.  ``abort``
+    raises a distinct error for an expired wait versus a prompt that could not
+    be presented, allowing the tool result to report accurate fail-closed
+    metadata.
+    """
+    if on_timeout != "abort":
+        return proceed_response
+
+    from tools.clarify_tool import ClarifyTimeoutError, ClarifyUnavailableError
+
+    if timed_out:
+        raise ClarifyTimeoutError()
+    raise ClarifyUnavailableError()
+
+
+def _clarify_wait_result(
+    response: Optional[str],
+    on_timeout: str,
+    timeout: int,
+) -> str:
+    """Map a gateway wait result without conflating timeout and cancellation."""
+    sentinel = f"[user did not respond within {int(timeout / 60)}m]"
+    if response is None:
+        return _clarify_no_response(
+            on_timeout,
+            sentinel,
+            timed_out=True,
+        )
+    if response == "":
+        # Session-boundary cancellation is not an expired wait, so it retains
+        # its historical sentinel.
+        return sentinel
+    return response
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -5781,19 +5824,28 @@ class TurnRunner:
         # callback contract).  Bridges sync→async by scheduling the
         # adapter's send_clarify on the gateway event loop, then blocks on
         # the clarify primitive's threading.Event with a configurable
-        # timeout.  Returns the user's response string, or a sentinel
-        # explaining that no response arrived (so the agent can adapt
-        # rather than hang forever).
+        # timeout.  Returns the user's response string or, in the default
+        # proceed mode, a sentinel explaining that no response arrived.  The
+        # opt-in abort mode raises a dedicated timeout error instead.
         # ------------------------------------------------------------------
-        def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
+        def _clarify_callback_sync(
+            question: str,
+            choices,
+            multi_select: bool = False,
+            on_timeout: str = "proceed",
+        ) -> str:
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
             if not ctx._status_adapter:
-                return ""
+                return _clarify_no_response(
+                    on_timeout,
+                    "",
+                    timed_out=False,
+                )
 
             clarify_id = _uuid.uuid4().hex[:10]
-            _clarify_mod.register(
+            clarify_entry = _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
                 question=question,
@@ -5854,18 +5906,22 @@ class TurnRunner:
                     send_ok = False
 
             if not send_ok:
-                # Couldn't deliver the prompt — clean up and return
-                # sentinel so the agent can fall back to a sensible
-                # default rather than hanging.
+                # Couldn't deliver the prompt — clean up and preserve the
+                # historical sentinel in proceed mode.  Abort mode must not
+                # treat an unseen approval question as an answer.
                 _clarify_mod.clear_session(ctx.session_key or "")
-                return "[clarify prompt could not be delivered]"
+                return _clarify_no_response(
+                    on_timeout,
+                    "[clarify prompt could not be delivered]",
+                    timed_out=False,
+                )
 
             timeout = _clarify_mod.get_clarify_timeout()
-            response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
-            if response is None or response == "":
-                # Timeout or session-boundary cancellation
-                return f"[user did not respond within {int(timeout / 60)}m]"
-            return response
+            response = _clarify_mod.wait_for_response(
+                clarify_entry,
+                timeout=float(timeout),
+            )
+            return _clarify_wait_result(response, on_timeout, timeout)
 
         agent.clarify_callback = _clarify_callback_sync
 

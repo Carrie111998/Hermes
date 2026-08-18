@@ -104,7 +104,10 @@ def register(
     return entry
 
 
-def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
+def wait_for_response(
+    clarify_id: str | _ClarifyEntry,
+    timeout: float,
+) -> Optional[str]:
     """Block on the entry's event until resolved or timeout fires.
 
     Polls in 1-second slices so the agent's inactivity heartbeat keeps
@@ -116,10 +119,18 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     heartbeat still fires each slice so inactivity watchdogs don't kill a live
     prompt.
 
-    Returns the resolved response string, or ``None`` on timeout.
+    ``clarify_id`` may be the ID or the entry returned by :func:`register`.
+    Passing the entry preserves a session-cancellation response when cleanup
+    races ahead of this wait and removes the ID from the registry.
+
+    Returns the resolved response string, or ``None`` on timeout or an unknown
+    ID.
     """
-    with _lock:
-        entry = _entries.get(clarify_id)
+    if isinstance(clarify_id, _ClarifyEntry):
+        entry = clarify_id
+    else:
+        with _lock:
+            entry = _entries.get(clarify_id)
     if entry is None:
         return None
 
@@ -147,10 +158,11 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 
     with _lock:
         # Remove from indices regardless of resolution outcome.
-        _entries.pop(clarify_id, None)
+        entry_id = entry.clarify_id
+        _entries.pop(entry_id, None)
         ids = _session_index.get(entry.session_key)
-        if ids and clarify_id in ids:
-            ids.remove(clarify_id)
+        if ids and entry_id in ids:
+            ids.remove(entry_id)
             if not ids:
                 _session_index.pop(entry.session_key, None)
 
@@ -527,6 +539,61 @@ def clear_session(session_key: str) -> int:
 # =========================================================================
 # Config
 # =========================================================================
+
+CLARIFY_ON_TIMEOUT_VALUES = ("proceed", "abort")
+
+
+def resolve_clarify_on_timeout(config: dict, override: Optional[str] = None) -> str:
+    """Resolve what a clarify call does when its response wait expires.
+
+    An explicit per-call *override* wins over ``agent.clarify_on_timeout``.
+    The shipped default is ``"proceed"``, preserving the historical behavior
+    where the tool returns a sentinel and lets the agent adapt.  ``"abort"``
+    asks the platform callback to report the timeout as an error instead.
+
+    An invalid persisted value fails safe to ``"abort"`` so a typo cannot turn
+    silence into approval.  An invalid explicit override raises ``ValueError``
+    because it is a malformed tool invocation.
+    """
+    if override is not None:
+        raw = override
+    else:
+        agent_config = config.get("agent") if isinstance(config, dict) else None
+        raw = (
+            agent_config.get("clarify_on_timeout", "proceed")
+            if isinstance(agent_config, dict)
+            else "proceed"
+        )
+
+    normalized = raw.strip().lower() if isinstance(raw, str) else ""
+    if normalized in CLARIFY_ON_TIMEOUT_VALUES:
+        return normalized
+    if override is not None:
+        allowed = " or ".join(repr(value) for value in CLARIFY_ON_TIMEOUT_VALUES)
+        raise ValueError(f"on_timeout must be {allowed}.")
+    logger.warning(
+        "Invalid agent.clarify_on_timeout value %r; defaulting to 'abort'",
+        raw,
+    )
+    return "abort"
+
+
+def get_clarify_on_timeout(override: Optional[str] = None) -> str:
+    """Read the effective clarify timeout policy from config.
+
+    The explicit per-call override is validated even when config loading fails.
+    A config read failure falls back to ``"proceed"`` so existing installs keep
+    their current behavior.
+    """
+    if override is not None:
+        return resolve_clarify_on_timeout({}, override=override)
+    try:
+        from hermes_cli.config import load_config
+        config = load_config() or {}
+    except Exception:
+        config = {}
+    return resolve_clarify_on_timeout(config)
+
 
 def resolve_clarify_timeout(config: dict) -> int:
     """Resolve the clarify timeout (seconds) from an already-loaded config dict.

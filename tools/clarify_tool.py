@@ -17,6 +17,11 @@ a thin dispatcher that delegates to a platform-provided callback.
 import json
 from typing import List, Optional, Callable
 
+from tools.clarify_gateway import (
+    CLARIFY_ON_TIMEOUT_VALUES,
+    get_clarify_on_timeout,
+)
+
 
 # Maximum number of predefined choices the agent can offer.
 # A 5th "Other (type your answer)" option is always appended by the UI.
@@ -26,6 +31,20 @@ MAX_CHOICES = 4
 # option the agent actually recommends. Applied here rather than per-surface so
 # CLI, TUI, desktop, and messaging adapters all render the same label.
 RECOMMENDED_LABEL = "(Recommended)"
+
+
+class ClarifyTimeoutError(TimeoutError):
+    """A fail-closed clarify prompt expired without a user response."""
+
+    def __init__(self) -> None:
+        super().__init__("No user response was received before the clarify timeout.")
+
+
+class ClarifyUnavailableError(RuntimeError):
+    """A fail-closed clarify prompt could not be presented to the user."""
+
+    def __init__(self) -> None:
+        super().__init__("The clarify prompt was not available to the user.")
 
 
 def _flatten_choice(c) -> str:
@@ -97,31 +116,55 @@ def strip_recommended(text: str) -> str:
     return stripped
 
 
-def _invoke_callback(callback, question, choices, multi_select):
-    """Invoke the platform callback, passing multi_select if supported.
+def _invoke_callback(
+    callback,
+    question,
+    choices,
+    multi_select,
+    on_timeout="proceed",
+):
+    """Invoke the platform callback, passing optional policy flags it supports.
 
     Uses signature inspection (not a ``TypeError`` retry) to decide whether
-    the callback accepts the ``multi_select`` keyword — a retry-on-TypeError
-    approach would re-invoke a *compatible* callback that raised TypeError
-    internally, potentially prompting the user twice.
+    the callback accepts the ``multi_select`` and ``on_timeout`` keywords — a
+    retry-on-TypeError approach would re-invoke a *compatible* callback that
+    raised TypeError internally, potentially prompting the user twice.
+
+    Legacy callbacks remain valid in the default ``proceed`` mode.  An
+    ``abort`` request fails closed before invoking a callback that cannot
+    enforce the policy.
     """
     import inspect
 
     accepts_multi = False
+    accepts_on_timeout = False
     try:
         sig = inspect.signature(callback)
         params = sig.parameters
-        accepts_multi = "multi_select" in params or any(
+        accepts_kwargs = any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        accepts_multi = "multi_select" in params or accepts_kwargs
+        on_timeout_param = params.get("on_timeout")
+        accepts_on_timeout = on_timeout_param is not None and on_timeout_param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
         )
     except (TypeError, ValueError):
         # Builtins / C callables without introspectable signatures:
         # be conservative and use the legacy 2-arg form.
         accepts_multi = False
+        accepts_on_timeout = False
 
+    if on_timeout == "abort" and not accepts_on_timeout:
+        raise ClarifyUnavailableError()
+
+    callback_kwargs = {}
     if accepts_multi:
-        return callback(question, choices, multi_select=multi_select)
-    return callback(question, choices)
+        callback_kwargs["multi_select"] = multi_select
+    if accepts_on_timeout:
+        callback_kwargs["on_timeout"] = on_timeout
+    return callback(question, choices, **callback_kwargs)
 
 
 def _parse_multi_select_response(raw_response) -> List[str]:
@@ -155,6 +198,7 @@ def clarify_tool(
     choices: Optional[List[str]] = None,
     multi_select: bool = False,
     callback: Optional[Callable] = None,
+    on_timeout: Optional[str] = None,
 ) -> str:
     """
     Ask the user a question, optionally with multiple-choice options.
@@ -167,11 +211,15 @@ def clarify_tool(
                       (checkboxes).  The ``user_response`` in the output JSON
                       will be a list of strings instead of a single string.
                       Has no effect when ``choices`` is omitted.
+        on_timeout:   ``"proceed"`` preserves the historical timeout sentinel;
+                      ``"abort"`` returns an error that explicitly denies
+                      approval.  When omitted, uses
+                      ``agent.clarify_on_timeout`` (default ``"proceed"``).
         callback:     Platform-provided function that handles the actual UI
                       interaction.  Signature:
-                      ``callback(question, choices, multi_select=False) -> str``.
-                      The optional ``multi_select`` keyword is passed so the
-                      platform can render checkboxes instead of radio buttons.
+                      ``callback(question, choices, multi_select=False,
+                      on_timeout="proceed") -> str``.  Optional keywords are
+                      passed only when the callback supports them.
                       Injected by the agent runner (cli.py / gateway).
 
     Returns:
@@ -197,8 +245,10 @@ def clarify_tool(
         if not choices:
             choices = None  # empty list → open-ended
 
-    if callback is None:
-        return tool_error("Clarify tool is not available in this execution context.")
+    try:
+        effective_on_timeout = get_clarify_on_timeout(on_timeout)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     # The first choice is the agent's pick (the schema says order best-first),
     # so it reaches every surface carrying the "(Recommended)" label. The bare
@@ -208,7 +258,35 @@ def clarify_tool(
         choices = mark_recommended(choices)
 
     try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
+        if callback is None:
+            if effective_on_timeout == "abort":
+                raise ClarifyUnavailableError()
+            return tool_error("Clarify tool is not available in this execution context.")
+        raw_response = _invoke_callback(
+            callback,
+            question,
+            choices,
+            multi_select,
+            effective_on_timeout,
+        )
+    except ClarifyTimeoutError:
+        return tool_error(
+            "Clarify timed out without a user response. Approval was not "
+            "granted; do not proceed with the gated action.",
+            error_type="clarify_timeout",
+            approved=False,
+            timed_out=True,
+            on_timeout=effective_on_timeout,
+        )
+    except ClarifyUnavailableError:
+        return tool_error(
+            "Clarify could not present the question to the user. Approval was "
+            "not granted; do not proceed with the gated action.",
+            error_type="clarify_unavailable",
+            approved=False,
+            timed_out=False,
+            on_timeout=effective_on_timeout,
+        )
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
 
@@ -256,6 +334,13 @@ CLARIFY_SCHEMA = {
         "- You want post-task feedback ('How did that work out?')\n"
         "- You want to offer to save a skill or update memory\n"
         "- A decision has meaningful trade-offs the user should weigh in on\n\n"
+        "For a consequential action where the answer is an approval gate, set "
+        "on_timeout='abort'. If the user does not answer before the configured "
+        "timeout, or the prompt cannot be presented, the tool returns an error "
+        "meaning approval was NOT granted; do not proceed with the gated "
+        "action. Omit on_timeout to use the "
+        "configured default; set on_timeout='proceed' explicitly when a "
+        "low-stakes question should override a fail-closed fleet default.\n\n"
         "Do NOT use this tool for simple yes/no confirmation of dangerous "
         "commands (the terminal tool handles that). Prefer making a reasonable "
         "default choice yourself when the decision is low-stakes."
@@ -296,6 +381,17 @@ CLARIFY_SCHEMA = {
                     "Has no effect when choices is omitted (open-ended question)."
                 ),
             },
+            "on_timeout": {
+                "type": "string",
+                "enum": list(CLARIFY_ON_TIMEOUT_VALUES),
+                "description": (
+                    "What to do if the user does not respond before the clarify "
+                    "timeout. 'proceed' returns the current timeout sentinel so "
+                    "you can adapt. 'abort' returns an error with approved=false; "
+                    "treat it as not approved and do not perform the gated action. "
+                    "Omit to use agent.clarify_on_timeout (default: 'proceed')."
+                ),
+            },
         },
         "required": ["question"],
     },
@@ -313,7 +409,9 @@ registry.register(
         question=args.get("question", ""),
         choices=args.get("choices"),
         multi_select=args.get("multi_select", False),
-        callback=kw.get("callback")),
+        callback=kw.get("callback"),
+        on_timeout=args.get("on_timeout"),
+    ),
     check_fn=check_clarify_requirements,
     emoji="❓",
 )

@@ -3469,7 +3469,13 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> str:
+def _block(
+    event: str,
+    sid: str,
+    payload: dict,
+    timeout: float | None = 300,
+    timeout_error: Exception | None = None,
+) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
@@ -3499,7 +3505,8 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
     # slow renderer (or a reconnect that dropped tool.complete) can still answer
     # afterward. Without this the late `*.respond` would hit the generic 4009
     # "no pending request" error and clients would surface a raw JSON-RPC string.
-    if not answered and not answer_present and event in {
+    timed_out = not answered and not answer_present
+    if timed_out and event in {
         "secret.request",
         "sudo.request",
         "clarify.request",
@@ -3513,6 +3520,8 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
             sid,
             {"request_id": rid},
         )
+    if timed_out and timeout_error is not None:
+        raise timeout_error
     return answer
 
 
@@ -6134,6 +6143,31 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
 
 
 def _agent_cbs(sid: str) -> dict:
+    def _clarify_callback(
+        question,
+        choices,
+        multi_select=False,
+        on_timeout="proceed",
+    ):
+        from tools.clarify_tool import ClarifyTimeoutError
+
+        payload = {"question": question, "choices": choices}
+        # multi_select is a pass-through hint: renderers with checkbox support
+        # can honor it; older renderers ignore the extra field and stay
+        # single-select. Only emit it when true so the default payload keeps
+        # the exact pre-multi-select shape.
+        if multi_select:
+            payload["multi_select"] = True
+        return _block(
+            "clarify.request",
+            sid,
+            payload,
+            timeout=_clarify_timeout_seconds(),
+            timeout_error=(
+                ClarifyTimeoutError() if on_timeout == "abort" else None
+            ),
+        )
+
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
             sid, tc_id, name, args
@@ -6176,21 +6210,7 @@ def _agent_cbs(sid: str) -> dict:
         "notice_clear_callback": lambda key: _emit(
             "notification.clear", sid, {"key": key}
         ),
-        "clarify_callback": lambda q, c, multi_select=False: _block(
-            "clarify.request",
-            sid,
-            # multi_select is a pass-through hint: renderers with checkbox
-            # support can honor it; older renderers ignore the extra field
-            # and stay single-select (a single answer still parses as a
-            # one-element list on the tool side). Only emitted when True so
-            # single-select payloads keep the exact pre-multi-select shape.
-            (
-                {"question": q, "choices": c, "multi_select": True}
-                if multi_select
-                else {"question": q, "choices": c}
-            ),
-            timeout=_clarify_timeout_seconds(),
-        ),
+        "clarify_callback": _clarify_callback,
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
         "read_terminal_callback": lambda start=None, count=None: _block(
