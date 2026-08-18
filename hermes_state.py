@@ -3344,9 +3344,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # default install without the 'postgres' extra never loads it.
             # Read-only attaches and explicit db_path callers stay on SQLite.
             if not read_only and db_path is None:
+                # Detect whether the operator has explicitly selected the
+                # Postgres backend via an env var BEFORE attempting the import.
+                # An import-time failure (bad psycopg install, ABI mismatch,
+                # missing dep) must NOT silently degrade to SQLite when Postgres
+                # was explicitly configured — that would split history across
+                # two stores with no warning to the operator.
+                _pg_env_backend = (
+                    os.environ.get("HERMES_STATE_BACKEND") or ""
+                ).strip().lower()
+                if _pg_env_backend in ("postgresql", "pg"):
+                    _pg_env_backend = "postgres"
+                _pg_env_dsn = (
+                    os.environ.get("HERMES_STATE_DATABASE_URL")
+                    or os.environ.get("HERMES_STATE_POSTGRES_DSN")
+                    or ""
+                ).strip()
+                _pg_explicitly_selected = _pg_env_backend == "postgres" or bool(_pg_env_dsn)
                 try:
                     from hermes_state_postgres import maybe_open_postgres
-                except Exception:
+                except Exception as _pg_import_exc:
+                    if _pg_explicitly_selected:
+                        raise RuntimeError(
+                            "Postgres backend is explicitly configured "
+                            "(HERMES_STATE_BACKEND/HERMES_STATE_DATABASE_URL) "
+                            "but the hermes_state_postgres module could not be "
+                            f"imported: {_pg_import_exc}"
+                        ) from _pg_import_exc
                     maybe_open_postgres = None
                 if maybe_open_postgres is not None:
                     pg_conn = maybe_open_postgres(read_only, SCHEMA_VERSION)
