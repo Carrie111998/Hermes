@@ -77,6 +77,55 @@ except Exception:
 _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+_SLACK_SECTION_TEXT_LIMIT = 3000
+
+
+def _escape_slack_mrkdwn_text(value: Any) -> str:
+    """Escape user-authored text before embedding it in Slack mrkdwn."""
+    text = "" if value is None else str(value)
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _clarify_section_text(question: str, choices: list) -> str:
+    """Render a bounded question plus numbered choices for a Slack section.
+
+    Slack mobile truncates button labels aggressively, so the section is the
+    authoritative readable copy of every option. If pathological input would
+    exceed Slack's 3000-character limit, divide the available text budget
+    fairly across the question and choices. Short entries donate their unused
+    budget to long entries, and every numbered choice remains visible.
+    """
+    segments = [f"❓ {_escape_slack_mrkdwn_text(question)}"]
+    segments.extend(
+        f"{idx}. {_escape_slack_mrkdwn_text(choice)}"
+        for idx, choice in enumerate(choices, start=1)
+    )
+    separator_size = 2 + max(len(choices) - 1, 0)  # blank line, then list newlines
+    available = _SLACK_SECTION_TEXT_LIMIT - separator_size
+    caps = [0] * len(segments)
+    remaining = list(range(len(segments)))
+
+    while remaining:
+        share = available // len(remaining)
+        completed = [idx for idx in remaining if len(segments[idx]) <= share]
+        if not completed:
+            for offset, idx in enumerate(remaining):
+                caps[idx] = share + (1 if offset < available % len(remaining) else 0)
+            break
+        for idx in completed:
+            caps[idx] = len(segments[idx])
+            available -= caps[idx]
+        remaining = [idx for idx in remaining if idx not in completed]
+
+    def _bounded(text: str, cap: int) -> str:
+        if len(text) <= cap:
+            return text
+        if cap <= 3:
+            return text[:cap]
+        return text[: cap - 3] + "..."
+
+    fitted = [_bounded(text, caps[idx]) for idx, text in enumerate(segments)]
+    return fitted[0] + "\n\n" + "\n".join(fitted[1:])
 
 
 async def _read_error_text_limited(
@@ -7062,9 +7111,10 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Render a clarify prompt as Block Kit interactive buttons.
 
-        Multi-choice mode (``choices`` non-empty): one button per option
-        (unique ``hermes_clarify_choice_<idx>`` action_id, ``value`` packs
-        ``clarify_id|idx``) plus a final "✏️ Other…" button
+        Multi-choice mode (``choices`` non-empty): numbered option text in the
+        message body, one compact index button per option (unique
+        ``hermes_clarify_choice_<idx>`` action_id, ``value`` packs
+        ``clarify_id|idx``), plus a final "✏️ Other…" button
         (``hermes_clarify_other``).  A choice click resolves the clarify
         primitive directly; the "Other" button flips the entry into
         text-capture mode so the gateway's platform-agnostic text-intercept
@@ -7096,27 +7146,20 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             thread_ts = self._resolve_thread_ts(None, metadata)
 
-            # Escape the Slack mrkdwn control chars (&, <, >) so a question
-            # containing them renders literally instead of as markup/mentions.
-            # Section text caps at 3000 chars — budget the question so the
-            # wrapper never pushes the block over the limit (overflow →
-            # invalid_blocks → no buttons).
-            q = (question or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            body = f"❓ {q}"
-            budget = 3000 - len("...")
-            if len(body) > budget:
-                body = body[:budget] + "..."
+            # Slack mobile truncates long button labels before their essential
+            # text becomes visible. Keep the full numbered choices in the
+            # section and make the buttons compact index selectors instead.
+            body = _clarify_section_text(question, choices)
 
             # One button per choice + a free-text "Other" button.  Slack caps
             # an actions block at 5 elements; the clarify tool caps choices at
             # 4 (+ Other = 5) so this is normally one block, but chunk anyway
             # so a larger choice list degrades gracefully instead of 400ing.
             elements = []
-            for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
+            for idx in range(len(choices)):
                 elements.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": str(idx + 1)},
                     "action_id": f"hermes_clarify_choice_{idx}",
                     "value": f"{clarify_id}|{idx}",
                 })

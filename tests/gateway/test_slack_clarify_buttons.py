@@ -124,7 +124,11 @@ class TestSlackSendClarify:
         assert elements[0]["value"] == "cid1|0"
         assert elements[1]["action_id"] == "hermes_clarify_choice_1"
         assert elements[1]["value"] == "cid1|1"
-        assert elements[0]["text"]["text"] == "staging"
+        assert blocks[0]["text"]["text"] == (
+            "❓ Which environment?\n\n1. staging\n2. production"
+        )
+        assert elements[0]["text"]["text"] == "1"
+        assert elements[1]["text"]["text"] == "2"
         # Final button is the free-text "Other"
         assert elements[2]["action_id"] == "hermes_clarify_other"
         assert elements[2]["value"] == "cid1|other"
@@ -143,7 +147,7 @@ class TestSlackSendClarify:
         await adapter.send_clarify(
             chat_id="C1",
             question="Use <A> & <B>?",
-            choices=["yes"],
+            choices=["Use <prod> & wait"],
             clarify_id="cid2",
             session_key="sk2",
         )
@@ -151,6 +155,56 @@ class TestSlackSendClarify:
         assert "<A>" not in section_text
         assert "&lt;A&gt;" in section_text
         assert "&amp;" in section_text
+        assert "1. Use &lt;prod&gt; &amp; wait" in section_text
+
+    @pytest.mark.asyncio
+    async def test_long_mobile_choices_are_readable_in_numbered_body(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.2"})
+        choices = [
+            "Deploy the shared prefix to staging after the smoke test completes",
+            "Deploy the shared prefix to production after approval is recorded",
+        ]
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="Which deployment path?",
+            choices=choices,
+            clarify_id="cid-mobile",
+            session_key="sk-mobile",
+        )
+
+        blocks = mock_client.chat_postMessage.call_args[1]["blocks"]
+        section_text = blocks[0]["text"]["text"]
+        assert f"1. {choices[0]}" in section_text
+        assert f"2. {choices[1]}" in section_text
+        buttons = [element for block in blocks[1:] for element in block["elements"]]
+        assert [button["text"]["text"] for button in buttons] == ["1", "2", "✏️ Other…"]
+        assert [button["value"] for button in buttons] == [
+            "cid-mobile|0",
+            "cid-mobile|1",
+            "cid-mobile|other",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_oversized_prompt_keeps_every_choice_within_section_limit(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.3"})
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="q" * 4000,
+            choices=[f"choice-{idx}-" + ("x" * 4000) for idx in range(1, 5)],
+            clarify_id="cid-limit",
+            session_key="sk-limit",
+        )
+
+        section_text = mock_client.chat_postMessage.call_args[1]["blocks"][0]["text"]["text"]
+        assert len(section_text) <= 3000
+        for idx in range(1, 5):
+            assert f"{idx}. choice-{idx}-" in section_text
 
 
 # ===========================================================================
