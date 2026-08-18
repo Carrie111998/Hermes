@@ -6694,8 +6694,15 @@ class SlackAdapter(BasePlatformAdapter):
         # normal messages. Commands are restored from canonical authored
         # input only: the gateway parser requires the command token at
         # character zero, and enrichment must never mutate a command's
-        # arguments.
+        # arguments. Trailing composer padding (newlines/spaces from Slack's
+        # WYSIWYG thread composer) is normalized on bare commands while
+        # preserving argument whitespace on parameterized commands.
         if is_command_text:
+            cmd_tokens = command_probe_text.strip().split(maxsplit=1)
+            if len(cmd_tokens) == 1:
+                command_probe_text = command_probe_text.strip()
+            else:
+                command_probe_text = command_probe_text.rstrip("\r\n")
             text = command_probe_text
             msg_type = MessageType.COMMAND
 
