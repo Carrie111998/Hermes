@@ -462,6 +462,36 @@ def _health_response_is_authenticated(data: Any, token: str, challenge: str) -> 
     )
 
 
+async def _request_authenticated_bridge_health(
+    session: Any,
+    base_url: str,
+    token: str,
+    timeout: Any,
+) -> Optional[Dict[str, Any]]:
+    """Authenticate a bridge before sending it the bearer credential."""
+    challenge = secrets.token_urlsafe(24)
+    async with session.get(
+        f"{base_url}/auth-proof",
+        headers={"X-Hermes-Bridge-Challenge": challenge},
+        timeout=timeout,
+    ) as resp:
+        if resp.status != 200:
+            return None
+        proof_data = await resp.json()
+    if not _health_response_is_authenticated(proof_data, token, challenge):
+        return None
+
+    async with session.get(
+        f"{base_url}/health",
+        headers=_bridge_auth_headers(token),
+        timeout=timeout,
+    ) as resp:
+        if resp.status != 200:
+            return None
+        data = await resp.json()
+    return data if isinstance(data, dict) else None
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -727,57 +757,50 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             import aiohttp
             try:
                 async with aiohttp.ClientSession() as session:
-                    challenge = secrets.token_urlsafe(24)
-                    async with session.get(
-                        f"http://127.0.0.1:{self._bridge_port}/health",
-                        headers=_bridge_auth_headers(self._bridge_token, challenge),
-                        timeout=aiohttp.ClientTimeout(total=2)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if not _health_response_is_authenticated(
-                                data, self._bridge_token, challenge
+                    data = await _request_authenticated_bridge_health(
+                        session,
+                        f"http://127.0.0.1:{self._bridge_port}",
+                        self._bridge_token,
+                        aiohttp.ClientTimeout(total=2),
+                    )
+                    if data is not None:
+                        bridge_status = data.get("status", "unknown")
+                        if bridge_status == "connected":
+                            # Staleness handshake: only reuse a running
+                            # bridge if it is serving the same bridge.js
+                            # that is on disk right now.  A long-lived
+                            # bridge survives gateway restarts AND
+                            # `hermes update`, so without this check it
+                            # keeps serving pre-update code forever
+                            # (e.g. no inbound media download).  Old
+                            # bridges that don't report scriptHash are
+                            # treated as stale by definition.
+                            running_hash = data.get("scriptHash", "")
+                            disk_hash = _bridge_source_hash(bridge_path)
+                            running_read_receipts = bool(data.get("sendReadReceipts", False))
+                            config_matches = running_read_receipts == self._send_read_receipts
+                            if (
+                                running_hash
+                                and disk_hash
+                                and running_hash == disk_hash
+                                and config_matches
                             ):
-                                raise PermissionError(
-                                    "existing WhatsApp bridge failed authentication"
+                                print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
+                                self._mark_connected()
+                                self._bridge_process = None  # Not managed by us
+                                self._http_session = aiohttp.ClientSession(
+                                    headers=_bridge_auth_headers(self._bridge_token)
                                 )
-                            bridge_status = data.get("status", "unknown")
-                            if bridge_status == "connected":
-                                # Staleness handshake: only reuse a running
-                                # bridge if it is serving the same bridge.js
-                                # that is on disk right now.  A long-lived
-                                # bridge survives gateway restarts AND
-                                # `hermes update`, so without this check it
-                                # keeps serving pre-update code forever
-                                # (e.g. no inbound media download).  Old
-                                # bridges that don't report scriptHash are
-                                # treated as stale by definition.
-                                running_hash = data.get("scriptHash", "")
-                                disk_hash = _bridge_source_hash(bridge_path)
-                                running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
-                                if (
-                                    running_hash
-                                    and disk_hash
-                                    and running_hash == disk_hash
-                                    and config_matches
-                                ):
-                                    print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
-                                    self._mark_connected()
-                                    self._bridge_process = None  # Not managed by us
-                                    self._http_session = aiohttp.ClientSession(
-                                        headers=_bridge_auth_headers(self._bridge_token)
-                                    )
-                                    self._poll_task = asyncio.create_task(self._poll_messages())
-                                    return True
-                                stale_reason = (
-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
-                                    if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
-                                )
-                                print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
-                            else:
-                                print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
+                                self._poll_task = asyncio.create_task(self._poll_messages())
+                                return True
+                            stale_reason = (
+                                f"running={running_hash or 'unversioned'}, disk={disk_hash}"
+                                if running_hash != disk_hash
+                                else "send_read_receipts config changed"
+                            )
+                            print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
+                        else:
+                            print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
             except Exception:
                 pass  # Bridge not running, start a new one
             
@@ -872,22 +895,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     return False
                 try:
                     async with aiohttp.ClientSession() as session:
-                        challenge = secrets.token_urlsafe(24)
-                        async with session.get(
-                            f"http://127.0.0.1:{self._bridge_port}/health",
-                            headers=_bridge_auth_headers(self._bridge_token, challenge),
-                            timeout=aiohttp.ClientTimeout(total=2)
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if not _health_response_is_authenticated(
-                                    data, self._bridge_token, challenge
-                                ):
-                                    continue
-                                http_ready = True
-                                if data.get("status") == "connected":
-                                    print(f"[{self.name}] Bridge ready (status: connected)")
-                                    break
+                        authenticated_data = await _request_authenticated_bridge_health(
+                            session,
+                            f"http://127.0.0.1:{self._bridge_port}",
+                            self._bridge_token,
+                            aiohttp.ClientTimeout(total=2),
+                        )
+                        if authenticated_data is None:
+                            continue
+                        data = authenticated_data
+                        http_ready = True
+                        if data.get("status") == "connected":
+                            print(f"[{self.name}] Bridge ready (status: connected)")
+                            break
                 except Exception:
                     continue
 
@@ -910,21 +930,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         return False
                     try:
                         async with aiohttp.ClientSession() as session:
-                            challenge = secrets.token_urlsafe(24)
-                            async with session.get(
-                                f"http://127.0.0.1:{self._bridge_port}/health",
-                                headers=_bridge_auth_headers(self._bridge_token, challenge),
-                                timeout=aiohttp.ClientTimeout(total=2)
-                            ) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    if not _health_response_is_authenticated(
-                                        data, self._bridge_token, challenge
-                                    ):
-                                        continue
-                                    if data.get("status") == "connected":
-                                        print(f"[{self.name}] Bridge ready (status: connected)")
-                                        break
+                            authenticated_data = await _request_authenticated_bridge_health(
+                                session,
+                                f"http://127.0.0.1:{self._bridge_port}",
+                                self._bridge_token,
+                                aiohttp.ClientTimeout(total=2),
+                            )
+                            if authenticated_data is None:
+                                continue
+                            data = authenticated_data
+                            if data.get("status") == "connected":
+                                print(f"[{self.name}] Bridge ready (status: connected)")
+                                break
                     except Exception:
                         continue
                 else:

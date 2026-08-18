@@ -819,6 +819,16 @@ app.use((req, res, next) => {
   next();
 });
 
+// Prove that an existing listener already knows the session secret before the
+// Python adapter sends that listener any bearer-authenticated request.
+app.get('/auth-proof', (req, res) => {
+  const challenge = req.headers['x-hermes-bridge-challenge'];
+  if (typeof challenge !== 'string' || !challenge) {
+    return res.status(400).json({ error: 'Missing bridge challenge' });
+  }
+  res.json({ authProof: bridgeAuthProof(BRIDGE_TOKEN, challenge) });
+});
+
 // Loopback binding does not establish the caller's identity: another local
 // process can bind the configured port or call this API directly.
 app.use(createBridgeAuthMiddleware(BRIDGE_TOKEN));
@@ -1115,18 +1125,13 @@ app.get('/chat/:id', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => {
-  const challenge = req.headers['x-hermes-bridge-challenge'];
-  if (typeof challenge !== 'string' || !challenge) {
-    return res.status(400).json({ error: 'Missing bridge challenge' });
-  }
+app.get('/health', (_req, res) => {
   res.json({
     status: connectionState,
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
-    authProof: bridgeAuthProof(BRIDGE_TOKEN, challenge),
   });
 });
 
