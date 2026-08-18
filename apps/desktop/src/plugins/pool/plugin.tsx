@@ -245,16 +245,25 @@ function PoolPane() {
 
 function PoolChip() {
   const activeName = useValue($activeName)
-  const count = useValue($connections).length
+  const connections = useValue($connections)
+  const count = connections.length
+  const activeConn = connections.find((c: { active?: boolean }) => c.active)
+  const status = activeConn?.status || 'unknown'
+  const dotColor =
+    status === 'online'
+      ? 'bg-green-500'
+      : status === 'offline'
+        ? 'bg-red-500'
+        : 'bg-yellow-500'
 
   return (
-    <Tip label={`${count} connection(s) configured`}>
+    <Tip label={`${count} connection(s) configured · active: ${activeName || 'none'} (${status})`}>
       <button
         type="button"
         className="inline-flex h-full items-center gap-1 rounded-none px-1.5 text-[0.6875rem] tabular-nums transition-colors text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
         onClick={() => refreshConnections()}
       >
-        <span className="h-2 w-2 rounded-full bg-green-500" />
+        <span className={`h-2 w-2 rounded-full ${dotColor}`} />
         {activeName || 'no active'}
       </button>
     </Tip>

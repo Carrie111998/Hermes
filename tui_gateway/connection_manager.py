@@ -2,8 +2,9 @@
 Connection manager for the TUI multi-connection feature.
 
 Manages multiple named connections to hermes serve backends.
-Maintains a single active connection at a time; switching tears down
-the current backend session and dials the new one.
+Maintains a single active connection at a time; switching updates
+the persisted active connection/URL. Reconnection is the caller's
+responsibility (the TUI gateway is single-backend at any instant).
 """
 
 from __future__ import annotations
@@ -82,13 +83,19 @@ class ConnectionManager:
         return None
 
     def add(
-        self, name: str, url: str, mode: str = "remote", auth: str = "tailscale", token: Optional[str] = None
+        self, name: str, url: str, mode: str = "remote", auth: Optional[str] = None, token: Optional[str] = None
     ) -> tuple[bool, str]:
         """
         Add a new connection. Returns (success, message).
         Does NOT switch to it (call switch() separately).
+        
+        Auth is auto-detected: if a token is provided, auth defaults to "token".
+        If auth is "tailscale" (or unset and no token), Tailscale identity is used.
         """
         with self._lock:
+            # Auto-detect auth: token present means token auth
+            if auth is None:
+                auth = "token" if token else "tailscale"
             conn = ConnectionConfig(name=name, url=url, mode=mode, auth=auth, token=token)
             if add_connection(self._connections, conn):
                 self._notify_listeners()
@@ -158,6 +165,8 @@ class ConnectionManager:
     def discover_tailscale(self) -> tuple[int, str]:
         """
         Scan tailscale for hermes instances.
+        Uses proper Tailscale Serve FQDN (hostname.tailnet.ts.net) rather than
+        assuming https://hostname works.
         Returns (count, message).
         """
         try:
@@ -172,6 +181,8 @@ class ConnectionManager:
 
             status = json.loads(result.stdout)
             peers = status.get("Peer", {})
+            # Get the tailnet DNS suffix (e.g., "tailnet-xxxx.ts.net")
+            magic_dns = status.get("MagicDNSSuffix", "")
             added = 0
 
             for peer_id, peer in peers.items():
@@ -180,16 +191,34 @@ class ConnectionManager:
                 if not tailscale_ip:
                     continue
 
-                # Check if this peer has a hermes serve port open
-                # Tailscale Serve typically exposes on 443 or a high port
-                url = f"https://{hostname}" if hostname else f"https://{tailscale_ip}"
+                # Build the proper Tailscale Serve FQDN
+                # Tailscale Serve uses: hostname.tailnet-name.ts.net
+                if hostname and magic_dns:
+                    fqdn = f"{hostname}.{magic_dns}"
+                    url = f"https://{fqdn}"
+                elif hostname:
+                    # Fallback if MagicDNSSuffix not available
+                    url = f"https://{hostname}"
+                else:
+                    # Last resort: direct IP (won't work for HTTPS Serve but may work for HTTP)
+                    url = f"http://{tailscale_ip}"
 
                 conn_name = f"ts-{hostname}" if hostname else f"ts-{tailscale_ip.replace('.', '-')}"
                 if self.get_connection(conn_name):
                     continue
 
-                # Quick check if port 443 is responding
+                # Quick probe: try HTTPS first, then HTTP on common ports
                 ok, _msg = self._quick_probe(url)
+                if not ok and tailscale_ip:
+                    # Try HTTP on port 8080 as fallback (common hermes serve port)
+                    ok, _msg = self._quick_probe(f"http://{tailscale_ip}:8080")
+                    if ok:
+                        url = f"http://{tailscale_ip}:8080"
+                if not ok and tailscale_ip:
+                    # Try HTTP on port 3000
+                    ok, _msg = self._quick_probe(f"http://{tailscale_ip}:3000")
+                    if ok:
+                        url = f"http://{tailscale_ip}:3000"
                 if ok:
                     self.add(conn_name, url, mode="remote", auth="tailscale")
                     added += 1
