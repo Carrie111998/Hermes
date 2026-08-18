@@ -66,23 +66,41 @@ def test_seeds_from_hermes_home_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text(f"{YELP_KEY}={YELP_VALUE}\n{OPQ_KEY}={OPQ_VALUE}\n")
     ct.reset_cache()
-    values = ct.known_secret_values()
-    assert YELP_VALUE in values
-    assert OPQ_VALUE in values
+    assert ct.is_value_seeded(YELP_VALUE)
+    assert ct.is_value_seeded(OPQ_VALUE)
 
 
 def test_seeds_from_environment_with_no_file_present(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv(OPQ_KEY, OPQ_VALUE)
     ct.reset_cache()
-    assert OPQ_VALUE in ct.known_secret_values()
+    assert ct.is_value_seeded(OPQ_VALUE)
 
 
-def test_ignores_non_secret_variable_names(tmp_path, monkeypatch):
+def test_seeds_every_value_in_a_credential_file_whatever_the_key_is_called(
+    tmp_path, monkeypatch
+):
+    """A .env is a credential store: the key name carries no information.
+
+    Found by the PARTNER_HANDSHAKE_VALUE canary. The first implementation
+    filtered on the key name everywhere, so a real credential under an
+    unremarkable key was never seeded and never scrubbed.
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / ".env").write_text(f"PROJECT_NAME={OPQ_VALUE}\n")
+    (tmp_path / ".env").write_text(f"PARTNER_HANDSHAKE_VALUE={OPQ_VALUE}\n")
     ct.reset_cache()
-    assert OPQ_VALUE not in ct.known_secret_values()
+    assert ct.is_value_seeded(OPQ_VALUE)
+
+
+def test_key_name_filter_still_applies_to_general_purpose_files(tmp_path, monkeypatch):
+    """A shell rc is NOT a credential store: most of it is PATH and EDITOR,
+    so there the key name is the only available signal."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ct.reset_cache()
+    assert ct._parse_env_values("EDITOR=/usr/bin/vim\nFOO_API_KEY=abc\n") == ["abc"]
+    assert ct._parse_env_values(
+        "EDITOR=/usr/bin/vim\n", all_values=True
+    ) == ["/usr/bin/vim"]
 
 
 def test_cache_invalidates_when_the_file_changes(tmp_path, monkeypatch):
@@ -90,11 +108,11 @@ def test_cache_invalidates_when_the_file_changes(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text(f"{OPQ_KEY}={OPQ_VALUE}\n")
     ct.reset_cache()
-    assert OPQ_VALUE in ct.known_secret_values()
+    assert ct.is_value_seeded(OPQ_VALUE)
 
     rotated = "Nw3Xy8Qr5Vb2Mj7Kt4Pd1Zl6Hf0Cg9S"
     env.write_text(f"{OPQ_KEY}={rotated}\n")
-    assert rotated in ct.known_secret_values()
+    assert ct.is_value_seeded(rotated)
 
 
 # --- scrubbing ---------------------------------------------------------------

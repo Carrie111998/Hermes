@@ -117,7 +117,25 @@ def is_scrubbable_secret_value(value: str) -> bool:
     return True
 
 
-def _parse_env_values(text: str) -> list[str]:
+def _parse_env_values(text: str, *, all_values: bool = False) -> list[str]:
+    """Extract candidate secret values from KEY=VALUE text.
+
+    *all_values* controls the key-name filter, and the distinction matters:
+
+      all_values=True   the source file is ITSELF a credential store (a .env,
+                        ~/.aws/credentials, ...). Every value in it is a
+                        secret by virtue of where it lives, whatever the key
+                        is called. A key named PARTNER_HANDSHAKE_VALUE holds
+                        just as real a credential as one named API_KEY, and
+                        filtering on the name would silently miss it.
+
+      all_values=False  the source is a general-purpose file (a shell rc) or
+                        the process environment, where the overwhelming
+                        majority of entries are innocuous (PATH, LANG, EDITOR).
+                        Here the key name is the only signal available, so
+                        seeding indiscriminately would flood the seed set with
+                        ordinary strings.
+    """
     out = []
     for line in text.splitlines():
         line = line.strip()
@@ -126,13 +144,14 @@ def _parse_env_values(text: str) -> list[str]:
         if line.startswith("export "):
             line = line[len("export "):].strip()
         name, _, value = line.partition("=")
-        if not _SECRET_NAME_RE.search(name.strip()):
+        if not all_values and not _SECRET_NAME_RE.search(name.strip()):
             continue
         out.append(value.strip().strip("\"'"))
     return out
 
 
 def _seed_paths() -> list[Path]:
+    """Every path to seed from, credential-store and general-purpose alike."""
     from agent.file_safety import (
         build_credential_denied_paths,
         build_credential_denied_prefixes,
@@ -196,6 +215,8 @@ def _generation_key() -> tuple:
 def _build_values() -> frozenset:
     values: set[str] = set()
 
+    from agent.file_safety import is_credential_read_denied
+
     for path in _seed_paths():
         try:
             if not path.is_file() or path.stat().st_size > MAX_SEED_FILE_BYTES:
@@ -203,7 +224,10 @@ def _build_values() -> frozenset:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue  # best-effort: seeding is fail-open, scanning is not
-        for value in _parse_env_values(text):
+        # A file layer 1 already classifies as credential-bearing is a
+        # credential store: take every value, not just secret-looking keys.
+        all_values = is_credential_read_denied(str(path))
+        for value in _parse_env_values(text, all_values=all_values):
             if is_scrubbable_secret_value(value):
                 values.add(value)
 
@@ -239,10 +263,25 @@ def _refresh() -> None:
     )
 
 
-def known_secret_values() -> frozenset:
-    """Return the current seed set (never logged, never returned to a model)."""
+def known_secret_count() -> int:
+    """Return how many values are seeded. Safe to log and to assert on."""
     _refresh()
-    return _cache_values
+    return len(_cache_values)
+
+
+def is_value_seeded(value: str) -> bool:
+    """Return whether a SPECIFIC value is in the seed set.
+
+    This is the only supported way to interrogate seeding. There is
+    deliberately no accessor that returns the seed set itself: any such
+    function puts every credential on the machine one `print()`, one log
+    line, or one failed test assertion away from disclosure. That is not
+    hypothetical -- an assertion against a set-returning accessor is exactly
+    how real credentials were first leaked into an agent transcript during
+    this packet's own development.
+    """
+    _refresh()
+    return value in _cache_values
 
 
 def scrub_known_secrets(text: str) -> tuple[str, int]:
