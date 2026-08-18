@@ -2862,7 +2862,9 @@ class GatewaySlashCommandsMixin:
             session_id = await self.async_session_store.peek_session_id(session_key)
             if not session_id:
                 return [], None
-            history = await self.async_session_store.load_transcript(session_id)
+            history = await self.async_session_store.load_transcript(
+                session_id, raise_on_error=True
+            )
         except Exception:
             logger.debug(
                 "failed to load persisted /refine transcript", exc_info=True

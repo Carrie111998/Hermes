@@ -9,7 +9,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
 
 
 def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:
@@ -77,7 +77,9 @@ async def test_refine_cold_cache_with_persisted_turns_asks_to_resume():
     assert "2 persisted user/assistant messages" in result
     assert "resume" in result.lower() or "wake the session first" in result
     assert "Nothing to refine yet" not in result
-    runner.session_store.load_transcript.assert_called_once_with(entry.session_id)
+    runner.session_store.load_transcript.assert_called_once_with(
+        entry.session_id, raise_on_error=True
+    )
 
 
 @pytest.mark.asyncio
@@ -114,6 +116,22 @@ async def test_refine_cold_cache_transcript_read_failure_is_distinct():
 
     assert "Couldn't read the persisted conversation" in result
     assert "Nothing to refine yet" not in result
+
+
+def test_refine_strict_transcript_read_propagates_store_failure():
+    class _FailingDB:
+        def get_compression_tip(self, _session_id):
+            return None
+
+        def get_messages_as_conversation(self, _session_id, **_kwargs):
+            raise RuntimeError("db down")
+
+    store = object.__new__(SessionStore)
+    store._db = _FailingDB()
+    store._transcript_reroutes = {}
+
+    with pytest.raises(RuntimeError, match="db down"):
+        store.load_transcript("sess-refine-1", raise_on_error=True)
 
 
 @pytest.mark.asyncio
