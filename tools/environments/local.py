@@ -894,6 +894,45 @@ def _git_bash_aslr_help(bash: str, details: str = "") -> str:
     )
 
 
+def _reap_timed_out_probe(proc, *, is_windows: bool) -> None:
+    """Tear down a probe process that outlived its timeout, without wedging.
+
+    Git-for-Windows ``bin\\bash.exe`` is a shim that spawns
+    ``usr\\bin\\bash.exe``.  ``proc.kill()`` would kill only the shim; the
+    orphaned real bash keeps the pipe write ends open, and the follow-up
+    ``communicate()`` (required on Windows to reap the reader threads) then
+    blocks forever — wedging environment creation for the life of the
+    process.  Kill the whole tree so the pipes hit EOF and the probe fails
+    cleanly instead.
+
+    ``is_windows`` is data, not a host probe, so both arms are unit-testable
+    as input→output (see AGENTS.md "Don't fake the host OS").
+    """
+    if is_windows:
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                creationflags=windows_hide_flags(),
+            )
+        except Exception:
+            # taskkill missing or itself hung: fall through to the bounded
+            # drain — cleanup must never escape into the caller's generic
+            # handler and skip the cache write.
+            pass
+    else:
+        proc.kill()
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        # An orphaned MSYS fork child (parent bash died mid-fork) is not
+        # reachable via taskkill /T on the shim's tree and keeps the pipe
+        # write ends open.  Abandon the pipes — the reader threads are
+        # daemons — rather than wedge forever.
+        pass
+
+
 def _bash_starts(bash: str) -> bool:
     """True if *bash* can launch external MSYS programs.
 
@@ -922,30 +961,7 @@ def _bash_starts(bash: str) -> bool:
         try:
             stdout, stderr = proc.communicate(timeout=15)
         except subprocess.TimeoutExpired:
-            # Git-for-Windows ``bin\bash.exe`` is a shim that spawns
-            # ``usr\bin\bash.exe``.  ``proc.kill()`` would kill only the shim;
-            # the orphaned real bash keeps the pipe write ends open, and the
-            # follow-up ``communicate()`` (required on Windows to reap the
-            # reader threads) then blocks forever — wedging environment
-            # creation for the life of the process.  Kill the whole tree so
-            # the pipes hit EOF and the probe fails cleanly instead.
-            if _IS_WINDOWS:
-                subprocess.run(
-                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    timeout=10,
-                    creationflags=windows_hide_flags(),
-                )
-            else:
-                proc.kill()
-            try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                # An orphaned MSYS fork child (parent bash died mid-fork) is
-                # not reachable via taskkill /T on the shim's tree and keeps
-                # the pipe write ends open.  Abandon the pipes — the reader
-                # threads are daemons — rather than wedge forever.
-                pass
+            _reap_timed_out_probe(proc, is_windows=_IS_WINDOWS)
             _bash_probe_details_cache[bash] = "external-program probe timed out after 15s"
             logger.debug("bash probe timed out for %s", bash)
             _bash_starts_cache[bash] = False
