@@ -29,6 +29,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
   ConfirmDialog,
+  CopyButton,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -67,6 +68,12 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const { McpTab, ToolsetConfigPanel } = sdk
 // Keep optional exports feature-detected; test harnesses may strip the SDK namespace.
 const SkillsView = typeof sdk === 'undefined' ? undefined : sdk.SkillsView
+// TRUE only on builds whose SkillsView routes `fixedConnection` to the pinned
+// registry connection's backend. Older builds export SkillsView WITHOUT the
+// prop — rendering it for a remote-target draft there would read/write the
+// ACTIVE gateway's skills under the remote bot's name (the wrong machine),
+// so those builds keep the staged checklists for remote targets.
+const skillsViewRoutesConnections = Boolean(SkillsView && SkillsView.supportsFixedConnection)
 const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
 // Budgeted render loop (fps cap + observability pause + dormancy + teardown).
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
@@ -2897,6 +2904,26 @@ function showsHandle(name, meta, bot) {
 // In-flight creations, keyed by bot name — double-clicking a row must not
 // mint two canonical chats.
 const canonicalCreations = new Map()
+let botOpenGeneration = 0
+
+async function openStoredBotChat(name, storedId, summary) {
+  if (!storedId || typeof host.openSession !== 'function') {
+    throw new Error('This Hermes Desktop version cannot open stored sessions')
+  }
+
+  const hasAuthoritativeCount =
+    typeof summary?.message_count === 'number' && Number.isFinite(summary.message_count)
+  const expectHistory = hasAuthoritativeCount ? summary.message_count > 0 : true
+
+  await host.openSession(storedId, {
+    profile: name,
+    intent: 'main',
+    awaitHydration: true,
+    expectHistory
+  })
+
+  return storedId
+}
 
 /** Create the bot's ONE forever chat: a real session opened with a kickoff
  *  message (the gateway prunes zero-message sessions, so the chat is born
@@ -2932,7 +2959,7 @@ function createCanonicalChat(name) {
 
     if (sid && typeof host.openSession === 'function') {
       try {
-        await host.openSession(sid, { profile: name })
+        await host.openSession(sid, { profile: name, intent: 'main' })
         opened = true
       } catch {
         // The stored row may not exist until the kickoff persists it. Retry
@@ -2947,7 +2974,7 @@ function createCanonicalChat(name) {
         await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
 
         if (!opened && sid && typeof host.openSession === 'function') {
-          await host.openSession(sid, { profile: name })
+          await host.openSession(sid, { profile: name, intent: 'main' })
         }
       } catch {
         // The chat already exists. Keep the pin so the next click
@@ -2981,13 +3008,9 @@ async function openBotCanonicalChat(name, pinned, history) {
     // Grandfather: adopt the conversation the row already previews.
     const adoptId = history?.id
     if (adoptId && typeof host.openSession === 'function') {
-      try {
-        await host.openSession(adoptId, { profile: name })
-        saveBotMeta(name, { chat: adoptId })
-        return adoptId
-      } catch {
-        // Adoption raced a vanishing session — fall through to creation.
-      }
+      await openStoredBotChat(name, adoptId, history)
+      saveBotMeta(name, { chat: adoptId })
+      return adoptId
     }
     return createCanonicalChat(name)
   }
@@ -3013,27 +3036,22 @@ async function openBotCanonicalChat(name, pinned, history) {
 
   if (lookupFailed) {
     // Transient gateway state (or an older backend): the pin is innocent
-    // until proven guilty — try it as-is, and only a rejected open clears.
-    try {
-      await host.openSession(pinned, { profile: name })
-      return pinned
-    } catch {
-      saveBotMeta(name, { chat: null })
-      return createCanonicalChat(name)
-    }
+    // until proven guilty — try it as-is. A rejected open is still ambiguous:
+    // it can be the same reconnect/hydration outage that broke this lookup, so
+    // preserve the forever-chat pin and surface Retry instead of forking it.
+    return openStoredBotChat(name, pinned, history)
   }
 
   if (preferred) {
     try {
-      await host.openSession(preferred.resolved_id || preferred.id, { profile: name })
+      await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
       return pinned
     } catch (error) {
       // The precise lookup JUST confirmed this session exists, so a failed
       // open is transient (reconnect, backend restart). Clearing the pin or
       // minting a replacement here would fork the bot's forever-chat on
       // every hiccup — report and keep everything as it is.
-      host.notifyError?.(error, `Could not open ${name}'s chat — try again`)
-      return pinned
+      throw error
     }
   }
 
@@ -3041,13 +3059,9 @@ async function openBotCanonicalChat(name, pinned, history) {
   // recovery): re-anchor on the previewed session when there is one.
   const recoveryId = history?.id
   if (recoveryId && typeof host.openSession === 'function') {
-    try {
-      await host.openSession(recoveryId, { profile: name })
-      saveBotMeta(name, { chat: recoveryId })
-      return recoveryId
-    } catch {
-      // Fall through to a fresh chat.
-    }
+    await openStoredBotChat(name, recoveryId, history)
+    saveBotMeta(name, { chat: recoveryId })
+    return recoveryId
   }
   saveBotMeta(name, { chat: null })
   return createCanonicalChat(name)
@@ -3507,7 +3521,9 @@ function updateGroupChat(group, mutate) {
         stranded: room.stranded || {},
         // Source-qualified member descriptors keep the room whole when the
         // active connection changes and today's local members become remote.
-        members: Array.isArray(room.members) ? room.members : []
+        members: Array.isArray(room.members) ? room.members : [],
+        // Room picture (small data URL, same normalization as bot avatars).
+        image: room.image || null
       }
     }
 
@@ -3563,7 +3579,8 @@ async function disbandGroupChat(group, members) {
           log: room.log,
           watermarks: room.watermarks,
           sessions: room.sessions || {},
-          members: Array.isArray(room.members) ? room.members : []
+          members: Array.isArray(room.members) ? room.members : [],
+          image: room.image || null
         }
       }
     }
@@ -3584,6 +3601,96 @@ async function disbandGroupChat(group, members) {
     const meta = $botMeta.get()[member.name] || {}
     await saveBotMeta(member.name, groupMembershipPatch(meta, group, false))
   }
+}
+
+/** Set or clear a group chat's room picture (small data URL, normalized by
+ *  the same pipeline as bot avatars). Persists with the room record. */
+function setGroupChatImage(group, image) {
+  updateGroupChat(group, room => {
+    room.image = image || null
+    return room
+  })
+}
+
+/** Rename a group chat. The group's NAME is its identity everywhere — the
+ *  room-map key, each local member's ui_meta membership list, and derived
+ *  state — so a rename re-keys all of them. Member gateway sessions are kept
+ *  as-is: stored sids keep resuming, so no history is lost (only a member
+ *  whose sid is later lost falls back to a fresh "Group: <new name>" title
+ *  lookup). Returns the new name, or null when the target name is taken. */
+async function renameGroupChat(oldName, newName, members) {
+  const next = String(newName || '').trim().slice(0, 64)
+
+  if (!next || next === oldName) {
+    return oldName
+  }
+
+  // Renames are explicit user intent: reject a collision honestly instead of
+  // silently suffixing like creation does.
+  const taken = new Set(Object.keys($groupChats.get()))
+
+  for (const meta of Object.values($botMeta.get() || {})) {
+    for (const existing of botGroups(meta)) {
+      taken.add(existing)
+    }
+  }
+
+  taken.delete(oldName)
+
+  if (taken.has(next)) {
+    host.notify({ kind: 'error', message: `A group named “${next}” already exists.` })
+    return null
+  }
+
+  // Move the room record wholesale — log, watermarks, sessions, members,
+  // picture, and runtime flags all belong to the same room under its new name.
+  const all = { ...$groupChats.get() }
+  const room = all[oldName]
+
+  delete all[oldName]
+
+  if (room) {
+    all[next] = room
+  }
+
+  $groupChats.set(all)
+
+  const needs = { ...$groupNeedsYou.get() }
+
+  if (oldName in needs) {
+    needs[next] = needs[oldName]
+    delete needs[oldName]
+    $groupNeedsYou.set(needs)
+  }
+
+  // Local memberships: swap the name inside each member's canonical groups
+  // list (syncs cross-machine via ui_meta). Remote members' seating lives in
+  // the room record we just moved.
+  for (const member of members || []) {
+    if (!member?.name || member.remoteSource) {
+      continue
+    }
+
+    const meta = $botMeta.get()[member.name] || {}
+    const groups = [...new Set(botGroups(meta).map(g => (g === oldName ? next : g)))]
+
+    await saveBotMeta(member.name, { groups, group: groups[0] || null })
+  }
+
+  // Persist the re-keyed map (updateGroupChat writes the whole durable map).
+  updateGroupChat(next, r => r)
+
+  // Follow the open views to the new identity.
+  if ($groupChatWorkspace.get() === oldName) {
+    $groupChatWorkspace.set(next)
+  }
+
+  if (groupChatMainTabs.has(oldName)) {
+    closeGroupChatMainTab(oldName)
+    openGroupChat(next)
+  }
+
+  return next
 }
 
 function appendGroupChatEntry(group, from, text, thread) {
@@ -4259,6 +4366,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   }
 
   const open = async () => {
+    const generation = ++botOpenGeneration
     haptic('tap')
     $selectedBot.set(bot.name)
 
@@ -4290,14 +4398,26 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
       return
     }
 
-    try {
-      const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
+    if (generation !== botOpenGeneration) {
+      return
+    }
 
-      if (id) {
+    try {
+      const id = await openBotCanonicalChat(bot.name, pinnedChat, previewSession)
+
+      if (generation === botOpenGeneration && id) {
         return
       }
-    } catch {
-      // Fall through to the older-gateway draft below.
+    } catch (error) {
+      if (generation === botOpenGeneration) {
+        host.notifyError?.(error, `Could not open ${displayName(bot, meta)}'s chat — try again`)
+      }
+
+      return
+    }
+
+    if (generation !== botOpenGeneration) {
+      return
     }
 
     if (typeof host.newChat === 'function') {
@@ -5930,7 +6050,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
                       setTargetConnection(value === (activeConnectionId || 'local') ? '' : value)
                       // The capability catalog and clone list belong to the
                       // target backend — refetch for the new home. The live
-                      // Capabilities tab only exists for the active gateway.
+                      // Capabilities tab re-pins to it via fixedConnection on
+                      // builds that route it (staged checklists otherwise).
                       setCaps(null)
                       setCapsFailed(false)
                       setAdvTab('general')
@@ -6008,10 +6129,13 @@ function CreateAgentDialog({ open, onClose, roster }) {
                       // Newer desktops export the whole Capabilities surface —
                       // one live tab replaces the three staged checklists.
                       // The live Capabilities surface (SkillsView) binds to
-                      // the ACTIVE gateway's backend — a remote-target draft
-                      // lives elsewhere, so it keeps the staged checklists
-                      // (their catalog reads already route to the target).
-                      children: (SkillsView && !remoteTarget
+                      // the ACTIVE gateway's backend unless this build routes
+                      // fixedConnection (skillsViewRoutesConnections) — then a
+                      // remote-target draft gets the live surface pinned to
+                      // ITS machine. Builds without that routing keep the
+                      // staged checklists for remote targets (their catalog
+                      // reads already route to the target).
+                      children: (SkillsView && (!remoteTarget || skillsViewRoutesConnections)
                         ? [
                             ['general', 'General'],
                             ['capabilities', 'Capabilities']
@@ -6154,9 +6278,15 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                 style: { height: 440, minHeight: 280, resize: 'vertical', overflow: 'auto' },
                                 // The REAL core Capabilities surface (skills +
                                 // one-click hub installs + tools + MCP), pinned
-                                // to the just-created profile. Writes land
+                                // to the just-created profile — and, for a
+                                // remote-target draft, to the target machine's
+                                // backend via fixedConnection. Writes land
                                 // immediately — no staging needed.
-                                children: jsx(SkillsView, { embedded: true, fixedProfile: createdForCaps })
+                                children: jsx(SkillsView, {
+                                  embedded: true,
+                                  fixedProfile: createdForCaps,
+                                  ...(remoteTarget ? { fixedConnection: targetConnection } : {})
+                                })
                               })
                       : capsFailed
                         ? jsx('div', {
@@ -7160,14 +7290,23 @@ function useProfileSessions(botName, gatewayGeneration) {
   })
 }
 
-async function openProfileSession(botName, storedId, gatewayGeneration) {
+async function openProfileSession(botName, session, gatewayGeneration) {
   const profile = String(botName || '')
-  const id = String(storedId || '')
+  const id = String(session?.id || '')
   if (!NAME_RE.test(profile) || !id || gatewayGeneration !== $sessionsGatewayGeneration.get()) return
   if (typeof host.openSession !== 'function') {
     throw new Error('This Hermes Desktop version cannot open stored sessions')
   }
-  await host.openSession(id, { profile })
+
+  // Same hydration contract as canonical Bot Chats (#89206): a bare open can
+  // focus a main surface whose runtime/transcript silently vanished, leaving a
+  // blank pane while the row preview still shows the conversation. Waiting on
+  // hydration lets the SDK issue the explicit resume when the surface is stale.
+  const hasAuthoritativeCount =
+    typeof session?.message_count === 'number' && Number.isFinite(session.message_count)
+  const expectHistory = hasAuthoritativeCount ? session.message_count > 0 : Boolean(session?.preview)
+
+  await host.openSession(id, { profile, awaitHydration: true, expectHistory })
   if (gatewayGeneration !== $sessionsGatewayGeneration.get()) return
   $botSelectedSessions.set({ ...$botSelectedSessions.get(), [profile]: id })
 }
@@ -7176,7 +7315,7 @@ function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
   return jsxs('button', {
     type: 'button',
     'aria-current': active ? 'page' : undefined,
-    onClick: () => void openProfileSession(botName, session.id, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
+    onClick: () => void openProfileSession(botName, session, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
     className: cn(
       'flex w-full flex-col gap-0.5 overflow-hidden rounded-md px-2 py-1.5 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
@@ -7429,6 +7568,171 @@ function GroupDialog({ bot, onClose }) {
   })
 }
 
+/** Compact picture controls shared by group-chat creation and settings:
+ *  a live preview (image, else the organization glyph), Upload / Generate /
+ *  Remove. Reuses the bot-avatar pipeline (device picker, 256px normalize,
+ *  image.generate probe) so room pictures cost the same as bot avatars. */
+function GroupImageControls({ image, onImage, seedName, seedMembers }) {
+  const imagen = useValue($imagenAvailable)
+  const [busy, setBusy] = useState(false)
+
+  if (imagen === null) {
+    void probeImagen()
+  }
+
+  const upload = async () => {
+    const raw = await pickImageFromDevice()
+
+    if (raw) {
+      onImage(await normalizeAvatarImage(raw))
+    }
+  }
+
+  const generate = async () => {
+    if (busy) {
+      return
+    }
+
+    setBusy(true)
+
+    try {
+      const who = [seedName, seedMembers?.length ? `a team of ${seedMembers.join(', ')}` : '']
+        .filter(Boolean)
+        .join(' — ')
+      const res = await host.request('image.generate', {
+        prompt:
+          `Group chat icon for an AI agent team called "${who || 'a bot team'}". ` +
+          'Friendly minimal emblem, bold flat vector style, solid color background, centered, no text.',
+        aspect_ratio: 'square'
+      })
+
+      if (!res?.success) {
+        throw new Error(res?.error || 'generation failed')
+      }
+
+      const img = res.image_data || res.image
+
+      if (img) {
+        onImage(await normalizeAvatarImage(img))
+      }
+    } catch (err) {
+      host.notifyError(err, 'Group picture generation failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return jsxs('div', {
+    className: 'flex items-center gap-2',
+    children: [
+      jsx('div', {
+        className:
+          'flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-(--chrome-action-hover)',
+        children: image
+          ? jsx('img', { src: image, alt: '', className: 'size-full object-cover' })
+          : jsx(Codicon, { name: 'organization', className: 'text-(--ui-text-tertiary)' })
+      }),
+      jsx(Button, { type: 'button', variant: 'secondary', size: 'sm', onClick: upload, children: 'Upload' }),
+      imagen
+        ? jsx(Button, {
+            type: 'button',
+            variant: 'secondary',
+            size: 'sm',
+            disabled: busy,
+            onClick: generate,
+            children: busy ? 'Generating…' : 'Generate'
+          })
+        : null,
+      image
+        ? jsx(Button, { type: 'button', variant: 'ghost', size: 'sm', onClick: () => onImage(null), children: 'Remove' })
+        : null
+    ]
+  })
+}
+
+/** Edit an existing group chat's name and picture. Renames re-key the room
+ *  and every local member's membership (renameGroupChat); the picture rides
+ *  the room record. Both apply on Save so a cancelled dialog changes nothing. */
+function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
+  const rooms = useValue($groupChats)
+  const current = (rooms[group] || {}).image || null
+  const [name, setName] = useState(group)
+  const [image, setImage] = useState(current)
+
+  useEffect(() => {
+    if (open) {
+      setName(group)
+      setImage(current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, group])
+
+  const save = async () => {
+    const finalName = await renameGroupChat(group, name, members)
+
+    if (finalName === null) {
+      return // collision — dialog stays open for a different name
+    }
+
+    if (image !== current) {
+      setGroupChatImage(finalName, image)
+    }
+
+    onClose()
+
+    if (finalName !== group) {
+      onRenamed?.(finalName)
+    }
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Group settings' }),
+            jsx(DialogDescription, {
+              children: 'Rename the group or set a room picture. Members and history are kept.'
+            })
+          ]
+        }),
+        jsx(GroupImageControls, {
+          image,
+          onImage: setImage,
+          seedName: name.trim() || group,
+          seedMembers: (members || []).map(b => b.name)
+        }),
+        jsx('form', {
+          onSubmit: event => {
+            event.preventDefault()
+            void save()
+          },
+          children: jsx(Input, {
+            'aria-label': 'Group name',
+            autoFocus: true,
+            maxLength: 64,
+            value: name,
+            onChange: event => setName(event.target.value)
+          })
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
+            jsx(Button, { disabled: !name.trim(), onClick: () => void save(), children: 'Save' })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 /** Discord-style group chat creation: pick 2+ bots via checkboxes (with
  *  search), name the group, create. Assignment appends to each local bot's
  *  group membership list, so the room appears in the roster and syncs
@@ -7438,6 +7742,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const [query, setQuery] = useState('')
   const [checked, setChecked] = useState({})
   const [name, setName] = useState('')
+  const [image, setImage] = useState(null)
 
   // Reset per open so a cancelled draft doesn't leak into the next one.
   useEffect(() => {
@@ -7445,6 +7750,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       setQuery('')
       setChecked({})
       setName('')
+      setImage(null)
     }
   }, [open])
 
@@ -7499,6 +7805,11 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
 
     updateGroupChat(groupName, room => {
       room.members = roomMembers
+
+      if (image) {
+        room.image = image
+      }
+
       return room
     })
 
@@ -7603,18 +7914,29 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                 })
           })
         }),
-        jsx('form', {
-          onSubmit: event => {
-            event.preventDefault()
-            create()
-          },
-          children: jsx(Input, {
-            'aria-label': 'Group name',
-            maxLength: 64,
-            placeholder,
-            value: name,
-            onChange: event => setName(event.target.value)
-          })
+        jsxs('div', {
+          className: 'grid gap-2',
+          children: [
+            jsx(GroupImageControls, {
+              image,
+              onImage: setImage,
+              seedName: name.trim() || (selected.length ? placeholder : ''),
+              seedMembers: selected.map(bot => displayName(bot, botRosterMeta(bot, allMeta)))
+            }),
+            jsx('form', {
+              onSubmit: event => {
+                event.preventDefault()
+                create()
+              },
+              children: jsx(Input, {
+                'aria-label': 'Group name',
+                maxLength: 64,
+                placeholder,
+                value: name,
+                onChange: event => setName(event.target.value)
+              })
+            })
+          ]
         }),
         jsxs(DialogFooter, {
           children: [
@@ -7830,6 +8152,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
   const room = rooms[group] || { log: [], running: false }
   const [draft, setDraft] = useState('')
   const [confirmDisband, setConfirmDisband] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
   // connections). Naturally every speaker just shows its display name.
@@ -7852,6 +8175,14 @@ function GroupChatWorkspace({ group, members, onBack }) {
         onClick: () => (onBack ? onBack() : $groupChatWorkspace.set(null)),
         children: 'Back'
       }),
+      // Room picture (set via Group settings) leads the title when present.
+      room.image
+        ? jsx('img', {
+            src: room.image,
+            alt: '',
+            className: 'size-6 shrink-0 rounded-full object-cover ring-1 ring-(--ui-stroke-secondary)'
+          })
+        : null,
       jsx('div', {
         className: 'min-w-0 flex-1 truncate text-sm font-semibold',
         children: `${group} — group chat`
@@ -7875,6 +8206,14 @@ function GroupChatWorkspace({ group, members, onBack }) {
       jsx('span', {
         className: 'shrink-0 text-[0.65rem] text-(--ui-text-quaternary)',
         children: `${members.length} bots`
+      }),
+      jsx(Button, {
+        variant: 'ghost',
+        size: 'sm',
+        className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
+        title: `Group settings — rename ${group} or set a room picture`,
+        onClick: () => setSettingsOpen(true),
+        children: jsx(Codicon, { name: 'gear' })
       }),
       jsx(Button, {
         variant: 'ghost',
@@ -7962,7 +8301,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
                   return jsxs('div', {
                     className: cn(
-                      'flex items-start gap-2',
+                      'group flex items-start gap-2',
                       isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1'
                     ),
                     children: [
@@ -7982,7 +8321,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                         className: 'min-w-0 flex-1',
                         children: [
                           jsxs('div', {
-                            className: 'flex items-baseline gap-2',
+                            className: 'flex items-center gap-2',
                             children: [
                               isUser
                                 ? jsx('span', {
@@ -8000,12 +8339,27 @@ function GroupChatWorkspace({ group, members, onBack }) {
                               jsx('span', {
                                 className: 'text-[0.625rem] text-(--ui-text-quaternary)',
                                 children: relativeTime(entry.at)
-                              })
+                              }),
+                              entry.text.trim()
+                                ? jsx('div', {
+                                    className:
+                                      'ml-auto shrink-0 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100',
+                                    children: jsx(CopyButton, {
+                                      appearance: 'icon',
+                                      buttonSize: 'icon',
+                                      stopPropagation: true,
+                                      text: entry.text
+                                    })
+                                  })
+                                : null
                             ]
                           }),
                           jsx('div', {
                             className:
                               'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0 [&_ul]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_pre]:overflow-x-auto',
+                            // The app shell sets user-select: none globally; message bodies opt
+                            // back in so drag-select and ⌘C work in group chat logs.
+                            'data-selectable-text': 'true',
                             children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                           })
                         ]
@@ -8180,6 +8534,12 @@ function GroupChatWorkspace({ group, members, onBack }) {
           ]
         })
       }),
+      jsx(GroupChatSettingsDialog, {
+        group,
+        members,
+        open: settingsOpen,
+        onClose: () => setSettingsOpen(false)
+      }),
       jsx(ConfirmDialog, {
         open: confirmDisband,
         title: 'Disband group chat?',
@@ -8293,11 +8653,18 @@ function GroupRow({ group, members, needsYou, onOpen }) {
       'hover:bg-(--chrome-action-hover)'
     ),
     children: [
-      // Composite avatar: up to three member faces fanned like Discord's
-      // group-DM icon; a bare glyph when the room has no seated members.
+      // Room picture when the user set one; else a composite avatar of up to
+      // three member faces fanned like Discord's group-DM icon; a bare glyph
+      // when the room has no seated members.
       jsx('div', {
         className: 'flex w-[34px] shrink-0 items-center justify-center',
-        children: faces.length
+        children: room.image
+          ? jsx('img', {
+              src: room.image,
+              alt: '',
+              className: 'size-7 rounded-full object-cover ring-2 ring-(--ui-bg-primary,#111)'
+            })
+          : faces.length
           ? jsx('div', {
               className: 'flex items-center -space-x-2.5',
               children: faces.map(member => {
@@ -8574,6 +8941,7 @@ function BotsPane() {
         gatewayState,
         metaByName: allMeta,
         onOpen: bot => {
+          const generation = ++botOpenGeneration
           haptic('tap')
           $selectedBot.set(bot.name)
 
@@ -8604,14 +8972,30 @@ function BotsPane() {
               return
             }
 
-            try {
-              const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
+            if (generation !== botOpenGeneration) {
+              return
+            }
 
-              if (id) {
+            try {
+              const id = await openBotCanonicalChat(
+                bot.name,
+                pinnedChat,
+                bot.preferred_session || bot.last_session
+              )
+
+              if (generation === botOpenGeneration && id) {
                 return
               }
-            } catch {
-              // Fall through to the older-gateway draft below.
+            } catch (error) {
+              if (generation === botOpenGeneration) {
+                host.notifyError?.(error, `Could not open ${displayName(bot)}'s chat — try again`)
+              }
+
+              return
+            }
+
+            if (generation !== botOpenGeneration) {
+              return
             }
 
             if (typeof host.newChat === 'function') {
@@ -8905,6 +9289,7 @@ export default {
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   members: Array.isArray(room.members) ? room.members : [],
+                  image: typeof room.image === 'string' && room.image ? room.image : null,
                   epoch: 0,
                   running: false
                 }
