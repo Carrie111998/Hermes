@@ -282,7 +282,7 @@ class MarkdownAdapter:
             and current_marker == (task.metadata.get("hermes_kanban") or {})
         )
         resumable_claim = (
-            task.status in _SOURCE_RUNNABLE
+            task.status in _SOURCE_RUNNABLE | {"imported"}
             and current.status == "importing"
             and current_marker.get("import_id") == marker.get("import_id")
             and current.definition_revision == task.definition_revision
