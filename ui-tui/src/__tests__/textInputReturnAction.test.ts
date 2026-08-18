@@ -70,6 +70,7 @@ describe('shouldInsertNewlineOnReturn', () => {
       'SSH_CLIENT',
       'SSH_TTY',
       'WT_SESSION',
+      'TMUX',
       'GHOSTTY_RESOURCES_DIR',
       'GHOSTTY_BIN_DIR',
       'WSL_DISTRO_NAME'
@@ -98,6 +99,20 @@ describe('shouldInsertNewlineOnReturn', () => {
       const { shouldInsertNewlineOnReturn } = await importTextInput('linux')
 
       expect(shouldInsertNewlineOnReturn(key(), '\n')).toBe(true)
+    } finally {
+      process.env = prev
+    }
+  })
+
+  it('accepts a bare LF as a multiline fallback under tmux on non-macOS', async () => {
+    const prev = { ...process.env }
+    process.env.TMUX = '/tmp/tmux-1000/default,1234,0'
+
+    try {
+      const { shouldInsertNewlineOnReturn } = await importTextInput('linux')
+
+      expect(shouldInsertNewlineOnReturn(key(), '\n')).toBe(true)
+      expect(shouldInsertNewlineOnReturn(key(), '\r')).toBe(false)
     } finally {
       process.env = prev
     }
