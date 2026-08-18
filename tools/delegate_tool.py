@@ -2644,6 +2644,21 @@ def _run_single_child(
             if _agent_skills:
                 _prev_allowed_skills = os.environ.get("HERMES_ALLOWED_SKILLS")
                 os.environ["HERMES_ALLOWED_SKILLS"] = ",".join(_agent_skills)
+            _parent_sid = getattr(parent_agent, "session_id", "") or ""
+            _child_sid = getattr(child, "session_id", "") or ""
+            _agent_name = getattr(child, "_agent_name", "") or getattr(getattr(child, "_agent_def", None), "name", "") or "subagent"
+            if _parent_sid:
+                try:
+                    from tui_gateway.server import _broadcast_global_event
+                    _broadcast_global_event("subagent.status", {
+                        "parent_sid": _parent_sid,
+                        "child_sid": _child_sid,
+                        "name": _agent_name,
+                        "status": "running",
+                    })
+                except Exception:
+                    pass
+
             try:
                 with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                     return child.run_conversation(
@@ -2652,6 +2667,17 @@ def _run_single_child(
                         stream_callback=_relay_child_text,
                     )
             finally:
+                if _parent_sid:
+                    try:
+                        from tui_gateway.server import _broadcast_global_event
+                        _broadcast_global_event("subagent.status", {
+                            "parent_sid": _parent_sid,
+                            "child_sid": _child_sid,
+                            "name": _agent_name,
+                            "status": "completed",
+                        })
+                    except Exception:
+                        pass
                 # Restore previous env
                 if _agent_skill_path:
                     if _prev_skill_path is not None:
@@ -3910,8 +3936,10 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
-        # Attach agent skill_path and skills whitelist for skill filtering
+        # Attach agent definition metadata
         if task_agent_def:
+            child._agent_def = task_agent_def
+            child._agent_name = task_agent_def.name
             if task_agent_def.skill_path:
                 try:
                     child._agent_skill_path = Path(task_agent_def.skill_path)

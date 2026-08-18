@@ -8,6 +8,8 @@ import { DEFAULT_THEME } from '../theme.js'
 import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
 
 const buildUiState = (): UiState => ({
+  activeSubagents: [],
+  parentOrchestratorSid: null,
   battery: false,
   batteryStatus: null,
   bgTasks: new Set(),

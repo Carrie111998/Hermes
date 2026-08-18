@@ -27,6 +27,7 @@ import { ActiveWidgetSlot, AmbientDock, AmbientRail, useAmbientRailWidth } from 
 import { AgentsOverlay } from './agentsOverlay.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
 import { FloatingOverlays, PromptZone } from './appOverlays.js'
+import { SubagentTabBar } from './SubagentTabBar.js'
 import { Banner, Panel, SessionPanel } from './branding.js'
 import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
@@ -363,7 +364,7 @@ const ComposerPane = memo(function ComposerPane({
         <Box height={1} onMouseDown={captureInputDrag} onMouseDrag={dragFromSpacer} onMouseUp={endInputDrag} />
       )}
 
-      <StatusRulePane at="top" composer={composer} status={status} />
+      <StatusRulePane actions={actions} at="top" composer={composer} status={status} />
       <AmbientDock placement="dock-top" />
 
       <Box flexDirection="column" marginTop={ui.statusBar === 'top' ? 0 : 1} position="relative">
@@ -383,7 +384,12 @@ const ComposerPane = memo(function ComposerPane({
         {composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
         {!isBlocked && (
-          <>
+          <Box
+            flexDirection="column"
+            borderStyle="single"
+            borderColor={ui.interactionMode === 'plan' ? ui.theme.color.accent : ui.theme.color.prompt}
+            paddingX={1}
+          >
             {composer.inputBuf.map((line, i) => (
               <Box key={i}>
                 <Box width={promptWidth}>
@@ -403,7 +409,7 @@ const ComposerPane = memo(function ComposerPane({
               onMouseDrag={dragFromPromptRow}
               onMouseUp={endInputDrag}
               position="relative"
-              width={Math.max(1, composer.cols - 2)}
+              width={Math.max(1, composer.cols - 4)}
             >
               <Box width={promptWidth}>
                 {sh ? (
@@ -425,12 +431,7 @@ const ComposerPane = memo(function ComposerPane({
                   onPaste={composer.handleTextPaste}
                   onSubmit={composer.submit}
                   placeholder={composer.empty ? PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''}
-                  // Exactly the "(and N more toolsets…)" tone. `muted` is a
-                  // MID-luminance family tone, so it reads receded on both
-                  // poles even when polarity detection is wrong (transparent
-                  // terminals lie about their background); anything blended
-                  // toward the resolved surface inherits that wrong polarity.
-                  placeholderColor={ui.theme.color.muted}
+                  placeholderColor={ui.theme.color.placeholder || ui.theme.color.muted}
                   value={composer.input}
                   voiceRecordKey={composer.voiceRecordKey}
                 />
@@ -440,14 +441,14 @@ const ComposerPane = memo(function ComposerPane({
                 <GoodVibesHeart t={ui.theme} tick={status.goodVibesTick} />
               </Box>
             </Box>
-          </>
+          </Box>
         )}
       </Box>
 
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>⚕ {ui.status}</Text>}
 
       <AmbientDock placement="dock-bottom" />
-      <StatusRulePane at="bottom" composer={composer} status={status} />
+      <StatusRulePane actions={actions} at="bottom" composer={composer} status={status} />
     </NoSelect>
   )
 })
@@ -475,10 +476,11 @@ const JourneyPane = memo(function JourneyPane() {
 })
 
 const StatusRulePane = memo(function StatusRulePane({
+  actions,
   at,
   composer,
   status
-}: Pick<AppLayoutProps, 'composer' | 'status'> & { at: 'bottom' | 'top' }) {
+}: Pick<AppLayoutProps, 'actions' | 'composer' | 'status'> & { at: 'bottom' | 'top' }) {
   const ui = useStore($uiState)
 
   if (ui.statusBar !== at) {
@@ -496,6 +498,13 @@ const StatusRulePane = memo(function StatusRulePane({
         focusView={ui.focusView}
         indicatorStyle={ui.indicatorStyle}
         interactionMode={ui.interactionMode}
+        parentOrchestratorSid={ui.parentOrchestratorSid}
+        onBackToOrchestrator={() => {
+          if (ui.parentOrchestratorSid) {
+            actions.activateLiveSession(ui.parentOrchestratorSid)
+            patchUiState({ parentOrchestratorSid: null })
+          }
+        }}
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
         model={ui.info?.model ?? ''}
@@ -568,6 +577,7 @@ export const AppLayout = memo(function AppLayout({
 
             <PerfPane id="composer">
               <ComposerPane actions={actions} composer={composer} status={status} />
+              <SubagentTabBar onSelectSubagent={actions.activateLiveSession} />
             </PerfPane>
 
             {SHOW_FPS && (

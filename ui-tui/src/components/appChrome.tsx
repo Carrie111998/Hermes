@@ -467,6 +467,8 @@ export function StatusRule({
   battery,
   focusView,
   interactionMode = 'build',
+  parentOrchestratorSid,
+  onBackToOrchestrator,
   cwdLabel,
   cols,
   busy,
@@ -630,6 +632,18 @@ export function StatusRule({
   return (
     <Box height={1}>
       <Box flexDirection="row" flexShrink={1} overflow="hidden" width={leftWidth}>
+        {parentOrchestratorSid && onBackToOrchestrator ? (
+          <Box
+            flexDirection="row"
+            flexShrink={0}
+            marginRight={1}
+            borderStyle="single"
+            borderColor={t.color.accent}
+            onClick={onBackToOrchestrator}
+          >
+            <Text color={t.color.accent} bold>{' ✕ Back to Orchestrator '}</Text>
+          </Box>
+        ) : null}
         {/* Leading pinned chrome: border + busy face / idle status. When a
             notice occupies the slot the status text is dropped — the notice
             renders as a separate shrinkable box below so a long notice
@@ -875,6 +889,8 @@ interface StatusRuleProps {
   // Focus view (/focus) badge — display-only reduced-output indicator.
   focusView?: boolean
   interactionMode?: InteractionMode
+  parentOrchestratorSid?: string | null
+  onBackToOrchestrator?: () => void
   bgCount: number
   lastTurnEndedAt?: null | number
   liveSessionCount: number
