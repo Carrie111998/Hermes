@@ -1,3 +1,4 @@
+import json
 import queue
 import threading
 import time
@@ -64,6 +65,11 @@ def _make_background_cli_stub():
     cli.bell_on_complete = False
     cli.final_response_markdown = "strip"
     return cli
+
+
+class _EmptyResponseQueue:
+    def get(self, timeout=None):
+        raise queue.Empty
 
 
 class TestCliApprovalUi:
@@ -478,6 +484,71 @@ class TestPersistPromptSummary:
         assert "B" in summary
 
 
+class TestClarifyTimeoutPolicy:
+    """Exercise timeout policy through the classic CLI callback."""
+
+    _PROCEED_SENTINEL = (
+        "The user did not provide a response within the time limit. "
+        "Use your best judgement to make the choice and proceed."
+    )
+
+    def _run_expired_clarify(self, config, on_timeout=None):
+        from tools.clarify_tool import clarify_tool
+
+        cli = _make_cli_stub()
+        cli._clarify_state = None
+        cli._clarify_freetext = False
+        cli._clarify_deadline = 0
+        cli._clarify_multi_base = None
+        cli._paint_now = MagicMock()
+
+        kwargs = {"on_timeout": on_timeout} if on_timeout is not None else {}
+        with patch.object(cli_module.queue, "Queue", return_value=_EmptyResponseQueue()), \
+             patch("tools.clarify_gateway.resolve_clarify_timeout", return_value=1), \
+             patch("hermes_cli.config.load_config", return_value=config), \
+             patch("time.monotonic", side_effect=[0, 0, 2]), \
+             patch.object(cli_module, "_cprint"):
+            return json.loads(clarify_tool(
+                "Approve publishing?",
+                callback=cli._clarify_callback,
+                **kwargs,
+            ))
+
+    def test_default_proceed_preserves_timeout_sentinel(self):
+        result = self._run_expired_clarify({})
+
+        assert result["user_response"] == self._PROCEED_SENTINEL
+        assert "error" not in result
+
+    def test_config_abort_returns_fail_closed_timeout(self):
+        result = self._run_expired_clarify(
+            {"agent": {"clarify_on_timeout": "abort"}},
+        )
+
+        assert result["error_type"] == "clarify_timeout"
+        assert result["approved"] is False
+        assert result["timed_out"] is True
+
+    def test_per_call_abort_overrides_default_proceed(self):
+        result = self._run_expired_clarify(
+            {"agent": {"clarify_on_timeout": "proceed"}},
+            on_timeout="abort",
+        )
+
+        assert result["error_type"] == "clarify_timeout"
+        assert result["approved"] is False
+        assert result["timed_out"] is True
+
+    def test_per_call_proceed_overrides_config_abort(self):
+        result = self._run_expired_clarify(
+            {"agent": {"clarify_on_timeout": "abort"}},
+            on_timeout="proceed",
+        )
+
+        assert result["user_response"] == self._PROCEED_SENTINEL
+        assert "error" not in result
+
+
 class TestClearOverlaysForInterrupt:
     """Regression tests for #14026 — interrupting a running agent must clear
     every input-blocking overlay (approval/clarify/sudo/secret) so the CLI
@@ -561,4 +632,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

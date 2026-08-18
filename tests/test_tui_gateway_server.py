@@ -18183,8 +18183,14 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
 
     monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 42)
 
-    def fake_block(event, sid, payload, timeout=300):
-        captured.update(event=event, sid=sid, payload=payload, timeout=timeout)
+    def fake_block(event, sid, payload, timeout=300, timeout_error=None):
+        captured.update(
+            event=event,
+            sid=sid,
+            payload=payload,
+            timeout=timeout,
+            timeout_error=timeout_error,
+        )
         return "answer"
 
     monkeypatch.setattr(server, "_block", fake_block)
@@ -18194,6 +18200,7 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
     assert result == "answer"
     assert captured["event"] == "clarify.request"
     assert captured["timeout"] == 42
+    assert captured["timeout_error"] is None
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 
@@ -18203,7 +18210,7 @@ def test_clarify_callback_multi_select_hint(monkeypatch):
     (older renderers must never see the extra field)."""
     captured = {}
 
-    def fake_block(event, sid, payload, timeout=300):
+    def fake_block(event, sid, payload, timeout=300, timeout_error=None):
         captured.update(payload=payload)
         return "answer"
 
@@ -18219,6 +18226,44 @@ def test_clarify_callback_multi_select_hint(monkeypatch):
 
     cb("Pick one", ["a", "b"], multi_select=False)
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
+
+
+def test_clarify_callback_abort_passes_timeout_error(monkeypatch):
+    """Fail-closed policy reaches the blocking bridge as a timeout error."""
+    from tools.clarify_tool import ClarifyTimeoutError
+
+    captured = {}
+
+    def fake_block(event, sid, payload, timeout=300, timeout_error=None):
+        captured["timeout_error"] = timeout_error
+        return "answer"
+
+    monkeypatch.setattr(server, "_block", fake_block)
+
+    result = server._agent_cbs("sid-1")["clarify_callback"](
+        "Approve publishing?",
+        ["Approve", "Reject"],
+        on_timeout="abort",
+    )
+
+    assert result == "answer"
+    assert isinstance(captured["timeout_error"], ClarifyTimeoutError)
+
+
+def test_block_raises_supplied_error_on_actual_timeout(monkeypatch):
+    """_block raises only after its wait expires without an answer."""
+    from tools.clarify_tool import ClarifyTimeoutError
+
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    with pytest.raises(ClarifyTimeoutError):
+        server._block(
+            "clarify.request",
+            "sid-timeout",
+            {"question": "Approve?", "choices": ["Yes", "No"]},
+            timeout=0,
+            timeout_error=ClarifyTimeoutError(),
+        )
 
 
 @pytest.mark.parametrize(

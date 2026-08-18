@@ -14852,7 +14852,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             outcome = outcome[:119] + "…"
         _cprint(f"\n{_DIM}{icon} {label}: {detail} → {outcome}{_RST}")
 
-    def _clarify_callback(self, question, choices, multi_select=False):
+    def _clarify_callback(
+        self,
+        question,
+        choices,
+        multi_select=False,
+        on_timeout="proceed",
+    ):
         """
         Platform callback for the clarify tool. Called from the agent thread.
 
@@ -14863,6 +14869,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         When ``multi_select`` is True, shows checkboxes and the user can
         select multiple options with Space, confirming with Enter.
+
+        When ``on_timeout`` is ``"abort"``, an expired prompt raises a
+        dedicated timeout error so the tool reports that approval was not
+        granted instead of returning the adaptive sentinel below.
         """
         import time as _time
 
@@ -14923,6 +14933,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_deadline = None
         self._clarify_multi_base = None
         self._paint_now()
+        if on_timeout == "abort":
+            from tools.clarify_tool import ClarifyTimeoutError
+
+            _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — action aborted){_RST}")
+            raise ClarifyTimeoutError()
+
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
             "The user did not provide a response within the time limit. "

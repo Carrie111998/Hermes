@@ -248,6 +248,11 @@ DEFAULT_CONFIG = {
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
         "clarify_timeout": 3600,
+        # Timeout policy for clarify prompts.  "proceed" preserves the
+        # historical fail-open behavior; "abort" returns a tool error so a
+        # missing response cannot be treated as approval.  Individual clarify
+        # calls can override this with their on_timeout parameter.
+        "clarify_on_timeout": "proceed",
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.

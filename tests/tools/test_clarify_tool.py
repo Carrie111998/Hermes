@@ -5,6 +5,8 @@ from typing import List, Optional
 
 
 from tools.clarify_tool import (
+    ClarifyTimeoutError,
+    ClarifyUnavailableError,
     clarify_tool,
     check_clarify_requirements,
     MAX_CHOICES,
@@ -32,8 +34,21 @@ class TestClarifyToolBasics:
     def test_no_callback_returns_error(self):
         """Should return error when no callback is provided."""
         result = json.loads(clarify_tool("What do you want?"))
-        assert "error" in result
-        assert "not available" in result["error"].lower()
+        assert result == {
+            "error": "Clarify tool is not available in this execution context."
+        }
+
+    def test_no_callback_abort_returns_fail_closed_error(self):
+        """An unavailable approval prompt cannot produce implicit consent."""
+        result = json.loads(clarify_tool(
+            "Approve publishing?",
+            on_timeout="abort",
+        ))
+
+        assert result["error_type"] == "clarify_unavailable"
+        assert result["approved"] is False
+        assert result["timed_out"] is False
+        assert result["on_timeout"] == "abort"
 
 
 class TestClarifyToolChoicesValidation:
@@ -156,6 +171,14 @@ class TestClarifySchema:
         """multi_select should default to false (not in required)."""
         # The model should treat it as false when omitted
         assert "multi_select" not in CLARIFY_SCHEMA["parameters"]["required"]
+
+    def test_schema_on_timeout_is_optional_enum(self):
+        """on_timeout exposes the two policies without becoming required."""
+        prop = CLARIFY_SCHEMA["parameters"]["properties"]["on_timeout"]
+
+        assert prop["type"] == "string"
+        assert prop["enum"] == ["proceed", "abort"]
+        assert "on_timeout" not in CLARIFY_SCHEMA["parameters"]["required"]
 
 
 class TestClarifyToolMultiSelect:
@@ -310,11 +333,11 @@ class TestInvokeCallbackDispatch:
 
         import pytest
         with pytest.raises(TypeError, match="internal bug"):
-            _invoke_callback(bad_callback, "Q?", ["a"], True)
+            _invoke_callback(bad_callback, "Q?", ["a"], True, "proceed")
         assert len(calls) == 1
 
 
-    def test_var_keyword_callback_receives_flag(self):
+    def test_var_keyword_callback_keeps_legacy_proceed_contract(self):
         from tools.clarify_tool import _invoke_callback
         seen = {}
 
@@ -322,8 +345,144 @@ class TestInvokeCallbackDispatch:
             seen.update(kwargs)
             return "ok"
 
-        _invoke_callback(kw_cb, "Q?", ["a"], True)
+        _invoke_callback(kw_cb, "Q?", ["a"], True, "proceed")
         assert seen.get("multi_select") is True
+        assert "on_timeout" not in seen
+
+    def test_var_keyword_callback_cannot_claim_abort_support(self):
+        """Accepting arbitrary kwargs does not prove the callback enforces
+        the fail-closed policy."""
+        from tools.clarify_tool import _invoke_callback
+
+        calls = []
+
+        def kw_cb(question, choices, **kwargs):
+            calls.append(kwargs)
+            return "ok"
+
+        import pytest
+        with pytest.raises(ClarifyUnavailableError):
+            _invoke_callback(kw_cb, "Q?", ["a"], True, "abort")
+        assert calls == []
+
+
+class TestClarifyTimeoutPolicy:
+    """Timeout policy is config-backed and overridable per invocation."""
+
+    _PROCEED_SENTINEL = (
+        "The user did not provide a response within the time limit. "
+        "Use your best judgement to make the choice and proceed."
+    )
+
+    @staticmethod
+    def _set_config(monkeypatch, policy):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: (
+                {"agent": {"clarify_on_timeout": policy}}
+                if policy is not None
+                else {}
+            ),
+        )
+
+    @staticmethod
+    def _timeout_callback(seen):
+        def callback(question, choices, multi_select=False, on_timeout="proceed"):
+            seen["on_timeout"] = on_timeout
+            if on_timeout == "abort":
+                raise ClarifyTimeoutError()
+            return TestClarifyTimeoutPolicy._PROCEED_SENTINEL
+
+        return callback
+
+    @staticmethod
+    def _assert_abort_result(result):
+        assert "error" in result
+        assert result["error_type"] == "clarify_timeout"
+        assert result["approved"] is False
+        assert result["timed_out"] is True
+        assert result["on_timeout"] == "abort"
+
+    @staticmethod
+    def _assert_unavailable_result(result):
+        assert "error" in result
+        assert result["error_type"] == "clarify_unavailable"
+        assert result["approved"] is False
+        assert result["timed_out"] is False
+        assert result["on_timeout"] == "abort"
+
+    def test_default_proceed_preserves_existing_timeout_sentinel(self, monkeypatch):
+        """Unset config + unset argument keeps today's fail-open result."""
+        self._set_config(monkeypatch, None)
+        seen = {}
+
+        result = json.loads(clarify_tool(
+            "Proceed without an answer?",
+            callback=self._timeout_callback(seen),
+        ))
+
+        assert seen["on_timeout"] == "proceed"
+        assert result["user_response"] == self._PROCEED_SENTINEL
+        assert "error" not in result
+
+    def test_per_call_abort_returns_timeout_error(self, monkeypatch):
+        """An explicit abort turns callback timeout into an error result."""
+        self._set_config(monkeypatch, "proceed")
+        seen = {}
+
+        result = json.loads(clarify_tool(
+            "Approve publishing?",
+            on_timeout="abort",
+            callback=self._timeout_callback(seen),
+        ))
+
+        assert seen["on_timeout"] == "abort"
+        self._assert_abort_result(result)
+
+    def test_config_abort_is_honored_when_argument_is_omitted(self, monkeypatch):
+        """The fleet default applies when a call does not choose a policy."""
+        self._set_config(monkeypatch, "abort")
+        seen = {}
+
+        result = json.loads(clarify_tool(
+            "Approve publishing?",
+            callback=self._timeout_callback(seen),
+        ))
+
+        assert seen["on_timeout"] == "abort"
+        self._assert_abort_result(result)
+
+    def test_per_call_proceed_overrides_config_abort(self, monkeypatch):
+        """An informational prompt can opt back into fail-open behavior."""
+        self._set_config(monkeypatch, "abort")
+        seen = {}
+
+        result = json.loads(clarify_tool(
+            "Which color do you prefer?",
+            on_timeout="proceed",
+            callback=self._timeout_callback(seen),
+        ))
+
+        assert seen["on_timeout"] == "proceed"
+        assert result["user_response"] == self._PROCEED_SENTINEL
+        assert "error" not in result
+
+    def test_abort_fails_closed_for_legacy_callback(self, monkeypatch):
+        """A callback without explicit policy support is unavailable, not approved."""
+        self._set_config(monkeypatch, "abort")
+        called = []
+
+        def legacy_callback(question, choices, **kwargs):
+            called.append(True)
+            return "ok"
+
+        result = json.loads(clarify_tool(
+            "Approve publishing?",
+            callback=legacy_callback,
+        ))
+
+        assert called == []
+        self._assert_unavailable_result(result)
 
 
 class TestRegistryMultiSelectPassThrough:
@@ -360,3 +519,55 @@ class TestRegistryMultiSelectPassThrough:
         ))
         assert seen["multi"] is False
         assert result["user_response"] == "a"
+
+    def test_handler_forwards_on_timeout(self, monkeypatch):
+        """The registered handler forwards an explicit timeout policy."""
+        from tools.registry import registry
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"clarify_on_timeout": "proceed"}},
+        )
+        entry = registry.get_entry("clarify")
+        seen = {}
+
+        def cb(question, choices, multi_select=False, on_timeout="proceed"):
+            seen["on_timeout"] = on_timeout
+            raise ClarifyTimeoutError()
+
+        result = json.loads(entry.handler(
+            {
+                "question": "Approve publishing?",
+                "choices": ["Approve", "Reject"],
+                "on_timeout": "abort",
+            },
+            callback=cb,
+        ))
+
+        assert seen["on_timeout"] == "abort"
+        assert result["error_type"] == "clarify_timeout"
+        assert result["approved"] is False
+
+    def test_handler_omits_policy_for_config_resolution(self, monkeypatch):
+        """Omitting on_timeout does not force proceed ahead of config."""
+        from tools.registry import registry
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"clarify_on_timeout": "abort"}},
+        )
+        entry = registry.get_entry("clarify")
+        seen = {}
+
+        def cb(question, choices, multi_select=False, on_timeout="proceed"):
+            seen["on_timeout"] = on_timeout
+            raise ClarifyTimeoutError()
+
+        result = json.loads(entry.handler(
+            {"question": "Approve publishing?", "choices": ["Approve", "Reject"]},
+            callback=cb,
+        ))
+
+        assert seen["on_timeout"] == "abort"
+        assert result["error_type"] == "clarify_timeout"
+        assert result["timed_out"] is True

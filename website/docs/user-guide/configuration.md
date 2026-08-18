@@ -2423,12 +2423,20 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 ## Clarify
 
-Configure how long the gateway waits for a response to a clarifying question. The canonical key is `agent.clarify_timeout` (default `3600` seconds); a legacy top-level `clarify.timeout` is still honored if explicitly set:
+Configure the response wait for messaging and desktop prompts, and what the `clarify` tool does across execution contexts when a wait expires. The canonical timeout key is `agent.clarify_timeout` (default `3600` seconds). A legacy top-level `clarify.timeout` remains supported; the classic CLI retains its existing `120`-second default under that key.
 
 ```yaml
 agent:
   clarify_timeout: 3600        # Seconds to wait for user clarification response (0 or less = unlimited)
+  clarify_on_timeout: proceed  # proceed (default) or abort
 ```
+
+`agent.clarify_on_timeout` accepts two values:
+
+- `proceed` preserves the existing behavior. Hermes returns an adaptive timeout response, allowing the agent to choose a reasonable default for a low-stakes question.
+- `abort` returns a tool error that means approval was not granted. The agent must not continue the action gated by that question.
+
+An `on_timeout` value supplied in an individual `clarify` call overrides `agent.clarify_on_timeout`. An unrecognized persisted value logs a warning and fails safe to `abort`. Use `abort` for consequential approval-gated questions, such as whether to publish or spend money. The terminal tool's approval flow remains separate and continues to govern dangerous commands.
 
 ## Context Files (SOUL.md, AGENTS.md)
 

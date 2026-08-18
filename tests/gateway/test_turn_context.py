@@ -59,6 +59,34 @@ class TestTurnRunner:
         assert asyncio.iscoroutinefunction(TurnRunner.send_progress_messages)
         assert runner._ctx is ctx
 
+    def test_clarify_no_response_preserves_proceed_sentinel(self):
+        from gateway.run import _clarify_no_response
+
+        assert _clarify_no_response(
+            "proceed",
+            "[clarify prompt could not be delivered]",
+            timed_out=False,
+        ) == "[clarify prompt could not be delivered]"
+
+    def test_clarify_no_response_distinguishes_abort_outcomes(self):
+        from gateway.run import _clarify_no_response
+        from tools.clarify_tool import ClarifyTimeoutError, ClarifyUnavailableError
+
+        with pytest.raises(ClarifyTimeoutError):
+            _clarify_no_response("abort", "timeout sentinel", timed_out=True)
+        with pytest.raises(ClarifyUnavailableError):
+            _clarify_no_response("abort", "delivery sentinel", timed_out=False)
+
+    def test_clarify_wait_distinguishes_timeout_from_session_cancellation(self):
+        from gateway.run import _clarify_wait_result
+        from tools.clarify_tool import ClarifyTimeoutError
+
+        with pytest.raises(ClarifyTimeoutError):
+            _clarify_wait_result(None, "abort", 900)
+        assert _clarify_wait_result("", "abort", 900) == (
+            "[user did not respond within 15m]"
+        )
+
     def test_send_progress_messages_no_queue_returns(self):
         ctx = TurnContext(progress_queue=None)
         runner = _make_runner(ctx)

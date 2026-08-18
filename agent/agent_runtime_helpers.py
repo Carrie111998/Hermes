@@ -3201,6 +3201,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
+                    on_timeout=next_args.get("on_timeout"),
                 ),
                 next_args,
             )

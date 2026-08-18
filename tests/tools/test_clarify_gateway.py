@@ -12,6 +12,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 
 def _clear_clarify_state():
     """Reset module-level state between tests."""
@@ -100,6 +102,26 @@ class TestClarifyPrimitive:
             result = fut.result(timeout=10.0)
             # clear_session sets response="" then the wait returns it
             assert result == ""
+
+    def test_clear_before_wait_preserves_cancellation_response(self):
+        """The entry returned by register closes the cleanup-before-wait race."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-before-wait", "sk-before-wait", "Q?", ["A"])
+        assert cm.clear_session("sk-before-wait") == 1
+
+        assert cm.wait_for_response(entry, timeout=10.0) == ""
+
+    def test_entry_wait_cleans_both_registries(self):
+        """Normal entry-based waits must not leave stale session-index IDs."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-entry", "sk-entry", "Q?", ["A"])
+        assert cm.resolve_gateway_clarify("id-entry", "A") is True
+
+        assert cm.wait_for_response(entry, timeout=10.0) == "A"
+        assert "id-entry" not in cm._entries
+        assert "sk-entry" not in cm._session_index
 
 
     def test_clear_session_preserves_resolved_response(self):
@@ -281,6 +303,46 @@ class TestClarifyTimeoutResolution:
 
         assert cm.resolve_clarify_timeout({"agent": {"clarify_timeout": 0}}) == 0
         assert cm.resolve_clarify_timeout({"clarify": {"timeout": -1}}) == -1
+
+
+class TestClarifyOnTimeoutResolution:
+    """Per-call clarify timeout behavior overrides the fleet config default."""
+
+    def test_default_is_proceed(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.resolve_clarify_on_timeout({}) == "proceed"
+
+    def test_agent_config_can_abort(self):
+        from tools import clarify_gateway as cm
+
+        config = {"agent": {"clarify_on_timeout": "abort"}}
+        assert cm.resolve_clarify_on_timeout(config) == "abort"
+
+    def test_explicit_abort_overrides_proceed_config(self):
+        from tools import clarify_gateway as cm
+
+        config = {"agent": {"clarify_on_timeout": "proceed"}}
+        assert cm.resolve_clarify_on_timeout(config, override="abort") == "abort"
+
+    def test_explicit_proceed_overrides_abort_config(self):
+        from tools import clarify_gateway as cm
+
+        config = {"agent": {"clarify_on_timeout": "abort"}}
+        assert cm.resolve_clarify_on_timeout(config, override="proceed") == "proceed"
+
+    def test_invalid_config_fails_safe_to_abort(self, caplog):
+        from tools import clarify_gateway as cm
+
+        config = {"agent": {"clarify_on_timeout": "continue-anyway"}}
+        assert cm.resolve_clarify_on_timeout(config) == "abort"
+        assert "defaulting to 'abort'" in caplog.text
+
+    def test_invalid_explicit_override_raises(self):
+        from tools import clarify_gateway as cm
+
+        with pytest.raises(ValueError, match="on_timeout"):
+            cm.resolve_clarify_on_timeout({}, override="continue-anyway")
 
 
 class TestUnlimitedWait:
