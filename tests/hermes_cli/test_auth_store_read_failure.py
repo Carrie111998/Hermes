@@ -13,6 +13,7 @@ to have preserved one when the copy actually landed.
 import errno
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -79,18 +80,20 @@ def test_corrupt_copy_is_user_restricted(store_file, monkeypatch):
     on Windows (copy2 copies bytes + metadata, not the DACL) — it must be
     restricted to the current user exactly like the protected original, or
     removed. A credential-bearing recovery artifact LESS protected than the
-    store it preserves is a new exposure introduced by the guard itself."""
+    store it preserves is a new exposure introduced by the guard itself.
+    Restrict-before-write: restriction is applied to the EMPTY temp, then
+    the final artifact verifies restricted."""
     import hermes_constants as hc
 
     store_file.write_text("{ not json", encoding="utf-8")
 
-    state = {"restricted": []}
+    state = {"restricted_temps": []}
     real_restrict = hc.restrict_credential_file
-    real_check = hc.credential_file_is_user_restricted
 
     def _restrict_and_record(path):
         ok = real_restrict(path)
-        state["restricted"].append(str(path))
+        if ".tmp." in path.name:
+            state["restricted_temps"].append(str(path))
         return ok
 
     monkeypatch.setattr(hc, "restrict_credential_file", _restrict_and_record)
@@ -100,12 +103,48 @@ def test_corrupt_copy_is_user_restricted(store_file, monkeypatch):
 
     corrupt = store_file.with_suffix(".json.corrupt")
     assert corrupt.exists(), "corrupt copy must be preserved"
-    assert str(corrupt) in state["restricted"], (
-        "the .corrupt recovery copy must be restricted to the current user"
+    assert state["restricted_temps"], (
+        "a recovery temp must have been restricted before the bytes "
+        "were written (restrict-before-write, F10/P4)"
     )
     assert hc.credential_file_is_user_restricted(corrupt), (
         "recovery copy must verify as user-restricted"
     )
+
+
+def test_corrupt_copy_restriction_precedes_credential_bytes(store_file, monkeypatch):
+    """F10/P4 (exact-head re-review): the recovery artifact must be
+    restricted BEFORE the corrupt store's bytes are published — the same
+    write-before-ACL window F1 eliminated. Witness: at the moment
+    restrict_credential_file() runs on the recovery temp, the file must
+    contain ZERO bytes. copy2-then-restrict ordering fails this test."""
+    import hermes_constants as hc
+
+    store_file.write_text(
+        '{"providers": {"nous": {"api_key": "secret-token"} BAD', encoding="utf-8"
+    )
+
+    state = {"size_at_restrict": None}
+
+    def _restrict_with_witness(path):
+        if path.suffix.endswith(".tmp") or ".tmp." in path.name:
+            state["size_at_restrict"] = Path(path).stat().st_size
+        return True
+
+    monkeypatch.setattr(hc, "restrict_credential_file", _restrict_with_witness)
+    monkeypatch.setattr(hc, "credential_file_is_user_restricted", lambda p: True)
+
+    with pytest.raises(ValueError, match="fail closed"):
+        auth._load_auth_store(store_file)
+
+    assert state["size_at_restrict"] == 0, (
+        "recovery temp must be EMPTY when the user-only ACL is applied "
+        "(restrict-before-write, F10/P4); got "
+        f"{state['size_at_restrict']} bytes"
+    )
+
+    corrupt = store_file.with_suffix(".json.corrupt")
+    assert corrupt.exists(), "corrupt copy must be preserved"
 
 
 def test_corrupt_copy_removed_when_restriction_fails(store_file, monkeypatch):
@@ -157,15 +196,16 @@ def test_log_does_not_claim_a_backup_that_was_not_written(
 ):
     """The old message advertised the .corrupt path even when copy2 failed —
     and claimed an empty-store fallback. F10: still refuse to continue, and
-    never claim a backup that was not written."""
-    import shutil
+    never claim a backup that was not written. P4: the recovery path is now
+    restrict-before-write (no copy2); the failure point is the ACL
+    restriction — when it fails, no artifact is left and the log must not
+    claim one was preserved."""
+    import hermes_constants as hc
 
     store_file.write_text("{ not json", encoding="utf-8")
 
-    def _no_copy(*args, **kwargs):
-        raise OSError(errno.EMFILE, "Too many open files")
-
-    monkeypatch.setattr(shutil, "copy2", _no_copy)
+    monkeypatch.setattr(hc, "restrict_credential_file", lambda p: False)
+    monkeypatch.setattr(hc, "credential_file_is_user_restricted", lambda p: False)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
         with pytest.raises(ValueError, match="fail closed"):

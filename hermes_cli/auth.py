@@ -1317,31 +1317,80 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         preserved = False
         try:
-            import shutil
-            shutil.copy2(auth_file, corrupt_path)
-            # F10 (P4): copy2 copies bytes + metadata but NOT the Windows
-            # DACL — the .corrupt artifact would inherit the parent
-            # directory's broader ACL while the protected original was
-            # user-only. Restrict the copy the same way; if restriction
-            # fails, remove the copy rather than leaving a credential
-            # artifact LESS protected than the file it preserves.
-            from hermes_constants import (
-                credential_file_is_user_restricted,
-                restrict_credential_file,
-            )
+            # F10 (P4, exact-head re-review): restrict BEFORE the corrupt
+            # store's bytes are published. copy2 would create the recovery
+            # artifact under the parent directory's inherited DACL and
+            # write the whole (possibly token-bearing) store before
+            # restriction ran — the same write-before-ACL window F1 was
+            # hardened to eliminate. Sequence mirrors _save_auth_store:
+            # create an EMPTY temp, apply + verify the user-only ACL,
+            # only then write the corrupt bytes, fsync, and atomically
+            # replace the recovery artifact; verify the final destination
+            # and remove it (fail closed) on any failure.
+            import os
+            import stat
+            import uuid
 
-            if restrict_credential_file(corrupt_path) and credential_file_is_user_restricted(
-                corrupt_path
-            ):
+            tmp = corrupt_path.with_name(
+                f".{corrupt_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            )
+            fd = os.open(
+                str(tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            _fd_open = True
+            try:
+                from hermes_constants import (
+                    credential_file_is_user_restricted,
+                    restrict_credential_file,
+                )
+
+                # Restrict the EMPTY temp before any credential bytes.
+                if not restrict_credential_file(tmp):
+                    raise OSError(
+                        f"F10: could not restrict recovery temp {tmp} "
+                        "before writing; refusing to preserve."
+                    )
+                # Witness: zero credential bytes at restriction time.
+                if tmp.stat().st_size != 0:
+                    raise OSError(
+                        f"F10: recovery temp {tmp} was not empty when the "
+                        "ACL was applied; refusing to preserve."
+                    )
+                with os.fdopen(fd, "wb") as handle:
+                    _fd_open = False
+                    handle.write(auth_file.read_bytes())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # Re-verify the bytes-bearing temp before it becomes the
+                # recovery artifact (icacls race / exotic filesystem).
+                if not credential_file_is_user_restricted(tmp):
+                    raise OSError(
+                        f"F10: recovery temp {tmp} lost its user-only ACL "
+                        "before replacement; refusing to preserve."
+                    )
+                os.replace(tmp, corrupt_path)
+                if not credential_file_is_user_restricted(corrupt_path):
+                    raise OSError(
+                        f"F10: recovery artifact {corrupt_path} is not "
+                        "user-restricted after replacement; refusing to "
+                        "preserve."
+                    )
                 preserved = True
-            else:
-                try:
-                    corrupt_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            finally:
+                if _fd_open:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
         except Exception:
             try:
                 corrupt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                tmp.unlink(missing_ok=True)
             except OSError:
                 pass
             logger.debug(
