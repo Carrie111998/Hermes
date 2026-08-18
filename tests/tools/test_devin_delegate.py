@@ -107,6 +107,16 @@ class TestConfigResolution(unittest.TestCase):
         """Model can shorten the timeout for a quick task."""
         self.assertEqual(_resolve_timeout({"timeout_seconds": 1800}, 120), 120.0)
 
+    def test_timeout_rejects_nan(self):
+        """NaN must fall back to default, not bypass the floor check."""
+        self.assertEqual(_resolve_timeout({}, float("nan")), 1800.0)
+        self.assertEqual(_resolve_timeout({"timeout_seconds": float("nan")}, None), 1800.0)
+
+    def test_timeout_rejects_infinity(self):
+        """Infinity must fall back to default, not remove the timeout cap."""
+        self.assertEqual(_resolve_timeout({}, float("inf")), 1800.0)
+        self.assertEqual(_resolve_timeout({"timeout_seconds": float("inf")}, None), 1800.0)
+
     def test_max_result_chars_default(self):
         self.assertEqual(_resolve_max_result_chars({}), 20000)
 
@@ -150,6 +160,14 @@ class TestDelegateToDevin(unittest.TestCase):
             result = json.loads(delegate_to_devin(goal="do thing"))
         self.assertIn("error", result)
         self.assertIn("not on $PATH", result["error"])
+
+    def test_handler_rejects_when_disabled_at_runtime(self):
+        """Handler must re-check enabled gate — registry caches check_fn,
+        so a runtime config change could leave the tool callable."""
+        with patch.object(mod, "_devin_config", lambda: {"enabled": False}):
+            result = json.loads(delegate_to_devin(goal="do thing"))
+        self.assertIn("error", result)
+        self.assertIn("disabled", result["error"])
 
     def test_not_logged_in_returns_error(self):
         p1, p2, p3 = self._patch_env(logged_in=False,

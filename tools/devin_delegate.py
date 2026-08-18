@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -222,6 +223,8 @@ def _resolve_timeout(cfg: Dict[str, Any], override: Any) -> float:
             config_timeout = float(config_timeout)
         except (TypeError, ValueError):
             config_timeout = _DEFAULT_TIMEOUT_SECONDS
+        if not math.isfinite(config_timeout):
+            config_timeout = _DEFAULT_TIMEOUT_SECONDS
     else:
         config_timeout = _DEFAULT_TIMEOUT_SECONDS
     config_timeout = max(_MIN_TIMEOUT_SECONDS, config_timeout)
@@ -234,6 +237,13 @@ def _resolve_timeout(cfg: Dict[str, Any], override: Any) -> float:
     except (TypeError, ValueError):
         logger.warning(
             "delegate_to_devin timeout=%r is not a valid number; "
+            "using config default %.0f",
+            override, config_timeout,
+        )
+        return config_timeout
+    if not math.isfinite(parsed):
+        logger.warning(
+            "delegate_to_devin timeout=%r is not finite; "
             "using config default %.0f",
             override, config_timeout,
         )
@@ -292,6 +302,17 @@ def delegate_to_devin(
         return tool_error("delegate_to_devin requires a non-empty 'goal'.")
 
     cfg = _devin_config()
+
+    # Re-check the enabled gate at handler time. The registry TTL-caches
+    # check_fn results, so if an operator disables delegation.devin.enabled
+    # while a cached schema still exposes the tool, the handler must still
+    # refuse the call rather than launching Devin with no authorization.
+    if not _truthy(cfg.get("enabled"), default=False):
+        return tool_error(
+            "Devin delegation is disabled. Enable delegation.devin.enabled "
+            "in config.yaml to use this tool."
+        )
+
     binary = _devin_binary()
     if binary is None:
         return tool_error(
