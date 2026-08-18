@@ -6563,14 +6563,30 @@ class AIAgent:
         )
         # Prefix match (not exact equality): the final response may be the
         # streamed text plus a trailing delta, or the stream may have been
-        # partial when the verify nudge fired.  In both cases the streamed
+        # partial when the verify nudge fired. In both cases the streamed
         # content is a prefix of the final — that's enough to mark it
-        # previewed (fails safe to a benign duplicate, never loses text).
-        # The reverse direction (streamed longer than final) is NOT matched:
-        # that could suppress a needed resend in the gateway path where
-        # already_streamed=True calls on_segment_break() instead of
-        # on_commentary() (#65919 review).
+        # previewed for internal conversation-loop tracking.
         return bool(streamed) and visible_content.startswith(streamed)
+
+    def _interim_content_fully_streamed(self, content: str) -> bool:
+        """True only when the stream delivered the exact visible content.
+
+        Used for gateway delivery decisions (#88954): a partial/prefix match marks a
+        truncated commentary as fully streamed when the delta stream cuts off at a
+        tool-call boundary. In that scenario, marking already_streamed=True causes
+        gateway/run.py to invoke on_segment_break() instead of on_commentary(),
+        permanently losing the tail of the text. Exact equality ensures that any
+        truncated delta triggers a full commentary delivery with the intact text.
+        """
+        visible_content = self._normalize_interim_visible_text(
+            self._strip_think_blocks(content or "")
+        )
+        if not visible_content:
+            return False
+        streamed = self._normalize_interim_visible_text(
+            self._strip_think_blocks(getattr(self, "_current_streamed_assistant_text", "") or "")
+        )
+        return bool(streamed) and visible_content == streamed
 
     def _extract_codex_interim_visible_parts(
         self,
@@ -6714,7 +6730,7 @@ class AIAgent:
             or self._interim_text_was_delivered(visible)
         ):
             return
-        already_streamed = self._interim_content_was_streamed(visible)
+        already_streamed = self._interim_content_fully_streamed(visible)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
