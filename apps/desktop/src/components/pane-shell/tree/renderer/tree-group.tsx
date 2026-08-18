@@ -73,6 +73,7 @@ import { type DoubleTapContext, startPaneDrag } from './drag-session'
 import { forceLoneHeaderForPanes } from './lone-header'
 import { useActiveTabVisible } from './tab-strip-scroll'
 import { paneChrome } from './track-model'
+import { resolveZoneHeaderHidden, sessionStripAllowsHide } from './zone-header'
 
 /** Right-click zone menu: the tab verbs (close this / others / to the right /
  *  all) plus the strip's own chrome toggles. Same items and icons as a session
@@ -83,6 +84,7 @@ function ZoneMenu({
   children,
   closable,
   minimizable = true,
+  canHideHeader = true,
   headerHidden,
   minimized,
   nodeId,
@@ -95,6 +97,8 @@ function ZoneMenu({
   /** False for the zone hosting the uncloseable workspace — collapsing the
    *  MAIN pane strands the app behind a strip. */
   minimizable?: boolean
+  /** False for the chat session switcher — hiding that strip is a dead end. */
+  canHideHeader?: boolean
   headerHidden?: boolean
   minimized?: boolean
   nodeId: string
@@ -129,12 +133,13 @@ function ZoneMenu({
           onCloseOthers: () => closeOtherTreeTabs(targetId),
           onCloseToRight: () => closeTreeTabsToRight(targetId)
         })}
-        <kit.Separator />
-        {renderActionItem(kit, {
-          icon: headerHidden ? 'eye' : 'eye-closed',
-          label: headerHidden ? t.zones.showHeader : t.zones.hideHeader,
-          onSelect: () => setTreeGroupHeaderHidden(nodeId, !headerHidden)
-        })}
+        {(canHideHeader || minimizable) && <kit.Separator />}
+        {canHideHeader &&
+          renderActionItem(kit, {
+            icon: headerHidden ? 'eye' : 'eye-closed',
+            label: headerHidden ? t.zones.showHeader : t.zones.hideHeader,
+            onSelect: () => setTreeGroupHeaderHidden(nodeId, !headerHidden)
+          })}
         {minimizable &&
           renderActionItem(kit, {
             // Same action-direction contract as the strip button below: the
@@ -237,16 +242,25 @@ export function TreeGroup({
   //    tile in its own zone is unclosable (the "3rd tile has no tab" trap);
   //  - a TOOL PANEL (terminal/logs — a collapse pane) dragged out of the main
   //    stack, else it's a dead zone with no tab to grab or ✕ to close.
-  // The uncloseable workspace and side chrome (sessions/files) keep the clean
-  // no-tab default. Double-click toggles it either way; a minimized group
-  // always shows its header (it IS the header).
+  //  - the SESSION SWITCHER (workspace + session tiles): hiding that strip
+  //    is how the header "just disappears" after a click, restart, or update.
+  // The uncloseable workspace used to keep the clean no-tab default; that
+  // made the only session-switcher vanish on a lone main tab. Double-click
+  // still toggles hide on tool/side zones; a minimized group always shows
+  // its header (it IS the header).
   // Session-tile ids force the header even before chrome registers — cycling
   // onto a freshly-split tile used to land headerless ("name card missing").
   const forceLoneHeader = forceLoneHeaderForPanes(shown, id => paneChrome(paneFor(id)), isCollapsePane)
+  const canHideHeader = sessionStripAllowsHide(shown)
 
   // A full-page view (headerVeto) suppresses the strip while it's the active
   // pane — a page is not a tab-able surface; the bar returns with the chat.
-  const headerHidden = paneChrome(active).headerVeto || (node.headerHidden ?? (shown.length <= 1 && !forceLoneHeader))
+  const headerHidden = resolveZoneHeaderHidden({
+    forceLoneHeader,
+    headerVeto: Boolean(paneChrome(active).headerVeto),
+    persistedHidden: node.headerHidden,
+    shown
+  })
 
   // A group collapses ALONG its parent split's axis. In a row that means the
   // WIDTH collapses — a full-width horizontal header would strand a tall
@@ -271,6 +285,10 @@ export function TreeGroup({
   const hideHeaderDoubleTap: DoubleTapContext = {
     key: `hide-header-${node.id}`,
     onDoubleTap: () => {
+      if (!canHideHeader) {
+        return
+      }
+
       setTreeGroupMinimized(node.id, false)
       setTreeGroupHeaderHidden(node.id, true)
     }
@@ -316,6 +334,7 @@ export function TreeGroup({
 
   // Same menu on the header strip and the edit veil — one prop bag.
   const zoneMenu = {
+    canHideHeader,
     closable,
     headerHidden,
     minimizable,
@@ -326,9 +345,8 @@ export function TreeGroup({
 
   // NO body double-click toggle: virtualized content (the thread) recreates
   // its nodes between clicks, so the gesture was hopelessly unreliable. The
-  // bar's lifecycle is explicit instead — gaining a tab sticky-shows it
-  // (insertAtGroup pins headerHidden false), the main tab's context menu
-  // hides it, and full-page views veto it via paneChrome.headerVeto.
+  // session switcher stays visible; tool/side zones can still hide via their
+  // own strip. Full-page views veto the bar via paneChrome.headerVeto.
 
   return (
     <div
