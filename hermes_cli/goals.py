@@ -677,8 +677,18 @@ _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
 # pooled worker threads removes that variable from the race: once warm, a
 # submitted bootstrap starts executing immediately instead of waiting on
 # thread creation/scheduling.
+#
+# max_workers is generous, not tight: this pool must never itself become a
+# second bottleneck. In production a given HERMES_HOME bootstraps at most
+# once per process lifetime (the result is cached forever), so steady-state
+# concurrency is trivial -- but the test suite clears _DB_CACHE per test and
+# some of those in-flight bootstraps can still be running (slow CI disk)
+# when later tests submit their own. A small pool (e.g. 4) queues those
+# behind each other, which can itself blow the grace window below and
+# reintroduce the exact race this pool exists to close. A high cap keeps
+# queueing from ever being the limiting factor; idle threads are cheap.
 _DB_BOOTSTRAP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="goals-sessiondb-bootstrap"
+    max_workers=64, thread_name_prefix="goals-sessiondb-bootstrap"
 )
 
 # How long a loop-thread caller waits for the background bootstrap before
