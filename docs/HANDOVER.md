@@ -25,22 +25,23 @@ The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`
 - **Completed and deployed:** HERMES-MULTI-AGENT-ORCHESTRATION-001, PR #45, merge `dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea`; official Grok/AGY skills are installed with source parity, the metadata-only summary timer is enabled, and the gateway is running the matching immutable release.
 - **Telegram runtime:** the gateway recovered from a transient startup timeout through its bounded retry path. The latest authorized test produced a correlated inbound accepted audit, correlated outbound delivered audit records, and direct user confirmation of the visible response.
 - **Deferred/blocked:** HERMES-MONITORING-001 remains BLOCKED. Telegram user-visible delivery is not claimed from service or polling health.
-- **Next gate:** user-owned Grok OAuth and AGY CLI smoke remain open; the summary timer's `hermes send` success is outbound evidence only. Direct Telegram user-visible receipt for the new summary remains a separate authorized verification gate.
+- **Next gate:** user-owned Grok OAuth remains open; the corrected AGY CLI smoke passed with exit code 0. The summary timer's `hermes send` success is outbound evidence only. Direct Telegram user-visible receipt for the new summary and a real worker-produced `token_usage` metadata record remain separate verification gates.
 
 ## 3. Verified runtime and deployment state
 
 - **DGX host identity:** `cwliao@55-0940189-03`.
-- **Active release:** `v2026.8.18-hermes-multi-agent-orchestration-dd7a0164`.
+- **Active release:** `v2026.8.18-hermes-multi-agent-orchestration-dashboard-dd7a0164`.
 - **Release marker:** `HERMES_RELEASE_SHA=dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea`.
-- **Effective service:** user `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `2919046`, `NRestarts=0`, `ExecMainStatus=0` after the authorized deployment restart and bounded stability check.
-- **Effective WorkingDirectory/PYTHONPATH:** the multi-agent orchestration release above; both resolved to that immutable release.
-- **Effective drop-in:** `42-hermes-multi-agent-orchestration-dd7a0164.conf`.
+- **Effective service:** user `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `2943801`, `NRestarts=0`, `ExecMainStatus=0` after the authorized Dashboard-artifact deployment restart and bounded stability check.
+- **Effective WorkingDirectory/PYTHONPATH:** the Dashboard-artifact release above; both resolved to that immutable release.
+- **Effective drop-in:** `43-hermes-multi-agent-orchestration-dashboard-dd7a0164.conf`.
 - **Rollback:** ARCH-003 release `v2026.8.17-hermes-arch-003-e8cdfd1e`, ARCH-002 release `v2026.8.16-hermes-arch-002-3e9fd48dc2`, and prior Telegram releases/drop-ins remain available.
 - **Deployment manifest:** ARCH-004 rollback metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-arch-004-e2f94e26`; the prior ARCH-003 drop-in remains intact.
-- **Deployment manifest:** this deployment's prior-release metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-multi-agent-orchestration-dd7a0164`; the previous Telegram release/drop-in remains intact.
+- **Deployment manifest:** this deployment's prior-release metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-multi-agent-orchestration-dashboard-dd7a0164`; the previous multi-agent and Telegram release/drop-ins remain intact.
 
 - **Summary timer:** `hermes-kanban-summary.timer` is `enabled/active`; its ten-minute cadence and metadata-only oneshot service are installed from the matching release. The first run returned `success`/`sent`, which proves an outbound `hermes send` attempt only; no new user-visible Telegram receipt is claimed.
-- **Worker skills:** official `grok` and `antigravity-cli` skill directories are enabled and byte-identical to their optional sources. DGX `grok` and `agy` executables were not present during this check, so Grok OAuth and AGY smoke are not complete.
+- **Worker skills:** official `grok` and `antigravity-cli` skill directories are enabled and byte-identical to their optional sources. DGX `grok` `1.0.5` and `agy` `1.1.13` executables are present; the corrected bounded AGY smoke passed with exit code 0. Grok OAuth remains user-owned and not logged in (`auth-present=false`).
+- **Dashboard gate:** the built-in Dashboard artifact is present in the active release. A bounded authenticated loopback probe returned HTTP 200 for the root, status, Kanban board, and Kanban stats endpoints and confirmed ephemeral session-token injection. The board was empty, so this does not prove a real completed worker run or `token_usage` metadata rendering.
 
 The correction deployment retained its rollback manifest under the corresponding
 deployment-backups entry. The temporary staging directory was removed after
