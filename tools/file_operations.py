@@ -37,7 +37,9 @@ from tools.binary_extensions import BINARY_EXTENSIONS
 from agent.file_safety import (
     build_write_denied_paths,
     build_write_denied_prefixes,
+    get_credential_read_error as _shared_credential_read_error,
     get_safe_write_root as _shared_get_safe_write_root,
+    is_credential_read_denied as _shared_is_credential_read_denied,
     is_write_denied as _shared_is_write_denied,
 )
 
@@ -88,6 +90,50 @@ def _get_safe_write_root() -> Optional[str]:
 def _is_write_denied(path: str) -> bool:
     """Return True if path is on the write deny list."""
     return _shared_is_write_denied(path)
+
+
+def _is_credential_read_denied(path: str) -> bool:
+    """Return True if path names a credential-bearing file (read boundary)."""
+    return _shared_is_credential_read_denied(path)
+
+
+def _credential_read_error(path: str) -> Optional[str]:
+    """Return a refusal message if reading *path* would disclose credentials."""
+    return _shared_credential_read_error(path)
+
+
+def _filter_credential_matches(result):
+    """Drop matches and file entries that come from credential-bearing files.
+
+    Returns *result* unchanged when nothing was filtered, so the common path
+    allocates nothing. When entries are dropped, total_count is decremented
+    and a `_credential_filtered` note records how many, so the omission is
+    visible rather than silent.
+    """
+    if result is None or getattr(result, "error", None):
+        return result
+
+    removed = 0
+
+    matches = getattr(result, "matches", None)
+    if matches:
+        kept = [m for m in matches if not _is_credential_read_denied(getattr(m, "path", ""))]
+        removed += len(matches) - len(kept)
+        result.matches = kept
+
+    files = getattr(result, "files", None)
+    if files:
+        kept_files = [f for f in files if not _is_credential_read_denied(str(f))]
+        removed += len(files) - len(kept_files)
+        result.files = kept_files
+
+    if removed:
+        total = getattr(result, "total_count", None)
+        if isinstance(total, int):
+            result.total_count = max(0, total - removed)
+        result.credential_filtered = removed
+
+    return result
 
 
 # =============================================================================
@@ -629,6 +675,14 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+
+        # ── Credential read boundary (Phase 9 / Packet C) ─────────────
+        # Enforced at the byte layer so patch, patch_parser, and the
+        # fuzzy-match "did you mean" snippet are all covered without
+        # touching each call site. Independent of any redaction setting.
+        _cred_error = _credential_read_error(path)
+        if _cred_error:
+            return ReadResult(error=_cred_error)
         
         offset, limit = normalize_read_pagination(offset, limit)
         
@@ -766,6 +820,14 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
+
+        # ── Credential read boundary (Phase 9 / Packet C) ─────────────
+        # Enforced at the byte layer so patch, patch_parser, and the
+        # fuzzy-match "did you mean" snippet are all covered without
+        # touching each call site. Independent of any redaction setting.
+        _cred_error = _credential_read_error(path)
+        if _cred_error:
+            return ReadResult(error=_cred_error)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
         if stat_result.exit_code != 0:
@@ -1218,11 +1280,20 @@ class ShellFileOperations(FileOperations):
                 total_count=0
             )
         
+        # ── Credential read boundary: the search root itself ──────────
+        if _is_credential_read_denied(path):
+            return SearchResult(error=_credential_read_error(path), total_count=0)
+
         if target == "files":
-            return self._search_files(pattern, path, limit, offset)
+            _result = self._search_files(pattern, path, limit, offset)
         else:
-            return self._search_content(pattern, path, file_glob, limit, offset, 
-                                        output_mode, context)
+            _result = self._search_content(pattern, path, file_glob, limit, offset,
+                                           output_mode, context)
+
+        # ── Credential read boundary: per-match filtering ─────────────
+        # A content search over a project root would otherwise return .env
+        # line content verbatim in SearchResult.matches[*].content.
+        return _filter_credential_matches(_result)
     
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
