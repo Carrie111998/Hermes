@@ -1796,6 +1796,45 @@ class TestAuxiliaryFallbackLayering:
         # Main agent fallback should NOT be needed when chain succeeds
         mock_main.assert_not_called()
 
+    def test_inherited_routing_is_projected_per_fallback_destination(self):
+        primary_client = MagicMock()
+        primary_client.base_url = OPENROUTER_BASE_URL
+        rate_err = Exception("Rate limit exceeded")
+        rate_err.status_code = 429
+        primary_client.chat.completions.create.side_effect = rate_err
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.anthropic.com/v1"
+        fallback_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="fallback"))]
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "deepseek/deepseek-v4-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("openrouter", "deepseek/deepseek-v4-flash", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "claude-haiku-4-5", "anthropic"),
+        ), patch("agent.auxiliary_client._try_main_agent_model_fallback"):
+            result = call_llm(
+                task="compression",
+                main_runtime={
+                    "provider_preferences": {"ignore": ["digitalocean"]}
+                },
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "fallback"
+        primary_kwargs = primary_client.chat.completions.create.call_args.kwargs
+        fallback_kwargs = fallback_client.chat.completions.create.call_args.kwargs
+        assert primary_kwargs["extra_body"]["provider"] == {
+            "ignore": ["digitalocean"]
+        }
+        assert "provider" not in fallback_kwargs.get("extra_body", {})
+
 
     def test_warning_emitted_when_all_fallbacks_exhausted(self, monkeypatch, caplog):
         """When chain AND main model both fail, a user-visible warning fires before re-raise."""
