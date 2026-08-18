@@ -316,16 +316,34 @@ class TestSaveAuthStoreFailClosed:
 
     def test_save_rejected_when_destination_not_verified_restricted(self, tmp_path, monkeypatch):
         """After the atomic replace, the destination must verify as
-        user-restricted; failure to verify raises (fail closed) instead of
-        silently leaving the store exposed."""
+        user-restricted; failure to verify raises (fail closed) AND the
+        exposed store is removed — raising alone would leave a
+        group-readable credential file in place (F1/P4)."""
         target = tmp_path / "auth.json"
         target.write_text(
             json.dumps({"version": 1, "providers": {}}), encoding="utf-8"
         )
         monkeypatch.setattr(hc, "restrict_credential_file", lambda p: True)
-        monkeypatch.setattr(hc, "credential_file_is_user_restricted", lambda p: False)
+        check_calls = {"n": 0}
+
+        def _check(path):
+            check_calls["n"] += 1
+            # Temp re-verify (line 1421) = first call — must return True
+            # so the write proceeds to the atomic replace.
+            # Destination verify (line 1460) = second call — return False
+            # to trigger the fail-closed unlink + raise.
+            return check_calls["n"] < 2
+
+        monkeypatch.setattr(hc, "credential_file_is_user_restricted", _check)
+
         with pytest.raises(OSError, match="F1"):
             auth._save_auth_store(
                 {"version": 1, "providers": {"nous": {"api_key": "new"}}},
                 target_path=target,
             )
+        # P4: the unverifiable credential store must NOT remain on disk.
+        assert not target.exists(), (
+            "destination must be removed when it cannot be verified "
+            "user-restricted (fail closed)"
+        )
+        assert not list(tmp_path.glob("auth.json.tmp.*")), "temp store left behind"

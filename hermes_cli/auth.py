@@ -1458,6 +1458,15 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         from hermes_constants import credential_file_is_user_restricted
 
         if not credential_file_is_user_restricted(auth_file):
+            # F1 (P4): fail closed means the exposed bytes must not remain
+            # on disk at all. The adapter writer (anthropic_adapter.py)
+            # unlinks on verify failure; the auth store must do the same —
+            # raising alone leaves a group-readable credential store in
+            # place for the next process to read.
+            try:
+                auth_file.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise OSError(
                 f"F1: wrote {auth_file} but could not restrict it to the "
                 "current user; refusing to leave an exposed credential "
