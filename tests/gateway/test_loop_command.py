@@ -33,9 +33,17 @@ def loop_env(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+    from hermes_state import SessionDB
+
     loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
+    db = SessionDB()
+    loops._DB_CACHE[str(home)] = db
+    goals._DB_CACHE[str(home)] = db
     yield home
     loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
 
 
 def _make_runner():

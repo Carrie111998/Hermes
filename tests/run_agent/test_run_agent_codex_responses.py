@@ -1738,10 +1738,23 @@ def test_interim_content_was_streamed_matches_prefix_not_exact(monkeypatch):
     assert agent._interim_content_was_streamed("") is False
 
     # Streamed is LONGER than final (reverse direction) — should NOT match.
-    # This is the unsafe direction: it could suppress a needed resend in the
-    # gateway path where already_streamed=True calls on_segment_break().
     agent._current_streamed_assistant_text = "hello world extra"
     assert agent._interim_content_was_streamed("hello") is False
+
+
+def test_interim_content_fully_streamed_requires_exact_match(monkeypatch):
+    """_interim_content_fully_streamed requires exact equality after normalization (#88954).
+    A strict prefix match marks truncated commentary as fully streamed, causing gateway
+    on_segment_break() to permanently drop trailing text on Telegram."""
+    agent = _build_agent(monkeypatch)
+
+    # Exact match works
+    agent._current_streamed_assistant_text = "hello world"
+    assert agent._interim_content_fully_streamed("hello world") is True
+
+    # Streamed is only a strict prefix of the final — must NOT match (#88954)
+    agent._current_streamed_assistant_text = "hello"
+    assert agent._interim_content_fully_streamed("hello world") is False
 
 
 
