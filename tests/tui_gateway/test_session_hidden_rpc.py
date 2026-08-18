@@ -81,13 +81,16 @@ def test_compute_host_compress_wait_budget_resolution(monkeypatch):
     """#88988: the /compress host wait must scale with the compression
     timeout + retry rounds instead of the fixed 120s that failed the RPC
     while the host finished at ~134s."""
-    from tui_gateway import methods_session as ms
+    # The helper lives in tui_gateway.server: register() rebuilds every
+    # methods_* handler with server's globals, so module helpers referenced
+    # from those handlers must resolve there.
+    from tui_gateway import server
 
     import hermes_cli.config as hc_config
 
     # Shipped defaults: 120s per attempt x 3 rounds + 30s grace = 390s.
     monkeypatch.setattr(hc_config, "load_config", lambda: {})
-    assert ms._compute_host_compress_wait_s() == 390.0
+    assert server._compute_host_compress_wait_s() == 390.0
 
     # Config-driven: 60s per attempt x 2 rounds + 30s grace = 150s.
     monkeypatch.setattr(
@@ -98,8 +101,8 @@ def test_compute_host_compress_wait_budget_resolution(monkeypatch):
             "compression": {"max_attempts": 2},
         },
     )
-    assert ms._compute_host_compress_wait_s() == 150.0
+    assert server._compute_host_compress_wait_s() == 150.0
 
     # Broken config fails open to the default.
     monkeypatch.setattr(hc_config, "load_config", lambda: {"auxiliary": "nonsense"})
-    assert ms._compute_host_compress_wait_s() == 390.0
+    assert server._compute_host_compress_wait_s() == 390.0
