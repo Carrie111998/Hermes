@@ -42,6 +42,7 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -306,17 +307,21 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
 def _safe_temp_dirname(file: Path, repo_root: Path) -> str:
     """Build a filesystem-safe, unique-per-file basetemp dirname.
 
-    Derived from the test file's path relative to ``repo_root`` so runs are
-    stable/human-debuggable across retries, with non-alphanumeric
-    characters collapsed so the result is safe as a single path component
-    on both POSIX and Windows.
+    Derived from the test file's path relative to ``repo_root`` (stable
+    across retries and re-runs of the same file) but hashed down to a short
+    fixed-length token rather than a flattened full path: some environments
+    build AF_UNIX socket paths or similar fixed-length-limited paths inside
+    a test's temp tree, and a long human-readable basetemp component (deep
+    test package paths, long filenames) eats into that budget for no real
+    benefit. A short hash keeps every per-file basetemp path uniformly
+    short and still unique/deterministic per file.
     """
     try:
         rel = file.resolve().relative_to(repo_root.resolve())
     except ValueError:
         rel = file
-    stem = re.sub(r"[^A-Za-z0-9]+", "_", str(rel)).strip("_")
-    return stem or "file"
+    digest = hashlib.sha1(str(rel).encode("utf-8", "surrogateescape")).hexdigest()
+    return digest[:12]
 
 
 def _run_one_file(
@@ -399,17 +404,36 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file).
 
-    Each subprocess gets its OWN isolated temp root under
-    ``runner_tmp_root`` (derived from the test file's path, filesystem-safe)
-    instead of sharing one across every concurrently-running subprocess.
-    Previously every subprocess inherited the parent's ``TMPDIR`` unchanged,
-    so pytest's own ``tmp_path_factory`` startup GC — which prunes old
-    sibling ``pytest-<N>`` dirs under that shared root with no cross-process
-    lock — could delete a still-running sibling's temp tree mid-test,
-    producing non-deterministic failures under concurrency (matches the
-    ~34-file swing observed between two otherwise-identical PR #28
-    verification runs). Giving each subprocess its own basetemp/TMPDIR
-    removes the shared mutable state entirely.
+    Each subprocess gets its OWN isolated ``--basetemp`` under
+    ``runner_tmp_root`` (a short hash of the test file's path, see
+    ``_safe_temp_dirname``) instead of sharing one across every
+    concurrently-running subprocess. Previously every subprocess inherited
+    the parent's ``TMPDIR`` unchanged with no ``--basetemp`` override, so
+    pytest's own ``tmp_path_factory`` startup GC — which prunes old sibling
+    ``pytest-<N>`` dirs under that shared root with no cross-process lock —
+    could delete a still-running sibling's temp tree mid-test, producing
+    non-deterministic failures under concurrency (matches the ~34-file
+    swing observed between two otherwise-identical PR #28 verification
+    runs). An explicit, unique ``--basetemp`` per subprocess is what
+    actually disables that auto-GC path (pytest only runs the
+    keep-last-N/prune-siblings logic when it derives basetemp itself from
+    TMPDIR; an explicitly-passed --basetemp is used as-is, no GC of
+    siblings), so it alone removes the shared mutable state that caused
+    the race.
+
+    Deliberately NOT overriding the ``TMPDIR`` env var here (tried first,
+    reverted): ``tools/code_execution_tool.py`` builds its sandbox RPC
+    AF_UNIX socket path from ``tempfile.gettempdir()`` (which reads
+    ``TMPDIR``), on the documented assumption that it resolves to a short
+    path like ``/tmp`` (see its own comment about staying under the
+    104/108-byte AF_UNIX ``sun_path`` limit). Pointing ``TMPDIR`` at a
+    deep per-file directory here reproduced exactly that failure mode
+    live: ``tests/tools/test_approved_command_clean_slate.py`` failed with
+    ``OSError: AF_UNIX path too long`` once TMPDIR was overridden to a
+    nested per-file path. ``--basetemp`` is pytest-fixture-only plumbing
+    (``tmp_path``/``tmp_path_factory``) and is never consulted by
+    ``tempfile.gettempdir()``, so it isolates the one thing that actually
+    raced without touching AF_UNIX socket construction.
     """
     per_file_tmp = runner_tmp_root / _safe_temp_dirname(file, repo_root)
     per_file_tmp.mkdir(parents=True, exist_ok=True)
@@ -417,12 +441,6 @@ def _run_one_file_once(
         sys.executable, "-m", "pytest", str(file),
         f"--basetemp={per_file_tmp}", *pytest_args,
     ]
-
-    # Copy, don't forward, the parent environment: override TMPDIR per
-    # subprocess so any raw tempfile.* usage (not routed through pytest's
-    # tmp_path/--basetemp machinery) is also isolated per file.
-    subproc_env = dict(os.environ)
-    subproc_env["TMPDIR"] = str(per_file_tmp)
 
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -432,7 +450,7 @@ def _run_one_file_once(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        env=subproc_env,
+        env=os.environ,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
