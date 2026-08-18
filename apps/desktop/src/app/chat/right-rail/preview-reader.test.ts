@@ -3,6 +3,12 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { $rightRailActiveTabId, selectRightRailTab } from '@/store/layout'
 import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
 
+import {
+  PREVIEW_SELECTION_TEXT_MAX_CHARS,
+  PREVIEW_VISIBLE_HEADING_LIMIT,
+  PREVIEW_VISIBLE_HEADING_TEXT_MAX_CHARS,
+  PREVIEW_VISIBLE_TEXT_MAX_CHARS
+} from './preview-page-extract'
 import { PREVIEW_READ_MAX_CHARS, readActivePreview, registerPreviewPageReader } from './preview-reader'
 
 function urlTarget(url: string): PreviewTarget {
@@ -74,6 +80,46 @@ describe('readActivePreview (read_preview tool)', () => {
     })
   })
 
+  it('passes bounded viewport context independently of the full-text window', async () => {
+    openPreview(urlTarget('https://example.com/guide'), 'tool-result')
+    register($rightRailActiveTabId.get()!, async () => ({
+      scroll_height: 4_000,
+      scroll_ratio: 99,
+      scroll_y: 1_500,
+      selection_text: 's'.repeat(PREVIEW_SELECTION_TEXT_MAX_CHARS + 20),
+      text: 'abcdefghij',
+      title: 'Guide',
+      url: '',
+      viewport_height: 1_000,
+      visible_headings: Array.from({ length: PREVIEW_VISIBLE_HEADING_LIMIT + 2 }, (_, index) => ({
+        level: index + 1,
+        text: ` ${'h'.repeat(PREVIEW_VISIBLE_HEADING_TEXT_MAX_CHARS + 20)} `
+      })),
+      visible_text: 'v'.repeat(PREVIEW_VISIBLE_TEXT_MAX_CHARS + 20)
+    }))
+
+    const result = await readActivePreview({ count: 4, start: 2 })
+
+    expect(result).toMatchObject({
+      end: 6,
+      scroll_height: 4_000,
+      scroll_ratio: 0.5,
+      scroll_y: 1_500,
+      start: 2,
+      text: 'cdef',
+      total_chars: 10,
+      viewport_height: 1_000
+    })
+    expect(result?.selection_text).toHaveLength(PREVIEW_SELECTION_TEXT_MAX_CHARS)
+    expect(result?.visible_headings).toHaveLength(PREVIEW_VISIBLE_HEADING_LIMIT)
+    expect(result?.visible_headings?.[0]).toEqual({
+      level: 1,
+      text: 'h'.repeat(PREVIEW_VISIBLE_HEADING_TEXT_MAX_CHARS)
+    })
+    expect(result?.visible_headings?.at(-1)?.level).toBe(6)
+    expect(result?.visible_text).toHaveLength(PREVIEW_VISIBLE_TEXT_MAX_CHARS)
+  })
+
   it('caps a single read at PREVIEW_READ_MAX_CHARS even when asked for more', async () => {
     openPreview(urlTarget('https://example.com'), 'tool-result')
     register($rightRailActiveTabId.get()!, async () => ({
@@ -102,11 +148,15 @@ describe('readActivePreview (read_preview tool)', () => {
   it('answers a file tab with its identity and points at read_file', async () => {
     openPreview(fileTarget('/work/notes.md'), 'file-browser')
 
-    expect(await readActivePreview()).toMatchObject({
+    const result = await readActivePreview()
+
+    expect(result).toMatchObject({
       kind: 'file',
       note: expect.stringContaining('read_file') as string,
       path: '/work/notes.md'
     })
+    expect(result).not.toHaveProperty('visible_text')
+    expect(result).not.toHaveProperty('scroll_ratio')
   })
 
   it('reads the tab the user is LOOKING at, not the last one opened', async () => {
