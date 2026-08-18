@@ -74,10 +74,6 @@ class OpenCodeGoProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
 
         if _is_glm_5_2_model(model):
-            # GLM-5.2 on OpenCode Go uses its native OpenAI-compatible
-            # reasoning_effort knob, which has exactly two enabled levels:
-            # high and max. Map Hermes' richer scale onto those; leave the
-            # server default alone when reasoning is disabled or unset.
             if not isinstance(reasoning_config, dict):
                 return extra_body, top_level
             if reasoning_config.get("enabled") is False:
@@ -89,11 +85,7 @@ class OpenCodeGoProfile(ProviderProfile):
             return extra_body, top_level
 
         if _is_kimi_k2_model(model):
-            # Kimi K2 on OpenCode Go uses Moonshot's native wire shape:
-            # extra_body.thinking (binary toggle) + top-level reasoning_effort
-            # (low|medium|high). Mirrors the KimiProfile (api.moonshot.ai/v1).
             if not isinstance(reasoning_config, dict):
-                # No config → leave server defaults alone.
                 return extra_body, top_level
 
             enabled = reasoning_config.get("enabled") is not False
@@ -107,8 +99,6 @@ class OpenCodeGoProfile(ProviderProfile):
             elif effort in {"low", "medium", "high"}:
                 top_level["reasoning_effort"] = effort
 
-            # Avoid "cannot specify both 'thinking' and 'reasoning_effort'" HTTP 400:
-            # only send extra_body["thinking"] when no reasoning_effort is set.
             if "reasoning_effort" not in top_level:
                 extra_body["thinking"] = {"type": "enabled"}
             return extra_body, top_level
@@ -131,8 +121,6 @@ class OpenCodeGoProfile(ProviderProfile):
             elif effort in {"low", "medium", "high"}:
                 top_level["reasoning_effort"] = effort
 
-        # Avoid "cannot specify both 'thinking' and 'reasoning_effort'" HTTP 400:
-        # only send extra_body["thinking"] when no reasoning_effort is set.
         if "reasoning_effort" not in top_level:
             extra_body["thinking"] = {"type": "enabled"}
 
@@ -155,6 +143,7 @@ opencode_go = OpenCodeGoProfile(
     base_url="https://opencode.ai/zen/go/v1",
     default_headers=dict(_ATTRIBUTION_HEADERS),
     default_aux_model="glm-5",
+    supports_vision_tool_messages=False,
 )
 
 register_provider(opencode_zen)
