@@ -11,7 +11,7 @@
 # =============================================================================
 
 model:
-  default: deepseek-ai/deepseek-v4-flash-0731
+  default: stepfun-ai/step-3.7-flash
   provider: nvidia
   base_url: https://integrate.api.nvidia.com/v1
 
@@ -79,13 +79,7 @@ memory:
 # Fallback providers (NVIDIA NIM models — verified against /v1/models catalog)
 fallback_providers:
   - provider: nvidia
-    model: stepfun-ai/step-3.7-flash
-    key_env: NVIDIA_API_KEY
-  - provider: nvidia
     model: minimaxai/minimax-m3
-    key_env: NVIDIA_API_KEY
-  - provider: nvidia
-    model: deepseek-ai/deepseek-v4-flash-0731
     key_env: NVIDIA_API_KEY
   - provider: nvidia
     model: z-ai/glm-5.2
@@ -95,6 +89,9 @@ fallback_providers:
     key_env: NVIDIA_API_KEY
   - provider: nvidia
     model: meta/llama-3.3-70b-instruct
+    key_env: NVIDIA_API_KEY
+  - provider: nvidia
+    model: deepseek-ai/deepseek-v4-flash-0731
     key_env: NVIDIA_API_KEY
 
 tts:
