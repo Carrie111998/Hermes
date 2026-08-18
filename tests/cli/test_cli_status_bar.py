@@ -368,5 +368,80 @@ class TestIdleSinceLastTurn:
         cli_obj._prompt_duration = 5.0
         snapshot = cli_obj._get_status_bar_snapshot()
         assert snapshot["idle_since"].startswith("✓ ")
+class TestStatusBarReasoningLabel:
+    """Reasoning-effort indicator (thinking level) in the status bar."""
+
+    def test_label_none_config(self):
+        """reasoning_config unset → empty string."""
+        cli_obj = _make_cli()
+        assert cli_obj._status_bar_reasoning_label() == ""
+
+    def test_label_disabled(self):
+        """reasoning disabled → '⊘ off'."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": False}
+        assert cli_obj._status_bar_reasoning_label() == "⊘ off"
+
+    def test_label_enabled_with_effort(self):
+        """reasoning enabled with effort → effort string."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": True, "effort": "high"}
+        assert cli_obj._status_bar_reasoning_label() == "high"
+
+    def test_label_enabled_no_effort_key(self):
+        """reasoning enabled but no effort key → empty string."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": True}
+        assert cli_obj._status_bar_reasoning_label() == ""
+
+    def test_label_empty_effort(self):
+        """reasoning enabled with blank effort → empty string."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": True, "effort": "  "}
+        assert cli_obj._status_bar_reasoning_label() == ""
+
+    def test_label_uppercase_normalized(self):
+        """uppercase effort is lowercased for display."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": True, "effort": "HIGH"}
+        assert cli_obj._status_bar_reasoning_label() == "high"
+
+    def test_label_shown_in_text_output(self):
+        """reasoning label appears in _build_status_bar_text()."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": True, "effort": "high"}
+        text = cli_obj._build_status_bar_text(width=80)
+        assert "high" in text
+        assert "⚕" in text
+
+    def test_label_shown_in_snapshot(self):
+        """reasoning label is present in snapshot dict."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": True, "effort": "medium"}
+        snapshot = cli_obj._get_status_bar_snapshot()
+        assert snapshot["reasoning_effort"] == "medium"
+
+    def test_width_no_overflow_narrow(self):
+        """narrow terminal with reasoning label doesn't overflow."""
+        cli_obj = _make_cli()
+        cli_obj.reasoning_config = {"enabled": True, "effort": "xhigh"}
+        text = cli_obj._build_status_bar_text(width=40)
+        assert cli_obj._status_bar_display_width(text) <= 40
+
+    def test_width_no_overflow_wide(self):
+        """wide terminal with reasoning label doesn't overflow."""
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        cli_obj.reasoning_config = {"enabled": True, "effort": "high"}
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "high" in text
+        assert cli_obj._status_bar_display_width(text) <= 120
 
 

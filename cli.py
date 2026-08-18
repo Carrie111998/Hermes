@@ -6103,6 +6103,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "reasoning_effort": self._status_bar_reasoning_label(),
             "duration": format_duration_compact(elapsed_seconds),
             "session_title": self._get_status_bar_session_title(),
             "prompt_elapsed": self._format_prompt_elapsed(
@@ -6268,6 +6269,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._status_bar_title_cache = title
         self._status_bar_title_checked_at = now
         return title
+
+    def _status_bar_reasoning_label(self) -> str:
+        """Return a short reasoning-effort label for the status bar.
+
+        Shows the current thinking level (e.g. 'high', 'medium') when
+        reasoning is enabled, or '⊘ off' when explicitly disabled.
+        Returns empty string when no reasoning config is set (defaults
+        to provider behaviour).
+        """
+        cfg = getattr(self, "reasoning_config", None)
+        if cfg is None:
+            return ""
+        if not cfg.get("enabled", True):
+            return "⊘ off"
+        effort = str(cfg.get("effort", "")).strip().lower()
+        return effort if effort else ""
 
     @staticmethod
     def _status_bar_display_width(text: str) -> int:
@@ -6860,8 +6877,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
+            reasoning_label = snapshot.get("reasoning_effort") or ""
+            model_display = f"⚕ {snapshot['model_short']}"
+            if reasoning_label:
+                model_display += f" · {reasoning_label}"
             if width < 52:
-                text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
+                text = f"{battery_prefix}{model_display} · {duration_label}"
                 if goal_segment:
                     text += f" · {goal_segment}"
                 if focus_label:
@@ -6870,7 +6891,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     text += " · ⚠ YOLO"
                 return self._right_align_status_title(text, session_title, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [model_display, percent_label]
                 if battery_label:
                     parts.insert(0, battery_label)
                 compressions = snapshot.get("compressions", 0)
@@ -6902,7 +6923,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [model_display, context_label, percent_label]
             if battery_label:
                 parts.insert(0, battery_label)
             if compressions:
@@ -6953,12 +6974,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_title = snapshot.get("session_title") or ""
 
             if width < 52:
+                reasoning_label = snapshot.get("reasoning_effort") or ""
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
+                ]
+                if reasoning_label:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-dim", reasoning_label))
+                frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
-                ]
+                ])
                 if goal_segment:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-strong", goal_segment))
@@ -6977,12 +7004,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
+                    reasoning_label = snapshot.get("reasoning_effort") or ""
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if reasoning_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-dim", reasoning_label))
+                    frags.extend([
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
-                    ]
+                    ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -7022,16 +7055,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
+                    reasoning_label = snapshot.get("reasoning_effort") or ""
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if reasoning_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-dim", reasoning_label))
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
-                    ]
+                    ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
