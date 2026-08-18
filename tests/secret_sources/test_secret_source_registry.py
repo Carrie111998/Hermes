@@ -193,6 +193,35 @@ class TestApplyAll:
             report = reg.apply_all(cfg, tmp_path, environ={})
             assert isinstance(report, reg.ApplyReport)
 
+    def test_ordered_enabled_sources_warns_on_unknown_by_default(self, caplog):
+        import logging
+        reg.register_source(_make_source(name="dummy"))
+        cfg = {"sources": ["passbolt", "dummy"], "dummy": {"enabled": True}}
+        with caplog.at_level(logging.WARNING, logger="agent.secret_sources.registry"):
+            sources = reg._ordered_enabled_sources(cfg)
+        assert len(sources) == 1
+        assert sources[0].name == "dummy"
+        assert any("secrets.sources names unknown source(s): passbolt" in r.message for r in caplog.records)
+
+    def test_ordered_enabled_sources_suppresses_warning_when_warn_unknown_false(self, caplog):
+        import logging
+        reg.register_source(_make_source(name="dummy"))
+        cfg = {"sources": ["passbolt", "dummy"], "dummy": {"enabled": True}}
+        with caplog.at_level(logging.WARNING, logger="agent.secret_sources.registry"):
+            sources = reg._ordered_enabled_sources(cfg, warn_unknown=False)
+        assert len(sources) == 1
+        assert sources[0].name == "dummy"
+        assert not any("secrets.sources names unknown source(s)" in r.message for r in caplog.records)
+
+    def test_apply_all_forwards_warn_unknown_flag(self, tmp_path, caplog):
+        import logging
+        reg.register_source(_make_source(name="dummy", secrets={"K": "v"}))
+        cfg = {"sources": ["passbolt", "dummy"], "dummy": {"enabled": True}}
+        with caplog.at_level(logging.WARNING, logger="agent.secret_sources.registry"):
+            report = reg.apply_all(cfg, tmp_path, environ={}, warn_unknown=False)
+        assert report.applied_any
+        assert not any("secrets.sources names unknown source(s)" in r.message for r in caplog.records)
+
 
 
 # ---------------------------------------------------------------------------

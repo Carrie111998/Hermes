@@ -343,7 +343,10 @@ def _fetch_with_timeout(
 
 
 def _ordered_enabled_sources(
-    secrets_cfg: dict, *, scope: Optional[str] = None
+    secrets_cfg: dict,
+    *,
+    scope: Optional[str] = None,
+    warn_unknown: bool = True,
 ) -> List[SecretSource]:
     """Resolve which sources run, in which order.
 
@@ -363,10 +366,19 @@ def _ordered_enabled_sources(
         unknown = [e for e in explicit
                    if isinstance(e, str) and e not in sources]
         if unknown:
-            logger.warning(
-                "secrets.sources names unknown source(s): %s (known: %s)",
-                ", ".join(unknown), ", ".join(sources) or "none",
-            )
+            if warn_unknown:
+                logger.warning(
+                    "secrets.sources names unknown source(s): %s (known: %s)",
+                    ", ".join(unknown), ", ".join(sources) or "none",
+                )
+            else:
+                # Bootstrap runs before plugins register their sources
+                # (#89078), so "unknown" here is not yet a verdict. Park the
+                # names; register_source() discharges the ones a plugin
+                # supplies, and warn_unresolved_source_names() reports
+                # whatever is still unknown once discovery is done.
+                with _pending_unknown_lock:
+                    _pending_unknown_sources.update(unknown)
     for name in sources:
         if name not in order:
             order.append(name)
@@ -423,7 +435,8 @@ def _profile_alias_target(var: str, profile: str) -> Optional[str]:
 
 
 def apply_all(secrets_cfg: dict, home_path: Path,
-              environ: Optional[MutableMapping[str, str]] = None) -> ApplyReport:
+              environ: Optional[MutableMapping[str, str]] = None,
+              *, warn_unknown: bool = True) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to env.
 
     ``environ`` defaults to ``os.environ``; injectable for tests.
@@ -456,7 +469,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
 
     secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
     enabled = _ordered_enabled_sources(
-        secrets_cfg, scope=hermes_home_key(home_path)
+        secrets_cfg, scope=hermes_home_key(home_path), warn_unknown=warn_unknown
     )
     if not enabled:
         return report
