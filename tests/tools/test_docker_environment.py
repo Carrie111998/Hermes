@@ -717,12 +717,11 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
             if sub == "ps":
                 if ps_state is None:
                     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-                # 3-field format: ID, State, EgressLabel.  When egress_label
-                # is "off" the code parses all three fields; <no value> means
-                # the container has no egress label, which is acceptable.
+                # Local reuse probes include egress and mount-root labels.
+                # <no value> models a container created before either label.
                 return subprocess.CompletedProcess(
                     cmd, 0,
-                    stdout=f"reused-cid\t{ps_state}\t<no value>\n",
+                    stdout=f"reused-cid\t{ps_state}\t<no value>\t<no value>\n",
                     stderr="",
                 )
             if sub == "start":
@@ -764,6 +763,52 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+
+
+def test_local_reuse_accepts_container_created_before_mount_root_label(monkeypatch):
+    """The new mount identity must not churn legacy local-daemon containers."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = _mock_subprocess_run_with_reuse(monkeypatch, ps_state="running")
+
+    env = _make_dummy_env(task_id="legacy-local")
+
+    assert env._container_id == "reused-cid"
+    ps_args = next(
+        call[0] for call in calls
+        if isinstance(call[0], list) and call[0][1:2] == ["ps"]
+    )
+    assert not any(
+        str(arg).startswith("label=hermes-mount-root=") for arg in ps_args
+    )
+
+
+def test_local_reuse_rejects_container_with_remote_mount_root(monkeypatch):
+    """The legacy fallback must not attach to a remote-root container."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+            if cmd[1] == "ps":
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout="remote-cid\trunning\toff\tremote-root-hash\n",
+                    stderr="",
+                )
+            if cmd[1] == "run":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="fresh-cid\n", stderr="",
+                )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="local-root")
+
+    assert env._container_id == "fresh-cid"
 
 
 def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
@@ -928,8 +973,8 @@ def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
 
 def test_find_reusable_handles_empty_label_string(monkeypatch):
     """Docker CLI v29.5.3 returns an empty string (NOT ``<no value>``)
-    for absent labels.  The trailing tab produces ``cid\\trunning\\t\\n``;
-    we must not strip the trailing tab or the three-field parser drops the
+    for absent labels.  The trailing tabs preserve empty egress and mount-root
+    fields; we must not strip them or the parser drops the
     container.  Regression test for the egilewski review on #48073."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
@@ -942,7 +987,7 @@ def test_find_reusable_handles_empty_label_string(monkeypatch):
                 # Docker v29.5.3: absent label → empty string, trailing tab
                 return subprocess.CompletedProcess(
                     cmd, 0,
-                    stdout="safe-cid\trunning\t\n",
+                    stdout="safe-cid\trunning\t\t\n",
                     stderr="",
                 )
         return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")

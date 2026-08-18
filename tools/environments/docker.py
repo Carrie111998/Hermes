@@ -1914,8 +1914,12 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
-                "--filter", f"label={_MOUNT_ROOT_LABEL_KEY}={mount_root_label}",
             ]
+            local_mount_root = mount_root_label == "local"
+            if not local_mount_root:
+                filters.extend([
+                    "--filter", f"label={_MOUNT_ROOT_LABEL_KEY}={mount_root_label}",
+                ])
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
                 fmt = "{{.ID}}\t{{.State}}"
@@ -1928,6 +1932,11 @@ class DockerEnvironment(BaseEnvironment):
                 # reused after the operator runs "hermes egress disable",
                 # preserving baked-in proxy env and CA mounts.
                 fmt = '{{.ID}}\t{{.State}}\t{{.Label "' + _EGRESS_LABEL_KEY + '"}}'
+            if local_mount_root:
+                # Containers created before mount-root identity existed used
+                # the local daemon view. Include them in the probe, but reject
+                # containers carrying a different (remote-daemon) root below.
+                fmt += '\t{{.Label "' + _MOUNT_ROOT_LABEL_KEY + '"}}'
             result = subprocess.run(
                 [
                     self._docker_exe, "ps", "-a",
@@ -1960,24 +1969,29 @@ class DockerEnvironment(BaseEnvironment):
         running = None
         first = None
         for ln in lines:
+            parts = ln.split("\t")
+            expected_fields = 2 + (egress_label == "off") + local_mount_root
+            if len(parts) < expected_fields:
+                continue
+            cid, state = parts[0], parts[1].lower()
+            field_index = 2
             if egress_label == "off":
-                # Format: ID\tState\tEgressLabel — parse all three fields
-                # and reject containers with a non-off egress label.
-                parts = ln.split("\t", 2)
-                if len(parts) < 3:
-                    continue
-                cid, state, egress_val = parts[0], parts[1].lower(), parts[2]
+                egress_val = parts[field_index]
+                field_index += 1
                 if egress_val not in ("", "<no value>", "off"):
                     logger.debug(
                         "skipping container %s for egress=off reuse: "
                         "label %s=%r", cid, _EGRESS_LABEL_KEY, egress_val,
                     )
                     continue
-            else:
-                parts = ln.split("\t", 1)
-                if len(parts) != 2:
+            if local_mount_root:
+                mount_root_val = parts[field_index]
+                if mount_root_val not in ("", "<no value>", "local"):
+                    logger.debug(
+                        "skipping container %s for local mount-root reuse: "
+                        "label %s=%r", cid, _MOUNT_ROOT_LABEL_KEY, mount_root_val,
+                    )
                     continue
-                cid, state = parts[0], parts[1].lower()
             if first is None:
                 first = (cid, state)
             if state == "running" and running is None:
