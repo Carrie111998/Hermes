@@ -1,7 +1,7 @@
 # Write-side dead-link check — design
 
 Date: 2026-08-17
-Status: approved (Diego, 2026-08-17), pending implementation
+Status: implemented 2026-08-18, landed INERT (CLAUDE_MEMORY_TOMBSTONE_WARN unset). Acceptance sweep: 2 hits, both PREEXISTING_DEAD. Awaiting Diego's review before activation.
 Scope: `~/.claude/hooks/memory-index-size-guard.py` (single file; **no `settings.json` change**)
 Related: `specs/2026-08-17-link-aware-memory-deletion-design.md` (the deletion guard this
 completes), `plans/2026-08-17-link-aware-memory-deletion.md`,
