@@ -400,17 +400,38 @@ def generate_title(
     ]
 
     try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
-        )
+        try:
+            response = call_llm(
+                task="title_generation",
+                messages=messages,
+                # A title is a handful of tokens. The old 500-token ceiling let a
+                # chatty model burn seconds generating prose we then threw away.
+                max_tokens=64,
+                temperature=0.3,
+                timeout=timeout,
+                main_runtime=main_runtime,
+                extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            )
+        except Exception as e:
+            if "response_format" not in str(e).lower():
+                raise
+            # The provider rejected the structured-outputs format outright
+            # (DeepSeek &c. accept only json_object and 400 before the model
+            # ever runs). Retry without the parameter: the extraction
+            # fallbacks already handle non-structured responses, so titling
+            # still works instead of failing on every session (#88830).
+            logger.debug(
+                "Title generation retrying without response_format "
+                "after provider rejection: %s", e,
+            )
+            response = call_llm(
+                task="title_generation",
+                messages=messages,
+                max_tokens=64,
+                temperature=0.3,
+                timeout=timeout,
+                main_runtime=main_runtime,
+            )
         content = response.choices[0].message.content or ""
         title = _clean_title(_extract_title_text(content))
         # Answer-shaped output guard: titling is a 3-7 word task, so a title

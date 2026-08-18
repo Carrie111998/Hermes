@@ -46,6 +46,41 @@ class TestGenerateTitle:
         assert captured_kwargs["task"] == "title_generation"
         assert captured_kwargs["timeout"] is None
 
+    def test_retries_without_response_format_after_provider_rejection(self):
+        """DeepSeek-style providers 400 on json_schema response_format before
+        the model runs. The call must retry once without the parameter —
+        the extraction fallbacks handle non-structured responses — instead
+        of failing titling on every session (#88830)."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if "extra_body" in kwargs:
+                raise RuntimeError(
+                    "HTTP 400: This response_format type is unavailable now"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Retry Title"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            assert generate_title("question") == "Retry Title"
+
+        assert len(calls) == 2
+        assert "response_format" in calls[0]["extra_body"]
+        assert "extra_body" not in calls[1]
+
+    def test_unrelated_failure_does_not_retry_without_format(self):
+        """A failure that doesn't mention response_format (bad key, quota…)
+        must keep the single-attempt contract."""
+
+        def mock_call_llm(**kwargs):
+            raise RuntimeError("HTTP 401: invalid api key")
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            assert generate_title("question") is None
+
 
 
     def test_strips_think_blocks(self):
