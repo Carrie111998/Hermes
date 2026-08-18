@@ -317,7 +317,10 @@ def cmd_sessions(args, sessions_parser=None):
     try:
         from hermes_state import SessionDB
 
-        db = SessionDB(read_only=action == "cold-verify")
+        read_only = action == "cold-verify" or (
+            action == "cold-purge" and bool(getattr(args, "dry_run", False))
+        )
+        db = SessionDB(read_only=read_only)
     except Exception as e:
         print(f"Error: Could not open session database: {e}")
         return 1
@@ -968,6 +971,56 @@ def cmd_sessions(args, sessions_parser=None):
         print(f"  physical IDs: {', '.join(stored.physical_ids)}")
         print(f"  fingerprint: {stored.source_fingerprint}")
         print(f"  local snapshot: {stored.snapshot_dir}")
+
+    elif action == "cold-purge":
+        resolved_session_id = db.resolve_session_id(args.session_id)
+        if not resolved_session_id:
+            print(f"Session '{args.session_id}' was not found or is ambiguous.")
+            db.close()
+            return 1
+
+        archive_root = args.root.expanduser()
+        if args.dry_run:
+            from hermes_cli.session_cold_store import verify_archived_lineage
+
+            try:
+                verified = verify_archived_lineage(
+                    db, resolved_session_id, archive_root
+                )
+            except (OSError, ValueError) as exc:
+                print(f"Error: could not cold-purge session lineage: {exc}")
+                db.close()
+                return 1
+            print("Would purge archived session lineage:")
+            print(f"  terminal ID: {verified.terminal_id}")
+            print(f"  physical IDs: {', '.join(verified.physical_ids)}")
+            print("Dry run: nothing was deleted; the cold snapshot remains local.")
+            db.close()
+            return 0
+
+        if not args.yes:
+            print("Error: actual cold purge requires --yes; nothing was deleted.")
+            db.close()
+            return 1
+
+        from hermes_cli.session_cold_store import purge_archived_lineage
+
+        try:
+            purged = purge_archived_lineage(
+                db, resolved_session_id, archive_root
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Error: could not cold-purge session lineage: {exc}")
+            db.close()
+            return 1
+
+        print("Purged archived session lineage from SQLite:")
+        print(f"  terminal ID: {purged.terminal_id}")
+        print(f"  physical IDs: {', '.join(purged.physical_ids)}")
+        print(f"  fingerprint: {purged.source_fingerprint}")
+        print(f"  cold snapshot remains local: {purged.snapshot_dir}")
+        db.close()
+        return 0
 
     elif action == "prune" and getattr(args, "never_active", False):
         # Separate branch on purpose: the shared prune/archive selector is

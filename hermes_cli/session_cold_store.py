@@ -1,4 +1,4 @@
-"""Local cold archive Store and read-only Verify primitives."""
+"""Local cold archive Store, read-only Verify, and explicit Purge primitives."""
 
 from __future__ import annotations
 
@@ -37,6 +37,16 @@ class StoredLineage:
 @dataclass(frozen=True)
 class VerifiedLineage:
     """Identity of a current snapshot verified against its live Store plan."""
+
+    terminal_id: str
+    physical_ids: tuple[str, ...]
+    source_fingerprint: str
+    snapshot_dir: Path
+
+
+@dataclass(frozen=True)
+class PurgedLineage:
+    """Identity deleted from SQLite while its verified snapshot remains local."""
 
     terminal_id: str
     physical_ids: tuple[str, ...]
@@ -569,17 +579,8 @@ def _open_existing_snapshot_parent(
     return descriptors, edges
 
 
-def verify_archived_lineage(
-    db: SessionDB, terminal_id: str, archive_root: Path
-) -> VerifiedLineage:
-    """Verify one existing current snapshot against the live Store plan.
-
-    This primitive is strictly read-only: it performs no database writes and
-    opens only existing archive directories and payloads with no-follow flags.
-    """
-    _require_supported_platform()
-    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
-    plan = _read_store_plan(db, terminal_id)
+def _verify_plan_snapshot(archive_root: Path, plan: _StorePlan) -> Path:
+    """Verify the existing snapshot for an already-consistent Store plan."""
     snapshot_dir, snapshot_name, parent_parts = _snapshot_location(
         archive_root, plan
     )
@@ -608,12 +609,153 @@ def verify_archived_lineage(
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+    return snapshot_dir
+
+
+def verify_archived_lineage(
+    db: SessionDB, terminal_id: str, archive_root: Path
+) -> VerifiedLineage:
+    """Verify one existing current snapshot against the live Store plan.
+
+    This primitive is strictly read-only: it performs no database writes and
+    opens only existing archive directories and payloads with no-follow flags.
+    """
+    _require_supported_platform()
+    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
+    plan = _read_store_plan(db, terminal_id)
+    snapshot_dir = _verify_plan_snapshot(archive_root, plan)
     return VerifiedLineage(
         plan.terminal_id,
         plan.physical_ids,
         plan.source_fingerprint,
         snapshot_dir,
     )
+
+
+def _quoted_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _id_chunks(ids: tuple[str, ...]) -> list[tuple[str, ...]]:
+    return [
+        ids[start : start + _MAX_SQLITE_IN_PARAMS]
+        for start in range(0, len(ids), _MAX_SQLITE_IN_PARAMS)
+    ]
+
+
+def _reject_uncovered_session_references(
+    conn: sqlite3.Connection, physical_ids: tuple[str, ...]
+) -> None:
+    """Fail if deleting the covered rows would mutate any unsnapshotted row."""
+    covered = set(physical_ids)
+    chunks = _id_chunks(physical_ids)
+    for ids in chunks:
+        placeholders = ",".join("?" for _ in ids)
+        children = conn.execute(
+            f"SELECT id FROM sessions WHERE parent_session_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        uncovered = [str(row[0]) for row in children if str(row[0]) not in covered]
+        if uncovered:
+            raise ValueError(
+                "cold purge refuses an uncovered child session referencing the "
+                f"lineage: {uncovered[0]}"
+            )
+
+    tables = conn.execute(
+        "SELECT name FROM sqlite_schema "
+        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    covered_fk_tables = {"messages", "session_model_usage", "sessions"}
+    for table_row in tables:
+        table = str(table_row[0])
+        if table in covered_fk_tables:
+            continue
+        quoted_table = _quoted_identifier(table)
+        foreign_keys = conn.execute(
+            f"PRAGMA foreign_key_list({quoted_table})"
+        ).fetchall()
+        for foreign_key in foreign_keys:
+            if str(foreign_key[2]) != "sessions":
+                continue
+            source_column = str(foreign_key[3])
+            quoted_column = _quoted_identifier(source_column)
+            for ids in chunks:
+                placeholders = ",".join("?" for _ in ids)
+                referenced = conn.execute(
+                    f"SELECT 1 FROM {quoted_table} "
+                    f"WHERE {quoted_column} IN ({placeholders}) LIMIT 1",
+                    ids,
+                ).fetchone()
+                if referenced is not None:
+                    raise ValueError(
+                        "cold purge refuses an uncovered foreign-key row in "
+                        f"{table}.{source_column}"
+                    )
+
+
+def purge_archived_lineage(
+    db: SessionDB, terminal_id: str, archive_root: Path
+) -> PurgedLineage:
+    """Delete exactly one verified archived compression lineage from SQLite.
+
+    Store eligibility, source records, and the existing snapshot fingerprint
+    are re-read under the final ``BEGIN IMMEDIATE`` transaction. Archive files
+    are read for verification only and are never removed by this operation.
+    """
+    _require_supported_platform()
+    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
+
+    def _purge(conn: sqlite3.Connection) -> PurgedLineage:
+        plan = _build_store_plan(conn, terminal_id)
+        snapshot_dir = _verify_plan_snapshot(archive_root, plan)
+        _reject_uncovered_session_references(conn, plan.physical_ids)
+
+        prompt_hashes = tuple(
+            sorted(
+                {
+                    str(record["row"]["hash"])
+                    for record in plan.records
+                    if record["kind"] == "system-prompt"
+                }
+            )
+        )
+        for ids in _id_chunks(plan.physical_ids):
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"DELETE FROM messages WHERE session_id IN ({placeholders})", ids
+            )
+            conn.execute(
+                "DELETE FROM session_model_usage "
+                f"WHERE session_id IN ({placeholders})",
+                ids,
+            )
+        deleted_rows = 0
+        for ids in _id_chunks(tuple(reversed(plan.physical_ids))):
+            placeholders = ",".join("?" for _ in ids)
+            cursor = conn.execute(
+                f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
+            )
+            deleted_rows += cursor.rowcount
+        if deleted_rows != len(plan.physical_ids):
+            raise RuntimeError("cold purge source lineage changed during deletion")
+        for hashes in _id_chunks(prompt_hashes):
+            placeholders = ",".join("?" for _ in hashes)
+            conn.execute(
+                f"DELETE FROM system_prompts WHERE hash IN ({placeholders}) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM sessions "
+                "WHERE sessions.system_prompt_hash = system_prompts.hash)",
+                hashes,
+            )
+        return PurgedLineage(
+            plan.terminal_id,
+            plan.physical_ids,
+            plan.source_fingerprint,
+            snapshot_dir,
+        )
+
+    return db._execute_write(_purge)
 
 
 def store_archived_lineage(db: SessionDB, terminal_id: str, archive_root: Path) -> StoredLineage:

@@ -9,7 +9,11 @@ import signal
 import pytest
 
 import hermes_cli.session_cold_store as cold_store
-from hermes_cli.session_cold_store import plan_archived_lineage, store_archived_lineage
+from hermes_cli.session_cold_store import (
+    plan_archived_lineage,
+    purge_archived_lineage,
+    store_archived_lineage,
+)
 from hermes_state import SessionDB
 
 
@@ -56,6 +60,110 @@ def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
         assert store_archived_lineage(db, "terminal", archive_root) == result
         assert db.get_session("root") is not None
         assert db.get_session("terminal") is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("snapshot_state", ["missing", "mismatched"])
+def test_purge_rejects_missing_or_mismatched_snapshot_and_retains_source_rows(
+    tmp_path: Path,
+    snapshot_state: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="keep me")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        stored = store_archived_lineage(db, "terminal", archive_root)
+        if snapshot_state == "missing":
+            archive_root = tmp_path / "missing-archive"
+        else:
+            metadata_path = stored.snapshot_dir / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["source_fingerprint"] = "0" * 64
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="snapshot"):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("terminal") is not None
+        assert db.get_messages("terminal")[0]["content"] == "keep me"
+    finally:
+        db.close()
+
+
+def test_purge_rejects_source_mutation_after_store_and_retains_source_rows(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="stored")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        db.append_message("terminal", role="assistant", content="changed after Store")
+
+        with pytest.raises(ValueError, match="fingerprint"):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("terminal") is not None
+        assert [message["content"] for message in db.get_messages("terminal")] == [
+            "stored",
+            "changed after Store",
+        ]
+    finally:
+        db.close()
+
+
+def test_purge_rechecks_pin_inside_delete_transaction(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="stored")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        assert db.set_session_pinned("terminal", True)
+
+        with pytest.raises(ValueError, match="pinned"):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("terminal") is not None
+        assert db.get_messages("terminal")[0]["content"] == "stored"
+    finally:
+        db.close()
+
+
+def test_purge_rejects_uncovered_child_and_preserves_foreign_key_rows(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("root", source="cli")
+        db.end_session("root", "compression")
+        db.create_session("terminal", source="cli", parent_session_id="root")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        db.create_session(
+            "branch",
+            source="cli",
+            parent_session_id="root",
+            model_config={"_branched_from": "root"},
+        )
+
+        with pytest.raises(ValueError, match="uncovered child"):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("root") is not None
+        assert db.get_session("terminal") is not None
+        assert db.get_session("branch")["parent_session_id"] == "root"
     finally:
         db.close()
 
