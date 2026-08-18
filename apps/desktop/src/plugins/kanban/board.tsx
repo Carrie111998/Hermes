@@ -275,6 +275,7 @@ function Card({
             selected && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
             dragging && 'opacity-40'
           )}
+          data-kanban-card={task.id}
           draggable
           onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
           onDragEnd={() => setDragging(false)}
@@ -426,9 +427,11 @@ function Column({
         {...dragHandlers}
         aria-label={k.expand(label)}
         className={cn(
-          'flex h-full w-8 shrink-0 flex-col items-center gap-1.5 rounded-lg p-2 transition-colors hover:bg-(--ui-bg-quinary)',
+          'flex h-full w-8 shrink-0 snap-start flex-col items-center gap-1.5 rounded-lg p-2 transition-colors hover:bg-(--ui-bg-quinary) md:[scroll-snap-align:none]',
           wash
         )}
+        data-kanban-lane={column.name}
+        id={`kanban-lane-${column.name}`}
         onClick={onToggle}
         ref={laneRef}
         type="button"
@@ -450,10 +453,11 @@ function Column({
     <div
       {...dragHandlers}
       className={cn(
-        'group/col flex h-full w-[calc(100vw-2rem)] max-w-full shrink-0 snap-start snap-always flex-col rounded-lg p-2 transition-colors md:w-64 md:[scroll-snap-align:none]',
+        'group/col flex h-full w-[calc(100vw-2rem)] max-w-full shrink-0 snap-start flex-col rounded-lg p-2 transition-colors md:w-64 md:[scroll-snap-align:none]',
         wash
       )}
       data-kanban-lane={column.name}
+      id={`kanban-lane-${column.name}`}
       ref={laneRef}
       style={{ width: laneWidth }}
     >
@@ -1344,13 +1348,13 @@ export function KanbanBoardPage() {
     if (!scroller || !lane) {return}
 
     setSelectedLane(name)
-    const scrollerRect = scroller.getBoundingClientRect()
-    const laneRect = lane.getBoundingClientRect()
     const paddingLeft = Number.parseFloat(getComputedStyle(scroller).paddingLeft) || 0
 
     scroller.scrollTo({
       behavior: 'auto',
-      left: scroller.scrollLeft + laneRect.left - scrollerRect.left - paddingLeft
+      // offsetLeft is stable while another lane's snap position is settling;
+      // rect deltas can observe that transient scroll and land one lane short.
+      left: lane.offsetLeft - paddingLeft
     })
   }
 
@@ -1444,6 +1448,7 @@ export function KanbanBoardPage() {
 
             return (
               <button
+                aria-controls={`kanban-lane-${col.name}`}
                 aria-label={label}
                 aria-selected={selectedLane === col.name}
                 className={cn(
@@ -1455,6 +1460,7 @@ export function KanbanBoardPage() {
                 onClick={() => revealLane(col.name)}
                 onKeyDown={event => onLaneKeyDown(event, index)}
                 role="tab"
+                tabIndex={selectedLane === col.name ? 0 : -1}
                 title={label}
                 type="button"
               >

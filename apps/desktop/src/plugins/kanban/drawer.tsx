@@ -701,7 +701,7 @@ export function TaskDrawer({
                 <DropdownMenuTrigger asChild>
                   <button
                     aria-label={k.taskActions}
-                    className="grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
+                    className="grid size-11 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground md:size-6"
                     type="button"
                   >
                     <Codicon name="ellipsis" size="0.9rem" />
@@ -740,7 +740,7 @@ export function TaskDrawer({
             )}
             <button
               aria-label={k.close}
-              className="grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
+              className="grid size-11 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground md:size-6"
               onClick={onClose}
               type="button"
             >
