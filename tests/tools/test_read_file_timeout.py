@@ -79,11 +79,13 @@ def test_late_read_does_not_publish_bookkeeping(tmp_path, monkeypatch):
         time.sleep(0.05)
 
         with file_tools._read_tracker_lock:
-            task_data = file_tools._read_tracker[task_id]
-            assert task_data["last_key"] is None
-            assert task_data["consecutive"] == 0
-            assert task_data["dedup"] == {}
-            assert task_data["read_timestamps"] == {}
+            task_data = file_tools._read_tracker.get(task_id)
+            assert task_data is None or (
+                task_data["last_key"] is None
+                and task_data["consecutive"] == 0
+                and task_data["dedup"] == {}
+                and task_data["read_timestamps"] == {}
+            )
         record_read.assert_not_called()
     finally:
         release.set()
@@ -150,11 +152,13 @@ def test_timeout_wins_before_bookkeeping_commit(tmp_path, monkeypatch):
         assert worker_finished.wait(timeout=1)
 
         with file_tools._read_tracker_lock:
-            task_data = file_tools._read_tracker[task_id]
-            assert task_data["last_key"] is None
-            assert task_data["consecutive"] == 0
-            assert task_data["dedup"] == {}
-            assert task_data["read_timestamps"] == {}
+            task_data = file_tools._read_tracker.get(task_id)
+            assert task_data is None or (
+                task_data["last_key"] is None
+                and task_data["consecutive"] == 0
+                and task_data["dedup"] == {}
+                and task_data["read_timestamps"] == {}
+            )
         record_read.assert_not_called()
     finally:
         release_commit.set()
@@ -259,3 +263,146 @@ def test_unavailable_mtime_does_not_restat_after_commit(tmp_path, monkeypatch):
     finally:
         with file_tools._read_tracker_lock:
             file_tools._read_tracker.pop(task_id, None)
+
+
+def test_late_dedup_hit_does_not_publish_after_timeout(tmp_path, monkeypatch):
+    path = tmp_path / "cloud.md"
+    path.write_text("cached content")
+    release_stat = threading.Event()
+    stat_started = threading.Event()
+    worker_finished = threading.Event()
+    real_impl = file_tools._read_file_tool_impl
+    cached_mtime = path.stat().st_mtime
+    task_id = "late-dedup-hit-task"
+    dedup_key = (str(path), 1, 2000)
+    executor = file_tools.DaemonThreadPoolExecutor(max_workers=1)
+    admission = threading.BoundedSemaphore(1)
+
+    with file_tools._read_tracker_lock:
+        file_tools._read_tracker[task_id] = {
+            "last_key": None,
+            "consecutive": 0,
+            "read_history": set(),
+            "dedup": {dedup_key: cached_mtime},
+            "dedup_hits": {},
+            "read_timestamps": {},
+            "not_found": {},
+        }
+
+    def _wedged_getmtime(_path):
+        stat_started.set()
+        assert release_stat.wait(timeout=1)
+        return cached_mtime
+
+    def _observed_impl(*args, **kwargs):
+        try:
+            return real_impl(*args, **kwargs)
+        finally:
+            worker_finished.set()
+
+    real_submit = executor.submit
+
+    def _submit_after_worker_reaches_stat(*args, **kwargs):
+        future = real_submit(*args, **kwargs)
+        assert stat_started.wait(timeout=1)
+        return future
+
+    monkeypatch.setattr(file_tools, "_resolve_read_file_timeout", lambda: 0.05)
+    monkeypatch.setattr(file_tools, "_read_file_tool_impl", _observed_impl)
+    monkeypatch.setattr(file_tools, "_read_file_executor", executor)
+    monkeypatch.setattr(file_tools, "_read_file_admission", admission)
+    monkeypatch.setattr(executor, "submit", _submit_after_worker_reaches_stat)
+    monkeypatch.setattr(file_tools.os.path, "getmtime", _wedged_getmtime)
+
+    try:
+        payload = json.loads(file_tools.read_file_tool(str(path), task_id=task_id))
+        assert stat_started.is_set()
+        assert payload["error_type"] == "tool_timeout"
+
+        release_stat.set()
+        assert worker_finished.wait(timeout=1)
+        with file_tools._read_tracker_lock:
+            assert file_tools._read_tracker[task_id]["dedup_hits"] == {}
+    finally:
+        release_stat.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+        with file_tools._read_tracker_lock:
+            file_tools._read_tracker.pop(task_id, None)
+
+
+def test_late_negative_cache_existence_check_does_not_publish_after_timeout(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "created-later.md"
+    path.write_text("real content")
+    release_exists = threading.Event()
+    exists_started = threading.Event()
+    worker_finished = threading.Event()
+    real_impl = file_tools._read_file_tool_impl
+    task_id = "late-negative-cache-task"
+    cache_key = ("read", str(path))
+
+    file_tools._record_not_found(
+        "read", str(path), task_id, '{"error":"File not found: cached"}'
+    )
+
+    def _wedged_exists(_path):
+        exists_started.set()
+        assert release_exists.wait(timeout=1)
+        return True
+
+    def _observed_impl(*args, **kwargs):
+        try:
+            return real_impl(*args, **kwargs)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(file_tools, "_resolve_read_file_timeout", lambda: 0.05)
+    monkeypatch.setattr(file_tools, "_read_file_tool_impl", _observed_impl)
+    monkeypatch.setattr(file_tools.os.path, "exists", _wedged_exists)
+
+    try:
+        payload = json.loads(file_tools.read_file_tool(str(path), task_id=task_id))
+        assert exists_started.is_set()
+        assert payload["error_type"] == "tool_timeout"
+
+        release_exists.set()
+        assert worker_finished.wait(timeout=1)
+        with file_tools._read_tracker_lock:
+            assert cache_key in file_tools._read_tracker[task_id]["not_found"]
+    finally:
+        release_exists.set()
+        with file_tools._read_tracker_lock:
+            file_tools._read_tracker.pop(task_id, None)
+
+
+def test_timed_out_reads_use_a_process_wide_bounded_worker_pool(monkeypatch):
+    release = threading.Event()
+    started_lock = threading.Lock()
+    started = 0
+    executor = file_tools.DaemonThreadPoolExecutor(max_workers=4)
+    admission = threading.BoundedSemaphore(4)
+
+    def _wedged_read(*_args, **_kwargs):
+        nonlocal started
+        with started_lock:
+            started += 1
+        release.wait()
+        return "late result"
+
+    monkeypatch.setattr(file_tools, "_read_file_tool_impl", _wedged_read)
+    monkeypatch.setattr(file_tools, "_resolve_read_file_timeout", lambda: 0.1)
+    monkeypatch.setattr(file_tools, "_read_file_executor", executor)
+    monkeypatch.setattr(file_tools, "_read_file_admission", admission)
+
+    try:
+        payloads = [
+            json.loads(file_tools.read_file_tool(f"/cloud/stuck-{index}.md"))
+            for index in range(6)
+        ]
+        assert all(payload["error_type"] == "tool_timeout" for payload in payloads)
+        with started_lock:
+            assert started == 4
+    finally:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)

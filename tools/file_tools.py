@@ -23,6 +23,7 @@ from tools.file_operations import (
     normalize_read_pagination,
     normalize_search_pagination,
 )
+from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools import file_state
 from agent.redact import redact_sensitive_text
 
@@ -1300,12 +1301,21 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     # and a hung stat on a dead network mount must not stall every other
     # task's read/search bookkeeping.
     if _os.path.exists(resolved_str):
-        with _read_tracker_lock:
-            task_data = _read_tracker.get(task_id)
-            nf = task_data.get("not_found") if task_data else None
-            if nf:
-                nf.pop((op, resolved_str), None)
+        abandon_state = _read_abandon_state.get()
+        if abandon_state is None:
+            # Direct/search callers have no timeout abandonment race and retain
+            # the historical eager-eviction behavior.
+            with _read_tracker_lock:
+                task_data = _read_tracker.get(task_id)
+                nf = task_data.get("not_found") if task_data else None
+                if nf:
+                    nf.pop((op, resolved_str), None)
+        # Timeout-wrapped reads defer eviction until the final commit fence:
+        # ``exists`` can wedge past their deadline, and mutating afterward
+        # would publish from an abandoned worker.
         return None
+    if not _claim_read_result_publication():
+        return tool_error("read_file result abandoned after timeout")
     return cached_json
 
 
@@ -1651,6 +1661,12 @@ _read_abandon_state: contextvars.ContextVar[_ReadAbandonState | None] = (
 )
 
 
+def _claim_read_result_publication() -> bool:
+    """Fence a final result before it returns or mutates shared read state."""
+    abandon_state = _read_abandon_state.get()
+    return abandon_state is None or abandon_state.try_begin_commit()
+
+
 def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
@@ -1823,30 +1839,30 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
         resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
-                "last_key": None, "consecutive": 0,
-                "read_history": set(), "dedup": {},
-                "dedup_hits": {}, "read_timestamps": {},
-            })
-            # Backward-compat for pre-existing tracker entries that predate
-            # dedup_hits/read_timestamps (long-lived task or crossed an
-            # upgrade boundary).
-            if "dedup_hits" not in task_data:
-                task_data["dedup_hits"] = {}
-            if "read_timestamps" not in task_data:
-                task_data["read_timestamps"] = {}
-            cached_mtime = task_data.get("dedup", {}).get(dedup_key)
+            task_data = _read_tracker.get(task_id)
+            cached_mtime = (
+                task_data.get("dedup", {}).get(dedup_key) if task_data else None
+            )
 
         if cached_mtime is not None:
             try:
                 current_mtime = os.path.getmtime(resolved_str)
                 if current_mtime == cached_mtime:
+                    if not _claim_read_result_publication():
+                        return tool_error("read_file result abandoned after timeout")
                     # Count repeated stub returns so weak tool-followers that
                     # ignore the "refer to earlier result" hint don't burn
                     # their iteration budget in an infinite read loop.  After
                     # 2 stubs for the same key we escalate to a hard block
                     # mirroring the count>=4 path on real reads.
                     with _read_tracker_lock:
+                        task_data = _read_tracker.setdefault(task_id, {
+                            "last_key": None, "consecutive": 0,
+                            "read_history": set(), "dedup": {},
+                            "dedup_hits": {}, "read_timestamps": {},
+                        })
+                        task_data.setdefault("dedup_hits", {})
+                        task_data.setdefault("read_timestamps", {})
                         hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
                         task_data["dedup_hits"][dedup_key] = hits
                         _cap_read_tracker_data(task_data)
@@ -1967,14 +1983,22 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
         # timeout path won first, the daemon worker exits without publication.
         # If this worker wins, the timeout path returns the real result instead
         # of publishing a timeout for content whose state was committed.
-        abandon_state = _read_abandon_state.get()
-        if abandon_state is not None and not abandon_state.try_begin_commit():
+        if not _claim_read_result_publication():
             return tool_error("read_file result abandoned after timeout")
 
         if _not_found_json is not None:
             _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         with _read_tracker_lock:
+            task_data = _read_tracker.setdefault(task_id, {
+                "last_key": None, "consecutive": 0,
+                "read_history": set(), "dedup": {},
+                "dedup_hits": {}, "read_timestamps": {},
+            })
+            if _not_found_json is None:
+                task_data.get("not_found", {}).pop(
+                    ("read", resolved_str_for_neg), None
+                )
             # Ensure "dedup" / "dedup_hits" keys exist (backward compat with
             # old tracker state from pre-dedup-guard sessions).
             if "dedup" not in task_data:
@@ -2047,6 +2071,16 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
 
 
 _DEFAULT_READ_FILE_TIMEOUT_S = 45.0
+_READ_FILE_MAX_WORKERS = 4
+
+# A timed-out filesystem syscall cannot be cancelled by Python. Reuse one
+# process-wide daemon pool so at most this many workers can remain wedged;
+# excess reads queue behind them and expire at their own caller deadline.
+_read_file_executor = DaemonThreadPoolExecutor(
+    max_workers=_READ_FILE_MAX_WORKERS,
+    thread_name_prefix="hermes-read-file",
+)
+_read_file_admission = threading.BoundedSemaphore(_READ_FILE_MAX_WORKERS)
 
 
 def _resolve_read_file_timeout() -> float | None:
@@ -2074,9 +2108,23 @@ def read_file_tool(
         return _read_file_tool_impl(path, offset, limit, task_id)
 
     import concurrent.futures
-    from tools.daemon_pool import DaemonThreadPoolExecutor
+    import time
 
-    executor = DaemonThreadPoolExecutor(max_workers=1)
+    deadline = time.monotonic() + timeout_s
+    admission = _read_file_admission
+    if not admission.acquire(timeout=timeout_s):
+        logger.warning("read_file timed out waiting for a worker for %s", path)
+        return tool_error(
+            f"Timed out reading '{path}' after {timeout_s:.0f}s. The path may "
+            "be a cloud-backed placeholder, blocked by filesystem permissions, "
+            "or unavailable on this host. Try exact-path metadata, a local "
+            "clone/direct source, or report the access problem instead of "
+            "retrying the same read.",
+            error_type="tool_timeout",
+            timeout_seconds=timeout_s,
+            path=path,
+        )
+
     context = contextvars.copy_context()
 
     abandon_state = _ReadAbandonState()
@@ -2088,13 +2136,17 @@ def read_file_tool(
         finally:
             _read_abandon_state.reset(token)
 
-    future = executor.submit(
-        context.run,
-        _run,
-    )
-    timed_out = False
     try:
-        return future.result(timeout=timeout_s)
+        future = _read_file_executor.submit(
+            context.run,
+            _run,
+        )
+    except BaseException:
+        admission.release()
+        raise
+    future.add_done_callback(lambda _future: admission.release())
+    try:
+        return future.result(timeout=max(0.0, deadline - time.monotonic()))
     except concurrent.futures.TimeoutError:
         if not abandon_state.abandon_if_pending():
             # The worker completed all potentially blocking I/O and claimed
@@ -2103,7 +2155,6 @@ def read_file_tool(
             # context cannot diverge.
             return future.result()
 
-        timed_out = True
         future.cancel()
         logger.warning("read_file timed out after %.1fs for %s", timeout_s, path)
         return tool_error(
@@ -2116,10 +2167,7 @@ def read_file_tool(
             timeout_seconds=timeout_s,
             path=path,
         )
-    finally:
-        # A filesystem syscall may remain blocked below Python. Never join that
-        # worker or register it with the stdlib atexit hook.
-        executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
+
 
 
 def reset_file_dedup(task_id: str = None):
