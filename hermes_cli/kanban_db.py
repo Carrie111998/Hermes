@@ -7307,8 +7307,7 @@ def decompose_triage_task(
             # branch above then propagates None into every child.
             # Fall back to 'scratch' rather than writing a row that is
             # guaranteed to fail on dispatch and trip the circuit
-            # breaker after `failure_threshold` retries. See #<PR> for
-            # the incident that surfaced this.
+            # breaker after `failure_threshold` retries.
             if child_ws_kind == "dir" and not child_ws_path:
                 child_ws_kind = "scratch"
                 child_ws_path = None
