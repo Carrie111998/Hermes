@@ -1515,6 +1515,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
+                reply_to=self._initial_reply_to_id,
                 metadata=self.metadata,
             )
             # Note: do NOT set _already_sent = True here.

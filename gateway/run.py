@@ -20560,6 +20560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         display_text,
+                        reply_to=event_message_id,
                         metadata=_status_thread_metadata,
                     ),
                     _loop_for_step,
