@@ -1,5 +1,7 @@
+import json
 import sys
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 from acp.schema import TextContentBlock
@@ -62,6 +64,32 @@ class NoopDb:
     def update_session(self, *_args, **_kwargs):
         return None
 
+    def update_session_meta(self, *_args, **_kwargs):
+        return None
+
+    def replace_messages(self, *_args, **_kwargs):
+        return None
+
+
+class RecordingDb(NoopDb):
+    def __init__(self):
+        self.session: dict[str, Any] | None = None
+
+    def get_session(self, *_args, **_kwargs):
+        return self.session
+
+    def create_session(self, *, session_id, model, model_config, **_kwargs):
+        self.session = {
+            "id": session_id,
+            "model": model,
+            "model_config": dict(model_config),
+        }
+
+    def update_session_meta(self, _session_id, model_config, model):
+        assert self.session is not None
+        self.session["model"] = model
+        self.session["model_config"] = json.loads(model_config)
+
 
 def make_agent_and_state():
     fake = FakeAgent()
@@ -71,6 +99,119 @@ def make_agent_and_state():
     conn = CaptureConn()
     acp_agent.on_connect(conn)
     return acp_agent, state, fake, conn
+
+
+@pytest.fixture
+def openrouter_collision(monkeypatch):
+    from hermes_cli import models
+
+    catalog = [
+        ("collision-vendor/provider-collision-model", ""),
+        ("collision-vendor/provider-collision-model:free", ""),
+    ]
+    monkeypatch.setattr(models, "fetch_openrouter_models", lambda **_kwargs: catalog)
+
+
+@pytest.mark.parametrize(
+    ("raw_model", "current_provider", "expected"),
+    [
+        (
+            "anthropic:provider-collision-model",
+            "anthropic",
+            ("anthropic", "provider-collision-model"),
+        ),
+        (
+            "anthropic:provider-collision-model",
+            "google",
+            ("anthropic", "provider-collision-model"),
+        ),
+        (
+            "claude:provider-collision-model",
+            "anthropic",
+            ("anthropic", "provider-collision-model"),
+        ),
+        (
+            "custom:local:provider-collision-model",
+            "anthropic",
+            ("custom:local", "provider-collision-model"),
+        ),
+        (
+            "anthropic/provider-collision-model",
+            "anthropic",
+            ("anthropic", "provider-collision-model"),
+        ),
+        (
+            "openrouter:collision-vendor/provider-collision-model",
+            "anthropic",
+            ("openrouter", "collision-vendor/provider-collision-model"),
+        ),
+        (
+            "collision-vendor/provider-collision-model",
+            "anthropic",
+            ("openrouter", "collision-vendor/provider-collision-model"),
+        ),
+        (
+            "provider-collision-model",
+            "anthropic",
+            ("openrouter", "collision-vendor/provider-collision-model"),
+        ),
+        (
+            "provider-collision-model:free",
+            "anthropic",
+            ("openrouter", "collision-vendor/provider-collision-model:free"),
+        ),
+    ],
+)
+def test_acp_model_selection_uses_explicit_provider_before_detection(
+    openrouter_collision,
+    raw_model,
+    current_provider,
+    expected,
+):
+    """Recognized providers remain authoritative across the real detection chain."""
+    assert (
+        HermesACPAgent._resolve_model_selection(raw_model, current_provider) == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_acp_set_model_persists_explicit_provider_without_turn(
+    monkeypatch,
+    openrouter_collision,
+):
+    initial_agent = FakeAgent()
+    initial_agent.provider = "anthropic"
+    initial_agent.model = "old-model"
+    database = RecordingDb()
+    manager = SessionManager(agent_factory=lambda: initial_agent, db=database)
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    rebuild = {}
+
+    def rebuild_agent(**kwargs):
+        rebuild.update(kwargs)
+        agent = FakeAgent()
+        agent.provider = kwargs["requested_provider"]
+        agent.model = kwargs["model"]
+        return agent
+
+    monkeypatch.setattr(manager, "_make_agent", rebuild_agent)
+
+    response = await acp_agent.set_session_model(
+        "anthropic:provider-collision-model",
+        state.session_id,
+    )
+
+    assert response is not None
+    assert rebuild["requested_provider"] == "anthropic"
+    assert rebuild["model"] == "provider-collision-model"
+    assert state.agent.provider == "anthropic"
+    assert state.model == "provider-collision-model"
+    assert database.session is not None
+    assert database.session["model"] == "provider-collision-model"
+    assert database.session["model_config"]["provider"] == "anthropic"
+    assert initial_agent.runs == []
+    assert state.agent.runs == []
 
 
 def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
@@ -161,9 +302,6 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert observed["lock_held"] is True
     assert state.cancel_event.is_set()
     assert state.interrupted_prompt_text == "original request"
-
-
-
 
 
 

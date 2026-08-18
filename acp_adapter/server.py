@@ -821,16 +821,44 @@ class HermesACPAgent(acp.Agent):
         )
 
     @staticmethod
-    def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
+    def _resolve_model_selection(
+        raw_model: str,
+        current_provider: str,
+    ) -> tuple[str, str]:
         """Resolve ``provider:model`` input into the provider and normalized model id."""
         target_provider = current_provider
         new_model = raw_model.strip()
 
         try:
-            from hermes_cli.models import detect_provider_for_model, parse_model_input
+            from hermes_cli.models import (
+                detect_provider_for_model,
+                is_known_provider_name,
+                normalize_provider,
+                parse_model_input_details,
+            )
 
-            target_provider, new_model = parse_model_input(new_model, current_provider)
-            if target_provider == current_provider:
+            stripped_model = new_model.strip()
+            target_provider, new_model, explicit_provider = parse_model_input_details(
+                stripped_model,
+                current_provider,
+            )
+
+            slash = stripped_model.find("/")
+            if not explicit_provider and slash > 0:
+                provider_part = stripped_model[:slash].strip().lower()
+                model_part = stripped_model[slash + 1 :].strip()
+                if (
+                    provider_part
+                    and model_part
+                    and is_known_provider_name(provider_part)
+                    and normalize_provider(provider_part)
+                    == normalize_provider(current_provider)
+                ):
+                    target_provider = normalize_provider(provider_part)
+                    new_model = model_part
+                    explicit_provider = True
+
+            if not explicit_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected

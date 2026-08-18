@@ -2438,6 +2438,11 @@ _KNOWN_PROVIDER_NAMES: set[str] = (
 )
 
 
+def is_known_provider_name(provider: str) -> bool:
+    """Return whether a name is valid in ``provider:model`` input."""
+    return provider.strip().lower() in _KNOWN_PROVIDER_NAMES
+
+
 def list_available_providers() -> list[dict[str, str]]:
     """Return info about all providers the user could use with ``provider:model``.
 
@@ -2482,6 +2487,35 @@ def list_available_providers() -> list[dict[str, str]]:
     return result
 
 
+def parse_model_input_details(
+    raw: str,
+    current_provider: str,
+) -> tuple[str, str, bool]:
+    """Parse model input and report whether it names a recognized provider.
+
+    Returns ``(provider, model, explicit_provider)``. The final value is true
+    only when a recognized ``provider:model`` prefix supplied the provider.
+    Model colons such as OpenRouter variant tags remain part of the model.
+    """
+    stripped = raw.strip()
+    colon = stripped.find(":")
+    if colon > 0:
+        provider_part = stripped[:colon].strip().lower()
+        model_part = stripped[colon + 1:].strip()
+        if provider_part and model_part and is_known_provider_name(provider_part):
+            # Support custom:name:model triple syntax for named custom
+            # providers.  ``custom:local:qwen`` → ("custom:local", "qwen").
+            # Single colon ``custom:qwen`` → ("custom", "qwen") as before.
+            if provider_part == "custom" and ":" in model_part:
+                second_colon = model_part.find(":")
+                custom_name = model_part[:second_colon].strip()
+                actual_model = model_part[second_colon + 1:].strip()
+                if custom_name and actual_model:
+                    return (f"custom:{custom_name}", actual_model, True)
+            return (normalize_provider(provider_part), model_part, True)
+    return (current_provider, stripped, False)
+
+
 def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     """Parse ``/model`` input into ``(provider, model)``.
 
@@ -2499,23 +2533,11 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     Returns ``(provider, model)`` where *provider* is either the explicit
     provider from the input or *current_provider* if none was specified.
     """
-    stripped = raw.strip()
-    colon = stripped.find(":")
-    if colon > 0:
-        provider_part = stripped[:colon].strip().lower()
-        model_part = stripped[colon + 1:].strip()
-        if provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES:
-            # Support custom:name:model triple syntax for named custom
-            # providers.  ``custom:local:qwen`` → ("custom:local", "qwen").
-            # Single colon ``custom:qwen`` → ("custom", "qwen") as before.
-            if provider_part == "custom" and ":" in model_part:
-                second_colon = model_part.find(":")
-                custom_name = model_part[:second_colon].strip()
-                actual_model = model_part[second_colon + 1:].strip()
-                if custom_name and actual_model:
-                    return (f"custom:{custom_name}", actual_model)
-            return (normalize_provider(provider_part), model_part)
-    return (current_provider, stripped)
+    provider, model, _explicit_provider = parse_model_input_details(
+        raw,
+        current_provider,
+    )
+    return provider, model
 
 
 def _get_custom_base_url() -> str:
