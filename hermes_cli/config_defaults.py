@@ -2502,6 +2502,12 @@ DEFAULT_CONFIG = {
         # wedges the job's dispatch guard forever. Also overridable via
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
+        # Timeout (seconds) for each media attachment send during cron
+        # delivery via a live gateway adapter. Large attachments (long TTS
+        # audio, big exports) can exceed the old fixed 30s window. Also
+        # overridable via HERMES_CRON_MEDIA_SEND_TIMEOUT env var. Keep in
+        # sync with cron.scheduler._DEFAULT_MEDIA_SEND_TIMEOUT.
+        "media_send_timeout_seconds": 300,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that
@@ -3165,6 +3171,15 @@ DEFAULT_CONFIG = {
         #               ignored paths — node_modules, venv, build outputs —
         #               are never touched.
         "non_interactive_local_changes": "stash",
+        # When `hermes update` finds the source checkout parked on a feature
+        # branch (left behind by tooling or a manual checkout), switch back
+        # to the update target automatically — but only when the branch is
+        # clean and every commit on it is already merged into the target.
+        # When it is not safe, the code update is SKIPPED with a loud
+        # warning instead of pretending success (2026-08-17 incident:
+        # "✓ Code updated!" printed while the checkout stayed days behind
+        # main on a stale branch). Set false to never auto-switch.
+        "auto_switch_parked_branch": True,
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example

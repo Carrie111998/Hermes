@@ -69,6 +69,7 @@ import {
 import { $bindings, bindingsFor } from '@/store/keybinds'
 import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
 import { openPetGenerate } from '@/store/pet-generate'
+import { openBrowserTab } from '@/store/preview'
 import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
 import { $connection } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -908,6 +909,21 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             keywords: ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
             label: cc.updateHermes,
             run: () => requestActiveUpdate()
+          },
+          {
+            icon: RefreshCw,
+            id: 'cc-reload-window',
+            keywords: ['reload', 'window', 'refresh', 'restart', 'ui', 'stuck'],
+            label: cc.reloadWindow,
+            run: () => window.location.reload()
+          },
+          {
+            action: 'view.showBrowser',
+            icon: codiconIcon('globe'),
+            id: 'cc-open-browser',
+            keywords: ['browser', 'web', 'url', 'address', 'open', 'navigate', 'internet', 'site'],
+            label: cc.openBrowser,
+            run: () => openBrowserTab()
           }
         ]
       },
