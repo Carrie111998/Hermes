@@ -13787,68 +13787,32 @@ def main():
         "bare number of days, or ISO timestamp)",
     )
 
-    sessions_cold_store = sessions_subparsers.add_parser(
-        "cold-store",
-        help="Store one archived terminal session lineage under a local root",
+    sessions_cold_archive = sessions_subparsers.add_parser(
+        "cold-archive",
+        help="Store, verify, and purge one archived terminal session lineage",
     )
-    sessions_cold_store.add_argument(
+    sessions_cold_archive.add_argument(
         "root",
         type=Path,
         metavar="ROOT",
         help="Local archive root for sensitive raw transcript output",
     )
-    sessions_cold_store.add_argument(
+    sessions_cold_archive.add_argument(
         "--session-id",
         required=True,
-        help="Exact session ID or unique prefix to store",
+        help="Exact session ID or unique prefix to cold-archive",
     )
-    sessions_cold_store.add_argument(
+    cold_archive_mode = sessions_cold_archive.add_mutually_exclusive_group()
+    cold_archive_mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Resolve and report the requested store without writing anything",
+        help="Resolve and report Store → Verify → Purge without changing anything",
     )
-    sessions_cold_store.add_argument(
-        "--yes", "-y", action="store_true", help="Skip confirmation"
-    )
-
-    sessions_cold_verify = sessions_subparsers.add_parser(
-        "cold-verify",
-        help="Verify one archived terminal session lineage snapshot",
-    )
-    sessions_cold_verify.add_argument(
-        "root",
-        type=Path,
-        metavar="ROOT",
-        help="Existing local archive root containing the current snapshot",
-    )
-    sessions_cold_verify.add_argument(
-        "--session-id",
-        required=True,
-        help="Exact session ID or unique prefix to verify",
-    )
-
-    sessions_cold_purge = sessions_subparsers.add_parser(
-        "cold-purge",
-        help="Delete one verified archived terminal lineage from SQLite",
-    )
-    sessions_cold_purge.add_argument(
-        "root",
-        type=Path,
-        metavar="ROOT",
-        help="Existing local archive root containing the current snapshot",
-    )
-    sessions_cold_purge.add_argument(
-        "--session-id",
-        required=True,
-        help="Exact session ID or unique prefix to purge",
-    )
-    sessions_cold_purge.add_argument(
-        "--dry-run",
+    cold_archive_mode.add_argument(
+        "--yes",
+        "-y",
         action="store_true",
-        help="Verify and report exact IDs without deleting anything",
-    )
-    sessions_cold_purge.add_argument(
-        "--yes", "-y", action="store_true", help="Confirm permanent SQLite deletion"
+        help="Run Store → Verify → Purge and retain the local snapshot",
     )
 
     sessions_subparsers.add_parser(

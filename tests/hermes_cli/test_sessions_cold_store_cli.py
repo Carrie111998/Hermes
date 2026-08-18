@@ -1,4 +1,4 @@
-"""CLI contract for storing one explicit archived session lineage locally."""
+"""Public CLI contract for cold-archiving one marked session lineage."""
 
 from __future__ import annotations
 
@@ -6,13 +6,15 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
+import hermes_cli.session_cold_store as cold_store
 from hermes_state import SessionDB
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def session_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     import hermes_state
 
@@ -23,11 +25,11 @@ def session_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _seed_archived_lineage() -> None:
+def _seed_archived_lineage(*, unrelated: bool = False) -> None:
     db = SessionDB()
     try:
         db.create_session(
-            "lineage-root", source="cli", system_prompt="cold purge root prompt"
+            "lineage-root", source="cli", system_prompt="cold archive root prompt"
         )
         db.append_message("lineage-root", role="user", content="sensitive first turn")
         db.end_session("lineage-root", "compression")
@@ -35,13 +37,18 @@ def _seed_archived_lineage() -> None:
             "lineage-terminal",
             source="cli",
             parent_session_id="lineage-root",
-            system_prompt="cold purge shared prompt",
+            system_prompt="cold archive shared prompt",
         )
         db.append_message(
             "lineage-terminal", role="assistant", content="sensitive final turn"
         )
         db.end_session("lineage-terminal", "completed")
         assert db.set_session_archived("lineage-terminal", True)
+        if unrelated:
+            db.create_session(
+                "unrelated", source="cli", system_prompt="cold archive shared prompt"
+            )
+            db.append_message("unrelated", role="user", content="keep this row")
     finally:
         db.close()
 
@@ -64,7 +71,7 @@ def _run_cli(
     return code, captured.out, captured.err
 
 
-def _lineage_rows() -> list[tuple[str, int]]:
+def _session_rows() -> list[tuple[str, int]]:
     db = SessionDB()
     try:
         assert db._conn is not None
@@ -78,71 +85,66 @@ def _lineage_rows() -> list[tuple[str, int]]:
         db.close()
 
 
-def _purge_database_rows() -> tuple[list[tuple[object, ...]], ...]:
+def _message_rows() -> list[tuple[str, str]]:
     db = SessionDB()
     try:
         assert db._conn is not None
-        return (
-            [
-                tuple(row)
-                for row in db._conn.execute(
-                    "SELECT id, archived FROM sessions ORDER BY id"
-                ).fetchall()
-            ],
-            [
-                tuple(row)
-                for row in db._conn.execute(
-                    "SELECT session_id, role, content FROM messages ORDER BY id"
-                ).fetchall()
-            ],
-            [
-                tuple(row)
-                for row in db._conn.execute(
-                    "SELECT scope, session_key, entry_json "
-                    "FROM gateway_routing ORDER BY scope, session_key"
-                ).fetchall()
-            ],
-            [
-                tuple(row)
-                for row in db._conn.execute(
-                    "SELECT key, value FROM state_meta ORDER BY key"
-                ).fetchall()
-            ],
-            [
-                tuple(row)
-                for row in db._conn.execute(
-                    "SELECT * FROM async_delegations ORDER BY delegation_id"
-                ).fetchall()
-            ],
-            [
-                tuple(row)
-                for row in db._conn.execute(
-                    "SELECT * FROM compression_locks ORDER BY session_id"
-                ).fetchall()
-            ],
-            [
-                tuple(row)
-                for row in db._conn.execute(
-                    "SELECT * FROM session_turn_leases ORDER BY conversation_id"
-                ).fetchall()
-            ],
-        )
+        return [
+            (str(row["session_id"]), str(row["content"]))
+            for row in db._conn.execute(
+                "SELECT session_id, content FROM messages ORDER BY id"
+            ).fetchall()
+        ]
     finally:
         db.close()
+
+
+def _snapshot_files(archive_root: Path) -> dict[Path, bytes]:
+    if not archive_root.exists():
+        return {}
+    return {
+        path.relative_to(archive_root): path.read_bytes()
+        for path in archive_root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_sessions_help_exposes_only_converged_public_cold_archive_command(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, out, err = _run_cli(monkeypatch, capsys, "sessions", "--help")
+
+    assert code == 0
+    assert err == ""
+    assert re.search(r"\barchive\b", out)
+    assert re.search(r"\bcold-archive\b", out)
+    assert "cold-store" not in out
+    assert "cold-verify" not in out
+    assert "cold-purge" not in out
+
+
+@pytest.mark.parametrize("hidden_action", ["cold-store", "cold-verify", "cold-purge"])
+def test_hidden_stage_commands_are_rejected_by_argparse(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    hidden_action: str,
+) -> None:
+    code, _out, err = _run_cli(monkeypatch, capsys, "sessions", hidden_action)
+
+    assert code == 2
+    assert "invalid choice" in err
+    assert hidden_action in err
 
 
 @pytest.mark.parametrize(
     ("arguments", "required_argument"),
     [
-        (("sessions", "cold-store"), "ROOT"),
-        (("sessions", "cold-store", "archive"), "--session-id"),
-        (("sessions", "cold-verify"), "ROOT"),
-        (("sessions", "cold-verify", "archive"), "--session-id"),
-        (("sessions", "cold-purge"), "ROOT"),
-        (("sessions", "cold-purge", "archive"), "--session-id"),
+        (("sessions", "cold-archive"), "ROOT"),
+        (("sessions", "cold-archive", "archive-root"), "--session-id"),
     ],
 )
-def test_cold_store_requires_root_and_named_session_id(
+def test_cold_archive_requires_root_and_named_session_id(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     arguments: tuple[str, ...],
@@ -155,699 +157,48 @@ def test_cold_store_requires_root_and_named_session_id(
     assert "required" in err
 
 
-def test_cold_store_yes_stores_exactly_one_resolved_lineage_and_reports_identity(
+def test_cold_archive_dry_run_is_read_only_and_does_not_require_snapshot(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    before = _lineage_rows()
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-term",
-        "--yes",
-    )
-
-    assert code == 0
-    assert err == ""
-    assert "terminal ID: lineage-terminal" in out
-    assert "physical IDs: lineage-root, lineage-terminal" in out
-    assert re.search(r"fingerprint: [0-9a-f]{64}\b", out)
-    snapshot_match = re.search(r"local snapshot: (.+)$", out, re.MULTILINE)
-    assert snapshot_match is not None
-    snapshot = Path(snapshot_match.group(1))
-    assert snapshot.is_relative_to(archive_root)
-    assert {path.name for path in snapshot.iterdir()} == {
-        "artifacts",
-        "metadata.json",
-        "session.jsonl",
-    }
-    assert _lineage_rows() == before == [
-        ("lineage-root", 1),
-        ("lineage-terminal", 1),
-    ]
-
-
-def test_cold_store_verify_purge_deletes_only_snapshot_lineage_and_keeps_snapshot(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    db = SessionDB()
-    try:
-        db.create_session(
-            "unrelated",
-            source="cli",
-            system_prompt="cold purge shared prompt",
-        )
-        assert db._conn is not None
-        db._conn.execute(
-            "INSERT INTO session_model_usage (session_id, model) VALUES (?, ?)",
-            ("lineage-terminal", "test-model"),
-        )
-    finally:
-        db.close()
-
-    store_code, store_out, store_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-    assert store_code == 0
-    assert store_err == ""
-    snapshot_match = re.search(r"local snapshot: (.+)$", store_out, re.MULTILINE)
-    assert snapshot_match is not None
-    snapshot = Path(snapshot_match.group(1))
-    before_snapshot = {
-        path.relative_to(snapshot): path.read_bytes()
-        for path in snapshot.rglob("*")
-        if path.is_file()
-    }
-
-    verify_code, _verify_out, verify_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-verify",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-    )
-    assert verify_code == 0
-    assert verify_err == ""
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-purge",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-
-    assert code == 0
-    assert err == ""
-    assert "terminal ID: lineage-terminal" in out
-    assert "physical IDs: lineage-root, lineage-terminal" in out
-    assert "cold snapshot remains local" in out
-    assert _lineage_rows() == [("unrelated", 0)]
-    db = SessionDB()
-    try:
-        assert db._conn is not None
-        assert db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
-        assert (
-            db._conn.execute("SELECT COUNT(*) FROM session_model_usage").fetchone()[0]
-            == 0
-        )
-        prompts = db._conn.execute(
-            "SELECT prompt FROM system_prompts ORDER BY prompt"
-        ).fetchall()
-        assert [row[0] for row in prompts] == ["cold purge shared prompt"]
-    finally:
-        db.close()
-    assert snapshot.is_dir()
-    assert {
-        path.relative_to(snapshot): path.read_bytes()
-        for path in snapshot.rglob("*")
-        if path.is_file()
-    } == before_snapshot
-
-
-def test_cold_purge_dry_run_is_read_only_and_prints_exact_ids(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    store_code, _store_out, store_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-    assert store_code == 0
-    assert store_err == ""
-    before_rows = _lineage_rows()
-    before_files = {
-        path.relative_to(archive_root): path.read_bytes()
-        for path in archive_root.rglob("*")
-        if path.is_file()
-    }
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-purge",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--dry-run",
-    )
-
-    assert code == 0
-    assert err == ""
-    assert "Would purge archived session lineage:" in out
-    assert "terminal ID: lineage-terminal" in out
-    assert "physical IDs: lineage-root, lineage-terminal" in out
-    assert "nothing was deleted" in out
-    assert _lineage_rows() == before_rows
-    assert {
-        path.relative_to(archive_root): path.read_bytes()
-        for path in archive_root.rglob("*")
-        if path.is_file()
-    } == before_files
-
-
-@pytest.mark.parametrize("purge_flag", ["--dry-run", "--yes"])
-def test_cold_purge_refuses_routed_verified_lineage_and_retains_database_rows(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    purge_flag: str,
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    store_code, _store_out, store_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-    assert store_code == 0
-    assert store_err == ""
-
-    db = SessionDB()
-    try:
-        db.save_gateway_routing_entry(
-            "route-key",
-            '{"session_id":"lineage-root","platform":"test"}',
-            scope="test-routing-scope",
-        )
-    finally:
-        db.close()
-
-    verify_code, _verify_out, verify_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-verify",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-    )
-    assert verify_code == 0
-    assert verify_err == ""
-    before_rows = _purge_database_rows()
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-purge",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        purge_flag,
-    )
-
-    assert code == 1
-    assert err == ""
-    assert "gateway_routing" in out
-    assert "lineage-root" in out
-    assert _purge_database_rows() == before_rows
-
-
-@pytest.mark.parametrize("purge_flag", ["--dry-run", "--yes"])
-@pytest.mark.parametrize(
-    ("reference_kind", "reference_name"),
-    [
-        pytest.param("state_meta", "goal", id="state-meta-goal"),
-        pytest.param("state_meta", "loop", id="state-meta-loop"),
-        pytest.param("state_meta", "heartbeat", id="state-meta-heartbeat"),
-        pytest.param("async_delegations", "origin_session", id="delegation-origin"),
-        pytest.param(
-            "async_delegations",
-            "parent_session_id",
-            id="delegation-parent",
-        ),
-        pytest.param(
-            "async_delegations",
-            "origin_session_id",
-            id="delegation-origin-session-id",
-        ),
-        pytest.param(
-            "compression_locks",
-            "session_id",
-            id="compression-lock",
-        ),
-        pytest.param(
-            "session_turn_leases",
-            "conversation_id",
-            id="session-turn-lease",
-        ),
-    ],
-)
-def test_cold_purge_refuses_unsnapshotted_soft_references_without_mutation(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    purge_flag: str,
-    reference_kind: str,
-    reference_name: str,
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    store_code, _store_out, store_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-    assert store_code == 0
-    assert store_err == ""
-
-    db = SessionDB()
-    try:
-        assert db._conn is not None
-        columns = {
-            str(row[1])
-            for row in db._conn.execute(
-                "PRAGMA table_info(async_delegations)"
-            ).fetchall()
-        }
-        assert "origin_session_id" in columns
-        if reference_kind == "state_meta":
-            db._conn.execute(
-                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
-                (f"{reference_name}:lineage-root", '{"keep":"unchanged"}'),
-            )
-        elif reference_kind == "async_delegations":
-            reference_values = {
-                "origin_session": "unrelated-origin",
-                "parent_session_id": None,
-                "origin_session_id": "unrelated-api-session",
-            }
-            reference_values[reference_name] = "lineage-root"
-            db._conn.execute(
-                "INSERT INTO async_delegations ("
-                "delegation_id, origin_session, parent_session_id, "
-                "origin_session_id, state, dispatched_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    f"delegation-{reference_name}",
-                    reference_values["origin_session"],
-                    reference_values["parent_session_id"],
-                    reference_values["origin_session_id"],
-                    "completed",
-                    1.0,
-                    2.0,
-                ),
-            )
-        else:
-            db._conn.execute(
-                f"INSERT INTO {reference_kind} "
-                f"({reference_name}, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
-                ("lineage-root", "keep-holder", 1.0, 2.0),
-            )
-        assert (
-            db._conn.execute("SELECT COUNT(*) FROM gateway_routing").fetchone()[0]
-            == 0
-        )
-    finally:
-        db.close()
-
-    before_rows = _purge_database_rows()
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-purge",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        purge_flag,
-    )
-
-    assert code == 1
-    assert err == ""
-    assert reference_kind in out
-    assert reference_name in out
-    assert "lineage-root" in out
-    assert _purge_database_rows() == before_rows
-
-
-def test_cold_purge_without_yes_refuses_actual_deletion(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    store_code, _store_out, store_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-    assert store_code == 0
-    assert store_err == ""
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-purge",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-    )
-
-    assert code == 1
-    assert err == ""
-    assert "requires --yes" in out
-    assert "nothing was deleted" in out
-    assert _lineage_rows() == [
-        ("lineage-root", 1),
-        ("lineage-terminal", 1),
-    ]
-
-
-def test_cold_verify_successfully_checks_one_stored_lineage_read_only(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    store_code, _store_out, store_err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-    assert store_code == 0
-    assert store_err == ""
-    before_rows = _lineage_rows()
-    before_files = sorted(
-        path.relative_to(archive_root) for path in archive_root.rglob("*")
-    )
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-verify",
-        str(archive_root),
-        "--session-id",
-        "lineage-term",
-    )
-
-    assert code == 0
-    assert err == ""
-    assert "Verified archived session lineage:" in out
-    assert "terminal ID: lineage-terminal" in out
-    assert "physical IDs: lineage-root, lineage-terminal" in out
-    assert re.search(r"fingerprint: [0-9a-f]{64}\b", out)
-    snapshot_match = re.search(r"verified snapshot: (.+)$", out, re.MULTILINE)
-    assert snapshot_match is not None
-    assert Path(snapshot_match.group(1)).is_relative_to(archive_root)
-    assert _lineage_rows() == before_rows
-    assert sorted(
-        path.relative_to(archive_root) for path in archive_root.rglob("*")
-    ) == before_files
-
-
-def test_cold_verify_missing_snapshot_fails_without_creating_root(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "missing-cold-root"
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-verify",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-    )
-
-    assert code == 1
-    assert err == ""
-    assert "Error: could not cold-verify session lineage" in out
-    assert "snapshot not found" in out
-    assert not archive_root.exists()
-
-
-def test_cold_verify_database_open_failure_exits_nonzero(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-
-    def fail_read_only_open(*args, **kwargs):
-        assert kwargs.get("read_only") is True
-        raise sqlite3.OperationalError("read-only open failed")
-
-    monkeypatch.setattr("hermes_state.SessionDB", fail_read_only_open)
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-verify",
-        str(session_home.parent / "cold-root"),
-        "--session-id",
-        "lineage-terminal",
-    )
-
-    assert code == 1
-    assert err == ""
-    assert "Error: Could not open session database: read-only open failed" in out
-
-
-def test_cold_store_database_open_failure_exits_nonzero(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-
-    def fail_writable_open(*args, **kwargs):
-        assert kwargs.get("read_only") is False
-        raise sqlite3.OperationalError("writable open failed")
-
-    monkeypatch.setattr("hermes_state.SessionDB", fail_writable_open)
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(session_home.parent / "cold-root"),
-        "--session-id",
-        "lineage-terminal",
-        "--yes",
-    )
-
-    assert code == 1
-    assert err == ""
-    assert "Error: Could not open session database: writable open failed" in out
-
-
-@pytest.mark.parametrize(
-    ("action", "execution_flags"),
-    [
-        ("cold-store", ("--yes",)),
-        ("cold-verify", ()),
-    ],
-)
-def test_cold_commands_reject_finite_out_of_range_started_at_cleanly(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    action: str,
-    execution_flags: tuple[str, ...],
-) -> None:
-    db = SessionDB()
-    try:
-        db.create_session("bad-start-time", source="cli")
-        db.end_session("bad-start-time", "completed")
-        assert db.set_session_archived("bad-start-time", True)
-        assert db._conn is not None
-        db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (1e300, "bad-start-time"),
-        )
-    finally:
-        db.close()
-
-    code, out, err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        action,
-        str(session_home.parent / "cold-root"),
-        "--session-id",
-        "bad-start-time",
-        *execution_flags,
-    )
-
-    assert code == 1
-    assert err == ""
-    assert "terminal session start time is outside the supported range" in out
-    assert "Traceback" not in out
-
-
-def test_cold_store_default_confirmation_warns_about_raw_transcript_and_cancels(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    prompts: list[str] = []
-
-    def decline(prompt: str) -> str:
-        prompts.append(prompt)
-        return ""
-
-    monkeypatch.setattr("builtins.input", decline)
-    before = _lineage_rows()
-
-    code, out, _err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-terminal",
-    )
-
-    assert code == 0
-    assert out.strip() == "Cancelled."
-    assert len(prompts) == 1
-    assert "sensitive raw transcript" in prompts[0]
-    assert str(archive_root) in prompts[0]
-    assert prompts[0].endswith("[y/N] ")
-    assert not archive_root.exists()
-    assert _lineage_rows() == before
-
-
-def test_cold_store_dry_run_creates_nothing_and_does_not_prompt(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
-    archive_root = session_home.parent / "cold-root"
-    before = _lineage_rows()
-
-    def unexpected_prompt(_prompt: str) -> str:
-        raise AssertionError("dry-run must not prompt")
-
-    monkeypatch.setattr("builtins.input", unexpected_prompt)
-    code, out, _err = _run_cli(
-        monkeypatch,
-        capsys,
-        "sessions",
-        "cold-store",
-        str(archive_root),
-        "--session-id",
-        "lineage-term",
-        "--dry-run",
-    )
-
-    assert code == 0
-    assert "Would store archived session lineage 'lineage-terminal'" in out
-    assert str(archive_root) in out
-    assert "nothing was written" in out
-    assert not archive_root.exists()
-    assert _lineage_rows() == before
-
-
-def test_cold_store_dry_run_opens_database_read_only_without_reconciliation(
-    session_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _seed_archived_lineage()
+    archive_root = session_home.parent / "new-cold-root"
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
     db_path = session_home / "state.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute("DROP INDEX idx_compression_locks_expires")
         schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
-        before_rows = conn.execute(
-            "SELECT id, archived FROM sessions ORDER BY id"
-        ).fetchall()
-
     opens: list[bool] = []
+    original_session_db = SessionDB
 
     def tracked_open(*args, **kwargs):
         opens.append(bool(kwargs.get("read_only")))
-        return SessionDB(*args, **kwargs)
+        return original_session_db(*args, **kwargs)
+
+    def unexpected_prompt(_prompt: str) -> str:
+        raise AssertionError("dry-run must not prompt")
 
     monkeypatch.setattr("hermes_state.SessionDB", tracked_open)
-    archive_root = session_home.parent / "cold-root"
+    monkeypatch.setattr("builtins.input", unexpected_prompt)
 
     code, out, err = _run_cli(
         monkeypatch,
         capsys,
         "sessions",
-        "cold-store",
+        "cold-archive",
         str(archive_root),
         "--session-id",
-        "lineage-terminal",
+        "lineage-term",
         "--dry-run",
     )
 
     assert code == 0
     assert err == ""
-    assert "nothing was written" in out
+    assert "resolved terminal ID: lineage-terminal" in out
+    assert "Store → Verify → Purge" in out
+    assert "nothing was written or deleted" in out
     assert opens == [True]
     assert not archive_root.exists()
     with sqlite3.connect(db_path) as conn:
@@ -856,168 +207,202 @@ def test_cold_store_dry_run_opens_database_read_only_without_reconciliation(
             "SELECT 1 FROM sqlite_schema "
             "WHERE type = 'index' AND name = 'idx_compression_locks_expires'"
         ).fetchone() is None
-        assert conn.execute(
-            "SELECT id, archived FROM sessions ORDER BY id"
-        ).fetchall() == before_rows
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
 
 
-@pytest.mark.parametrize("execution_flag", ["--yes", "--dry-run"])
-def test_cold_store_cli_reports_unsupported_blob_without_writing(
+def test_cold_archive_yes_runs_store_verify_purge_serially_and_keeps_snapshot(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    execution_flag: str,
 ) -> None:
-    db = SessionDB()
-    try:
-        db.create_session("blob-session", source="cli")
-        message_id = db.append_message(
-            "blob-session", role="user", content="placeholder"
-        )
-        assert db._conn is not None
-        db._conn.execute(
-            "UPDATE messages SET content = ? WHERE id = ?",
-            (b"future-blob", message_id),
-        )
-        db.end_session("blob-session", "completed")
-        assert db.set_session_archived("blob-session", True)
-    finally:
-        db.close()
+    _seed_archived_lineage(unrelated=True)
     archive_root = session_home.parent / "cold-root"
-    before = _lineage_rows()
+    calls: list[str] = []
+    original_store = cold_store.store_archived_lineage
+    original_verify = cold_store.verify_archived_lineage
+    original_purge = cold_store.purge_archived_lineage
+
+    def record_store(*args, **kwargs):
+        calls.append("Store")
+        return original_store(*args, **kwargs)
+
+    def record_verify(*args, **kwargs):
+        calls.append("Verify")
+        return original_verify(*args, **kwargs)
+
+    def record_purge(*args, **kwargs):
+        calls.append("Purge")
+        return original_purge(*args, **kwargs)
+
+    def unexpected_prompt(_prompt: str) -> str:
+        raise AssertionError("--yes must not prompt")
+
+    monkeypatch.setattr(cold_store, "store_archived_lineage", record_store)
+    monkeypatch.setattr(cold_store, "verify_archived_lineage", record_verify)
+    monkeypatch.setattr(cold_store, "purge_archived_lineage", record_purge)
+    monkeypatch.setattr("builtins.input", unexpected_prompt)
 
     code, out, err = _run_cli(
         monkeypatch,
         capsys,
         "sessions",
-        "cold-store",
+        "cold-archive",
         str(archive_root),
         "--session-id",
-        "blob-session",
-        execution_flag,
+        "lineage-terminal",
+        "--yes",
     )
 
-    assert code == 1
+    assert code == 0
     assert err == ""
-    assert (
-        "cold store v1 does not support SQLite BLOB/bytes values at message.content"
-        in out
-    )
-    assert not archive_root.exists()
-    assert _lineage_rows() == before == [("blob-session", 1)]
-
-    db = SessionDB()
-    try:
-        assert db._conn is not None
-        row = db._conn.execute(
-            "SELECT content FROM messages WHERE session_id = ?", ("blob-session",)
-        ).fetchone()
-        assert row is not None and row["content"] == b"future-blob"
-    finally:
-        db.close()
+    assert calls == ["Store", "Verify", "Purge"]
+    assert "Cold-archived session lineage:" in out
+    assert "terminal ID: lineage-terminal" in out
+    assert "physical IDs: lineage-root, lineage-terminal" in out
+    assert re.search(r"fingerprint: [0-9a-f]{64}\b", out)
+    snapshot_match = re.search(r"local snapshot retained: (.+)$", out, re.MULTILINE)
+    assert snapshot_match is not None
+    snapshot = Path(snapshot_match.group(1))
+    assert snapshot.is_relative_to(archive_root)
+    assert snapshot.is_dir()
+    assert {path.name for path in snapshot.iterdir()} == {
+        "artifacts",
+        "metadata.json",
+        "session.jsonl",
+    }
+    assert _session_rows() == [("unrelated", 0)]
+    assert _message_rows() == [("unrelated", "keep this row")]
 
 
 @pytest.mark.parametrize(
-    ("session_id", "extra_session"),
+    ("failed_stage", "expected_calls", "snapshot_retained"),
     [
-        ("missing", None),
-        ("lineage-", "lineage-another"),
+        pytest.param("Store", ["Store"], False, id="store"),
+        pytest.param("Verify", ["Store", "Verify"], True, id="verify"),
+        pytest.param("Purge", ["Store", "Verify", "Purge"], True, id="purge"),
     ],
 )
-def test_cold_store_rejects_missing_or_ambiguous_ids_before_writing(
+def test_cold_archive_stage_failure_stops_and_retains_source_rows_and_snapshot(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    session_id: str,
-    extra_session: str | None,
+    failed_stage: str,
+    expected_calls: list[str],
+    snapshot_retained: bool,
 ) -> None:
     _seed_archived_lineage()
-    if extra_session is not None:
-        db = SessionDB()
-        try:
-            db.create_session(extra_session, source="cli")
-            db.end_session(extra_session, "completed")
-        finally:
-            db.close()
     archive_root = session_home.parent / "cold-root"
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+    calls: list[str] = []
+    original_store = cold_store.store_archived_lineage
+    original_verify = cold_store.verify_archived_lineage
 
-    code, out, _err = _run_cli(
+    def stage(
+        name: str, implementation: Callable[..., object] | None
+    ) -> Callable[..., object]:
+        def run(*args, **kwargs):
+            calls.append(name)
+            if name == failed_stage:
+                raise OSError(f"forced {name} failure")
+            assert implementation is not None
+            return implementation(*args, **kwargs)
+
+        return run
+
+    monkeypatch.setattr(
+        cold_store, "store_archived_lineage", stage("Store", original_store)
+    )
+    monkeypatch.setattr(
+        cold_store, "verify_archived_lineage", stage("Verify", original_verify)
+    )
+    monkeypatch.setattr(cold_store, "purge_archived_lineage", stage("Purge", None))
+
+    code, out, err = _run_cli(
         monkeypatch,
         capsys,
         "sessions",
-        "cold-store",
+        "cold-archive",
         str(archive_root),
         "--session-id",
-        session_id,
+        "lineage-terminal",
         "--yes",
     )
 
     assert code == 1
-    assert f"Session '{session_id}' was not found or is ambiguous." in out
-    assert not archive_root.exists()
+    assert err == ""
+    assert calls == expected_calls
+    assert f"Error: cold archive {failed_stage} failed: forced {failed_stage} failure" in out
+    assert "source rows were retained" in out.lower()
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+    files = _snapshot_files(archive_root)
+    assert bool(files) is snapshot_retained
+    if snapshot_retained:
+        assert any(path.name == "metadata.json" for path in files)
+        assert "local snapshot was retained" in out.lower()
+    else:
+        assert "no verified local snapshot was produced" in out.lower()
 
 
-@pytest.mark.parametrize("execution_flag", ["--yes", "--dry-run"])
-def test_cold_store_surfaces_store_eligibility_rejection_without_db_changes(
+def test_cold_archive_without_confirmation_refuses_without_prompt_or_mutation(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    execution_flag: str,
 ) -> None:
-    db = SessionDB()
-    try:
-        db.create_session("not-archived", source="cli")
-        db.end_session("not-archived", "completed")
-    finally:
-        db.close()
+    _seed_archived_lineage()
     archive_root = session_home.parent / "cold-root"
-    before = _lineage_rows()
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
 
-    code, out, _err = _run_cli(
+    def unexpected_prompt(_prompt: str) -> str:
+        raise AssertionError("cold-archive confirmation is flag-based")
+
+    monkeypatch.setattr("builtins.input", unexpected_prompt)
+    code, out, err = _run_cli(
         monkeypatch,
         capsys,
         "sessions",
-        "cold-store",
+        "cold-archive",
         str(archive_root),
         "--session-id",
-        "not-archived",
-        execution_flag,
+        "lineage-terminal",
     )
 
     assert code == 1
-    assert "all compression lineage rows must be marked archived" in out
+    assert err == ""
+    assert "requires either --dry-run or --yes" in out
+    assert "nothing was written or deleted" in out
     assert not archive_root.exists()
-    assert _lineage_rows() == before == [("not-archived", 0)]
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
 
 
-@pytest.mark.parametrize("execution_flag", ["--yes", "--dry-run"])
-def test_cold_store_surfaces_non_terminal_rejection_without_db_changes(
+def test_cold_archive_rejects_conflicting_confirmation_flags(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    execution_flag: str,
 ) -> None:
-    db = SessionDB()
-    try:
-        db.create_session("still-open", source="cli")
-        assert db.set_session_archived("still-open", True)
-    finally:
-        db.close()
+    _seed_archived_lineage()
     archive_root = session_home.parent / "cold-root"
-    before = _lineage_rows()
 
-    code, out, _err = _run_cli(
+    code, _out, err = _run_cli(
         monkeypatch,
         capsys,
         "sessions",
-        "cold-store",
+        "cold-archive",
         str(archive_root),
         "--session-id",
-        "still-open",
-        execution_flag,
+        "lineage-terminal",
+        "--dry-run",
+        "--yes",
     )
 
-    assert code == 1
-    assert "terminal session must be ended and non-compression" in out
+    assert code == 2
+    assert "not allowed with argument" in err
     assert not archive_root.exists()
-    assert _lineage_rows() == before == [("still-open", 1)]
+    assert _session_rows() == [
+        ("lineage-root", 1),
+        ("lineage-terminal", 1),
+    ]

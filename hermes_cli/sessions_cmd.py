@@ -315,12 +315,21 @@ def cmd_sessions(args, sessions_parser=None):
             return 1
         return
 
+    if action == "cold-archive" and not (
+        bool(getattr(args, "dry_run", False))
+        or bool(getattr(args, "yes", False))
+    ):
+        print(
+            "Error: cold-archive requires either --dry-run or --yes; "
+            "nothing was written or deleted."
+        )
+        return 1
+
     try:
         from hermes_state import SessionDB
 
-        read_only = action == "cold-verify" or (
-            action in {"cold-store", "cold-purge"}
-            and bool(getattr(args, "dry_run", False))
+        read_only = action == "cold-archive" and bool(
+            getattr(args, "dry_run", False)
         )
         db = SessionDB(read_only=read_only)
     except Exception as e:
@@ -899,31 +908,7 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"Session '{args.session_id}' not found.")
             return 1
 
-    elif action == "cold-verify":
-        resolved_session_id = db.resolve_session_id(args.session_id)
-        if not resolved_session_id:
-            print(f"Session '{args.session_id}' was not found or is ambiguous.")
-            db.close()
-            return 1
-
-        from hermes_cli.session_cold_store import verify_archived_lineage
-
-        try:
-            verified = verify_archived_lineage(
-                db, resolved_session_id, args.root.expanduser()
-            )
-        except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-            print(f"Error: could not cold-verify session lineage: {exc}")
-            db.close()
-            return 1
-
-        print("Verified archived session lineage:")
-        print(f"  terminal ID: {verified.terminal_id}")
-        print(f"  physical IDs: {', '.join(verified.physical_ids)}")
-        print(f"  fingerprint: {verified.source_fingerprint}")
-        print(f"  verified snapshot: {verified.snapshot_dir}")
-
-    elif action == "cold-store":
+    elif action == "cold-archive":
         resolved_session_id = db.resolve_session_id(args.session_id)
         if not resolved_session_id:
             print(
@@ -939,90 +924,58 @@ def cmd_sessions(args, sessions_parser=None):
             try:
                 plan_archived_lineage(db, resolved_session_id)
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-                print(f"Error: could not cold-store session lineage: {exc}")
+                print(f"Error: could not plan cold archive: {exc}")
                 db.close()
                 return 1
-            print(
-                f"Would store archived session lineage '{resolved_session_id}' "
-                f"under {archive_root}; nothing was written."
-            )
-            db.close()
-            return
-
-        if not args.yes and not _confirm_prompt(
-            f"Store session lineage '{resolved_session_id}' as sensitive raw "
-            f"transcript output under {archive_root}? [y/N] "
-        ):
-            print("Cancelled.")
-            db.close()
-            return
-
-        from hermes_cli.session_cold_store import store_archived_lineage
-
-        try:
-            stored = store_archived_lineage(
-                db, resolved_session_id, archive_root
-            )
-        except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-            print(f"Error: could not cold-store session lineage: {exc}")
-            db.close()
-            return 1
-
-        print("Stored archived session lineage:")
-        print(f"  terminal ID: {stored.terminal_id}")
-        print(f"  physical IDs: {', '.join(stored.physical_ids)}")
-        print(f"  fingerprint: {stored.source_fingerprint}")
-        print(f"  local snapshot: {stored.snapshot_dir}")
-
-    elif action == "cold-purge":
-        resolved_session_id = db.resolve_session_id(args.session_id)
-        if not resolved_session_id:
-            print(f"Session '{args.session_id}' was not found or is ambiguous.")
-            db.close()
-            return 1
-
-        archive_root = args.root.expanduser()
-        if args.dry_run:
-            from hermes_cli.session_cold_store import (
-                validate_purge_archived_lineage,
-            )
-
-            try:
-                verified = validate_purge_archived_lineage(
-                    db, resolved_session_id, archive_root
-                )
-            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-                print(f"Error: could not cold-purge session lineage: {exc}")
-                db.close()
-                return 1
-            print("Would purge archived session lineage:")
-            print(f"  terminal ID: {verified.terminal_id}")
-            print(f"  physical IDs: {', '.join(verified.physical_ids)}")
-            print("Dry run: nothing was deleted; the cold snapshot remains local.")
+            print("Resolved archived session lineage:")
+            print(f"  resolved terminal ID: {resolved_session_id}")
+            print(f"  local archive root: {archive_root}")
+            print("Would run: Store → Verify → Purge")
+            print("Dry run: nothing was written or deleted.")
             db.close()
             return 0
 
-        if not args.yes:
-            print("Error: actual cold purge requires --yes; nothing was deleted.")
-            db.close()
-            return 1
-
-        from hermes_cli.session_cold_store import purge_archived_lineage
+        from hermes_cli.session_cold_store import (
+            purge_archived_lineage,
+            store_archived_lineage,
+            verify_archived_lineage,
+        )
 
         try:
-            purged = purge_archived_lineage(
-                db, resolved_session_id, archive_root
-            )
+            stored = store_archived_lineage(db, resolved_session_id, archive_root)
         except (OSError, RuntimeError, sqlite3.DatabaseError, ValueError) as exc:
-            print(f"Error: could not cold-purge session lineage: {exc}")
+            print(f"Error: cold archive Store failed: {exc}")
+            print(
+                "The source rows were retained; no verified local snapshot was "
+                "produced by this run, and any pre-existing snapshot was left "
+                "unchanged."
+            )
             db.close()
             return 1
 
-        print("Purged archived session lineage from SQLite:")
+        try:
+            verified = verify_archived_lineage(db, resolved_session_id, archive_root)
+        except (OSError, RuntimeError, sqlite3.DatabaseError, ValueError) as exc:
+            print(f"Error: cold archive Verify failed: {exc}")
+            print("The source rows were retained and the local snapshot was retained:")
+            print(f"  {stored.snapshot_dir}")
+            db.close()
+            return 1
+
+        try:
+            purged = purge_archived_lineage(db, resolved_session_id, archive_root)
+        except (OSError, RuntimeError, sqlite3.DatabaseError, ValueError) as exc:
+            print(f"Error: cold archive Purge failed: {exc}")
+            print("The source rows were retained and the local snapshot was retained:")
+            print(f"  {verified.snapshot_dir}")
+            db.close()
+            return 1
+
+        print("Cold-archived session lineage:")
         print(f"  terminal ID: {purged.terminal_id}")
         print(f"  physical IDs: {', '.join(purged.physical_ids)}")
         print(f"  fingerprint: {purged.source_fingerprint}")
-        print(f"  cold snapshot remains local: {purged.snapshot_dir}")
+        print(f"  local snapshot retained: {purged.snapshot_dir}")
         db.close()
         return 0
 
