@@ -21,7 +21,7 @@ Create, read, merge, fill, and secure PDF files.
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `pdf`, `documents`, `forms`, `reportlab`, `pypdf`, `pdfplumber` |
-| Related skills | [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx), [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx), [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint), [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) |
+| Related skills | [`docx`](/user-guide/skills/bundled/productivity/productivity-docx), [`xlsx`](/user-guide/skills/bundled/productivity/productivity-xlsx), [`powerpoint`](/user-guide/skills/bundled/productivity/productivity-powerpoint), [`ocr-and-documents`](/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) |
 
 ## Reference: full SKILL.md
 
