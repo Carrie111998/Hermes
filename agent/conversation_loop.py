@@ -7230,7 +7230,6 @@ def run_conversation(
                         if agent.stream_delta_callback:
                             try:
                                 agent.stream_delta_callback(final_response)
-                                agent.stream_delta_callback(None)
                             except Exception:
                                 pass
                     break
