@@ -331,6 +331,45 @@ complete quarantined bundle and records the source URL, exact content hash,
 scanner version, findings, timestamp, and fresh-or-cached status in
 `skills/.hub/lock.json`.
 
+### Advisory SkillEvaluator scan
+
+In addition to the built-in security scanner (which enforces the install
+policy above), Hermes can run [NVIDIA SkillEvaluator](https://github.com/NVIDIA/SkillEvaluator)
+Tier 1 checks on every hub install as a second opinion. Tier 1 is
+deterministic and keyless — PII detection (leaked emails, personal paths,
+connection strings), unicode-smuggling detection, script lint, license
+compliance, and a static security scan via
+[NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector).
+
+The scan is **advisory only**: findings are printed with file and line
+before the install confirmation, and the install continues. Findings that
+look like real credentials (private keys, cloud access keys, tokens,
+credentialed connection strings) are highlighted in red so you can review
+the flagged lines before deciding. PII-class findings are informational —
+the upstream scanner has known false-positive classes (e.g.
+`git@github.com` SSH syntax, documentation example emails), so they never
+block anything.
+
+To enable it, install the optional scanner binaries (the second one powers
+the `security` check; without it that check simply reports "not run"):
+
+```bash
+uv tool install --python 3.13 \
+  "skillevaluator @ git+https://github.com/NVIDIA/SkillEvaluator.git@v0.1.0"
+uv tool install "git+https://github.com/NVIDIA/SkillSpector.git@v2.9.5"
+```
+
+Without the binary on PATH the scan is silently skipped. To turn it off
+entirely:
+
+```yaml
+skills:
+  tier1_advisory: false
+```
+
+The dashboard's Browse-hub scan button returns the same advisory data in
+its response (`tier1` field) alongside the built-in scanner's verdict.
+
 ## External Skill Directories
 
 If you maintain skills outside of Hermes — for example, a shared `~/.agents/skills/` directory used by multiple AI tools — you can tell Hermes to scan those directories too.
@@ -407,6 +446,14 @@ Trusted roots are stored in `skills.trusted_project_dirs` in `~/.hermes/config.y
 Project skills are the **highest-precedence tier**: `project → local (~/.hermes/skills/) → external_dirs`. A project skill named `deploy` overrides a same-named profile or bundled skill for sessions inside that repo — that's the point: vendored repo skills win on their home turf, without touching your global profile. Project skills are tagged `[project]` in the agent's skill index so provenance stays visible.
 
 Like external dirs, project skill directories are treated as repo-owned: autonomous skill maintenance (the curator) never modifies them, and new agent-created skills always go to `~/.hermes/skills/`.
+
+### Scan-time quarantine
+
+Trust is a repo-level decision, but a repo's skill content changes with every `git pull`. To close that gap, every project skill is scanned with the same security scanner used for Skills Hub installs before it enters the index. A skill whose scan verdict is **dangerous** (prompt-injection directives, credential-exfiltration commands, hidden-text tricks) is quarantined: it does not appear in the skill index, `skills_list`, slash commands, and refuses to load by name with an explanatory error. Scans are content-hash cached under `~/.hermes/cache/project_skill_scans/` (never inside your repo) and re-run automatically when the skill's content changes.
+
+### Non-interactive surfaces (cron, API, ACP)
+
+Cron jobs and other non-interactive surfaces inherit your interactive trust decision — they never prompt and never auto-trust. The project root resolves from the surface's working directory (a cron job's `workdir`, via the same mechanism the terminal tool uses). A cron job whose `workdir` is inside a repo you previously trusted loads that repo's project skills; a job in an untrusted or undecided repo loads none.
 
 ## Skill Bundles
 
@@ -564,7 +611,18 @@ and the requesting profile/session/surface/tool-call context. On POSIX systems
 the pending directories are owner-only (`0700`) and records are `0600`; reads
 and writes stay anchored to held no-follow directory descriptors. Skill
 approval is serialized with other Hermes skill mutations and revalidates the
-bound pre-image inside a descriptor-anchored mutation path. Target-tree hashing
+bound pre-image inside a descriptor-anchored mutation path. The one-shot CLI
+binds its `cli` surface task-locally before agent dispatch. A first approved
+create in a clean profile anchors at the existing Hermes home, binds every
+absent path component, and creates `skills/`, optional categories, and the
+skill descriptor-relatively. If the content scanner rejects a supporting-file
+write, identity-bound rollback restores the pre-apply bytes and leaves the claimed
+record pending; if another writer changes the published leaf first, rollback
+fails closed instead of overwriting that concurrent content. New skills are
+scanned from the exact in-memory `SKILL.md` content before publication, so the
+scanner input cannot diverge from the bytes selected for publish and a rejected
+create never becomes discoverable. Absent leaves are published with an atomic
+no-replace link, so a concurrent creator is preserved. Target-tree hashing
 is capped at 64 MiB and 16,384 entries; pending records are capped at 8 MiB and
 listing fails closed above 4,096 directory entries. Platforms where Hermes
 cannot enforce an owner-only pending store fail closed instead of staging or

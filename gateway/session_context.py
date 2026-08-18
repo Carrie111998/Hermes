@@ -197,6 +197,16 @@ def set_current_session_id(session_id: str) -> None:
 
 
 @contextmanager
+def scoped_session_source(source: str) -> Iterator[None]:
+    """Bind one task-local surface/source and restore its prior value."""
+    token = _SESSION_SOURCE.set(source)
+    try:
+        yield
+    finally:
+        _SESSION_SOURCE.reset(token)
+
+
+@contextmanager
 def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
     """Bind a task-local session id and restore the prior value on exit.
 

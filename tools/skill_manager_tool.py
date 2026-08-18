@@ -102,7 +102,12 @@ def _reset_background_review_read_marks() -> None:
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
 try:
-    from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
+    from tools.skills_guard import (
+        scan_skill,
+        scan_skill_content,
+        should_allow_install,
+        format_scan_report,
+    )
     _GUARD_AVAILABLE = True
 except ImportError:
     _GUARD_AVAILABLE = False
@@ -127,14 +132,33 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
-def _security_scan_skill(skill_dir: Path) -> Optional[str]:
+def _guard_agent_created_enabled_readonly() -> bool:
+    """Read the create-scan policy without creating the Hermes directory tree."""
+    try:
+        from hermes_cli.config import read_raw_config, _expand_env_vars
+        from hermes_cli.managed_scope import apply_managed_overlay
+
+        cfg = apply_managed_overlay(_expand_env_vars(read_raw_config()))
+        return is_truthy_value(
+            cfg_get(cfg, "skills", "guard_agent_created"),
+            default=False,
+        )
+    except Exception:
+        return False
+
+
+def _security_scan_skill(
+    skill_dir: Path, *, guard_enabled: Optional[bool] = None
+) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
     No-op when skills.guard_agent_created is disabled (the default).
     """
     if not _GUARD_AVAILABLE:
         return None
-    if not _guard_agent_created_enabled():
+    if guard_enabled is None:
+        guard_enabled = _guard_agent_created_enabled()
+    if not guard_enabled:
         return None
     try:
         result = scan_skill(skill_dir, source="agent-created")
@@ -152,6 +176,35 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
     return None
+
+
+def _security_scan_new_skill_content(name: str, content: str) -> Optional[str]:
+    """Scan exact proposed SKILL.md bytes before they become discoverable."""
+    if not _GUARD_AVAILABLE:
+        return None
+    guard_enabled = None
+    if _pending_target_anchor.get() is not None:
+        # Approval replay must not let load_config() materialize an absent
+        # skills root after the staged pre-image was bound.
+        guard_enabled = _guard_agent_created_enabled_readonly()
+    if guard_enabled is None:
+        guard_enabled = _guard_agent_created_enabled()
+    if not guard_enabled:
+        return None
+    try:
+        result = scan_skill_content(
+            content,
+            skill_name=name,
+            source="agent-created",
+        )
+        allowed, reason = should_allow_install(result)
+        if allowed is not True:
+            report = format_scan_report(result)
+            return f"Security scan blocked this skill ({reason}):\n{report}"
+    except Exception as e:
+        logger.warning("Security scan failed for proposed skill %s: %s", name, e, exc_info=True)
+    return None
+
 
 import yaml
 
@@ -942,6 +995,12 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if pre_image_guard:
         return pre_image_guard
 
+    # Scan the exact proposed bytes before publishing SKILL.md. A rejected
+    # create never becomes discoverable and needs no race-prone rollback.
+    scan_error = _security_scan_new_skill_content(name, content)
+    if scan_error:
+        return {"success": False, "error": scan_error}
+
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
     if _pending_target_anchor.get() is None:
@@ -955,15 +1014,6 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     _pending_atomic_write_text(
         skill_md, content, create_parents=True, expect_absent=True
     )
-
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
-    if scan_error:
-        try:
-            _pending_rmtree(skill_dir)
-        except OSError:
-            pass
-        return {"success": False, "error": scan_error}
 
     # Extract description from frontmatter for verbose notifications
     _desc = ""
@@ -1063,9 +1113,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            _pending_atomic_write_text(
-                skill_md, original_content, enforce_read_identity=False
-            )
+            _pending_atomic_write_text(skill_md, original_content)
         return {"success": False, "error": scan_error}
 
     # Extract description from new content for verbose notifications
@@ -1200,9 +1248,7 @@ def _patch_skill(
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
-        _pending_atomic_write_text(
-            target, original_content, enforce_read_identity=False
-        )
+        _pending_atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
 
     result = {
@@ -1418,9 +1464,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            _pending_atomic_write_text(
-                target, original_content, enforce_read_identity=False
-            )
+            _pending_atomic_write_text(target, original_content)
         else:
             try:
                 _pending_unlink(target)
@@ -1564,6 +1608,18 @@ def _pending_fs_identity(info: os.stat_result) -> tuple:
     )
 
 
+def _pending_refresh_directory_identity(
+    anchor: Dict[str, Any], directory_fd: int, relative_key: str
+) -> None:
+    """Refresh metadata changed by Hermes' own descriptor-relative mutation."""
+    info = os.fstat(directory_fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("pending skill target parent is not a directory")
+    anchor.setdefault("tree_identities", {})[relative_key] = _pending_fs_identity(
+        info
+    )
+
+
 def _hash_skill_tree_fd(
     root: Path,
     root_fd: int,
@@ -1691,7 +1747,28 @@ def _target_tree_pre_image_hash(name: str, category: Optional[str] = None) -> st
         try:
             root_info = skills_root.lstat()
         except FileNotFoundError:
-            digest.update(b"root-absent\0")
+            anchor_root = skills_root.parent
+            anchor_info = anchor_root.lstat()
+            if stat.S_ISLNK(anchor_info.st_mode) or not stat.S_ISDIR(
+                anchor_info.st_mode
+            ):
+                raise ValueError("skills root parent is not a real directory")
+            digest.update(
+                (
+                    f"root-parent\0{anchor_root.resolve()}\0{anchor_info.st_dev}\0"
+                    f"{anchor_info.st_ino}\0{stat.S_IMODE(anchor_info.st_mode):o}\0"
+                ).encode("utf-8")
+            )
+            current_parent = skills_root
+            digest.update(
+                f"parent-absent\0{current_parent}\0".encode("utf-8")
+            )
+            relative_parent = destination.parent.relative_to(skills_root)
+            for part in relative_parent.parts:
+                current_parent = current_parent / part
+                digest.update(
+                    f"parent-absent\0{current_parent}\0".encode("utf-8")
+                )
         else:
             if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
                 raise ValueError("skills root is not a real directory")
@@ -1706,15 +1783,22 @@ def _target_tree_pre_image_hash(name: str, category: Optional[str] = None) -> st
             except ValueError as exc:
                 raise ValueError("new skill target escapes the skills root") from exc
             current_parent = skills_root
+            missing_parent = False
             for part in relative_parent.parts:
                 current_parent = current_parent / part
-                try:
-                    parent_info = current_parent.lstat()
-                except FileNotFoundError:
+                if missing_parent:
                     digest.update(
                         f"parent-absent\0{current_parent}\0".encode("utf-8")
                     )
-                    break
+                    continue
+                try:
+                    parent_info = current_parent.lstat()
+                except FileNotFoundError:
+                    missing_parent = True
+                    digest.update(
+                        f"parent-absent\0{current_parent}\0".encode("utf-8")
+                    )
+                    continue
                 if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(
                     parent_info.st_mode
                 ):
@@ -1794,7 +1878,20 @@ def _pending_target_anchor_context(name: str, category: Optional[str] = None):
         raise ValueError("descriptor-anchored pending skill apply is unsupported")
 
     found = _find_skill(name)
-    root = Path(found["path"]) if found else _skills_dir()
+    if found:
+        root = Path(found["path"])
+    else:
+        skills_root = _skills_dir()
+        try:
+            skills_root_info = skills_root.lstat()
+        except FileNotFoundError:
+            root = skills_root.parent
+        else:
+            if stat.S_ISLNK(skills_root_info.st_mode) or not stat.S_ISDIR(
+                skills_root_info.st_mode
+            ):
+                raise ValueError("skills root is not a real directory")
+            root = skills_root
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     parent_fd = os.open(root.parent, flags)
     try:
@@ -1902,6 +1999,7 @@ def _pending_target_parent_fd(target: Path, *, create_parents: bool = False):
         prefix_parts: List[str] = []
         identities = anchor.get("tree_identities", {})
         for part in parent_parts:
+            parent_identity_key = "/".join(prefix_parts) or "."
             prefix_parts.append(part)
             identity_key = "/".join(prefix_parts)
             expected_identity = identities.get(identity_key)
@@ -1920,6 +2018,9 @@ def _pending_target_parent_fd(target: Path, *, create_parents: bool = False):
                             "Pending skill write target pre-image changed"
                         )
                     created = True
+                    _pending_refresh_directory_identity(
+                        anchor, fd, parent_identity_key
+                    )
             elif expected_identity is None:
                 raise ValueError("Pending skill write target pre-image changed")
             next_fd = os.open(part, flags, dir_fd=fd)
@@ -1983,17 +2084,63 @@ def _pending_read_text(target: Path) -> str:
             os.close(fd)
 
 
+def _atomic_create_text_noreplace(
+    target: Path,
+    content: str,
+    *,
+    create_parents: bool = False,
+) -> None:
+    """Atomically publish a new text leaf without replacing an existing one."""
+    if create_parents:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(
+        f".pending-{os.getpid()}-{os.urandom(8).hex()}.tmp"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temp, flags, 0o600)
+    linked = False
+    try:
+        view = memoryview(content.encode("utf-8"))
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("skill create staging write made no progress")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.link(temp, target)
+        linked = True
+        os.unlink(temp)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not linked or temp.exists():
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
 def _pending_atomic_write_text(
     target: Path,
     content: str,
     *,
     create_parents: bool = False,
     expect_absent: bool = False,
-    enforce_read_identity: bool = True,
 ) -> None:
     anchor = _pending_target_anchor.get()
     if anchor is None:
-        atomic_write_text(target, content)
+        if expect_absent:
+            _atomic_create_text_noreplace(
+                target,
+                content,
+                create_parents=create_parents,
+            )
+        else:
+            atomic_write_text(target, content)
         return
     if not _pending_anchor_is_current():
         raise ValueError("Pending skill write target pre-image changed")
@@ -2019,7 +2166,7 @@ def _pending_atomic_write_text(
         current_identity = (
             None if existing is None else _pending_fs_identity(existing)
         )
-        if enforce_read_identity and current_identity != expected_identity:
+        if current_identity != expected_identity:
             raise ValueError("Pending skill write target pre-image changed")
         temp_name = f".pending-{os.getpid()}-{os.urandom(8).hex()}.tmp"
         fd = os.open(
@@ -2057,7 +2204,22 @@ def _pending_atomic_write_text(
                 )
             if before_publish_identity != current_identity:
                 raise ValueError("Pending skill write target pre-image changed")
-            os.replace(temp_name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            if expect_absent:
+                os.link(
+                    temp_name,
+                    leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(temp_name, dir_fd=parent_fd)
+            else:
+                os.replace(
+                    temp_name,
+                    leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
             published = True
             published_identity = _pending_fs_identity(
                 os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
@@ -2069,6 +2231,14 @@ def _pending_atomic_write_text(
                 relative_key
             ] = published_identity
             os.fsync(parent_fd)
+            parent_relative = target.parent.relative_to(
+                Path(anchor["root_path"])
+            ).as_posix()
+            _pending_refresh_directory_identity(
+                anchor,
+                parent_fd,
+                "." if parent_relative == "." else parent_relative,
+            )
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -2102,6 +2272,14 @@ def _pending_unlink(target: Path) -> None:
         anchor.get("tree_identities", {}).pop(relative_key, None)
         anchor.get("read_identities", {}).pop(relative_key, None)
         os.fsync(parent_fd)
+        parent_relative = target.parent.relative_to(
+            Path(anchor["root_path"])
+        ).as_posix()
+        _pending_refresh_directory_identity(
+            anchor,
+            parent_fd,
+            "." if parent_relative == "." else parent_relative,
+        )
 
 
 def _snapshot_pending_delete_tree_fd(
@@ -2162,6 +2340,31 @@ def _snapshot_pending_delete_tree_fd(
     if _pending_fs_identity(directory_after) != _pending_fs_identity(directory_before):
         raise ValueError("Pending skill write target pre-image changed")
     return result
+
+
+def _pending_assert_snapshot_matches_anchor(
+    target: Path, snapshot: Dict[str, Any]
+) -> None:
+    """Require a rollback tree to equal the state published by this replay."""
+    anchor = _pending_target_anchor.get()
+    if anchor is None:
+        return
+    try:
+        prefix = target.relative_to(Path(anchor["root_path"])).as_posix()
+    except ValueError as exc:
+        raise ValueError("pending skill target escaped its anchored root") from exc
+    identities = anchor.get("tree_identities", {})
+    if prefix == ".":
+        expected = dict(identities)
+    else:
+        expected = {}
+        for key, identity in identities.items():
+            if key == prefix:
+                expected["."] = identity
+            elif key.startswith(f"{prefix}/"):
+                expected[key[len(prefix) + 1 :]] = identity
+    if not expected or expected != snapshot.get("identities", {}):
+        raise ValueError("Pending skill write target pre-image changed")
 
 
 def _pending_quarantine_tree(parent_fd: int, leaf: str, target_fd: int) -> str:
@@ -2249,10 +2452,11 @@ def _pending_rmtree(target: Path) -> None:
         opened = os.fstat(target_fd)
         if not stat.S_ISDIR(opened.st_mode):
             raise ValueError("pending skill target directory is unsafe")
-        _snapshot_pending_delete_tree_fd(
+        snapshot = _snapshot_pending_delete_tree_fd(
             target_fd,
             [_MAX_PENDING_PRE_IMAGE_ENTRIES],
         )
+        _pending_assert_snapshot_matches_anchor(target, snapshot)
         _pending_quarantine_tree(parent_fd, leaf, target_fd)
 
     if target == Path(anchor["root_path"]):
@@ -2477,7 +2681,11 @@ def _skill_manage_unlocked(
         from tools import skill_ledger as _ledger
         _pre = _find_skill(name)
         _ledger_before_dir = _pre["path"] if _pre else None
-        _ledger_before = _ledger.capture_before(_ledger_before_dir)
+        _ledger_before = (
+            []
+            if _ledger_before_dir is None
+            else _ledger.capture_before(_ledger_before_dir)
+        )
     except Exception:
         pass
 
