@@ -797,8 +797,11 @@ def _hydrate_seed_state(agent, state) -> None:
 
 
 def seed_credits_at_session_start(agent) -> bool:
-    """Hydrate agent._credits_state from /api/oauth/account (or a dev fixture) and
-    fire the notice policy, so depletion / usage-band warnings show at session OPEN.
+    """Start provider credit/window hydration at session open.
+
+    Nous hydrates ``agent._credits_state`` from its account endpoint (or a dev
+    fixture). CommandCode schedules its provider-account refresh hook. Both are
+    fail-open and fire the relevant notice policy without delaying readiness.
 
     Shared by (a) the TUI/desktop agent build (fires at "ready", before any message)
     and (b) the first-turn conversation setup (fallback for plain CLI / when the
@@ -809,7 +812,16 @@ def seed_credits_at_session_start(agent) -> bool:
     fail-open error). Never raises — credits must never block session startup.
     """
     try:
-        if getattr(agent, "provider", "") != "nous":
+        provider = str(getattr(agent, "provider", "") or "").lower()
+        if provider in {
+            "commandcode",
+            "commandcode-chat",
+            "commandcode-anthropic",
+            "commandcode-claude",
+        }:
+            refresh = getattr(agent, "_refresh_account_usage_notices", None)
+            return bool(refresh()) if callable(refresh) else False
+        if provider != "nous":
             return False
         # Idempotent: don't re-seed if state already exists (seed or live header).
         if getattr(agent, "_credits_state", None) is not None:

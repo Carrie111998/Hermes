@@ -4080,6 +4080,10 @@ class AIAgent:
         EVALUATION/EMIT is a SEPARATE block that WARNS on failure (R1-M2): a bug in the
         depletion-notice path must not vanish silently under the parse swallow.
         """
+        # Providers without response-side billing headers refresh account-window
+        # notices in a daemon thread. The TTL/in-flight gates keep this call cheap.
+        self._refresh_account_usage_notices()
+
         # Dev test fixture (HERMES_DEV_CREDITS_FIXTURE): inject a chosen notice state
         # each turn for repeatable testing, bypassing real headers. Throwaway scaffolding.
         try:
@@ -4155,6 +4159,111 @@ class AIAgent:
 
         # Threshold notices — shared with the cold-start seed (see _emit_credits_notices).
         self._emit_credits_notices()
+
+    def _refresh_account_usage_notices(self) -> bool:
+        """Refresh CommandCode rolling-window notices without blocking a turn."""
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        if provider not in {
+            "commandcode",
+            "commandcode-chat",
+            "commandcode-anthropic",
+            "commandcode-claude",
+        }:
+            self._clear_account_usage_notices()
+            return False
+        if not os.environ.get("COMMANDCODE_SESSION_COOKIE"):
+            self._clear_account_usage_notices()
+            return False
+        if (
+            getattr(self, "notice_callback", None) is None
+            and getattr(self, "notice_clear_callback", None) is None
+        ) or not self._credits_notices_enabled():
+            self._clear_account_usage_notices()
+            return False
+
+        import threading
+        import time
+
+        lock = getattr(self, "_account_usage_refresh_lock", None)
+        if lock is None:
+            lock = self._account_usage_refresh_lock = threading.Lock()
+        with lock:
+            now = time.monotonic()
+            if getattr(self, "_account_usage_refresh_inflight", False):
+                return False
+            refreshed_at = getattr(self, "_account_usage_refreshed_at", None)
+            if refreshed_at is not None and now - refreshed_at < 300.0:
+                return False
+            self._account_usage_refresh_inflight = True
+            self._account_usage_refreshed_at = now
+
+        def _refresh() -> None:
+            try:
+                from agent.account_usage import (
+                    evaluate_account_usage_notices,
+                    fetch_account_usage,
+                    new_account_usage_notice_latch,
+                )
+
+                snapshot = fetch_account_usage(
+                    provider,
+                    base_url=getattr(self, "base_url", None),
+                    api_key=getattr(self, "api_key", None),
+                )
+                if snapshot is None:
+                    self._clear_account_usage_notices()
+                    return
+                with lock:
+                    # A fallback/model switch or cookie removal can race the
+                    # network request. Never publish the old provider's result
+                    # after the current runtime has left that account.
+                    if (
+                        str(getattr(self, "provider", "") or "").strip().lower()
+                        != provider
+                        or not os.environ.get("COMMANDCODE_SESSION_COOKIE")
+                        or not self._credits_notices_enabled()
+                    ):
+                        return
+                    latch = getattr(self, "_account_usage_notice_latch", None)
+                    if latch is None:
+                        latch = self._account_usage_notice_latch = (
+                            new_account_usage_notice_latch()
+                        )
+                    to_show, to_clear = evaluate_account_usage_notices(snapshot, latch)
+                    # Keep clear/show ordering serialized with lifecycle cleanup.
+                    for key in to_clear:
+                        self._emit_notice_clear(key)
+                    for notice in to_show:
+                        self._emit_notice(notice)
+            except Exception:
+                logger.debug("provider account usage notice refresh failed", exc_info=True)
+            finally:
+                with lock:
+                    self._account_usage_refresh_inflight = False
+
+        threading.Thread(
+            target=_refresh,
+            name="account-usage-refresh",
+            daemon=True,
+        ).start()
+        return True
+
+    def _clear_account_usage_notices(self) -> bool:
+        """Clear provider-account sticky notices and discard their latch."""
+        import threading
+
+        lock = getattr(self, "_account_usage_refresh_lock", None)
+        if lock is None:
+            lock = self._account_usage_refresh_lock = threading.Lock()
+        with lock:
+            latch = getattr(self, "_account_usage_notice_latch", None)
+            if not isinstance(latch, dict):
+                return False
+            active = list(latch.get("active", ()))
+            self._account_usage_notice_latch = None
+            for key in active:
+                self._emit_notice_clear(key)
+        return bool(active)
 
     def _emit_credits_notices(self) -> None:
         """Run the threshold policy on the current credits state and emit notices.

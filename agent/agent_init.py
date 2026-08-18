@@ -1001,6 +1001,10 @@ def init_agent(
     from agent.credits_tracker import new_credits_latch
 
     agent._credits_latch = new_credits_latch()
+    agent._account_usage_notice_latch = None
+    agent._account_usage_refresh_lock = threading.Lock()
+    agent._account_usage_refresh_inflight = False
+    agent._account_usage_refreshed_at = None
 
     # OpenRouter response cache hit counter — incremented when
     # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.

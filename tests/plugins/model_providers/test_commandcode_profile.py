@@ -232,3 +232,118 @@ class TestCommandCodeModelFiltering:
         assert "startswith(\"claude-\")" in source or '"claude-" in m' in source, (
             "CommandCodeAnthropicProfile.fetch_models should filter to claude-* models"
         )
+
+
+class TestCommandCodeAccountUsage:
+    def test_cookie_header_sends_only_recognized_session_cookie(self):
+        from plugins.model_providers.commandcode import _commandcode_cookie_header
+
+        raw = "analytics=do-not-send; __Secure-commandcode_prod_.session_token=abc==; other=secret"
+        assert (
+            _commandcode_cookie_header(raw)
+            == "__Secure-commandcode_prod_.session_token=abc=="
+        )
+        assert _commandcode_cookie_header("bare-token") == (
+            "__Secure-better-auth.session_token=bare-token"
+        )
+        assert _commandcode_cookie_header("analytics=only") is None
+        assert _commandcode_cookie_header("token\r\nInjected: yes") is None
+
+    def test_fetch_account_usage_maps_windows_monthly_plan_and_alias(
+        self, monkeypatch
+    ):
+        import sys
+
+        from agent.account_usage import fetch_account_usage
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("commandcode")
+        assert profile is not None
+        module = sys.modules[profile.__class__.__module__]
+
+        calls = []
+
+        def fake_get(url, cookie_header, timeout):
+            calls.append((url, cookie_header, timeout))
+            if url.endswith("/credits"):
+                return {
+                    "credits": {
+                        "monthlyCredits": 7.5,
+                        "purchasedCredits": 2,
+                        "premiumMonthlyCredits": 0,
+                        "opensourceMonthlyCredits": 0,
+                    },
+                    "windowLimits": {
+                        "fiveHour": {
+                            "cap": "4",
+                            "used": "3",
+                            "resetAt": 1_900_000_000,
+                        },
+                        "weekly": {
+                            "cap": 20,
+                            "used": 5,
+                            "resetAt": 1_900_500_000_000,
+                        },
+                    },
+                }
+            return {
+                "success": True,
+                "data": {
+                    "planId": "individual-pro",
+                    "status": "active",
+                    "currentPeriodEnd": "2030-03-01T00:00:00.000Z",
+                },
+            }
+
+        monkeypatch.setenv(
+            "COMMANDCODE_SESSION_COOKIE",
+            "analytics=no; __Secure-commandcode_prod_.session_token=valid; unrelated=no",
+        )
+        monkeypatch.setattr(module, "_commandcode_get_json", fake_get)
+
+        snapshot = fetch_account_usage("commandcode-claude")
+
+        assert snapshot is not None
+        assert snapshot.provider == "commandcode"
+        assert snapshot.plan == "Pro"
+        assert [window.label for window in snapshot.windows] == [
+            "5-hour limit",
+            "Weekly limit",
+            "Monthly credits",
+        ]
+        assert snapshot.windows[0].used_percent == 75.0
+        assert snapshot.windows[1].used_percent == 25.0
+        assert snapshot.windows[2].used_percent == 75.0
+        assert snapshot.windows[2].detail == "$7.50 of $30.00 remaining"
+        assert snapshot.details == ("Purchased credits: $2.00",)
+        assert all(
+            cookie == "__Secure-commandcode_prod_.session_token=valid"
+            for _, cookie, _ in calls
+        )
+
+    def test_fetch_account_usage_requires_session_cookie(self, monkeypatch):
+        import sys
+
+        from agent.account_usage import fetch_account_usage
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("commandcode")
+        assert profile is not None
+        module = sys.modules[profile.__class__.__module__]
+
+        monkeypatch.delenv("COMMANDCODE_SESSION_COOKIE", raising=False)
+        monkeypatch.setattr(
+            module,
+            "_commandcode_get_json",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("billing endpoint must not be called")
+            ),
+        )
+        assert fetch_account_usage("commandcode") is None
+
+    def test_session_cookie_is_catalogued_as_secret(self):
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+
+        entry = OPTIONAL_ENV_VARS["COMMANDCODE_SESSION_COOKIE"]
+        assert entry["password"] is True
+        assert entry["category"] == "provider"

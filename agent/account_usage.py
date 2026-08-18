@@ -17,6 +17,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ACCOUNT_USAGE_NOTICE_BANDS: tuple[tuple[float, str, int], ...] = (
+    (75.0, "warn", 75),
+    (90.0, "warn", 90),
+    (100.0, "error", 100),
+)
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -110,7 +116,7 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
             base = f"{window.label}: {remaining}% remaining ({used}% used)"
         if window.reset_at:
             base += f" • resets {_format_reset(window.reset_at)}"
-        elif window.detail:
+        if window.detail:
             base += f" • {window.detail}"
         lines.append(base)
     for detail in snapshot.details:
@@ -118,6 +124,69 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
     if snapshot.unavailable_reason:
         lines.append(f"Unavailable: {snapshot.unavailable_reason}")
     return lines
+
+
+def new_account_usage_notice_latch() -> dict[str, Any]:
+    """Return state for provider-window notice reconciliation."""
+    return {"active": set(), "bands": {}}
+
+
+def _account_usage_notice_key(provider: str, label: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in label).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return f"account_usage.{provider}.{slug or 'window'}"
+
+
+def evaluate_account_usage_notices(
+    snapshot: AccountUsageSnapshot,
+    latch: dict[str, Any],
+) -> tuple[list[Any], list[str]]:
+    """Reconcile sticky warnings for provider windows at 75/90/100 percent."""
+    from agent.credits_tracker import AgentNotice
+
+    active: set[str] = latch.setdefault("active", set())
+    bands: dict[str, int] = latch.setdefault("bands", {})
+    seen: set[str] = set()
+    to_show: list[AgentNotice] = []
+    to_clear: list[str] = []
+
+    for window in snapshot.windows:
+        if window.used_percent is None or not _is_finite_num(window.used_percent):
+            continue
+        key = _account_usage_notice_key(snapshot.provider, window.label)
+        seen.add(key)
+        used = max(0.0, float(window.used_percent))
+        current: Optional[tuple[float, str, int]] = None
+        for band in _ACCOUNT_USAGE_NOTICE_BANDS:
+            if used >= band[0]:
+                current = band
+        target = current[2] if current else None
+        if bands.get(key) == target:
+            continue
+        if key in active:
+            to_clear.append(key)
+            active.discard(key)
+        if current is not None:
+            level = current[1]
+            glyph = "✕" if level == "error" else "⚠"
+            text = f"{glyph} {snapshot.provider} {window.label} is {used:.0f}% used"
+            if window.reset_at:
+                text += f" · resets {_format_reset(window.reset_at)}"
+            to_show.append(
+                AgentNotice(text=text, level=level, kind="sticky", key=key, id=key)
+            )
+            active.add(key)
+            bands[key] = target
+        else:
+            bands.pop(key, None)
+
+    for key in list(active):
+        if key.startswith(f"account_usage.{snapshot.provider}.") and key not in seen:
+            to_clear.append(key)
+            active.discard(key)
+            bands.pop(key, None)
+    return to_show, to_clear
 
 
 def _fmt_usd(d: float) -> str:
@@ -897,6 +966,17 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized)
+        if profile is not None:
+            snapshot = profile.fetch_account_usage(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=9.0,
+            )
+            return snapshot if isinstance(snapshot, AccountUsageSnapshot) else None
     except Exception:
+        logger.debug("account usage fetch failed for %s", normalized, exc_info=True)
         return None
     return None
