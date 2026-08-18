@@ -206,3 +206,85 @@ class TestTickExecutesWokenJobs:
         scheduler.tick(verbose=False, sync=True)
 
         assert ran == []
+
+
+class TestWakeSurvivesAConcurrentRun:
+    """A wake for a job that is ALREADY RUNNING must be re-queued, not dropped.
+
+    Canary day 0 (2026-08-18) measured the cost of dropping it: both live wakes
+    hit the duplicate-fire guard because the producer and consumer share a
+    schedule boundary (tracker-cycle `0 */4`, matcher `0 */2` — the tracker's
+    SCORE_REQUESTs landed 10:06:51-54, inside the matcher run that started
+    10:00:57). The wake was discarded, so the messages waited for the next
+    scheduled run up to two hours later and the dispatcher's ledger claim aged
+    out unfinished. Event dispatch delivered zero accelerations.
+
+    Re-queueing makes the wake survive the in-flight run: the next tick after it
+    finishes dispatches the job. The channel is a set, so a re-queue is one
+    entry no matter how many ticks it waits, and a genuinely hung run is bounded
+    by the cron wall-clock timeout rather than by this loop.
+    """
+
+    def _jobs(self, monkeypatch, rows):
+        from cron import scheduler
+        monkeypatch.setattr(scheduler, "load_jobs", lambda: rows)
+        return scheduler
+
+    def test_running_job_wake_is_requeued_not_collected(self, monkeypatch):
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "matcher", "enabled": True}])
+        monkeypatch.setattr(s, "get_running_job_ids", lambda: frozenset({"j1"}))
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids=set()) == []
+        # still pending for a later tick — this is the whole point
+        assert "j1" in wake_channel.pending_wakes()
+
+    def test_requeued_wake_dispatches_once_the_run_finishes(self, monkeypatch):
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "matcher", "enabled": True}])
+        running = {"j1"}
+        monkeypatch.setattr(s, "get_running_job_ids", lambda: frozenset(running))
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids=set()) == []   # blocked, requeued
+        running.clear()                                          # run finishes
+        got = s._collect_woken_jobs(exclude_ids=set())
+
+        assert [j["id"] for j in got] == ["j1"]
+        assert wake_channel.pending_wakes() == frozenset()          # now consumed
+
+    def test_requeue_survives_many_blocked_ticks_as_one_entry(self, monkeypatch):
+        """A 12-minute run spans ~12 ticks; the channel must not grow."""
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "matcher", "enabled": True}])
+        monkeypatch.setattr(s, "get_running_job_ids", lambda: frozenset({"j1"}))
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        for _ in range(12):
+            assert s._collect_woken_jobs(exclude_ids=set()) == []
+        assert wake_channel.pending_wakes() == frozenset({"j1"})
+
+    def test_a_disabled_running_job_is_still_not_revived(self, monkeypatch):
+        """Re-queue must not resurrect a wake an operator's disable should kill."""
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "matcher", "enabled": False}])
+        monkeypatch.setattr(s, "get_running_job_ids", lambda: frozenset({"j1"}))
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids=set()) == []
+        assert wake_channel.pending_wakes() == frozenset()
+
+    def test_unknown_running_job_is_still_dropped(self, monkeypatch):
+        s = self._jobs(monkeypatch, [{"id": "other", "name": "a", "enabled": True}])
+        monkeypatch.setattr(s, "get_running_job_ids", lambda: frozenset({"j1"}))
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids=set()) == []
+        assert wake_channel.pending_wakes() == frozenset()
+
+    def test_scheduled_fire_this_tick_still_consumes_the_wake(self, monkeypatch):
+        """exclude_ids means the job is ALREADY firing now — the wake is
+        satisfied, not blocked, so it must be consumed rather than re-queued."""
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "matcher", "enabled": True}])
+        monkeypatch.setattr(s, "get_running_job_ids", lambda: frozenset())
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids={"j1"}) == []
+        assert wake_channel.pending_wakes() == frozenset()
