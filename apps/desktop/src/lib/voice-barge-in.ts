@@ -55,6 +55,7 @@ export interface BargeMonitorCallbacks {
 }
 
 export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): () => void {
+  const speechSource = Symbol('barge-in')
   let disposed = false
   let stream: MediaStream | null = null
   let context: AudioContext | null = null
@@ -65,7 +66,7 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
 
   const cleanup = () => {
     disposed = true
-    setUserSpeaking(false, 'barge-in')
+    setUserSpeaking(false, speechSource)
 
     if (frame !== null) {
       window.cancelAnimationFrame(frame)
@@ -283,7 +284,7 @@ export function monitorSpeechDuringPlayback(callbacks: BargeMonitorCallbacks): (
             tripped = true
             trippedAt = now
             quietSince = null
-            setUserSpeaking(true, 'barge-in')
+            setUserSpeaking(true, speechSource)
             callbacks.onSpeech()
 
             if (!callbacks.onUtterance || !recorder) {

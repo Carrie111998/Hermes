@@ -79,9 +79,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const silenceTriggeredRef = useRef(false)
   const silenceStartedAtRef = useRef<number | null>(null)
   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
+  const speechSourceRef = useRef<symbol>(Symbol('voice-capture'))
 
   const cleanup = () => {
-    setUserSpeaking(false, 'voice-capture')
+    setUserSpeaking(false, speechSourceRef.current)
 
     if (animationRef.current) {
       window.cancelAnimationFrame(animationRef.current)
@@ -143,7 +144,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
         if (speechThreshold > 0 && options.onSilence && !silenceTriggeredRef.current) {
           if (normalized >= speechThreshold) {
             if (!heardSpeechRef.current) {
-              setUserSpeaking(true, 'voice-capture')
+              setUserSpeaking(true, speechSourceRef.current)
             }
 
             heardSpeechRef.current = true
@@ -153,7 +154,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
 
             if (now - silenceStartedAtRef.current >= silenceMs) {
               silenceTriggeredRef.current = true
-              setUserSpeaking(false, 'voice-capture')
+              setUserSpeaking(false, speechSourceRef.current)
               options.onSilence()
 
               return

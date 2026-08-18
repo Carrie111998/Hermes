@@ -12,6 +12,7 @@ export interface VoiceLifecycleState {
 }
 
 export type VoiceLifecycleListener = (event: VoiceLifecycleEvent) => void
+export type VoiceSpeechSource = string | symbol
 
 export const $voiceLifecycle = atom<VoiceLifecycleState>({
   ttsSpeaking: false,
@@ -19,7 +20,7 @@ export const $voiceLifecycle = atom<VoiceLifecycleState>({
 })
 
 const listeners = new Map<VoiceLifecycleEventType | '*', Set<VoiceLifecycleListener>>()
-const userSpeechSources = new Set<string>()
+const userSpeechSources = new Set<VoiceSpeechSource>()
 
 export function onVoiceLifecycleEvent(
   type: VoiceLifecycleEventType | '*',
@@ -72,7 +73,7 @@ export function setTtsSpeaking(active: boolean): void {
   setLifecycleFlag('ttsSpeaking', active)
 }
 
-export function setUserSpeaking(active: boolean, source = 'default'): void {
+export function setUserSpeaking(active: boolean, source: VoiceSpeechSource = 'default'): void {
   if (active) {
     userSpeechSources.add(source)
   } else {

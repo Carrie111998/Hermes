@@ -56,15 +56,17 @@ describe('voice lifecycle', () => {
   it('keeps speech active while another VAD source still owns it', () => {
     const events: VoiceLifecycleEventType[] = []
     const off = onVoiceLifecycleEvent('*', event => events.push(event.type))
+    const firstCapture = Symbol('voice-capture')
+    const secondCapture = Symbol('voice-capture')
 
-    setUserSpeaking(true, 'voice-capture')
-    setUserSpeaking(true, 'barge-in')
-    setUserSpeaking(false, 'voice-capture')
+    setUserSpeaking(true, firstCapture)
+    setUserSpeaking(true, secondCapture)
+    setUserSpeaking(false, firstCapture)
 
     expect($voiceLifecycle.get().userSpeaking).toBe(true)
     expect(events).toEqual(['user_speech_started'])
 
-    setUserSpeaking(false, 'barge-in')
+    setUserSpeaking(false, secondCapture)
     expect(events).toEqual(['user_speech_started', 'user_speech_ended'])
 
     off()
