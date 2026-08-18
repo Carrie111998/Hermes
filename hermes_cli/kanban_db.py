@@ -7609,9 +7609,14 @@ def archive_task(
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
-    Safety guard: only archived tasks can be deleted. Active / blocked / done
-    tasks must be explicitly archived first so accidental data loss requires a
-    second deliberate action.
+    Safety guards:
+      1. Only archived tasks can be deleted. Active / blocked / done
+         tasks must be explicitly archived first so accidental data loss
+         requires a second deliberate action.
+      2. Refuses with :class:`TaskHasActiveRunError` if a worker run is
+         still in flight. Same stranded-worker guard as :func:`delete_task`
+         — cleanup flows (``archive --rm``, post-verification purge) must
+         SKIP such cards and retry later, never delete mid-run.
     """
     with write_txn(conn):
         row = conn.execute(
@@ -7620,6 +7625,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        active_run = _has_active_run(conn, task_id)
+        if active_run is not None:
+            raise TaskHasActiveRunError(task_id, active_run)
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
