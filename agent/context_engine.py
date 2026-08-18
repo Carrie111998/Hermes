@@ -143,10 +143,16 @@ class ContextEngine(ABC):
         """
 
     @abstractmethod
-    def should_compress(self, prompt_tokens: int = None) -> bool:
-        """Return True if compaction should fire this turn."""
+    def should_compress(self, prompt_tokens: int = None, messages: List[Dict[str, Any]] = None) -> bool:
+        """Return True if compaction should fire this turn.
 
-    def should_compress_info(self, prompt_tokens: int = None) -> "tuple[bool, str | None]":
+        ``messages`` is optional: when provided, engines with a structural
+        eligibility view (e.g. protected head/tail windows) should return
+        False when every message is protected and a pass would be a
+        guaranteed no-op (#88778). Engines that can't use it may ignore it.
+        """
+
+    def should_compress_info(self, prompt_tokens: int = None, messages: List[Dict[str, Any]] = None) -> "tuple[bool, str | None]":
         """Return ``(should_compress, reason)``.
 
         The base implementation is backward-compatible: engines that only
@@ -157,7 +163,7 @@ class ContextEngine(ABC):
         of silently skipping compression. Added for the silent-overflow
         warning fix (#62625) so plugin engines don't raise AttributeError.
         """
-        return self.should_compress(prompt_tokens), None
+        return should_compress_with_messages(self, prompt_tokens, messages), None
 
     @abstractmethod
     def compress(
@@ -487,3 +493,18 @@ class ContextEngine(ABC):
         )
         self.threshold_percent = self._base_threshold_percent
         self.threshold_tokens = int(context_length * self.threshold_percent)
+
+
+def should_compress_with_messages(
+    compressor: Any, prompt_tokens: int, messages: List[Dict[str, Any]]
+) -> bool:
+    """Call ``should_compress`` with the structural-eligibility messages.
+
+    Engines predating the ``messages`` parameter (external plugin engines
+    overriding the one-argument signature) raise TypeError on the extra
+    argument — fall back to the token-only decision for them (#88778).
+    """
+    try:
+        return compressor.should_compress(prompt_tokens, messages)
+    except TypeError:
+        return compressor.should_compress(prompt_tokens)
