@@ -1024,7 +1024,10 @@ async def _run_with_agent(
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
     if stream_consumer_config_error:
+        adapter.stream_consumer_config_error_called = False
+
         def _fail_stream_consumer_config(*args, **kwargs):
+            adapter.stream_consumer_config_error_called = True
             raise RuntimeError("synthetic stream consumer setup failure")
 
         runner._build_stream_consumer_config = _fail_stream_consumer_config
@@ -1207,7 +1210,9 @@ async def test_interim_fallback_send_marks_interim_intent_when_consumer_setup_fa
     )
 
     assert result["final_response"] == "done"
+    assert adapter.stream_consumer_config_error_called is True
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+    assert adapter.sent[0]["metadata"]["thread_id"] == "17585"
     assert adapter.sent[0]["metadata"]["interim_assistant_message"] is True
 
 
