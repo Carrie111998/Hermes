@@ -780,3 +780,41 @@ def test_successful_body_and_releases_remain_unchanged(isolated_skill_roots, mon
 
     assert len(factory.acquired) == 2
     assert len(factory.released) == 2
+
+
+def test_delete_guard_public_signature_and_locking_match_repair_path(isolated_skill_roots, monkeypatch):
+    sig = inspect.signature(_spg.live_skill_delete_guard)
+    assert list(sig.parameters) == [
+        "name", "target", "approved_existing_paths", "mutation_paths", "identity_names",
+    ]
+    assert sig.parameters["target"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    approved = _skill(isolated_skill_roots / "lemur", "lemur")
+    future = isolated_skill_roots / "future" / "lemur"
+    factory = RecordingLockFactory()
+    monkeypatch.setattr(_spg, "_acquire_lock_at_path", factory)
+
+    with _spg.live_skill_delete_guard(
+        "lemur",
+        target=approved,
+        approved_existing_paths=[approved],
+        mutation_paths=[future, approved],
+    ):
+        pass
+
+    expected = sorted({_spg._canonical_path(approved), _spg._canonical_path(future)}, key=_spg._path_sort_key)
+    assert _path_acquisitions(factory) == expected
+
+
+def test_delete_guard_unexpected_same_name_state_fails_closed(isolated_skill_roots):
+    approved = _skill(isolated_skill_roots / "marten", "marten")
+    _skill(isolated_skill_roots / "other" / "marten", "marten")
+
+    with pytest.raises(_spg.SkillMutationLockAcquireFailure):
+        with _spg.live_skill_delete_guard(
+            "marten",
+            target=approved,
+            approved_existing_paths=[approved],
+            mutation_paths=[approved],
+        ):
+            pass

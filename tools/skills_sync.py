@@ -49,6 +49,7 @@ from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_option
 from agent.skill_utils import is_excluded_skill_path
 from tools.skill_publish_guard import (
     SkillMutationLockAcquireFailure,
+    live_skill_delete_guard,
     live_skill_publish_guard,
     live_skill_repair_guard,
 )
@@ -1472,12 +1473,31 @@ def remove_pristine_bundled_skills(dry_run: bool = False) -> dict:
         if on_disk != origin_hash:
             skipped.append({"name": name, "reason": "user-modified (kept)"})
             continue
-        # Pristine bundled copy — safe to remove.
+        # Pristine bundled copy — safe to remove after deletion-specific live
+        # serialization and immediate final revalidation below.
         if dry_run:
             removed.append(name)
             continue
         try:
-            _rmtree_writable(dest)
+            with live_skill_delete_guard(
+                name,
+                target=dest,
+                approved_existing_paths=[dest],
+                mutation_paths=[dest],
+            ):
+                ok, reason = _validate_pristine_bundled_delete_current_state(
+                    name,
+                    origin_hash=origin_hash,
+                    expected_dest=dest,
+                    bundled_dir=bundled_dir,
+                )
+                if not ok:
+                    skipped.append({"name": name, "reason": reason})
+                    continue
+                _rmtree_writable(dest)
+        except SkillMutationLockAcquireFailure as e:
+            skipped.append({"name": name, "reason": f"delete guard refused: {e}"})
+            continue
         except (OSError, IOError) as e:
             skipped.append({"name": name, "reason": f"delete failed: {e}"})
             continue
@@ -1494,6 +1514,40 @@ def remove_pristine_bundled_skills(dry_run: bool = False) -> dict:
         "ok": True, "removed": removed, "skipped": skipped,
         "dry_run": dry_run, "message": message,
     }
+
+
+def _validate_pristine_bundled_delete_current_state(
+    name: str,
+    *,
+    origin_hash: str,
+    expected_dest: Path,
+    bundled_dir: Path,
+) -> Tuple[bool, str]:
+    """Revalidate bundled ownership and pristine content under delete guard."""
+    current_manifest = _read_manifest()
+    if current_manifest.get(name) != origin_hash:
+        return False, "manifest changed during removal"
+    bundled_by_name = dict(_discover_bundled_skills(bundled_dir))
+    src = bundled_by_name.get(name)
+    if src is None:
+        return False, "no bundled source (removed upstream)"
+    current_dest = _compute_relative_dest(src, bundled_dir)
+    if current_dest != expected_dest:
+        return False, "bundled target changed during removal"
+    try:
+        target = current_dest.resolve()
+        skills_root = SKILLS_DIR.resolve()
+    except OSError as exc:
+        return False, f"target path could not be resolved: {exc}"
+    if skills_root not in target.parents:
+        return False, "target is not strictly under skills dir"
+    if not current_dest.exists() or not current_dest.is_dir():
+        return False, "target disappeared during removal"
+    if _read_skill_name(current_dest / "SKILL.md", current_dest.name) != name:
+        return False, "target skill identity changed during removal"
+    if _dir_hash(current_dest) != origin_hash:
+        return False, "target content changed during removal"
+    return True, ""
 
 
 if __name__ == "__main__":

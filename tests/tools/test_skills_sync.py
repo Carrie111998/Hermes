@@ -810,6 +810,135 @@ class TestOptOutToggleAndRemove:
             assert (skills_dir / "mine" / "SKILL.md").exists()
 
 
+    def test_remove_pristine_uses_delete_guard_across_final_validation_and_rmtree(self, tmp_path):
+        from contextlib import contextmanager
+        import tools.skills_sync as ss
+        from tools.skills_sync import sync_skills, remove_pristine_bundled_skills
+
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        active = {"guard": False}
+        events = []
+
+        @contextmanager
+        def fake_delete_guard(name, *, target, approved_existing_paths, mutation_paths, identity_names=()):
+            assert name == "alpha"
+            assert target == skills_dir / "alpha"
+            assert approved_existing_paths == [skills_dir / "alpha"]
+            assert mutation_paths == [skills_dir / "alpha"]
+            active["guard"] = True
+            events.append("enter")
+            try:
+                yield
+            finally:
+                active["guard"] = False
+                events.append("exit")
+
+        real_rmtree = ss._rmtree_writable
+
+        def checked_rmtree(path):
+            assert active["guard"] is True
+            events.append("rmtree")
+            return real_rmtree(path)
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
+             patch("tools.skills_sync.MANIFEST_FILE", manifest_file), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]):
+            sync_skills(quiet=True)
+            # Keep this focused on one manifest entry so the fake guard can assert exact args.
+            manifest = _read_manifest()
+            _write_manifest({"alpha": manifest["alpha"]})
+            with patch("tools.skills_sync.live_skill_delete_guard", side_effect=fake_delete_guard), \
+                 patch("tools.skills_sync._rmtree_writable", side_effect=checked_rmtree):
+                result = remove_pristine_bundled_skills(dry_run=False)
+
+        assert result["removed"] == ["alpha"]
+        assert events == ["enter", "rmtree", "exit"]
+        assert not (skills_dir / "alpha").exists()
+
+    def test_remove_pristine_revalidates_changed_target_inside_delete_guard(self, tmp_path):
+        from contextlib import contextmanager
+        import tools.skills_sync as ss
+        from tools.skills_sync import sync_skills, remove_pristine_bundled_skills
+
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        @contextmanager
+        def replacing_delete_guard(*args, **kwargs):
+            target = skills_dir / "alpha"
+            ss._rmtree_writable(target)
+            target.mkdir()
+            (target / "SKILL.md").write_text("---\nname: alpha\n---\nCHANGED\n")
+            yield
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
+             patch("tools.skills_sync.MANIFEST_FILE", manifest_file), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]):
+            sync_skills(quiet=True)
+            with patch("tools.skills_sync.live_skill_delete_guard", side_effect=replacing_delete_guard):
+                result = remove_pristine_bundled_skills(dry_run=False)
+            manifest_after = _read_manifest()
+
+        assert "alpha" not in result["removed"]
+        assert any(s["name"] == "alpha" and "content changed" in s["reason"] for s in result["skipped"])
+        assert (skills_dir / "alpha" / "SKILL.md").read_text().endswith("CHANGED\n")
+        assert "alpha" in manifest_after
+
+    def test_remove_pristine_unexpected_same_name_fails_closed(self, tmp_path):
+        from tools.skills_sync import sync_skills, remove_pristine_bundled_skills
+
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
+             patch("tools.skills_sync.MANIFEST_FILE", manifest_file), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]):
+            sync_skills(quiet=True)
+            other = skills_dir / "category" / "alpha"
+            other.mkdir(parents=True)
+            (other / "SKILL.md").write_text("---\nname: alpha\n---\nother\n")
+            result = remove_pristine_bundled_skills(dry_run=False)
+
+        assert "alpha" not in result["removed"]
+        assert any(s["name"] == "alpha" and "delete guard refused" in s["reason"] for s in result["skipped"])
+        assert (skills_dir / "alpha" / "SKILL.md").exists()
+        assert other.exists()
+
+    def test_remove_pristine_delete_failure_preserves_target_and_manifest(self, tmp_path):
+        from tools.skills_sync import sync_skills, remove_pristine_bundled_skills
+
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        def fail_delete(_path):
+            raise PermissionError("busy")
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
+             patch("tools.skills_sync.MANIFEST_FILE", manifest_file), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]):
+            sync_skills(quiet=True)
+            with patch("tools.skills_sync._rmtree_writable", side_effect=fail_delete):
+                result = remove_pristine_bundled_skills(dry_run=False)
+            manifest_after = _read_manifest()
+
+        assert result["removed"] == []
+        assert {s["name"] for s in result["skipped"]} == {"alpha", "beta"}
+        assert (skills_dir / "alpha" / "SKILL.md").exists()
+        assert "alpha" in manifest_after and "beta" in manifest_after
+
+
 class TestUpdateBackupRecovery:
     """Regression tests for backup handling in the bundled-update path.
 

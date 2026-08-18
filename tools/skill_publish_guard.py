@@ -1388,6 +1388,22 @@ def _live_skill_transaction_guard(
                 state=state,
                 acquire=_acquire,
             )
+        elif mode == "delete":
+            # Deletion is its own live-skill trust boundary: callers must
+            # perform deletion-specific provenance/content checks inside this
+            # guard, but the generic same-name + mutation-path serialization is
+            # intentionally shared with the repair primitive so A1G lock
+            # ordering and identity failure behaviour stay identical.
+            yield from _live_skill_repair_locked(
+                canonical=canonical,
+                canonical_skill_path=canonical_skill_path,
+                approved_existing_paths=approved_existing_paths,
+                mutation_paths=mutation_paths,
+                identity_names=identity_names,
+                global_lock_path=global_lock_path,
+                state=state,
+                acquire=_acquire,
+            )
         else:
             raise ValueError("unknown live skill transaction mode: {0}".format(mode))
     except BaseException as exc:
@@ -1744,6 +1760,34 @@ def live_skill_repair_guard(
         name,
         target=target,
         mode="repair",
+        approved_existing_paths=approved_existing_paths,
+        mutation_paths=mutation_paths,
+        identity_names=identity_names,
+    ) as state:
+        yield state
+
+
+@contextmanager
+def live_skill_delete_guard(
+    name,
+    *,
+    target,
+    approved_existing_paths,
+    mutation_paths,
+    identity_names=(),
+):
+    """Guard a same-name live-skill deletion transaction.
+
+    The guard is deliberately narrow: it serializes the canonical skill name,
+    locks caller-supplied mutation paths, and fails closed if unexpected
+    same-name live state appears before the deletion body. Caller-specific
+    provenance/content checks remain with the caller and must be re-run inside
+    the guarded body immediately before removing anything.
+    """
+    with _live_skill_transaction_guard(
+        name,
+        target=target,
+        mode="delete",
         approved_existing_paths=approved_existing_paths,
         mutation_paths=mutation_paths,
         identity_names=identity_names,

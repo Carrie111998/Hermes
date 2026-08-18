@@ -37,7 +37,11 @@ import yaml
 from tools.skills_guard import (
     ScanResult, content_hash, TRUSTED_REPOS,
 )
-from tools.skill_publish_guard import live_skill_publish_guard
+from tools.skill_publish_guard import (
+    SkillMutationLockAcquireFailure,
+    live_skill_delete_guard,
+    live_skill_publish_guard,
+)
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
@@ -4064,13 +4068,100 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     except ValueError as exc:
         return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
-    if install_path.exists():
-        shutil.rmtree(install_path)
-
-    lock.record_uninstall(skill_name)
-    append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+    expected_existed = install_path.exists()
+    try:
+        with live_skill_delete_guard(
+            skill_name,
+            target=install_path,
+            approved_existing_paths=[install_path] if expected_existed else [],
+            mutation_paths=[install_path],
+        ):
+            current_entry = lock.get_installed(skill_name)
+            ok, reason = _validate_hub_uninstall_current_object(
+                skill_name,
+                expected_entry=entry,
+                current_entry=current_entry,
+                expected_install_path=install_path,
+                expected_existed=expected_existed,
+            )
+            if not ok:
+                return False, f"Refusing to uninstall '{skill_name}': {reason}"
+            if install_path.exists():
+                shutil.rmtree(install_path)
+            lock.record_uninstall(skill_name)
+            append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+    except SkillMutationLockAcquireFailure as exc:
+        return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
     return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
+
+
+def _hub_skill_frontmatter_name(skill_dir: Path) -> str:
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        content = skill_md.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        return ""
+    in_frontmatter = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped == "---":
+            if in_frontmatter:
+                break
+            in_frontmatter = True
+            continue
+        if in_frontmatter and stripped.startswith("name:"):
+            return stripped.split(":", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _hub_installed_file_list(skill_dir: Path) -> List[str]:
+    files: List[str] = []
+    for fpath in sorted(skill_dir.rglob("*")):
+        if fpath.is_file():
+            files.append(fpath.relative_to(skill_dir).as_posix())
+    return files
+
+
+def _validate_hub_uninstall_current_object(
+    skill_name: str,
+    *,
+    expected_entry: dict,
+    current_entry: Optional[dict],
+    expected_install_path: Path,
+    expected_existed: bool,
+) -> Tuple[bool, str]:
+    """Revalidate hub provenance/content while the deletion guard is held."""
+    if current_entry != expected_entry:
+        return False, "hub lock entry changed during uninstall"
+    if current_entry is None:
+        return False, "hub lock entry disappeared during uninstall"
+    try:
+        current_install_path = _resolve_lock_install_path(
+            current_entry.get("install_path", ""), skill_name
+        )
+    except ValueError as exc:
+        return False, str(exc)
+    if current_install_path != expected_install_path:
+        return False, "hub install path changed during uninstall"
+    if not current_install_path.exists():
+        if expected_existed:
+            return False, "hub install target disappeared during uninstall"
+        return True, ""
+    if not current_install_path.is_dir():
+        return False, "hub install target is not a directory"
+    if not (current_install_path / "SKILL.md").is_file():
+        return False, "hub install target no longer contains SKILL.md"
+    frontmatter_name = _hub_skill_frontmatter_name(current_install_path)
+    if frontmatter_name and frontmatter_name != skill_name:
+        return False, "hub install target skill identity changed"
+    expected_hash = current_entry.get("content_hash")
+    if expected_hash and content_hash(current_install_path) != expected_hash:
+        return False, "hub install target content hash changed"
+    expected_files = current_entry.get("files")
+    if isinstance(expected_files, list) and sorted(expected_files) != _hub_installed_file_list(current_install_path):
+        return False, "hub install target file list changed"
+    return True, ""
 
 
 def bundle_content_hash(bundle: SkillBundle) -> str:
