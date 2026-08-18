@@ -335,6 +335,7 @@ import {
 } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
+import { guardUntrustedWebviewWindowOpen } from './webview-security'
 import { readWindowBelow } from './window-below'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
@@ -15393,6 +15394,10 @@ if (!isPrimaryInstance) {
 
 // macOS delivers deep links via 'open-url' — register early (can fire before
 // whenReady; handleDeepLink queues until the renderer is ready).
+app.on('web-contents-created', (_event, contents) => {
+  guardUntrustedWebviewWindowOpen(contents)
+})
+
 app.on('open-url', (event, url) => {
   event.preventDefault()
   handleDeepLink(url)
