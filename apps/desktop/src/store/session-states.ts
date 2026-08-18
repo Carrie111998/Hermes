@@ -62,16 +62,55 @@ export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 // connected gateways can both expose a 'default' profile, so the gateway
 // keep-set (pruneSecondaryGateways) must key live work by the composite
 // (connectionId, profile) scope, not the bare profile name. Recorded at
-// event fan-in (use-gateway-boot); local/primary events carry no connectionId
-// and record nothing, so single-source behavior is untouched.
+// event fan-in. Local/primary authority is recorded too so a remote source
+// cannot claim a colliding runtime id, but only registry-backed authorities
+// contribute to the gateway keep-set below.
 // ---------------------------------------------------------------------------
 
-const sessionScopeByRuntimeId = new Map<string, string>()
+interface SessionEventAuthority {
+  connectionId: null | string
+  profile: string
+}
 
-export function recordSessionEventScope(event: { connectionId?: string; profile?: string; session_id?: string }): void {
-  if (event.session_id && event.connectionId) {
-    sessionScopeByRuntimeId.set(event.session_id, registryBackendScopeKey(event.connectionId, event.profile))
+const sessionScopeByRuntimeId = new Map<string, SessionEventAuthority>()
+
+export function claimActiveSessionEventScope(event: {
+  connectionId?: null | string
+  profile?: string
+  session_id: string
+}): void {
+  sessionScopeByRuntimeId.set(event.session_id, {
+    connectionId: event.connectionId ?? null,
+    profile: normalizeProfileKey(event.profile ?? $activeGatewayProfile.get())
+  })
+}
+
+export function recordSessionEventScope(event: {
+  connectionId?: null | string
+  profile?: string
+  session_id?: string
+}): boolean {
+  if (!event.session_id) {
+    return true
   }
+
+  const authority = {
+    connectionId: event.connectionId ?? null,
+    profile: normalizeProfileKey(event.profile ?? $activeGatewayProfile.get())
+  }
+
+  const current = sessionScopeByRuntimeId.get(event.session_id)
+
+  if (
+    current &&
+    (current.connectionId !== authority.connectionId || normalizeProfileKey(current.profile) !== authority.profile)
+  ) {
+    return false
+  }
+
+  sessionScopeByRuntimeId.set(event.session_id, authority)
+
+  return true
 }
 
 /** Composite scopes of registry-sourced sessions that are live (busy or
@@ -85,10 +124,10 @@ export function liveSessionScopes(): Set<string> {
       continue
     }
 
-    const scope = sessionScopeByRuntimeId.get(runtimeId)
+    const authority = sessionScopeByRuntimeId.get(runtimeId)
 
-    if (scope) {
-      scopes.add(scope)
+    if (authority?.connectionId) {
+      scopes.add(registryBackendScopeKey(authority.connectionId, authority.profile))
     }
   }
 

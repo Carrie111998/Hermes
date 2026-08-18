@@ -1,6 +1,9 @@
+import { registryBackendScopeKey } from '@hermes/shared'
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { $clarifyRequest, $clarifyRequests } from './clarify'
+import { $gateway, activeGatewayConnectionId } from './gateway'
+import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import { $activeSessionId } from './session'
 
 // Blocking interactive prompts the gateway raises mid-turn. Each maps to a
@@ -16,6 +19,11 @@ import { $activeSessionId } from './session'
 // prompt never hijacks the foreground.
 
 const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
+
+export interface PromptSource {
+  connectionId: null | string
+  profile: string
+}
 
 interface KeyedPrompt {
   sessionId: string | null
@@ -67,15 +75,17 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   }
 }
 
-// Approval is session-keyed on the backend and correlated by `request_id` when
-// available (legacy ID-free responses remain FIFO-compatible). Resolved via
-// approval.respond {choice, request_id, session_id}.
+// Approval is session-keyed on the backend. Desktop requests preserve the
+// gateway queue's opaque `request_id` so responses resolve exactly; legacy
+// backends without IDs retain their existing FIFO fallback.
 export interface ApprovalRequest extends KeyedPrompt {
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]
   command: string
+  connectionId?: null | string
   description: string
+  profile?: string
   requestId?: string
   smartDenied?: boolean
 }
@@ -103,7 +113,89 @@ export interface SecretRequest extends KeyedPrompt {
   requestId: string
 }
 
-const approval = keyedPromptStore<ApprovalRequest>()
+const approvalSourceKey = (
+  sessionId: string | null | undefined,
+  source: { connectionId?: null | string; profile?: string }
+): string =>
+  `${registryBackendScopeKey(source.connectionId ?? null, normalizeProfileKey(source.profile))}\u0000${keyFor(sessionId)}`
+
+const approvalsForSession = (all: Record<string, ApprovalRequest>, sessionId: string | null | undefined) =>
+  Object.values(all).filter(request => request.sessionId === (sessionId ?? null))
+
+const approvalForSession = (
+  all: Record<string, ApprovalRequest>,
+  sessionId: string | null | undefined,
+  source?: PromptSource,
+  strictSource = false
+): ApprovalRequest | null => {
+  if (source) {
+    const exact = all[approvalSourceKey(sessionId, source)]
+
+    if (exact || strictSource) {
+      return exact ?? null
+    }
+  }
+
+  const matches = approvalsForSession(all, sessionId)
+
+  return matches.length === 1 ? matches[0] : null
+}
+
+// Approval identity includes the complete backend authority. Session ids are
+// only runtime-local and may collide across configured gateway connections.
+const $approvalRequests = atom<Record<string, ApprovalRequest>>({})
+
+const approval = {
+  $active: computed(
+    [$approvalRequests, $activeSessionId, $activeGatewayProfile, $gateway],
+    (all, sessionId, profile) =>
+      approvalForSession(
+        all,
+        sessionId,
+        {
+          connectionId: activeGatewayConnectionId(),
+          profile: normalizeProfileKey(profile)
+        },
+        true
+      )
+  ),
+  $all: $approvalRequests,
+  clear(sessionId?: string | null, requestId?: string, source?: PromptSource) {
+    const all = $approvalRequests.get()
+
+    const keys =
+      sessionId === undefined
+        ? Object.keys(all)
+        : source
+          ? [approvalSourceKey(sessionId, source)]
+          : Object.entries(all)
+              .filter(([, request]) => request.sessionId === sessionId)
+              .map(([key]) => key)
+
+    const next = { ...all }
+    let changed = false
+
+    for (const key of keys) {
+      const current = next[key]
+
+      if (current && !(requestId && current.requestId !== requestId)) {
+        delete next[key]
+        changed = true
+      }
+    }
+
+    if (changed) {
+      $approvalRequests.set(next)
+    }
+  },
+  reset: () => $approvalRequests.set({}),
+  set: (request: ApprovalRequest) =>
+    $approvalRequests.set({
+      ...$approvalRequests.get(),
+      [approvalSourceKey(request.sessionId, request)]: request
+    })
+}
+
 const sudo = keyedPromptStore<SudoRequest>()
 const secret = keyedPromptStore<SecretRequest>()
 
@@ -126,7 +218,11 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
   }
 }
 
-export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
+export async function replayPendingApproval(
+  gateway: ApprovalGateway | null,
+  sessionId: string | null,
+  source?: { connectionId: null | string; profile: string }
+): Promise<void> {
   if (!gateway || !sessionId) {
     return
   }
@@ -148,7 +244,9 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     allowPermanent: pending.allow_permanent !== false,
     choices: Array.isArray(pending.choices) ? pending.choices.filter(choice => typeof choice === 'string') : undefined,
     command: typeof pending.command === 'string' ? pending.command : '',
+    connectionId: source?.connectionId,
     description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
+    profile: source?.profile,
     requestId: pending.request_id,
     sessionId,
     smartDenied: pending.smart_denied === true
@@ -157,8 +255,20 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
 
 /** The prompt request for one specific session — the tile counterpart of the
  *  active-session `$*Request` views (same map, fixed key). */
-export const sessionApprovalRequest = (sessionId: string | null) =>
-  computed(approval.$all, all => all[keyFor(sessionId)] ?? null)
+export const sessionApprovalRequest = (sessionId: string | null, source?: PromptSource) =>
+  computed(approval.$all, all => approvalForSession(all, sessionId, source, Boolean(source)))
+export const activeSessionApprovalRequest = (sessionId: string | null) =>
+  computed([$approvalRequests, $activeGatewayProfile, $gateway], (all, profile) =>
+    approvalForSession(
+      all,
+      sessionId,
+      {
+        connectionId: activeGatewayConnectionId(),
+        profile: normalizeProfileKey(profile)
+      },
+      true
+    )
+  )
 export const sessionSudoRequest = (sessionId: string | null) =>
   computed(sudo.$all, all => all[keyFor(sessionId)] ?? null)
 export const sessionSecretRequest = (sessionId: string | null) =>
@@ -210,33 +320,66 @@ export const $activeSessionAwaitingInput = computed(
 export const hasBlockingPromptRequest = (sessionId: string | null | undefined): boolean => {
   const key = keyFor(sessionId)
 
-  return Boolean(approval.$all.get()[key] || sudo.$all.get()[key] || secret.$all.get()[key])
+  const approvalRequest = approvalForSession(
+    approval.$all.get(),
+    sessionId,
+    {
+      connectionId: activeGatewayConnectionId(),
+      profile: normalizeProfileKey($activeGatewayProfile.get())
+    },
+    true
+  )
+
+  return Boolean(approvalRequest || sudo.$all.get()[key] || secret.$all.get()[key])
 }
 
 /** Reactive twin of `hasBlockingPromptRequest`, for the composer's busy-action
  *  affordance (the primary button must advertise queue, not steer, while the
  *  turn is parked on a prompt Enter can't answer). */
 export const sessionBlockingPrompt = (sessionId: string | null) =>
-  computed([approval.$all, sudo.$all, secret.$all], (approvals, sudos, secrets) => {
+  computed([approval.$all, sudo.$all, secret.$all, $activeGatewayProfile, $gateway], (approvals, sudos, secrets, profile) => {
     const key = keyFor(sessionId)
 
-    return Boolean(approvals[key] || sudos[key] || secrets[key])
+    const approvalRequest = approvalForSession(
+      approvals,
+      sessionId,
+      {
+        connectionId: activeGatewayConnectionId(),
+        profile: normalizeProfileKey(profile)
+      },
+      true
+    )
+
+    return Boolean(approvalRequest || sudos[key] || secrets[key])
   })
 
 /** Per-session `awaitingInput` — the tile composer's counterpart of
  *  `$activeSessionAwaitingInput` (same sources, fixed session instead of the
  *  active one). */
 export function sessionAwaitingInput(sessionId: string | null) {
-  return computed([$clarifyRequests, approval.$all, sudo.$all, secret.$all], (clarify, approvals, sudos, secrets) => {
-    const key = keyFor(sessionId)
+  return computed(
+    [$clarifyRequests, approval.$all, sudo.$all, secret.$all, $activeGatewayProfile, $gateway],
+    (clarify, approvals, sudos, secrets, profile) => {
+      const key = keyFor(sessionId)
 
-    return Boolean(clarify[key] || approvals[key] || sudos[key] || secrets[key])
-  })
+      const approvalRequest = approvalForSession(
+        approvals,
+        sessionId,
+        {
+          connectionId: activeGatewayConnectionId(),
+          profile: normalizeProfileKey(profile)
+        },
+        true
+      )
+
+      return Boolean(clarify[key] || approvalRequest || sudos[key] || secrets[key])
+    }
+  )
 }
 
 // Drop in-flight prompts for `sessionId` (a turn ended) across all three kinds —
 // or every parked prompt when no session is given (global reset / tests).
-export function clearAllPrompts(sessionId?: string | null): void {
+export function clearAllPrompts(sessionId?: string | null, source?: PromptSource): void {
   if (sessionId === undefined) {
     approval.reset()
     sudo.reset()
@@ -246,7 +389,14 @@ export function clearAllPrompts(sessionId?: string | null): void {
     return
   }
 
-  approval.clear(sessionId)
+  approval.clear(sessionId, undefined, source)
   sudo.clear(sessionId)
   secret.clear(sessionId)
+}
+
+export function clearAllPromptsForActiveSource(sessionId: string | null): void {
+  clearAllPrompts(sessionId, {
+    connectionId: activeGatewayConnectionId(),
+    profile: normalizeProfileKey($activeGatewayProfile.get())
+  })
 }

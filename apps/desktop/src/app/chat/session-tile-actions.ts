@@ -22,7 +22,7 @@ import type { ComposerAttachment } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
-import { clearAllPrompts } from '@/store/prompts'
+import { clearAllPromptsForActiveSource } from '@/store/prompts'
 import { $connection, $sessions, sessionMatchesStoredId } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
@@ -298,7 +298,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     clearSessionSubagents(sessionId)
     resetSessionBackground(sessionId)
     setSessionDraftingTool(sessionId, '')
-    clearAllPrompts(sessionId)
+    clearAllPromptsForActiveSource(sessionId)
     clearClarifyRequest(undefined, sessionId)
 
     try {

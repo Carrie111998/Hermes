@@ -17,6 +17,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
+import { clearAllPrompts, sessionApprovalRequest } from '@/store/prompts'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
@@ -1700,6 +1701,8 @@ describe('resumeSession warm-cache mapping integrity', () => {
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    clearAllPrompts()
+    $activeGatewayProfile.set('default')
     vi.restoreAllMocks()
   })
 
@@ -1863,6 +1866,93 @@ describe('resumeSession warm-cache mapping integrity', () => {
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
     )
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+  })
+
+  it('parks a session.resume approval under the resumed profile authority', async () => {
+    $activeGatewayProfile.set('research')
+    setSessions([storedSession({ id: 'stored-A', profile: 'research' })])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 0,
+          messages: [],
+          pending_approval: {
+            description: 'cold resumed approval',
+            request_id: 'cold-resume-request'
+          },
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={value => (resume = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect(sessionApprovalRequest('rt-A', { connectionId: null, profile: 'research' }).get()).toMatchObject({
+      description: 'cold resumed approval',
+      requestId: 'cold-resume-request'
+    })
+  })
+
+  it('parks a session.activate approval under the resumed profile authority', async () => {
+    $activeGatewayProfile.set('research')
+    setSessions([storedSession({ id: 'stored-A', profile: 'research' })])
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', clientState('stored-A')]])
+    }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          message_count: 0,
+          messages: [],
+          pending_approval: {
+            description: 'resumed approval',
+            request_id: 'resume-request'
+          },
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={value => (resume = value)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect(sessionApprovalRequest('rt-A', { connectionId: null, profile: 'research' }).get()).toMatchObject({
+      description: 'resumed approval',
+      requestId: 'resume-request'
+    })
   })
 
   it('preserves cached image attachments through an idle persisted transcript refresh', async () => {

@@ -217,6 +217,11 @@ import {
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
 import {
+  nativeNotificationDedupeKey,
+  sendNativeNotificationAction,
+  sendNativeNotificationFocus
+} from './native-notification-action'
+import {
   nativeRefreshUrl,
   type NativeTokenSet,
   parseTokenResponse,
@@ -13620,7 +13625,7 @@ const claimedAmbientCue = createEventDeduper()
 // The first caller within the window gets true; peers get false and stay quiet.
 ipcMain.handle('hermes:ambient:claim', (_event, key) => !claimedAmbientCue(String(key ?? '')))
 
-ipcMain.handle('hermes:notify', (_event, payload) => {
+ipcMain.handle('hermes:notify', (event, payload) => {
   if (!Notification.isSupported()) {
     return false
   }
@@ -13629,7 +13634,7 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   // kind+session can arrive here twice. Collapse it at this single choke point.
   // Return true (not false): a notification for the event IS being shown by the
   // first caller, so the settings "send test" success probe stays honest.
-  if (isDuplicateNotification(`${payload?.kind ?? ''}:${payload?.sessionId ?? payload?.tag ?? ''}`)) {
+  if (isDuplicateNotification(nativeNotificationDedupeKey(payload ?? {}))) {
     return true
   }
 
@@ -13645,26 +13650,16 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   })
 
   notification.on('click', () => {
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      return
+    const sourceWindow = BrowserWindow.fromWebContents(event.sender)
+
+    if (sourceWindow && !sourceWindow.isDestroyed()) {
+      focusWindow(sourceWindow)
     }
 
-    focusWindow(mainWindow)
-
-    if (payload?.sessionId) {
-      mainWindow.webContents.send('hermes:focus-session', payload.sessionId)
-    }
+    sendNativeNotificationFocus(event.sender, payload ?? {})
   })
   notification.on('action', (_actionEvent, index) => {
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      return
-    }
-
-    const action = actions[index]
-
-    if (action?.id) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
-    }
+    sendNativeNotificationAction(event.sender, payload ?? {}, actions, index)
   })
   notification.show()
 

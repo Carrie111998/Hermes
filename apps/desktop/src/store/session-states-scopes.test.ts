@@ -70,6 +70,15 @@ describe('liveSessionScopes', () => {
     expect(liveSessionScopes()).toEqual(new Set(['conn:homelab::default', 'conn:spark::default']))
   })
 
+  it("does not overwrite a live runtime id's original source scope", () => {
+    recordSessionEventScope({ connectionId: 'remote-a', profile: 'research', session_id: 'shared' })
+    publishSessionState('shared', state({ busy: false, needsInput: true }))
+
+    recordSessionEventScope({ connectionId: 'remote-b', profile: 'research', session_id: 'shared' })
+
+    expect(liveSessionScopes()).toEqual(new Set(['conn:remote-a::research']))
+  })
+
   it('forgets a dropped runtime session', () => {
     recordSessionEventScope({ connectionId: 'homelab', profile: 'default', session_id: 'rt-1' })
     publishSessionState('rt-1', state({ busy: true }))

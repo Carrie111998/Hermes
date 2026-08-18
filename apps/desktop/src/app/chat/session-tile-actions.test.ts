@@ -2,6 +2,8 @@ import { renderHook } from '@testing-library/react'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { clearAllPrompts, sessionApprovalRequest, setApprovalRequest } from '@/store/prompts'
+
 import { MAIN_COMPOSER_SCOPE } from './composer/scope'
 
 const requestGatewayMock = vi.hoisted(() => vi.fn())
@@ -58,6 +60,7 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
   })
 
   afterEach(() => {
+    clearAllPrompts()
     requestGatewayMock.mockReset()
     vi.restoreAllMocks()
   })
@@ -97,6 +100,30 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID })
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
+  })
+
+  it('interrupt cleanup preserves a foreign-source approval with the same session id', async () => {
+    requestGatewayMock.mockResolvedValue({})
+    setApprovalRequest({ command: '', description: 'active', requestId: 'active-request', sessionId: RUNTIME_SESSION_ID })
+    setApprovalRequest({
+      command: '',
+      connectionId: 'remote-b',
+      description: 'foreign',
+      profile: 'research',
+      requestId: 'foreign-request',
+      sessionId: RUNTIME_SESSION_ID
+    })
+
+    const { result } = renderTileActions()
+
+    await act(async () => {
+      await result.current.cancelRun()
+    })
+
+    expect(sessionApprovalRequest(RUNTIME_SESSION_ID, { connectionId: null, profile: 'default' }).get()).toBeNull()
+    expect(
+      sessionApprovalRequest(RUNTIME_SESSION_ID, { connectionId: 'remote-b', profile: 'research' }).get()?.requestId
+    ).toBe('foreign-request')
   })
 
   it('resumes the stored session and retries once when session.redirect (steer) reports "session not found"', async () => {

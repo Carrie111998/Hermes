@@ -1,6 +1,8 @@
-import { renderHook } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type * as GatewayStore from '@/store/gateway'
+import type * as NativeNotifications from '@/store/native-notifications'
 import { _resetLegacyDiscardForTests } from '@/store/session'
 import type * as WindowsStore from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
@@ -10,7 +12,23 @@ import { useDesktopIntegrations } from './use-desktop-integrations'
 // Mutable HUD-window flag so the restore tests can flip the window kind the
 // hook believes it runs in. Default false keeps the pre-existing restore
 // coverage exercising the real main-window path.
-const { hudWindowMock } = vi.hoisted(() => ({ hudWindowMock: vi.fn(() => false) }))
+const { ensureGatewayForAgentMock, hudWindowMock, respondToApprovalActionMock } = vi.hoisted(() => ({
+  ensureGatewayForAgentMock: vi.fn(async () => true),
+  hudWindowMock: vi.fn(() => false),
+  respondToApprovalActionMock: vi.fn()
+}))
+
+vi.mock('@/store/gateway', async importOriginal => {
+  const actual = await importOriginal<typeof GatewayStore>()
+
+  return { ...actual, ensureGatewayForAgent: ensureGatewayForAgentMock }
+})
+
+vi.mock('@/store/native-notifications', async importOriginal => {
+  const actual = await importOriginal<typeof NativeNotifications>()
+
+  return { ...actual, respondToApprovalAction: respondToApprovalActionMock }
+})
 
 vi.mock('@/store/windows', async importOriginal => {
   const actual = await importOriginal<typeof WindowsStore>()
@@ -53,10 +71,33 @@ const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
 describe('useDesktopIntegrations', () => {
   let navigate: ReturnType<typeof vi.fn<(...args: unknown[]) => void>>
 
+  let notificationActionCallback:
+    | ((payload: {
+        actionId: string
+        connectionId?: null | string
+        profile?: string
+        requestId?: string
+        sessionId?: string
+      }) => void)
+    | undefined
+
+  let focusSessionCallback:
+    | ((payload: {
+        connectionId?: null | string
+        profile?: string
+        requestId?: string
+        sessionId?: string
+      }) => void)
+    | undefined
+
   beforeEach(() => {
     window.localStorage.clear()
     _resetLegacyDiscardForTests()
     navigate = vi.fn()
+    notificationActionCallback = undefined
+    focusSessionCallback = undefined
+    ensureGatewayForAgentMock.mockClear()
+    respondToApprovalActionMock.mockReset()
     // Every test starts as a main window; only the HUD describe flips this.
     hudWindowMock.mockReturnValue(false)
 
@@ -66,8 +107,16 @@ describe('useDesktopIntegrations', () => {
     desktopWindow.hermesDesktop = {
       setPreviewShortcutActive: vi.fn(),
       onOpenUpdatesRequested: vi.fn(),
-      onFocusSession: vi.fn(),
-      onNotificationAction: vi.fn(),
+      onFocusSession: vi.fn(callback => {
+        focusSessionCallback = callback
+
+        return vi.fn()
+      }),
+      onNotificationAction: vi.fn(callback => {
+        notificationActionCallback = callback
+
+        return vi.fn()
+      }),
       onDeepLink: vi.fn(),
       signalDeepLinkReady: vi.fn(),
       onClosePreviewRequested: vi.fn(),
@@ -132,6 +181,58 @@ describe('useDesktopIntegrations', () => {
       }
     )
   }
+
+  it('forwards complete native approval authority into the response handler', () => {
+    render()
+
+    act(() =>
+      notificationActionCallback?.({
+        actionId: 'approve',
+        connectionId: 'remote-a',
+        profile: 'research',
+        requestId: 'request-a',
+        sessionId: 'session-a'
+      })
+    )
+
+    expect(respondToApprovalActionMock).toHaveBeenCalledWith('session-a', 'request-a', 'approve', {
+      connectionId: 'remote-a',
+      profile: 'research'
+    })
+  })
+
+  it('activates the captured notification source before opening its session', async () => {
+    render()
+
+    act(() =>
+      focusSessionCallback?.({
+        connectionId: 'remote-a',
+        profile: 'research',
+        requestId: 'request-a',
+        sessionId: 'session-a'
+      })
+    )
+
+    await waitFor(() => expect(ensureGatewayForAgentMock).toHaveBeenCalledWith('remote-a', 'research'))
+    expect(navigate).toHaveBeenCalled()
+  })
+
+  it('does not navigate when the captured notification source cannot be activated', async () => {
+    ensureGatewayForAgentMock.mockResolvedValueOnce(false)
+    render()
+
+    act(() =>
+      focusSessionCallback?.({
+        connectionId: 'remote-a',
+        profile: 'research',
+        requestId: 'request-a',
+        sessionId: 'session-a'
+      })
+    )
+
+    await waitFor(() => expect(ensureGatewayForAgentMock).toHaveBeenCalledWith('remote-a', 'research'))
+    expect(navigate).not.toHaveBeenCalled()
+  })
 
   describe('profile-ready gate', () => {
     it('does NOT restore before profileReady is true', () => {

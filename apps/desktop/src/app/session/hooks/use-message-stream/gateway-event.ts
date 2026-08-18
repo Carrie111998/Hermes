@@ -28,7 +28,7 @@ import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock
 import { clearClarifyRequest, normalizeChoices, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
-import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
+import { $gateway, activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
 import {
   notifyCronChanged,
@@ -77,7 +77,12 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
-import { dropSessionState, unbindTileRuntime } from '@/store/session-states'
+import {
+  claimActiveSessionEventScope,
+  dropSessionState,
+  recordSessionEventScope,
+  unbindTileRuntime
+} from '@/store/session-states'
 import { pruneDelegateFallbackSubagents, pruneFinishedSessionSubagents, upsertSubagent } from '@/store/subagents'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
@@ -375,6 +380,24 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const sessionId = route.sessionId
 
+      // A foreign source may legitimately park an approval whose runtime id
+      // collides with the visible session. Claim the active runtime for the
+      // active gateway before examining the event so that source-qualified
+      // prompt handling cannot transfer ownership of shared transcript state.
+      if (sessionId && sessionId === activeSessionIdRef.current) {
+        claimActiveSessionEventScope({
+          connectionId: activeGatewayConnectionId(),
+          profile: normalizeProfileKey($activeGatewayProfile.get()),
+          session_id: sessionId
+        })
+      }
+
+      const isSessionSourceEvent = recordSessionEventScope({
+        connectionId: event.connectionId ?? null,
+        profile: event.profile,
+        session_id: sessionId ?? undefined
+      })
+
       // Late stragglers: an unscoped stream event attributed via the
       // active-session fallback (no pin) to a session that has no live turn
       // belongs to a turn that already ended elsewhere. Dropping it keeps the
@@ -402,10 +425,40 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
+      const isActiveSourceEvent =
+        (event.connectionId ?? null) === activeGatewayConnectionId() &&
+        normalizeProfileKey(event.profile ?? $activeGatewayProfile.get()) ===
+          normalizeProfileKey($activeGatewayProfile.get())
+
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
 
       if (replaySessionId) {
-        void replayPendingApproval($gateway.get(), replaySessionId).catch(() => undefined)
+        const replaySource = {
+          connectionId: event.connectionId ?? null,
+          profile: normalizeProfileKey(event.profile ?? $activeGatewayProfile.get())
+        }
+
+        const replayGateway = {
+          request: (method: string, params: Record<string, unknown>) =>
+            requestGatewayForAgent(replaySource.connectionId, replaySource.profile, method, params)
+        }
+
+        void replayPendingApproval(replayGateway, replaySessionId, replaySource).catch(() => undefined)
+      }
+
+      if (
+        sessionId &&
+        !isSessionSourceEvent &&
+        event.type !== 'approval.request' &&
+        event.type !== 'message.complete' &&
+        event.type !== 'error' &&
+        event.type !== 'session.info'
+      ) {
+        // Only events with their own exact-source handling may cross a runtime
+        // authority mismatch. Ordinary stream/tool/status events compose into
+        // session-keyed runtime, transcript and composer state, so a colliding
+        // backend must stop before any of those shared sinks.
+        return
       }
 
       // Mid-turn compaction does not emit another message.start. The first
@@ -416,11 +469,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         setSessionCompacting(sessionId, false)
       }
 
-      if (sessionId && DRAFT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
+      if (sessionId && isSessionSourceEvent && DRAFT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
         setSessionDraftingTool(sessionId, '')
       }
 
-      if (sessionId && PROVIDER_WAIT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
+      if (sessionId && isSessionSourceEvent && PROVIDER_WAIT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
         setSessionProviderWait(sessionId, '')
       }
 
@@ -495,6 +548,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         return
       } else if (event.type === 'session.info') {
+        // Explicit session state belongs to the authority that first claimed
+        // this runtime id. A colliding backend must not mutate the active view,
+        // transcript/runtime cache, composer metadata, or turn lifecycle.
+        if (explicitSid && !isSessionSourceEvent) {
+          return
+        }
+
         // Apply session-scoped fields when the event targets the active
         // session, OR when it's a global broadcast and we have no session.
         const apply = explicitSid ? isActiveEvent : !activeSessionIdRef.current
@@ -972,7 +1032,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // (e.g. interrupted, or the approval already resolved). Scoped to the
         // session so a background turn finishing can't wipe the active chat's
         // prompt, and vice versa.
-        clearAllPrompts(sessionId)
+        clearAllPrompts(sessionId, {
+          connectionId: event.connectionId ?? null,
+          profile: normalizeProfileKey(event.profile ?? $activeGatewayProfile.get())
+        })
+
+        if (!isSessionSourceEvent) {
+          return
+        }
+
         clearClarifyRequest(undefined, sessionId)
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the
@@ -1258,29 +1326,45 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // surfaces once the user focuses that chat.
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+        const requestId = typeof payload?.request_id === 'string' && payload.request_id ? payload.request_id : undefined
+        const approvalProfile = normalizeProfileKey(event.profile ?? $activeGatewayProfile.get())
 
-        void receiveApprovalRequest($gateway.get(), {
+        const approvalConnectionId = event.connectionId ?? null
+
+        const approvalGateway = {
+          request: (method: string, params: Record<string, unknown>) =>
+            requestGatewayForAgent(approvalConnectionId, approvalProfile, method, params)
+        }
+
+        void receiveApprovalRequest(approvalGateway, {
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
           choices: Array.isArray(payload?.choices)
             ? payload.choices.filter(choice => typeof choice === 'string')
             : undefined,
           command,
+          connectionId: approvalConnectionId,
           description,
-          requestId: typeof payload?.request_id === 'string' ? payload.request_id : undefined,
+          profile: approvalProfile,
+          requestId,
           sessionId: sessionId ?? null,
           smartDenied: payload?.smart_denied === true
         }).catch(() => undefined)
 
-        if (sessionId) {
+        if (sessionId && isActiveSourceEvent) {
           updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
         }
 
         dispatchNativeNotification({
-          actions: [
-            { id: 'approve', text: translateNow('notifications.native.approveAction') },
-            { id: 'reject', text: translateNow('notifications.native.rejectAction') }
-          ],
+          actions: requestId
+            ? [
+                { id: 'approve', text: translateNow('notifications.native.approveAction') },
+                { id: 'reject', text: translateNow('notifications.native.rejectAction') }
+              ]
+            : undefined,
+          approvalConnectionId,
+          approvalProfile,
+          approvalRequestId: requestId,
           body: command || description,
           kind: 'approval',
           sessionId,
@@ -1531,7 +1615,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // for this session so an approval/sudo/secret overlay can't linger past
         // the failed turn (same intent as the message.complete clear).
         if (sessionId) {
-          clearAllPrompts(sessionId)
+          clearAllPrompts(sessionId, {
+            connectionId: event.connectionId ?? null,
+            profile: normalizeProfileKey(event.profile ?? $activeGatewayProfile.get())
+          })
+
+          if (!isSessionSourceEvent) {
+            return
+          }
+
           clearClarifyRequest(undefined, sessionId)
           clearActiveSessionTodos(sessionId)
           setSessionCompacting(sessionId, false)

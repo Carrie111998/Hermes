@@ -4,6 +4,7 @@ import { closeActiveTab } from '@/app/chat/close-tab'
 import { commandFocusedPreview } from '@/app/chat/right-rail/preview-nav'
 import { openSession } from '@/app/open-session'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
+import { ensureGatewayForAgent } from '@/store/gateway'
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
 import { startMcpHealthChecker, stopMcpHealthChecker } from '@/store/mcp-health'
 import { respondToApprovalAction } from '@/store/native-notifications'
@@ -177,19 +178,43 @@ export function useDesktopIntegrations({
   // on screen. Runtime id is translated to the stored id the chat route is
   // keyed by; action buttons resolve in place.
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onFocusSession?.(sessionId => {
-      if (sessionId) {
-        openSession(storedSessionIdForNotification(sessionId, runtimeIdByStoredSessionId.current), navigate, 'stack')
+    const unsubscribe = window.hermesDesktop?.onFocusSession?.(rawPayload => {
+      const payload = typeof rawPayload === 'string' ? { sessionId: rawPayload } : rawPayload
+
+      const sessionId = payload.sessionId
+
+      if (!sessionId) {
+        return
       }
+      void (async () => {
+        if (payload.profile) {
+          const activated = await ensureGatewayForAgent(payload.connectionId ?? null, payload.profile)
+
+          if (!activated) {
+            return
+          }
+        }
+
+        openSession(
+          storedSessionIdForNotification(sessionId, runtimeIdByStoredSessionId.current),
+          navigate,
+          'stack'
+        )
+      })()
     })
 
     return () => unsubscribe?.()
   }, [navigate, runtimeIdByStoredSessionId])
 
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
-      void respondToApprovalAction(sessionId ?? null, actionId)
-    })
+    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(
+      ({ actionId, connectionId, profile, requestId, sessionId }) => {
+        void respondToApprovalAction(sessionId ?? null, requestId ?? '', actionId, {
+          connectionId: connectionId ?? null,
+          profile: profile ?? ''
+        })
+      }
+    )
 
     return () => unsubscribe?.()
   }, [])

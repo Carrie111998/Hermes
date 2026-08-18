@@ -2,9 +2,10 @@ import { atom } from 'nanostores'
 
 import { persistString, storedString } from '@/lib/storage'
 
-import { $gateway } from './gateway'
+import { activeGatewayConnectionId, requestGatewayForAgent } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { $activeGatewayProfile, normalizeProfileKey } from './profile'
+import { clearApprovalRequest, replayPendingApproval } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -125,7 +126,13 @@ function isBackgrounded(): boolean {
   return typeof document.hasFocus === 'function' && !document.hasFocus()
 }
 
-function shouldFire(kind: NativeNotificationKind, sessionId?: null | string, global = false): boolean {
+function shouldFire(
+  kind: NativeNotificationKind,
+  sessionId?: null | string,
+  global = false,
+  approvalConnectionId?: null | string,
+  approvalProfile?: string
+): boolean {
   // Global notifications aren't tied to a chat session (e.g. pet generation,
   // which runs from the command center with no active conversation). They fire
   // whenever the user is away, with no session-match requirement — otherwise a
@@ -136,7 +143,15 @@ function shouldFire(kind: NativeNotificationKind, sessionId?: null | string, glo
 
   // Attention kinds break through for an off-screen session even while focused.
   if (ATTENTION_KINDS.has(kind)) {
-    return isBackgrounded() || (Boolean(sessionId) && sessionId !== $activeSessionId.get())
+    const activeSessionMatches = Boolean(sessionId) && sessionId === $activeSessionId.get()
+
+    const activeSourceMatches =
+      kind !== 'approval' ||
+      ((approvalConnectionId ?? null) === activeGatewayConnectionId() &&
+        normalizeProfileKey(approvalProfile ?? $activeGatewayProfile.get()) ===
+          normalizeProfileKey($activeGatewayProfile.get()))
+
+    return isBackgrounded() || !activeSessionMatches || !activeSourceMatches
   }
 
   // Completion kinds: only the active session, only while away — so a busy
@@ -162,6 +177,11 @@ export interface NativeNotificationInput {
   global?: boolean
   silent?: boolean
   actions?: NativeNotificationAction[]
+  /** Opaque backend authority captured when an approval notification is created. */
+  approvalRequestId?: string
+  /** Backend source captured with the opaque approval authority. */
+  approvalConnectionId?: null | string
+  approvalProfile?: string
   /**
    * Extra throttle/dedupe discriminator for session-less notifications (e.g.
    * the plugin id), so unrelated emitters of the same kind don't collapse
@@ -181,16 +201,38 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     return
   }
 
-  if (!shouldFire(input.kind, input.sessionId, input.global)) {
+  if (
+    !shouldFire(
+      input.kind,
+      input.sessionId,
+      input.global,
+      input.approvalConnectionId,
+      input.approvalProfile
+    )
+  ) {
     return
   }
 
-  if (throttled(`${input.kind}:${input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`, Date.now())) {
+  const throttleKey =
+    input.kind === 'approval'
+      ? JSON.stringify([
+          input.kind,
+          input.sessionId ?? null,
+          input.approvalConnectionId ?? null,
+          input.approvalProfile ?? null,
+          input.approvalRequestId ?? null
+        ])
+      : `${input.kind}:${input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`
+
+  if (throttled(throttleKey, Date.now())) {
     return
   }
 
   void window.hermesDesktop?.notify({
     actions: input.actions,
+    approvalConnectionId: input.approvalConnectionId,
+    approvalProfile: input.approvalProfile,
+    approvalRequestId: input.approvalRequestId,
     body: input.body,
     kind: input.kind,
     sessionId: input.sessionId ?? undefined,
@@ -217,24 +259,43 @@ export function dispatchPluginNativeNotification(pluginId: string, input: Plugin
   dispatchNativeNotification({ ...input, global: true, kind: 'plugin', tag: pluginId })
 }
 
-// Resolve a pending approval from a notification button, mirroring the in-app
-// Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+// Resolve the exact approval captured by this notification, mirroring the
+// in-app Run/Reject bar. Never re-read mutable session prompt state here: an old
+// OS notification can outlive the request that replaced it in the renderer.
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  requestId: string,
+  actionId: string,
+  source: { connectionId: null | string; profile: string }
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
     return
   }
 
-  const gateway = $gateway.get()
+  if (!source.profile) {
+    return
+  }
 
-  if (!gateway) {
+  if (!requestId) {
     return
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    const request = <T>(method: string, params: Record<string, unknown>) =>
+      requestGatewayForAgent<T>(source.connectionId, source.profile, method, params)
+
+    const result = await request<{ resolved?: number }>('approval.respond', {
+      choice,
+      request_id: requestId,
+      session_id: sessionId ?? undefined
+    })
+
+    if (result?.resolved === 1) {
+      clearApprovalRequest(sessionId, requestId, source)
+      await replayPendingApproval({ request }, sessionId, source)
+    }
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }
