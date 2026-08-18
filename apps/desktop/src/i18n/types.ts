@@ -1016,6 +1016,11 @@ export interface Translations {
       deleteFailed: string
       updateDirFailed: string
       clearDirFailed: string
+      pinnedDisplayTitle: string
+      pinnedCardRowsTitle: string
+      pinnedCardRowsDesc: string
+      pinnedInProjectsTitle: string
+      pinnedInProjectsDesc: string
     }
     toolsets: {
       loadingConfig: string
