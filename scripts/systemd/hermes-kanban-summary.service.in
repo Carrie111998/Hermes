@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes metadata-only Kanban summary
+
+[Service]
+Type=oneshot
+ExecStart=@PYTHON@ -m hermes_cli.kanban_summary --board @BOARD@
+Environment=HERMES_HOME=@HERMES_HOME@
+Environment=PYTHONPATH=@RELEASE_PATH@
+WorkingDirectory=@RELEASE_PATH@
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=120
