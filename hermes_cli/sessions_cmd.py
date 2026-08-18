@@ -142,13 +142,14 @@ def _session_inspection(db, session_id):
     resolved = db.resolve_session_id(session_id)
     if not resolved:
         return None
-    exported = db.export_session(resolved)
+    exported = db.export_session_lineage(resolved)
     if not exported:
         return None
-    activity = db.get_session_activity(resolved) or {}
+    current_id = exported.get("id") or resolved
+    activity = db.get_session_activity(current_id) or {}
     return {
         "session": {
-            "id": resolved,
+            "id": current_id,
             "title": exported.get("title"),
             "source": exported.get("source"),
             "state": "active" if exported.get("ended_at") is None else "ended",

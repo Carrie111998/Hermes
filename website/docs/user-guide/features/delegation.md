@@ -314,7 +314,7 @@ The parent agent orchestrates its own running children with the same `delegate_t
 {"action": "stop",  "subagent_id": "sa-0-1a2b3c4d"}
 ```
 
-- **`list`** returns the conversation's live children: `subagent_id`, goal, status, `running_seconds`, `accepting_steer`, and the live transcript path. Ids also come back in the spawn dispatch response as `subagent_ids`.
+- **`list`** returns the conversation's live children: `subagent_id`, `session_id`, goal, status, `running_seconds`, `accepting_steer`, and the live transcript path. Subagent ids also come back in the spawn dispatch response as `subagent_ids`.
 - **`steer`** queues a course correction into a running child without stopping it (delivery semantics below).
 - **`stop`** ends a child early at its next iteration boundary; the partial result still re-enters the conversation as a normal completion message.
 

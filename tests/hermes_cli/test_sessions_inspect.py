@@ -24,6 +24,9 @@ class _FakeDB:
             "messages": self.messages,
         }
 
+    def export_session_lineage(self, session_id):
+        return self.export_session(session_id)
+
     def get_session_activity(self, session_id):
         assert session_id == "session-full-id"
         return {
@@ -150,18 +153,18 @@ def test_inspect_reports_missing_session(monkeypatch, capsys):
     assert db.closed is True
 
 
-def test_inspection_reads_real_persisted_session_rows(tmp_path):
+def test_inspection_reads_todo_across_compression_lineage(tmp_path):
     from hermes_cli.sessions_cmd import _session_inspection
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("child-session", "subagent")
+    db.create_session("child-root", "subagent")
     todos = [
         {"id": "one", "content": "Run TTS sample", "status": "in_progress"},
         {"id": "two", "content": "Compare output", "status": "pending"},
     ]
     db.append_message(
-        "child-session",
+        "child-root",
         "assistant",
         tool_calls=[
             {
@@ -172,19 +175,25 @@ def test_inspection_reads_real_persisted_session_rows(tmp_path):
         ],
     )
     db.append_message(
-        "child-session",
+        "child-root",
         "tool",
         content=json.dumps({"todos": todos}),
         tool_call_id="todo-real",
+    )
+    db.end_session("child-root", "compression")
+    db.create_session(
+        "child-session", "subagent", parent_session_id="child-root"
     )
     db.touch_session_activity(
         "child-session", 1_700_000_100.0, description="running text_to_speech"
     )
     try:
-        snapshot = _session_inspection(db, "child")
+        snapshot = _session_inspection(db, "child-session")
     finally:
         db.close()
 
+    assert snapshot["session"]["id"] == "child-session"
+    assert snapshot["session"]["state"] == "active"
     assert snapshot["activity"]["description"] == "running text_to_speech"
     assert snapshot["plan"]["current_stage"] == "Run TTS sample"
     assert snapshot["plan"]["todos"] == todos
