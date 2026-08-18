@@ -11577,6 +11577,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "update":
             if self._handle_update_command():
                 return False
+        elif canonical in ("restart", "reload-session", "reboot"):
+            if self._handle_restart_command():
+                return False
         elif canonical == "version":
             from hermes_cli.main import _print_version_info
 
