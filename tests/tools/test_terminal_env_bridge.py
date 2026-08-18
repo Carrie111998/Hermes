@@ -201,3 +201,63 @@ def test_bridge_applies_config_default_when_no_worker_override(monkeypatch):
     config = terminal_tool._get_env_config()
 
     assert config["timeout"] == 240
+
+
+# ---------------------------------------------------------------------------
+# Managed-scope backend precedence (#61882 P1)
+# ---------------------------------------------------------------------------
+
+
+def _write_managed_config(tmp_path, body):
+    """Create a managed-scope config.yaml and point HERMES_MANAGED_DIR at it."""
+    md = tmp_path / "managed"
+    md.mkdir()
+    (md / "config.yaml").write_text(body, encoding="utf-8")
+    import hermes_cli.managed_scope as managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    return md
+
+
+def test_managed_backend_overrides_stale_env(monkeypatch, tmp_path):
+    """Admin-pinned terminal.backend beats a stale TERMINAL_ENV=local.
+
+    Managed-scope config is merged into the effective config by
+    ``load_config_readonly()``, but ``apply_terminal_config_to_env()`` only
+    treated user config.yaml keys as explicit — so a managed
+    ``terminal.backend: docker`` lost to a stale ``TERMINAL_ENV=local`` and
+    silently downgraded an isolated backend to host execution (#61882 P1).
+    """
+    md = _write_managed_config(tmp_path, "terminal:\n  backend: docker\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(md))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "docker"
+    # Process-global env is never mutated by the bridge.
+    assert os.environ["TERMINAL_ENV"] == "local"
+
+
+def test_managed_backend_resolves_docker_for_sibling_readers(monkeypatch, tmp_path):
+    """``resolve_terminal_backend()`` must report docker (not local) for a
+    managed docker backend, so sibling host-read/SSRF gates fail closed
+    rather than trusting the host-side browser/media helpers (#61882 P1).
+    """
+    md = _write_managed_config(tmp_path, "terminal:\n  backend: docker\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(md))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    assert terminal_tool.resolve_terminal_backend() == "docker"
+
+
+def test_managed_backend_without_stale_env_still_wins(monkeypatch, tmp_path):
+    """A managed docker backend applies even with no launcher TERMINAL_ENV at
+    all (cold start) — the managed value is authoritative, not just a tiebreak.
+    """
+    md = _write_managed_config(tmp_path, "terminal:\n  backend: docker\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(md))
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "docker"
