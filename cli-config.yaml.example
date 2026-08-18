@@ -1744,6 +1744,12 @@ display:
 telemetry:
   shared_metrics:
     enabled: false
+  # Allow supported model providers to identify Hermes on existing requests.
+  # Currently applies to ChatGPT-authenticated Codex requests. No separate
+  # telemetry request is sent. Configure with `hermes setup telemetry` or
+  # `hermes tools`; restart running sessions/gateways after changing this.
+  usage_attribution:
+    enabled: false
 
 
 # =============================================================================

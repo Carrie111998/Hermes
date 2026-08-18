@@ -13,9 +13,9 @@ header set so the primary chat client (``run_agent.AIAgent.__init__`` +
 (``_build_codex_client`` and the ``raw_codex`` branch of ``resolve_provider_client``)
 all emit the same headers.
 
-These tests pin:
-- the originator value (must be ``codex_cli_rs`` — the whitelisted one)
-- the User-Agent shape (codex_cli_rs-prefixed)
+These tests pin the default behavior when provider usage attribution is off:
+- the compatibility originator value (``codex_cli_rs``)
+- the compatibility User-Agent shape (codex_cli_rs-prefixed)
 - ``ChatGPT-Account-ID`` extraction from the OAuth JWT (canonical casing,
   from codex-rs ``auth.rs``)
 - graceful handling of malformed tokens (drop the account-ID header, don't

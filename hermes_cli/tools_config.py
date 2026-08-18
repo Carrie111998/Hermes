@@ -5308,13 +5308,15 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     if _has_mcp:
         platform_choices.append("Configure MCP server tools")
 
+    _attribution_idx = len(platform_choices)
+    platform_choices.append("Configure provider usage attribution")
+    _done_idx = len(platform_choices)
     platform_choices.append("Done")
 
     # Index offsets for the extra options after per-platform entries
     _global_idx = len(platform_keys) if len(platform_keys) > 1 else -1
     _reconfig_idx = len(platform_keys) + (1 if len(platform_keys) > 1 else 0)
     _mcp_idx = (_reconfig_idx + 1) if _has_mcp else -1
-    _done_idx = _reconfig_idx + (2 if _has_mcp else 1)
 
     while True:
         idx = _prompt_choice("Select an option:", platform_choices, default=0)
@@ -5322,6 +5324,14 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         # "Done" selected
         if idx == _done_idx:
             break
+
+        if idx == _attribution_idx:
+            from hermes_cli.setup import setup_usage_attribution
+
+            setup_usage_attribution(config)
+            save_config(config)
+            print()
+            continue
 
         # "Reconfigure" selected
         if idx == _reconfig_idx:

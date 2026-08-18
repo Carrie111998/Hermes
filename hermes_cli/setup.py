@@ -2313,12 +2313,40 @@ def setup_tools(config: dict, first_install: bool = False):
 
 
 # =============================================================================
-# Shared Metrics
+# Telemetry and Usage Attribution
 # =============================================================================
 
 
+def setup_usage_attribution(config: dict):
+    """Ask before identifying Hermes to supported model providers."""
+    from hermes_cli.usage_attribution import usage_attribution_enabled
+
+    print_header("Provider Usage Attribution")
+    print_info("Allow supported model providers to recognize Hermes traffic.")
+    print_info("This adds the Hermes name and version to existing requests.")
+    print_info("It does not add prompt content or send a separate telemetry request.")
+
+    current = usage_attribution_enabled(config)
+    enabled = prompt_yes_no("Allow provider usage attribution?", default=current)
+    telemetry = config.get("telemetry")
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+        config["telemetry"] = telemetry
+    attribution = telemetry.get("usage_attribution")
+    if not isinstance(attribution, dict):
+        attribution = {}
+        telemetry["usage_attribution"] = attribution
+    attribution["enabled"] = enabled
+
+    if enabled:
+        print_success("Provider usage attribution enabled for new clients.")
+    else:
+        print_info("Provider usage attribution disabled for new clients.")
+    print_info("Restart running Hermes sessions or gateways to apply the change.")
+
+
 def setup_telemetry(config: dict):
-    """Configure the local, privacy-safe shared-metrics subscriber."""
+    """Configure local shared metrics and optional provider attribution."""
     print_header("Shared Metrics")
     print_info("Shared metrics contain only bounded counters and histograms.")
     print_info("Packages stay under this Hermes profile and are not uploaded.")
@@ -2341,6 +2369,8 @@ def setup_telemetry(config: dict):
         print_success("Local shared metrics enabled.")
     else:
         print_info("Local shared metrics disabled.")
+
+    setup_usage_attribution(config)
 
 
 # =============================================================================
@@ -2751,7 +2781,7 @@ SETUP_SECTIONS = [
     ("terminal", "Terminal Backend", setup_terminal_backend),
     ("gateway", "Messaging Platforms (Gateway)", setup_gateway),
     ("tools", "Tools", setup_tools),
-    ("telemetry", "Shared Metrics", setup_telemetry),
+    ("telemetry", "Telemetry & Usage Attribution", setup_telemetry),
     ("agent", "Agent Settings", setup_agent_settings),
 ]
 
@@ -2850,7 +2880,7 @@ def run_setup_wizard(args):
       hermes setup terminal  — just terminal backend
       hermes setup gateway   — just messaging platforms
       hermes setup tools     — just tool configuration
-      hermes setup telemetry — just local shared metrics
+      hermes setup telemetry — local metrics and provider usage attribution
       hermes setup agent     — just agent settings
     """
     from hermes_cli.config import is_managed, managed_error
@@ -2994,7 +3024,7 @@ def run_setup_wizard(args):
         print_info("Press Enter to keep it, or type a new value to change it.")
         print_info("")
         print_info("Tip: jump straight to a section with 'hermes setup model|terminal|")
-        print_info("     gateway|tools|agent', or fill only missing items with --quick.")
+        print_info("     gateway|tools|telemetry|agent', or fill only missing items with --quick.")
         # Fall through to the "Full Setup — run all sections" block below.
         # --reconfigure is now the default on existing installs; the flag
         # is preserved for backwards compatibility but is a no-op here.
@@ -3071,6 +3101,9 @@ def run_setup_wizard(args):
     # Section 5: Tools
     if not (migration_ran and _skip_configured_section(config, "tools", "Tools")):
         setup_tools(config, first_install=not is_existing)
+
+    # Attribution is a separate, profile-owned opt-in, never a setup default.
+    setup_usage_attribution(config)
 
     # Save and show summary
     save_config(config)

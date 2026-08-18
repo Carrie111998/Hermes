@@ -1930,6 +1930,30 @@ When `redact_pii` is `true`, the gateway redacts personally identifiable informa
 
 Hashes are deterministic — the same user always maps to the same hash, so the model can still distinguish between users in group chats. Routing and delivery use the original values internally.
 
+### Provider usage attribution
+
+You can allow supported model providers to recognize requests made by Hermes.
+This is off by default and separate from local shared metrics. Configure it in
+`hermes setup telemetry`, in `hermes tools` → **Configure provider usage
+attribution**, or in your profile's `config.yaml`:
+
+```yaml
+telemetry:
+  usage_attribution:
+    enabled: false
+```
+
+When enabled, ChatGPT-authenticated requests to the official Codex endpoint
+send `originator: hermes-agent` and `User-Agent: HermesAgent/<version>`. The
+existing ChatGPT account header is preserved. No prompt content or separate
+telemetry requests are added.
+Direct OpenAI API requests and custom proxy endpoints are unchanged.
+
+The setting applies when clients are created. Restart running Hermes sessions
+or gateways after changing it. If the new identity causes a Codex connection
+error, disable the setting and restart to restore the existing compatibility
+headers.
+
 ## Speech-to-Text (STT)
 
 ```yaml

@@ -3114,10 +3114,14 @@ DEFAULT_CONFIG = {
         "profile_build": "ask",
     },
 
-    # Privacy-safe aggregate metrics written only to this profile's local
-    # telemetry directory. Collection is opt-in and no remote sink exists.
+    # Profile-owned, opt-in telemetry and provider attribution settings.
     "telemetry": {
+        # Aggregate metrics stay local; no remote sink exists.
         "shared_metrics": {
+            "enabled": False,
+        },
+        # Identify Hermes on supported providers' existing inference requests.
+        "usage_attribution": {
             "enabled": False,
         },
     },
