@@ -15,6 +15,7 @@ from tools.gradeos_tools import set_gradeos_session_scope
 app = FastAPI(title="GradeOS Hermes Smoke Server")
 
 DEFAULT_DEV_TOKEN = "gradeos-local-dev-token"
+_gradeos_internal_token: str | None = None
 
 
 class TeacherInfo(BaseModel):
@@ -116,8 +117,22 @@ def readyz() -> Dict[str, Any]:
     }
 
 
+def configure_gradeos_internal_token(token: str) -> None:
+    """Pin the local GradeOS service token after Hermes has loaded its .env."""
+    global _gradeos_internal_token
+    _gradeos_internal_token = token.strip() or None
+
+
 def _expected_token() -> str:
-    return os.getenv("HERMES_INTERNAL_KEY") or os.getenv("API_SERVER_KEY") or DEFAULT_DEV_TOKEN
+    # CODEX CHANGE: GradeOS authentication must not change while an active
+    # student conversation lazily initializes other Hermes configuration.
+    # TODO: replace this local bridge when both projects consume shared config.
+    return (
+        _gradeos_internal_token
+        or os.getenv("HERMES_INTERNAL_KEY")
+        or os.getenv("API_SERVER_KEY")
+        or DEFAULT_DEV_TOKEN
+    )
 
 
 def _verify_internal_auth(authorization: Optional[str]) -> None:

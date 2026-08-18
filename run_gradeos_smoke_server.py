@@ -86,6 +86,7 @@ if __name__ == "__main__":
     import gradeos_smoke_server
 
     os.environ["HERMES_INTERNAL_KEY"] = internal_key
+    gradeos_smoke_server.configure_gradeos_internal_token(internal_key)
     os.environ["GRADEOS_INTERNAL_SERVICE_TOKEN"] = values.get(
         "GRADEOS_INTERNAL_SERVICE_TOKEN",
         teacher_service_token or internal_key,
