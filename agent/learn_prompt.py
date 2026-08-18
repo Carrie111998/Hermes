@@ -104,8 +104,6 @@ Quality bar:
   templates in `templates/`."""
 
 
-
-
 # Rules for the expansive shape: a book, a paper stack, a large docs folder, a
 # spec — anything too big to distill into one ~200-line file without lossy
 # summarization. Modeled on the layout that makes book-to-skill
