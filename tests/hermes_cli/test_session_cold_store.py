@@ -40,16 +40,15 @@ def test_store_archived_compression_lineage_writes_one_terminal_id_snapshot(
         terminal = db.get_session("terminal")
         assert terminal is not None
         started = datetime.fromtimestamp(float(terminal["started_at"]), UTC)
-        expected_snapshot = (
+        expected_snapshot_parent = (
             archive_root
             / "sessions"
             / "started"
             / f"{started:%Y}"
             / f"{started:%m}"
             / f"{started:%d}"
-            / cold_store._safe_component("terminal")
         )
-        assert result.snapshot_dir == expected_snapshot
+        assert result.snapshot_dir.parent == expected_snapshot_parent
         assert {path.name for path in result.snapshot_dir.iterdir()} == {
             "artifacts",
             "metadata.json",
@@ -649,28 +648,101 @@ def test_store_does_not_use_old_snapshot_after_replacement(tmp_path: Path) -> No
 
         replacement = store_archived_lineage(db, "terminal", archive_root)
 
-        assert replacement.snapshot_dir == first.snapshot_dir == (
-            archive_root
-            / "sessions"
-            / "started"
-            / "2026"
-            / "01"
-            / "02"
-            / cold_store._safe_component("terminal")
+        assert replacement.snapshot_dir == first.snapshot_dir
+        assert replacement.snapshot_dir.parent == (
+            archive_root / "sessions" / "started" / "2026" / "01" / "02"
         )
         current_metadata = json.loads(
             (replacement.snapshot_dir / "metadata.json").read_text(encoding="utf-8")
         )
         assert current_metadata["source_fingerprint"] == replacement.source_fingerprint
         assert current_metadata["source_fingerprint"] != first.source_fingerprint
-        assert list(archive_root.rglob(cold_store._safe_component("terminal"))) == [
-            replacement.snapshot_dir
-        ]
         payloads = list(archive_root.rglob("session.jsonl"))
         assert payloads == [replacement.snapshot_dir / "session.jsonl"]
         assert "new payload marker" in payloads[0].read_text(encoding="utf-8")
     finally:
         db.close()
+
+
+def test_store_keeps_purged_snapshot_when_same_id_is_reused_in_new_generation(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    first_started_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC).timestamp()
+    second_started_at = datetime(2026, 1, 2, 3, 5, tzinfo=UTC).timestamp()
+    try:
+        db.create_session("reused", source="cli")
+        db.append_message("reused", role="user", content="first generation")
+        db.end_session("reused", "completed")
+        assert db.set_session_archived("reused", True)
+        assert db._conn is not None
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (first_started_at, "reused"),
+        )
+        db._conn.commit()
+        first = store_archived_lineage(db, "reused", archive_root)
+        purge_archived_lineage(db, "reused", archive_root)
+
+        db.create_session("reused", source="cli")
+        db.append_message("reused", role="user", content="second generation")
+        db.end_session("reused", "completed")
+        assert db.set_session_archived("reused", True)
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (second_started_at, "reused"),
+        )
+        db._conn.commit()
+        second = store_archived_lineage(db, "reused", archive_root)
+
+        assert first.snapshot_dir != second.snapshot_dir
+        assert "first generation" in (first.snapshot_dir / "session.jsonl").read_text(
+            encoding="utf-8"
+        )
+        assert "second generation" in (second.snapshot_dir / "session.jsonl").read_text(
+            encoding="utf-8"
+        )
+    finally:
+        db.close()
+
+
+def test_store_isolates_same_id_and_generation_from_distinct_source_stores(
+    tmp_path: Path,
+) -> None:
+    first_db = SessionDB(db_path=tmp_path / "first" / "state.db")
+    second_db = SessionDB(db_path=tmp_path / "second" / "state.db")
+    archive_root = tmp_path / "archive"
+    started_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC).timestamp()
+    try:
+        for db, content in (
+            (first_db, "first source store"),
+            (second_db, "second source store"),
+        ):
+            db.create_session("same-id", source="cli")
+            db.append_message("same-id", role="user", content=content)
+            db.end_session("same-id", "completed")
+            assert db.set_session_archived("same-id", True)
+            assert db._conn is not None
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (started_at, "same-id"),
+            )
+            db._conn.commit()
+
+        first = store_archived_lineage(first_db, "same-id", archive_root)
+        second = store_archived_lineage(second_db, "same-id", archive_root)
+
+        assert first.snapshot_dir != second.snapshot_dir
+        assert "first source store" in (first.snapshot_dir / "session.jsonl").read_text(
+            encoding="utf-8"
+        )
+        assert "second source store" in (second.snapshot_dir / "session.jsonl").read_text(
+            encoding="utf-8"
+        )
+    finally:
+        first_db.close()
+        second_db.close()
 
 
 @pytest.mark.skipif(

@@ -81,8 +81,21 @@ class _StorePlan:
     terminal_id: str
     physical_ids: tuple[str, ...]
     started_at: float
+    source_store_key: str
     records: list[dict[str, Any]]
     source_fingerprint: str
+
+
+def _source_store_key(conn: sqlite3.Connection) -> str:
+    """Return a non-secret stable namespace for this file-backed SQLite store."""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if str(row[1]) != "main":
+            continue
+        database_path = row[2]
+        if not isinstance(database_path, str) or not database_path:
+            break
+        return sha256(os.fsencode(os.path.abspath(database_path))).hexdigest()[:16]
+    raise ValueError("cold store requires a file-backed SQLite source store")
 
 
 def _connection(db: SessionDB) -> sqlite3.Connection:
@@ -575,6 +588,7 @@ def _build_store_plan(conn: sqlite3.Connection, terminal_id: str) -> _StorePlan:
         terminal_id=terminal_id,
         physical_ids=lineage,
         started_at=validated_started_at,
+        source_store_key=_source_store_key(conn),
         records=records,
         source_fingerprint=_fingerprint(records),
     )
@@ -601,7 +615,9 @@ def _snapshot_location(
     archive_root: Path, plan: _StorePlan
 ) -> tuple[Path, str, tuple[str, ...]]:
     terminal_date = datetime.fromtimestamp(plan.started_at, UTC)
-    snapshot_name = _safe_component(plan.terminal_id)
+    snapshot_name = _safe_component(
+        f"{plan.source_store_key}:{plan.terminal_id}:{float(plan.started_at).hex()}"
+    )
     parent_parts = (
         "sessions",
         "started",
