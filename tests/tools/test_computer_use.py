@@ -2134,6 +2134,27 @@ class TestCapabilityDiscovery:
         assert session._tool_schemas["click"] == {"type": "object"}
         assert session.supports_capability("accessibility.element_tokens")
 
+    @staticmethod
+    def _native_listing():
+        """A tools/list result whose tool already exposes vendor fields as
+        attributes — the shape a loose SDK (or a future spec-native field)
+        hands back. Built as plain namespaces so the test does not depend
+        on which mcp generation is installed: a strict install would drop
+        the fields during model validation, a loose one keeps them, and
+        _populate_capabilities only reads attributes off the result."""
+        from types import SimpleNamespace
+
+        tool = SimpleNamespace(
+            name="click",
+            capabilities=["input.pointer.click"],
+            model_extra=None,
+        )
+        return SimpleNamespace(
+            tools=[tool],
+            capability_version=None,
+            model_extra=None,
+        )
+
     def test_extra_preserving_sdk_uses_native_listing(self, monkeypatch):
         """SDKs that already keep extras (1.x) go straight to list_tools —
         no mirror request, no behavior change."""
@@ -2147,14 +2168,8 @@ class TestCapabilityDiscovery:
             mt.Tool, "model_config",
             dict(mt.Tool.model_config, extra="allow"),
         )
-        native = mt.ListToolsResult.model_validate({
-            "tools": [{
-                "name": "click", "description": "d", "inputSchema": {},
-                "capabilities": ["input.pointer.click"],
-            }],
-        })
         mcp_session = MagicMock()
-        mcp_session.list_tools = AsyncMock(return_value=native)
+        mcp_session.list_tools = AsyncMock(return_value=self._native_listing())
         mcp_session.send_request = AsyncMock(
             side_effect=AssertionError("loose SDK must not re-issue tools/list")
         )
@@ -2178,15 +2193,9 @@ class TestCapabilityDiscovery:
             mt.Tool, "model_config",
             dict(mt.Tool.model_config, extra="ignore"),
         )
-        native = mt.ListToolsResult.model_validate({
-            "tools": [{
-                "name": "click", "description": "d", "inputSchema": {},
-                "capabilities": ["input.pointer.click"],
-            }],
-        })
         mcp_session = MagicMock()
         mcp_session.send_request = AsyncMock(side_effect=RuntimeError("boom"))
-        mcp_session.list_tools = AsyncMock(return_value=native)
+        mcp_session.list_tools = AsyncMock(return_value=self._native_listing())
 
         session = _CuaDriverSession(_AsyncBridge())
         self._run(session._populate_capabilities(mcp_session))
