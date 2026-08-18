@@ -6347,6 +6347,66 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_delivery_choices(
+        self,
+        chat_id: str,
+        text: str,
+        choices: list,
+        delivery_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a cron delivery with fixed-choice buttons (no Other, no wait).
+
+        Callbacks use ``cd:<delivery_id>:<idx>`` and inject the choice text as
+        a user turn. Distinct from ``send_clarify`` (``cl:``) which blocks a
+        live agent tool call.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        if not choices:
+            return SendResult(success=False, error="No delivery choices")
+
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": text,
+                **self._link_preview_kwargs(),
+            }
+            rows = []
+            for idx, label in enumerate(choices):
+                button_label = str(label)[:64]
+                rows.append([
+                    InlineKeyboardButton(
+                        button_label,
+                        callback_data=f"cd:{delivery_id}:{idx}",
+                    )
+                ])
+            kwargs["reply_markup"] = InlineKeyboardMarkup(rows)
+
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning(
+                "[%s] send_delivery_choices failed: %s",
+                self.name,
+                _redact_telegram_error_text(e),
+            )
+            return SendResult(success=False, error=_redact_telegram_error_text(e))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -7233,6 +7293,108 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._send_message_with_thread_fallback(**send_kwargs)
                 except Exception as exc:
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
+            return
+
+        # --- Cron delivery-choice callbacks (cd:delivery_id:idx) ---
+        if data.startswith("cd:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                delivery_id = parts[1]
+                choice_token = parts[2]
+
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "User")
+                try:
+                    idx = int(choice_token)
+                except (ValueError, TypeError):
+                    await query.answer(text="Invalid choice.")
+                    return
+
+                from cron.delivery_choices import STALE_HINT, resolve_delivery_choice
+
+                resolved_text = resolve_delivery_choice(delivery_id, idx)
+                if resolved_text is None:
+                    await query.answer(text=STALE_HINT)
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    try:
+                        await query.edit_message_text(
+                            text=(
+                                f"{query.message.text or ''}\n\n"
+                                f"<i>{_html.escape(STALE_HINT)}</i>"
+                            ),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                await query.answer(text=f"✓ {resolved_text[:60]}")
+                try:
+                    await query.edit_message_text(
+                        text=(
+                            f"{_html.escape(query.message.text or '')}\n\n"
+                            f"<b>{_html.escape(user_display)}:</b> "
+                            f"{_html.escape(resolved_text)}"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+
+                chat_type_raw = str(query_chat_type or "").lower()
+                chat_type = "dm" if chat_type_raw in {"private", "dm"} else "group"
+                try:
+                    from gateway.config import Platform
+                    from gateway.platforms.base import MessageEvent, MessageType
+                    from gateway.session import SessionSource
+
+                    event = MessageEvent(
+                        text=resolved_text,
+                        message_type=MessageType.TEXT,
+                        source=SessionSource(
+                            platform=Platform.TELEGRAM,
+                            chat_id=str(query_chat_id or ""),
+                            chat_type=chat_type,
+                            user_id=caller_id,
+                            user_name=user_display,
+                            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                        ),
+                        user_id=caller_id,
+                        user_name=user_display,
+                    )
+                    await self.handle_message(event)
+                    logger.info(
+                        "Telegram cron delivery button injected as user turn "
+                        "(id=%s, choice=%r, user=%s)",
+                        delivery_id,
+                        resolved_text,
+                        user_display,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[%s] cron delivery-choice inject failed: %s",
+                        self.name,
+                        exc,
+                        exc_info=True,
+                    )
             return
 
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---

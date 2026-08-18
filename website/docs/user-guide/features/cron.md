@@ -449,6 +449,32 @@ explicit other-chat deliveries) are never made continuable. The mirror is
 written as a labelled user turn (`[Cron delivery: <task name>]`), which keeps
 the conversation history alternation-safe across all model providers.
 
+### Action buttons on a cron delivery
+
+Cron workers never receive the `clarify` tool — a scheduled job has nobody to
+wait for, and blocking the run would stall the ticker. To put **native buttons
+on the cron message itself**, end the agent's final response with a last-line
+JSON envelope:
+
+```json
+{"delivery_choices": ["vis bilag", "lav konteringspreview", "spring over"]}
+```
+
+The scheduler strips that line before send and, on Telegram (and any adapter
+that implements `send_delivery_choices`), attaches one button per label. A tap
+becomes a user turn in the continuable session — the same as if the user typed
+the label. The cron worker does **not** wait.
+
+A per-job `delivery_choices` list is the fallback when the model forgets the
+envelope. `deliver: local` and an empty list stay plain text. A newer delivery
+for the same job, or a tap older than 6 hours, fails visibly
+("This action expired. Wait for the next preview.") instead of silently
+accepting.
+
+This is the preferred form of [issue #78999](https://github.com/NousResearch/hermes-agent/issues/78999).
+It is not `cron.allow_clarify` (mid-run wait) and not a journal of button
+clicks outside the agent turn.
+
 #### Flat, in-channel continuation (Slack)
 
 The thread-preferred behaviour above mints a dedicated thread on every

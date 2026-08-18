@@ -1797,6 +1797,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    delivery_choices: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1854,6 +1855,11 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        delivery_choices: Optional fallback action-button labels attached to
+                Telegram/Discord deliveries when the agent's final response
+                does not include a last-line ``{"delivery_choices": [...]}``
+                envelope. Taps become a user turn in the continuable session;
+                the cron worker does not wait. Empty / omitted = text only.
 
     Returns:
         The created job dict
@@ -1890,6 +1896,8 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    from cron.delivery_choices import normalize_delivery_choices
+    normalized_delivery_choices = normalize_delivery_choices(delivery_choices)
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -1995,6 +2003,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_delivery_choices is not None:
+        job["delivery_choices"] = normalized_delivery_choices
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2100,6 +2110,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = updates[_mon_field]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
+
+            if "delivery_choices" in updates:
+                from cron.delivery_choices import normalize_delivery_choices
+                updates["delivery_choices"] = normalize_delivery_choices(
+                    updates.get("delivery_choices")
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
