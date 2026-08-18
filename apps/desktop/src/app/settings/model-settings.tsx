@@ -9,7 +9,9 @@ import {
   getAuxiliaryModels,
   getGlobalModelInfo,
   getGlobalModelOptions,
+  getHermesConfigRecord,
   getMoaModels,
+  getOpenRouterEndpoints,
   getRecommendedDefaultModel,
   saveHermesConfig,
   saveMoaModels,
@@ -21,10 +23,17 @@ import type {
   MoaConfigResponse,
   MoaModelSlot,
   ModelOptionProvider,
+  OpenRouterEndpoint,
   StaleAuxAssignment
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
+import {
+  isOpenRouterProvider,
+  openRouterRoutingDraft,
+  type OpenRouterRoutingDraft,
+  updateOpenRouterRoutingConfig
+} from '@/lib/openrouter-routing'
 import { DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { setMainModelAssignment } from '@/store/cron-model-impact'
@@ -36,6 +45,8 @@ import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
 import { CONTROL_TEXT } from './constants'
 import { getNested, setNested } from './helpers'
+import { OpenRouterModelInput } from './openrouter-model-input'
+import { OpenRouterRoutingField } from './openrouter-routing-field'
 import { ListRow, Pill, SectionHeading } from './primitives'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
 
@@ -213,6 +224,19 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
   // place — mirrors the onboarding ApiKeyForm but scoped to the model picker.
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [activating, setActivating] = useState(false)
+  const [routingEndpoints, setRoutingEndpoints] = useState<OpenRouterEndpoint[]>([])
+  const [routingLoading, setRoutingLoading] = useState(false)
+  const [routingError, setRoutingError] = useState('')
+  const [routingManual, setRoutingManual] = useState(false)
+
+  const [routingDraft, setRoutingDraft] = useState<OpenRouterRoutingDraft>({
+    allowFallbacks: false,
+    blockedTags: [],
+    providerTag: '',
+    quantization: ''
+  })
+
+  const routingRequestGeneration = useRef(0)
 
   // Deep link from the vision Capabilities detail (?tab=config:model&aux=vision):
   // scroll the auxiliary task row into view and flash it once the list loads.
@@ -287,14 +311,65 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
   // new profile (bumping the epoch first so any in-flight A request is discarded).
   useOnProfileSwitch(() => {
     profileEpoch.current += 1
+    routingRequestGeneration.current += 1
     // The panel stays mounted across profile switches, so clear the previous
     // profile's draft selection before loading the new profile's source of
     // truth. Ordinary same-profile refreshes still preserve in-progress edits.
     setSelectedProvider('')
     setSelectedModel('')
     setApiKeyDraft('')
+    setRoutingEndpoints([])
+    setRoutingError('')
     void refresh({ replaceSelection: true })
   })
+
+  useEffect(() => {
+    setRoutingDraft(openRouterRoutingDraft(config ?? null, selectedModel))
+    setRoutingManual(false)
+  }, [config, selectedModel, selectedProvider])
+
+  const loadRoutingEndpoints = useCallback(
+    async (forceRefresh = false) => {
+      const generation = routingRequestGeneration.current + 1
+      routingRequestGeneration.current = generation
+      const epoch = profileEpoch.current
+
+      if (!isOpenRouterProvider(selectedProvider) || !selectedModel) {
+        setRoutingEndpoints([])
+        setRoutingError('')
+        setRoutingLoading(false)
+
+        return
+      }
+
+      setRoutingEndpoints([])
+      setRoutingError('')
+      setRoutingLoading(true)
+
+      try {
+        const result = await getOpenRouterEndpoints(selectedModel, forceRefresh ? { refresh: true } : undefined)
+
+        if (routingRequestGeneration.current !== generation || profileEpoch.current !== epoch) {
+          return
+        }
+
+        setRoutingEndpoints(result.endpoints || [])
+      } catch (err) {
+        if (routingRequestGeneration.current === generation && profileEpoch.current === epoch) {
+          setRoutingError(err instanceof Error ? err.message : String(err))
+        }
+      } finally {
+        if (routingRequestGeneration.current === generation && profileEpoch.current === epoch) {
+          setRoutingLoading(false)
+        }
+      }
+    },
+    [selectedModel, selectedProvider]
+  )
+
+  useEffect(() => {
+    void loadRoutingEndpoints()
+  }, [loadRoutingEndpoints])
 
   const providerOptions = providers.length ? providers : NO_PROVIDERS
 
@@ -320,6 +395,34 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
   )
 
   const selectedProviderModels = selectedProviderRow?.models ?? []
+
+  const sortedRoutingEndpoints = useMemo(() => {
+    const healthy = (endpoint: OpenRouterEndpoint) =>
+      endpoint.status === undefined ||
+      endpoint.status === null ||
+      endpoint.status === 0 ||
+      endpoint.status === 'available'
+
+    return [...routingEndpoints].sort((left, right) => {
+      const configured = Number(right.tag === routingDraft.providerTag) - Number(left.tag === routingDraft.providerTag)
+
+      if (configured) {
+        return configured
+      }
+
+      const health = Number(healthy(right)) - Number(healthy(left))
+
+      if (health) {
+        return health
+      }
+
+      const provider = String(left.provider_name ?? left.tag ?? '').localeCompare(
+        String(right.provider_name ?? right.tag ?? '')
+      )
+
+      return provider || String(left.quantization ?? '').localeCompare(String(right.quantization ?? ''))
+    })
+  }, [routingDraft.providerTag, routingEndpoints])
 
   // An unconfigured provider was picked: no credentials yet, so there are no
   // models to choose. `api_key` providers can be activated inline (paste key);
@@ -628,6 +731,8 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
     }
 
     const epoch = profileEpoch.current
+    const previousConfig = config
+
     setApplying(true)
     setError('')
 
@@ -645,6 +750,25 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
         return
       }
 
+      if (isOpenRouterProvider(selectedProvider)) {
+        // Re-fetch the AUTHORITATIVE record now that the model assignment has
+        // landed server-side, and apply the routing delta to THAT — never to
+        // the config snapshot captured when Apply was clicked. Building the
+        // PUT from a pre-assignment snapshot races setMainModelAssignment's
+        // own write: the stale record's default `model` field can be an
+        // empty scalar that (pre-guard) clobbered the just-written structured
+        // model assignment on the next whole-record PUT (#5be516088).
+        const authoritativeConfig = await getHermesConfigRecord(scopeProfile ?? undefined)
+
+        if (profileEpoch.current !== epoch) {
+          return
+        }
+
+        const nextConfig = updateOpenRouterRoutingConfig(authoritativeConfig, selectedModel, routingDraft)
+        setConfig(nextConfig)
+        await saveHermesConfig(nextConfig, scopeProfile)
+      }
+
       const provider = result.provider || selectedProvider
       const model = result.model || selectedModel
       setMainModel({ provider, model })
@@ -658,11 +782,25 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
 
       await refresh()
     } catch (err) {
+      if (previousConfig) {
+        setConfig(previousConfig)
+      }
+
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, scopeProfile, selectedModel, selectedProvider, selectedProviderRow])
+  }, [
+    config,
+    onMainModelChanged,
+    refresh,
+    routingDraft,
+    scopeProfile,
+    selectedModel,
+    selectedProvider,
+    selectedProviderRow,
+    setConfig
+  ])
 
   // Sibling of the applyMainModel endpoint passthrough (#65254): auxiliary
   // assignments targeting a user-defined provider must carry that provider's
@@ -833,18 +971,29 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
             )
           ) : (
             <>
-              <Select onValueChange={setSelectedModel} value={selectedModel}>
-                <SelectTrigger className={cn('min-w-60', CONTROL_TEXT)}>
-                  <SelectValue placeholder={m.model} />
-                </SelectTrigger>
-                <SelectContent>
-                  {withActive(selectedProviderModels, selectedModel).map(model => (
-                    <SelectItem key={model} value={model}>
-                      {model}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {isOpenRouterProvider(selectedProvider) ? (
+                <OpenRouterModelInput
+                  className={CONTROL_TEXT}
+                  hint={m.openrouterModelShapeHint}
+                  label={m.openrouterModelInput}
+                  onChange={setSelectedModel}
+                  options={withActive(selectedProviderModels, selectedModel)}
+                  value={selectedModel}
+                />
+              ) : (
+                <Select onValueChange={setSelectedModel} value={selectedModel}>
+                  <SelectTrigger className={cn('min-w-60', CONTROL_TEXT)}>
+                    <SelectValue placeholder={m.model} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {withActive(selectedProviderModels, selectedModel).map(model => (
+                      <SelectItem key={model} value={model}>
+                        {model}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
               <Button
                 disabled={!selectedProvider || !selectedModel || applying}
                 onClick={() => void applyMainModel()}
@@ -856,6 +1005,19 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
             </>
           )}
         </div>
+        {isOpenRouterProvider(selectedProvider) && selectedModel && (
+          <OpenRouterRoutingField
+            copy={m.openrouterRouting}
+            draft={routingDraft}
+            endpoints={sortedRoutingEndpoints}
+            error={routingError}
+            loading={routingLoading}
+            manual={routingManual}
+            onDraftChange={setRoutingDraft}
+            onManualChange={setRoutingManual}
+            onRefresh={() => void loadRoutingEndpoints(true)}
+          />
+        )}
         {needsSetup && !setupIsApiKey && selectedProviderRow && (
           <p className="mt-2 text-xs text-muted-foreground">
             {selectedProviderRow?.auth_type === 'api_key'
