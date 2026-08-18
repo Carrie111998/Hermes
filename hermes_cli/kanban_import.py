@@ -574,7 +574,9 @@ def sync_import(
                             (import_id, source_id, str(task.path), task.revision, native_id, "imported", int(time.time())),
                         )
                         _event(conn, native_id, "imported", {"import_id": import_id, "source_id": source_id, "source_revision": task.revision})
-                    adapter.write_state(claimed, "imported", {"import_id": import_id, "task_id": native_id, "state": "imported"})
+                adapter.write_state(claimed, "imported", {
+                    "import_id": import_id, "task_id": native_id, "state": "imported",
+                })
             except (OSError, ValueError) as exc:
                 results.append(ImportResult(source_id, "conflict", error=str(exc)))
                 del unresolved[source_id]
