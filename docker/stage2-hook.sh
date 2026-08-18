@@ -450,7 +450,19 @@ seed_one "SOUL.md" "docker/SOUL.md"
 # keygen never ran, the api_server never started, and every scheduled cron
 # fire on the instance was silently lost. The key must not depend on the
 # example-file seed having worked.
-if ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
+#
+# OPERATOR-PROVIDED KEYS WIN: if the container environment already carries
+# API_SERVER_KEY (documented `docker run -e API_SERVER_KEY=...` flow), do
+# not generate one. Hermes loads $HERMES_HOME/.env with override=True, so
+# a generated key written here would silently SHADOW the operator's env
+# key and 401 every client still using the supplied credential.
+if [ -n "${API_SERVER_KEY:-}" ]; then
+    if [ -f "$HERMES_HOME/.env" ] && grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
+        echo "[stage2] Warning: API_SERVER_KEY is set in both the container environment and $HERMES_HOME/.env — the .env value wins at runtime (loaded with override=True)"
+    else
+        echo "[stage2] API_SERVER_KEY provided via container environment — skipping generation"
+    fi
+elif ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
     if refuse_symlinked_path "append" "$HERMES_HOME/.env"; then
         :
     else

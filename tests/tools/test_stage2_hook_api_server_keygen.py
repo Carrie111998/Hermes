@@ -43,11 +43,20 @@ def _path_guard_functions(text: str) -> str:
     return text[start:end]
 
 
-def _run_keygen(stage2_text: str, home: Path) -> subprocess.CompletedProcess[str]:
+def _run_keygen(
+    stage2_text: str,
+    home: Path,
+    env_key: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     if shutil.which("sh") is None:
         pytest.skip("sh not available")
+    if env_key is None:
+        env_setup = "unset API_SERVER_KEY\n"
+    else:
+        env_setup = f'API_SERVER_KEY="{env_key}"\n'
     script = (
         "set -u\n"
+        f"{env_setup}"
         f'HERMES_HOME="{home}"\n'
         # In tests we run unprivileged; as_hermes is a passthrough then.
         'as_hermes() { "$@"; }\n'
@@ -114,6 +123,39 @@ def test_keygen_refuses_symlinked_env(stage2_text: str, tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "refusing append" in (result.stdout + result.stderr)
     assert outside.read_text() == "HIJACK=1\n", "must not write through symlink"
+
+
+def test_keygen_skips_when_container_env_provides_key(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    """`docker run -e API_SERVER_KEY=...` must win: no generated key.
+
+    Hermes loads $HERMES_HOME/.env with override=True, so a key generated
+    into .env would silently shadow the operator's env-provided credential
+    and 401 every client still using it.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    result = _run_keygen(stage2_text, home, env_key="operator-env-key-0123456789")
+    assert result.returncode == 0, result.stderr
+    assert "skipping generation" in (result.stdout + result.stderr)
+    env_path = home / ".env"
+    if env_path.exists():
+        assert "API_SERVER_KEY=" not in env_path.read_text()
+
+
+def test_keygen_env_key_with_existing_env_file_key_warns_not_clobbers(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    """Both container env AND .env carry keys: warn, touch nothing."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("API_SERVER_KEY=file-key-abcdef0123456789\n")
+    result = _run_keygen(stage2_text, home, env_key="env-key-9876543210fedcba")
+    assert result.returncode == 0, result.stderr
+    assert "the .env value wins" in (result.stdout + result.stderr)
+    content = (home / ".env").read_text()
+    assert content == "API_SERVER_KEY=file-key-abcdef0123456789\n"
 
 
 def test_dockerignore_keeps_env_example_template() -> None:
