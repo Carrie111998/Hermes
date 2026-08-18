@@ -45,6 +45,11 @@ def test_ttl_is_capped_at_24h(ov):
     exp = datetime.fromisoformat(rec["expires_at"])
     remaining = (exp - datetime.now(timezone.utc)).total_seconds()
     assert remaining <= MAX_TTL_SECONDS + 5
+    # Lower bound matters as much as the upper one: an upper-bound-only
+    # assertion passes just as happily if a regression clamps the TTL to a
+    # few seconds, which would silently expire every override almost
+    # immediately. Pin both sides so the cap is proven to CAP, not crush.
+    assert remaining > MAX_TTL_SECONDS - 60
 
 
 def test_self_target_is_rejected(ov):
