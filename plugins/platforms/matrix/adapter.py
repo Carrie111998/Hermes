@@ -1288,9 +1288,9 @@ class MatrixAdapter(BasePlatformAdapter):
         # Mention/thread gating — parsed once from config.extra or env vars.
         self._require_mention: bool = self._parse_require_mention(config)
         self._thread_require_mention: bool = self._parse_thread_require_mention(config)
-        free_rooms_raw = config.extra.get("free_response_rooms")
-        if free_rooms_raw is None:
-            free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
+        free_rooms_raw = _resolve_allowlist(
+            "MATRIX_FREE_RESPONSE_ROOMS", config.extra.get("free_response_rooms")
+        )
         if isinstance(free_rooms_raw, list):
             self._free_rooms: Set[str] = {
                 str(r).strip() for r in free_rooms_raw if str(r).strip()
@@ -1403,7 +1403,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 u.strip() for u in str(allowed_users_raw).split(",") if u.strip()
             }
         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
-        ignore_patterns_raw = os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
+        ignore_patterns_raw = _resolve_allowlist(
+            "MATRIX_IGNORE_USER_PATTERNS", config.extra.get("ignore_user_patterns")
+        )
         self._ignored_user_patterns: list[re.Pattern[str]] = []
         for pattern in (p.strip() for p in ignore_patterns_raw.split(",") if p.strip()):
             try:

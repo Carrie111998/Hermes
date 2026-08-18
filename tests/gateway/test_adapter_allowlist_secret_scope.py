@@ -381,3 +381,68 @@ class TestMatrixSiblingAllowAllIsScoped:
             assert scheduled == []
         finally:
             ss.reset_secret_scope(token)
+
+    def test_free_rooms_and_ignore_patterns_do_not_borrow_environ(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_FREE_RESPONSE_ROOMS", "!default:example.org")
+        monkeypatch.setenv("MATRIX_IGNORE_USER_PATTERNS", "@spam:example.org")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        try:
+            config = PlatformConfig(enabled=True)
+            config.extra = {"homeserver": "https://example.org"}
+            adapter = MatrixAdapter(config)
+            assert adapter._free_rooms == set()
+            assert adapter._ignored_user_patterns == []
+        finally:
+            ss.reset_secret_scope(token)
+
+
+class TestSiblingAllowAllDoesNotBorrowEnviron:
+    def test_weixin_open_dm_does_not_borrow_environ(self, monkeypatch):
+        from gateway.platforms.weixin import WeixinAdapter
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        try:
+            adapter = object.__new__(WeixinAdapter)
+            adapter._dm_policy = "open"
+            assert adapter._open_dm_opted_in() is False
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_wecom_open_dm_does_not_borrow_environ(self, monkeypatch):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        try:
+            adapter = object.__new__(WeComAdapter)
+            assert adapter._open_dm_opted_in() is False
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_qqbot_open_dm_does_not_borrow_environ(self, monkeypatch):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        try:
+            adapter = object.__new__(QQAdapter)
+            assert adapter._open_dm_opted_in() is False
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_yuanbao_open_dm_does_not_borrow_environ(self, monkeypatch):
+        from gateway.platforms.yuanbao import AccessPolicy
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        try:
+            policy = AccessPolicy("open", [], "open", [])
+            assert policy._open_dm_opted_in() is False
+        finally:
+            ss.reset_secret_scope(token)
