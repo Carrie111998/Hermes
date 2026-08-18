@@ -8,6 +8,7 @@ or a temp file (local).
 
 import codecs
 import json
+import locale
 import logging
 import os
 import re
@@ -50,6 +51,116 @@ _activity_callback_local = threading.local()
 # enough that the collector never evicts in practice, keeping a single code
 # path for both bounded and unbounded modes.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
+
+
+def _windows_output_encoding() -> "str | None":
+    """Return the host ANSI codec used by native Windows console programs."""
+    if os.name != "nt":
+        return None
+    try:
+        encoding = locale.getencoding()
+    except (AttributeError, TypeError):
+        encoding = locale.getpreferredencoding(False)
+    try:
+        normalized = codecs.lookup(encoding or "utf-8").name
+    except LookupError:
+        return None
+    return None if normalized == "utf-8" else normalized
+
+
+class _IncrementalOutputDecoder:
+    """Decode UTF-8 shell output with a per-line Windows ANSI fallback.
+
+    Git Bash emits UTF-8 for MSYS tools but passes native Windows child bytes
+    through unchanged.  A single fixed codec therefore cannot represent the
+    stream.  Complete lines are first decoded as strict UTF-8 and only fall
+    back to the host ANSI codec when that fails.  Buffering by line also keeps
+    multibyte sequences intact when pipe reads split them across chunks.
+
+    ASCII is emitted immediately because it is byte-identical in UTF-8 and
+    every supported Windows ANSI code page.  Unterminated non-ASCII output is
+    bounded so an arbitrarily long line cannot grow memory without limit.
+    """
+
+    _PROBE_LIMIT = 4096
+
+    def __init__(self, fallback_encoding: "str | None" = None):
+        self._fallback_encoding = (
+            _windows_output_encoding()
+            if fallback_encoding is None
+            else fallback_encoding
+        )
+        if self._fallback_encoding:
+            try:
+                normalized = codecs.lookup(self._fallback_encoding).name
+            except LookupError:
+                normalized = "utf-8"
+            self._fallback_encoding = None if normalized == "utf-8" else normalized
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._buffer = bytearray()
+
+    def _decode_record(self, raw: bytes) -> str:
+        try:
+            return raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return raw.decode(self._fallback_encoding or "utf-8", errors="replace")
+
+    def _flush_long_buffer(self) -> str:
+        raw = bytes(self._buffer)
+        try:
+            text = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            if exc.end == len(raw) and exc.reason == "unexpected end of data" and exc.start:
+                prefix = raw[: exc.start]
+                try:
+                    text = prefix.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    self._buffer = bytearray(raw[exc.start :])
+                    return text
+
+            decoder = codecs.getincrementaldecoder(self._fallback_encoding)(errors="replace")
+            text = decoder.decode(raw, final=False)
+            pending, _ = decoder.getstate()
+            self._buffer = bytearray(pending)
+            return text
+
+        self._buffer.clear()
+        return text
+
+    def decode(self, data: bytes, final: bool = False) -> str:
+        if not self._fallback_encoding:
+            return self._utf8_decoder.decode(data, final=final)
+
+        self._buffer.extend(data)
+        output: list[str] = []
+
+        while True:
+            try:
+                newline = self._buffer.index(0x0A)
+            except ValueError:
+                break
+            record = bytes(self._buffer[: newline + 1])
+            del self._buffer[: newline + 1]
+            output.append(self._decode_record(record))
+
+        # An ASCII-only tail is safe to stream without waiting for a newline.
+        ascii_end = 0
+        while ascii_end < len(self._buffer) and self._buffer[ascii_end] < 0x80:
+            ascii_end += 1
+        if ascii_end:
+            output.append(bytes(self._buffer[:ascii_end]).decode("ascii"))
+            del self._buffer[:ascii_end]
+
+        if len(self._buffer) >= self._PROBE_LIMIT:
+            output.append(self._flush_long_buffer())
+
+        if final and self._buffer:
+            output.append(self._decode_record(bytes(self._buffer)))
+            self._buffer.clear()
+
+        return "".join(output)
 
 
 class EnvironmentConnectionError(RuntimeError):
@@ -1049,14 +1160,11 @@ class BaseEnvironment(ABC):
         # Any output the grandchild writes after that point goes to an
         # orphaned pipe (harmless — the kernel reaps it when our end closes).
         #
-        # Decoding: we ``os.read()`` raw bytes in fixed-size chunks (4096)
-        # so a single multibyte UTF-8 character can split across reads.  An
-        # incremental decoder buffers partial sequences across chunks, and
-        # ``errors="replace"`` mirrors the baseline ``TextIOWrapper`` (which
-        # was constructed with ``encoding="utf-8", errors="replace"`` on
-        # ``Popen``) so binary or mis-encoded output is preserved with
-        # U+FFFD substitution rather than clobbering the whole buffer.
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # Git Bash emits UTF-8 for MSYS tools but passes bytes from native
+        # Windows children through in the host ANSI code page.  Decode raw
+        # chunks with a shared line-aware decoder so both forms survive and
+        # multibyte sequences remain intact across read boundaries.
+        decoder = _IncrementalOutputDecoder()
 
         def _drain_iterable(stream):
             # Fallback path: ``stream`` is not backed by a real OS file
