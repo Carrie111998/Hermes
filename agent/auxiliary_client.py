@@ -3390,6 +3390,7 @@ def set_runtime_main(
     auth_mode: str = "",
     session_id: str = "",
     cache_scope: str = "",
+    provider_preferences: Optional[Dict[str, Any]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3418,6 +3419,11 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
+        "provider_preferences": (
+            copy.deepcopy(provider_preferences)
+            if isinstance(provider_preferences, dict)
+            else {}
+        ),
     }
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
@@ -3891,7 +3897,10 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider",
+    "provider_preferences",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3916,6 +3925,9 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     normalized: Dict[str, Any] = {}
     for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
         value = main_runtime.get(field)
+        if field == "provider_preferences" and isinstance(value, dict):
+            normalized[field] = copy.deepcopy(value)
+            continue
         # Preserve a callable api_key (Entra ID bearer provider) unchanged.
         if field == "api_key" and callable(value) and not isinstance(value, str):
             normalized[field] = value
@@ -3927,6 +3939,28 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if isinstance(identity, str):
             normalized[identity_field] = identity.lower()
     return normalized
+
+
+def _inherit_provider_preferences(
+    extra_body: Dict[str, Any],
+    main_runtime: Dict[str, Any],
+    request_provider: str,
+    client: Any,
+    base_url: str,
+) -> None:
+    """Apply the main routing policy to aggregator aux calls unless overridden."""
+    provider_preferences = main_runtime.get("provider_preferences")
+    if (
+        isinstance(provider_preferences, dict)
+        and provider_preferences
+        and "provider" not in extra_body
+        and (
+            _is_openrouter_client(client)
+            or request_provider == "nous"
+            or base_url_host_matches(base_url, "inference-api.nousresearch.com")
+        )
+    ):
+        extra_body["provider"] = copy.deepcopy(provider_preferences)
 
 
 def _get_provider_chain() -> List[tuple]:
@@ -9314,6 +9348,9 @@ def _call_llm_impl(
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    _inherit_provider_preferences(
+        effective_extra_body, main_runtime, request_provider, client, _base_info
+    )
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
                      task, request_provider or "auto", final_model or "default",
@@ -10102,6 +10139,9 @@ async def _async_call_llm_impl(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    _inherit_provider_preferences(
+        effective_extra_body, main_runtime, request_provider, client, _client_base
+    )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
