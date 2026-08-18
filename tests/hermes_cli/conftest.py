@@ -2,7 +2,54 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
+
+
+@pytest.fixture
+def restore_purged_modules():
+    """Put ``sys.modules`` back the way a HERMES_HOME purge found it.
+
+    The ``isolated_kanban_home*`` fixtures drop every ``hermes_cli*`` /
+    ``hermes_state*`` / ``hermes_constants`` module and re-import, which is the
+    right way to pick up a changed ``HERMES_HOME``. What they never did is put
+    them back, so every test collected *after* those files ran against freshly
+    imported duplicates while already-imported test modules still held
+    references to the originals.
+
+    pytest imports every test module during collection, up front, so
+    ``tests/hermes_cli/test_tools_config.py`` binds ``tools_command`` from the
+    original module object.  After the purge,
+    ``monkeypatch.setattr("hermes_cli.tools_config._prompt_choice", fake)``
+    resolves that string by *importing* — the name is gone, so Python builds a
+    **fresh** module object and the patch lands on that one instead.  The
+    already-bound ``tools_command`` still reads the original module's globals,
+    so the patch silently does nothing and the real interactive/network code
+    path runs.  That is what hung ``tests/hermes_cli`` at 83% on
+    ``test_configure_all_platforms_configures_selected_tool_missing_provider``.
+
+    Restoring ``sys.modules`` alone is NOT enough, and this is the part that is
+    easy to get wrong: ``import a.b as x`` reads ``sys.modules``, while
+    ``from a.b import y`` reads the attribute ``b`` on the parent package. Fix
+    only the first and half the imports still resolve to the stale copy. Same
+    two-step as ``tests/agent/test_verification_stop_caching.py``.
+    """
+    snapshot = dict(sys.modules)
+    yield
+    purged = {
+        name: module for name, module in snapshot.items()
+        if sys.modules.get(name) is not module
+    }
+    for name, module in purged.items():
+        sys.modules[name] = module
+    for name, module in purged.items():
+        parent_name, _, child = name.rpartition(".")
+        if not parent_name:
+            continue
+        parent = sys.modules.get(parent_name)
+        if parent is not None and getattr(parent, child, None) is not module:
+            setattr(parent, child, module)
 
 
 @pytest.fixture
