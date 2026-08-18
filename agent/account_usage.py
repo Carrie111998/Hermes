@@ -922,9 +922,25 @@ def _kimi_window_label(window: dict[str, Any]) -> str:
 def _kimi_usage_percent(bucket: dict[str, Any]) -> Optional[float]:
     try:
         limit = float(str(bucket.get("limit")))
-        used = float(str(bucket.get("used")))
     except (TypeError, ValueError):
         return None
+    used_raw = bucket.get("used")
+    if used_raw is None:
+        # The coding /usages API omits `used` for untouched buckets (zero
+        # consumption); derive it from `remaining` so those windows still
+        # render instead of vanishing from the account-limits board.
+        remaining_raw = bucket.get("remaining")
+        if remaining_raw is None:
+            return None
+        try:
+            used = limit - float(str(remaining_raw))
+        except (TypeError, ValueError):
+            return None
+    else:
+        try:
+            used = float(str(used_raw))
+        except (TypeError, ValueError):
+            return None
     if limit <= 0 or used < 0:
         return None
     return (used / limit) * 100
