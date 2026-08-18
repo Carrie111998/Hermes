@@ -84,3 +84,44 @@ def test_override_read_failure_never_breaks_init(monkeypatch):
     agent = _fake_agent(provider="deepseek", model="deepseek-v4-pro")
     _apply_model_override(agent)   # must not raise
     assert agent.model == "deepseek-v4-pro"
+
+
+def test_anthropic_replacement_sets_native_client_state(monkeypatch):
+    """CRITICAL: swapping onto an Anthropic replacement must not just flip
+    api_mode -- it must also build the native client state that
+    api_mode == "anthropic_messages" dispatch reads with no getattr default
+    (agent._create_request_anthropic_client, run_agent.py:4404-4409). An
+    agent whose ORIGINAL api_mode was chat_completions/codex has none of
+    these attributes, so a string-only swap produces an AttributeError on
+    the very next request -- a broken agent, not a degrade-to-primary.
+    """
+    from events import model_override
+    monkeypatch.setattr(model_override, "get_override", lambda p, m: {
+        "replacement_provider": "anthropic", "replacement_model": "claude-x"})
+    agent = _fake_agent(provider="deepseek", model="deepseek-v4-pro")
+    _apply_model_override(agent)
+
+    assert agent.api_mode == "anthropic_messages"
+    assert (agent.provider, agent.model) == ("anthropic", "claude-x")
+    assert getattr(agent, "_anthropic_api_key", None)
+    assert getattr(agent, "_anthropic_base_url", None) is not None
+    assert getattr(agent, "_anthropic_client", None) is not None
+    assert hasattr(agent, "_is_anthropic_oauth")
+
+
+def test_unresolvable_replacement_leaves_agent_on_primary(monkeypatch):
+    """IMPORTANT: the autouse _stub_resolve_provider_client fixture always
+    returns a working fake client, so `if new_client is None: return` is
+    unreachable anywhere else in this file. Override the stub per-test to
+    exercise that named global constraint directly.
+    """
+    from events import model_override
+    monkeypatch.setattr(model_override, "get_override", lambda p, m: {
+        "replacement_provider": "openai-codex", "replacement_model": "gpt-5.6-sol"})
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda provider, model=None, **kwargs: (None, None),
+    )
+    agent = _fake_agent(provider="deepseek", model="deepseek-v4-pro")
+    _apply_model_override(agent)
+    assert (agent.provider, agent.model) == ("deepseek", "deepseek-v4-pro")

@@ -350,17 +350,76 @@ def _apply_model_override(agent) -> None:
         else:
             new_api_mode = "chat_completions"
 
+        # anthropic_messages dispatch (agent._create_request_anthropic_client,
+        # chat_completion_helpers.py:410-416) reads agent._anthropic_api_key
+        # with no getattr default (run_agent.py:4404-4409). That attribute
+        # only exists when the agent's ORIGINAL api_mode was
+        # anthropic_messages at construction time -- so for the (overwhelmingly
+        # common) case of a chat_completions/codex primary swapping to an
+        # Anthropic replacement, the *next* request after this function
+        # returns would AttributeError unless that native-client state is
+        # built here too. Build it BEFORE any agent attribute is mutated, so
+        # a failure here (bad key, SDK missing, etc.) is caught by the
+        # outer except and leaves the agent completely untouched on its
+        # configured primary -- a half-applied override (api_mode flipped but
+        # no native client) is worse than no override at all.
+        anthropic_native_state = None
+        if new_api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import (
+                build_anthropic_client, resolve_anthropic_token, _is_oauth_token,
+            )
+
+            _new_key = getattr(new_client, "api_key", "") or ""
+            effective_key = (
+                (_new_key or resolve_anthropic_token() or "")
+                if replacement_provider == "anthropic"
+                else _new_key
+            )
+            anthropic_native_state = {
+                "api_key": effective_key,
+                "base_url": new_base_url,
+                "client": build_anthropic_client(effective_key, new_base_url),
+                "is_oauth": (
+                    _is_oauth_token(effective_key)
+                    if replacement_provider == "anthropic"
+                    else False
+                ),
+            }
+
         agent.model = replacement_model
         agent.provider = replacement_provider
         agent.base_url = new_base_url
         agent.api_mode = new_api_mode
-        agent.api_key = getattr(new_client, "api_key", getattr(agent, "api_key", ""))
-        agent.client = new_client
-        if hasattr(agent, "_client_kwargs"):
-            agent._client_kwargs = {
-                "api_key": getattr(new_client, "api_key", ""),
-                "base_url": new_base_url,
-            }
+
+        if anthropic_native_state is not None:
+            agent.api_key = anthropic_native_state["api_key"]
+            agent._anthropic_api_key = anthropic_native_state["api_key"]
+            agent._anthropic_base_url = anthropic_native_state["base_url"]
+            agent._anthropic_client = anthropic_native_state["client"]
+            agent._is_anthropic_oauth = anthropic_native_state["is_oauth"]
+            # Mirrors try_activate_fallback's anthropic branch: the OpenAI
+            # client/kwargs are not used on this dispatch path, so null them
+            # out rather than leaving stale primary-provider state around.
+            agent.client = None
+            if hasattr(agent, "_client_kwargs"):
+                agent._client_kwargs = {}
+        else:
+            agent.api_key = getattr(new_client, "api_key", getattr(agent, "api_key", ""))
+            agent.client = new_client
+            if hasattr(agent, "_client_kwargs"):
+                # Preserve provider-specific default headers baked into the
+                # resolved client (e.g. Kimi Coding's User-Agent sentinel) --
+                # dropping them here causes subsequent request-client
+                # rebuilds to lose them, same rationale as
+                # try_activate_fallback (chat_completion_helpers.py:1848-1859).
+                _new_headers = getattr(new_client, "_custom_headers", None)
+                if not _new_headers:
+                    _new_headers = getattr(new_client, "default_headers", None)
+                agent._client_kwargs = {
+                    "api_key": getattr(new_client, "api_key", ""),
+                    "base_url": new_base_url,
+                    **({"default_headers": dict(_new_headers)} if _new_headers else {}),
+                }
 
         logger.info(
             "Model override active: %s/%s -> %s/%s",
