@@ -107,6 +107,48 @@ class TestMatrixYamlAllowlistsSurviveScopedMiss:
         monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@default:example.org")
         assert matrix_secret("MATRIX_ALLOWED_USERS") == "@default:example.org"
 
+    def test_named_profile_yaml_survives_load_gateway_config(self, tmp_path, monkeypatch):
+        """YAML-only Matrix allowlists must reach MatrixAdapter via extra.
+
+        Reviewer asked for this exact path: a named profile configured only
+        in config.yaml, load_gateway_config() under that profile's runtime
+        scope, then construct MatrixAdapter and assert the effective
+        _allowed_rooms / _allowed_user_ids.
+        """
+        from gateway.config import Platform, load_gateway_config
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        home = tmp_path / "profiles" / "operator"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "matrix:\n"
+            "  allowed_users:\n"
+            "    - \"@operator:example.org\"\n"
+            "  allowed_rooms:\n"
+            "    - \"!private:example.org\"\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@default:example.org")
+        monkeypatch.setenv("MATRIX_ALLOWED_ROOMS", "!default:example.org")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        home_token = set_hermes_home_override(str(home))
+        try:
+            cfg = load_gateway_config()
+            extra = cfg.platforms[Platform.MATRIX].extra
+            assert extra.get("allowed_users") == "@operator:example.org"
+            assert extra.get("allowed_rooms") == "!private:example.org"
+            import os
+            assert os.environ["MATRIX_ALLOWED_USERS"] == "@default:example.org"
+            assert os.environ["MATRIX_ALLOWED_ROOMS"] == "!default:example.org"
+            adapter = MatrixAdapter(cfg.platforms[Platform.MATRIX])
+            assert adapter._allowed_user_ids == {"@operator:example.org"}
+            assert adapter._allowed_rooms == {"!private:example.org"}
+        finally:
+            reset_hermes_home_override(home_token)
+            ss.reset_secret_scope(token)
+
 
 class TestSignalReactionsFailClosedOnScopedMiss:
     def test_helper_scoped_miss_is_empty_not_star(self, monkeypatch):
