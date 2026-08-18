@@ -55,10 +55,11 @@ _DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
 
 
 def _decode_ddg_url(href: str) -> str:
-    """Return the destination hidden inside DDG's redirect wrapper."""
+    """Return the destination hidden inside a trusted DDG redirect wrapper."""
     absolute = urljoin(_DDG_HTML_ENDPOINT, href)
     parsed = urlparse(absolute)
-    if parsed.hostname in {"duckduckgo.com", "www.duckduckgo.com"}:
+    hostname = parsed.hostname or ""
+    if hostname == "duckduckgo.com" or hostname.endswith(".duckduckgo.com"):
         destination = parse_qs(parsed.query).get("uddg")
         if destination:
             return destination[0]
@@ -130,6 +131,11 @@ def _run_ddg_html_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     response.raise_for_status()
     parser = _DDGHTMLParser(safe_limit)
     parser.feed(response.text)
+    if not parser.results:
+        raise RuntimeError(
+            "DuckDuckGo HTML endpoint returned no parseable results "
+            "(possible bot challenge or markup change)"
+        )
     return parser.results
 
 

@@ -123,7 +123,7 @@ class TestDDGSProviderSearch:
         parser = _DDGHTMLParser(limit=1)
         parser.feed(
             '<div class="result"><a class="result__a" '
-            'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fx%3D1">'
+            'href="//links.duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fx%3D1">'
             '<b>Example</b> &amp; result</a>'
             '<a class="result__snippet">A <b>useful</b> description.</a></div>'
             '<a class="result__a" href="https://ignored.example">Ignored</a>'
@@ -136,6 +136,24 @@ class TestDDGSProviderSearch:
             "description": "A useful description.",
             "position": 1,
         }]
+
+    def test_redirect_param_on_external_host_is_not_decoded(self):
+        from plugins.web.ddgs.provider import _decode_ddg_url
+
+        wrapped = "https://example.com/?uddg=https%3A%2F%2Fattacker.example"
+        assert _decode_ddg_url(wrapped) == wrapped
+
+    def test_html_transport_rejects_page_without_parseable_results(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+
+        response = types.SimpleNamespace(
+            text="<html><body>bot challenge</body></html>",
+            raise_for_status=lambda: None,
+        )
+        monkeypatch.setattr("httpx.post", lambda *args, **kwargs: response)
+
+        with pytest.raises(RuntimeError, match="no parseable results"):
+            prov._run_ddg_html_search("q", 3)
 
     def test_termux_worker_dispatches_to_html_transport(self, monkeypatch):
         import plugins.web.ddgs.provider as prov
