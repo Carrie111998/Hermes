@@ -74,7 +74,9 @@ print(json.dumps({
 }, sort_keys=True))
 conn.close()
 `], { cwd: REPO_ROOT, encoding: 'utf8', env })
-  if (result.status !== 0) throw new Error(`Kanban identity read failed: ${result.stderr}`)
+  if (result.status !== 0) {
+    throw new Error(`Kanban identity read failed: ${result.stderr}`)
+  }
   return JSON.parse(result.stdout) as BoardIdentity
 }
 
@@ -136,6 +138,27 @@ async function expectMobileTargetsAndClipping(page: MockBackendFixture['page']) 
   expect(clipping).toEqual({ cardClipping: false, labelMidwordSplits: false, rootClipping: false })
 }
 
+async function measureTrailingPeek(page: MockBackendFixture['page'], current: string, next?: string) {
+  return page.locator('[data-kanban-scroller]:visible').evaluate((scroller, lanes) => {
+    const currentElement = scroller.querySelector<HTMLElement>(`[data-kanban-lane="${lanes.current}"]`)!
+    const nextElement = lanes.next
+      ? scroller.querySelector<HTMLElement>(`[data-kanban-lane="${lanes.next}"]`)
+      : null
+    const viewportLeft = 0
+    const viewportRight = innerWidth
+    const currentRect = currentElement.getBoundingClientRect()
+    const nextRect = nextElement?.getBoundingClientRect()
+
+    return {
+      currentContained: currentRect.left >= viewportLeft && currentRect.right <= viewportRight,
+      currentSquare: getComputedStyle(currentElement).borderRadius === '0px',
+      nextBorder: nextElement ? getComputedStyle(nextElement).borderLeftWidth : null,
+      trailingPeek: nextRect ? Math.max(0, viewportRight - nextRect.left) : 0,
+      remaining: Math.round(scroller.scrollWidth - scroller.clientWidth - scroller.scrollLeft),
+    }
+  }, { current, next })
+}
+
 let fixture: MockBackendFixture | null = null
 let canonicalRoot: string | null = null
 let canonicalDb = ''
@@ -176,6 +199,7 @@ conn.close()
     },
     prepareSandbox: sandbox => seedBoard(sandbox.hermesHome)
   })
+  await fixture.page.emulateMedia({ reducedMotion: 'reduce' })
   await fixture.page.waitForSelector('body')
   await fixture.page.evaluate(() => {
     localStorage.setItem('hermes.desktop.pluginDecisions.v2', JSON.stringify({ kanban: true }))
@@ -191,7 +215,9 @@ test.afterAll(async () => {
   fixture?.app.process().kill()
   await fixture?.mock.close()
   fixture?.sandbox.cleanup()
-  if (canonicalRoot) fs.rmSync(canonicalRoot, { recursive: true, force: true })
+  if (canonicalRoot) {
+    fs.rmSync(canonicalRoot, { recursive: true, force: true })
+  }
   fixture = null
 })
 
@@ -210,8 +236,41 @@ test('actual shell validates exact mobile viewports and all lane input paths', a
     }))
     expect(shell.viewport).toBe(width)
     expect(shell.board).toBe(shell.viewport) // the mobile shell hides its desktop rail; no board delta
-    expect(shell.lane).toBe(shell.board - 32) // the board's explicit 2rem horizontal lane gutter
+    expect(shell.lane).toBe(shell.board - 38) // 36px outer gutter plus the lane's two one-pixel borders
     await expectMobileTargetsAndClipping(page)
+
+    const scroller = page.locator('[data-kanban-scroller]:visible')
+    await scroller.evaluate(element => element.scrollTo({ left: 0, behavior: 'instant' }))
+    await expect.poll(() => measureTrailingPeek(page, 'triage', 'todo')).toMatchObject({
+      currentContained: true,
+      currentSquare: true,
+      nextBorder: '1px',
+      trailingPeek: 12,
+    })
+    const firstBytes = await page.screenshot({ fullPage: true })
+    const firstFilename = `kanban-mobile-${width}-before-scroll.png`
+    const firstPath = testInfo.outputPath(firstFilename)
+    fs.writeFileSync(firstPath, firstBytes)
+    await testInfo.attach(firstFilename, { path: firstPath, contentType: 'image/png' })
+    manifest.push({ bytes: firstBytes.length, filename: firstFilename, sha256: createHash('sha256').update(firstBytes).digest('hex'), state: 'first', viewportWidth: width })
+
+    // Real wheel input exercises the pointer/touchpad-equivalent path. Snap
+    // settling must expose the next square lane's one-pixel leading border.
+    const scrollerBox = await scroller.boundingBox()
+    await page.mouse.move(scrollerBox!.x + scrollerBox!.width / 2, scrollerBox!.y + 20)
+    await page.mouse.wheel((shell.lane + 10) * 2 + 40, 0)
+    await expect.poll(() => measureTrailingPeek(page, 'ready', 'running')).toMatchObject({
+      currentContained: true,
+      currentSquare: true,
+      nextBorder: '1px',
+      trailingPeek: 12,
+    })
+    const middleBytes = await page.screenshot({ fullPage: true })
+    const middleFilename = `kanban-mobile-${width}-after-pointer-scroll.png`
+    const middlePath = testInfo.outputPath(middleFilename)
+    fs.writeFileSync(middlePath, middleBytes)
+    await testInfo.attach(middleFilename, { path: middlePath, contentType: 'image/png' })
+    manifest.push({ bytes: middleBytes.length, filename: middleFilename, sha256: createHash('sha256').update(middleBytes).digest('hex'), state: 'middle', viewportWidth: width })
 
     for (const status of COLUMNS) {
       const selector = page.locator(`[data-kanban-lane-selector="${status}"]`)
@@ -224,6 +283,18 @@ test('actual shell validates exact mobile viewports and all lane input paths', a
     await first.focus()
     await first.press('End')
     await expectContained(page, 'done')
+    await expect.poll(() => measureTrailingPeek(page, 'done')).toMatchObject({
+      currentContained: true,
+      currentSquare: true,
+      remaining: 0,
+      trailingPeek: 0,
+    })
+    const endBytes = await page.screenshot({ fullPage: true })
+    const endFilename = `kanban-mobile-${width}-end-no-hint.png`
+    const endPath = testInfo.outputPath(endFilename)
+    fs.writeFileSync(endPath, endBytes)
+    await testInfo.attach(endFilename, { path: endPath, contentType: 'image/png' })
+    manifest.push({ bytes: endBytes.length, filename: endFilename, sha256: createHash('sha256').update(endBytes).digest('hex'), state: 'end', viewportWidth: width })
     await page.locator('[data-kanban-lane-selector="done"]').press('ArrowRight')
     await expectContained(page, 'done') // explicit non-wrapping edge policy
     await page.locator('[data-kanban-lane-selector="done"]').press('Home')
@@ -241,17 +312,25 @@ test('actual shell validates exact mobile viewports and all lane input paths', a
       await expectContained(page, status)
     }
 
-    const bytes = await page.screenshot({ fullPage: true })
-    const hash = createHash('sha256').update(bytes).digest('hex')
-    const filename = `kanban-mobile-viewport-${width}.png`
-    const outputPath = testInfo.outputPath(filename)
-    fs.writeFileSync(outputPath, bytes)
-    await testInfo.attach(filename, { path: outputPath, contentType: 'image/png' })
-    manifest.push({ boardWidth: shell.board, bytes: bytes.length, filename, sha256: hash, viewportWidth: shell.viewport })
+    expect(await page.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches)).toBe(true)
   }
 
   const manifestPath = testInfo.outputPath('kanban-mobile-viewport-manifest.json')
-  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  const boardSource = path.join(REPO_ROOT, 'apps', 'desktop', 'src', 'plugins', 'kanban', 'board.tsx')
+  const responsiveSource = path.join(REPO_ROOT, 'apps', 'desktop', 'src', 'plugins', 'kanban', 'responsive.ts')
+  const distRoot = path.join(REPO_ROOT, 'apps', 'desktop', 'dist')
+  const rendererBundle = fs.readdirSync(path.join(distRoot, 'assets')).find(name => /^index-.*\.js$/.test(name))!
+  const sha256File = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+  const evidence = {
+    captures: manifest,
+    provenance: {
+      boardSource: { path: path.relative(REPO_ROOT, boardSource), sha256: sha256File(boardSource) },
+      rendererBundle: { path: `apps/desktop/dist/assets/${rendererBundle}`, sha256: sha256File(path.join(distRoot, 'assets', rendererBundle)) },
+      rendererIndex: { path: 'apps/desktop/dist/index.html', sha256: sha256File(path.join(distRoot, 'index.html')) },
+      responsiveSource: { path: path.relative(REPO_ROOT, responsiveSource), sha256: sha256File(responsiveSource) },
+    },
+  }
+  fs.writeFileSync(manifestPath, `${JSON.stringify(evidence, null, 2)}\n`)
   await testInfo.attach('kanban-mobile-viewport-manifest.json', { path: manifestPath, contentType: 'application/json' })
 })
 
@@ -328,6 +407,12 @@ test('1280 desktop regression keeps lanes, navigation, and drawer geometry', asy
   const widths = await page.locator('[data-kanban-lane]').evaluateAll(lanes => lanes.map(lane => lane.getBoundingClientRect().width))
   expect(widths.filter(width => width === 256).length).toBeGreaterThanOrEqual(7)
   expect(widths).toContain(32)
+  const desktopLaneStyle = await page.locator('[data-kanban-lane="triage"]').evaluate(element => {
+    const style = getComputedStyle(element)
+    return { borderWidth: style.borderLeftWidth, radius: style.borderRadius }
+  })
+  expect(desktopLaneStyle.borderWidth).toBe('0px')
+  expect(Number.parseFloat(desktopLaneStyle.radius)).toBeGreaterThan(0)
   await page.getByText(LONG_TITLE, { exact: true }).last().click()
   const drawer = page.locator('[data-kanban-layout="desktop"]').last()
   await expect(drawer).toHaveJSProperty('clientWidth', 415) // 26rem outer width minus the 1px shell border

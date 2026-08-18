@@ -17,7 +17,9 @@ kanban_db.create_task(conn, title=${JSON.stringify(title)}, body="fixture", crea
 conn.commit()
 conn.close()
 `], { cwd: REPO_ROOT, encoding: 'utf8', env: { ...env, PYTHONPATH: REPO_ROOT } })
-  if (result.status !== 0) throw new Error(result.stderr)
+  if (result.status !== 0) {
+    throw new Error(result.stderr)
+  }
 }
 
 test('final app env rejects hostile Kanban selectors and mutates only the isolated board', () => {

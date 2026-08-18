@@ -1494,9 +1494,10 @@ export function KanbanBoardPage() {
         <div
           aria-label={k.board}
           className={cn(
-            'flex flex-1 snap-x snap-mandatory gap-2 overflow-x-auto overscroll-x-contain px-4 pt-1 pb-3 md:snap-none',
+            'flex flex-1 snap-x snap-mandatory scroll-px-4 gap-2 overflow-x-auto overscroll-x-contain px-4 pt-1 pb-3 md:snap-none',
             grabbing && 'cursor-grabbing'
           )}
+          data-kanban-scroller=""
           onMouseDown={onMouseDown}
           ref={lanesRef}
           role="region"
