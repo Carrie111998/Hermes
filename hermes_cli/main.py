@@ -13194,7 +13194,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
+        "model", "overrides", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -13786,6 +13786,42 @@ def main():
         help="Remove all fallback entries",
     )
     fallback_parser.set_defaults(func=cmd_fallback)
+
+    # =========================================================================
+    # overrides command — see/revoke active model reroute overrides
+    # =========================================================================
+    from hermes_cli.overrides_cmd import cmd_overrides
+
+    overrides_parser = subparsers.add_parser(
+        "overrides",
+        help="See and revoke active model reroute overrides",
+        description=(
+            "See and revoke active model reroute overrides (Phase 2 rate-limit "
+            "handling). An override diverts calls to (provider, model) onto a "
+            "replacement for a bounded window; this is the safety valve to see "
+            "and clear one without needing the Telegram flow that set it."
+        ),
+    )
+    overrides_subparsers = overrides_parser.add_subparsers(dest="overrides_command")
+    overrides_subparsers.add_parser(
+        "list",
+        aliases=["ls"],
+        help="Show active overrides: what's avoided, what it routes to, expiry, who set it (default when no subcommand)",
+    )
+    overrides_clear_parser = overrides_subparsers.add_parser(
+        "clear",
+        help="Revoke an override by provider/model, or every override with --all",
+    )
+    overrides_clear_parser.add_argument(
+        "provider", nargs="?", default=None, help="Provider of the override to clear"
+    )
+    overrides_clear_parser.add_argument(
+        "model", nargs="?", default=None, help="Model of the override to clear"
+    )
+    overrides_clear_parser.add_argument(
+        "--all", action="store_true", help="Clear every active override"
+    )
+    overrides_parser.set_defaults(func=cmd_overrides)
 
     # =========================================================================
     # secrets command — external secret managers (Bitwarden, 1Password)
