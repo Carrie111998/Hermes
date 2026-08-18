@@ -111,6 +111,17 @@ class TestConfigYamlRouting:
         assert "not a recognized config key" not in capsys.readouterr().out
         assert "script_timeout_seconds: 600" in _read_config(_isolated_hermes_home)
 
+    def test_agent_reasoning_effort_is_recognized(self, _isolated_hermes_home, capsys):
+        """The documented global reasoning key must not emit the #85741
+        unrecognized-key warning."""
+        set_config_value("agent.reasoning_effort", "high")
+
+        out = capsys.readouterr().out
+        assert "not a recognized config key" not in out
+        assert "Did you mean" not in out
+        config = _read_config(_isolated_hermes_home)
+        assert "reasoning_effort: high" in config
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)
@@ -515,6 +526,7 @@ class TestValidateConfigKey:
         "model",
         "terminal.backend",
         "agent.max_turns",
+        "agent.reasoning_effort",
         "discord.gateway_restart_notification",
         "telegram.bot_token",
         "mcp_servers.foo.command",

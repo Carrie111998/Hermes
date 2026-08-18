@@ -516,6 +516,16 @@ class TestReasoningOverridesDefaultConfig:
         assert DEFAULT_CONFIG["agent"]["reasoning_overrides"] == {}
 
 
+    def test_default_config_has_reasoning_effort_key(self):
+        """DEFAULT_CONFIG['agent'] must expose the documented global
+        ``agent.reasoning_effort`` key so ``hermes config set`` recognizes it
+        (#85741). Empty string = provider default, matching runtime behavior.
+        """
+        from hermes_cli.config import DEFAULT_CONFIG
+        assert "reasoning_effort" in DEFAULT_CONFIG["agent"]
+        assert DEFAULT_CONFIG["agent"]["reasoning_effort"] == ""
+
+
     def test_spelling_tolerant_lookup_works_with_user_config(self):
         """resolve_per_model_reasoning_effort works with user-added overrides."""
         from hermes_constants import resolve_per_model_reasoning_effort

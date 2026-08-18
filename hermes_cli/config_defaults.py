@@ -322,6 +322,11 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
 
+        # Global reasoning effort for the primary agent (spelling-tolerant
+        # parse). Values: none|minimal|low|medium|high|xhigh|max|ultra.
+        # Empty string = provider default. Takes lower priority than the
+        # per-model reasoning_overrides dict below.
+        "reasoning_effort": "",
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.
         # Takes precedence over agent.reasoning_effort when the current model
