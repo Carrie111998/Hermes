@@ -354,6 +354,21 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
 
+  // A skin authored in $HERMES_HOME/skins/*.yaml only becomes resolvable once
+  // the gateway syncs it into $backendThemes AFTER connect — i.e. after the
+  // boot-time paint and the initial state init above. If the active profile's
+  // persisted pref points at such a skin, that first normalization silently
+  // fell back to the default (nous), and the connect-time seed (apply:false)
+  // deliberately does not repaint — so the choice was lost until the user
+  // switched profiles. Re-resolve the persisted pref whenever the skin registry
+  // changes, so a now-resolvable backend skin applies on its own at startup.
+  // Same-value sets are React no-ops and the pref is only ever re-read (never
+  // written), so a manual pick already persisted can't be stomped here.
+  useEffect(() => {
+    const live = normalizeProfileKey($activeGatewayProfile.get())
+    setThemeNameState(skinPref.resolve(live))
+  }, [userThemes, backendThemes, registryVersion])
+
   // Appearance is per-profile localStorage, and every desktop window is another
   // renderer on the same origin — so a switch made in the HUD (or any peer
   // window) only ever repainted the window it was made in. `storage` fires in

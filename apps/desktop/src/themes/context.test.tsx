@@ -67,4 +67,26 @@ describe('ThemeProvider ← backend skin sync', () => {
     )
     expect(cssVar('--theme-foreground')).toBe('#ff9f0a')
   })
+
+  it('applies a persisted backend skin once its definition syncs after connect', () => {
+    // A prior session selected a backend skin for the default profile, so the
+    // persisted pref names it — but at boot its definition has not synced yet.
+    window.localStorage.setItem('hermes-desktop-theme-v2', 'bloomberg')
+
+    render(
+      <ThemeProvider>
+        <div />
+      </ThemeProvider>
+    )
+
+    // Not resolvable yet → the theme falls back to the default, not the skin.
+    expect(cssVar('--theme-foreground')).not.toBe('#ff9f0a')
+
+    // The gateway connects and SEEDS the skin (apply:false). The persisted pref
+    // must now re-resolve and repaint without a manual profile switch.
+    act(() => ingestBackendSkin(bloomberg('#ff9f0a'), { apply: false }))
+
+    expect(cssVar('--theme-foreground')).toBe('#ff9f0a')
+    expect(cssVar('--theme-background-seed')).toBe('#000000')
+  })
 })
