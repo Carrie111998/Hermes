@@ -421,7 +421,7 @@ test('AT-RG: send snapshot survives the whole round and is finalized only after 
 })
 
 test('AT-RG: attachment-only send drives the room (no text, staged files still start a round)', async () => {
-  const { instances, sdkNamespace } = fakeSdkWithController()
+  const { sdkNamespace } = fakeSdkWithController()
   const cp = load(sdkNamespace, () => 'got it')
   const { attachKey } = await seedAttachmentSend(cp)
 
@@ -436,7 +436,7 @@ test('AT-RG: attachment-only send drives the room (no text, staged files still s
 })
 
 test('AT-RG: a newer send while a round runs is NOT consumed by the older round', async () => {
-  const { instances, sdkNamespace } = fakeSdkWithController()
+  const { sdkNamespace } = fakeSdkWithController()
   const cp = load(sdkNamespace, () => 'got it')
   const first = await seedAttachmentSend(cp)
   // Second send: park a NEW snapshot under a different key while the first
