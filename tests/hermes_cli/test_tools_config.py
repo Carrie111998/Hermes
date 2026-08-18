@@ -96,6 +96,16 @@ def test_malformed_quoted_json_platform_toolsets_fails_closed():
         _get_platform_tools(config, "cli", include_default_mcp_servers=False)
 
 
+def test_dict_platform_toolsets_value_fails_closed():
+    """F7/P4 (exact-head re-review): a dict value like ``{cli: {web:
+    true}}`` (reachable because validate_platform_toolsets only logs on
+    schema mismatch) must NOT be coerced to a junk single name and mixed
+    with real tools — it is a configuration error, fail closed."""
+    config = {"platform_toolsets": {"cli": {"web": True}}}
+    with pytest.raises(ValueError, match="fail closed"):
+        _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+
 def test_empty_platform_toolsets_list_means_disable_all():
     """F7: an explicitly saved EMPTY toolset list means NO toolsets for the
     platform (disable all / fail closed) — not \"no restriction\", which

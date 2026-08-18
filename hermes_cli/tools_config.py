@@ -2447,6 +2447,19 @@ def _get_platform_tools(
             # Plugin platform — derive toolset name from platform key
             default_ts = f"hermes-{platform}"
         toolset_names = [default_ts]
+    elif isinstance(toolset_names, dict):
+        # F7/P4 (exact-head re-review): a dict value like ``{cli: {web:
+        # true}}`` (reachable because validate_platform_toolsets only logs
+        # on schema mismatch) is NOT a toolset restriction — coercing it to
+        # a single str name (``"{'web': True}"``) resolved to a junk name
+        # that the subset-inference pass then mixed with REAL tools
+        # (fail-open). A mapping value is a configuration error: fail
+        # closed.
+        raise ValueError(
+            f"platform_toolsets.{platform} is a dict ({toolset_names!r}); "
+            "expected a list of toolset names. Refusing to resolve "
+            "(fail closed)."
+        )
     elif not isinstance(toolset_names, list):
         # F7/P2: a non-list, non-None value (e.g. YAML parses a bare numeric
         # key like ``12306:`` as int) is an EXPLICIT restriction, not
