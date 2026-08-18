@@ -29,6 +29,25 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+#: Matches the server-rendered "## Explicit Observations" section up to the
+#: next "## " heading (or end of string). The heading text is stable formatter
+#: output from Honcho's ``Representation.format_as_markdown``.
+_EXPLICIT_OBSERVATIONS_SECTION = re.compile(
+    r"^## Explicit Observations\s*\n.*?(?=^## |\Z)", re.MULTILINE | re.DOTALL
+)
+
+_MEMORY_DEDUCTION_GUIDANCE = (
+    "## How to treat memory deductions\n"
+    "IMPORTANT: If the implicit conclusions section concluded that the user has "
+    "some kind of general preference, you should try to follow that preference "
+    "in your interactions with them if you can."
+)
+
+
+def _strip_explicit_observations(text: str) -> str:
+    """Drop the raw explicit-observations wall, keeping the distilled sections."""
+    return _EXPLICIT_OBSERVATIONS_SECTION.sub("", text).strip()
+
 
 # ---------------------------------------------------------------------------
 # Tool schemas (moved from tools/honcho_tools.py)
@@ -606,6 +625,12 @@ class HonchoMemoryProvider(MemoryProvider):
                 # able to see in a log, not an absence to be inferred later.
                 suppressed.append(f"{name} ({len(value)}B)")
                 continue
+            if name == "peerRepresentation":
+                # Experiment: raw timestamped explicit observations drown out
+                # the distilled deductions, so inject only the latter.
+                value = _strip_explicit_observations(value)
+                if not value:
+                    continue
             parts.append(f"{heading}\n{value}")
 
         if suppressed:
@@ -619,6 +644,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
         if not parts:
             return ""
+        if any(p.startswith("## User Representation") for p in parts):
+            parts.append(_MEMORY_DEDUCTION_GUIDANCE)
         return "\n\n".join(parts)
 
     def system_prompt_block(self) -> str:
