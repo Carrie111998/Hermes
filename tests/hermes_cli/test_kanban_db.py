@@ -635,6 +635,274 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def _complete_parent_output(conn, filename="candidate.html", payload=b"candidate"):
+    parent_id = kb.create_task(conn, title="builder output", workspace_kind="scratch")
+    parent = kb.get_task(conn, parent_id)
+    workspace = kb.resolve_workspace(parent)
+    kb.set_workspace_path(conn, parent_id, workspace)
+    artifact = workspace / filename
+    artifact.write_bytes(payload)
+    assert kb.complete_task(
+        conn,
+        parent_id,
+        summary="candidate complete",
+        metadata={"artifacts": [str(artifact)]},
+    )
+    return parent_id, kb.list_attachments(conn, parent_id)[0]
+
+
+def test_hydrate_parent_output_replays_idempotently_and_enters_worker_context(kanban_home):
+    with kb.connect() as conn:
+        parent_id, attachment = _complete_parent_output(conn)
+        child_id = kb.create_task(
+            conn,
+            title="test candidate",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        child_workspace = kb.resolve_workspace(kb.get_task(conn, child_id))
+
+        first = kb.hydrate_parent_attachments(conn, child_id, child_workspace)
+        second = kb.hydrate_parent_attachments(conn, child_id, child_workspace)
+        events = [
+            event for event in kb.list_events(conn, child_id)
+            if event.kind == "parent_attachments_hydrated"
+        ]
+        context = kb.build_worker_context(conn, child_id)
+
+    expected = [(child_id, "candidate.html", attachment.sha256)]
+    assert first == expected
+    assert second == expected
+    assert (child_workspace / "candidate.html").read_bytes() == b"candidate"
+    assert len(events) == 1
+    assert events[0].payload["artifacts"][0]["origins"] == [
+        {
+            "parent_task_id": parent_id,
+            "attachment_id": attachment.id,
+            "source_run_id": attachment.source_run_id,
+            "artifact_role": "candidate.html",
+        }
+    ]
+    assert "## Hydrated parent artifacts" in context
+    assert str(child_workspace / "candidate.html") in context
+    assert attachment.sha256 in context
+
+
+def test_hydration_rejects_conflicting_same_name_parent_outputs_before_writing(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        first_parent, _first = _complete_parent_output(conn, payload=b"first")
+        second_parent, _second = _complete_parent_output(conn, payload=b"second")
+        child_id = kb.create_task(
+            conn,
+            title="ambiguous fan-in",
+            parents=[first_parent, second_parent],
+            workspace_kind="scratch",
+        )
+        workspace = kb.resolve_workspace(kb.get_task(conn, child_id))
+
+        with pytest.raises(
+            kb.ParentAttachmentHydrationError,
+            match="conflict for declared filename",
+        ):
+            kb.hydrate_parent_attachments(conn, child_id, workspace)
+
+    assert not (workspace / "candidate.html").exists()
+
+
+def test_dispatch_hydrates_verified_parent_output_before_scratch_worker_spawn(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    spawned = []
+    with kb.connect() as conn:
+        parent_id, attachment = _complete_parent_output(conn, payload=b"verified")
+        child_id = kb.create_task(
+            conn,
+            title="verify candidate",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+
+        def record_spawn(task, workspace):
+            hydrated = Path(workspace) / "candidate.html"
+            assert hydrated.read_bytes() == b"verified"
+            spawned.append((task.id, attachment.sha256))
+            return 12345
+
+        result = kb._dispatch_once_locked(conn, spawn_fn=record_spawn)
+
+    assert spawned == [(child_id, attachment.sha256)]
+    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [child_id]
+    assert result.auto_blocked == []
+
+
+def test_dispatch_blocks_before_spawn_when_parent_custody_digest_drifts(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    spawned = []
+    with kb.connect() as conn:
+        parent_id, attachment = _complete_parent_output(conn, payload=b"AAAAAAAA")
+        Path(attachment.stored_path).write_bytes(b"BBBBBBBB")
+        child_id = kb.create_task(
+            conn,
+            title="reject tampered candidate",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+        result = kb._dispatch_once_locked(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        child = kb.get_task(conn, child_id)
+        gave_up = [event for event in kb.list_events(conn, child_id) if event.kind == "gave_up"]
+
+    assert spawned == []
+    assert result.spawned == []
+    assert result.auto_blocked == [child_id]
+    assert child.status == "blocked"
+    assert "digest drifted" in child.last_failure_error
+    assert gave_up[-1].payload["phase"] == "parent_artifact_hydration"
+
+
+def test_dispatch_blocks_before_spawn_when_parent_custody_file_is_missing(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    spawned = []
+    with kb.connect() as conn:
+        parent_id, attachment = _complete_parent_output(conn)
+        Path(attachment.stored_path).unlink()
+        child_id = kb.create_task(
+            conn,
+            title="reject missing candidate",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+        result = kb._dispatch_once_locked(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        child = kb.get_task(conn, child_id)
+
+    assert spawned == []
+    assert result.spawned == []
+    assert result.auto_blocked == [child_id]
+    assert child.status == "blocked"
+    assert "outside custody or missing" in child.last_failure_error
+
+
+def test_dispatch_rejects_symlinked_successor_destination_without_touching_target(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    ambient = kanban_home / "ambient-successor.txt"
+    ambient.write_text("do-not-touch")
+    with kb.connect() as conn:
+        parent_id, _attachment = _complete_parent_output(conn)
+        child_id = kb.create_task(
+            conn,
+            title="reject linked destination",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        workspace = kb.resolve_workspace(kb.get_task(conn, child_id))
+        (workspace / "candidate.html").symlink_to(ambient)
+        kb.recompute_ready(conn)
+        result = kb._dispatch_once_locked(conn, spawn_fn=lambda task, workspace: 12345)
+        child = kb.get_task(conn, child_id)
+
+    assert result.spawned == []
+    assert result.auto_blocked == [child_id]
+    assert child.status == "blocked"
+    assert ambient.read_text() == "do-not-touch"
+
+
+def test_parent_without_captured_output_preserves_existing_scratch_dispatch(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    spawned = []
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="ordinary parent")
+        assert kb.complete_task(conn, parent_id, summary="no declared artifact")
+        child_id = kb.create_task(
+            conn,
+            title="ordinary child",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+        result = kb._dispatch_once_locked(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id) or 12345,
+        )
+
+    assert spawned == [child_id]
+    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [child_id]
+
+
+def test_manual_parent_attachment_is_not_implicitly_hydrated(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent with reference attachment")
+        kb.store_attachment_bytes(
+            conn,
+            parent_id,
+            "reference.txt",
+            b"reference only",
+            uploaded_by="operator",
+        )
+        assert kb.complete_task(conn, parent_id, summary="ordinary completion")
+        child_id = kb.create_task(
+            conn,
+            title="ordinary child",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+
+        def record_spawn(task, workspace):
+            assert not (Path(workspace) / "reference.txt").exists()
+            return 12345
+
+        result = kb._dispatch_once_locked(conn, spawn_fn=record_spawn)
+
+    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [child_id]
+
+
+def test_hydration_fails_closed_when_secure_filesystem_primitives_are_unavailable(
+    kanban_home,
+    monkeypatch,
+):
+    with kb.connect() as conn:
+        parent_id, _attachment = _complete_parent_output(conn)
+        child_id = kb.create_task(conn, title="unsupported hydration", parents=[parent_id])
+        workspace = kb.resolve_workspace(kb.get_task(conn, child_id))
+        monkeypatch.setattr(kb, "_secure_dir_fd_custody_available", lambda: False)
+        with pytest.raises(kb.ParentAttachmentHydrationError, match="unavailable"):
+            kb.hydrate_parent_attachments(conn, child_id, workspace)
+
+
 def test_complete_task_rejects_symlinked_scratch_artifact_without_cleanup(kanban_home):
     """A worker cannot smuggle ambient bytes into custody through a symlink."""
     ambient = kanban_home / "ambient.txt"

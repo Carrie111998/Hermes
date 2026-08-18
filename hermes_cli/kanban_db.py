@@ -4177,6 +4177,29 @@ def _ensure_directory_tree_nofollow(path: Path) -> tuple[Path, int]:
         raise
 
 
+def _open_existing_path_nofollow(path: Path, *, directory: bool = False) -> int:
+    """Open an existing absolute path without following any symlink component."""
+    absolute = Path(os.path.abspath(path))
+    if os.name != "posix" or not absolute.is_absolute():
+        raise OSError(f"secure path must be absolute: {absolute}")
+    current_fd = _open_nofollow(absolute.anchor, directory=True)
+    try:
+        for component in absolute.parts[1:-1]:
+            next_fd = _open_nofollow(component, dir_fd=current_fd, directory=True)
+            os.close(current_fd)
+            current_fd = next_fd
+        opened_fd = _open_nofollow(
+            absolute.parts[-1],
+            dir_fd=current_fd,
+            directory=directory,
+        )
+        os.close(current_fd)
+        return opened_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
 def _secure_dir_fd_custody_available() -> bool:
     """Whether this runtime can enforce descriptor-relative no-follow custody.
 
@@ -9789,68 +9812,74 @@ def hydrate_parent_attachments(
     *,
     board: Optional[str] = None,
 ) -> list[tuple[str, str, str]]:
-    """Copy verified direct-parent attachments into ``workspace`` exactly once.
+    """Hydrate captured direct-parent outputs into an isolated workspace.
 
-    This is opt-in at dispatch.  It gives isolated successor workers the exact
-    filenames their parent handoffs declare, without allowing the worker to
-    discover or substitute ambient paths.  All sources and filename collisions
-    are qualified before any destination is written; existing byte-identical
-    files are accepted, while conflicting bytes fail closed.
+    Only artifacts captured by ``kanban_complete`` participate. Ordinary task
+    attachments remain task-local and parents without declared completion
+    artifacts preserve existing dispatch behaviour. Every filesystem component
+    is opened descriptor-relatively without following symlinks; any provenance,
+    size, digest, or destination conflict stops before the worker starts.
     """
-
     parent_rows = conn.execute(
         "SELECT p.id, p.status FROM tasks p "
         "JOIN task_links l ON l.parent_id = p.id "
         "WHERE l.child_id = ? ORDER BY p.id",
         (task_id,),
     ).fetchall()
-    if not parent_rows:
-        return []
-
     planned: dict[str, dict[str, Any]] = {}
     for parent in parent_rows:
         if parent["status"] not in ("done", "archived"):
-            raise ParentAttachmentHydrationError(
-                f"parent {parent['id']} is not complete"
-            )
+            raise ParentAttachmentHydrationError(f"parent {parent['id']} is not complete")
         attachments = conn.execute(
             "SELECT id, filename, stored_path, size, sha256, source_run_id, "
-            "artifact_role FROM task_attachments "
-            "WHERE task_id = ? ORDER BY created_at, id",
+            "artifact_role, capture_key FROM task_attachments "
+            "WHERE task_id = ? AND capture_key IS NOT NULL "
+            "AND uploaded_by = 'kanban_complete' ORDER BY created_at, id",
             (parent["id"],),
         ).fetchall()
-        if not attachments:
-            raise ParentAttachmentHydrationError(
-                f"completed parent {parent['id']} has no attached artifact"
-            )
-        attachment_root = task_attachments_dir(parent["id"], board=board).resolve()
         for attachment in attachments:
             filename = str(attachment["filename"] or "")
-            if not filename or Path(filename).name != filename or filename in (".", ".."):
+            digest = str(attachment["sha256"] or "")
+            artifact_role = str(attachment["artifact_role"] or "")
+            if (
+                not filename
+                or Path(filename).name != filename
+                or filename in (".", "..")
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or attachment["source_run_id"] is None
+                or not artifact_role
+            ):
                 raise ParentAttachmentHydrationError(
-                    f"parent {parent['id']} has unsafe attachment filename {filename!r}"
+                    f"parent {parent['id']} attachment {filename!r} has incomplete provenance"
                 )
-            source = Path(attachment["stored_path"]).resolve()
-            if not source.is_relative_to(attachment_root) or not source.is_file():
+            root = Path(os.path.abspath(task_attachments_dir(parent["id"], board=board)))
+            source = Path(os.path.abspath(Path(attachment["stored_path"])))
+            try:
+                source.relative_to(root)
+                source_fd = _open_existing_path_nofollow(source)
+            except (ValueError, OSError) as exc:
                 raise ParentAttachmentHydrationError(
                     f"parent {parent['id']} attachment {filename} is outside custody or missing"
-                )
-            size = source.stat().st_size
+                ) from exc
+            try:
+                source_stat = os.fstat(source_fd)
+                actual_digest = _sha256_fd(source_fd)
+            finally:
+                os.close(source_fd)
+            size = int(source_stat.st_size)
             if size != int(attachment["size"]):
                 raise ParentAttachmentHydrationError(
                     f"parent {parent['id']} attachment {filename} size drifted"
                 )
-            digest = _sha256_file(source)
-            admitted_digest = attachment["sha256"]
-            if admitted_digest is not None and digest != admitted_digest:
+            if actual_digest != digest:
                 raise ParentAttachmentHydrationError(
                     f"parent {parent['id']} attachment {filename} digest drifted"
                 )
             origin = {
                 "parent_task_id": parent["id"],
                 "attachment_id": int(attachment["id"]),
-                "source_run_id": attachment["source_run_id"],
-                "artifact_role": attachment["artifact_role"] or filename,
+                "source_run_id": int(attachment["source_run_id"]),
+                "artifact_role": artifact_role,
             }
             prior = planned.get(filename)
             if prior is not None and (prior["size"], prior["sha256"]) != (size, digest):
@@ -9867,76 +9896,126 @@ def hydrate_parent_attachments(
             else:
                 prior["origins"].append(origin)
 
-    workspace.mkdir(parents=True, exist_ok=True)
-    created: list[Path] = []
+    if not planned:
+        return []
+
+    if not _secure_dir_fd_custody_available():
+        raise ParentAttachmentHydrationError(
+            "secure descriptor-relative parent artifact hydration is unavailable"
+        )
+
+    workspace_path, workspace_fd = _ensure_directory_tree_nofollow(workspace)
+    created: list[str] = []
     hydrated: list[tuple[str, str, str]] = []
     try:
-        for filename, package in sorted(planned.items()):
-            source = package["source"]
-            size = package["size"]
-            digest = package["sha256"]
-            destination = workspace / filename
-            if destination.exists():
-                if not destination.is_file():
-                    raise ParentAttachmentHydrationError(
-                        f"destination {filename} exists but is not a regular file"
-                    )
-                existing_digest = _sha256_file(destination)
-                if destination.stat().st_size != size or existing_digest != digest:
-                    raise ParentAttachmentHydrationError(
-                        f"destination {filename} conflicts with admitted parent bytes"
-                    )
-            else:
-                temporary = workspace / f".{filename}.{secrets.token_hex(8)}.tmp"
+        try:
+            for filename, package in sorted(planned.items()):
+                size = package["size"]
+                digest = package["sha256"]
                 try:
-                    shutil.copyfile(source, temporary)
-                    copied_digest = _sha256_file(temporary)
-                    if temporary.stat().st_size != size or copied_digest != digest:
-                        raise ParentAttachmentHydrationError(
-                            f"custody verification failed while hydrating {filename}"
+                    destination_fd = _open_nofollow(filename, dir_fd=workspace_fd)
+                except FileNotFoundError:
+                    temporary = f".{filename}.{secrets.token_hex(8)}.tmp"
+                    source_fd = _open_existing_path_nofollow(package["source"])
+                    temp_fd: Optional[int] = None
+                    try:
+                        temp_fd = os.open(
+                            temporary,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                            0o600,
+                            dir_fd=workspace_fd,
                         )
-                    os.replace(temporary, destination)
-                    created.append(destination)
-                finally:
-                    temporary.unlink(missing_ok=True)
-            hydrated.append((task_id, filename, digest))
-    except Exception:
-        for destination in created:
-            destination.unlink(missing_ok=True)
-        raise
-
-    if hydrated:
-        event_payload = {
-            "artifacts": [
-                {
-                    "filename": filename,
-                    "sha256": package["sha256"],
-                    "origins": package["origins"],
-                }
-                for filename, package in sorted(planned.items())
-            ]
-        }
-        with write_txn(conn):
-            replayed = False
-            for row in conn.execute(
-                "SELECT payload FROM task_events WHERE task_id=? "
-                "AND kind='parent_attachments_hydrated' ORDER BY id",
-                (task_id,),
-            ).fetchall():
+                        copied = 0
+                        copied_digest = hashlib.sha256()
+                        with os.fdopen(temp_fd, "wb", closefd=True) as destination_file:
+                            temp_fd = None
+                            while chunk := os.read(source_fd, 1024 * 1024):
+                                copied += len(chunk)
+                                if copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                                    raise ParentAttachmentHydrationError(
+                                        f"parent attachment {filename} exceeds the size limit"
+                                    )
+                                destination_file.write(chunk)
+                                copied_digest.update(chunk)
+                            destination_file.flush()
+                            os.fsync(destination_file.fileno())
+                        if copied != size or copied_digest.hexdigest() != digest:
+                            raise ParentAttachmentHydrationError(
+                                f"custody verification failed while hydrating {filename}"
+                            )
+                        os.replace(
+                            temporary,
+                            filename,
+                            src_dir_fd=workspace_fd,
+                            dst_dir_fd=workspace_fd,
+                        )
+                        created.append(filename)
+                        os.fsync(workspace_fd)
+                    finally:
+                        os.close(source_fd)
+                        if temp_fd is not None:
+                            os.close(temp_fd)
+                        try:
+                            os.unlink(temporary, dir_fd=workspace_fd)
+                        except FileNotFoundError:
+                            pass
+                else:
+                    try:
+                        destination_stat = os.fstat(destination_fd)
+                        destination_digest = _sha256_fd(destination_fd)
+                    finally:
+                        os.close(destination_fd)
+                    if destination_stat.st_size != size or destination_digest != digest:
+                        raise ParentAttachmentHydrationError(
+                            f"destination {filename} conflicts with admitted parent bytes"
+                        )
+                hydrated.append((task_id, filename, digest))
+        except Exception:
+            for filename in created:
                 try:
-                    if json.loads(row["payload"] or "{}") == event_payload:
-                        replayed = True
-                        break
-                except json.JSONDecodeError:
-                    continue
-            if not replayed:
-                _append_event(
-                    conn,
-                    task_id,
-                    "parent_attachments_hydrated",
-                    event_payload,
-                    run_id=_current_run_id(conn, task_id),
-                )
+                    os.unlink(filename, dir_fd=workspace_fd)
+                except FileNotFoundError:
+                    pass
+            if created:
+                os.fsync(workspace_fd)
+            raise
+    finally:
+        os.close(workspace_fd)
+
+    event_payload = {
+        "workspace": str(workspace_path),
+        "artifacts": [
+            {
+                "filename": filename,
+                "destination": str(workspace_path / filename),
+                "sha256": package["sha256"],
+                "origins": package["origins"],
+            }
+            for filename, package in sorted(planned.items())
+        ],
+    }
+    with write_txn(conn):
+        replayed = False
+        for row in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='parent_attachments_hydrated' ORDER BY id",
+            (task_id,),
+        ).fetchall():
+            try:
+                if json.loads(row["payload"] or "{}") == event_payload:
+                    replayed = True
+                    break
+            except (TypeError, json.JSONDecodeError):
+                continue
+        if not replayed:
+            _append_event(
+                conn,
+                task_id,
+                "parent_attachments_hydrated",
+                event_payload,
+                run_id=_current_run_id(conn, task_id),
+            )
     return hydrated
 
 
@@ -10846,6 +10925,29 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if claimed.workspace_kind == "scratch":
+            try:
+                hydrate_parent_attachments(
+                    conn,
+                    claimed.id,
+                    Path(workspace),
+                    board=board,
+                )
+            except (ParentAttachmentHydrationError, OSError) as exc:
+                blocked = _record_task_failure(
+                    conn,
+                    claimed.id,
+                    f"parent_artifact_hydration: {exc}",
+                    outcome="spawn_failed",
+                    failure_limit=failure_limit,
+                    force_trip=True,
+                    release_claim=True,
+                    end_run=True,
+                    event_payload_extra={"phase": "parent_artifact_hydration"},
+                )
+                if blocked:
+                    result.auto_blocked.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -11683,6 +11785,43 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             ctype = f", {att.content_type}" if att.content_type else ""
             lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
         lines.append("")
+
+    hydration_row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'parent_attachments_hydrated' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if hydration_row is not None:
+        try:
+            hydration_payload = json.loads(hydration_row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            hydration_payload = {}
+        hydrated_artifacts = hydration_payload.get("artifacts")
+        if isinstance(hydrated_artifacts, list) and hydrated_artifacts:
+            lines.append("## Hydrated parent artifacts")
+            lines.append(
+                "Verified outputs from completed direct parents were copied into "
+                "this isolated workspace before worker start:"
+            )
+            for artifact in hydrated_artifacts:
+                if not isinstance(artifact, dict):
+                    continue
+                destination = str(artifact.get("destination") or "")
+                digest = str(artifact.get("sha256") or "")
+                origins = artifact.get("origins") or []
+                parent_ids = sorted(
+                    {
+                        str(origin.get("parent_task_id"))
+                        for origin in origins
+                        if isinstance(origin, dict) and origin.get("parent_task_id")
+                    }
+                )
+                if destination and digest:
+                    parent_text = ", ".join(parent_ids) or "unknown parent"
+                    lines.append(
+                        f"- `{destination}` — SHA-256 `{digest}` — source: {parent_text}"
+                    )
+            lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).
