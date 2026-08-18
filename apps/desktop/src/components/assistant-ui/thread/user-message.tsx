@@ -3,6 +3,7 @@ import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } fro
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
+import { MessageContextMenu } from '@/components/assistant-ui/thread/message-context-menu'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
@@ -444,31 +445,33 @@ export const UserMessage: FC<{
         messageId={messageId}
       >
         <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
-          <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
-            <ReactionPicker
-              onOpenChange={setPickerOpen}
-              onSelect={pickEmoji}
-              open={pickerOpen}
-              selected={shownReactions.find(reaction => reaction.author === 'user')?.emoji}
-            >
-              <div
-                className="relative w-full"
-                onContextMenu={
-                  // Right-click is the desktop stand-in for iOS touch-and-hold —
-                  // but only when there's nothing selected. A live highlight
-                  // keeps the native Copy menu (and ⌘C) instead of the picker.
-                  readOnly || !reactionsEnabled
-                    ? undefined
-                    : event => {
-                        if (hasTextSelection()) {
-                          return
-                        }
-
-                        event.preventDefault()
-                        setPickerOpen(true)
-                      }
-                }
+          <MessageContextMenu messageId={messageId}>
+            <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
+              <ReactionPicker
+                onOpenChange={setPickerOpen}
+                onSelect={pickEmoji}
+                open={pickerOpen}
+                selected={shownReactions.find(reaction => reaction.author === 'user')?.emoji}
               >
+                <div
+                  className="relative w-full"
+                  onContextMenu={
+                    // Right-click is the desktop stand-in for iOS touch-and-hold —
+                    // but only when there's nothing selected. A live highlight
+                    // keeps the custom message context menu (Copy / Select All /
+                    // Add as context / Paste as text) instead of the picker.
+                    readOnly || !reactionsEnabled
+                      ? undefined
+                      : event => {
+                          if (hasTextSelection()) {
+                            return
+                          }
+
+                          event.preventDefault()
+                          setPickerOpen(true)
+                        }
+                  }
+                >
                 {readOnly ? (
                   // Spectator transcript: clicking only toggles the clamp so the
                   // full prompt is readable — never opens an edit composer.
@@ -598,7 +601,8 @@ export const UserMessage: FC<{
                 {copy.goForward}
               </BranchPickerPrimitive.Next>
             </BranchPickerPrimitive.Root>
-          </div>
+            </div>
+          </MessageContextMenu>
         </ActionBarPrimitive.Root>
       </StickyHumanMessageContainer>
     </MessagePrimitive.Root>
