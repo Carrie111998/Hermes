@@ -10,7 +10,14 @@ export const MIME_MAP = {
   pdf: 'application/pdf',
   doc: 'application/msword',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  html: 'text/html', htm: 'text/html',
+  txt: 'text/plain', csv: 'text/csv',
+  json: 'application/json', xml: 'application/xml',
+  md: 'text/markdown', zip: 'application/zip',
 };
 
 export function normalizeWhatsAppId(value) {

@@ -255,6 +255,25 @@ import {
 }
 
 {
+  for (const [ext, expectedMime] of [
+    ['html', 'text/html'],
+    ['htm', 'text/html'],
+    ['txt', 'text/plain'],
+    ['csv', 'text/csv'],
+    ['json', 'application/json'],
+  ]) {
+    const payload = mediaPayloadForFile({
+      buffer: Buffer.from('test content'),
+      filePath: `/tmp/report.${ext}`,
+      caption: `report ${ext}`,
+    });
+    assert.ok(payload.document);
+    assert.equal(payload.mimetype, expectedMime, `expected ${expectedMime} for .${ext}`);
+  }
+  console.log('  ✓ mediaPayloadForFile maps text/web extensions (.html, .txt, .csv, .json) correctly (#89074)');
+}
+
+{
   const payload = buildPollPayload({
     question: 'Proceed?',
     options: ['Approve', 'Deny'],
