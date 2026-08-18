@@ -428,13 +428,25 @@ def set_override(
         return False, "internal error setting override"
 
 
-def clear_override(*, provider: str, model: str, bus: Any = None) -> bool:
+def clear_override(
+    *, provider: str, model: str, cleared_by: str = "", bus: Any = None
+) -> bool:
     """Remove an active override. Returns True only if something was removed.
 
     Emits MODEL_OVERRIDE_SET only when a record was actually removed -- a
     no-op clear (nothing to remove) leaves nothing behind, so it must not
     leave an audit trail either. ``bus`` is test-injectable, mirroring
     events/rate_limit_signal.py.
+
+    ``cleared_by`` identifies who performed THIS clear, distinct from the
+    ``set_by`` carried over from the original record: the trail needs both
+    "who set it" and "who cleared it" to tell "the operator cleared their
+    own override" apart from "someone else un-diverted traffic on their
+    behalf". It defaults to "" because existing callers (and the Phase 2
+    task-7/8 callers landing after this one) may not always have an actor
+    to hand -- absent that actor, the payload records the literal string
+    "unknown" rather than silently attributing the clear to whoever
+    originally set the override.
     """
     try:
         key = _override_key(provider, model)
@@ -465,6 +477,7 @@ def clear_override(*, provider: str, model: str, bus: Any = None) -> bool:
             "set_by": (
                 removed.get("set_by", "") if isinstance(removed, dict) else ""
             ),
+            "cleared_by": cleared_by or "unknown",
             "action": "cleared",
         }
         _emit_audit(payload, bus)

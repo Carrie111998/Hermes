@@ -256,3 +256,51 @@ def test_clear_override_still_succeeds_when_bus_explodes(ov):
     assert clear_override(provider="deepseek", model="deepseek-v4-pro",
                           bus=_ExplodingBus()) is True
     assert get_override("deepseek", "deepseek-v4-pro") is None
+
+
+# ---------------------------------------------------------------------------
+# Review finding: the "cleared" audit payload carried only the ORIGINAL
+# setter's set_by, so it could not distinguish "the operator cleared their
+# own override" from "someone else un-diverted traffic on their behalf".
+# clear_override() now takes a keyword-only cleared_by, defaulted to "" so
+# existing/pre-Task-7/8 callers are unaffected, and the payload records BOTH
+# who set it and who cleared it as distinct fields.
+# ---------------------------------------------------------------------------
+
+def test_clear_records_who_cleared_it(ov):
+    """The cleared payload must carry BOTH the original setter and the
+    clearing actor as distinct fields -- that is the whole point of the
+    audit trail (spec Sec:Containment: "who diverted what, when")."""
+    from events.model_override import set_override, clear_override
+    from events.schema import EventType
+    set_override(provider="deepseek", model="deepseek-v4-pro",
+                 replacement_provider="openai-codex",
+                 replacement_model="gpt-5.6-sol",
+                 ttl_seconds=3600, set_by="telegram:diego")
+    bus = _FakeBus()
+    assert clear_override(provider="deepseek", model="deepseek-v4-pro",
+                          cleared_by="telegram:diego2", bus=bus) is True
+    assert len(bus.emitted) == 1
+    et, source, payload, _ = bus.emitted[0]
+    assert et is EventType.MODEL_OVERRIDE_SET
+    assert payload["set_by"] == "telegram:diego"
+    assert payload["cleared_by"] == "telegram:diego2"
+    assert payload["set_by"] != payload["cleared_by"]
+
+
+def test_clear_without_actor_is_still_legible(ov):
+    """When no cleared_by is supplied, the payload must not silently
+    attribute the clear to the original setter -- it must be legible as
+    'no actor was recorded', not indistinguishable from a real one."""
+    from events.model_override import set_override, clear_override
+    bus = _FakeBus()
+    set_override(provider="deepseek", model="deepseek-v4-pro",
+                 replacement_provider="openai-codex",
+                 replacement_model="gpt-5.6-sol",
+                 ttl_seconds=3600, set_by="telegram:diego")
+    assert clear_override(provider="deepseek", model="deepseek-v4-pro",
+                          bus=bus) is True
+    _, _, payload, _ = bus.emitted[0]
+    assert payload["set_by"] == "telegram:diego"
+    assert payload["cleared_by"] != "telegram:diego"
+    assert payload["cleared_by"] == "unknown"
