@@ -110,6 +110,31 @@ def cron_stale_thresholds_path() -> Path:
     return notifications_home() / "cron_stale_thresholds.json"
 
 
+def profile_workspace(profile: str) -> Path:
+    """Workspace directory of a named profile, e.g. ~/.hermes/profiles/scribe/workspace.
+
+    Profile-scoped by construction, so it takes the profile NAME rather than
+    reading HERMES_HOME: the scribe subscribers run inside the *gateway*
+    process (whatever profile that is) but persist to the scribe profile.
+
+    Resolved on every call, never at import. The scribe subscribers used to
+    hold ``Path(os.path.expanduser("~/.hermes/profiles/scribe/workspace/..."))``
+    as a module constant, which no env redirect can reach -- so every test
+    that ran a subscriber poll wrote the developer's real scribe workspace.
+    """
+    return _root() / "profiles" / profile / "workspace"
+
+
+def scribe_action_telemetry_path() -> Path:
+    """ScribeActionTelemetry state (digest -> action correlation windows)."""
+    return profile_workspace("scribe") / "action_telemetry.json"
+
+
+def scribe_voice_tuning_path() -> Path:
+    """ScribeVoiceTuning state (per-topic brevity/verbosity tuning)."""
+    return profile_workspace("scribe") / "voice_tuning.json"
+
+
 def mailbox_root() -> Path:
     return _root() / "mailbox"
 

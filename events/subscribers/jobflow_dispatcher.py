@@ -24,10 +24,20 @@ ledger — it answers "would this have woken?" with the reconciler's own
 ``is_available`` predicate and writes nothing, so a seven-day observation window
 cannot leave residue that would suppress the first real run.
 
-Known coverage gap: ``RESEARCH_REQUEST`` is not in the mailbox watcher's
-``MIRRORED_MESSAGE_TYPES``, so no event is ever emitted for it and the
-researcher can only be activated by reconciliation. Widening that set would
+Known coverage gap: ``RESEARCH_REQUEST`` and ``QUESTION_ANSWER`` are not in the
+mailbox watcher's ``MIRRORED_MESSAGE_TYPES``, so no event is ever emitted for
+either and both can only be activated by reconciliation. Widening that set would
 also change notification delivery, which is out of scope here.
+
+Only the first of those is a latent defect. ``RESEARCH_REQUEST`` is
+machine-produced, so real work starts silently missing the event path the moment
+research volume resumes. ``QUESTION_ANSWER`` is a *human reply* — the applier
+emits ``BLOCKED_QUESTION`` when a form field defeats it and waits for a person to
+answer — so having no automated producer is its design, not an omission, and its
+consumer is live (``profiles/applier/workspace/tmp_ready_sweep_cron.py`` in the
+hermes repo re-runs the dry-run with the answer attached). A grep of this repo
+alone makes it look like dead code; it is not. Do not delete that route on the
+grounds that nothing emits it.
 """
 
 from __future__ import annotations
@@ -174,8 +184,16 @@ class JobFlowDispatcher(BaseSubscriber):
                 continue
 
             if self._waker(job_id, caller=self.subscriber_id, reason="mailbox_message") is False:
-                logger.warning(
-                    "dispatch: wake channel refused %s (%s) — releasing claim",
+                # Overwhelmingly the benign case: the job is ALREADY queued, so a
+                # burst of N messages collapses to one wake and the other N-1 land
+                # here. That is the mechanism that makes event dispatch cheaper
+                # than polling, not a fault — the first live burst logged 14 of
+                # these for one run. Logged at INFO so a real problem stays
+                # visible: request_wake's other False (channel full) already emits
+                # its own WARNING from cron/wake_channel.py with more detail, so
+                # demoting here loses no signal.
+                logger.info(
+                    "dispatch: %s (%s) already queued — collapsing, releasing claim",
                     job_id, activity_id,
                 )
                 self._release(key, activity_id)

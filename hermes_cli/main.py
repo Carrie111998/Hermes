@@ -9899,6 +9899,20 @@ def _pause_windows_gateways_for_update() -> dict | None:
     }
 
 
+# Set when `_cold_start_windows_gateway_after_update` issues a spawn, and read
+# by the next call to suppress a duplicate. The `find_gateway_pids()` guard
+# below cannot cover this on its own: a freshly spawned gateway takes ~28s to
+# become discoverable (measured 2026-08-18 — spawn 10:18:06, `:8642` listening
+# 10:18:34), so every re-check inside that window truthfully answers "nothing
+# running" and spawns again. On 2026-08-17 that produced THREE gateways in 1.4s
+# from a single parent (pids 24760/44860/35144, all ppid 48796), repeatedly.
+#
+# A liveness poll can never be an idempotence guard for something that takes
+# 28s to appear; remembering our own spawn is what closes it.
+_COLD_START_SPAWNED_AT: float | None = None
+_COLD_START_SUPPRESS_S = 60.0
+
+
 def _cold_start_windows_gateway_after_update() -> None:
     """Start a fresh detached gateway after update when one is installed but down.
 
@@ -9933,11 +9947,29 @@ def _cold_start_windows_gateway_after_update() -> None:
         logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
         return
 
+    # Second guard: we may have spawned one ourselves moments ago, while it is
+    # still invisible to `find_gateway_pids()`. See `_COLD_START_SPAWNED_AT`.
+    global _COLD_START_SPAWNED_AT
+    import time as _time
+
+    now = _time.monotonic()
+    if (
+        _COLD_START_SPAWNED_AT is not None
+        and (now - _COLD_START_SPAWNED_AT) < _COLD_START_SUPPRESS_S
+    ):
+        logger.debug(
+            "Skipping cold-start: spawned %.1fs ago, still inside the discovery window",
+            now - _COLD_START_SPAWNED_AT,
+        )
+        return
+
     try:
         pid = gateway_windows._spawn_detached(reason="update:windows-cold-start")
     except Exception as exc:
         logger.debug("Could not cold-start Windows gateway after update: %s", exc)
         return
+
+    _COLD_START_SPAWNED_AT = now
 
     if pid:
         print()

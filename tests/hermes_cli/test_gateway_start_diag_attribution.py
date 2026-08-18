@@ -470,3 +470,48 @@ def test_generated_launchers_stay_syntactically_intact(tmp_path):
     }
     for token in ("fso", "sh", "target"):
         assert token in dropper_names
+
+
+def test_force_terminate_records_who_killed_the_gateway(monkeypatch):
+    """A force-kill must be attributed by the KILLER, because the victim cannot.
+
+    `_force_terminate_known_gateway_pids` escalates to `terminate_pid(force=True)`
+    (taskkill /F). Windows `TerminateProcess` does not run `atexit`, so the victim's
+    own `atexit.hook` / `gateway.exit_*` records are never written — the gateway
+    simply vanishes leaving no trace at all.
+
+    Observed 2026-08-18: two gateways died (pids 11232 ~09:30, 44064 ~10:12:57) with
+    ZERO exit records, while the same instrumentation wrote 30 exit records the day
+    before. No amount of victim-side instrumentation can close that gap; only the
+    killer can say a kill happened, and who asked for it.
+    """
+    from hermes_cli import gateway_windows
+
+    records: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        gateway_windows,
+        "write_diag",
+        lambda tag, **kw: records.append((tag, kw)),
+        raising=False,
+    )
+
+    import gateway.status as gateway_status
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: True)
+    killed: list[int] = []
+    monkeypatch.setattr(
+        gateway_status,
+        "terminate_pid",
+        lambda pid, force=False: killed.append(pid),
+    )
+
+    gateway_windows._force_terminate_known_gateway_pids([31337])
+
+    assert killed == [31337]
+    kill_records = [r for r in records if r[0] == "gateway.force_kill"]
+    assert kill_records, f"no gateway.force_kill record written; got {[r[0] for r in records]}"
+    payload = kill_records[0][1]
+    assert payload.get("victim_pid") == 31337
+    # The whole point: name the killer, since the victim can't.
+    assert payload.get("killer_pid") == os.getpid()
+    assert "killer_cmdline" in payload

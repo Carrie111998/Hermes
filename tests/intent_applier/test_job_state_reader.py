@@ -79,3 +79,34 @@ def test_build_default_reader_does_not_raise():
     # Present-or-absent psycopg: must return a reader or None, never raise.
     reader = build_default_reader()
     assert reader is None or isinstance(reader, NativePgJobStateReader)
+
+
+def test_connect_bounds_both_phases(monkeypatch):
+    """Both psycopg phases must be bounded, not just connect.
+
+    psycopg has no default timeout on either phase: connect() waits on the OS
+    TCP timeout and, once connected, a query blocks forever. This reader runs
+    inside the gateway on the tracker-intent-applier subscriber, so an
+    unbounded statement phase would stall the subscriber against a container
+    that accepts the socket then stops answering -- and would silently falsify
+    the module's fail-soft contract. Pin both so removing either fails here.
+    """
+    import intent_applier.job_state_reader as mod
+
+    seen = {}
+
+    class _FakePsycopg:
+        @staticmethod
+        def connect(dsn, **kwargs):
+            seen.update(kwargs)
+            seen["dsn"] = dsn
+            return _FakeConn(None)
+
+    monkeypatch.setitem(__import__("sys").modules, "psycopg", _FakePsycopg)
+
+    r = mod.NativePgJobStateReader(dsn="x", connect_timeout=2.0)
+    r._connect()
+
+    assert seen["connect_timeout"] == 2.0
+    assert seen["options"] == f"-c statement_timeout={mod._STATEMENT_TIMEOUT_MS}"
+    assert seen["autocommit"] is True

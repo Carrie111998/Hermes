@@ -209,10 +209,24 @@ class TestReadFile:
         _assert_clean(result.content)
 
     def test_tilde_expansion(self, ops):
-        # Must live under the real $HOME to exercise ~ expansion (can't move to
-        # tmp_path). The name is made unique per process/run so two concurrent
-        # pytest invocations of this file don't race on a shared fixed path --
-        # one unlinking in its finally while the other is mid-read.
+        # Must live under the real $HOME: ShellFileOperations does NOT expand
+        # "~" in Python. tools/file_operations.py::_expand_path shells out --
+        # `self._exec("echo $HOME")` -- so the value comes from the Git Bash
+        # process LocalEnvironment drives, whose environment is fixed when
+        # that shell spawns.
+        #
+        # tests/_home_isolation.redirect_home does NOT work here, and this
+        # comment exists because it was tried: it repoints $HOME/%USERPROFILE%/
+        # Path.home() inside the *Python* process, the shell keeps the real
+        # one, and the test fails with
+        # "File not found: /c/Users/diego/.hermes_test_tilde_...".
+        #
+        # So this is a KNOWN, ACCEPTED write into the real home -- an audit
+        # hook over the suite will report it and that report is correct. It is
+        # bounded: the name is unique per process/run so two concurrent pytest
+        # invocations of this file don't race on a shared fixed path (one
+        # unlinking in its finally while the other is mid-read), and the
+        # finally-unlink removes it.
         name = f".hermes_test_tilde_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         test_path = Path.home() / name
         try:

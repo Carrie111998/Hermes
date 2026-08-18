@@ -31,6 +31,28 @@ _DEFAULT_DSN = "postgres://jobflow:jobflow@127.0.0.1:5432/jobflow"
 # job_id in intents is the jobs.external_job_key (full UUID form).
 _QUERY = "select current_business_state from jobs where external_job_key = %s limit 1"
 
+# Bound the STATEMENT phase, not just connect.
+#
+# ``connect_timeout`` below already bounds phase one, but psycopg has no default
+# timeout on phase two: once connected, a query blocks forever. A container that
+# accepts the TCP connection and then stops servicing queries -- the exact
+# disk-starvation shape that wedged cron.postgres.sync for nine consecutive
+# ~61-minute runs on 2026-08-14 -- would therefore hang ``cur.execute`` here with
+# no ceiling at all. This reader runs INSIDE the gateway process, on the
+# tracker-intent-applier event-bus subscriber, so that hang would stall the
+# subscriber rather than one cron tick, and the module docstring's fail-soft
+# contract ("a Postgres hiccup can only ever disable the optimization, never
+# block a real transition") would be silently false.
+#
+# Budget derived from this query's own measured cost against the live DB: the
+# single indexed external_job_key lookup returns in ~0.0015s. 2000ms is over a
+# thousand times that, and deliberately mirrors the 2.0s connect budget -- both
+# phases now cost at most the same bounded amount before the reader gives up,
+# returns None, and arms the existing cooldown. Env-overridable.
+_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get("HERMES_JOBFLOW_PG_STATEMENT_TIMEOUT_MS", "2000")
+)
+
 
 class NativePgJobStateReader:
     """Lazy, reconnecting, fail-soft reader of jobs.current_business_state.
@@ -57,7 +79,14 @@ class NativePgJobStateReader:
         import psycopg  # imported lazily so a missing driver disables Fix A, not the gateway
 
         return psycopg.connect(
-            self._dsn, connect_timeout=self._connect_timeout, autocommit=True
+            self._dsn,
+            connect_timeout=self._connect_timeout,
+            autocommit=True,
+            # Server-side, so it covers every statement on the session without
+            # touching the call site. Exceeding it raises, which the caller's
+            # broad ``except Exception`` already turns into the fail-soft
+            # ``None`` + cooldown path.
+            options="-c statement_timeout=" + str(_STATEMENT_TIMEOUT_MS),
         )
 
     def _reset(self) -> None:

@@ -36,8 +36,27 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 HERMES_ROOT = Path.home() / ".hermes"
-AGENT_SRC = HERMES_ROOT / "agent-src"
-sys.path.insert(0, str(AGENT_SRC))
+
+# Bootstrap for `python devflow_delegation/adopt_history.py`, where sys.path[0]
+# is the package directory and the sibling `from devflow_delegation...` imports
+# below cannot resolve. Two things were wrong with the previous unconditional
+# `sys.path.insert(0, Path.home() / ".hermes" / "agent-src")`:
+#
+#   * it named the DEPLOYED checkout rather than this file's own, so importing
+#     this module from a worktree put ~/.hermes/agent-src AHEAD of the checkout
+#     under test, and every later first-time import of a Hermes package
+#     resolved from deployed code instead;
+#   * it ran even when the package was already importable -- i.e. on every
+#     ordinary `import devflow_delegation.adopt_history` and every
+#     `python -m devflow_delegation.adopt_history`, where it is redundant by
+#     construction.
+#
+# ``__package__`` is the package name for both import forms and "" or None only
+# for the run-this-file-by-path form, which is exactly when the insert is
+# needed. Caught by tests/test_live_root_isolation.py, which measured 23 copies
+# of the deployed checkout surviving a tests/devflow_delegation run.
+if not __package__:  # pragma: no cover - only the run-by-path entry point
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from devflow_delegation.contract import parse_request, parse_v2_fix_request  # noqa: E402
 from devflow_delegation.lifecycle import transition  # noqa: E402

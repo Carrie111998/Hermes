@@ -4108,9 +4108,12 @@ def _collect_woken_jobs(*, exclude_ids: set) -> list:
     now", not "the schedule moved". Advancing would let inbound traffic drift a
     job's regular cadence.
 
-    A wake is always consumed, even when it cannot be used (job unknown,
-    disabled, or already due) — otherwise a disabled worker's wake would be
-    redelivered on every tick forever.
+    A wake is consumed even when it cannot be *usefully* used (job unknown,
+    disabled, or already firing this tick) — otherwise a disabled worker's wake
+    would be redelivered on every tick forever.
+
+    The one exception is a job that is currently RUNNING: that wake is
+    re-queued, not consumed. See the re-queue branch below for why.
 
     Never raises into the tick: losing a wake degrades to the deterministic
     reconciler catching the work, while an exception here would stall every
@@ -4141,6 +4144,32 @@ def _collect_woken_jobs(*, exclude_ids: set) -> list:
             # An operator disabled this on purpose. Unlike trigger_job, a wake
             # never re-enables.
             logger.info("cron wake for disabled job %s — not revived", job_id)
+            continue
+        if job_id in get_running_job_ids():
+            # The job is mid-run, so dispatching now would only hit the
+            # duplicate-fire guard and the wake would be lost. Put it back and
+            # let a later tick deliver it once the run finishes.
+            #
+            # Measured 2026-08-18 (canary day 0): dropping it cost every
+            # acceleration event dispatch was supposed to buy. The producer and
+            # the consumer share a schedule boundary — jobflow-tracker-cycle is
+            # `0 */4` and jobflow-matcher `0 */2`, both on the hour — so the
+            # tracker's SCORE_REQUESTs landed 10:06:51-54, inside the matcher
+            # run that began 10:00:57. Both live wakes were refused, the work
+            # waited for the next scheduled run up to two hours later, and the
+            # dispatcher's ledger claim aged out unfinished.
+            #
+            # Bounded without a counter: the channel is a set, so a wake waiting
+            # many ticks stays exactly one entry, and a genuinely hung run is
+            # ended by the cron wall-clock timeout rather than by this loop.
+            # Logged at DEBUG because a busy worker is the normal case and this
+            # fires once per tick until the run ends.
+            wake_channel.request_wake(
+                job_id, caller="cron.tick", reason="requeued_job_running"
+            )
+            logger.debug(
+                "cron wake for %s deferred — job still running; re-queued", job_id
+            )
             continue
         collected.append(job)
 

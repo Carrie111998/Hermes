@@ -15,15 +15,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from events import paths
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-STATE_PATH = Path(os.path.expanduser(
-    "~/.hermes/profiles/scribe/workspace/voice_tuning.json"
-))
-TOPICS_PATH = Path(os.path.expanduser("~/.hermes/telegram/topics.json"))
+
+
+def _state_path() -> Path:
+    """Resolved per call, never at import -- see the sibling note in
+    scribe_action_telemetry.py. A module constant built from
+    ``os.path.expanduser("~/...")`` ignores HERMES_HOME (and on Windows
+    ignores $HOME too), so tests wrote the developer's real scribe workspace.
+    """
+    return paths.scribe_voice_tuning_path()
+
+
+def _topics_path() -> Path:
+    """Telegram topic routing config, cross-profile at the canonical root.
+
+    ``events.paths`` has owned this location since the notification layer
+    landed; this module was the one holdout still expanding ``~`` itself.
+    """
+    return paths.telegram_topics_path()
+
 SCHEMA_VERSION = 1
 DEFAULT_BREVITY = 4000
 BREVITY_MIN = 800
@@ -40,10 +56,11 @@ def _load_state() -> dict:
         "last_updated": None,
         "feedback_log": [],
     }
-    if not STATE_PATH.exists():
+    state_path = _state_path()
+    if not state_path.exists():
         return fresh
     try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(state_path.read_text(encoding="utf-8"))
         if data.get("schema_version") != SCHEMA_VERSION:
             logger.warning("voice_tuning: schema mismatch, resetting")
             return fresh
@@ -56,16 +73,17 @@ def _load_state() -> dict:
 
 
 def _save_state(data: dict) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".json.tmp")
+    state_path = _state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, STATE_PATH)
+    os.replace(tmp, state_path)
 
 
 def _scribe_daily_thread_id() -> Optional[str]:
     """Read fresh from topics.json each call so taxonomy changes take immediate effect."""
     try:
-        cfg = json.loads(TOPICS_PATH.read_text(encoding="utf-8"))
+        cfg = json.loads(_topics_path().read_text(encoding="utf-8"))
         thread = cfg.get("topics", {}).get("scribe_daily", {}).get("thread_id", "")
         return str(thread) if thread else None
     except Exception:

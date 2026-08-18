@@ -25,6 +25,8 @@ class TestActionableRequests:
             ("TAILOR_REQUEST", "tailor", ("jobflow.tailor.generate",)),
             ("TAILOR_MODULE_REQUEST", "tailor", ("jobflow.tailor.generate",)),
             ("RESEARCH_REQUEST", "researcher", ("cron.jobflow.researcher",)),
+            ("SUBMIT_REQUEST", "applier", ("cron.jobflow.applier",)),
+            ("SUBMIT_CONFIRM", "applier", ("cron.jobflow.applier",)),
         ),
     )
     def test_requests_route_to_their_worker(self, message_type, destination, expected):
@@ -174,3 +176,83 @@ class TestTrackerIsDeliberatelyUnrouted:
         from jobflow_dispatch.contracts import route_mailbox
 
         assert route_mailbox(message_type, "tracker", {}) == ()
+
+
+class TestApplierRoutesOnTheTypeThatActuallyArrives:
+    """SUBMIT_REQUEST is the applier's only observed inbound work.
+
+    The lane was routed solely on SUBMIT_CONFIRM and QUESTION_ANSWER, neither
+    of which any component produces — every message in ``applier/inbox`` since
+    July is a SUBMIT_REQUEST. The lane was therefore unreachable on the event
+    path AND in the reconciler, which builds its scanned types from ROUTES.
+
+    That is why the 2026-08-17 shadow gate could report 100% recall while the
+    applier logged zero dispatches: zero was structural, not idle. No soak of
+    any length would have produced a single applier line.
+    """
+
+    def test_submit_request_wakes_the_applier(self):
+        assert route_mailbox("SUBMIT_REQUEST", "applier", {}) == (
+            "cron.jobflow.applier",
+        )
+
+    def test_the_reconciler_recognises_it_too(self):
+        """Both paths must agree; the reconciler derives its types from ROUTES."""
+        from jobflow_dispatch.reconcile import _TYPES, DESTINATIONS, _message_type
+
+        assert "SUBMIT_REQUEST" in _TYPES
+        assert "applier" in DESTINATIONS
+        assert _message_type(
+            "20260720T100927Z_SUBMIT_REQUEST_main_8446590b.json"
+        ) == "SUBMIT_REQUEST"
+
+    def test_submit_request_elsewhere_still_wakes_nobody(self):
+        """The destination stays authoritative — this is not a global unlock."""
+        for destination in ("matcher", "tailor", "researcher", "tracker", "main"):
+            assert route_mailbox("SUBMIT_REQUEST", destination, {}) == ()
+
+
+class TestEveryRouteHasAnEventPath:
+    """A route whose type is not mirrored can never fire.
+
+    ``MailboxWatcher`` emits events only for ``MIRRORED_MESSAGE_TYPES``, so a
+    route keyed on anything else is dead on the event path — and dead in the
+    reconciler too, since it derives its scanned types from the same table.
+    Nothing reports this at runtime: the lane just reads zero forever, which
+    looks like an idle worker rather than an unreachable one.
+
+    Two types are knowingly unmirrored. Widening the watcher also changes
+    notification delivery, so it stays a deliberate separate decision.
+    """
+
+    #: Routed types with no event path. Each is a standing decision, not a bug.
+    KNOWN_UNMIRRORED = {"RESEARCH_REQUEST", "QUESTION_ANSWER"}
+
+    def test_routed_types_are_mirrored_or_recorded_as_dead(self):
+        from events.producers.mailbox_watcher import MIRRORED_MESSAGE_TYPES
+        from jobflow_dispatch.contracts import ROUTES
+
+        routed = {mtype for mtype, _dest in ROUTES}
+        dead = sorted(routed - set(MIRRORED_MESSAGE_TYPES) - self.KNOWN_UNMIRRORED)
+        assert dead == [], (
+            f"routes with no event path: {dead}. Either add the type to "
+            "MailboxWatcher.MIRRORED_MESSAGE_TYPES, or record it in "
+            "KNOWN_UNMIRRORED with the reason it stays dark."
+        )
+
+    def test_allowlist_shrinks_when_a_type_becomes_mirrored(self):
+        """Otherwise the allowlist rots into a permanent false exemption."""
+        from events.producers.mailbox_watcher import MIRRORED_MESSAGE_TYPES
+
+        mirrored_now = sorted(self.KNOWN_UNMIRRORED & set(MIRRORED_MESSAGE_TYPES))
+        assert mirrored_now == [], (
+            f"{mirrored_now} is mirrored now — drop it from KNOWN_UNMIRRORED"
+        )
+
+    def test_allowlist_only_names_types_that_are_routed(self):
+        """A stale entry protects nothing and misleads the next reader."""
+        from jobflow_dispatch.contracts import ROUTES
+
+        routed = {mtype for mtype, _dest in ROUTES}
+        stale = sorted(self.KNOWN_UNMIRRORED - routed)
+        assert stale == [], f"allowlist names unrouted types: {stale}"

@@ -24,6 +24,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
+# stdlib-only and import-cheap by design (see its module docstring), so it is
+# safe to pull into this low-level module without adding startup cost.
+from hermes_cli.gateway_diag import write_diag
 from typing import Any, NamedTuple, Optional
 from utils import atomic_json_write
 
@@ -249,6 +252,25 @@ def _wait_for_pid_death(pid: int, timeout_s: float, interval_s: float = 0.25) ->
         time.sleep(interval_s)
 
 
+def _terminate_caller() -> str | None:
+    """``file:line`` of whoever called :func:`terminate_pid`, or None.
+
+    A bare "a kill happened" record is not actionable when a dozen call sites
+    can produce it; the frame is what turns the log into a name.
+    """
+    try:
+        import traceback
+
+        # -1 is this helper, -2 is terminate_pid, -3 is the actual caller.
+        stack = traceback.extract_stack(limit=4)
+        if len(stack) < 3:
+            return None
+        frame = stack[-3]
+        return f"{frame.filename}:{frame.lineno} in {frame.name}"
+    except Exception:
+        return None
+
+
 def terminate_pid(pid: int, *, force: bool = False) -> None:
     """Terminate a PID with platform-appropriate force semantics.
 
@@ -267,6 +289,25 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     only report failure when the target is provably still alive — and as an
     ``OSError``, the type callers in the kill path already handle.
     """
+    # Attribute every kill from the killer's side, before it lands -- this is
+    # the only side that can. Windows TerminateProcess does not run `atexit`,
+    # so a force-killed gateway writes none of its own exit records and simply
+    # vanishes (two did exactly that on 2026-08-18, leaving nothing to read).
+    # This sits at the chokepoint rather than at any one caller because there
+    # are a dozen: instrumenting only `_force_terminate_known_gateway_pids`
+    # left three later gateway turnovers still unattributed.
+    # Best-effort by contract, exactly like the rest of the diag layer.
+    try:
+        write_diag(
+            "process.terminate",
+            victim_pid=pid,
+            force=force,
+            killer_pid=os.getpid(),
+            caller=_terminate_caller(),
+        )
+    except Exception:
+        pass
+
     if force and _IS_WINDOWS:
         # CREATE_NO_WINDOW: terminate_pid runs from the windowless pythonw.exe
         # gateway/desktop backend, so a bare taskkill spawn would flash a

@@ -5,6 +5,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
+from plugins.memory.mem0 import _oss_providers
 from plugins.memory.mem0._setup import (
     parse_flags,
     build_oss_config,
@@ -14,6 +17,29 @@ from plugins.memory.mem0._setup import (
     _check_ollama,
     _check_pgvector,
 )
+
+
+@pytest.fixture(autouse=True)
+def _redirect_default_qdrant_path(tmp_path, monkeypatch):
+    """Keep the OSS connectivity check off the developer's real ~/.hermes.
+
+    ``VECTOR_PROVIDERS["qdrant"]["default_config"]["path"]`` is
+    ``os.path.expanduser("~/.hermes/mem0_qdrant")`` evaluated at IMPORT of
+    ``plugins/memory/mem0/_oss_providers.py``. expanduser ignores
+    HERMES_HOME, so the tests here that patch ``get_hermes_home`` do not
+    reach it, and ``_check_qdrant_path`` -- a writability probe that
+    ``mkdir(parents=True, exist_ok=True)``s the parent -- ran against the
+    live ``~/.hermes``. Caught by an audit hook on ``test_oss_flag_mode``
+    and ``test_dry_run_oss_no_files``.
+
+    Patching the registry entry (not the check) keeps every assertion about
+    the *custom* --oss-vector-path intact.
+    """
+    monkeypatch.setitem(
+        _oss_providers.VECTOR_PROVIDERS["qdrant"]["default_config"],
+        "path",
+        str(tmp_path / "mem0_qdrant"),
+    )
 
 
 def _inject_fake_hermes_cli(monkeypatch):
