@@ -381,6 +381,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="PROFILE:TITLE[:SKILL,SKILL]",
         help="Parallel worker card (repeatable)",
     )
+    p_swarm.add_argument(
+        "--worker-lane",
+        action="append",
+        default=[],
+        choices=list(ks.MULTI_AGENT_LANE_IDS),
+        help="Expected worker lane, in the same order as --worker (repeatable)",
+    )
+    p_swarm.add_argument("--goal-max-turns", type=int, default=ks.DEFAULT_GOAL_MAX_TURNS,
+                         help="Goal-loop turn budget for a lane-bound swarm")
+    p_swarm.add_argument("--worker-max-runtime", type=int,
+                         default=ks.DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
+                         help="Per-worker runtime cap in seconds")
     p_swarm.add_argument("--verifier", required=True, help="Verifier profile")
     p_swarm.add_argument("--synthesizer", required=True, help="Synthesizer/writer profile")
     p_swarm.add_argument("--tenant", default=None, help="Tenant namespace")
@@ -1377,6 +1389,15 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
+    lanes = list(getattr(args, "worker_lane", []) or [])
+    if lanes:
+        if len(lanes) != len(workers):
+            print("kanban swarm: --worker-lane count must match --worker count", file=sys.stderr)
+            return 2
+        workers = [
+            ks.SwarmWorkerSpec(**{**spec.__dict__, "lane_id": lane})
+            for spec, lane in zip(workers, lanes)
+        ]
     with kb.connect_closing() as conn:
         created = ks.create_swarm(
             conn,
@@ -1388,6 +1409,10 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            goal_max_turns=getattr(args, "goal_max_turns", ks.DEFAULT_GOAL_MAX_TURNS),
+            worker_max_runtime_seconds=getattr(
+                args, "worker_max_runtime", ks.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+            ),
         )
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
@@ -1894,6 +1919,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            task = kb.get_task(conn, tid)
+            reason = ks.validate_completion(
+                task,
+                metadata=metadata,
+                result=args.result,
+            ) if task else None
+            if reason:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {reason}", file=sys.stderr)
+                continue
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,

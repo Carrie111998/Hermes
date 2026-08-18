@@ -9,6 +9,34 @@ Use the existing Kanban completion path (`hermes kanban complete` or the
 `kanban_complete` tool). Keep the human-readable summary useful but concise;
 machine-readable facts belong in completion metadata.
 
+## Four-lane worker contract
+
+For a lane-bound swarm, the task card names the expected lane and preflight
+skill (empty only for the native_hermes lane). A worker may complete only after its preflight succeeds and must use
+this metadata shape:
+
+```json
+{
+  "role": "worker",
+  "root_id": "<swarm root id>",
+  "lane_id": "native_hermes|claude|grok|agy",
+  "preflight_skill_id": "<named skill>",
+  "outcome": "completed",
+  "verified_clean": true
+}
+```
+
+The verifier must use `role="verifier"`, the matching `root_id`,
+`gate="pass"`, and both `expected_lane_count` and `verified_lane_count` equal
+to four. The synthesizer must use `role="synthesizer"`, the matching root,
+`outcome="completed"`, and `result_present=true`.
+
+The human-visible joke or other deliverable belongs in the existing task
+`result` field. Do not copy it into metadata, audit events, dashboard
+correlation fields, or Telegram delivery metadata. The swarm CLI syntax is
+`PROFILE:TITLE[:SKILL,SKILL]`; the third segment is skill names only, so put
+bounded instructions in the task title/body.
+
 ## Token metadata contract
 
 When the worker actually receives token usage from its provider, it may attach

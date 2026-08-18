@@ -3334,6 +3334,71 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                # Lane-bound swarms add one extra lifecycle gate: a
+                # synthesizer may become ready only after its verifier's
+                # persisted handoff explicitly carries gate=pass.  This is
+                # intentionally body/metadata based so generic Kanban tasks
+                # keep their existing dependency semantics.
+                child_body = conn.execute(
+                    "SELECT body FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if child_body and (child_body["body"] or "").splitlines():
+                    contract = None
+                    prefix = "[swarm:contract] "
+                    for line in reversed((child_body["body"] or "").splitlines()):
+                        if line.startswith(prefix):
+                            try:
+                                parsed = json.loads(line[len(prefix):])
+                            except json.JSONDecodeError:
+                                parsed = None
+                            if isinstance(parsed, dict):
+                                contract = parsed
+                            break
+                    if contract and contract.get("role") == "synthesizer":
+                        expected_verifier = contract.get("verifier_id")
+                        verifier_ids = [
+                            str(p["id"]) for p in conn.execute(
+                                "SELECT parent_id AS id FROM task_links WHERE child_id = ?",
+                                (task_id,),
+                            ).fetchall()
+                        ]
+                        if verifier_ids != [str(expected_verifier)]:
+                            continue
+                        verifier_row = conn.execute(
+                            "SELECT body FROM tasks WHERE id = ?", (expected_verifier,)
+                        ).fetchone()
+                        verifier_contract = None
+                        if verifier_row:
+                            for line in reversed((verifier_row["body"] or "").splitlines()):
+                                if line.startswith(prefix):
+                                    try:
+                                        parsed = json.loads(line[len(prefix):])
+                                    except json.JSONDecodeError:
+                                        parsed = None
+                                    if isinstance(parsed, dict):
+                                        verifier_contract = parsed
+                                    break
+                        verifier_run = conn.execute(
+                            "SELECT metadata FROM task_runs WHERE task_id = ? "
+                            "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
+                            (expected_verifier,),
+                        ).fetchone()
+                        try:
+                            verifier_metadata = (
+                                json.loads(verifier_run["metadata"])
+                                if verifier_run and verifier_run["metadata"] else {}
+                            )
+                        except (TypeError, json.JSONDecodeError):
+                            verifier_metadata = {}
+                        if (
+                            not verifier_contract
+                            or verifier_contract.get("role") != "verifier"
+                            or verifier_contract.get("root_id") != contract.get("root_id")
+                            or verifier_metadata.get("role") != "verifier"
+                            or verifier_metadata.get("root_id") != contract.get("root_id")
+                            or verifier_metadata.get("gate") != "pass"
+                        ):
+                            continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4046,6 +4111,21 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Enforce lane-bound swarm handoffs at the kernel boundary too.  The CLI
+    # and model tool provide friendly errors, while this guard protects direct
+    # callers and keeps a verifier/synthesizer from bypassing the contract.
+    task_for_contract = get_task(conn, task_id)
+    if task_for_contract:
+        try:
+            from hermes_cli import kanban_swarm as _kanban_swarm
+            contract_error = _kanban_swarm.validate_completion(
+                task_for_contract, metadata=metadata, result=result,
+            )
+        except ImportError:
+            contract_error = None
+        if contract_error:
+            raise ValueError(contract_error)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
