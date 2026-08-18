@@ -2105,6 +2105,15 @@ class ShellFileOperations(FileOperations):
         # toolchains key on it). Only prepend when the original had a BOM
         # and the new content doesn't already carry one (guards against
         # double-BOM if a caller passed raw bytes).
+        #
+        # Snapshot the pre-BOM content for linting below: pre_content is
+        # always BOM-stripped (read_file_raw strips it), and in-process
+        # linters like ast.parse reject a literal U+FEFF outright — the
+        # same reason the pre-write fail-closed gate above checks the raw
+        # ``content`` argument before these shims run. Linting the
+        # BOM-restored bytes would falsely report "this edit introduced a
+        # syntax error" on every legitimately BOM-marked file.
+        lint_content = content
         if self._file_has_bom(path, pre_content) and not _has_bom(content):
             content = _UTF8_BOM + content
 
@@ -2195,8 +2204,11 @@ class ShellFileOperations(FileOperations):
         except Exception:
             content_verified = None
 
-        # Post-write lint with delta refinement.
-        lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
+        # Post-write lint with delta refinement. Lints lint_content (the
+        # pre-BOM-shim content), not the on-disk `content`, so a legitimately
+        # BOM-marked file's restored U+FEFF doesn't get misread as a syntax
+        # error introduced by this write.
+        lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=lint_content)
         introduced_lint_failure = _introduced_lint_failure(lint_result)
         validated = None if lint_result.skipped else lint_result.success
 
