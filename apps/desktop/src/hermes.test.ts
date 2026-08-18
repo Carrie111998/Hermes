@@ -137,6 +137,44 @@ describe('Hermes REST helpers', () => {
     expect(api).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'local', path: '/api/profiles' }))
   })
 
+  it('routes the batched sidebar refresh through the active backend scope', async () => {
+    setApiRequestConnection('cubi')
+    setApiRequestProfile('default')
+    api.mockResolvedValue({ recents: { sessions: [] }, cron: { sessions: [] }, messaging: { sessions: [] } })
+
+    await listSidebarSessions({
+      recentsProfile: 'default',
+      recentsLimit: 20,
+      recentsExclude: ['cron'],
+      cronLimit: 50,
+      messagingLimit: 100,
+      messagingExclude: ['cron', 'desktop']
+    })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'cubi',
+        profile: 'default',
+        path: expect.stringContaining('/api/profiles/sessions/sidebar?recents_profile=default')
+      })
+    )
+  })
+
+  it('routes legacy profile-session slices through the active backend scope', async () => {
+    setApiRequestConnection('cubi')
+    setApiRequestProfile('default')
+
+    await listAllProfileSessions(20, 1, 'exclude', 'recent', 'default')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'cubi',
+        profile: 'default',
+        path: expect.stringContaining('/api/profiles/sessions?')
+      })
+    )
+  })
+
   it('defaults missing sidebar slices to empty session arrays', async () => {
     api.mockResolvedValue({})
 
