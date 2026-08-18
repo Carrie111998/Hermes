@@ -24674,6 +24674,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.error("Watch notification injection error: %s", exc)
 
+    def _resolve_watch_route(self, evt: dict):
+        """Resolve a concrete route available to this gateway process.
+
+        This is the single dry-run resolver used by both classification and
+        injection.  An unroutable process must not claim durable work, since
+        another gateway may own the adapter that can deliver it.
+        """
+        source = self._build_process_event_source(evt)
+        if source:
+            platform_name = (
+                source.platform.value
+                if hasattr(source.platform, "value")
+                else str(source.platform)
+            )
+            for platform, adapter in self.adapters.items():
+                if platform.value == platform_name and adapter:
+                    return source
+            return None
+
+        # Raw API sessions have no structured source.  They are concrete only
+        # when this process has the non-push api_server adapter to self-post.
+        raw_sid = str(evt.get("origin_session_id") or "").strip()
+        if not raw_sid:
+            session_key = str(evt.get("session_key") or "").strip()
+            if session_key and _parse_session_key(session_key) is None:
+                raw_sid = session_key
+        if raw_sid:
+            adapter = self.adapters.get(Platform.API_SERVER)
+            from gateway.wake import adapter_supports_push
+            if adapter and not adapter_supports_push(adapter):
+                return ("raw_api_server", raw_sid)
+        return None
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -24686,7 +24719,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        route = await asyncio.to_thread(self._resolve_watch_route, evt)
+        source = route if not isinstance(route, tuple) else None
         if not source:
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
@@ -24695,11 +24729,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Recover the raw session id and wake the real session via the API
             # server's own /v1/chat/completions entry point instead of
             # dropping the event.
-            raw_sid = str(evt.get("origin_session_id") or "").strip()
-            if not raw_sid:
-                _sk = str(evt.get("session_key") or "").strip()
-                if _sk and _parse_session_key(_sk) is None:
-                    raw_sid = _sk
+            raw_sid = route[1] if isinstance(route, tuple) else ""
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
                 from gateway.wake import adapter_supports_push, deliver_wake
@@ -24719,11 +24749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             raw_sid, e,
                         )
                         return False
-                logger.warning(
-                    "Dropping watch notification for raw session %s: no "
-                    "api_server adapter to self-post through",
-                    raw_sid,
-                )
+                logger.warning("Dropping watch notification for raw session %s", raw_sid)
                 return None
             logger.warning(
                 "Dropping watch notification with no routing metadata for process %s",
@@ -24841,7 +24867,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return (evt_type, producer_id, started_at)
         return None
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_async_completion(self, evt: dict) -> str:
         """Classify an async-completion delivery target before adapter acceptance.
 
         Returns one of:
@@ -24860,6 +24886,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           continuation exists). The claim should be released so a later
           consumer can retry; the attempt cap bounds the churn.
         """
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        if not parent_session_id:
+            # The watcher waits for adapters to finish connecting before this
+            # classification runs.  If no concrete route is visible, leave
+            # the row pending for the gateway process that owns the target.
+            return "deliver" if self._resolve_watch_route(evt) is not None else "unroutable"
+
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return "retry"
@@ -24924,6 +24957,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
+            verdict = await self._classify_async_completion(evt)
+            if verdict == "unroutable":
+                logger.debug(
+                    "Async completion %s is unroutable in this gateway process; "
+                    "leaving its durable delivery row pending",
+                    durable_delegation_id or "<legacy>",
+                )
+                return None
             if durable_delegation_id:
                 try:
                     from tools.async_delegation import claim_completion_delivery
@@ -24947,7 +24988,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # would falsely acknowledge the durable row as delivered.
                 # Verify the target here, before acceptance, and give drops an
                 # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
                 if verdict == "terminal":
                     logger.warning(
                         "Async delegation %s targets permanently-gone session %s; "
