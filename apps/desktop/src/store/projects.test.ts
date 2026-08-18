@@ -145,6 +145,22 @@ describe('project scope', () => {
     expect($sidebarAgentsGrouped.get()).toBe(true)
     expect($sessionResumeRequest.get()?.sessionId).toBe('project-agent-session')
   })
+
+  it('does not disable existing Projects when only the agent endpoint is missing', async () => {
+    activeGateway.mockReturnValue({
+      connectionState: 'open',
+      request: vi.fn().mockRejectedValue(new Error('unknown method: projects.agent.open'))
+    } as never)
+    $projectsRpcAvailable.set(true)
+
+    await openProjectAgent('p_123')
+
+    expect($projectsRpcAvailable.get()).toBe(true)
+    expect(notify).toHaveBeenCalledWith({
+      kind: 'warning',
+      message: 'sidebar.projects.agentOpenFailed'
+    })
+  })
 })
 
 describe('resolveNewSessionCwd', () => {

@@ -225,10 +225,12 @@ export async function openProjectAgent(id: string): Promise<void> {
 
     requestSessionResume(result.stored_session_id)
   } catch (err) {
-    markProjectsRpcFailure(err)
     notify({
       kind: 'warning',
-      message: err instanceof Error ? err.message : translateNow('sidebar.projects.agentOpenFailed')
+      message:
+        isMissingRpcMethod(err) || !(err instanceof Error)
+          ? translateNow('sidebar.projects.agentOpenFailed')
+          : err.message
     })
   }
 }
