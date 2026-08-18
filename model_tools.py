@@ -810,6 +810,14 @@ def handle_function_call(
         except Exception:
             pass
 
+        # Re-run the dispatch-level credential tripwire. transform_tool_result
+        # runs AFTER registry.dispatch and a plugin may replace the result
+        # wholesale (e.g. reconstituting it from a cache), which would carry a
+        # credential straight past layer 2. Same fail-closed contract as
+        # tools/registry.py: if the scan fails, the result is withheld.
+        from tools.registry import _scrub_dispatch_result
+        result = _scrub_dispatch_result(function_name, result)
+
         return result
 
     except Exception as e:
