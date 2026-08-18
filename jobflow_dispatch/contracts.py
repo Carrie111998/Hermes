@@ -30,6 +30,19 @@ ROUTES: dict[tuple[str, str], tuple[str, ...]] = {
     ("TAILOR_MODULE_REQUEST", "tailor"): ("jobflow.tailor.generate",),
     ("TAILOR_REVISION", "tailor"): ("jobflow.tailor.generate",),
     ("RESEARCH_REQUEST", "researcher"): ("cron.jobflow.researcher",),
+    # The applier drains SUBMIT_REQUEST / SUBMIT_CONFIRM / QUESTION_ANSWER
+    # (cron/README.md), but only SUBMIT_REQUEST has ever arrived: every message
+    # in applier/inbox since July is one, while the other two have no producer
+    # anywhere in the tree. Routing only the latter two left the lane
+    # unreachable on BOTH paths — the reconciler derives its scanned types from
+    # this table too — so the 2026-08-17 shadow gate recorded zero applier
+    # dispatches and it read as an idle lane rather than a dead route.
+    #
+    # Waking on SUBMIT_REQUEST cannot submit anything: the payload is a
+    # dry-run request (`idempotency_key: applier-dry-run:...`) and the applier
+    # independently re-gates real submission behind `approved_for_submission`
+    # plus a completed dry-run. The wake only moves its 3-hourly sweep earlier.
+    ("SUBMIT_REQUEST", "applier"): ("cron.jobflow.applier",),
     ("SUBMIT_CONFIRM", "applier"): ("cron.jobflow.applier",),
     ("QUESTION_ANSWER", "applier"): ("cron.jobflow.applier",),
 }
