@@ -137,14 +137,9 @@ def _peer_paragraph(root: Path) -> str:
     listed = ", ".join(f"`{p}`" for p in peers)
     return (
         "\n\nTeammates on OTHER machines: this install also has peer gateways "
-        f"registered ({listed}). Message an agent on a peer the same way, via "
-        "`hermes peer dm` (same terminal-tool pattern: background=true, "
-        "notify_on_complete=true; the reply prints on stdout when it completes):\n"
-        "```\n"
-        'hermes peer dm <peer>/<agent-name> "Message from 🤖 <you> (@<you>): your message"\n'
-        "```\n"
-        "Use `<peer>` alone for the peer's main agent. Run `hermes peer list` "
-        "for the live peer list."
+        f"registered ({listed}). Reach them with the same tool, addressing "
+        "`<peer>/<agent>` (or `<peer>` alone for that peer's main agent). "
+        "Run `hermes peer list` for the live peer list."
     )
 
 
@@ -168,18 +163,22 @@ def _build_section(home: Path) -> str:
     return (
         f"{_PROTOCOL_HEADING}\n"
         "This install runs Bot Mode: each Hermes profile is an agent teammate with "
-        'one canonical "Bot Chat" conversation. To message a teammate, run on the '
-        "terminal tool (background=true, notify_on_complete=true), then finish your "
-        "turn — the reply arrives later as a new message:\n"
+        'one canonical "Bot Chat" conversation. Message a teammate with the '
+        "`agent_message` tool:\n"
         "```\n"
-        f'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from 🤖 {handle} (@{handle}): your message"\n'
+        'agent_message(to="<agent-name>", message="your message")\n'
         "```\n"
-        f'Always open with the "Message from 🤖 {handle} (@{handle}):" prefix so they '
-        "know who is talking. When YOU receive a message with that prefix, you are "
-        "being messaged by a teammate agent — address them (not the user) and reply "
-        "concisely. When the user says \"ask <name>\" or \"tell <name> ...\", that is a "
-        "handoff: message that agent, wait for the reply, and report back, saying "
-        "which agent it came from. Run `hermes profile list` for the LIVE teammate "
+        "Send the message verbatim — the tool signs it "
+        f'"Message from 🤖 {handle} (@{handle}):" for you, so do not write a '
+        "prefix yourself. Do NOT assemble a `hermes ... chat` command on the "
+        "terminal tool instead: the message would be parsed by the shell "
+        "first, which truncates it at a quote and executes any `$(...)` or "
+        "backticks it contains.\n"
+        "When YOU receive a message opening with that prefix, you are being "
+        "messaged by a teammate agent — address them (not the user) and reply "
+        "concisely. When the user says \"ask <name>\" or \"tell <name> ...\", that "
+        "is a handoff: message that agent, then report back saying which agent "
+        "the answer came from. Run `hermes profile list` for the LIVE teammate "
         f"list before a handoff. Teammates at session start: {teammates}."
         + _peer_paragraph(root)
     )
@@ -345,3 +344,54 @@ def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.Path
 def _reset_cache_for_tests() -> None:
     with _lock:
         _cached.clear()
+
+
+def _default_home() -> Path:
+    """The agent's home when a caller has no session-derived one to pass."""
+    return Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+
+
+# ── Public helpers (shared with tools/agent_message_tool.py) ────────────────
+#
+# The protocol section and the tool that implements it must agree on who the
+# teammates are and how a sender identifies itself; deriving that twice is how
+# the two drift apart.
+
+
+def is_bot_mode_install(home: str | os.PathLike | None = None) -> bool:
+    """True when any profile on this install is Bot-Mode-managed.
+
+    This is the ``check_fn`` gate for ``agent_message``: the tool only reaches
+    a model's schema on an install the desktop's Bot Mode manages.
+    """
+    try:
+        root = _hermes_root(Path(home) if home else _default_home())
+        return any(_is_bot_managed(d) for _n, d in _roster(root))
+    except Exception:
+        return False
+
+
+def sender_handle(home: str | os.PathLike | None = None) -> str:
+    """The ``@handle`` this install signs teammate messages with."""
+    try:
+        return _handle(_profile_name(Path(home) if home else _default_home()))
+    except Exception:
+        return "hermes"
+
+
+def teammate_names(home: str | os.PathLike | None = None) -> list[str]:
+    """Local profile names other than the caller's own."""
+    try:
+        h = Path(home) if home else _default_home()
+        me = _profile_name(h)
+        return [n for n, _d in _roster(_hermes_root(h)) if n != me]
+    except Exception:
+        return []
+
+
+def peer_names(home: str | os.PathLike | None = None) -> list[str]:
+    """Registered peer gateway names (``hermes peer list``)."""
+    try:
+        return _peers(_hermes_root(Path(home) if home else _default_home()))
+    except Exception:
+        return []

@@ -87,6 +87,10 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # Agent-to-agent messaging — only in schema on a Bot-Mode-managed
+    # install (a profile carrying ui_meta['hermes-bots']). Gated via
+    # check_fn in tools/agent_message_tool.py.
+    "agent_message",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -308,6 +312,19 @@ TOOLSETS = {
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+    "messaging": {
+        "description": (
+            "Agent-to-agent messaging — only active on a Bot-Mode-managed "
+            "install, where each profile is a teammate agent with a canonical "
+            "Bot Chat conversation. Delivers to a teammate here or on a "
+            "registered peer gateway, with the sender's attribution prefix "
+            "applied and the message passed as an argument rather than "
+            "interpolated into a shell command."
+        ),
+        "tools": ["agent_message"],
         "includes": []
     },
 
