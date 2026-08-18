@@ -252,3 +252,19 @@ class ProviderProfile:
         except Exception as exc:
             logger.debug("fetch_models(%s): %s", self.name, exc)
             return None
+
+    def fetch_account_usage(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 15.0,
+    ) -> Any | None:
+        """Return an ``AccountUsageSnapshot`` for this provider, when supported.
+
+        Account billing is optional provider surface. The default deliberately
+        performs no I/O; provider profiles with a documented account endpoint
+        may override this hook while the shared ``/usage`` command remains
+        provider-agnostic.
+        """
+        return None

@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 from agent.account_usage import (
     AccountUsageSnapshot,
     AccountUsageWindow,
+    evaluate_account_usage_notices,
     fetch_account_usage,
+    new_account_usage_notice_latch,
     render_account_usage_lines,
 )
 
@@ -201,3 +203,49 @@ def test_fetch_account_usage_openrouter_omits_quota_window_when_key_has_no_limit
     assert snapshot.windows == ()
     assert "Credits balance: $74.50" in snapshot.details
     assert "API key usage: $25.50 total • $1.25 today • $4.50 this week • $18.00 this month" in snapshot.details
+
+
+def test_account_usage_notices_emit_on_band_changes_and_clear_on_recovery():
+    latch = new_account_usage_notice_latch()
+
+    def snapshot(used):
+        return AccountUsageSnapshot(
+            provider="commandcode",
+            source="test",
+            fetched_at=datetime.now(timezone.utc),
+            windows=(AccountUsageWindow(label="5-hour limit", used_percent=used),),
+        )
+
+    show, clear = evaluate_account_usage_notices(snapshot(74), latch)
+    assert show == [] and clear == []
+    show, clear = evaluate_account_usage_notices(snapshot(75), latch)
+    assert [notice.key for notice in show] == ["account_usage.commandcode.5-hour-limit"]
+    assert show[0].level == "warn" and clear == []
+    show, clear = evaluate_account_usage_notices(snapshot(80), latch)
+    assert show == [] and clear == []
+    show, clear = evaluate_account_usage_notices(snapshot(91), latch)
+    assert [notice.key for notice in show] == ["account_usage.commandcode.5-hour-limit"]
+    assert clear == ["account_usage.commandcode.5-hour-limit"]
+    show, clear = evaluate_account_usage_notices(snapshot(20), latch)
+    assert show == []
+    assert clear == ["account_usage.commandcode.5-hour-limit"]
+
+
+def test_render_account_usage_lines_keeps_reset_and_credit_detail():
+    reset = datetime.fromtimestamp(1_900_000_000, tz=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="commandcode",
+        source="test",
+        fetched_at=datetime.now(timezone.utc),
+        windows=(
+            AccountUsageWindow(
+                label="Monthly credits",
+                used_percent=25,
+                reset_at=reset,
+                detail="$22.50 of $30.00 remaining",
+            ),
+        ),
+    )
+    line = render_account_usage_lines(snapshot)[2]
+    assert "resets" in line
+    assert "$22.50 of $30.00 remaining" in line

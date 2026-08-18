@@ -3877,6 +3877,14 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "COMMANDCODE_SESSION_COOKIE": {
+        "description": "CommandCode web session cookie for /usage account limits",
+        "prompt": "CommandCode session cookie (Cookie header or session token)",
+        "url": "https://commandcode.ai/",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
     "OPENCODE_ZEN_BASE_URL": {
         "description": "OpenCode Zen base URL override",
         "prompt": "OpenCode Zen base URL (leave empty for default)",
