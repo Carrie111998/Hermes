@@ -284,25 +284,44 @@ def test_update_skips_and_warns_on_dirty_parked_branch(
     assert stashes == ""
 
 
-def test_update_skips_on_unmerged_parked_branch(repo_pair, monkeypatch, capsys):
+def test_update_updates_unmerged_branch_in_place(repo_pair, monkeypatch, capsys):
+    """A branch carrying unmerged commits is a branch the user is WORKING on,
+    not a stale leftover: update it in place from origin/<target> instead of
+    skipping. The running code must advance (origin/main's files arrive) AND
+    the local commits must survive, with the checkout never moving."""
     (repo_pair / "feature.txt").write_text("unmerged work\n")
     _git(repo_pair, "add", "feature.txt")
     _git(repo_pair, "commit", "-qm", "feature work")
     _patch_update_flow(monkeypatch, repo_pair)
+
+    # Stop right after the pull/branch logic, before dependency install.
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(_StopFlow):
         hermes_main.cmd_update(args)
 
-    assert exc_info.value.code == 1
     out = capsys.readouterr().out
-    assert "CODE UPDATE SKIPPED" in out
-    assert "1 commit(s) not merged" in out
-    assert "✓ Code updated!" not in out
+    assert "updating it in place" in out
+    assert "CODE UPDATE SKIPPED" not in out
+    # The checkout never moved.
     assert (
         _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         == "old-feature"
     )
+    # origin/main's code actually arrived (b.txt lands with c3)...
+    assert (repo_pair / "b.txt").exists()
+    assert (repo_pair / "a.txt").read_text() == "two\n"
+    # ...and the branch's own commit survived it.
+    assert (repo_pair / "feature.txt").read_text() == "unmerged work\n"
+    assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
 
 
 def test_update_auto_switches_clean_merged_parked_branch(
