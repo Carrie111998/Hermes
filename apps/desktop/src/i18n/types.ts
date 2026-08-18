@@ -91,6 +91,39 @@ export interface Translations {
     off: string
   }
 
+  trajectory: {
+    assistant: string
+    calls: string
+    chatTab: string
+    close: string
+    details: string
+    duration: string
+    emptyEvent: string
+    error: string
+    executionOverview: string
+    input: string
+    label: string
+    modelLane: string
+    noMatches: string
+    payload: string
+    reasoning: string
+    result: string
+    running: string
+    search: string
+    searchPlaceholder: string
+    step: string
+    timeline: string
+    timing: string
+    tool: string
+    toolCount: string
+    toolsLane: string
+    turn: string
+    turns: string
+    unknown: string
+    user: string
+    waiting: string
+  }
+
   fileMenu: {
     revealFinder: string
     revealExplorer: string

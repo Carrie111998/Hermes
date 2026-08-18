@@ -1744,6 +1744,19 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Optional reconstructable event trace. This recorder is independent from
+    # the ShareGPT training trajectory and fail-open by design.
+    try:
+        from agent.session_events import start_agent_turn_trace
+
+        start_agent_turn_trace(
+            agent,
+            turn_id=turn_id,
+            user_message=_summarize_user_message_for_log(original_user_message),
+        )
+    except Exception:
+        logger.debug("trajectory turn/start emission failed", exc_info=True)
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -1862,6 +1875,13 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
             break
+
+        try:
+            from agent.session_events import start_agent_step_trace
+
+            start_agent_step_trace(agent, step=api_call_count)
+        except Exception:
+            logger.debug("trajectory step/start emission failed", exc_info=True)
 
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
@@ -2756,6 +2776,30 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                try:
+                    from agent.session_events import emit_agent_event
+
+                    emit_agent_event(
+                        agent,
+                        "request/header",
+                        {
+                            "api_request_id": api_request_id,
+                            "provider": agent.provider,
+                            "model": agent.model,
+                            "api_mode": agent.api_mode,
+                            "api_call_count": api_call_count,
+                            "retry_count": retry_count,
+                            "message_count": len(api_messages),
+                            "tool_count": len(agent.tools or []),
+                            "approx_input_tokens": approx_tokens,
+                            "request_char_count": total_chars,
+                            "max_tokens": agent.max_tokens,
+                            "middleware_trace": list(_llm_middleware_trace),
+                        },
+                    )
+                except Exception:
+                    logger.debug("trajectory request/header emission failed", exc_info=True)
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -6446,6 +6490,22 @@ def run_conversation(
             except Exception:
                 pass
 
+            try:
+                from agent.session_events import emit_agent_event
+
+                emit_agent_event(
+                    agent,
+                    "assistant/message",
+                    {
+                        "content": (assistant_message.content or "")[:4000],
+                        "finish_reason": finish_reason,
+                        "tool_call_count": len(assistant_message.tool_calls or []),
+                        "usage": agent._usage_summary_for_api_request_hook(response),
+                    },
+                )
+            except Exception:
+                logger.debug("trajectory assistant/message emission failed", exc_info=True)
+
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:
@@ -7068,6 +7128,20 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                try:
+                    from agent.session_events import emit_agent_event
+
+                    emit_agent_event(
+                        agent,
+                        "step/end",
+                        {
+                            "status": "tools_completed",
+                            "tool_call_count": len(assistant_message.tool_calls),
+                        },
+                    )
+                except Exception:
+                    logger.debug("trajectory step/end emission failed", exc_info=True)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7945,6 +8019,16 @@ def run_conversation(
                     )
 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+                try:
+                    from agent.session_events import emit_agent_event
+
+                    emit_agent_event(
+                        agent,
+                        "step/end",
+                        {"status": "text_response", "finish_reason": finish_reason},
+                    )
+                except Exception:
+                    logger.debug("trajectory step/end emission failed", exc_info=True)
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break

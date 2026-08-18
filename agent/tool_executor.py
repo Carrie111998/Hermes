@@ -913,6 +913,24 @@ def _begin_tool_execution(
     except Exception:
         pass
 
+    try:
+        from agent.session_events import emit_agent_event
+
+        emit_agent_event(
+            agent,
+            "tool/call",
+            {
+                "call_id": tool_call_id,
+                "name": function_name,
+                "arguments": _redact_tool_args_for_display(
+                    function_name, function_args
+                )
+                or function_args,
+            },
+        )
+    except Exception:
+        logging.debug("trajectory tool/call emission failed", exc_info=True)
+
     if agent.tool_progress_callback:
         try:
             display_args = (
@@ -1729,6 +1747,24 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug("Tool progress callback error: %s", cb_err)
 
+        try:
+            from agent.session_events import emit_agent_event
+
+            emit_agent_event(
+                agent,
+                "tool/result",
+                {
+                    "call_id": tc.id,
+                    "name": name,
+                    "duration_ms": int(tool_duration * 1000),
+                    "is_error": is_error,
+                    "blocked": blocked,
+                    "result": str(display_function_result)[:4000],
+                },
+            )
+        except Exception:
+            logging.debug("trajectory tool/result emission failed", exc_info=True)
+
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
             cute_msg = _get_cute_tool_message_impl(
@@ -2533,6 +2569,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool progress callback error: %s", cb_err)
+
+        try:
+            from agent.session_events import emit_agent_event
+
+            emit_agent_event(
+                agent,
+                "tool/result",
+                {
+                    "call_id": tool_call.id,
+                    "name": function_name,
+                    "duration_ms": int(tool_duration * 1000),
+                    "is_error": _is_error_result,
+                    "blocked": _execution_blocked,
+                    "result": str(display_function_result)[:4000],
+                },
+            )
+        except Exception:
+            logging.debug("trajectory tool/result emission failed", exc_info=True)
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:

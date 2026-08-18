@@ -65,6 +65,7 @@ import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
+import { LiveTrajectoryPanel } from './trajectory/live-trajectory-panel'
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
@@ -351,6 +352,7 @@ export const ChatView = memo(function ChatView({
   const selectedSessionId = useStore(view.$storedId)
   const sessions = useStore($sessions)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
+  const [contentMode, setContentMode] = useState<'chat' | 'trajectory'>('chat')
 
   // Durable composer/queue scope (lineage root) so auto-compression tip rotation
   // does not wipe an in-progress draft or orphan /queue entries. For the
@@ -534,6 +536,39 @@ export const ChatView = memo(function ChatView({
         />
       )}
 
+      {(activeSessionId || selectedSessionId) && (
+        <div
+          aria-label={t.trajectory.label}
+          className="relative z-10 flex shrink-0 items-center gap-1 border-b border-(--ui-border) bg-(--ui-chat-surface-background) px-3 py-1.5"
+          role="tablist"
+        >
+          <button
+            aria-selected={contentMode === 'chat'}
+            className={cn(
+              'rounded-md px-2.5 py-1 text-xs text-(--ui-text-muted) transition-colors hover:text-(--ui-text)',
+              contentMode === 'chat' && 'bg-(--ui-selected) text-(--ui-text)'
+            )}
+            onClick={() => setContentMode('chat')}
+            role="tab"
+            type="button"
+          >
+            {t.trajectory.chatTab}
+          </button>
+          <button
+            aria-selected={contentMode === 'trajectory'}
+            className={cn(
+              'rounded-md px-2.5 py-1 text-xs text-(--ui-text-muted) transition-colors hover:text-(--ui-text)',
+              contentMode === 'trajectory' && 'bg-(--ui-selected) text-(--ui-text)'
+            )}
+            onClick={() => setContentMode('trajectory')}
+            role="tab"
+            type="button"
+          >
+            {t.trajectory.label}
+          </button>
+        </div>
+      )}
+
       {/* Mounted for the primary AND every tile, each scoped to its own session
           so a tiled/background session's blocking prompt surfaces instead of
           stalling to timeout. */}
@@ -552,19 +587,23 @@ export const ChatView = memo(function ChatView({
           data-slot="composer-bounds"
           {...dropHandlers}
         >
-          <Thread
-            clampToComposer={showChatBar}
-            cwd={currentCwd}
-            gateway={gateway}
-            intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
-            loading={threadLoading}
-            onBranchInNewChat={onBranchInNewChat}
-            onCancel={haltRun}
-            onDismissError={onDismissError}
-            onRestoreToMessage={onRestoreToMessage}
-            sessionId={activeSessionId}
-            sessionKey={threadKey}
-          />
+          {contentMode === 'trajectory' ? (
+            <LiveTrajectoryPanel model={currentModel} provider={currentProvider} />
+          ) : (
+            <Thread
+              clampToComposer={showChatBar}
+              cwd={currentCwd}
+              gateway={gateway}
+              intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
+              loading={threadLoading}
+              onBranchInNewChat={onBranchInNewChat}
+              onCancel={haltRun}
+              onDismissError={onDismissError}
+              onRestoreToMessage={onRestoreToMessage}
+              sessionId={activeSessionId}
+              sessionKey={threadKey}
+            />
+          )}
           {resumeExhausted && routedSessionId && (
             <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">
               <ErrorState

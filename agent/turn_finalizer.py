@@ -800,6 +800,25 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    try:
+        from agent.session_events import emit_agent_event
+
+        emit_agent_event(
+            agent,
+            "turn/end",
+            {
+                "turn_id": turn_id,
+                "completed": completed,
+                "failed": failed,
+                "interrupted": interrupted,
+                "exit_reason": _turn_exit_reason,
+                "api_calls": api_call_count,
+                "cleanup_errors": list(_cleanup_errors),
+            },
+        )
+    except Exception:
+        logger.debug("trajectory turn/end emission failed", exc_info=True)
+
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
 
