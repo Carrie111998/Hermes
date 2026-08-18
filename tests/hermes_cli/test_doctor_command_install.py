@@ -143,9 +143,13 @@ class TestDoctorCommandInstallation:
         out = _run_doctor(fix=False)
         assert "discord.py" in out
         # The warning line must carry the install hint with the pip package
-        # name, not a bare "(optional, not installed)".
-        assert "install with:" in out
-        assert "discord.py" in out.split("install with:", 1)[1].split("\n", 1)[0]
+        # name, not a bare "(optional, not installed)". Locate discord's own
+        # line: other optional packages may legitimately be missing in CI too,
+        # so their "install with:" hints can precede discord's in the output.
+        discord_hint = [
+            ln for ln in out.splitlines() if "install with:" in ln and "discord.py" in ln
+        ]
+        assert discord_hint, f"no discord install hint found in output:\n{out}"
 
     @pytest.mark.skipif(sys.platform == "win32", reason="Symlink check is Unix-only")
     def test_termux_uses_prefix_bin(self, monkeypatch, tmp_path):
