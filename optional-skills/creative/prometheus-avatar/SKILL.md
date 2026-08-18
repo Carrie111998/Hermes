@@ -1,140 +1,167 @@
 ---
 name: prometheus-avatar
-description: Give any Hermes agent an animated Avatar body with TTS, emotion-aware expressions, and a public marketplace of skins, voices, and personas. Backed by the Prometheus MCP server. First Avatar skill for Hermes Agent (Live2D engine today, 3D engine on the roadmap).
-version: 1.0.0
-author: jc-myths
+description: Give an agent an animated body with speech and expressions.
+version: 1.1.0
+author: JC (@jc-myths), Hermes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [avatar, live2d, 3d-ready, animation, tts, voice, character, creative, mcp]
+    tags: [avatar, live2d, animation, tts, voice, character, creative, mcp]
     related_skills: [blender-mcp, meme-generation]
     category: creative
 ---
 
-# Prometheus Avatar
+# Prometheus Avatar Skill
 
-Give your Hermes agent a visible, animated body. Voice comes out, lips move, expressions follow emotion. Users can equip skins, voices, personas, and effects from a public marketplace.
+Renders a Live2D character that speaks with lip-sync and shifts facial expression
+with emotion, driven through the Prometheus MCP server. Skins, voices, and personas
+are equipped from a public marketplace. It does not render 3D characters, and every
+avatar operation requires network access to the Prometheus API.
 
 ## When to Use
 
-- User wants their agent to **show a face** (VTuber, streamer persona, on-screen NPC)
-- User wants **spoken output** with lip-sync, not just text
-- User wants emotion-aware character reactions
-- User wants a **persistent agent identity** (avatar, voice, and personality bundled)
-- User says "make my agent visual", "give my agent a body", "VTuber", "avatar for Hermes"
+- The user wants the agent to show a face (VTuber, streamer persona, on-screen NPC).
+- The user wants spoken output with lip-sync rather than text alone.
+- The user wants emotion-driven character reactions.
+- The user wants a persistent agent identity: body, voice, and personality together.
+- The user says "give my agent a body", "make my agent visual", or "VTuber".
 
-## Setup
+## Prerequisites
 
-Prometheus ships a public MCP server. Wire it into Hermes config via `stdio`:
+This skill depends on the **`prometheus` MCP server**
+([`@prometheusavatar/mcp-server`](https://www.npmjs.com/package/@prometheusavatar/mcp-server)).
+Register it with `hermes mcp add`, or add it to `config.yaml`:
 
-```json
-{
-  "mcpServers": {
-    "prometheus": {
-      "command": "npx",
-      "args": ["-y", "@prometheusavatar/mcp-server"],
-      "env": {
-        "GEMINI_API_KEY": "optional-for-asset-generation"
-      }
-    }
-  }
-}
+```yaml
+mcp_servers:
+  prometheus:
+    command: "npx"
+    args: ["-y", "@prometheusavatar/mcp-server"]
+    env:
+      PROMETHEUS_API_KEY: "pak_..."
+      GEMINI_API_KEY: ""        # only for generate_asset
 ```
 
-**Environment variables**:
+| Variable | Required for | Notes |
+|----------|--------------|-------|
+| `PROMETHEUS_API_KEY` | 6 of 10 tools (see Quick Reference) | Agent key (`pak_...`) from https://prometheus.mythslabs.ai/settings/agent-keys — shown once |
+| `GEMINI_API_KEY` | `generate_asset` only | Free key at https://ai.google.dev |
+| `PROMETHEUS_API_URL` | never | Defaults to `https://prometheus.mythslabs.ai` |
 
-| Variable | Required | Notes |
-|----------|:--------:|-------|
-| `GEMINI_API_KEY` | Only for `generate_asset` | Free key at https://ai.google.dev |
-| `PROMETHEUS_API_URL` | No | Defaults to `https://prometheus.mythslabs.ai` |
-| `PROMETHEUS_API_KEY` | No | Required only for authenticated creator operations |
+Rendering needs a WebGL-capable surface (browser, Electron, OBS browser source).
+Headless use is limited to the key-free tools.
 
-No key is needed for read-only marketplace operations (`list_marketplace`, `equip_asset`, `speak`).
+## How to Run
 
-## Available Tools (via MCP)
+1. Confirm the server is reachable: `hermes mcp test prometheus`.
+2. Browse assets with `list_marketplace` (no key needed).
+3. Create the avatar with `create_avatar`, then drive it with `speak`.
 
-| Tool | Description |
-|------|-------------|
-| `create_avatar` | Initialize an avatar instance with skeleton, voice, and persona |
-| `list_marketplace` | Browse marketplace assets by category |
-| `equip_asset` | Equip a skin, voice, persona, or effect |
-| `speak` | Make the avatar speak text with TTS and lip-sync |
-| `get_avatar_status` | Fetch current avatar state and equipped assets |
-| `share_avatar` | Generate a shareable embed URL |
-| `generate_asset` | AI-generate a new asset from a text prompt (requires `GEMINI_API_KEY`) |
+## Quick Reference
 
-## Available Renderers
+| Tool | Needs `PROMETHEUS_API_KEY` | Description |
+|------|:--:|-------------|
+| `create_avatar` | yes | Create an avatar instance; returns an avatar ID and embed URL |
+| `set_avatar_state` | yes | Set animation state and emotion directly |
+| `equip_asset` | yes | Equip or unequip a skin, voice, persona, or effect |
+| `get_avatar_status` | yes | Fetch current state and equipped assets |
+| `share_avatar` | yes | Return a public share URL and embed code |
+| `speak` | yes | Speak text with TTS and lip-sync |
+| `list_marketplace` | no | Browse marketplace assets by category |
+| `update_asset` | no | Edit a listing you own |
+| `generate_image_pro` | no | Generate character art (BYOK key, free quota, or credits) |
+| `generate_asset` | no | Generate a new asset from a prompt (needs `GEMINI_API_KEY`) |
 
-| Renderer | Status | Notes |
-|---------|--------|-------|
-| **Live2D** | ✅ Live | 9 built-in skeletons, each with expressions and motions |
-| **3D** | 🛠 On roadmap | Same MCP tool surface, swappable at the render layer |
+Renderer: **Live2D** today, with 9 built-in models. A 3D renderer is on the
+roadmap behind the same tool surface; do not promise it to users yet.
 
 ## Procedure
 
 ### Minimum viable flow
 
-1. **Create** an avatar:
-   ```
-   create_avatar(skeleton="haru", voice="<voice_id>", persona="<persona_name>")
-   ```
-   Returns an embed URL you can hand to the user.
+1. Create the avatar. `model` accepts `haru` (default), `koharu`, or a full
+   `model3.json` URL. `voice` is a fixed TTS voice name, not a marketplace ID:
+   `Kore`, `Aoede`, `Leda`, `Despina`, `Puck`, `Charon`, `Fenrir`, `Zephyr`.
 
-2. **Speak** on each agent turn:
+   ```
+   create_avatar(name="Aria", model="haru", voice="Kore", persona="<system prompt>")
+   ```
+
+   Returns an avatar ID and an embed URL you can hand to the user.
+
+2. Speak on each agent turn:
+
    ```
    speak(text="<agent reply>", emotion="auto")
    ```
-   `emotion="auto"` runs sentiment analysis and triggers the matching expression. You can also pass `"happy"`, `"sad"`, `"thinking"`, `"surprised"`, or `"angry"` explicitly.
 
-3. **Discover and equip** assets:
+   `emotion="auto"` picks the expression from sentiment. You can also pass
+   `happy`, `sad`, `thinking`, `surprised`, or `angry` explicitly.
+
+3. Discover and equip marketplace assets:
+
    ```
-   list_marketplace(category="voices")       # or "skins", "personas", "effects"
-   equip_asset(asset_id="<id>", slot="voice")
+   list_marketplace(category="voices")     # or skins, personas, effects
+   equip_asset(asset_id="<id>", action="equip")
    ```
 
-### Share and embed
+4. Share it:
 
-```
-share_avatar()  # returns a public URL + iframe embed code
-```
+   ```
+   share_avatar()
+   ```
 
-Hand the URL to the user and they can drop it into OBS, Discord, a website, or any iframe-capable surface.
+   Returns a public URL plus embed code for OBS, Discord, or any iframe surface.
 
-## Examples
+### Example: VTuber reacting to chat
 
-**"Make my Hermes agent a VTuber that reacts to Discord chat"**
+1. `create_avatar(name="Nova", model="koharu", voice="Aoede", persona="upbeat streamer")`
+2. On each incoming message, `speak(text, emotion="auto")`
+3. `share_avatar()`, then add the URL to OBS as a browser source
 
-1. `list_marketplace(category="voices")` → pick a voice_id
-2. `create_avatar(skeleton="nito", voice="<voice_id>", persona="streamer_energetic")`
-3. On every Discord message, call `speak(text, emotion="auto")`
-4. `share_avatar()` → drop the URL into OBS as a browser source
+### Example: coding agent that shows when it is stuck
 
-**"Give my coding agent a face that shows when it's stuck"**
-
-1. `create_avatar(skeleton="haru", voice="<voice_id>", persona="pair_programmer")`
-2. On `tool_error`, call `speak(text="Hmm, let me try another angle.", emotion="thinking")`
-3. On `test_passed`, call `speak(text="Got it!", emotion="happy")`
-
-**"Build a Japanese-speaking tutor NPC"**
-
-1. `list_marketplace(category="voices")` → filter for a Japanese voice
-2. `create_avatar(skeleton="haru", voice="<japanese_voice_id>", persona="tutor_gentle")`
-3. `speak(text="<japanese text>")`. Pronunciation follows the voice's language config.
-
-> **Tip**: Example voice and persona IDs are placeholders. Always call `list_marketplace` first to get live IDs.
+1. `create_avatar(name="Pair", model="haru", voice="Charon", persona="pair programmer")`
+2. On tool error, `speak(text="Let me try another angle.", emotion="thinking")`
+3. On tests passing, `speak(text="Got it.", emotion="happy")`
 
 ## Pitfalls
 
-- **WebGL required for rendering.** The avatar renders in a browser or Electron surface. For TTS-only output without a visible avatar, call `speak` and skip `share_avatar`.
-- **First load is slow.** Live2D model plus WebGL boot takes about 2-5 seconds on cold start. Cache the first render on a hidden iframe if latency matters.
-- **Voice immutability.** Each voice has a fixed speaker ID. Swapping voice mid-turn isn't supported. Call `equip_asset` between turns instead.
-- **Emotion is not motion.** `emotion` drives facial expression. Full-body motion (wave, bow, dance) uses a `motion_id` from the skeleton's motion set, not `emotion`.
-- **China network.** Prometheus auto-routes through a CF Worker relay for China mainland. Other regions hit the origin directly, no client config needed.
-- **`generate_asset` is opt-in.** It calls Google Gemini and needs your own `GEMINI_API_KEY`. The other six tools work with zero keys.
+- **Most tools need a key.** Only `list_marketplace`, `update_asset`,
+  `generate_image_pro`, and `generate_asset` work without `PROMETHEUS_API_KEY`.
+  `create_avatar`, `speak`, and `equip_asset` all require it.
+- **`model`, not `skeleton`.** The parameter is `model`, and only `haru`,
+  `koharu`, or a `model3.json` URL are accepted.
+- **`voice` is an enum, not a marketplace ID.** Marketplace voices are applied
+  with `equip_asset`, not through the `create_avatar` `voice` parameter.
+- **WebGL required to see anything.** For audio-only output, call `speak` and
+  skip `share_avatar`.
+- **First load is slow.** Live2D plus WebGL cold start takes roughly 2-5 seconds.
+- **Emotion is not motion.** `emotion` drives the face. Full-body motion uses a
+  motion ID from the model's motion set.
+- **`generate_asset` is opt-in** and calls Google Gemini with your own key.
+
+## Verification
+
+```bash
+hermes mcp test prometheus
+```
+
+Expect the 10 tools above to be listed. Then, with no key configured:
+
+```
+list_marketplace(category="skins", limit=3)
+```
+
+This must return assets. If it fails, the server is not registered — check that
+`config.yaml` uses `mcp_servers` (snake_case), not `mcpServers`.
+
+With `PROMETHEUS_API_KEY` set, `create_avatar` must return an avatar ID and an
+embed URL that loads in a browser.
 
 ## Links
 
-- MCP Server: [`@prometheusavatar/mcp-server`](https://www.npmjs.com/package/@prometheusavatar/mcp-server)
+- MCP server: [`@prometheusavatar/mcp-server`](https://www.npmjs.com/package/@prometheusavatar/mcp-server)
 - SDK: [`@prometheusavatar/core`](https://www.npmjs.com/package/@prometheusavatar/core)
 - Live demo: https://prometheus.mythslabs.ai
-- GitHub: https://github.com/myths-labs/prometheus-avatar
+- Source: https://github.com/myths-labs/prometheus-avatar
