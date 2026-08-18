@@ -190,7 +190,15 @@ class TestRunJobScript:
         m = re.search(r"site\.addsitedir\('([^']*)'\)", captured["argv"][2])
         assert m is not None
         assert Path(m.group(1)) == site_packages
-        assert captured["argv"][3] == str(script.resolve())
+        # F3 execution binding: the subprocess runs a validated COPY of the
+        # scanned bytes (same scripts dir, same suffix, .hermes-exec- prefix),
+        # not the original path — the executed bytes are exactly the bytes
+        # that passed the fire-time scan.
+        exec_path = Path(captured["argv"][3])
+        assert exec_path.parent == script.resolve().parent
+        assert exec_path.name.startswith(".hermes-exec-")
+        assert exec_path.suffix == script.suffix
+        assert exec_path != script.resolve()
         # The script runner always adds CREATE_NEW_PROCESS_GROUP on win32 so a
         # cancel can taskkill the whole tree; on POSIX the getattr default is
         # 0 and the flag set is exactly windows_hide_flags().
@@ -313,7 +321,14 @@ class TestRunJobScript:
 
         assert success is True
         assert output == "ok"
-        assert captured["argv"] == [sys.executable, str(script.resolve())]
+        # F3 execution binding: argv[1] is the validated copy, not the
+        # original script path (same dir, same suffix, .hermes-exec- prefix).
+        exec_path = Path(captured["argv"][1])
+        assert captured["argv"][0] == sys.executable
+        assert exec_path.parent == script.resolve().parent
+        assert exec_path.name.startswith(".hermes-exec-")
+        assert exec_path.suffix == script.suffix
+        assert exec_path != script.resolve()
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
         assert "encoding" not in captured["kwargs"]
@@ -353,7 +368,14 @@ class TestRunJobScript:
 
         assert success is True
         assert output == "ok"
-        assert captured["argv"] == [sys.executable, str(script.resolve())]
+        # F3 execution binding: argv[1] is the validated copy, not the
+        # original script path (same dir, same suffix, .hermes-exec- prefix).
+        exec_path = Path(captured["argv"][1])
+        assert captured["argv"][0] == sys.executable
+        assert exec_path.parent == script.resolve().parent
+        assert exec_path.name.startswith(".hermes-exec-")
+        assert exec_path.suffix == script.suffix
+        assert exec_path != script.resolve()
 
     def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
         """Emoji in script stdout must reach the caller intact (#42384).
