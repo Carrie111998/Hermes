@@ -426,6 +426,39 @@ class TelegramNotifier(BaseSubscriber):
                         "— delivering without buttons", event.event_id,
                     )
                     buttons = None
+                if buttons:
+                    # Record what the opaque callback token actually points
+                    # at (Task 7 seam). buttons_for() is deliberately
+                    # pure/stateless — see its docstring — so it never
+                    # writes this itself; this is the one place downstream
+                    # of it that has both the token (embedded identically
+                    # in every button on this row) and the event payload
+                    # (provider/model/fallback_provider/fallback_model)
+                    # needed to populate events.override_callback_state.
+                    # plugins/platforms/telegram/adapter.py's callback
+                    # handler resolves a tap through THIS map, never by
+                    # trusting anything Telegram echoes back in
+                    # callback_data — a tap must never be able to name an
+                    # arbitrary model. Wrapped so a failure here degrades
+                    # to "buttons render but no-op on tap" rather than
+                    # dropping the alert.
+                    try:
+                        from events import override_callback_state
+                        token = buttons[0][0]["callback_data"].split(":", 2)[2]
+                        payload = getattr(event, "payload", None) or {}
+                        override_callback_state.record(
+                            token,
+                            provider=payload.get("provider", ""),
+                            model=payload.get("model", ""),
+                            replacement_provider=payload.get("fallback_provider", ""),
+                            replacement_model=payload.get("fallback_model", ""),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "TelegramNotifier: failed to record override "
+                            "callback state for event %s — buttons will "
+                            "no-op on tap", event.event_id,
+                        )
             # Pass event + topic_key so _deliver can emit the
             # NOTIFICATION_DELIVERED / NOTIFICATION_FAILED reverse
             # signal carrying original_event_id + target metadata.

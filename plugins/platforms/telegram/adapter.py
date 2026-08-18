@@ -6119,6 +6119,90 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
             return
 
+        # --- Model-rate-limit reroute callbacks (rl:action:token) ---
+        # action is one of divert / choose / dismiss (events/override_buttons.py).
+        # ``token`` is an OPAQUE handle, never the model name — it is resolved
+        # to a (provider, model, replacement_provider, replacement_model)
+        # record via events.override_callback_state, which was populated by
+        # events/subscribers/telegram_notifier.py when the buttons were sent.
+        # A tap must NEVER be able to name an arbitrary model through
+        # callback_data; this lookup is what enforces that.
+        if data.startswith("rl:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                action = parts[1]  # divert, choose, dismiss
+                token = parts[2]
+
+                # Only authorized users may act on a reroute prompt.
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                    return
+
+                # Pop BEFORE acting — this is what makes a double-tap
+                # idempotent (the second tap finds nothing and answers
+                # "already resolved"), mirroring the sc: branch above.
+                # Also covers an unknown/expired token: never-recorded and
+                # already-consumed both come back None here on purpose.
+                from events import override_callback_state
+                target = override_callback_state.pop(token)
+                if not target:
+                    await query.answer(text="This prompt has already been resolved.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "User")
+
+                if action == "dismiss":
+                    label = "❌ Dismissed"
+                elif action == "choose":
+                    # Model-picker integration is out of scope for this
+                    # task; explicitly acknowledge rather than silently
+                    # doing nothing. No override is written.
+                    label = "🔧 Model picker isn't wired up yet — coming soon."
+                elif action == "divert":
+                    from events.model_override import set_override
+                    ok, reason = set_override(
+                        provider=target["provider"],
+                        model=target["model"],
+                        replacement_provider=target["replacement_provider"],
+                        replacement_model=target["replacement_model"],
+                        ttl_seconds=6 * 3600,
+                        set_by=f"telegram:{caller_id}",
+                    )
+                    if ok:
+                        label = (
+                            f"✅ Diverted 6h → {target['replacement_provider']}/"
+                            f"{target['replacement_model']}"
+                        )
+                    else:
+                        # A rejected write (self-target, divert-into-a-wall,
+                        # internal error) must surface its reason — a
+                        # button that silently does nothing is the failure
+                        # mode this whole design exists to prevent.
+                        label = f"⚠️ Not diverted: {reason}"
+                else:
+                    label = "Resolved"
+
+                await query.answer(text=label)
+
+                # Retire the buttons so a stale message can't be tapped
+                # twice (the token is already consumed either way).
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(f"{label} by {user_display}"),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            return
+
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---
         if data.startswith("cl:"):
             parts = data.split(":", 2)
