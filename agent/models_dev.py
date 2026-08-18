@@ -183,6 +183,7 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "minimax-cn": "minimax-cn",
     "deepseek": "deepseek",
     "alibaba": "alibaba",
+    "alibaba-coding-plan": "alibaba-coding-plan",
     "qwen-oauth": "alibaba",
     "copilot": "github-copilot",
     "ai-gateway": "vercel",
@@ -213,6 +214,8 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "cohere": "cohere",
     "ollama-cloud": "ollama-cloud",
 }
+
+_CODING_PLAN_CATALOG_SUFFIX = "-coding-plan"
 
 # Reverse mapping: models.dev id → Hermes ids (built lazily; many-to-one,
 # e.g. both "meta" and "meta-ai" may map to the same models.dev id).
@@ -765,15 +768,6 @@ def lookup_models_dev_context(
     if not mdev_provider_id:
         return _default_override_context(provider)
 
-    provider_ids = [mdev_provider_id]
-    if (
-        mdev_provider_id == "zai"
-        and "/api/coding/" in str(base_url or "").lower()
-    ):
-        # Z.AI publishes Coding Plan-only models in a separate models.dev
-        # catalog even though Hermes uses one provider identity for both APIs.
-        provider_ids.insert(0, "zai-coding-plan")
-
     # NOTE: keep the zero-argument call on the allow_network path. Dozens
     # of test sites monkeypatch fetch_models_dev with zero-arg lambdas;
     # passing the kwarg unconditionally breaks them all (TypeError).
@@ -782,6 +776,7 @@ def lookup_models_dev_context(
         if allow_network
         else fetch_models_dev(allow_network=False)
     )
+    provider_ids = _catalog_search_order(mdev_provider_id, base_url, data)
     model_lower = model.lower()
     for provider_id in provider_ids:
         provider_data = data.get(provider_id)
@@ -824,6 +819,35 @@ def lookup_models_dev_context(
 
     # Catalog miss — a _default override may fill the gap (#84482).
     return _default_override_context(provider)
+
+
+def _catalog_search_order(
+    mdev_provider_id: str,
+    base_url: str,
+    data: Dict[str, Any],
+) -> tuple[str, ...]:
+    """Return route-specific models.dev catalogs before the regular catalog.
+
+    Coding Plan products have separate provider entries and provider-specific
+    limits. Match their declared API URL instead of borrowing a sibling merely
+    because the regular catalog missed; the latter would leak subscription-only
+    metadata into a provider's standard API.
+    """
+    if mdev_provider_id.endswith(_CODING_PLAN_CATALOG_SUFFIX):
+        return (mdev_provider_id,)
+
+    requested_url = str(base_url or "").strip().lower().rstrip("/")
+    if requested_url:
+        for provider_id, provider_data in data.items():
+            if not provider_id.endswith(_CODING_PLAN_CATALOG_SUFFIX):
+                continue
+            if not isinstance(provider_data, dict):
+                continue
+            catalog_url = str(provider_data.get("api") or "").strip().lower().rstrip("/")
+            if catalog_url and catalog_url == requested_url:
+                return (provider_id, mdev_provider_id)
+
+    return (mdev_provider_id,)
 
 
 def _default_override_context(provider: str) -> Optional[int]:

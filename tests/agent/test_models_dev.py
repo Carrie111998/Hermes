@@ -139,8 +139,10 @@ class TestLookupModelsDevContext:
         mock_fetch.return_value = {
             "zai": {"models": {}},
             "zai-coding-plan": {
+                "api": "https://api.z.ai/api/coding/paas/v4",
                 "models": {
                     "glm-5.3": {"limit": {"context": 1_000_000}},
+                    "glm-5.2-highspeed": {"limit": {"context": 1_000_000}},
                 },
             },
         }
@@ -152,9 +154,52 @@ class TestLookupModelsDevContext:
         ) == 1_000_000
         assert lookup_models_dev_context(
             "zai",
+            "glm-5.2-highspeed",
+            base_url="https://api.z.ai/api/coding/paas/v4/",
+        ) == 1_000_000
+        assert lookup_models_dev_context(
+            "zai",
             "glm-5.3",
             base_url="https://api.z.ai/api/paas/v4",
         ) is None
+
+    @patch("agent.models_dev.fetch_models_dev")
+    def test_coding_route_matches_catalog_api_instead_of_provider_name(self, mock_fetch):
+        mock_fetch.return_value = {
+            "zai": {"models": {}},
+            "zhipuai-coding-plan": {
+                "api": "https://open.bigmodel.cn/api/coding/paas/v4",
+                "models": {
+                    "glm-5.3": {"limit": {"context": 1_000_000}},
+                },
+            },
+        }
+
+        assert lookup_models_dev_context(
+            "zai",
+            "glm-5.3",
+            base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+        ) == 1_000_000
+
+    @patch("agent.models_dev.fetch_models_dev")
+    def test_alibaba_coding_plan_catalog_is_route_scoped(self, mock_fetch):
+        mock_fetch.return_value = {
+            "alibaba": {"models": {}},
+            "alibaba-coding-plan": {
+                "api": "https://coding-intl.dashscope.aliyuncs.com/v1",
+                "models": {
+                    "glm-5": {"limit": {"context": 202_752}},
+                },
+            },
+        }
+
+        assert lookup_models_dev_context(
+            "alibaba",
+            "glm-5",
+            base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
+        ) == 202_752
+        assert lookup_models_dev_context("alibaba", "glm-5") is None
+        assert lookup_models_dev_context("alibaba-coding-plan", "glm-5") == 202_752
 
 
 
