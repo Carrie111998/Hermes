@@ -291,11 +291,27 @@ class SignalAdapter(BasePlatformAdapter):
 
         # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
-        # (reactions fire before run.py's auth gate). A scoped miss must
-        # stay empty — "*" is only an explicit open-access opt-in.
-        dm_allowed_raw = extra.get("allowed_users")
-        if dm_allowed_raw is None:
-            dm_allowed_raw = _startup_env_secret("SIGNAL_ALLOWED_USERS", "")
+        # (reactions fire before run.py's auth gate). Scoped secret >
+        # YAML extra > unscoped process env. A scoped miss stays empty;
+        # "*" is only an explicit open-access opt-in.
+        try:
+            from agent.secret_scope import current_secret_scope, is_multiplex_active
+            if is_multiplex_active() and current_secret_scope() is not None:
+                scope = current_secret_scope()
+                if "SIGNAL_ALLOWED_USERS" in scope:
+                    dm_allowed_raw = scope.get("SIGNAL_ALLOWED_USERS") or ""
+                elif extra.get("allowed_users") is not None:
+                    dm_allowed_raw = extra.get("allowed_users")
+                else:
+                    dm_allowed_raw = ""
+            else:
+                dm_allowed_raw = extra.get("allowed_users")
+                if dm_allowed_raw is None:
+                    dm_allowed_raw = _startup_env_secret("SIGNAL_ALLOWED_USERS", "")
+        except Exception:
+            dm_allowed_raw = extra.get("allowed_users")
+            if dm_allowed_raw is None:
+                dm_allowed_raw = _startup_env_secret("SIGNAL_ALLOWED_USERS", "")
         self.dm_allow_from = set(_parse_comma_list(str(dm_allowed_raw)))
 
         # HTTP client

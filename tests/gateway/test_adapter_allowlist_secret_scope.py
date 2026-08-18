@@ -264,3 +264,120 @@ class TestEmailAndWhatsAppAdapterGates:
             assert _Host()._open_dm_opted_in() is False
         finally:
             ss.reset_secret_scope(token)
+
+
+class TestGatewayAuthorizationDoesNotBorrowEnviron:
+    def _runner(self):
+        from gateway.config import GatewayConfig, Platform
+        from gateway.run import GatewayRunner
+        from unittest.mock import AsyncMock, MagicMock
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(platforms={Platform.SIGNAL: PlatformConfig(enabled=True)})
+        runner.adapters = {
+            Platform.SIGNAL: SimpleNamespace(
+                send=AsyncMock(),
+                enforces_own_access_policy=False,
+                authorization_is_upstream=False,
+            )
+        }
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        runner.pairing_stores = {}
+        runner._profile_adapters = {}
+        return runner
+
+    def test_scoped_miss_does_not_borrow_process_allowlist(self, monkeypatch):
+        from gateway.config import Platform
+
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+155****0001")
+        monkeypatch.delenv("SIGNAL_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        try:
+            runner = self._runner()
+            source = SessionSource(
+                platform=Platform.SIGNAL,
+                chat_id="+155****0001",
+                user_id="+155****0001",
+                chat_type="dm",
+            )
+            assert runner._is_user_authorized(source) is False
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_scoped_profile_allowlist_authorizes_only_that_profile(self, monkeypatch):
+        from gateway.config import Platform
+
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+155****0001")
+        monkeypatch.delenv("SIGNAL_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SIGNAL_ALLOWED_USERS": "+155****0002"})
+        try:
+            runner = self._runner()
+            allowed = SessionSource(
+                platform=Platform.SIGNAL,
+                chat_id="+155****0002",
+                user_id="+155****0002",
+                chat_type="dm",
+            )
+            borrowed = SessionSource(
+                platform=Platform.SIGNAL,
+                chat_id="+155****0001",
+                user_id="+155****0001",
+                chat_type="dm",
+            )
+            assert runner._is_user_authorized(allowed) is True
+            assert runner._is_user_authorized(borrowed) is False
+        finally:
+            ss.reset_secret_scope(token)
+
+
+class TestSignalScopedSecretBeatsYamlExtra:
+    def test_scoped_env_wins_over_conflicting_extra(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+155****0001")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SIGNAL_ALLOWED_USERS": "+155****0002"})
+        try:
+            config = PlatformConfig(enabled=True)
+            config.extra = {
+                "http_url": "http://localhost:8080",
+                "account": "+155****4567",
+                "allowed_users": "+155****0003",
+            }
+            adapter = SignalAdapter(config)
+            assert adapter.dm_allow_from == {"+155****0002"}
+            assert adapter._reactions_enabled(_signal_event("+155****0002")) is True
+            assert adapter._reactions_enabled(_signal_event("+155****0003")) is False
+        finally:
+            ss.reset_secret_scope(token)
+
+
+class TestMatrixSiblingAllowAllIsScoped:
+    def test_invite_does_not_borrow_process_allow_all(self, monkeypatch):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SOME_OTHER_KEY": "x"})
+        try:
+            config = PlatformConfig(enabled=True)
+            config.extra = {"homeserver": "https://example.org"}
+            adapter = MatrixAdapter(config)
+            adapter._allowed_user_ids = set()
+            scheduled = []
+            adapter._schedule_invite_join = lambda *args, **kwargs: scheduled.append((args, kwargs))
+            event = SimpleNamespace(
+                room_id="!evil:example.org",
+                sender="@stranger:example.org",
+                content=SimpleNamespace(is_direct=True),
+            )
+            asyncio.run(adapter._on_invite(event))
+            assert scheduled == []
+        finally:
+            ss.reset_secret_scope(token)
