@@ -2334,6 +2334,12 @@ export const en: Translations = {
         description: 'Walk through how the selected code works and link to the key files.',
         text: 'Please explain how this works and point me to the key files.'
       }
+    },
+    githubIssueDeepLink: {
+      task: 'Investigate this GitHub issue in the current workspace. Read the issue and its comments, reproduce the problem, then implement and verify a focused fix:',
+      errorTitle: 'GitHub issue link rejected',
+      errorUrl: 'Only canonical https://github.com/owner/repo/issues/123 links are allowed.',
+      errorTooLarge: 'The link exceeds the 2KB limit.'
     }
   },
 

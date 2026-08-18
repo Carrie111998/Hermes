@@ -1962,6 +1962,12 @@ export interface Translations {
       done: string
       doneTip: string
     }
+    githubIssueDeepLink: {
+      task: string
+      errorTitle: string
+      errorUrl: string
+      errorTooLarge: string
+    }
   }
 
   statusStack: {

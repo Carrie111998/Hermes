@@ -1841,6 +1841,12 @@ export const ar = defineLocale({
         description: 'اشرح كيفية عمل الكود المحدد واربطه بالملفات الرئيسية.',
         text: 'يرجى شرح كيفية عمل هذا وإرشادي إلى الملفات الرئيسية.'
       }
+    },
+    githubIssueDeepLink: {
+      task: 'حقّق في مشكلة GitHub هذه داخل مساحة العمل الحالية. اقرأ المشكلة وتعليقاتها، وأعد إنتاج المشكلة، ثم نفّذ إصلاحًا مركّزًا وتحقّق منه:',
+      errorTitle: 'رُفض رابط مشكلة GitHub',
+      errorUrl: 'يسمح فقط بالروابط القياسية بالشكل https://github.com/owner/repo/issues/123.',
+      errorTooLarge: 'حجم الرابط يتجاوز الحد الأقصى 2KB.'
     }
   },
   statusStack: {
