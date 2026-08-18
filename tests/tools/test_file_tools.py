@@ -625,9 +625,9 @@ class TestPatchSchemaShape:
 def test_mutation_schemas_document_applied_validation_failure_contract():
     for schema in (WRITE_FILE_SCHEMA, PATCH_SCHEMA):
         description = schema["description"]
-        assert "applied=true" in description
+        assert "applied:true" in description
         assert "changed" in description and "disk" in description
-        assert "validated=false" in description
+        assert "validated:false" in description
         assert "must be repaired" in description
 
 
@@ -993,7 +993,7 @@ class TestNotFoundCache:
         # First read → not found; second read (after write) → present.
         mock_ops.read_file.side_effect = [not_found_obj, present_obj]
         write_result_obj = MagicMock()
-        write_result_obj.to_dict.return_value = {"status": "ok"}
+        write_result_obj.to_dict.return_value = {"status": "ok", "applied": True}
         mock_ops.write_file.return_value = write_result_obj
         mock_get.return_value = mock_ops
 
