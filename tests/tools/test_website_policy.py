@@ -181,6 +181,46 @@ def test_browser_navigate_allows_when_shared_file_missing(monkeypatch, tmp_path)
     assert result is None
 
 
+def test_browser_tool_fails_closed_when_policy_module_unavailable(monkeypatch):
+    """If the website-policy module cannot be imported, navigation must be
+    blocked (fail-closed), never allowed past a policy we could not load.
+
+    Regression for the fail-open path that returned ``None`` (allow) when the
+    policy module import raised — silently bypassing the website blocklist.
+    """
+    import builtins
+    import importlib
+    from tools import browser_tool
+
+    real_import = builtins.__import__
+
+    def _blocked_policy_import(name, *a, **kw):
+        if name == "tools.website_policy":
+            raise ImportError("simulated website_policy module failure")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_policy_import)
+
+    # Force the module to re-run its import guard with the policy import
+    # blocked. The guard must install a FAIL-CLOSED fallback, not
+    # ``lambda url: None``.
+    importlib.reload(browser_tool)
+
+    try:
+        result = browser_tool.check_website_access("https://unknown.test")
+    finally:
+        # Restore the real import before anything else imports the module.
+        monkeypatch.setattr(builtins, "__import__", real_import)
+        importlib.reload(browser_tool)
+
+    # Fail-closed: the result must be truthy (blocked), never None/allow.
+    assert result is not None
+    assert bool(result) is True
+    assert result.get("rule") == "policy-unavailable"
+    assert "unavailable" in result.get("message", "").lower()
+
+
+
 class TestWebToolPolicy:
     """Tests that exercise web_extract_tool with website-policy gates.
 
