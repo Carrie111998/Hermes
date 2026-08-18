@@ -68,6 +68,24 @@ def _async_event(delegation_id="deleg_duplicate"):
     }
 
 
+def _delegated_approval_event(approval_id="approval-dynamic"):
+    return {
+        "type": "delegated_approval_request",
+        "approval_id": approval_id,
+        "delegation_id": "deleg-dynamic",
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "subagent_id": "subagent-dynamic",
+        "child_session_id": "child-dynamic",
+        "command": "python -c 'print(1)'",
+        "command_digest": "d" * 64,
+        "tool_call_id": "call-dynamic",
+        "pattern_keys": ["script execution via -e/-c flag"],
+        "expires_in_seconds": 90,
+        "untrusted_data": True,
+        "system_authored": True,
+    }
+
+
 def _completion_event(*, started_at, session_id="proc_reused"):
     return {
         "type": "completion",
@@ -110,6 +128,25 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     adapter.handle_message.assert_awaited_once()
+
+
+def test_delegated_approval_event_uses_gateway_fresh_turn_delivery(
+    monkeypatch, isolated_registry
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_delegated_approval_event())
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    incoming = adapter.handle_message.await_args.args[0]
+    assert incoming.text.startswith("[SYSTEM EVENT: delegated_approval_request]")
+    assert "UNTRUSTED DATA" in incoming.text
 
 
 def test_unroutable_async_event_is_not_requeued_forever(

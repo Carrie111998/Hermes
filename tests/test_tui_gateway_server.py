@@ -4815,6 +4815,86 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
+def test_delegated_approval_event_runs_as_fresh_typed_turn_without_approval_card(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    emitted = []
+
+    class _ApprovalTurnAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+            **_kwargs,
+        ):
+            self._turns.append(prompt)
+            messages = list(conversation_history or [])
+            messages.extend(
+                [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "display_kind": persist_user_display_kind,
+                    },
+                    {"role": "assistant", "content": "decision turn complete"},
+                ]
+            )
+            return {"final_response": "decision turn complete", "messages": messages}
+
+    session = _session(
+        session_key="session-parent-approval",
+        agent=_ApprovalTurnAgent(turns),
+        running=False,
+    )
+    event = {
+        "type": "delegated_approval_request",
+        "approval_id": "approval-exact",
+        "session_key": "session-parent-approval",
+        "origin_ui_session_id": "sid-parent-approval",
+        "subagent_id": "subagent-exact",
+        "child_session_id": "child-exact",
+        "command": "python -c 'print(1)'",
+        "command_digest": "d" * 64,
+        "tool_call_id": "call-exact",
+        "pattern_keys": ["script execution via -e/-c flag"],
+        "expires_in_seconds": 90,
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
+    server._sessions["sid-parent-approval"] = session
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid-parent-approval", session
+        )
+
+        assert len(turns) == 1
+        assert turns[0].startswith("[SYSTEM EVENT: delegated_approval_request]")
+        assert "UNTRUSTED DATA" in turns[0]
+        assert isolated_queue.empty()
+        assert not [args for args in emitted if args[0] == "approval.request"]
+        timeline = [
+            row for row in session["history"]
+            if row.get("display_kind") == "delegated_approval_request"
+        ]
+        assert len(timeline) == 1
+        assert timeline[0]["role"] == "user"
+        assert [row["role"] for row in session["history"]] == ["user", "assistant"]
+    finally:
+        server._sessions.pop("sid-parent-approval", None)
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_run_prompt_submit_requeues_foreign_completion(
     monkeypatch, tmp_path, exit_code

@@ -2600,6 +2600,11 @@ def clear_session(session_key: str) -> None:
         # immediately so the old run can unwind instead of idling until timeout.
         entry.result = "deny"
         entry.event.set()
+    try:
+        from tools.delegated_approval import revoke_for_parent_session
+        revoke_for_parent_session(session_key, "parent_reset")
+    except Exception:
+        logger.debug("delegated approval parent reset revocation failed", exc_info=True)
     _release_permission_mode_dependents(session_key)
 
 
@@ -4005,6 +4010,67 @@ def check_all_command_guards(command: str, env_type: str,
     # correctly persist the pattern key and downgrade the tirith key to
     # session — the UI was stricter than the persistence layer.
     has_permanent_capable = any(not is_t for _, _, is_t in warnings)
+
+    # Active top-level background children may use the exact parent lane only
+    # under trusted profile policy and the conservative local/reversible class.
+    # Every owner-consequence or otherwise ineligible request falls through to
+    # the unchanged user approval path below.
+    _await_parent_decision = None
+    try:
+        from agent.delegation_context import get_delegated_approval_authority
+        from tools.delegated_approval import (
+            DelegatedApprovalAuthority,
+            await_parent_decision,
+            is_specialist_local_reversible,
+        )
+
+        _await_parent_decision = await_parent_decision
+        _delegated_authority = get_delegated_approval_authority()
+        _delegated_eligible = (
+            isinstance(_delegated_authority, DelegatedApprovalAuthority)
+            and _delegated_authority.parent_lane_enabled
+            and is_specialist_local_reversible(
+                _delegated_authority,
+                command,
+                env_type,
+                pattern_keys=all_keys,
+                tirith_findings=list(tirith_result.get("findings") or []),
+                has_host_access=has_host_access,
+            )
+        )
+    except Exception:
+        _delegated_eligible = False
+
+    if _delegated_eligible and _await_parent_decision is not None:
+        _parent_decision = _await_parent_decision(
+            command=command,
+            description=combined_desc,
+            pattern_keys=all_keys,
+            tool_call_id=_approval_tool_call_id.get(),
+        )
+        _parent_choice = _parent_decision.get("choice")
+        if _parent_decision.get("resolved") and _parent_choice == "once":
+            _reset_denials(session_key)
+            return {
+                "approved": True,
+                "message": None,
+                "parent_agent_approved": True,
+                "description": combined_desc,
+            }
+        if _parent_decision.get("resolved") and _parent_choice == "escalate_to_user":
+            pass  # atomically consumed parent capability; use existing user path
+        else:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: delegated parent approval was denied, revoked, "
+                    "mismatched, or expired. Do NOT retry or rephrase this command."
+                ),
+                "pattern_key": primary_key,
+                "description": combined_desc,
+                "outcome": "denied",
+                "user_consent": False,
+            }
 
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous

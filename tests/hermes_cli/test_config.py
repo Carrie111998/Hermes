@@ -75,6 +75,9 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+            assert config["approvals"]["delegated_parent"] == {"enabled": False}
+            assert "allowed_command_digests" not in config["approvals"]["delegated_parent"]
+            assert "eligible_command_digests" not in config["approvals"]["delegated_parent"]
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

@@ -8859,6 +8859,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
         # this the fallthrough keys every one as ("", "async_delegation")
         # and the second completion's status update is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
+    if evt_type == "delegated_approval_request":
+        return (evt.get("approval_id", ""), evt_type)
     return (evt_sid, evt_type)
 
 
@@ -9176,6 +9178,14 @@ def _notification_poller_loop(
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
+            elif evt.get("type") == "delegated_approval_request":
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="delegated_approval_request",
+                )
             else:
                 _run_prompt_submit(rid, sid, session, text)
             complete_event_delivery(evt, _claim)
@@ -9253,6 +9263,14 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                )
+            elif evt.get("type") == "delegated_approval_request":
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="delegated_approval_request",
                 )
             else:
                 _run_prompt_submit(rid, sid, session, text)

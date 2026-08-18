@@ -3459,8 +3459,8 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type == "async_delegation":
-        # Reuse the shared rich formatter (self-contained task-source block).
+    if evt_type in {"async_delegation", "delegated_approval_request"}:
+        # Reuse the shared typed formatter.
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
@@ -22123,6 +22123,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
             return (evt_type, producer_id, "") if producer_id else None
+        if evt_type == "delegated_approval_request":
+            producer_id = str(evt.get("approval_id") or "")
+            return (evt_type, producer_id, "") if producer_id else None
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -22362,7 +22365,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
+                    if evt.get("type") in {
+                        "async_delegation", "delegated_approval_request"
+                    }:
                         async_events.append(evt)
                     else:
                         requeue.append(evt)

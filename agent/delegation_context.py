@@ -21,6 +21,10 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_delegated_child_context",
     default=False,
 )
+_DELEGATED_APPROVAL_AUTHORITY: ContextVar[object | None] = ContextVar(
+    "hermes_delegated_approval_authority",
+    default=None,
+)
 
 # Set for any in-process execution that is NOT the dispatcher-owned worker even
 # though the worker's HERMES_KANBAN_* vars are legitimately in os.environ (cron
@@ -63,6 +67,21 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
             yield
     finally:
         _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
+@contextmanager
+def delegated_approval_context(authority: object) -> Iterator[None]:
+    """Bind a non-serializable parent/child authority for one child run."""
+    token = _DELEGATED_APPROVAL_AUTHORITY.set(authority)
+    try:
+        yield
+    finally:
+        _DELEGATED_APPROVAL_AUTHORITY.reset(token)
+
+
+def get_delegated_approval_authority() -> object | None:
+    """Return the active in-process authority, never a serializable id."""
+    return _DELEGATED_APPROVAL_AUTHORITY.get()
 
 
 def is_delegated_child_context() -> bool:

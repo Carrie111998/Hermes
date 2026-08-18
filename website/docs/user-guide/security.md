@@ -34,6 +34,8 @@ approvals:
   mode: smart                     # smart | manual | off
   timeout: 300                    # seconds to wait for user response (default: 300)
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
+  delegated_parent:
+    enabled: false                # experimental delegated-child parent resolver; keep off
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
 ```
@@ -45,6 +47,7 @@ The full set of keys:
 | `mode` | `smart` | Approval policy for dangerous shell commands — see the table below. |
 | `timeout` | `300` | Seconds Hermes waits for an approval reply before timing out. |
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
+| `delegated_parent.enabled` | `false` | Experimental, non-live parent-agent resolver for one exact eligible command from an active top-level background child. It has no static command allowlist and permits only `once`, `deny`, or escalation to the existing user path. Keep disabled pending independent review and a separate activation decision. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. TUI uses its own modal overlay (set `HERMES_TUI_NO_CONFIRM=1` to opt out there). |
 
@@ -57,6 +60,12 @@ The full set of keys:
 :::warning
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
 :::
+
+### Experimental delegated-parent resolver (disabled)
+
+Hermes contains a default-off resolver for a narrow delegated-child case. An active top-level background child may pause on a dynamically generated local command only when the existing scanner reports solely the low-ambiguity interpreter `-e`/`-c` class, Tirith reports no findings, and the backend has no host access. The exact commissioning parent can then allow that one digest/tool call, deny it, or escalate it to the existing user approval flow. Hardline and all other ineligible commands keep their established behavior.
+
+The request is process-local, exact-once, short-lived, and bound to live parent/child/session identities. Child tool schemas do not expose the resolver. There is no static digest allowlist and no session/permanent decision. This feature remains experimental and non-live; do not enable it until independent acceptance and a separate operator activation/restart decision are complete.
 
 ### YOLO Mode
 

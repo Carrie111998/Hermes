@@ -7644,6 +7644,14 @@ class AIAgent:
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
+        if "approval_response" in function_args:
+            if set(function_args) != {"approval_response"}:
+                from tools.registry import tool_error
+                return tool_error("Delegated approval response unavailable.")
+            return _delegate_task(
+                approval_response=function_args.get("approval_response"),
+                parent_agent=self,
+            )
         # Delegations from the top-level MODEL always run in the background —
         # the model does not get to choose. delegate_task returns immediately
         # with a handle (one per task) and each subagent's result re-enters the

@@ -2059,6 +2059,13 @@ DEFAULT_CONFIG = {
         # plain "Do NOT retry". Any approval resets the count. 0 disables.
         # Inspired by ChatGPT Work's auto-review circuit breaker.
         "denial_breaker_threshold": 3,
+        # Disabled by default. When explicitly enabled in a trusted profile,
+        # active top-level background children may ask their exact parent agent
+        # for one-operation approval of conservatively-classified local,
+        # reversible commands. No allowlist or config mutation is granted.
+        "delegated_parent": {
+            "enabled": False,
+        },
         # User-defined deny rules: fnmatch globs matched against terminal
         # commands. A match blocks the command unconditionally — BEFORE the
         # --yolo / /yolo / mode=off bypass — making this the user-editable

@@ -2210,6 +2210,18 @@ Smart mode is particularly useful for reducing approval fatigue — it lets the 
 Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
 :::
 
+### Experimental delegated-parent resolver (default off)
+
+`approvals.delegated_parent.enabled` defaults to `false`. The implemented but non-live feature lets the exact parent of an active top-level background child decide one dynamically generated command only in a narrow local interpreter `-e`/`-c` scanner class. It uses exact request/digest/tool-call binding, exposes no resolver in child schemas, offers only `once`, `deny`, or escalation to the existing user path, and has no static digest allowlist.
+
+```yaml
+approvals:
+  delegated_parent:
+    enabled: false  # keep disabled pending independent acceptance and activation review
+```
+
+Do not enable this experimental feature yet. Independent acceptance of the exact code tree and a separate operator decision for activation and any required restart are still required.
+
 ### Denial circuit breaker
 
 `approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. After that many consecutive denials in a session, the deny message escalates to a hard-stop instruction telling the agent to stop, report the blocked operation, and ask you to run it manually or `/approve`. Any approval resets the count; set `0` to disable:

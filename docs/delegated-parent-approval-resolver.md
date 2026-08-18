@@ -1,148 +1,99 @@
 # Parent-agent resolver for delegated command approvals
 
-Status: implementation-ready design; no production wiring in this branch.
+Status: implemented on this branch, default OFF, and intentionally not activated. Experimental/non-live pending independent acceptance and a separate operator decision for configuration and restart.
 
-## Root cause
+## Problem and implemented result
 
-The approval system has one authority key: `session_key`.
+Historically, a delegated child inherited the parent's approval routing ContextVars. A flagged child command could therefore enter the parent's user-facing approval queue, but the parent model had no request capability or resolver operation. The implementation now provides a narrow process-local lane in which an active top-level background child can pause on one eligible command, the exact commissioning parent can decide it in a fresh turn, and the child can resume once.
 
-1. Desktop/TUI registers one user-facing notify callback for the parent session (`register_gateway_notify(key, ...)`).
-2. `delegate_task` copies the parent's ContextVars into worker threads.
-3. `delegated_child_context(child_session_id)` isolates the durable child session id, but it does not replace the approval-specific session key.
-4. The child guard therefore finds the parent's notify callback, queues under the parent session key, and emits `approval.request` to Desktop.
-5. `approval.respond` can only resolve FIFO by that same session key. The parent model has neither a pending-request capability nor a resolver operation.
+The implementation reuses existing seams:
 
-The runnable reproduction is `tests/tools/test_delegated_parent_approval_gap.py`.
+- `delegate_tool._active_subagents` binds the child to its commissioning parent and, for Desktop/TUI, the live transport and session-record generation.
+- the process notification queue and gateway/TUI watchers deliver a typed event as a fresh turn while the parent is idle;
+- `delegate_task` carries the parent-only resolver operation, avoiding another core tool.
 
-Existing machinery that should be reused:
+No runtime default contains a static command digest list. The command is created by the child first, then bound dynamically to a one-request capability using its exact SHA-256 digest and tool-call id.
 
-- `delegate_tool._active_subagents` already binds a child to the commissioning UI session and to unforgeable in-process transport/session-record identities for steering.
-- `tools.async_delegation` already injects cache-safe fresh internal turns while the parent is idle.
-- `delegate_task` already exists in the parent schema, so a narrow resolver operation can extend it without adding another core tool to every prompt.
+## Security contract
 
-## Security invariants
+1. Model-provided ids are lookup hints, not authority.
+2. Resolution requires handler-injected `parent_agent` object identity plus the active child registry record. Desktop/TUI additionally requires the same live transport object and session-record generation captured at dispatch.
+3. The capability is bound to one raw command held in memory, its exact digest, one tool-call id, one child, and one request id.
+4. Allowed decisions are only `once`, `deny`, and `escalate_to_user`. There is no session/permanent approval and no config mutation.
+5. Child, sibling, unrelated parent, and self resolution are denied with a generic non-oracular response.
+6. Hardline blocks and ineligible dangerous-command classes continue through the existing behavior: unconditional block or the established user approval path.
+7. Requests expire and are single-consumption. Completion, interrupt, parent/session reset, transport/session-generation replacement, and process exit revoke pending requests and unblock the child as denied.
+8. The child schema never advertises `approval_response`, including orchestrator children that retain ordinary delegation.
+9. Raw command text remains only in the blocking in-memory entry. Parent events and approval hooks receive bounded, secret-redacted display text plus digest and identities.
+10. Publish errors, stale identity, mismatches, timeout, and internal resolver errors fail closed.
 
-1. A child cannot resolve its own request.
-2. Model-provided ids are lookup hints, never authority.
-3. Resolver authority requires identity of the handler-injected `parent_agent`, active child object, and (for Desktop/TUI) the captured live transport plus live session-record generation.
-4. Approval is `once` for one exact raw command byte string and one child tool call. No pattern/session/permanent allowlisting.
-5. Hardline blocks, explicit deny rules, missing sudo credentials, privilege escalation, production/external effects, secret changes, security-control changes, and other owner-consequence classes never enter the parent-resolvable lane; they use the existing user fallback or remain unconditionally blocked.
-6. Pending requests expire, are single-consumption, and are revoked on child completion, parent/session reset, transport rebind, interrupt, or process exit.
-7. The child receives no approval id and no resolver operation/tool.
-8. The model cannot set YOLO, alter `approvals.mode`, broaden scope, change the command, or choose `session`/`always`.
-9. Raw command text is never written to routine logs; audit records carry a redacted display plus SHA-256 digest and identities.
-10. Silence, stale capabilities, mismatches, and resolver errors fail closed.
+## Exact eligibility
 
-## Proposed architecture
+The parent lane is considered only after the existing hardline, explicit-deny, sudo, dangerous-pattern, host-access, and Tirith checks have produced an approvable request. Every condition below is required:
 
-### 1. Bind delegated authority at spawn
+- `approvals.delegated_parent.enabled` is exactly YAML boolean `true` in the trusted parent profile;
+- the caller is a top-level parent (`_delegate_depth == 0`);
+- the child was successfully dispatched in the background; forced synchronous fallback disables the lane;
+- the in-process delegated authority is present and still matches the active registry record;
+- for Desktop/TUI ownership, the captured transport and session-record objects still match the live generation;
+- environment type is exactly `local` and the terminal backend reports no host access;
+- command is non-empty and at most 8192 UTF-8 bytes;
+- Tirith reports no findings;
+- every structured dangerous-pattern key is the single low-ambiguity inline-interpreter `-e`/`-c` class, represented by the canonical key `script execution via -e/-c flag` or its exact compatibility alias.
 
-Add an immutable internal `DelegatedApprovalAuthority` to each active subagent record:
+No command text heuristic expands this class. Missing/unknown/mixed pattern keys, shell `-c`, remote/container/SSH execution, host access, Tirith findings, and all other consequence classes are ineligible and preserve the existing user/hardline route.
 
-- `owner_agent`: exact parent `AIAgent` object identity
-- `child_agent`: exact child `AIAgent` object identity
-- `subagent_id`, `child_session_id`, `parent_session_id`
-- existing `owner_session_id`, `owner_transport`, `owner_session_record`
-- `delegation_id` when backgrounded
-- monotonic creation/expiry timestamps
+## Dynamic exact-command flow
 
-Pass it through a new ContextVar in `agent/delegation_context.py` only while `child.run_conversation()` executes. Do not serialize it or place it in environment variables.
+1. Trusted parent-side dispatch reads the feature flag and captures metadata on each background child. The model cannot set this metadata.
+2. Child execution binds a frozen `DelegatedApprovalAuthority` through a ContextVar only for the child run.
+3. When an eligible command reaches `check_all_command_guards`, the resolver creates a CSPRNG request id and stores the raw command, exact SHA-256 digest, tool-call id, authority, and monotonic expiry in memory.
+4. A bounded redacted `delegated_approval_request` event is queued for the parent. Command and description are explicitly marked untrusted data.
+5. Gateway and TUI deliver the event through their existing fresh-turn paths. TUI persists the event as a typed timeline row, not a user approval card, and preserves user/assistant role alternation.
+6. The parent responds through `delegate_task(approval_response={approval_id, choice})`. Spawn fields are forbidden in the same call.
+7. Runtime revalidates exact parent identity, active child authority, live transport/session generation, expiry, command digest, and tool-call binding before atomically consuming the request.
+8. `once` resumes that one guard. `deny` fails closed without prompting the user. `escalate_to_user` consumes the parent capability and enters the existing user approval path.
 
-### 2. Intercept before the user gateway branch
+## Schema and cache behavior
 
-After hardline/deny/sudo checks and scanner gathering, but before `_gateway_notify_cbs`, `tools.approval` checks for a valid delegated authority.
+The commissioning parent receives an `approval_response` branch on the existing `delegate_task` schema. Its runtime handler also rejects mixed spawn/resolver arguments. Before a child's first model call, child tool schemas are deep-copied and that branch plus its conditional schema constraint are removed. This happens before the child's prompt cache exists and does not mutate the parent schema or registry schema.
 
-Eligible lane (all required):
+Notifications are injected only at turn boundaries through existing fresh-turn delivery. The implementation does not mutate prior context or the system prompt.
 
-- delegated ContextVar present and active registry identities still match
-- local, non-production environment; no host privilege escalation
-- scanner result is approvable (not an unconditional floor)
-- classification says `specialist_local_reversible`
-- parent policy/identity explicitly owns that class (D-CC-12 supplied by trusted profile policy, not model arguments)
+## Event, audit, and lifecycle data
 
-Create `_DelegatedApprovalEntry` with a CSPRNG `approval_id`, exact raw-command digest, raw command retained only in memory, redacted display, scanner findings, exact child tool-call id, expiry (recommended 90 seconds), and authority identities. The child blocks on its private Event.
+The in-memory entry contains the raw command. Persistable/display surfaces contain only bounded secret-redacted command/description text, digest, request/tool/child/delegation identities, pattern keys, expiry, fixed choices, and decision/reason metadata. Capability objects are never serialized.
 
-Ineligible requests call the existing user path unchanged.
+Pending requests are revoked by:
 
-### 3. Surface a typed parent event
+- child completion/unregistration;
+- explicit child interrupt;
+- parent approval-session reset;
+- live Desktop/TUI transport or session-record replacement detected while waiting;
+- process exit via `atexit`.
 
-Publish `type="delegated_approval_request"` on a process-local parent-event rail with:
+Restart does not restore pending capabilities.
 
-- `approval_id`, `subagent_id`, `child_session_id`
-- redacted command display and description
-- digest, scanner severity/rules
-- fixed choices: `once`, `deny`, `escalate_to_user`
-- expiry timestamp
-- an explicit marker that command/description are untrusted data
+## Configuration and activation hold
 
-Delivery rules:
+The shipped default is:
 
-- Background delegation: reuse the async-delegation fresh-turn watcher and ownership filters, but do not persist a process-local capability across restart.
-- Synchronous delegation: when a request appears, return a typed `approval_required` result from the existing `delegate_task` call and keep the now-paused child owned by the async registry. This avoids re-entering the parent model while its tool call is still executing.
-- Never splice the event into an in-flight assistant/tool sequence and never mutate the system prompt.
-
-The parent sees a system-authored typed block. Untrusted command text is JSON encoded and bounded. Prompt injection can still influence an LLM's choice, but the capability's exact-command/child/once-only binding prevents any injected text from widening authority.
-
-### 4. Resolve through the existing `delegate_task` tool
-
-Extend `delegate_task` with an optional discriminated `approval_response` object:
-
-```json
-{
-  "approval_id": "opaque-id",
-  "choice": "once|deny|escalate_to_user"
-}
+```yaml
+approvals:
+  delegated_parent:
+    enabled: false
 ```
 
-When present, spawning fields are forbidden and normal child creation is skipped. The registry resolves only if:
+This document records implementation behavior; it is not an activation instruction. Do not enable the experimental lane until an independent reviewer accepts the exact committed tree and the operator separately approves a config change and any required service/session restart. No install, live config edit, service restart, activation, push, or PR is part of this branch closeout.
 
-- handler-injected `parent_agent is entry.owner_agent`
-- active child object and all child/session ids still match
-- Desktop/TUI transport and live session-record identities still match
-- request is unresolved and unexpired
-- exact raw-command digest and tool-call id still match the blocked guard
+## Verification scope
 
-`once` sets only that entry's Event. `deny` sets only that entry's Event. `escalate_to_user` atomically transfers that same entry to the existing user notify queue without minting a broader request. Any mismatch returns a non-oracular generic refusal and leaves the command blocked.
+Regression coverage includes exact once/replay, dynamic non-prelisted commands, classifier boundaries, parent/child/sibling identity denial, command/tool-call substitution, expiry and lifecycle revocation, concurrent keyed requests, resolver schema exclusivity, child schema hiding, redaction/audit, fresh TUI typed-turn delivery without an approval card, and gateway fresh-turn delivery.
 
-This adds no new core tool and exposes no resolver to a child because delegated leaves do not inherit `delegate_task`; an orchestrator child may have `delegate_task`, but its injected `parent_agent` identity is the orchestrator, not its own parent, so it cannot resolve its own entry.
-
-### 5. Audit
-
-Emit lifecycle hook records for request and terminal resolution:
-
-- request id, digest, redacted display
-- parent/child/subagent/delegation ids
-- scanner findings and eligibility classification
-- decision (`once`, `deny`, `escalated`, `expired`, `revoked`)
-- `decided_by="parent_agent"|"user"|"timeout"`
-- timestamps and reason code
-
-Never log the capability object or raw command.
-
-## Regression-first test plan
-
-Implement as vertical slices, running each RED before production code:
-
-1. Context isolation: delegated child receives an unforgeable parent authority but not a parent user-notify route.
-2. Exact once: matching parent agent + child + request approves the exact blocked command once.
-3. Command substitution: same approval id cannot approve a one-byte-different command.
-4. Child self-approval: child-agent identity is rejected even with the id.
-5. Sibling theft: another child and another parent session are rejected.
-6. Replay: a consumed id resolves exactly once.
-7. Expiry/revocation: timeout, child finish, interrupt, reset, transport rebind, and session-record replacement all deny/revoke.
-8. Scope: `session`, `always`, model-set YOLO/config fields, and spawning fields combined with `approval_response` are schema/runtime rejected.
-9. Owner fallback: irreversible/external/privileged/security/secret classifications still emit the existing Desktop user card.
-10. Smart-DENY behavior: parent may only select exact `once`, never persistence.
-11. Async delivery: request arrives as a fresh owned internal turn with legal role alternation and no prompt rebuild.
-12. Sync conversion: synchronous delegation safely returns `approval_required`, pauses rather than abandons the child, and resumes to one final result.
-13. Batch: concurrent requests remain child/request keyed; no FIFO-by-parent ambiguity.
-14. Audit/redaction: hooks contain identities/digest and no raw secret.
-15. End-to-end Desktop/TUI: parent resolves local reversible request without a Desktop card; `escalate_to_user` produces the existing card and response path.
-
-## Why production code is deferred
-
-A correct implementation must atomically coordinate four existing lifecycles: blocking approval, live child ownership, synchronous-to-paused delegation conversion, and cache-safe parent wake delivery. Implementing only the registry or only the Desktop RPC would create a deadlock/orphan/self-approval risk. The source has all required seams, but this is not a small one-file safety patch.
+The detailed RED→GREEN and suite evidence is recorded in `docs/parent-approval-resolver-progress.md`.
 
 ## Rollback
 
-No live activation is proposed. For a future implementation, rollback is removal of the resolver branch; pending in-memory entries fail closed on process exit and no allowlist/config migration exists.
+Before activation, rollback is simply reverting the feature commit; the default remains OFF and there is no config migration or static allowlist to unwind.
+
+After a separately approved activation, first set `approvals.delegated_parent.enabled` back to `false`, then perform only the separately approved session/service restart needed for the running host to pick up the change. Pending entries are process-local and fail closed on reset/restart/exit. Reverting the implementation commit remains the code rollback.

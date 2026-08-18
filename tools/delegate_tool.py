@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import copy
 import contextvars
 import json
 import logging
@@ -57,6 +58,34 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "cronjob",  # no scheduling more work in the parent's name
     ]
 )
+
+
+def _strip_parent_resolver_from_child_tools(child: Any) -> None:
+    """Keep orchestrator spawning while hiding parent-only resolution.
+
+    Child schemas are finalized before their first model call, so this does not
+    mutate a live prompt cache. A deep copy avoids changing the registry schema
+    or the commissioning parent's already-built tool definitions.
+    """
+    tools = getattr(child, "tools", None)
+    if not isinstance(tools, list):
+        return
+    rewritten = []
+    for tool in tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("function", {}).get("name") != "delegate_task"
+        ):
+            rewritten.append(tool)
+            continue
+        safe_tool = copy.deepcopy(tool)
+        parameters = safe_tool.get("function", {}).get("parameters", {})
+        properties = parameters.get("properties")
+        if isinstance(properties, dict):
+            properties.pop("approval_response", None)
+        parameters.pop("allOf", None)
+        rewritten.append(safe_tool)
+    child.tools = rewritten
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +214,12 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
         record = _active_subagents.get(subagent_id)
         if record is not None and (agent is None or record.get("agent") is agent):
             _active_subagents.pop(subagent_id, None)
+    if agent is not None:
+        try:
+            from tools.delegated_approval import revoke_for_child
+            revoke_for_child(agent, "child_completed")
+        except Exception:
+            logger.debug("delegated approval child revocation failed", exc_info=True)
 
 
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
@@ -226,6 +261,11 @@ def interrupt_subagent(subagent_id: str) -> bool:
     agent = record.get("agent")
     if agent is None:
         return False
+    try:
+        from tools.delegated_approval import revoke_for_child
+        revoke_for_child(agent, "child_interrupted")
+    except Exception:
+        logger.debug("delegated approval interrupt revocation failed", exc_info=True)
     try:
         if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
             return False
@@ -1742,6 +1782,7 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    _strip_parent_resolver_from_child_tools(child)
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -2402,6 +2443,7 @@ def _run_single_child_in_profile_scope(
     # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    _approval_authority = None
     if _subagent_id:
         if owner_session_id is None:
             try:
@@ -2419,6 +2461,33 @@ def _run_single_child_in_profile_scope(
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
+        _approval_meta = getattr(child, "_delegated_approval_metadata", None)
+        _has_live_owner_generation = (
+            not owner_session_id
+            or (owner_transport is not None and owner_session_record is not None)
+        )
+        if (
+            isinstance(_approval_meta, dict)
+            and _approval_meta.get("enabled")
+            and _has_live_owner_generation
+        ):
+            from tools.delegated_approval import DelegatedApprovalAuthority
+
+            _approval_authority = DelegatedApprovalAuthority(
+                owner_agent=parent_agent,
+                child_agent=child,
+                subagent_id=_subagent_id,
+                child_session_id=str(getattr(child, "session_id", "") or ""),
+                parent_session_id=str(getattr(parent_agent, "session_id", "") or ""),
+                owner_approval_session_key=str(_approval_meta.get("session_key") or ""),
+                owner_session_id=owner_session_id,
+                owner_transport=owner_transport,
+                owner_session_record=owner_session_record,
+                delegation_id=str(_approval_meta.get("delegation_id") or ""),
+                parent_lane_enabled=True,
+                parent_task_id=str(_approval_meta.get("parent_task_id") or ""),
+                delegated_goal=str(_approval_meta.get("delegated_goal") or ""),
+            )
         _register_subagent(
             {
                 "subagent_id": _subagent_id,
@@ -2434,11 +2503,13 @@ def _run_single_child_in_profile_scope(
                 "status": "running",
                 "tool_count": 0,
                 "agent": child,
+                "owner_agent": parent_agent,
                 # Immutable live gateway/TUI session that commissioned this
                 # child. Empty outside those hosts; RPC authority fails closed.
                 "owner_session_id": owner_session_id,
                 "owner_transport": owner_transport,
                 "owner_session_record": owner_session_record,
+                "approval_authority": _approval_authority,
             }
         )
 
@@ -2509,14 +2580,24 @@ def _run_single_child_in_profile_scope(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            from agent.delegation_context import delegated_child_context
+            from agent.delegation_context import (
+                delegated_approval_context,
+                delegated_child_context,
+            )
+            from contextlib import nullcontext
 
+            _approval_scope = (
+                delegated_approval_context(_approval_authority)
+                if _approval_authority is not None
+                else nullcontext()
+            )
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                with _approval_scope:
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3401,6 +3482,7 @@ def delegate_task(
     model: Optional[str] = None,
     required_toolsets: Optional[List[str]] = None,
     background: Optional[bool] = None,
+    approval_response: Optional[Dict[str, Any]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3419,6 +3501,26 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    if approval_response is not None:
+        if not isinstance(approval_response, dict) or set(approval_response) != {
+            "approval_id", "choice"
+        }:
+            return tool_error("Delegated approval response unavailable.")
+        from tools.delegated_approval import resolve_parent_decision
+
+        _approval_id = approval_response.get("approval_id")
+        _approval_choice = approval_response.get("choice")
+        if not isinstance(_approval_id, str) or not isinstance(_approval_choice, str):
+            return tool_error("Delegated approval response unavailable.")
+        result = resolve_parent_decision(
+            parent_agent,
+            _approval_id,
+            _approval_choice,
+        )
+        if not result.get("resolved"):
+            return tool_error("Delegated approval response unavailable.")
+        return json.dumps(result, ensure_ascii=False)
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -3948,6 +4050,32 @@ def delegate_task(
                 _session_key = _agent_session_id
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
+        # Trusted profile policy is captured on the parent thread. The model has
+        # no argument that can enable or label this lane, and the default is off.
+        try:
+            from hermes_cli.config import cfg_get as _cfg_get, load_config_readonly
+            _approval_cfg = load_config_readonly()
+            _parent_approval_lane = (
+                _cfg_get(
+                    _approval_cfg,
+                    "approvals",
+                    "delegated_parent",
+                    "enabled",
+                    default=False,
+                )
+                is True
+                and getattr(parent_agent, "_delegate_depth", 0) == 0
+            )
+        except Exception:
+            _parent_approval_lane = False
+        for _index, _c in enumerate(_child_agents):
+            _c._delegated_approval_metadata = {
+                "enabled": _parent_approval_lane,
+                "session_key": _session_key,
+                "delegation_id": live_deleg_id,
+                "parent_task_id": str(getattr(parent_agent, "_current_task_id", "") or ""),
+                "delegated_goal": str(task_list[_index].get("goal") or ""),
+            }
 
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
@@ -4074,6 +4202,17 @@ def delegate_task(
             "batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
+        # A fresh resolver turn cannot run while this fallback is still inside
+        # the parent's current tool call. Disable the detached-only capability
+        # so the inline child preserves the existing user approval path.
+        for _c in _child_agents:
+            _c._delegated_approval_metadata = {
+                "enabled": False,
+                "session_key": _session_key,
+                "delegation_id": live_deleg_id,
+                "parent_task_id": str(getattr(parent_agent, "_current_task_id", "") or ""),
+                "delegated_goal": "",
+            }
         _cap_result = _execute_and_aggregate()
         if isinstance(_cap_result, dict):
             _cap_result["note"] = (
@@ -4626,6 +4765,23 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "approval_response": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "approval_id": {"type": "string", "minLength": 1},
+                    "choice": {
+                        "type": "string",
+                        "enum": ["once", "deny", "escalate_to_user"],
+                    },
+                },
+                "required": ["approval_id", "choice"],
+                "description": (
+                    "Resolve one exact delegated-child command request. When "
+                    "present, no spawning field may be included. Choices are "
+                    "fixed and never create session/permanent approval."
+                ),
+            },
             "background": {
                 "type": "boolean",
                 "description": (
@@ -4640,6 +4796,22 @@ DELEGATE_TASK_SCHEMA = {
             },
         },
         "required": [],
+        "allOf": [
+            {
+                "if": {"required": ["approval_response"]},
+                "then": {
+                    "not": {
+                        "anyOf": [
+                            {"required": [name]}
+                            for name in (
+                                "goal", "context", "profile", "model",
+                                "required_toolsets", "tasks", "role", "background",
+                            )
+                        ]
+                    }
+                },
+            }
+        ],
     },
 }
 
@@ -4687,11 +4859,15 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     return stripped_tasks if changed else tasks
 
 
-registry.register(
-    name="delegate_task",
-    toolset="delegation",
-    schema=DELEGATE_TASK_SCHEMA,
-    handler=lambda args, **kw: delegate_task(
+def _handle_delegate_task(args: dict, **kw) -> str:
+    if "approval_response" in args:
+        if set(args) != {"approval_response"}:
+            return tool_error("Delegated approval response unavailable.")
+        return delegate_task(
+            approval_response=args.get("approval_response"),
+            parent_agent=kw.get("parent_agent"),
+        )
+    return delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
@@ -4702,7 +4878,14 @@ registry.register(
         required_toolsets=args.get("required_toolsets"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
-    ),
+    )
+
+
+registry.register(
+    name="delegate_task",
+    toolset="delegation",
+    schema=DELEGATE_TASK_SCHEMA,
+    handler=_handle_delegate_task,
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
