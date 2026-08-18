@@ -31,12 +31,21 @@ ROUTES: dict[tuple[str, str], tuple[str, ...]] = {
     ("TAILOR_REVISION", "tailor"): ("jobflow.tailor.generate",),
     ("RESEARCH_REQUEST", "researcher"): ("cron.jobflow.researcher",),
     # The applier drains SUBMIT_REQUEST / SUBMIT_CONFIRM / QUESTION_ANSWER
-    # (cron/README.md), but only SUBMIT_REQUEST has ever arrived: every message
-    # in applier/inbox since July is one, while the other two have no producer
-    # anywhere in the tree. Routing only the latter two left the lane
-    # unreachable on BOTH paths — the reconciler derives its scanned types from
-    # this table too — so the 2026-08-17 shadow gate recorded zero applier
-    # dispatches and it read as an idle lane rather than a dead route.
+    # (``cron/README.md`` in the *hermes* repo — this one has no such file), but
+    # only SUBMIT_REQUEST has ever arrived: every message in applier/inbox since
+    # July is one. Routing only the latter two left the lane unreachable on BOTH
+    # paths — the reconciler derives its scanned types from this table too — so
+    # the 2026-08-17 shadow gate recorded zero applier dispatches and it read as
+    # an idle lane rather than a dead route.
+    #
+    # The other two are human replies, not machine output. SUBMIT_CONFIRM is
+    # Jaum's go-ahead; QUESTION_ANSWER answers a BLOCKED_QUESTION the applier
+    # raised against a form field it could not fill. That is why neither has a
+    # producer in THIS repo and why zero traffic is the expected steady state
+    # rather than evidence of a dead stage — both have a live consumer in the
+    # hermes repo (profiles/applier/workspace/tmp_ready_sweep_cron.py). Keep
+    # both routes: the reconciler scans them because they are listed here, and
+    # the 3-hourly sweep drains them regardless of the event path.
     #
     # Waking on SUBMIT_REQUEST cannot submit anything: the payload is a
     # dry-run request (`idempotency_key: applier-dry-run:...`) and the applier
