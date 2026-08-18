@@ -1170,6 +1170,64 @@ def test_scanner_rejection_rolls_back_new_supporting_file(
     assert wa.get_pending(wa.SKILLS, record["id"]) is not None
 
 
+@pytest.mark.linux_only
+def test_scanner_rejected_new_supporting_file_preserves_concurrent_update(
+    hermes_home, monkeypatch
+):
+    from pathlib import Path
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as sm
+    from tools import write_approval as wa
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    references = skill_dir / "references"
+    references.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_SKILL, encoding="utf-8")
+    sentinel = references / "keep.md"
+    sentinel.write_text("keep", encoding="utf-8")
+    target = references / "new.md"
+    observed = {}
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+
+    def _reject_after_stealth_update(_path):
+        published = target.stat()
+        concurrent = b"X" * published.st_size
+        target.write_bytes(concurrent)
+        os.utime(target, ns=(published.st_atime_ns, published.st_mtime_ns))
+        changed = target.stat()
+        assert changed.st_size == published.st_size
+        assert changed.st_mtime_ns == published.st_mtime_ns
+        assert changed.st_ctime_ns != published.st_ctime_ns
+        observed["concurrent"] = concurrent
+        return "scanner blocked"
+
+    monkeypatch.setattr(sm, "_security_scan_skill", _reject_after_stealth_update)
+    payload = {
+        "action": "write_file",
+        "name": "demo",
+        "file_path": "references/new.md",
+        "file_content": "scanner-rejected",
+    }
+    record = wa.stage_write(
+        wa.SKILLS,
+        payload,
+        summary="create note with rollback race",
+        origin="foreground",
+        session_context=_SESSION_CONTEXT,
+        target_tree_pre_image_hash=sm._target_tree_pre_image_hash("demo"),
+    )
+
+    output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert output is not None
+    assert "Approved 0 skills write(s)." in output
+    assert "target pre-image changed" in output.lower()
+    assert target.read_bytes() == observed["concurrent"]
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert wa.get_pending(wa.SKILLS, record["id"]) is not None
+
+
 @pytest.mark.parametrize("action", ["write_file", "remove_file"])
 def test_descriptor_supporting_file_rejects_late_ancestor_replacement(
     hermes_home, monkeypatch, action
