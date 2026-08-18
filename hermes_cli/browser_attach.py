@@ -34,7 +34,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.browser_connect import find_free_debug_port, is_browser_debug_ready
+from hermes_cli.browser_connect import discover_local_cdp_url, find_free_debug_port
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -105,15 +105,17 @@ def is_electron_child(cmdline: List[str]) -> bool:
 
 def app_display_name(exe_path: str, fallback: str) -> str:
     """Human name for the app: the ``.app`` bundle on macOS, else the binary."""
-    for part in reversed(exe_path.split(os.sep)):
-        if part.endswith(".app"):
-            return part[: -len(".app")]
-    return fallback
+    bundle = _bundle_path(exe_path)
+    return os.path.basename(bundle)[: -len(".app")] if bundle else fallback
 
 
 def session_slug(name: str) -> str:
-    """Registry/session-safe slug (matches browser_exec's session grammar)."""
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-").lower()
+    """Registry/session-safe slug (matches browser_exec's session grammar).
+
+    browser_exec's ``_SESSION_RE`` requires an alphanumeric FIRST char, so
+    strip leading/trailing underscores as well as dashes.
+    """
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-_").lower()
     return slug[:64] or "app"
 
 
@@ -131,7 +133,7 @@ def scan_electron_apps() -> List[Dict[str, Any]]:
     import psutil
 
     found: List[Dict[str, Any]] = []
-    seen_exes: Dict[str, int] = {}
+    seen_exes: set = set()
     for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
         try:
             info = proc.info
@@ -144,13 +146,13 @@ def scan_electron_apps() -> List[Dict[str, Any]]:
             # One entry per app binary: the first (lowest-pid) main wins.
             if exe in seen_exes:
                 continue
-            seen_exes[exe] = info["pid"]
+            seen_exes.add(exe)
             port = debug_port_from_cmdline(cmdline)
             cdp_url: Optional[str] = None
             if port:
-                candidate = f"http://127.0.0.1:{port}"
-                if is_browser_debug_ready(candidate, timeout=0.5):
-                    cdp_url = candidate
+                # Dual-stack probe: an IPv4-loopback squatter can push the
+                # relaunched app's debug listener onto [::1] only.
+                cdp_url = discover_local_cdp_url(port, timeout=0.5)
             found.append(
                 {
                     "pid": info["pid"],
@@ -255,14 +257,29 @@ def _terminate_app(pid: int, timeout: float = 10.0) -> bool:
 
         exe_path = _exe_of(proc)
         app_name = app_display_name(exe_path, proc.name()) if exe_path else proc.name()
+        quit_sent = False
         try:
-            subprocess.run(
-                ["osascript", "-e", f'quit app "{app_name}"'],
-                capture_output=True,
-                timeout=5,
+            quit_sent = (
+                subprocess.run(
+                    ["osascript", "-e", f'quit app "{app_name}"'],
+                    capture_output=True,
+                    timeout=5,
+                ).returncode
+                == 0
             )
         except Exception as e:
             logger.debug("osascript quit failed (falling back to terminate): %s", e)
+        if quit_sent:
+            # Give the AppleEvent quit a grace window before SIGTERM —
+            # terminating immediately defeats the graceful quit and can
+            # skip the app's before-quit handlers (the point of osascript).
+            try:
+                proc.wait(timeout=5)
+                return True
+            except psutil.NoSuchProcess:
+                return True
+            except psutil.TimeoutExpired:
+                pass
     try:
         if proc.is_running():
             proc.terminate()
@@ -329,10 +346,12 @@ def relaunch_with_debug_port(
         logger.warning("could not stop %s (pid %d)", app["name"], app["pid"])
         return None
     _spawn_with_debug_port(app["exe"], port)
-    url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if is_browser_debug_ready(url, timeout=0.5):
+        # Dual-stack: the relaunched app may bind [::1] only (see
+        # discover_local_cdp_url) — probe both loopbacks each pass.
+        url = discover_local_cdp_url(port, timeout=0.5)
+        if url:
             return url
         time.sleep(0.3)
     return None

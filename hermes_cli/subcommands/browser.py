@@ -83,8 +83,11 @@ def _cmd_attach(args: argparse.Namespace) -> int:
             return 1
 
     target = apps[0]
-    if len(apps) > 1 and not requested:
-        print("Running Electron apps:")
+    if len(apps) > 1:
+        # Always show the picker on ambiguity — a filter can legitimately
+        # match several apps ('code' → 'Code' and 'Code - Insiders'), and
+        # silently taking the first would attach to the wrong one.
+        print("Matching Electron apps:" if requested else "Running Electron apps:")
         for i, app in enumerate(apps, 1):
             state = f"CDP live on {app['cdp_url']}" if app["cdp_url"] else (
                 f"debug port {app['debug_port']} (not answering)" if app["debug_port"]

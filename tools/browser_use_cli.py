@@ -464,6 +464,11 @@ def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dic
         return None
 
 
+def _set_cdp_env(env: dict, url: str) -> None:
+    """Export a CDP endpoint under the env var the harness expects."""
+    env["BU_CDP_URL" if url.startswith(("http://", "https://")) else "BU_CDP_WS"] = url
+
+
 def _resolve_backend_cdp(
     env: dict, task_id: Optional[str], session_name: str = ""
 ) -> Optional[str]:
@@ -511,7 +516,7 @@ def _resolve_backend_cdp(
             logger.debug("browser session registry lookup failed: %s", e)
             registered = None
         if registered:
-            env["BU_CDP_URL" if registered.startswith(("http://", "https://")) else "BU_CDP_WS"] = registered
+            _set_cdp_env(env, registered)
             # The app's browser belongs to this session alone — no sibling
             # daemon to collide with, and an own-tab preamble would open a
             # visible blank window inside the user's app.
@@ -543,7 +548,7 @@ def _resolve_backend_cdp(
     except Exception:
         override = ""
     if override:
-        env["BU_CDP_URL" if override.startswith(("http://", "https://")) else "BU_CDP_WS"] = override
+        _set_cdp_env(env, override)
         return None
 
     try:
@@ -588,7 +593,7 @@ def _resolve_backend_cdp(
             "CDP endpoint, so Browser Use mode cannot drive it. Switch to "
             "the built-in browser tools for this provider."
         )
-    env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
+    _set_cdp_env(env, cdp)
     # A provider browser keyed bu-named-<name> is exclusive to this session —
     # the own-tab preamble is unnecessary there (it would just leak a blank
     # tab into a browser nobody else touches).

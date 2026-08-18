@@ -85,6 +85,15 @@ class TestNames:
     def test_session_slug_empty_fallback(self):
         assert ba.session_slug("///") == "app"
 
+    def test_session_slug_always_matches_browser_exec_grammar(self):
+        # browser_exec rejects sessions not matching _SESSION_RE (alnum
+        # first char) — a slug that fails it would be registered but
+        # unreachable, silent dead state.
+        from tools.browser_use_cli import _SESSION_RE
+
+        for raw in ("_private app", "-dash", "My Obsidian", "app!", "日本語アプリ"):
+            assert _SESSION_RE.match(ba.session_slug(raw)), raw
+
 
 # ── Registry round-trip ────────────────────────────────────────────
 
