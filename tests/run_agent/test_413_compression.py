@@ -590,9 +590,13 @@ class TestPreflightCompression:
         agent.context_compressor.threshold_tokens = 130_000
         agent.context_compressor.emit_automatic_compaction_status = False
 
+        # Long enough that messages exist outside the protected head/tail
+        # (production default protect_last_n=20 + head + 1 = window of 24) —
+        # the pre-API gate is structurally eligibility-aware (#88778), so a
+        # short history would be refused as a guaranteed no-op pass.
         history = [
-            {"role": "user", "content": "earlier question"},
-            {"role": "assistant", "content": "earlier answer"},
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(30)
         ]
         ok_resp = _mock_response(content="After quiet pre-API", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [ok_resp]
@@ -1075,6 +1079,15 @@ class TestToolResultPreflightCompression:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
 
+        # Long enough to clear the protected head/tail (production default
+        # protect_last_n=20 → window of 24) — the pre-API gate is structurally
+        # eligibility-aware (#88778) and would otherwise refuse the pass
+        # before the marginal-effectiveness logic under test runs.
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(30)
+        ]
+
         tc = SimpleNamespace(
             id="tc1", type="function",
             function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'),
@@ -1116,7 +1129,7 @@ class TestToolResultPreflightCompression:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("hello")
+            result = agent.run_conversation("hello", conversation_history=history)
 
         assert result["completed"] is True
         assert result["final_response"] == "Done after one compression"
