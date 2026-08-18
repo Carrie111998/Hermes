@@ -1,7 +1,10 @@
 # Write-side dead-link check — design
 
 Date: 2026-08-17
-Status: implemented 2026-08-18, landed INERT (CLAUDE_MEMORY_TOMBSTONE_WARN unset). Acceptance sweep: 2 hits, both PREEXISTING_DEAD. Awaiting Diego's review before activation.
+Status: implemented 2026-08-18, landed INERT (CLAUDE_MEMORY_TOMBSTONE_WARN unset). Acceptance
+sweep: 2 hits, both PREEXISTING_DEAD. Final whole-branch review found the hit path exceeded
+the hook's 10s registered timeout; fixed and re-verified at 328ms (see "Fitting the hook
+timeout"). 48 unit tests, full hooks suite 250 passed. Awaiting Diego's review before activation.
 Scope: `~/.claude/hooks/memory-index-size-guard.py` (single file; **no `settings.json` change**)
 Related: `specs/2026-08-17-link-aware-memory-deletion-design.md` (the deletion guard this
 completes), `plans/2026-08-17-link-aware-memory-deletion.md`,
@@ -142,12 +145,49 @@ always, never block.**
    semantics to the linter and the deletion gate, so a link this hook flags is a link the
    linter would call DEAD.
 6. Intersect targets with the cached tombstone set. Empty → return.
-7. On a hit only, confirm the name is not live again, so a re-created name cannot produce a
-   false warning. Zero names are resurrected today; this keeps the check correct on the day
-   one is. Cost is paid only on a candidate hit.
+7. On a hit only, resolve the memory roots and confirm the name is not live again, so a
+   re-created name cannot produce a false warning. Zero names are resurrected today; this
+   keeps the check correct on the day one is. Both the root resolution (a `git check-ignore`
+   spawn) and the liveness scan are paid only on a candidate hit — see **Fitting the hook
+   timeout** below, which is what makes that true in practice rather than only on paper.
 8. Emit a `systemMessage` naming each dead target, the commit that destroyed it, and its
    date. If the size guard also fired, the two messages are merged into the single JSON
    object a hook is allowed to emit.
+
+### Fitting the hook timeout — added 2026-08-18 after the final review
+
+The first implementation of step 7 was correct and unusable. The hook is registered with
+**`timeout: 10`** (seconds), and the hit path measured **7765 ms warm** — `_memory_roots()`
+5578 ms, the liveness scan 2171 ms — with the scan measured at **106 974 ms cold**. Because
+a hit happens roughly never, its OS file cache is *always* cold when it finally does, so the
+check would have been killed mid-scan on the first real hit: no warning, and no log line
+either. Worse, both warnings ride a single `print()` at the end of `main()`, so the hang
+would also have destroyed the pre-existing index-size warning. The per-check `try/except`
+guards against exceptions, not against wall clock.
+
+Four changes brought the hit path to **328 ms warm**, verified end-to-end:
+
+1. **The liveness scan is candidate-scoped.** It answers "are *these* few keys live?", not
+   "what are all 1370 identities?", and stops as soon as every candidate is resolved.
+2. **Filename pass first.** Comparing `normalize(path.stem)` across the roots costs no file
+   reads at all; only keys still unmatched require opening anything, and then only the first
+   `FRONTMATTER_SCAN_LINES` (12) lines rather than the whole file.
+3. **It is budgeted.** A `memory_links.Budget` of 5 s bounds the scan, and `BudgetExceeded`
+   returns no warning — failing silent, the same safe direction as the cache. Exhaustion
+   emits a distinguishable `deadlink-check-budget-exceeded` log line so "gave up" can be
+   told apart from "clean".
+4. **Root resolution is lazy.** It happens *after* the "no candidates" early return, so the
+   5.6 s git spawn is no longer paid on every memory write that contains no tombstoned link
+   — which is essentially all of them.
+
+A subtlety worth recording, because it silently defeated the first attempt at this fix: the
+budget must be created **after** root resolution. Created before, its 5 s clock was already
+spent by the 5.6 s git spawn, and the check returned no warning on every live hit while
+appearing correct in tests.
+
+**This couples the hook to a constant that lives outside it.** The 5 s budget exists because
+`settings.json` registers this hook with `timeout: 10`. Changing either without the other
+re-opens the defect.
 
 ### Tombstone cache
 
@@ -162,6 +202,13 @@ layer.
 
 Git history is append-only for deletions, so a stale cache under-reports and never
 over-reports: the failure direction is a missed warning, never a false one.
+
+A failed refresh **backs off** rather than retrying on the next write. It rewrites the cache
+with the stale names plus a `failed_at` stamp so the mtime advances, and retries after 15
+minutes. Without that, a failure left the mtime stale, so every subsequent memory write
+re-attempted the full `git log` — which on a saturated box would exceed the hook timeout on
+every write and take the index-size guard dark with it. The `git log` timeout is 4 s for the
+same reason: a single attempt must not be able to exhaust the hook's budget on its own.
 
 The `git` subprocess clears `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`
 and `GIT_OBJECT_DIRECTORY` for the child, reusing `memory_links._GIT_ENV_HIJACKERS` — those
