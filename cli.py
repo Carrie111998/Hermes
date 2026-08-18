@@ -15660,9 +15660,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Sync interaction mode before each turn.
                     if hasattr(self.agent, 'interaction_mode'):
                         self.agent.interaction_mode = self._interaction_mode
-                    # Inject mode awareness into the turn.
-                    # Build mode-specific instructions
-                    if self._interaction_mode == 'plan':
+                    # Only prepend mode note if user switched explicitly to plan mode
+                    # or if custom interaction mode instructions are needed
+                    if getattr(self, '_interaction_mode', 'build') == 'plan':
                         _mode_note = (
                             "[System: Current interaction mode: PLAN.\n"
                             "Plan mode is active for safe exploring, research, analysis, and architecture design. "
@@ -15674,17 +15674,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             "- Research and design architecture, workflows, and task roadmaps\n"
                             "- Do not attempt to write code, edit files, or execute mutating actions directly]"
                         )
-                    else:
-                        _mode_note = (
-                            "[System: Current interaction mode: BUILD.\n"
-                            "Full tool execution is enabled for implementing changes.\n\n"
-                            "BUILD mode guidelines:\n"
-                            "- Explore first: read code, locate exact symbols/functions before editing\n"
-                            "- Implement minimal, robust changes matching project conventions\n"
-                            "- Run tests and verify changes before reporting completion\n"
-                            "- Use delegate_task to orchestrate subagent workstreams when appropriate]"
-                        )
-                    agent_message = _mode_note + "\n\n" + agent_message
+                        agent_message = _prepend_note_to_message(agent_message, _mode_note)
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -15891,10 +15881,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Drain any remaining agent output still in the StdoutProxy
             # buffer so tool/status lines render ABOVE our response box.
-            # The flush pushes data into the renderer queue; the short
-            # sleep lets the renderer actually paint it before we draw.
+            # The flush pushes data into the renderer queue immediately without blocking sleep.
             sys.stdout.flush()
-            time.sleep(0.15)
 
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
@@ -16026,16 +16014,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
                 elif already_streamed:
                     # Response was already streamed token-by-token with box framing;
-                    # _flush_stream() already closed the box. Skip Rich Panel.
-                    # A transform hook runs after streaming. Show a suffix for
-                    # append-only changes, or the complete replacement otherwise.
+                    # _flush_stream() already closed the box. Skip Rich Panel completely to avoid blocking UI freeze.
                     _post_stream_text = _post_stream_transform_output(response, result)
                     if _post_stream_text.strip():
                         _cprint(_post_stream_text)
                 else:
                     _chat_console = ChatConsole()
+                    # Skip heavy table realignment/reparsing on plain text responses
+                    if not any(c in response for c in ('|', '```', '#', '*', '`')):
+                        _rendered_body = _RichText(response)
+                    else:
+                        _rendered_body = _render_final_assistant_content(response, mode=self.final_response_markdown)
                     _chat_console.print(Panel(
-                        _render_final_assistant_content(response, mode=self.final_response_markdown),
+                        _rendered_body,
                         title=f"[{_resp_color} bold]{label}[/]",
                         title_align="left",
                         border_style=_resp_color,
