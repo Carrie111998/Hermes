@@ -245,7 +245,22 @@ def get_credential_read_error(path: str) -> Optional[str]:
 
 
 def get_read_block_error(path: str) -> Optional[str]:
-    """Return an error message when a read targets internal Hermes cache files."""
+    """Return an error message when a read must be refused.
+
+    Two independent checks, in order:
+
+    1. Hermes internal cache files (prompt-injection prevention). Pre-existing.
+    2. Credential-bearing files (secret disclosure). Added in Phase 9 / Packet C.
+
+    Chaining here rather than adding a parallel function is deliberate: every
+    existing caller of this function is already a read chokepoint, so the
+    credential boundary reaches tools/file_tools.py and the ACP shim with no
+    new call sites and no risk of a caller being missed.
+    """
+    credential_error = get_credential_read_error(path)
+    if credential_error:
+        return credential_error
+
     resolved = Path(path).expanduser().resolve()
     hermes_home = _hermes_home_path().resolve()
     blocked_dirs = [

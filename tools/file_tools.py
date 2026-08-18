@@ -473,9 +473,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 ),
             })
 
-        # ── Hermes internal path guard ────────────────────────────────
-        # Prevent prompt injection via catalog or hub metadata files.
-        block_error = get_read_block_error(path)
+        # ── Hermes internal path guard + credential read boundary ─────
+        # Prevent prompt injection via catalog or hub metadata files, and
+        # refuse credential-bearing files outright.
+        #
+        # Pass _resolved, not path: the bytes below are read from _resolved
+        # (resolved against the task's live terminal cwd), whereas a raw
+        # relative path would be resolved against os.getcwd() inside the
+        # guard. Those bases can differ, so `../.env` could otherwise clear
+        # the guard and still be read.
+        block_error = get_read_block_error(str(_resolved))
         if block_error:
             return json.dumps({"error": block_error})
 
