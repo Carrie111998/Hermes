@@ -2412,7 +2412,7 @@ def _send_media_via_adapter(
                 # close() is a no-op on an already-closed coroutine and
                 # getattr() guards non-coroutine awaitables.
                 _close = getattr(coro, "close", None)
-                if _close is not None:
+                if callable(_close):
                     _close()
                 continue
             try:
