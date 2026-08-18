@@ -18,6 +18,7 @@ vi.mock('@/hermes', () => ({
   deleteEnvVar: vi.fn(),
   getEnvVars: () => getEnvVars(),
   revealEnvVar: vi.fn(),
+  setApiRequestProfile: () => undefined,
   setEnvVar: vi.fn()
 }))
 
