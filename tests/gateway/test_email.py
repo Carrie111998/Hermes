@@ -1134,6 +1134,114 @@ class TestSenderAuthentication(unittest.TestCase):
         self.assertFalse(ok, reason)
         self.assertIn("authserv-id", reason)
 
+    def test_mismatched_top_header_does_not_fall_through_to_forged_match(self):
+        """A real top stamp with a different id must not search downward."""
+        ok, reason = self._verify(
+            "admin@example.com",
+            [
+                "mx.other.com; dmarc=fail header.from=example.com",
+                "mx.pinned; dmarc=pass header.from=example.com",
+            ],
+            authserv_id="mx.pinned",
+        )
+        self.assertFalse(ok, reason)
+        self.assertIn("does not match pin", reason)
+
+    def test_parent_and_subdomain_ids_do_not_satisfy_pin(self):
+        ok_parent, _ = self._verify(
+            "admin@example.com",
+            ["example.com; dmarc=pass header.from=example.com"],
+            authserv_id="mx.example.com",
+        )
+        self.assertFalse(ok_parent)
+        ok_child, _ = self._verify(
+            "admin@example.com",
+            ["attacker.mx.example.com; dmarc=pass header.from=example.com"],
+            authserv_id="mx.example.com",
+        )
+        self.assertFalse(ok_child)
+        ok_exact, reason = self._verify(
+            "admin@example.com",
+            ["mx.example.com; dmarc=pass header.from=example.com"],
+            authserv_id="mx.example.com",
+        )
+        self.assertTrue(ok_exact, reason)
+
+    def test_copied_authserv_id_on_top_header_is_still_only_a_pin_match(self):
+        """A matching id authenticates the *header contents*, not provenance.
+
+        RFC 8601 requires the receiving MTA to strip inbound results that
+        claim its namespace. Hermes cannot prove that sanitization happened;
+        this test documents that a copied id on the topmost header is
+        accepted as a pin match (the MTA contract is operational).
+        """
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["mx.pinned; dmarc=pass header.from=example.com"],
+            authserv_id="mx.pinned",
+        )
+        self.assertTrue(ok, reason)
+
+
+class TestEmailDispatchMissingAuthservPin(unittest.TestCase):
+    """Allowlist + missing pin must drop at dispatch, not silently accept."""
+
+    def setUp(self):
+        self._prev = {
+            key: os.environ.get(key)
+            for key in (
+                "EMAIL_ALLOWED_USERS",
+                "EMAIL_ALLOW_ALL_USERS",
+                "EMAIL_AUTHSERV_ID",
+                "GATEWAY_ALLOW_ALL_USERS",
+                "GATEWAY_ALLOWED_USERS",
+            )
+        }
+        os.environ["EMAIL_ALLOWED_USERS"] = "owner@allowed.example"
+        os.environ.pop("EMAIL_ALLOW_ALL_USERS", None)
+        os.environ.pop("EMAIL_AUTHSERV_ID", None)
+        os.environ.pop("GATEWAY_ALLOW_ALL_USERS", None)
+        os.environ.pop("GATEWAY_ALLOWED_USERS", None)
+
+    def tearDown(self):
+        for key, value in self._prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    def test_allowlist_without_pin_drops_authenticated_looking_mail(self):
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._message_handler = MagicMock()
+        self.assertEqual(adapter._authserv_id, "")
+        asyncio.run(adapter._dispatch_message({
+            "uid": b"9",
+            "sender_addr": "owner@allowed.example",
+            "sender_name": "Owner",
+            "subject": "hi",
+            "message_id": "<pinless@allowed.example>",
+            "in_reply_to": "",
+            "body": "hello",
+            "attachments": [],
+            "date": "",
+            "sender_authenticated": False,
+            "auth_reason": "authserv-id is not configured; refusing to trust Authentication-Results",
+        }))
+        adapter._message_handler.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
