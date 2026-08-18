@@ -1,7 +1,7 @@
 export type LocalBackendRestartResult =
   { ok: true; mode: 'local' } | { ok: false; reason: 'restart-failed'; message: string }
 
-type BackendChildProcess = {
+export type BackendChildProcess = {
   exitCode: number | null
   signalCode: string | null
   kill: (signal?: number | string) => unknown
