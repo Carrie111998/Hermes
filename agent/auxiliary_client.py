@@ -6653,7 +6653,11 @@ def resolve_provider_client(
         # credential can authenticate against endpoints where no built-in
         # credential is registered for this provider alias.
         if explicit_api_key:
-            api_key = explicit_api_key.strip() or api_key
+            api_key = (
+                explicit_api_key.strip()
+                if isinstance(explicit_api_key, str)
+                else explicit_api_key
+            ) or api_key
         raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
         if explicit_base_url:
             raw_base_url = explicit_base_url.strip().rstrip("/")
