@@ -2872,6 +2872,28 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def _background_exit_signal_note(exit_code: "int | str") -> "str | None":
+    """Resolve a background process's exit code through terminal_tool's
+    signal-death table (OOM/SIGKILL, SIGSEGV, SIGBUS, ...).
+
+    ``exit_code`` arrives from the completion-queue event as either an int
+    or a numeric string depending on the producer; anything else (the "?"
+    placeholder, non-numeric) resolves to no note. Lazy import avoids a
+    circular dependency -- terminal_tool imports this module too, for
+    background-process registration/polling.
+    """
+    if isinstance(exit_code, bool):
+        return None
+    if isinstance(exit_code, int):
+        code = exit_code
+    elif isinstance(exit_code, str) and exit_code.lstrip("-").isdigit():
+        code = int(exit_code)
+    else:
+        return None
+    from tools.terminal_tool import _interpret_signal_exit
+    return _interpret_signal_exit(code)
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2913,9 +2935,7 @@ def format_process_notification(evt: dict) -> "str | None":
     _out = evt.get("output", "")
     _reason = evt.get("completion_reason") or "exited"
     _source = evt.get("termination_source") or ""
-    _signal = ""
-    if _exit in {-15, 143, "-15", "143"}:
-        _signal = ", SIGTERM"
+    _signal_note = _background_exit_signal_note(_exit)
     if _reason == "killed":
         _status = f"terminated by {_source or 'Hermes'}"
     elif _reason == "lost":
@@ -2926,9 +2946,11 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "completed normally"
     else:
         _status = "exited"
+    _note_line = f"{_signal_note}\n" if _signal_note else ""
     return (
         f"[IMPORTANT: Background process {_sid} {_status} "
-        f"(exit code {_exit}{_signal}).\n"
+        f"(exit code {_exit}).\n"
+        f"{_note_line}"
         f"Command: {_cmd}\n"
         f"Output:\n{_out}]"
     )
