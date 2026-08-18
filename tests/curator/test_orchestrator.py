@@ -234,3 +234,39 @@ def test_curator_daily_payload_schema(tmp_path):
     assert isinstance(payload["drawers_scanned"], int)
     assert isinstance(payload["degraded"], bool)
     assert isinstance(payload["duration_s"], (int, float))
+
+
+def test_emit_event_does_not_put_the_deployed_checkout_on_sys_path():
+    """``_emit_event`` must not shadow the running checkout with a deployed one.
+
+    It used to do, on every emit::
+
+        agent_src = Path(r"C:/Users/diego/.hermes/agent-src")
+        if str(agent_src) not in sys.path:
+            sys.path.insert(0, str(agent_src))
+
+    -- a hard-wired DEPLOYED path, at position 0, gated only on string
+    membership rather than on whether ``events`` was already importable. Any
+    process that emitted a curator event therefore resolved every later
+    first-time import from ``~/.hermes/agent-src`` instead of the tree it was
+    actually running from, so a fix present in the running checkout could be
+    invisible and a bug fixed there could still appear. Same defect and same
+    fix as ``devflow_delegation/adopt_history.py`` (e422d55ec0); pinned as a
+    standing invariant by ``tests/test_live_root_isolation.py``.
+    """
+    import sys
+    from datetime import datetime, timezone
+
+    from curator.orchestrator import BackfillResult, _emit_event
+
+    before = list(sys.path)
+    _emit_event(
+        _FakeBus(),
+        "nightly",
+        BackfillResult(mode="nightly"),
+        datetime(2026, 8, 18, tzinfo=timezone.utc),
+    )
+    assert sys.path == before, (
+        "_emit_event mutated sys.path; entries added: "
+        f"{[e for e in sys.path if e not in set(before)]}"
+    )

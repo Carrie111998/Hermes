@@ -136,10 +136,23 @@ def _emit_event(bus, mode: str, result: BackfillResult, generated_at: datetime) 
     # Try the real producer first (production path with real EventBus).
     try:
         # Local import so test envs without events/ on PYTHONPATH can fall through.
+        import importlib.util as _importlib_util
         import sys as _sys
-        agent_src = Path(r"C:/Users/diego/.hermes/agent-src")
-        if str(agent_src) not in _sys.path:
-            _sys.path.insert(0, str(agent_src))
+
+        # Fallback only -- never shadow an active checkout (C26 casualty
+        # class). Two things this must not do, both of which the previous form
+        # did: name the hard-wired deployed ``~/.hermes/agent-src`` rather than
+        # this file's own root, and run even when ``events`` already imports
+        # fine. Together they put the DEPLOYED checkout at sys.path[0] of any
+        # process that emits a curator event, so every later first-time import
+        # resolved from deployed code instead of the tree actually running --
+        # a fix present here could be invisible, a bug fixed here could still
+        # appear. Same defect and same fix as devflow_delegation/adopt_history.py
+        # (e422d55ec0). Appending means it can never outrank the live checkout.
+        if _importlib_util.find_spec("events") is None:
+            _repo_root = str(Path(__file__).resolve().parents[1])
+            if _repo_root not in _sys.path:
+                _sys.path.append(_repo_root)
         from events.producers.curator import emit_curator_daily  # type: ignore
         emit_curator_daily(bus, payload)
         return
