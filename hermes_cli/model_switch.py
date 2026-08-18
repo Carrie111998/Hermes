@@ -3215,7 +3215,7 @@ def list_authenticated_providers(
             from hermes_cli.models import cached_fetch_api_models
 
             _live_models = cached_fetch_api_models(
-                "",
+                current_api_key,
                 str(current_base_url).strip().rstrip("/"),
                 timeout=1.5 if for_picker else 5.0,  # picker: fail fast on a slow current endpoint
                 cache_only=not _probe_live,
