@@ -1114,6 +1114,20 @@ def _resolve_named_custom_runtime(
             pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        # An explicit key belongs to this exact endpoint and must win over a
+        # pool entry selected only by host.  Direct model aliases use this
+        # path; reversing the order can silently substitute a different key
+        # for the alias's configured credential (#83612).
+        explicit_key = (explicit_api_key or "").strip()
+        if has_usable_secret(explicit_key):
+            return {
+                "provider": "custom",
+                "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
+                "base_url": base_url,
+                "api_key": explicit_key,
+                "source": "direct-alias",
+                "requested_provider": requested_provider,
+            }
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -1124,7 +1138,6 @@ def _resolve_named_custom_runtime(
         _da_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
         _da_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
         api_key_candidates = [
-            (explicit_api_key or "").strip(),
             # Gate env key fallbacks on authoritative hosts (#28660)
             (_getenv("OPENAI_API_KEY", "").strip()     if _da_is_openai_url else ""),
             (_getenv("OPENROUTER_API_KEY", "").strip() if _da_is_openrouter  else ""),
@@ -1157,8 +1170,37 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
+    # A direct alias may name a configured custom provider for its model/API
+    # mode while deliberately overriding the endpoint.  The named provider's
+    # pool entry, api_key/key_env, and extra_headers are all credentials bound
+    # to the endpoint in that provider entry; none may cross to the alias
+    # endpoint.  Resolve that case as a bare endpoint instead.  Keep the
+    # named-provider path when the routes are the same so ordinary aliases
+    # retain their configured provider behavior.
+    configured_base_url = _normalize_base_url_for_match(custom_provider.get("base_url"))
+    explicit_route = _normalize_base_url_for_match(explicit_base_url)
+    if explicit_route and configured_base_url and explicit_route != configured_base_url:
+        return _resolve_named_custom_runtime(
+            requested_provider="custom",
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=base_url,
+        )
+
+    # An explicit alias key is bound to the explicit endpoint.  Do not let a
+    # credential-pool entry for the named provider override it: an alias may
+    # deliberately target a different host, and substituting the pool key
+    # would disclose that secret to the alias endpoint (#83612).
+    explicit_key = (explicit_api_key or "").strip()
+    if has_usable_secret(explicit_key):
+        pool_result = None
+    else:
+        pool_result = _try_resolve_from_custom_pool(
+            base_url,
+            "custom",
+            custom_provider.get("api_mode"),
+            provider_name=custom_provider.get("name"),
+        )
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -1183,7 +1225,7 @@ def _resolve_named_custom_runtime(
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
     _cp_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
     api_key_candidates = [
-        (explicit_api_key or "").strip(),
+        explicit_key,
         str(custom_provider.get("api_key", "") or "").strip(),
         _getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
         # Gate provider env keys on their authoritative hosts — sending

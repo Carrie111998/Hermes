@@ -368,6 +368,8 @@ class DirectAlias(NamedTuple):
     model: str
     provider: str
     base_url: str
+    api_key: str = ""
+    key_env: str = ""
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
@@ -413,7 +415,11 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                 base_url = entry.get("base_url", "")
                 if model:
                     merged[name.strip().lower()] = DirectAlias(
-                        model=model, provider=provider, base_url=base_url,
+                        model=model,
+                        provider=provider,
+                        base_url=base_url,
+                        api_key=str(entry.get("api_key", "") or ""),
+                        key_env=str(entry.get("key_env", "") or ""),
                     )
 
         # --- model.aliases (string-based format, from config set) ---
@@ -1690,7 +1696,42 @@ def switch_model(
     base_url = current_base_url
     api_mode = ""
 
-    if provider_changed or explicit_provider:
+    direct_alias = None
+    if resolved_alias:
+        _ensure_direct_aliases()
+        direct_alias = DIRECT_ALIASES.get(resolved_alias)
+
+    # A direct alias is an endpoint-and-credential binding.  Resolving the
+    # current/default provider first and applying its base_url afterwards can
+    # send that provider's API key to the alias host (#83612).
+    if direct_alias is not None and direct_alias.base_url:
+        direct_api_key = direct_alias.api_key.strip()
+        if direct_api_key.startswith("${") and direct_api_key.endswith("}"):
+            direct_api_key = _scoped_key_env(direct_api_key[2:-1])
+        if not direct_api_key and direct_alias.key_env.strip():
+            direct_api_key = _scoped_key_env(direct_alias.key_env.strip())
+        try:
+            runtime = resolve_runtime_provider(
+                requested=target_provider,
+                explicit_api_key=direct_api_key or None,
+                explicit_base_url=direct_alias.base_url,
+                target_model=new_model,
+            )
+            api_key = runtime.get("api_key", "") or "no-key-required"
+            base_url = runtime.get("base_url", "") or direct_alias.base_url
+            api_mode = runtime.get("api_mode", "")
+        except Exception as e:
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                provider_label=provider_label,
+                is_global=is_global,
+                error_message=(
+                    f"Could not resolve credentials for direct alias "
+                    f"'{resolved_alias}': {e}"
+                ),
+            )
+    elif provider_changed or explicit_provider:
         import os
         # User-config providers (providers.<name> in config.yaml) carry their
         # own base_url + transport + key reference. resolve_runtime_provider()
@@ -1771,16 +1812,6 @@ def switch_model(
             api_mode = runtime.get("api_mode", "")
         except Exception:
             pass
-
-    # --- Direct alias override: use exact base_url from the alias if set ---
-    if resolved_alias:
-        _ensure_direct_aliases()
-        _da = DIRECT_ALIASES.get(resolved_alias)
-        if _da is not None and _da.base_url:
-            base_url = _da.base_url
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
-            if not api_key:
-                api_key = "no-key-required"
 
     # --- Resolve api_mode from the final (provider, base_url) before validation ---
     # Two cases this closes, both surfaced when the switched model's reasoning

@@ -45,6 +45,105 @@ class TestOllamaCloudCredentials:
         assert runtime["api_key"] == "test-ollama-key-12345"
         assert runtime["provider"] == "custom"
 
+    def test_explicit_custom_endpoint_key_beats_pool_entry(self, monkeypatch):
+        """An explicit alias key is bound to its endpoint and cannot be
+        replaced by a host-level pool credential (#83612)."""
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setattr(
+            rp,
+            "_try_resolve_from_custom_pool",
+            lambda *args: {
+                "api_key": "pool-key-that-must-not-win",
+                "base_url": "https://theta.example/infer_request",
+                "api_mode": "chat_completions",
+            },
+        )
+
+        runtime = rp.resolve_runtime_provider(
+            requested="custom",
+            explicit_base_url="https://theta.example/infer_request",
+            explicit_api_key="alias-key",
+        )
+
+        assert runtime["api_key"] == "alias-key"
+
+    def test_named_custom_endpoint_explicit_key_beats_pool_entry(self, monkeypatch):
+        """A direct alias may name a configured custom provider but select a
+        different endpoint. Its explicit key must win before pool lookup."""
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setattr(
+            rp,
+            "_get_named_custom_provider",
+            lambda _name: {
+                "name": "foo",
+                "base_url": "https://configured.example/v1",
+            },
+        )
+        monkeypatch.setattr(
+            rp,
+            "_try_resolve_from_custom_pool",
+            lambda *args, **kwargs: {
+                "api_key": "pool-key-that-must-not-leak",
+                "base_url": "https://alias.example/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+
+        runtime = rp.resolve_runtime_provider(
+            requested="custom:foo",
+            explicit_base_url="https://alias.example/v1",
+            explicit_api_key="alias-key",
+        )
+
+        assert runtime["api_key"] == "alias-key"
+        assert runtime["base_url"] == "https://alias.example/v1"
+
+    def test_named_custom_alias_endpoint_drops_provider_credentials(self, monkeypatch):
+        """An alias endpoint override must not inherit a named provider's
+        pool key, static key, auth headers, or request overrides (#83612)."""
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setattr(
+            rp,
+            "_get_named_custom_provider",
+            lambda _name: {
+                "name": "trusted",
+                "base_url": "https://trusted.example/v1",
+                "api_key": "trusted-key-that-must-not-leak",
+                "key_env": "TRUSTED_API_KEY",
+                "extra_headers": {"Authorization": "Bearer trusted-header"},
+                "extra_body": {"tenant": "trusted"},
+            },
+        )
+        monkeypatch.setenv("TRUSTED_API_KEY", "trusted-env-key-that-must-not-leak")
+        pool_calls = []
+
+        def pool(*args, **kwargs):
+            pool_calls.append((args, kwargs))
+            if kwargs.get("provider_name") is None:
+                return None
+            return {
+                "api_key": "trusted-pool-key-that-must-not-leak",
+                "base_url": args[0],
+                "api_mode": "chat_completions",
+            }
+
+        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", pool)
+
+        runtime = rp.resolve_runtime_provider(
+            requested="custom:trusted",
+            explicit_base_url="https://alias.example/v1",
+        )
+
+        assert runtime["base_url"] == "https://alias.example/v1"
+        assert runtime["api_key"] == "no-key-required"
+        assert runtime["source"] == "direct-alias"
+        assert "extra_headers" not in runtime
+        assert "request_overrides" not in runtime
+        assert pool_calls == [(('https://alias.example/v1', 'custom', None), {})]
+
 
 # ---------------------------------------------------------------------------
 # Direct alias resolution
@@ -76,6 +175,30 @@ class TestDirectAliases:
         assert aliases["mymodel"].model == "custom-model:latest"
         assert aliases["mymodel"].provider == "custom"
         assert aliases["mymodel"].base_url == "https://example.com/v1"
+
+    def test_direct_alias_loads_credential_fields(self, monkeypatch):
+        """Direct aliases must retain credentials instead of silently
+        discarding the api_key / key_env supplied for their endpoint (#83612)."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model_aliases": {
+                    "theta": {
+                        "model": "glm_5_2",
+                        "provider": "custom",
+                        "base_url": "https://theta.example/infer_request",
+                        "api_key": "theta-key",
+                        "key_env": "THETA_API_KEY",
+                    }
+                }
+            },
+        )
+
+        from hermes_cli.model_switch import _load_direct_aliases
+
+        alias = _load_direct_aliases()["theta"]
+        assert alias.api_key == "theta-key"
+        assert alias.key_env == "THETA_API_KEY"
 
     def test_direct_alias_resolved_before_catalog(self, monkeypatch):
         """Direct aliases take priority over models.dev catalog lookup."""
@@ -420,6 +543,63 @@ class TestSwitchModelDirectAliasOverride:
         assert result.success
         assert result.api_key == "no-key-required"
         assert result.base_url == "http://localhost:11434/v1"
+
+    def test_switch_model_binds_alias_key_before_runtime_resolution(self, monkeypatch):
+        """The endpoint and key of a direct alias are one security boundary.
+        A current provider key must never be resolved and then carried to the
+        alias host (#83612)."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(
+            ms,
+            "DIRECT_ALIASES",
+            {
+                "theta": DirectAlias(
+                    "glm_5_2",
+                    "custom",
+                    "https://theta.example/infer_request",
+                    "theta-key",
+                )
+            },
+        )
+        monkeypatch.setattr(
+            ms,
+            "resolve_alias",
+            lambda raw, provider: ("custom", "glm_5_2", "theta"),
+        )
+        captured = {}
+
+        def fake_resolve_runtime_provider(**kwargs):
+            captured.update(kwargs)
+            return {
+                "api_key": kwargs["explicit_api_key"],
+                "base_url": kwargs["explicit_base_url"],
+                "api_mode": "chat_completions",
+                "provider": "custom",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **kw: {"accepted": True, "persist": True, "recognized": True, "message": None},
+        )
+        monkeypatch.setattr("hermes_cli.models.opencode_model_api_mode", lambda *a, **kw: "openai_compat")
+
+        result = ms.switch_model(
+            "theta",
+            "openrouter",
+            "old-model",
+            current_api_key="openrouter-key-that-must-not-leak",
+        )
+
+        assert captured["explicit_base_url"] == "https://theta.example/infer_request"
+        assert captured["explicit_api_key"] == "theta-key"
+        assert result.api_key == "theta-key"
+        assert result.base_url == "https://theta.example/infer_request"
 
 
 # ---------------------------------------------------------------------------
