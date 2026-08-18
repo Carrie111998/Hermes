@@ -619,23 +619,29 @@ skill descriptor-relatively. If the content scanner rejects a supporting-file
 write, identity-bound rollback restores the pre-apply bytes and leaves the claimed
 record pending; the bound leaf identity includes filesystem change time, so even
 a same-size concurrent update that restores its modification time makes rollback
-fail closed instead of overwriting that concurrent content. New skills are
-scanned from the exact in-memory `SKILL.md` content before publication, so the
-scanner input cannot diverge from the bytes selected for publish and a rejected
-create never becomes discoverable. Absent leaves are published with an atomic
-no-replace link, so a concurrent creator is preserved. Target-tree hashing
-is capped at 64 MiB and 16,384 entries; pending records are capped at 8 MiB and
-listing fails closed above 4,096 directory entries. Platforms where Hermes
-cannot enforce an owner-only pending store fail closed instead of staging or
-applying records. Hermes claims a record into a non-replayable quarantine before
-apply and refuses to list, approve, or reject legacy, tampered, linked,
-non-owner-only, oversized, or otherwise invalid records. Approved skill deletes
-fail closed without mutating the target because portable POSIX APIs cannot unlink
-a directory by held inode/descriptor; reject the record or perform a separate
-explicit delete. Approval fails closed if the target tree changed after staging.
-Restage the proposal against the current target instead of repairing an unsafe
-record in place. Memory writes have the same gate under
-`memory.write_approval` — see [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
+fail closed instead of overwriting that concurrent content. After an approved
+edit, patch, or supporting-file write passes the pathname-based scanner, Hermes
+captures a descriptor-anchored content hash before scanning, rehashes afterward,
+compares every bound identity, and rechecks that the visible root still names
+the held directory; a concurrent scan-time change therefore fails closed even
+on filesystems whose change-time granularity cannot distinguish the writes, and
+leaves the record pending instead of being reported as an approved success. New
+skills are scanned from the exact in-memory `SKILL.md` content before
+publication, so the scanner input cannot diverge from the bytes selected for
+publish and a rejected create never becomes discoverable. Absent leaves are
+published with an atomic no-replace link, so a concurrent creator is preserved.
+Target-tree hashing is capped at 64 MiB and 16,384 entries; pending records are
+capped at 8 MiB and listing fails closed above 4,096 directory entries.
+Platforms where Hermes cannot enforce an owner-only pending store fail closed
+instead of staging or applying records. Hermes claims a record into a
+non-replayable quarantine before apply and refuses to list, approve, or reject
+legacy, tampered, linked, non-owner-only, oversized, or otherwise invalid
+records. Approved skill deletes fail closed without mutating the target because
+portable POSIX APIs cannot unlink a directory by held inode/descriptor; reject
+the record or perform a separate explicit delete. Approval fails closed if the
+target tree changed after staging. Restage the proposal against the current
+target instead of repairing an unsafe record in place. Memory writes have the
+same gate under `memory.write_approval` — see [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
 
 > The separate `skills.guard_agent_created` setting is a content scanner
 > (dangerous-pattern heuristics), not an approval gate — the two are

@@ -923,6 +923,219 @@ def test_scanner_rollback_detects_same_size_mtime_restored_update(
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "mutation",
+    ["edit", "patch", "write_file", "supporting_patch"],
+)
+def test_successful_scanner_replay_rejects_concurrent_leaf_update(
+    hermes_home, monkeypatch, mutation
+):
+    from pathlib import Path
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as sm
+    from tools import write_approval as wa
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    references = skill_dir / "references"
+    references.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    supporting = references / "note.md"
+    supporting.write_text("approved-original", encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+
+    payloads = {
+        "edit": {
+            "action": "edit",
+            "name": "demo",
+            "content": _SKILL.replace("body", "edited body"),
+        },
+        "patch": {
+            "action": "patch",
+            "name": "demo",
+            "old_string": "body",
+            "new_string": "edited body",
+        },
+        "write_file": {
+            "action": "write_file",
+            "name": "demo",
+            "file_path": "references/note.md",
+            "file_content": "scanner-allowed",
+        },
+        "supporting_patch": {
+            "action": "patch",
+            "name": "demo",
+            "file_path": "references/note.md",
+            "old_string": "approved-original",
+            "new_string": "scanner-allowed",
+        },
+    }
+    target = skill_md if mutation in {"edit", "patch"} else supporting
+    observed = {}
+
+    def _allow_after_stealth_update(_path):
+        published = target.stat()
+        concurrent = b"X" * published.st_size
+        target.write_bytes(concurrent)
+        os.utime(
+            target,
+            ns=(published.st_atime_ns, published.st_mtime_ns),
+        )
+        changed = target.stat()
+        assert changed.st_size == published.st_size
+        assert changed.st_mtime_ns == published.st_mtime_ns
+        assert changed.st_ctime_ns != published.st_ctime_ns
+        observed["concurrent"] = concurrent
+        return None
+
+    monkeypatch.setattr(sm, "_security_scan_skill", _allow_after_stealth_update)
+    record = wa.stage_write(
+        wa.SKILLS,
+        payloads[mutation],
+        summary=f"successful scanner race {mutation}",
+        origin="foreground",
+        session_context=_SESSION_CONTEXT,
+        target_tree_pre_image_hash=sm._target_tree_pre_image_hash("demo"),
+    )
+
+    output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert output is not None
+    assert "Approved 0 skills write(s)." in output
+    assert "target pre-image changed" in output.lower()
+    assert target.read_bytes() == observed["concurrent"]
+    assert wa.get_pending(wa.SKILLS, record["id"]) is not None
+
+
+@pytest.mark.linux_only
+def test_successful_scanner_replay_rechecks_visible_root_after_hash(
+    hermes_home, monkeypatch
+):
+    from pathlib import Path
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as sm
+    from tools import write_approval as wa
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    moved_root = Path(hermes_home) / "skills-original"
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+    armed = {"value": False}
+    injected = {"value": False}
+
+    def _allow_and_arm(_path):
+        armed["value"] = True
+        return None
+
+    real_anchor_is_current = sm._pending_anchor_is_current
+
+    def _replace_root_after_identity_check():
+        current = real_anchor_is_current()
+        if current and armed["value"] and not injected["value"]:
+            skills_dir.rename(moved_root)
+            replacement = skills_dir / "demo"
+            replacement.mkdir(parents=True)
+            (replacement / "SKILL.md").write_text(
+                "concurrent replacement root", encoding="utf-8"
+            )
+            injected["value"] = True
+        return current
+
+    monkeypatch.setattr(sm, "_security_scan_skill", _allow_and_arm)
+    monkeypatch.setattr(sm, "_pending_anchor_is_current", _replace_root_after_identity_check)
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "edit",
+            "name": "demo",
+            "content": _SKILL.replace("body", "edited body"),
+        },
+        summary="visible-root post-scan race",
+        origin="foreground",
+        session_context=_SESSION_CONTEXT,
+        target_tree_pre_image_hash=sm._target_tree_pre_image_hash("demo"),
+    )
+
+    output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert output is not None
+    assert "Approved 0 skills write(s)." in output
+    assert "target pre-image changed" in output.lower()
+    assert injected["value"] is True
+    assert skill_md.read_text(encoding="utf-8") == "concurrent replacement root"
+    assert "edited body" in (moved_root / "demo" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert wa.get_pending(wa.SKILLS, record["id"]) is not None
+
+
+@pytest.mark.linux_only
+def test_successful_scanner_replay_compares_content_hash_on_coarse_ctime(
+    hermes_home, monkeypatch
+):
+    from pathlib import Path
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as sm
+    from tools import write_approval as wa
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+
+    def _coarse_identity(info):
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_nlink,
+            info.st_mode,
+        )
+
+    monkeypatch.setattr(sm, "_pending_fs_identity", _coarse_identity)
+    observed = {}
+
+    def _allow_after_same_identity_update(_path):
+        published = skill_md.stat()
+        concurrent = b"X" * published.st_size
+        skill_md.write_bytes(concurrent)
+        os.utime(
+            skill_md,
+            ns=(published.st_atime_ns, published.st_mtime_ns),
+        )
+        observed["concurrent"] = concurrent
+        return None
+
+    monkeypatch.setattr(sm, "_security_scan_skill", _allow_after_same_identity_update)
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "edit",
+            "name": "demo",
+            "content": _SKILL.replace("body", "edited body"),
+        },
+        summary="coarse-ctime scanner race",
+        origin="foreground",
+        session_context=_SESSION_CONTEXT,
+        target_tree_pre_image_hash=sm._target_tree_pre_image_hash("demo"),
+    )
+
+    output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert output is not None
+    assert "Approved 0 skills write(s)." in output
+    assert "target pre-image changed" in output.lower()
+    assert skill_md.read_bytes() == observed["concurrent"]
+    assert wa.get_pending(wa.SKILLS, record["id"]) is not None
+
+
+@pytest.mark.linux_only
 def test_scanner_rejected_create_removes_unchanged_hermes_tree(
     hermes_home, monkeypatch
 ):
@@ -1228,6 +1441,7 @@ def test_scanner_rejected_new_supporting_file_preserves_concurrent_update(
     assert wa.get_pending(wa.SKILLS, record["id"]) is not None
 
 
+@pytest.mark.linux_only
 @pytest.mark.parametrize("action", ["write_file", "remove_file"])
 def test_descriptor_supporting_file_rejects_late_ancestor_replacement(
     hermes_home, monkeypatch, action
@@ -1298,6 +1512,7 @@ def test_descriptor_supporting_file_rejects_late_ancestor_replacement(
         ).read_text(encoding="utf-8") == "approved-original"
 
 
+@pytest.mark.linux_only
 def test_descriptor_delete_entry_budget_fails_before_mutation(tmp_path, monkeypatch):
     from tools import skill_manager_tool as sm
 
@@ -1322,6 +1537,7 @@ def test_descriptor_delete_entry_budget_fails_before_mutation(tmp_path, monkeypa
     ]
 
 
+@pytest.mark.linux_only
 def test_descriptor_delete_entry_budget_fails_before_nested_mutation(
     tmp_path, monkeypatch
 ):
@@ -1859,6 +2075,7 @@ def test_stage_write_fails_closed_without_owner_only_support(
         )
 
 
+@pytest.mark.linux_only
 def test_owner_only_support_requires_nofollow_openat(monkeypatch):
     from tools import write_approval as wa
 

@@ -1108,13 +1108,28 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if pre_image_guard:
         return pre_image_guard
     _pending_atomic_write_text(skill_md, content)
+    try:
+        published_tree_hash = _pending_assert_anchor_tree_current()
+    except ValueError:
+        if original_content is not None:
+            _pending_assert_published_text_current(skill_md, content)
+            _pending_atomic_write_text(skill_md, original_content)
+        raise
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
+            _pending_assert_published_text_current(skill_md, content)
             _pending_atomic_write_text(skill_md, original_content)
         return {"success": False, "error": scan_error}
+    try:
+        _pending_assert_anchor_tree_current(published_tree_hash)
+    except ValueError:
+        if original_content is not None:
+            _pending_assert_published_text_current(skill_md, content)
+            _pending_atomic_write_text(skill_md, original_content)
+        raise
 
     # Extract description from new content for verbose notifications
     _desc = ""
@@ -1244,12 +1259,25 @@ def _patch_skill(
     if pre_image_guard:
         return pre_image_guard
     _pending_atomic_write_text(target, new_content)
+    try:
+        published_tree_hash = _pending_assert_anchor_tree_current()
+    except ValueError:
+        _pending_assert_published_text_current(target, new_content)
+        _pending_atomic_write_text(target, original_content)
+        raise
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
+        _pending_assert_published_text_current(target, new_content)
         _pending_atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
+    try:
+        _pending_assert_anchor_tree_current(published_tree_hash)
+    except ValueError:
+        _pending_assert_published_text_current(target, new_content)
+        _pending_atomic_write_text(target, original_content)
+        raise
 
     result = {
         "success": True,
@@ -1460,9 +1488,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         expect_absent=original_content is None,
     )
 
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(existing["path"])
-    if scan_error:
+    def _rollback_published_file() -> None:
+        _pending_assert_published_text_current(target, file_content)
         if original_content is not None:
             _pending_atomic_write_text(target, original_content)
         else:
@@ -1470,7 +1497,23 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
                 _pending_unlink(target)
             except FileNotFoundError:
                 pass
+
+    try:
+        published_tree_hash = _pending_assert_anchor_tree_current()
+    except ValueError:
+        _rollback_published_file()
+        raise
+
+    # Security scan — roll back on block
+    scan_error = _security_scan_skill(existing["path"])
+    if scan_error:
+        _rollback_published_file()
         return {"success": False, "error": scan_error}
+    try:
+        _pending_assert_anchor_tree_current(published_tree_hash)
+    except ValueError:
+        _rollback_published_file()
+        raise
 
     result = {
         "success": True,
@@ -1987,6 +2030,45 @@ def _pending_anchor_is_current() -> bool:
         and (current.st_dev, current.st_ino)
         == (anchor["root_dev"], anchor["root_ino"])
     )
+
+
+def _pending_assert_anchor_tree_current(
+    expected_hash: Optional[str] = None,
+) -> Optional[str]:
+    """Validate and hash the published tree around a pathname-based scan."""
+    anchor = _pending_target_anchor.get()
+    if anchor is None:
+        return None
+    if not _pending_anchor_is_current():
+        raise ValueError("Pending skill write target pre-image changed")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(".", flags, dir_fd=anchor["root_fd"])
+    identities: Dict[str, tuple] = {}
+    try:
+        current_hash = _hash_skill_tree_fd(
+            Path(anchor["root_path"]), root_fd, identities
+        )
+    finally:
+        os.close(root_fd)
+    if (
+        identities != anchor.get("tree_identities", {})
+        or not _pending_anchor_is_current()
+        or (expected_hash is not None and current_hash != expected_hash)
+    ):
+        raise ValueError("Pending skill write target pre-image changed")
+    return current_hash
+
+
+def _pending_assert_published_text_current(target: Path, expected: str) -> None:
+    """Permit rollback only while the leaf still contains Hermes-published bytes."""
+    if _pending_target_anchor.get() is None:
+        return
+    try:
+        current = _pending_read_text(target)
+    except FileNotFoundError as exc:
+        raise ValueError("Pending skill write target pre-image changed") from exc
+    if current != expected:
+        raise ValueError("Pending skill write target pre-image changed")
 
 
 @contextmanager
