@@ -71,23 +71,42 @@ def test_one_hundred_pct_produces_chain_exhausted():
 
 
 def test_window_absent_entirely_produces_no_finding():
-    # Live quirk: Codex nulls its 5h window entirely when the weekly is capped.
-    # Absence must never be treated as 0% ("recovered").
+    """Live quirk: Codex nulls its 5h window when the weekly is capped.
+
+    SCOPE NOTE — read before "strengthening" this test. At THIS layer, absence
+    and 0% are genuinely indistinguishable: both correctly yield no finding, so
+    no fixture here can tell a correct `is None: continue` apart from a buggy
+    `used_pct or 0.0`. The property that actually matters — absence must never
+    read as RECOVERED and clear an open episode — is a property of the emit and
+    recovery path, and is pinned in Task 2, not here.
+
+    What this test does pin: a provider whose windows list is EMPTY, and one
+    that omits a window id another provider has, must not cause `evaluate` to
+    synthesise a window from an expected-id schema. It iterates what is present.
+    """
     snap = _snapshot(
         [
+            # Empty windows list entirely — a shape the live file really produces
+            # for balance/unconfigured providers.
+            {"key": "openai-codex", "mode": "budget", "windows": []},
+            # Present-but-partial: has "wk", omits "5h", while the provider below
+            # HAS a 5h window. A schema-driven implementation that iterated
+            # expected ids and defaulted the missing one would diverge here.
             {
-                "key": "openai-codex",
+                "key": "kimi",
                 "mode": "budget",
                 "windows": [
-                    {
-                        "id": "wk",
-                        "label": "Weekly",
-                        "used_pct": 7.0,
-                        "resets_at": "2026-08-20T03:35:25Z",
-                    }
-                    # no "5h" window present at all
+                    {"id": "wk", "label": "Weekly", "used_pct": 7.0},
                 ],
-            }
+            },
+            {
+                "key": "anthropic",
+                "mode": "budget",
+                "windows": [
+                    {"id": "5h", "label": "5h", "used_pct": 3.0},
+                    {"id": "wk", "label": "Weekly", "used_pct": 4.0},
+                ],
+            },
         ]
     )
     assert evaluate(snap) == []
