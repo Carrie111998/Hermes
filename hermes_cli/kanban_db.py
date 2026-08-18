@@ -1271,6 +1271,13 @@ class Run:
     def from_row(cls, row: sqlite3.Row) -> "Run":
         try:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
+            if isinstance(meta, dict):
+                public_metadata_was_none = bool(
+                    meta.pop("_artifact_manifest_public_none", False)
+                )
+                meta.pop("_artifact_manifest", None)
+                if public_metadata_was_none and not meta:
+                    meta = None
         except Exception:
             meta = None
         return cls(
@@ -5629,6 +5636,17 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # A later no-output completion must supersede custody from older runs even
+    # if its completed event is lost. Preserve public ``metadata is None`` while
+    # allocating a private completed-run manifest when stale custody exists.
+    if metadata is None:
+        has_prior_custody = conn.execute(
+            "SELECT 1 FROM task_attachments WHERE task_id = ? "
+            "AND capture_key IS NOT NULL AND uploaded_by = 'kanban_complete' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if has_prior_custody is not None:
+            metadata = {"_artifact_manifest_public_none": True}
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5713,8 +5731,11 @@ def complete_task(
                 }
                 for staged_artifact in staged_artifacts
             ]
-            if artifact_manifest:
-                metadata["artifact_manifest"] = artifact_manifest
+            # Internal, per-run expected-output statement. Persist the empty
+            # list too: it prevents a later no-output completion from falling
+            # back to stale custody rows if its completed event is unavailable.
+            # Run.from_row hides this implementation key from public metadata.
+            metadata["_artifact_manifest"] = artifact_manifest
             for staged_artifact in staged_artifacts:
                 _insert_completion_attachment(
                     conn,
@@ -9855,17 +9876,32 @@ def hydrate_parent_attachments(
         if parent["status"] not in ("done", "archived"):
             raise ParentAttachmentHydrationError(f"parent {parent['id']} is not complete")
 
-        completed_event = conn.execute(
-            "SELECT payload, run_id FROM task_events WHERE task_id = ? "
-            "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+        completed_run = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+            "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
             (parent["id"],),
         ).fetchone()
+        completion_run_id: Optional[int] = (
+            int(completed_run["id"]) if completed_run is not None else None
+        )
+        if completion_run_id is None:
+            completed_event = conn.execute(
+                "SELECT payload, run_id FROM task_events WHERE task_id = ? "
+                "AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+                (parent["id"],),
+            ).fetchone()
+        else:
+            completed_event = conn.execute(
+                "SELECT payload, run_id FROM task_events WHERE task_id = ? "
+                "AND kind = 'completed' AND run_id = ? ORDER BY id DESC LIMIT 1",
+                (parent["id"], completion_run_id),
+            ).fetchone()
         manifest_present = False
         manifest: list[dict[str, Any]] = []
-        completion_run_id: Optional[int] = None
         event_manifest: Optional[list[dict[str, Any]]] = None
         if completed_event is not None:
-            completion_run_id = completed_event["run_id"]
+            if completion_run_id is None and completed_event["run_id"] is not None:
+                completion_run_id = int(completed_event["run_id"])
             try:
                 completion_payload = json.loads(completed_event["payload"] or "{}")
             except (TypeError, json.JSONDecodeError) as exc:
@@ -9881,11 +9917,6 @@ def hydrate_parent_attachments(
                     )
                 event_manifest = raw_manifest
 
-        completed_run = conn.execute(
-            "SELECT id, metadata FROM task_runs WHERE task_id = ? "
-            "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
-            (parent["id"],),
-        ).fetchone()
         run_manifest: Optional[list[dict[str, Any]]] = None
         if completed_run is not None and completed_run["metadata"]:
             try:
@@ -9894,19 +9925,13 @@ def hydrate_parent_attachments(
                 raise ParentAttachmentHydrationError(
                     f"parent {parent['id']} has malformed completed-run metadata"
                 ) from exc
-            if isinstance(run_metadata, dict) and "artifact_manifest" in run_metadata:
-                raw_run_manifest = run_metadata["artifact_manifest"]
+            if isinstance(run_metadata, dict) and "_artifact_manifest" in run_metadata:
+                raw_run_manifest = run_metadata["_artifact_manifest"]
                 if not isinstance(raw_run_manifest, list):
                     raise ParentAttachmentHydrationError(
                         f"parent {parent['id']} has malformed completed-run artifact manifest"
                     )
                 run_manifest = raw_run_manifest
-                if completion_run_id is None:
-                    completion_run_id = int(completed_run["id"])
-                elif completion_run_id != int(completed_run["id"]):
-                    raise ParentAttachmentHydrationError(
-                        f"parent {parent['id']} completion evidence has conflicting run lineage"
-                    )
 
         if event_manifest is not None and run_manifest is not None:
             if event_manifest != run_manifest:

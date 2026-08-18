@@ -870,6 +870,49 @@ def test_completed_run_manifest_preserves_expected_output_if_event_is_missing(
     assert observed == [b"candidate"]
 
 
+def test_later_no_output_run_does_not_resurrect_stale_custody_if_event_is_missing(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+    observed = []
+    with kb.connect() as conn:
+        parent_id, old_attachment = _complete_parent_output(conn)
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (parent_id,),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, parent_id, summary="superseded with no output")
+        latest = kb.latest_run(conn, parent_id)
+        assert latest.metadata is None
+        assert kb.get_attachment(conn, old_attachment.id) is not None
+        conn.execute(
+            "DELETE FROM task_events WHERE id = ("
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'"
+            ")",
+            (parent_id,),
+        )
+        conn.commit()
+        child_id = kb.create_task(
+            conn,
+            title="do not hydrate superseded output",
+            assignee="09-test",
+            parents=[parent_id],
+            workspace_kind="scratch",
+        )
+        kb.recompute_ready(conn)
+
+        def inspect_spawn(task, workspace):
+            observed.append((Path(workspace) / "candidate.html").exists())
+            return 12345
+
+        result = kb._dispatch_once_locked(conn, spawn_fn=inspect_spawn)
+
+    assert [row[0] for row in result.spawned] == [child_id]
+    assert observed == [False]
+
+
 def test_dispatch_blocks_and_releases_claim_on_malformed_custody_metadata(
     kanban_home,
     monkeypatch,
