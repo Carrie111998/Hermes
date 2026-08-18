@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -285,6 +286,28 @@ class TestJobCRUD:
         )
 
         assert job["deliver"] == deliver
+
+    def test_cronjob_tool_surfaces_api_server_delivery_validation(self, tmp_cron_dir, monkeypatch):
+        from tools.cronjob_tools import cronjob
+
+        monkeypatch.setattr(
+            "tools.cronjob_tools._origin_from_env",
+            lambda: {"platform": "api_server", "chat_id": "session-1"},
+        )
+        monkeypatch.setattr(
+            "cron.scheduler.create_job_with_scheduler_registration",
+            lambda **kwargs: create_job(**kwargs),
+        )
+
+        result = json.loads(cronjob(
+            action="create",
+            prompt="Follow up later",
+            schedule="30m",
+        ))
+
+        assert result["success"] is False
+        assert "Set deliver='local'" in result["error"]
+        assert load_jobs() == []
 
 
 class TestUpdateJob:
