@@ -6989,6 +6989,46 @@ async def get_model_options(
         raise HTTPException(status_code=500, detail="Failed to list model options")
 
 
+@app.get("/api/model/openrouter/endpoints")
+async def get_openrouter_endpoints(
+    model: str,
+    profile: Optional[str] = None,
+    refresh: bool = False,
+):
+    """Return normalized OpenRouter endpoints for one profile and model."""
+    from hermes_cli.openrouter_endpoints import (
+        OpenRouterEndpointError,
+        fetch_openrouter_endpoints,
+    )
+
+    def _fetch_scoped() -> dict:
+        with _profile_scope(profile) as scoped_home:
+            env = load_env()
+            api_key = env.get("OPENROUTER_API_KEY", "").strip()
+            requested_profile = (profile or "").strip().lower()
+            if not api_key and requested_profile in {"", "current"}:
+                api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+            if not api_key:
+                raise OpenRouterEndpointError(
+                    401,
+                    "OpenRouter API key is not configured for this profile; run 'hermes auth add openrouter'",
+                )
+            profile_home = scoped_home or get_hermes_home()
+            return fetch_openrouter_endpoints(
+                model,
+                api_key=api_key,
+                profile_id=str(profile_home),
+                refresh=bool(refresh),
+            )
+
+    try:
+        return await run_in_threadpool(_fetch_scoped)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except OpenRouterEndpointError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+
+
 @app.get("/api/model/recommended-default")
 def get_recommended_default_model(provider: str = ""):
     """Return the recommended default model for a freshly-authenticated provider.
