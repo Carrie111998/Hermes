@@ -2812,6 +2812,11 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Optional user-timer destination for the metadata-only Kanban
+        # summary runner. Empty keeps the timer fail-closed until configured.
+        "summary": {
+            "telegram_target": "",
+        },
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

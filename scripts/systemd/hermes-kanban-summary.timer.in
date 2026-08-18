@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Hermes metadata-only Kanban summary
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+Unit=hermes-kanban-summary.service
+
+[Install]
+WantedBy=timers.target
