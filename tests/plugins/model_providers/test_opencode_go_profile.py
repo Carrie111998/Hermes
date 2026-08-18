@@ -16,6 +16,11 @@ def opencode_go_profile():
     return profile
 
 
+def test_opencode_go_disables_vision_tool_messages(opencode_go_profile):
+    """OpenCode Go accepts images in user messages, not tool-result messages."""
+    assert opencode_go_profile.supports_vision_tool_messages is False
+
+
 class TestOpenCodeGoKimiReasoning:
     """Kimi K2 models use Moonshot's thinking + reasoning_effort shape on OpenCode Go."""
 
