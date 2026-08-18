@@ -237,7 +237,7 @@ The rewrite only applies to page navigation URLs with loopback hosts (`localhost
 
 Or configure via `hermes tools` → Browser Automation → Camofox.
 
-When `CAMOFOX_URL` is set, all browser tools automatically route through Camofox instead of Browserbase or agent-browser.
+When `CAMOFOX_URL` is set, all browser tools automatically route through Camofox instead of Browserbase or agent-browser. You can also attach at runtime with `/browser connect http://localhost:9377` (or `localhost:9377`) — Hermes detects the Camofox health endpoint and switches backends without requiring the env var to be pre-set.
 
 #### Persistent browser sessions
 
@@ -370,9 +370,12 @@ In the CLI, use:
 ```
 /browser connect                 # Auto-launch/connect to a local Chromium-family browser at http://127.0.0.1:9222
 /browser connect ws://host:port  # Connect to a specific CDP endpoint
+/browser connect localhost:9377  # Auto-detect a Camofox server and switch to that backend
 /browser status                  # Check current connection
 /browser disconnect              # Detach and return to cloud/local mode
 ```
+
+`/browser connect` probes `/json/version` first (CDP) and falls back to `/health` (Camofox). The same detection runs in the classic CLI and in TUI/Desktop `browser.manage`. Disconnect restores the previous `CAMOFOX_URL` exactly, including when you reconnect to the already configured Camofox URL.
 
 If a browser isn't already running with remote debugging, Hermes will attempt to auto-launch a supported Chromium-family browser with `--remote-debugging-port=9222`. Detection includes Brave, Google Chrome, Chromium, and Microsoft Edge, with common Linux install paths such as `/opt/brave-bin/brave` and `/snap/bin/brave`.
 

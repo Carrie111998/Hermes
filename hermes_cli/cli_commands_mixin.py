@@ -31,12 +31,16 @@ from hermes_constants import display_hermes_home, is_termux as _is_termux_enviro
 from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
+    apply_browser_backend_override,
+    detect_browser_connect_backend,
     discover_local_cdp_url,
     find_free_debug_port,
+    get_browser_connect_override,
     is_browser_debug_ready,
     launch_chrome_debug,
     local_port_in_use,
     manual_chrome_debug_command,
+    restore_browser_backend_override,
 )
 
 
@@ -2305,14 +2309,16 @@ class CLICommandsMixin:
         )
 
     def _handle_browser_command(self, cmd: str):
-        """Handle /browser connect|disconnect|status — manage live Chromium-family CDP connection."""
+        """Handle /browser connect|disconnect|status — manage live browser backend overrides."""
         import platform as _plat
 
         parts = cmd.strip().split(None, 1)
         sub = parts[1].lower().strip() if len(parts) > 1 else "status"
 
         _DEFAULT_CDP = DEFAULT_BROWSER_CDP_URL
-        current = os.environ.get("BROWSER_CDP_URL", "").strip()
+        current_mode, current_override = get_browser_connect_override()
+        current = current_override if current_mode == "cdp" else os.environ.get("BROWSER_CDP_URL", "").strip()
+        current_camofox = os.environ.get("CAMOFOX_URL", "").strip().rstrip("/")
 
         if sub == "use" or sub.startswith("use "):
             # /browser use [off] — toggle Browser Use mode (browser.backend),
@@ -2388,6 +2394,30 @@ class CLICommandsMixin:
                     fragment="",
                 ).geturl()
 
+            detected_mode, detected_url = detect_browser_connect_backend(parsed_cdp.geturl())
+            if detected_mode == "camofox":
+                try:
+                    from tools.browser_tool import cleanup_all_browsers
+                    cleanup_all_browsers()
+                except Exception:
+                    pass
+                apply_browser_backend_override(mode="camofox", url=detected_url)
+                print()
+                print(f"   ✓ Camofox detected at {detected_url}")
+                print()
+                print("🌐 Browser connected to Camofox")
+                print(f"   Endpoint: {detected_url}")
+                print()
+                if hasattr(self, "_pending_input"):
+                    self._pending_input.put(
+                        "[System note: The user invoked /browser connect and connected your browser tools to "
+                        "a live Camofox browser backend. Your browser tools now route through Camofox instead "
+                        "of the default browser backend. Camofox may preserve cookies or sessions depending on "
+                        "its server-side profile configuration. Please await the user's instruction before "
+                        "attempting to operate the browser.]"
+                    )
+                return
+
             # Clear any existing browser sessions so the next tool call uses the new backend
             try:
                 from tools.browser_tool import cleanup_all_browsers
@@ -2461,7 +2491,7 @@ class CLICommandsMixin:
                 print()
                 return
 
-            os.environ["BROWSER_CDP_URL"] = cdp_url
+            apply_browser_backend_override(mode="cdp", url=cdp_url)
             # Eagerly start the CDP supervisor so pending_dialogs + frame_tree
             # show up in the next browser_snapshot.  No-op if already started.
             try:
@@ -2490,8 +2520,9 @@ class CLICommandsMixin:
                 )
 
         elif sub == "disconnect":
-            if current:
-                os.environ.pop("BROWSER_CDP_URL", None)
+            if current_mode:
+                was_camofox = current_mode == "camofox"
+                restore_browser_backend_override()
                 try:
                     from tools.browser_tool import cleanup_all_browsers, _stop_cdp_supervisor
                     _stop_cdp_supervisor("default")
@@ -2499,18 +2530,18 @@ class CLICommandsMixin:
                 except Exception:
                     pass
                 print()
-                print("🌐 Browser disconnected from live Chromium-family browser")
+                print("🌐 Browser disconnected from Camofox" if was_camofox else "🌐 Browser disconnected from live Chromium-family browser")
                 print("   Browser tools reverted to default mode (local headless or cloud provider)")
                 print()
 
                 if hasattr(self, '_pending_input'):
                     self._pending_input.put(
-                        "[System note: The user has disconnected the browser tools from their live Chromium-family browser. "
+                        "[System note: The user has disconnected the browser tools from their explicit browser backend override. "
                         "Browser tools are back to default mode (headless local browser or cloud provider).]"
                     )
             else:
                 print()
-                print("Browser is not connected to a live Chromium-family browser (already using default mode)")
+                print("Browser is not connected to an explicit browser override (already using default mode)")
                 print()
 
         elif sub == "status":
@@ -2520,14 +2551,22 @@ class CLICommandsMixin:
                 _bu_mode = is_browser_use_cli_mode()
             except Exception:
                 _bu_mode = False
-            if _bu_mode:
+            if current_mode == "camofox":
+                print("🌐 Browser: connected to Camofox")
+                print(f"   Endpoint: {current_override}")
+                print("   Status: ✓ configured")
+            elif _bu_mode:
                 print("🌐 Browser: Browser Use mode (browser_exec via the Browser Use CLI 3.0)")
                 print("   Local Chrome via CDP, or Browser Use cloud browsers")
                 print()
                 print("   /browser use off      — revert to the built-in browser tools")
                 print()
                 return
-            if current:
+            elif current_camofox and not current:
+                print("🌐 Browser: Camofox (configured)")
+                print(f"   Endpoint: {current_camofox}")
+                print("   Status: ✓ configured")
+            elif current:
                 print("🌐 Browser: connected to live Chromium-family browser via CDP")
                 print(f"   Endpoint: {current}")
 
@@ -2570,7 +2609,7 @@ class CLICommandsMixin:
                     else:
                         print("🌐 Browser: local headless Chromium (agent-browser)")
             print()
-            print("   /browser connect      — connect to your live Chromium-family browser")
+            print("   /browser connect      — connect to Chrome/CDP or Camofox")
             print("   /browser disconnect   — revert to default")
             print()
 
@@ -2578,7 +2617,7 @@ class CLICommandsMixin:
             print()
             print("Usage: /browser connect|disconnect|status|use")
             print()
-            print("   connect      Connect browser tools to your live Chromium-family browser session")
+            print("   connect      Connect browser tools to Chrome CDP or a Camofox server")
             print("   disconnect   Revert to default browser backend")
             print("   status       Show current browser mode")
             print("   use [off]    Switch to Browser Use mode (CLI 3.0) / back to built-in tools")
