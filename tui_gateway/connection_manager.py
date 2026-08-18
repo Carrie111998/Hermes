@@ -134,6 +134,10 @@ class ConnectionManager:
         try:
             url = conn.url.rstrip("/") + "/api/status"
             req = urllib.request.Request(url, method="GET")
+            # Add auth header if using token
+            token = conn.get_effective_token()
+            if token and conn.auth == "token":
+                req.add_header("X-Hermes-Session-Token", token)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 if resp.status == 200:
                     conn.status = "online"
