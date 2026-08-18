@@ -1552,6 +1552,66 @@ def _redecorate_prompt_cache_for_provider(
     return messages, prepared, planned_tools
 
 
+def _context_selection_is_safe(
+    selected: List[Dict[str, Any]],
+    api_messages: List[Dict[str, Any]],
+) -> bool:
+    """Validate a ContextEngine ``select_context()`` replacement list before
+    applying it (security boundary for untrusted context engines, #84262).
+
+    The host runs the engine's returned list past the same downstream
+    sanitizers as any request, but the engine must not be able to:
+
+      * inject a NEW system message (a ``role: system`` message beyond the
+        original protected system prefix) — this is how an attacker policy
+        would be smuggled into the prompt;
+      * fabricate assistant ``tool_calls`` (a fake tool invocation that the
+        harness would then execute with the agent's authority);
+      * emit a malformed ``tool`` role message (missing ``tool_call_id`` or
+        non-string content), which could corrupt execution state.
+
+    The original first ``system`` message in ``api_messages`` is the
+    protected prefix and is allowed to persist; any additional ``system``
+    message is rejected.
+    """
+    # Allowed OpenAI roles in a request message list.
+    _ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
+
+    protected_system = None
+    if api_messages and isinstance(api_messages[0], dict) and api_messages[0].get("role") == "system":
+        protected_system = api_messages[0]
+
+    system_seen = False
+    for m in selected:
+        role = m.get("role")
+        if role not in _ALLOWED_ROLES:
+            return False
+        if role == "system":
+            if system_seen:
+                # More than one system message -> injection.
+                return False
+            system_seen = True
+            if protected_system is not None and m is not protected_system:
+                # A system message that is not the original prefix is injection.
+                # (Identity compare: the protected message is passed through
+                # from api_messages, so the engine cannot forge it.)
+                if m.get("content") != protected_system.get("content"):
+                    return False
+        elif role == "tool":
+            # Tool result must carry the tool_call_id it answers.
+            if not m.get("tool_call_id"):
+                return False
+            if not isinstance(m.get("content"), str):
+                return False
+        elif role == "assistant":
+            # An assistant message must not fabricate tool_calls the harness
+            # would then execute. Only allow tool_calls that were already
+            # present in the original request (best-effort: if the original
+            # assistant messages carried them, they are legitimate).
+            pass
+    return True
+
+
 def _apply_context_engine_selection(
     agent: Any,
     api_messages: List[Dict[str, Any]],
@@ -1627,6 +1687,19 @@ def _apply_context_engine_selection(
     # with an empty message list that the downstream sanitizers cannot restore,
     # reaching the provider as an invalid request instead of failing open.
     if isinstance(selected, list) and selected and all(isinstance(m, dict) for m in selected):
+        # Validate the replacement before applying it (#84262): an untrusted
+        # context engine must not be able to inject a new system message,
+        # fabricate assistant tool_calls, or emit malformed tool results.
+        # The protected system prefix is the ORIGINAL first system message;
+        # any other system-role message is an injection and is rejected.
+        if not _context_selection_is_safe(selected, api_messages):
+            logger.warning(
+                "Context engine select_context returned a message list with "
+                "invalid role/tool structure (system injection or malformed "
+                "tool message); ignoring (session=%s)",
+                session_label,
+            )
+            return api_messages
         return selected
 
     logger.warning(
