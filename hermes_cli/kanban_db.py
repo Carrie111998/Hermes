@@ -8971,7 +8971,6 @@ def _spawn_goal_mode_recovery_card(
         goal_mode=False,
         created_by=_GOAL_MODE_RECOVERY_CREATED_BY,
         idempotency_key=idempotency_key,
-        initial_status="ready",
     )
 
     # Block the original so its violation streak stops accumulating
