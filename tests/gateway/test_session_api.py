@@ -450,6 +450,10 @@ async def test_session_chat_stream_treats_pre_existing_poisoned_row_as_no_model(
                 json={"message": "hi"},
             )
             assert resp.status == 200
+            # The SSE handler runs _run_agent in a background task after the
+            # headers are sent; drain the stream so the call has happened
+            # before we inspect the mock (otherwise call_args is a race).
+            await resp.text()
 
     _, kwargs = mock_run.call_args
     assert kwargs["session_model"] is None
