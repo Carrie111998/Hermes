@@ -18546,8 +18546,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
-        """Inner handler that runs under the _running_agents sentinel guard."""
+    async def _handle_message_with_agent(
+        self, event, source, _quick_key: str, run_generation: int
+    ):
+        """Run the routed session lifecycle in the selected profile scope.
+
+        Primary adapters enter through the default profile so authorization and
+        platform secrets remain owned by that adapter.  Route stamping happens
+        during that ingress path, but session creation and transcript loading
+        happen here, before ``_run_agent`` applies its narrower agent scope.  A
+        multiplexed turn therefore has to switch scopes at this boundary so
+        every session-store access and the eventual agent use the same DB.
+
+        Single-profile gateways keep the existing unscoped path unchanged.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._handle_message_with_agent_inner(
+                event, source, _quick_key, run_generation
+            )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        with _profile_runtime_scope(profile_home):
+            return await self._handle_message_with_agent_inner(
+                event, source, _quick_key, run_generation
+            )
+
+    async def _handle_message_with_agent_inner(
+        self, event, source, _quick_key: str, run_generation: int
+    ):
+        """Execute one turn after its profile storage scope has been selected."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
