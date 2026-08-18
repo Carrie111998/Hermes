@@ -1,9 +1,9 @@
 name: Publish Hermes 89376
 
 on:
-  push:
+  pull_request:
     paths:
-      - .github/workflows/hermes-89376-publish.yml
+      - hermes-89376-publish-trigger.txt
   workflow_dispatch:
 
 permissions:
