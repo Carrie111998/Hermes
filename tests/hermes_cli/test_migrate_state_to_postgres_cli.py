@@ -38,6 +38,13 @@ _GOOD_SUMMARY = {
     "target_sessions": 3,
     "target_messages": 12,
     "nul_rows": 0,
+    # Field-value verification results.
+    "field_check": {
+        "sessions_checked": 3,
+        "messages_checked": 12,
+        "field_mismatches": [],
+        "clean": True,
+    },
     "complete": True,
 }
 
@@ -47,6 +54,12 @@ _MISMATCH_SUMMARY = {
     "migrated_messages": 9,
     "target_sessions": 2,
     "target_messages": 9,
+    "field_check": {
+        "sessions_checked": 2,
+        "messages_checked": 9,
+        "field_mismatches": [],
+        "clean": True,
+    },
     "complete": False,
 }
 

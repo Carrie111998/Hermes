@@ -1360,7 +1360,22 @@ class _PostgresCursor:
         want_id = _needs_returning_id(translated) and " RETURNING " not in translated.upper()
         if want_id:
             translated = translated.rstrip().rstrip(";") + " RETURNING id"
-        self._cursor.execute(translated, params or ())
+        # execute() is where a stale TCP connection is actually discovered —
+        # the server drops it between cursor() and the real round-trip. Wrap
+        # with one reconnect-and-retry at this level so the defect path
+        # (stale connection surfaced on EXECUTE, not on cursor()) is covered.
+        # We only retry when the connection adapter reference is available and
+        # the connection is the one that was handed to us at cursor time.
+        try:
+            self._cursor.execute(translated, params or ())
+        except Exception as exc:
+            if not _is_connection_broken_error(exc) or self._conn is None:
+                raise
+            # Reconnect the parent _PostgresConnection and obtain a fresh
+            # psycopg cursor for the retry, then re-run the statement once.
+            self._conn._reconnect()
+            self._cursor = self._conn._conn.cursor()
+            self._cursor.execute(translated, params or ())
         if want_id:
             row = self._cursor.fetchone()
             self.lastrowid = row[0] if row else None
@@ -1594,10 +1609,34 @@ class _PostgresConnection:
         return self.cursor().executescript(sql_script)
 
     def commit(self):
-        return self._call_with_retry("commit", lambda: self._conn.commit())
+        # SAFETY: retrying commit() on a new connection is UNSAFE. If the
+        # connection drops during or after commit, the original transaction's
+        # outcome is UNKNOWN — the data may or may not have landed. A fresh
+        # empty commit on a new connection succeeds vacuously, which would
+        # report durable writes that never happened (synthetic success over an
+        # unknown outcome). Fail closed instead: surface the connection error so
+        # _execute_write sees a genuine failure and does NOT treat it as success.
+        try:
+            return self._conn.commit()
+        except Exception as exc:
+            if _is_connection_broken_error(exc):
+                raise RuntimeError(
+                    "PostgreSQL commit: connection lost during or after COMMIT — "
+                    "transaction outcome is UNKNOWN; NOT retrying to avoid "
+                    "reporting synthetic success over an unknown write"
+                ) from exc
+            raise
 
     def rollback(self):
-        return self._call_with_retry("rollback", lambda: self._conn.rollback())
+        # Rollback on a dead connection is a no-op (the server already rolled
+        # back on disconnect). Best-effort: swallow connection errors so the
+        # caller's except/finally path is not blocked by a cascade error.
+        try:
+            return self._conn.rollback()
+        except Exception as exc:
+            if _is_connection_broken_error(exc):
+                return None
+            raise
 
     def close(self):
         # Close is best-effort and never reconnects — the caller is shutting
@@ -1669,29 +1708,49 @@ def resolve_postgres_dsn(config: Optional[Dict[str, Any]] = None) -> Optional[st
 
     Returns None when ``sessions.state_backend`` is not "postgres" (the default
     "sqlite" path), so callers can cheaply decide whether to engage this module.
+
+    Fail-loud invariant: ``None`` means "Postgres was NOT selected."  It never
+    means "selection could not be evaluated."  Once the operator has expressed an
+    explicit selection via an env var, any failure in config loading or elsewhere
+    MUST propagate as a targeted error rather than silently returning None (which
+    the caller interprets as "use SQLite instead").
     """
+    # Read the env backend selector FIRST — before any config I/O.  A config
+    # load failure must not mask an explicit env-var selection.
+    env_backend = ""
+    for key in _ENV_BACKEND_KEYS:
+        env_val = (os.environ.get(key) or "").strip().lower()
+        if env_val:
+            env_backend = env_val
+            break
+    if env_backend in ("postgresql", "pg"):
+        env_backend = "postgres"
+
     if config is None:
         try:
             from hermes_cli.config import load_config
 
             config = load_config()
-        except Exception:
+        except Exception as _cfg_exc:
+            if env_backend == "postgres":
+                # The operator explicitly selected Postgres via env var.
+                # A config-loading failure must NOT silently degrade to SQLite.
+                raise RuntimeError(
+                    f"HERMES_STATE_BACKEND=postgres is set but config loading "
+                    f"failed; cannot evaluate backend selection: {_cfg_exc}"
+                ) from _cfg_exc
+            # No explicit env selection — genuinely not configured for Postgres.
             return None
 
     sessions_cfg = (config or {}).get("sessions") or {}
 
-    # Check env var first, then config.yaml
-    backend = ""
-    for key in _ENV_BACKEND_KEYS:
-        env_val = (os.environ.get(key) or "").strip()
-        if env_val:
-            backend = env_val
-            break
+    # Resolve backend: env var (already read) takes precedence over config.yaml.
+    backend = env_backend
     if not backend:
         backend = str(sessions_cfg.get("state_backend") or "sqlite").strip().lower()
+        if backend in ("postgresql", "pg"):
+            backend = "postgres"
 
-    if backend in ("postgresql", "pg"):
-        backend = "postgres"
     if backend != "postgres":
         return None
 
@@ -2097,23 +2156,67 @@ def _attach_context(conn: Any, decode_content, matches: List[Dict[str, Any]]) ->
 # (``encode_content``), so the migrated content carries the current sentinel and
 # never a raw NUL byte. Message ids and timestamps are preserved for fidelity.
 
-_SESSION_COLUMNS = [
-    "id", "source", "user_id", "model", "model_config", "system_prompt",
-    "parent_session_id", "started_at", "ended_at", "end_reason",
-    "message_count", "tool_call_count", "input_tokens", "output_tokens",
-    "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "cwd",
-    "billing_provider", "billing_base_url", "billing_mode",
-    "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
-    "pricing_version", "title", "api_call_count", "handoff_state",
-    "handoff_platform", "handoff_error", "rewind_count", "archived",
-]
 
-_MESSAGE_COLUMNS = [
-    "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
-    "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
-    "reasoning_content", "reasoning_details", "codex_reasoning_items",
-    "codex_message_items", "platform_message_id", "observed", "active",
-]
+# Module-level cache for _derive_migration_columns; populated once per process.
+_MIGRATION_COLUMNS_CACHE: Optional[Dict[str, List[str]]] = None
+
+
+def _derive_migration_columns(table: str) -> List[str]:
+    """Return the durable column list for ``table`` from the authoritative schema.
+
+    Derived from ``hermes_state.SCHEMA_SQL`` via an in-memory SQLite database
+    and ``PRAGMA table_info`` — the same authoritative source the schema-parity
+    guard and the runtime reconciler use. Any column added to ``SCHEMA_SQL`` is
+    automatically included in the next migration run, so no hand-maintained list
+    can drift.
+
+    Result is memoized so the one-time ``sqlite3.connect(":memory:")`` call
+    happens at most once per process lifetime.
+    """
+    global _MIGRATION_COLUMNS_CACHE
+    if _MIGRATION_COLUMNS_CACHE is None:
+        import sqlite3 as _sqlite3
+        from hermes_state import SCHEMA_SQL  # local import: avoids circular load
+        ref = _sqlite3.connect(":memory:")
+        try:
+            ref.executescript(SCHEMA_SQL)
+            cache: Dict[str, List[str]] = {}
+            for (tbl,) in ref.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall():
+                cache[tbl] = [r[1] for r in ref.execute(
+                    f'PRAGMA table_info("{tbl}")'
+                )]
+        finally:
+            ref.close()
+        _MIGRATION_COLUMNS_CACHE = cache
+    return _MIGRATION_COLUMNS_CACHE.get(table, [])
+
+
+# NOT NULL columns that may be NULL in SQLite rows predating the column's
+# addition.  Maps (table, column) -> default value to substitute when None.
+# The set is closed: every entry here corresponds to a NOT NULL DEFAULT <n>
+# column in SCHEMA_SQL.  When a new NOT NULL DEFAULT column is added to
+# SCHEMA_SQL, add it here so old migrated rows receive the correct default
+# instead of a psycopg NotNullViolation.
+_NOT_NULL_DEFAULTS: Dict[tuple, Any] = {
+    ("sessions", "git_metadata_generation"): 0,
+    ("sessions", "compression_fallback_streak"): 0,
+    ("sessions", "compression_ineffective_count"): 0,
+    ("sessions", "rewind_count"): 0,
+    ("sessions", "archived"): 0,
+    ("sessions", "pinned"): 0,
+    ("sessions", "hidden"): 0,
+    ("messages", "active"): 1,
+    ("messages", "compacted"): 0,
+}
+
+# Columns whose values are JSON-ish structures that must be serialized to text
+# before inserting into PostgreSQL.
+_JSON_COLUMNS = frozenset(
+    ("tool_calls", "reasoning_details", "codex_reasoning_items", "codex_message_items")
+)
 
 
 def _json_for_storage(value: Any) -> Optional[str]:
@@ -2122,6 +2225,20 @@ def _json_for_storage(value: Any) -> Optional[str]:
     if value is None or isinstance(value, str):
         return value
     return json.dumps(value)
+
+
+def _coalesce_not_null(table: str, col: str, value: Any) -> Any:
+    """Return *value*, substituting the NOT NULL default when it is None.
+
+    Old SQLite rows that predate a NOT NULL DEFAULT N column addition may
+    carry NULL for that column.  Postgres rejects a NULL for a NOT NULL column
+    even when the schema supplies a DEFAULT, because the DEFAULT only applies
+    to omitted columns in an INSERT — an explicit NULL overrides it.  Use
+    ``_NOT_NULL_DEFAULTS`` to fill the gap.
+    """
+    if value is not None:
+        return value
+    return _NOT_NULL_DEFAULTS.get((table, col))  # None for non-listed columns
 
 
 def import_session(conn: Any, decode_content, encode_content,
@@ -2138,47 +2255,47 @@ def import_session(conn: Any, decode_content, encode_content,
     sentinel is decoded to its native object and re-encoded with the current
     (NUL-free) sentinel. No NUL byte is ever written to PostgreSQL. Message
     ids/timestamps are preserved.
+
+    The column set is derived at runtime from ``hermes_state.SCHEMA_SQL`` so
+    any column added to the authoritative schema is automatically migrated —
+    no hand-maintained list can drift.
     """
     session_id = session_data["id"]
     messages = session_data.get("messages") or []
 
-    placeholders = ", ".join("?" for _ in _SESSION_COLUMNS)
+    session_cols = _derive_migration_columns("sessions")
+    placeholders = ", ".join("?" for _ in session_cols)
     # INSERT OR IGNORE -> ON CONFLICT DO NOTHING (via the adapter). The target is
     # a fresh database in the normal migration flow; conflict-ignore makes a
     # re-run idempotent without per-row DELETEs, which would otherwise trip the
     # self-referential sessions FK (a parent cannot be deleted while a child
     # still references it).
     conn.execute(
-        f"INSERT OR IGNORE INTO sessions ({', '.join(_SESSION_COLUMNS)}) "
+        f"INSERT OR IGNORE INTO sessions ({', '.join(session_cols)}) "
         f"VALUES ({placeholders})",
         tuple(
-            # rewind_count and archived are NOT NULL DEFAULT 0 in Postgres but
-            # may be NULL in old SQLite rows that predate the column addition.
-            session_data.get(col) if col not in ("rewind_count", "archived")
-            else (session_data.get(col) or 0)
-            for col in _SESSION_COLUMNS
+            _coalesce_not_null("sessions", col, session_data.get(col))
+            for col in session_cols
         ),
     )
 
-    msg_placeholders = ", ".join("?" for _ in _MESSAGE_COLUMNS)
+    msg_cols = _derive_migration_columns("messages")
+    msg_placeholders = ", ".join("?" for _ in msg_cols)
     for message in messages:
         row = dict(message)
         row["session_id"] = session_id
         # decode -> encode normalizes the stored sentinel (legacy NUL -> current)
         # and guarantees no NUL byte survives into PostgreSQL text.
         row["content"] = encode_content(decode_content(row.get("content")))
-        for key in ("tool_calls", "reasoning_details", "codex_reasoning_items",
-                    "codex_message_items"):
-            row[key] = _json_for_storage(row.get(key))
+        for key in _JSON_COLUMNS:
+            if key in row:
+                row[key] = _json_for_storage(row.get(key))
         conn.execute(
-            f"INSERT OR IGNORE INTO messages ({', '.join(_MESSAGE_COLUMNS)}) "
+            f"INSERT OR IGNORE INTO messages ({', '.join(msg_cols)}) "
             f"VALUES ({msg_placeholders})",
             tuple(
-                # active is NOT NULL DEFAULT 1 in Postgres but may be NULL in
-                # old SQLite rows that predate the column addition.
-                row.get(col) if col != "active"
-                else (row.get(col) if row.get(col) is not None else 1)
-                for col in _MESSAGE_COLUMNS
+                _coalesce_not_null("messages", col, row.get(col))
+                for col in msg_cols
             ),
         )
 

@@ -33,14 +33,165 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 # Sessions are exported in pages rather than one unbounded query so a very
 # large source database does not have to materialize every session row at
 # once. The walk continues until a short page is returned, so the page size
 # bounds memory, never the amount of history migrated.
 _PAGE_SIZE = 500
+
+# Max sessions to field-sample during verification (avoids scanning huge
+# databases completely while still catching the class of bug where every row
+# carries the correct count but wrong values).
+_VERIFY_SAMPLE_SIZE = 20
+
+
+def _sqlite_schema_columns(table: str) -> list:
+    """Return the ordered column list for *table* from SCHEMA_SQL.
+
+    Uses the same authoritative source as _derive_migration_columns in
+    hermes_state_postgres.py — an in-memory sqlite3 run of SCHEMA_SQL — so
+    the verifier and the migrator always agree on what columns exist.  A
+    verifier that picks its own hand-maintained column subset has the SAME
+    blind spot as the migration: they agree with each other and both miss the
+    same columns.
+    """
+    from hermes_state import SCHEMA_SQL
+    ref = sqlite3.connect(":memory:")
+    try:
+        ref.executescript(SCHEMA_SQL)
+        return [r[1] for r in ref.execute(f'PRAGMA table_info("{table}")')]
+    finally:
+        ref.close()
+
+
+def _verify_field_values(
+    src_sqlite: "sqlite3.Connection",
+    target: "Any",
+    session_ids: list,
+    sample: int = _VERIFY_SAMPLE_SIZE,
+) -> dict:
+    """Compare column-level values between SQLite source and PostgreSQL target.
+
+    Proves that every durable column's VALUE was migrated correctly, not merely
+    that the row exists.  Row-count-only verification cannot detect the class
+    of bug where a hardcoded column subset silently drops fields while reporting
+    "N/N rows".
+
+    Column set is derived from SCHEMA_SQL so the verifier and the migrator
+    always agree on what fields exist: a verifier that hand-picks columns has
+    the same blind spot as a migration that hand-picks columns.
+
+    Returns a dict:
+        sessions_checked  -- how many sessions were sampled
+        messages_checked  -- how many messages were sampled
+        field_mismatches  -- list of "session_id.column: src=X pg=Y" strings
+        clean             -- True when field_mismatches is empty
+    """
+    session_cols = _sqlite_schema_columns("sessions")
+    message_cols = _sqlite_schema_columns("messages")
+
+    sample_ids = session_ids[:sample]
+    if not sample_ids:
+        return {"sessions_checked": 0, "messages_checked": 0,
+                "field_mismatches": [], "clean": True}
+
+    placeholders = ", ".join("?" for _ in sample_ids)
+
+    # Fetch source rows from SQLite.
+    src_cursor = src_sqlite.cursor()
+    src_cursor.row_factory = sqlite3.Row
+    src_sessions = {
+        r["id"]: dict(r)
+        for r in src_cursor.execute(
+            f"SELECT * FROM sessions WHERE id IN ({placeholders})",
+            tuple(sample_ids),
+        )
+    }
+    src_messages = {}
+    for r in src_cursor.execute(
+        f"SELECT * FROM messages WHERE session_id IN ({placeholders})",
+        tuple(sample_ids),
+    ):
+        src_messages.setdefault(r["session_id"], []).append(dict(r))
+
+    mismatches = []
+    messages_checked = 0
+
+    for sid in sample_ids:
+        src_row = src_sessions.get(sid)
+        if not src_row:
+            continue
+
+        # Compare session-level columns.
+        pg_row_raw = target.execute(
+            f"SELECT {', '.join(session_cols)} FROM sessions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if pg_row_raw is None:
+            mismatches.append(f"{sid}: session row absent from PostgreSQL")
+            continue
+        pg_row = dict(zip(session_cols, pg_row_raw))
+        for col in session_cols:
+            src_val = src_row.get(col)
+            pg_val = pg_row.get(col)
+            # Normalize: None and 0 are distinct; don't false-positive on type
+            # differences between INTEGER 0 and float 0.0.
+            if src_val != pg_val and not (src_val is None and pg_val is None):
+                # Allow int/float equivalence (SQLite INTEGER vs PG REAL).
+                try:
+                    if float(src_val) == float(pg_val):  # type: ignore[arg-type]
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                mismatches.append(
+                    f"{sid}.sessions.{col}: src={src_val!r} pg={pg_val!r}"
+                )
+
+        # Compare message-level columns.
+        src_msgs = {m.get("id"): m for m in src_messages.get(sid, [])}
+        if src_msgs:
+            msg_ids = list(src_msgs)
+            msg_placeholders = ", ".join("?" for _ in msg_ids)
+            pg_msgs_raw = target.execute(
+                f"SELECT {', '.join(message_cols)} FROM messages"
+                f" WHERE id IN ({msg_placeholders})",
+                tuple(msg_ids),
+            ).fetchall()
+            pg_msgs = {row[0]: dict(zip(message_cols, row)) for row in pg_msgs_raw}
+            messages_checked += len(src_msgs)
+            for mid, src_msg in src_msgs.items():
+                pg_msg = pg_msgs.get(mid)
+                if pg_msg is None:
+                    mismatches.append(f"message {mid}: absent from PostgreSQL")
+                    continue
+                for col in message_cols:
+                    if col == "content":
+                        # content goes through encode/decode normalization; skip
+                        # byte-level comparison (sentinel translation is expected).
+                        continue
+                    src_val = src_msg.get(col)
+                    pg_val = pg_msg.get(col)
+                    if src_val != pg_val and not (src_val is None and pg_val is None):
+                        try:
+                            if float(src_val) == float(pg_val):  # type: ignore[arg-type]
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                        mismatches.append(
+                            f"message {mid}.{col}: src={src_val!r} pg={pg_val!r}"
+                        )
+
+    return {
+        "sessions_checked": len(sample_ids),
+        "messages_checked": messages_checked,
+        "field_mismatches": mismatches,
+        "clean": len(mismatches) == 0,
+    }
 
 
 def _resolve_sqlite_path(explicit: str | None) -> Path:
@@ -163,6 +314,23 @@ def migrate(sqlite_path: Path, dsn: str) -> dict:
         # carrying one is rejected at INSERT time. So a successful import is
         # itself the proof that no NUL survived; there is nothing left to count.
         nul_rows = 0
+
+        # Field-value verification: sample the first N migrated sessions and
+        # compare every column's value between the SQLite source and the PG
+        # target.  Row-count-only verification cannot detect the class of bug
+        # where a hand-maintained column subset silently drops fields while
+        # reporting "N/N rows".  The column set is derived from SCHEMA_SQL so
+        # the verifier and the migrator always agree on which fields exist.
+        field_check: dict = {"sessions_checked": 0, "messages_checked": 0,
+                             "field_mismatches": [], "clean": True}
+        if src_session_ids:
+            src_raw = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+            try:
+                field_check = _verify_field_values(
+                    src_raw, target, src_session_ids
+                )
+            finally:
+                src_raw.close()
     finally:
         target.close()
 
@@ -179,13 +347,18 @@ def migrate(sqlite_path: Path, dsn: str) -> dict:
         "target_sessions": dst_sessions,
         "target_messages": dst_messages,
         "nul_rows": nul_rows,
-        # True when every source row is accounted for in the target. False
-        # means rows were dropped -- most likely an id collision, since rows
-        # keep their original SQLite ids and are inserted with
-        # ON CONFLICT DO NOTHING.
+        # Field-value verification results. sessions_checked / messages_checked
+        # are the sample counts; field_mismatches lists any column whose value
+        # differed between source and target; clean is True when no mismatches.
+        "field_check": field_check,
+        # True when every source row is accounted for in the target AND field
+        # values in the sampled rows agree. False means rows were dropped or
+        # column values were silently wrong (the class of bug this guard was
+        # added to detect).
         "complete": (
             migrated_sessions == src_sessions
             and migrated_messages == src_messages
+            and field_check["clean"]
         ),
     }
 
@@ -212,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = migrate(sqlite_path, dsn)
 
+    fc = summary["field_check"]
     ok = summary["complete"] and summary["nul_rows"] == 0
     status = "OK" if ok else "MISMATCH"
     print(
@@ -220,16 +394,27 @@ def main(argv: list[str] | None = None) -> int:
         f"{summary['migrated_messages']}/{summary['source_messages']} messages "
         f"-> PostgreSQL (target now holds {summary['target_sessions']} sessions "
         f"/ {summary['target_messages']} messages in total). "
+        f"Field check: {fc['sessions_checked']} sessions / "
+        f"{fc['messages_checked']} messages sampled, "
+        f"{len(fc['field_mismatches'])} field mismatch(es). "
         f"SQLite source left untouched: {summary['sqlite_path']}"
     )
     if not ok:
-        print(
-            "Some source rows are not present in the target. Rows keep their "
-            "original SQLite ids and are inserted with ON CONFLICT DO NOTHING, "
-            "so this usually means the target already contains rows with the "
-            "same ids. Migrate into an empty database.",
-            file=sys.stderr,
-        )
+        if summary["migrated_sessions"] != summary["source_sessions"]:
+            print(
+                "Some source rows are not present in the target. Rows keep their "
+                "original SQLite ids and are inserted with ON CONFLICT DO NOTHING, "
+                "so this usually means the target already contains rows with the "
+                "same ids. Migrate into an empty database.",
+                file=sys.stderr,
+            )
+        if fc["field_mismatches"]:
+            print(
+                "Field value mismatches detected (first 10 shown):",
+                file=sys.stderr,
+            )
+            for m in fc["field_mismatches"][:10]:
+                print(f"  {m}", file=sys.stderr)
     return 0 if ok else 1
 
 

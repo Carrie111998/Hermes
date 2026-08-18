@@ -819,3 +819,128 @@ def test_search_sql_uses_no_trigram_operators():
         + ". The extension must stay an optimization, not a requirement — "
         "managed PostgreSQL can refuse to install it."
     )
+
+
+# ---------------------------------------------------------------------------
+# Migration column-fidelity guard (Blocker 1)
+#
+# The one-shot SQLite -> PostgreSQL migration used hand-maintained column
+# lists (_SESSION_COLUMNS / _MESSAGE_COLUMNS) that had drifted from the live
+# schema: 33 of 56 session columns and 18 of 23 message columns were copied,
+# silently dropping the rest while reporting "N/N sessions, M/M messages".
+#
+# The fix replaces those lists with _derive_migration_columns(), which derives
+# the column set from SCHEMA_SQL via PRAGMA table_info at runtime.  These
+# tests are the static CI gate: they fail when a column is declared in
+# SCHEMA_SQL but not present in the derived migration set, without requiring
+# Docker or a live PostgreSQL server.
+# ---------------------------------------------------------------------------
+
+
+def test_migration_columns_cover_full_schema():
+    """Every column declared in SCHEMA_SQL must be in the derived migration set.
+
+    The primary regression guard for the data-loss bug: a hand-maintained
+    column list had drifted to 33/56 session columns and 18/23 message columns,
+    silently dropping the rest. The fix derives the set from SCHEMA_SQL at
+    runtime; this test asserts that derivation is complete.
+
+    The test is self-updating: any column added to SCHEMA_SQL is automatically
+    covered -- there is no list to forget to update.
+    """
+    from hermes_state_postgres import _derive_migration_columns
+
+    sqlite_tables = _sqlite_tables()
+
+    for table in ("sessions", "messages"):
+        declared = sqlite_tables[table]
+        derived = _derive_migration_columns(table)
+        derived_set = set(derived)
+        missing = [c for c in declared if c not in derived_set]
+        assert not missing, (
+            f"{table}: columns declared in SCHEMA_SQL but absent from "
+            f"_derive_migration_columns('{table}'): {missing}. "
+            f"These columns would be silently dropped by the migration. "
+            f"Do NOT add a hand-maintained fallback list -- fix the derivation."
+        )
+
+
+def test_migration_column_set_matches_pragma_table_info():
+    """The derived migration columns must exactly match PRAGMA table_info output.
+
+    Anti-regression for the fix itself: if _derive_migration_columns were
+    ever replaced with a hardcoded list (or stopped reading SCHEMA_SQL), the
+    list would eventually drift and this test would catch it.  The oracle here
+    is an independent fresh sqlite3.connect(':memory:') run -- same data,
+    separate code path.
+    """
+    import sqlite3 as _sqlite3
+    from hermes_state import SCHEMA_SQL
+    import hermes_state_postgres as hsp
+
+    # Force a fresh derivation (clear cache) to catch any lazy-init bugs.
+    orig_cache = hsp._MIGRATION_COLUMNS_CACHE
+    hsp._MIGRATION_COLUMNS_CACHE = None
+    try:
+        for table in ("sessions", "messages"):
+            ref = _sqlite3.connect(":memory:")
+            try:
+                ref.executescript(SCHEMA_SQL)
+                expected = [r[1] for r in ref.execute(
+                    f'PRAGMA table_info("{table}")'
+                )]
+            finally:
+                ref.close()
+
+            derived = hsp._derive_migration_columns(table)
+            assert derived == expected, (
+                f"{table}: _derive_migration_columns returned {derived!r} "
+                f"but PRAGMA table_info says {expected!r}. The derivation "
+                f"must match the authoritative SQLite schema oracle exactly."
+            )
+    finally:
+        hsp._MIGRATION_COLUMNS_CACHE = orig_cache
+
+
+def test_not_null_defaults_cover_not_null_columns():
+    """Every NOT NULL DEFAULT N column in SCHEMA_SQL must be in _NOT_NULL_DEFAULTS.
+
+    When the migration writes a row from an old SQLite backup where a column
+    was added later, that column's value will be None.  PostgreSQL rejects an
+    explicit NULL for a NOT NULL column even when the schema supplies a DEFAULT,
+    because the DEFAULT only applies to omitted columns.  _NOT_NULL_DEFAULTS
+    maps (table, column) -> default to substitute.
+
+    Fails when a new NOT NULL DEFAULT N column is added to SCHEMA_SQL without
+    a corresponding entry in _NOT_NULL_DEFAULTS -- caught here rather than as
+    a NotNullViolation during a real user's migration.
+
+    Columns with no DEFAULT (source, started_at, session_id, role, timestamp)
+    are excluded: these are core required fields and a NULL there is a genuinely
+    broken row that should fail loudly.
+    """
+    import sqlite3 as _sqlite3
+    from hermes_state import SCHEMA_SQL
+    from hermes_state_postgres import _NOT_NULL_DEFAULTS
+
+    ref = _sqlite3.connect(":memory:")
+    try:
+        ref.executescript(SCHEMA_SQL)
+        uncovered = []
+        for table in ("sessions", "messages"):
+            for row in ref.execute(f'PRAGMA table_info("{table}")'):
+                _, name, _, notnull, dflt, _ = row
+                if notnull and dflt is not None:
+                    if (table, name) not in _NOT_NULL_DEFAULTS:
+                        uncovered.append(f"{table}.{name} (DEFAULT {dflt})")
+    finally:
+        ref.close()
+
+    assert not uncovered, (
+        "NOT NULL DEFAULT columns missing from _NOT_NULL_DEFAULTS in "
+        "hermes_state_postgres.py: "
+        + ", ".join(uncovered)
+        + ". Old SQLite rows that predate this column carry NULL, which "
+        "PostgreSQL rejects as NotNullViolation during migration. Add the "
+        "column and its default to _NOT_NULL_DEFAULTS."
+    )
