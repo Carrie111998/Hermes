@@ -2395,17 +2395,13 @@ class MCPServerTask:
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
-        # Command allowlist (tasks-69t.4 C2, handoff from the 69t.9 audit):
-        # only a fixed set of interpreters/launchers may be spawned as MCP
-        # stdio servers. Opt-in via security.mcp_stdio_command_allowlist_enabled
-        # (default off — see tools/mcp_command_guard.py for why). When on,
-        # runs on the fully-resolved command, before ANY further preflight or
-        # the StdioServerParameters construction below, so a disallowed
-        # command never reaches subprocess spawn even if a later check is
-        # bypassed. Raises (never silently swallowed).
+        # Opt-in command allowlist (tasks-69t.4 C2) — see tools/mcp_command_guard.py.
         from tools.mcp_command_guard import is_enabled, validate_stdio_command
         if is_enabled():
-            validate_stdio_command(command, server_name=self.name)
+            command = validate_stdio_command(
+                command, server_name=self.name,
+                resolved_path=safe_env.get("PATH"),
+            )
 
         # Check package against OSV malware database before spawning.
         # Run off the event loop (the urllib HTTPS call is blocking) and bound

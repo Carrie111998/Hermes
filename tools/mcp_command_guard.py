@@ -42,11 +42,61 @@ is exempt: it hasn't been resolved to a specific file yet, and if it
 can't be resolved at spawn time it fails with ENOENT regardless of this
 guard.
 
-Provenance is only enforced for the base interpreter set
-(``ALLOWED_STDIO_COMMANDS``); a per-call-site ``extra_allowed`` widening
-(e.g. cua-driver, see below) is a fixed, call-site-owned literal the
-operator's own environment resolves — not a remote MCP server config — so
-it is outside the threat model this closes and is exempt.
+Provenance for a per-call-site ``extra_allowed`` widening (e.g. cua-driver,
+see below) is checked too, but against a DIFFERENT trust source: the base
+interpreter set trusts Hermes' own install dirs or the ambient PATH (see
+:func:`_provenance_ok`), because those names are common and any of many
+installs is legitimate. An ``extra_allowed`` name is call-site-specific and
+usually has exactly one legitimate identity, so its caller must pass
+``extra_trusted_paths`` — the exact resolved, already-trusted absolute
+path(s) that name is allowed to be — and a PATH-FORM ``extra_allowed``
+command is rejected unless it realpath-matches one of them. (Earlier this
+module exempted ``extra_allowed`` from provenance entirely on the theory
+that it is "a fixed, call-site-owned literal the operator's own environment
+resolves" — but cua_backend.py's usage passes a value *read back from a
+subprocess's manifest output*, not a literal, so a compromised or
+misbehaving manifest could name any absolute path and inherit the
+exemption; egilewski review on PR #62808.) A bare ``extra_allowed`` name
+(no path separator) stays exempt, same as a bare interpreter name.
+
+:func:`validate_stdio_command` returns the exact command string it
+validated — for a PATH-FORM command this is the CANONICAL ABSOLUTE form it
+ran provenance checks against, not necessarily the string passed in.
+Callers must use the RETURNED value in ``StdioServerParameters``, not the
+original argument: a relative command is validated by absolutizing it
+against the process's CURRENT working directory, and if the caller instead
+spawned the original (still-relative) string later — after other work
+(e.g. an ``await``, during which the process cwd can move: ``cli.py``'s
+mid-chat ``/resume``/``/sessions <id>`` handling calls ``os.chdir()`` on
+the SAME event loop an MCP stdio server's reconnect loop runs on; unlike
+that path, ``cron/scheduler.py`` deliberately never mutates the process
+cwd for exactly this reason, #69396) — the relative string could resolve
+to a different file at spawn time than the one that was actually checked
+(egilewski review on PR #62808). Returning the resolved value removes the
+gap instead of relying on the cwd staying put.
+
+Only the ``command`` (the interpreter/launcher binary) is validated here —
+not ``args``. A server config can still pass e.g. ``docker`` with
+``args=["run", "--privileged", ...]``; the allowlist bounds WHICH BINARY
+launches, not what an allowed launcher is told to do, so it does not by
+itself bound blast radius for launchers like ``docker`` that are
+general-purpose by design (Enough1122 review on PR #62808).
+
+Provenance for the base interpreter set trusts a fixed list of install
+dirs (see :func:`_trusted_install_dirs`) plus whatever the ambient PATH
+resolves. A project-local, pinned toolchain launcher (e.g.
+``node_modules/.bin/npx``, a common pattern for reproducible builds) is
+NOT one of those and will be rejected when referenced by its own absolute
+path, even though it is a legitimate npx install (Enough1122 review on PR
+#62808) — this is a known compatibility tradeoff of a fixed trusted-dir
+allowlist, not a bug; point such a server config at the project's actual
+node/npx via the ambient PATH (or a trusted install dir) instead. The same
+tradeoff applies to a BARE interpreter (see the ``resolved_path`` param
+below): a server config naming e.g. ``python`` with ``env.PATH`` pointing
+at a project virtualenv's ``bin/`` — the common way to target a specific
+venv interpreter — is rejected once this resolves and provenance-checks
+it, for the same reason a venv is not itself a trusted install dir or on
+the ambient PATH; same workaround.
 
 Opt-in, default off: call sites must check :func:`is_enabled` before
 calling :func:`validate_stdio_command`. Some operators run MCP servers
@@ -82,6 +132,18 @@ def is_enabled() -> bool:
         from hermes_cli.config import load_config
         cfg = load_config().get("security", {}) or {}
     except Exception:
+        # Fail open (allowlist stays disabled) rather than crashing MCP
+        # startup over a config read failure -- but a security control that
+        # silently disables itself on a syntax error or permissions issue
+        # (Enough1122 review on PR #62808) must not do so quietly. Warn so
+        # an operator who believes the allowlist is on can notice it isn't.
+        logger.warning(
+            "MCP stdio command allowlist: could not read config.yaml to "
+            "check security.mcp_stdio_command_allowlist_enabled; treating "
+            "it as disabled. Fix the config error above if you expect the "
+            "allowlist to be active.",
+            exc_info=True,
+        )
         cfg = {}
     return bool(cfg.get("mcp_stdio_command_allowlist_enabled", False))
 
@@ -186,15 +248,18 @@ def validate_stdio_command(
     *,
     server_name: str = "",
     extra_allowed: "frozenset[str] | None" = None,
-) -> None:
+    extra_trusted_paths: "frozenset[str] | None" = None,
+    resolved_path: "str | None" = None,
+) -> str:
     """Validate *command* against the MCP stdio command allowlist.
 
     Accepts absolute paths (e.g. ``/usr/local/bin/npx``) or bare names
     (e.g. ``npx``) — the check is against the given path's basename, with
     any Windows executable suffix stripped, case-insensitively. A resolved
-    ABSOLUTE path in the base interpreter set additionally must have
-    trusted provenance (see :func:`_provenance_ok`) — see the module
-    docstring for why a name-only check is not sufficient on its own.
+    PATH-FORM command (absolute, or relative with a separator) in the base
+    interpreter set additionally must have trusted provenance (see
+    :func:`_provenance_ok`) — see the module docstring for why a name-only
+    check is not sufficient on its own.
 
     ``extra_allowed`` lets a specific call site widen the allowlist for a
     fixed, non-configurable launcher that isn't an interpreter (e.g.
@@ -202,10 +267,57 @@ def validate_stdio_command(
     rather than through python/node). It is deliberately NOT a general
     escape hatch — only pass a literal frozenset of exact binary names the
     call site owns and controls, never anything derived from user input.
+    A PATH-FORM ``extra_allowed`` command additionally requires
+    ``extra_trusted_paths`` — see that parameter and the module docstring
+    (egilewski review on PR #62808: an unconditional exemption here let an
+    arbitrary same-named executable through).
 
-    Raises :class:`DisallowedMcpCommandError` (never returns a bool) so
-    callers fail loudly instead of silently proceeding with a bad command.
-    A security error is always logged before raising.
+    ``extra_trusted_paths``, when given, is a frozenset of exact absolute
+    paths (not directories) that a PATH-FORM ``extra_allowed`` command may
+    realpath-match to be accepted — e.g. the call site's own
+    already-resolved, already-trusted binary. Ignored for the base
+    interpreter set, which uses :func:`_provenance_ok` instead. Has no
+    effect on bare (separator-free) command names, which are exempt from
+    provenance for both the base set and ``extra_allowed``.
+
+    ``resolved_path``, when given, is the PATH string the subprocess env
+    will actually carry (e.g. the server config's own ``env.PATH``). A
+    bare command normally skips provenance entirely, on the theory that
+    it names no specific file yet (see below) — but when this argument is
+    given, that theory no longer holds: this function resolves the bare
+    name itself, via ``shutil.which`` against this exact PATH, and treats
+    the hit exactly like a PATH-FORM command below (full provenance
+    check). An unresolved name is rejected outright, not returned bare,
+    because it has not actually been checked (egilewski + round-6 panel
+    reviews on PR #62808: reachable whenever
+    ``tools.mcp_tool._resolve_stdio_command`` can't resolve the bare name
+    itself first, e.g. an allowlisted interpreter other than npx/npm/node
+    with no fallback candidates, or any allowlisted name given a broken or
+    attacker-influenced subprocess PATH). Two narrower attempts at this —
+    rejecting a relative PATH entry, then also an empty one — both missed
+    an absolute-but-untrusted entry that had no file in it yet at
+    validation time; resolving here instead of pattern-matching PATH
+    entries closes the whole class rather than one more shape of it.
+    Omitting this argument leaves a bare command exempt, unchanged from
+    before this parameter existed.
+
+    Returns the validated command string, fully resolved: for a PATH-FORM
+    command this is ``os.path.realpath`` of the checked path — the SAME
+    file provenance was actually verified against, symlinks followed —
+    not merely the absolutized original. Returning the symlink path
+    instead would leave a window where the symlink is repointed after
+    the check but before spawn; spawning the realpath closes it outright.
+    (Known tradeoff: a wrapper that keys behavior off ``argv[0]``/``$0``
+    matching the invoking symlink name, rather than its own real
+    location, would see a different value. No launcher in the base
+    interpreter set or ``extra_allowed`` is known to do this.) A bare
+    name is returned unchanged when ``resolved_path`` is omitted; when
+    given, a bare name that resolves is returned as the same realpath a
+    PATH-FORM command would be (see ``resolved_path`` above).
+
+    Raises :class:`DisallowedMcpCommandError` so callers fail loudly
+    instead of silently proceeding with a bad command. A security error is
+    always logged before raising.
     """
     allowed = ALLOWED_STDIO_COMMANDS | (extra_allowed or frozenset())
 
@@ -246,9 +358,7 @@ def validate_stdio_command(
     # (/attacker/npx) and relative-with-a-separator paths (./npx,
     # subdir/npx); a relative form is made absolute against the CWD first
     # so it can't skip provenance. A bare name (no separator) is exempt —
-    # it names no specific file yet. extra_allowed entries are
-    # call-site-owned literals, not resolved through any MCP server config,
-    # so they're exempt too — see module docstring.
+    # it names no specific file yet.
     #
     # "Path form" is judged with the CURRENT platform's separators
     # (os.sep/os.altsep) — the same test tools.mcp_tool._resolve_stdio_command
@@ -259,21 +369,77 @@ def validate_stdio_command(
     # '\\' and it gets provenance-checked.
     separators = os.sep + (os.altsep or "")
     is_path_form = any(sep in expanded for sep in separators)
-    if basename in ALLOWED_STDIO_COMMANDS and is_path_form:
+
+    if is_path_form:
         candidate = expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
-        if not _provenance_ok(candidate, basename):
-            real_target = os.path.realpath(candidate)
+    elif resolved_path is None:
+        # Bare name, no PATH to check it against: legacy call shape,
+        # unchanged behavior -- returned exempt from provenance below.
+        return expanded
+    else:
+        # Bare name WITH a subprocess PATH to check: resolve it ourselves,
+        # right here, against the exact PATH string the subprocess will
+        # carry, and require a hit. Two narrower checks tried instead
+        # (reject a relative PATH entry; reject an empty one too) both
+        # missed a case: an ABSOLUTE-but-untrusted PATH entry that simply
+        # has no file in it yet at validation time still passed, and an
+        # attacker able to write into it before spawn got the same
+        # exec-time bypass this whole mechanism exists to close (round-6
+        # panel, PR #62808). An unresolved bare name has not actually been
+        # checked at all, so it is rejected outright instead -- what
+        # resolves here falls through to the SAME provenance check below
+        # as a path-form command, so a resolved-but-untrusted hit is still
+        # rejected, not merely a missing one.
+        which_hit = shutil.which(basename, path=resolved_path)
+        if not which_hit:
             logger.error(
-                "SECURITY: rejected MCP stdio command for server '%s': %r "
-                "matched allowlisted basename %r but resolves to %r, which is "
-                "not a trusted install location (tasks-69t.4 C2 follow-up — "
-                "basename-only checks are bypassable via an attacker-controlled "
-                "PATH; see teknium1 review on PR #62808).",
-                server_name, command, basename, real_target,
+                "SECURITY: rejected MCP stdio command for server '%s': "
+                "%r is a bare command that does not resolve against the "
+                "subprocess PATH %r -- an unresolved bare command is not "
+                "checkable and is rejected before spawning rather than "
+                "left to the OS exec call (round-6 panel, PR #62808).",
+                server_name, command, resolved_path,
             )
             raise DisallowedMcpCommandError(
-                f"MCP server '{server_name}': command {command!r} matched "
-                f"allowlisted basename {basename!r} but resolves to "
-                f"{real_target!r}, which is not a trusted install location. "
-                "Rejected before spawning per security policy (tasks-69t.4 C2)."
+                f"MCP server '{server_name}': command {command!r} is bare "
+                f"and does not resolve against PATH {resolved_path!r} -- "
+                "rejected before spawning per security policy "
+                "(tasks-69t.4 C2)."
             )
+        candidate = os.path.abspath(which_hit)
+
+    real_target = os.path.realpath(candidate)
+
+    if basename in ALLOWED_STDIO_COMMANDS:
+        provenance_ok = _provenance_ok(candidate, basename)
+    else:
+        # extra_allowed, in PATH FORM: unlike the base interpreter set,
+        # this name is call-site-specific and usually has exactly one
+        # legitimate identity, so it is trusted only if it realpath-matches
+        # a path the CALLER has already resolved and vouches for — never
+        # exempted outright (egilewski review on PR #62808: an
+        # unconditional exemption here let an arbitrary same-named
+        # executable through, e.g. a compromised cua-driver manifest
+        # naming an arbitrary absolute path).
+        trusted_targets = {
+            os.path.realpath(p) for p in (extra_trusted_paths or frozenset())
+        }
+        provenance_ok = real_target in trusted_targets
+
+    if not provenance_ok:
+        logger.error(
+            "SECURITY: rejected MCP stdio command for server '%s': %r "
+            "matched allowlisted basename %r but resolves to %r, which is "
+            "not a trusted install location (tasks-69t.4 C2 follow-up — "
+            "basename-only checks are bypassable via an attacker-controlled "
+            "PATH; see teknium1/egilewski reviews on PR #62808).",
+            server_name, command, basename, real_target,
+        )
+        raise DisallowedMcpCommandError(
+            f"MCP server '{server_name}': command {command!r} matched "
+            f"allowlisted basename {basename!r} but resolves to "
+            f"{real_target!r}, which is not a trusted install location. "
+            "Rejected before spawning per security policy (tasks-69t.4 C2)."
+        )
+
+    return real_target

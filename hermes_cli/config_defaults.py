@@ -2156,14 +2156,12 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
-        # Reject MCP stdio server commands that aren't one of a fixed set of
-        # interpreters/launchers (npx, uvx, python, python3, node, docker,
-        # deno) before spawning. Default False (opt-in): some operators run
-        # MCP servers launched via a custom compiled binary or wrapper script
-        # that isn't in this list, and this check would otherwise refuse to
-        # start those servers. Enable once you've confirmed every MCP server
-        # in your config launches through one of the allowed interpreters.
-        # See ``tools/mcp_command_guard.py``.
+        # Reject MCP stdio server commands outside a fixed interpreter
+        # allowlist before spawning. Opt-in (default False) — see
+        # ``tools/mcp_command_guard.py`` for the allowlist, provenance
+        # rules, and known compat tradeoffs (e.g. node_modules/.bin/npx,
+        # or a bare interpreter resolved only via a server-supplied PATH
+        # into a project venv — see that module for the workaround).
         "mcp_stdio_command_allowlist_enabled": False,
     },
 
