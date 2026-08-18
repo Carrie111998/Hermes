@@ -145,6 +145,49 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     assert task.assignee == "fallback"
 
 
+def test_decompose_skips_duplicate_child_and_links_existing_card(kanban_home):
+    # Simulate #88656: a card produced by an earlier, unrelated decomposition
+    # is already open on the board with the same observation title the new
+    # decomposer is about to propose as a child.
+    with kb.connect() as conn:
+        existing_id = kb.create_task(conn, title="Verify two consecutive scheduled imports in production")
+        tid = kb.create_task(conn, title="production incident", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {"title": "Investigate the failure signature", "body": "look it up", "assignee": "researcher", "parents": []},
+            {
+                "title": "verify two consecutive scheduled imports in production",
+                "body": "watch the next two runs",
+                "assignee": "engineer",
+                "parents": [0],
+            },
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    # Only the non-duplicate child was created — no twin of the existing card.
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+
+    with kb.connect() as conn:
+        created_titles = {kb.get_task(conn, cid).title for cid in outcome.child_ids}
+        assert created_titles == {"Investigate the failure signature"}
+        # The existing card is now linked under the new root instead of duplicated.
+        assert tid in kb.parent_ids(conn, existing_id)
+
+
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x")  # ready, not triage
