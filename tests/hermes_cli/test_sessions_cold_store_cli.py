@@ -211,6 +211,54 @@ def test_cold_archive_dry_run_is_read_only_and_does_not_require_snapshot(
     assert _message_rows() == before_messages
 
 
+def test_cold_archive_dry_run_rejects_state_meta_reference_without_mutation(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "new-cold-root"
+    db = SessionDB()
+    try:
+        db.set_meta("goal:lineage-terminal", '{"status":"active"}')
+        assert db._conn is not None
+        before_meta = db._conn.execute(
+            "SELECT key, value FROM state_meta ORDER BY key"
+        ).fetchall()
+    finally:
+        db.close()
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-archive",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--dry-run",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "could not plan cold archive" in out
+    assert "cold purge refuses state_meta soft reference" in out
+    assert "Would run: Store → Verify → Purge" not in out
+    assert not archive_root.exists()
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+    db = SessionDB()
+    try:
+        assert db._conn is not None
+        assert db._conn.execute(
+            "SELECT key, value FROM state_meta ORDER BY key"
+        ).fetchall() == before_meta
+    finally:
+        db.close()
+
+
 def test_cold_archive_yes_runs_store_verify_purge_serially_and_keeps_snapshot(
     session_home: Path,
     monkeypatch: pytest.MonkeyPatch,

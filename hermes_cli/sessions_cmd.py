@@ -919,10 +919,10 @@ def cmd_sessions(args, sessions_parser=None):
 
         archive_root = args.root.expanduser()
         if args.dry_run:
-            from hermes_cli.session_cold_store import plan_archived_lineage
+            from hermes_cli.session_cold_store import preflight_purge_archived_lineage
 
             try:
-                plan_archived_lineage(db, resolved_session_id)
+                preflight_purge_archived_lineage(db, resolved_session_id)
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 print(f"Error: could not plan cold archive: {exc}")
                 db.close()

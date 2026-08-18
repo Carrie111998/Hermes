@@ -829,12 +829,32 @@ def _reject_uncovered_session_references(
                     )
 
 
+def _build_purge_reference_plan(
+    conn: sqlite3.Connection, terminal_id: str
+) -> _StorePlan:
+    """Build the archived source plan and reject every deletion reference."""
+    plan = _build_store_plan(conn, terminal_id)
+    _reject_uncovered_session_references(conn, plan.physical_ids)
+    return plan
+
+
+def preflight_purge_archived_lineage(db: SessionDB, terminal_id: str) -> None:
+    """Check Store planning and Purge references without a snapshot or writes."""
+    _require_supported_platform()
+    conn = _connection(db)
+    with db._lock:
+        conn.execute("SAVEPOINT cold_purge_reference_preflight")
+        try:
+            _build_purge_reference_plan(conn, terminal_id)
+        finally:
+            conn.execute("RELEASE SAVEPOINT cold_purge_reference_preflight")
+
+
 def _validated_purge_plan(
     conn: sqlite3.Connection, terminal_id: str, archive_root: Path
 ) -> tuple[_StorePlan, Path]:
-    plan = _build_store_plan(conn, terminal_id)
+    plan = _build_purge_reference_plan(conn, terminal_id)
     snapshot_dir = _verify_plan_snapshot(archive_root, plan)
-    _reject_uncovered_session_references(conn, plan.physical_ids)
     return plan, snapshot_dir
 
 
