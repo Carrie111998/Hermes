@@ -793,6 +793,33 @@ def test_complete_task_rejects_intermediate_custody_root_symlink(
     assert workspace.exists()
 
 
+def test_complete_task_fails_closed_without_secure_dir_fd_custody(
+    kanban_home,
+    monkeypatch,
+):
+    """Unsupported platforms preserve scratch instead of using link-following IO."""
+    monkeypatch.setattr(kb, "_secure_dir_fd_custody_available", lambda: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unsupported custody platform")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "candidate.txt"
+        artifact.write_text("candidate")
+
+        with pytest.raises(kb.ArtifactPreservationError, match="unavailable"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="must fail closed",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, task_id).status != "done"
+        assert kb.list_attachments(conn, task_id) == []
+    assert workspace.exists()
+    assert artifact.read_text() == "candidate"
+
+
 def test_complete_task_fsyncs_custody_directories_before_commit(kanban_home, monkeypatch):
     fsynced_modes: list[int] = []
     original_fsync = kb.os.fsync

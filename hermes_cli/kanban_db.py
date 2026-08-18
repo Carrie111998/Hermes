@@ -4161,11 +4161,7 @@ def _mkdir_open_nofollow(parent_fd: int, name: str) -> int:
 def _ensure_directory_tree_nofollow(path: Path) -> tuple[Path, int]:
     """Create an absolute directory tree with durable, no-follow components."""
     absolute = Path(os.path.abspath(path))
-    if os.name == "nt":
-        absolute.mkdir(parents=True, exist_ok=True)
-        return absolute, _open_nofollow(absolute, directory=True)
-
-    if not absolute.is_absolute():
+    if os.name != "posix" or not absolute.is_absolute():
         raise OSError(f"custody root must be absolute: {absolute}")
     # Walk the lexical path, not Path.resolve(): resolving first would follow
     # an attacker-controlled intermediate symlink before no-follow admission.
@@ -4179,6 +4175,24 @@ def _ensure_directory_tree_nofollow(path: Path) -> tuple[Path, int]:
     except Exception:
         os.close(current_fd)
         raise
+
+
+def _secure_dir_fd_custody_available() -> bool:
+    """Whether this runtime can enforce descriptor-relative no-follow custody.
+
+    Windows' Python filesystem APIs do not expose the dir-fd and no-follow
+    primitives used below. Fail closed there rather than silently falling back
+    to pathname operations that follow junctions or symlinks.
+    """
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
 
 
 def _sha256_fd(fd: int) -> str:
@@ -5878,6 +5892,28 @@ def _persist_scratch_completion_artifacts(
         return
 
     workspace_root = Path(os.path.abspath(workspace))
+    has_managed_candidate = False
+    for item in raw_artifacts:
+        artifact = str(item).strip() if isinstance(item, str) else ""
+        if not artifact:
+            continue
+        source_path = Path(os.path.abspath(Path(artifact).expanduser()))
+        try:
+            relative = source_path.relative_to(workspace_root)
+        except ValueError:
+            continue
+        if relative.parts:
+            has_managed_candidate = True
+            break
+    if not has_managed_candidate:
+        return
+    if has_managed_candidate and not _secure_dir_fd_custody_available():
+        raise ArtifactPreservationError(
+            "managed scratch artifact custody is unavailable on this platform "
+            "because descriptor-relative no-follow filesystem operations are "
+            "not supported; scratch workspace preserved"
+        )
+
     attachment_root = attachments_root(board=board)
     workspace_fd: Optional[int] = None
     attachment_root_fd: Optional[int] = None
