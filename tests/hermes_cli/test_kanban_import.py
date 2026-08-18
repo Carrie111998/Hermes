@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import stat
 import threading
 from pathlib import Path
 
@@ -95,6 +97,22 @@ def test_import_is_idempotent_and_mirrors_terminal_state(import_env):
             "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='import_mirrored'",
             (task_id,),
         ).fetchone()[0] == 1
+
+
+def test_stale_reconciler_accepts_already_applied_mirror(import_env):
+    path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    adapter = MarkdownAdapter(import_env)
+    with kb.connect_closing() as conn:
+        imported = sync_import(conn, adapter=adapter, import_id="pool")
+    stale = next(adapter.scan())
+    marker = {
+        "import_id": "pool", "task_id": imported[0].task_id, "state": "done",
+    }
+    adapter.write_state(stale, "done", marker)
+    adapter.write_state(stale, "done", marker)
+    assert _read(path)["status"] == "done"
 
 
 def test_writeback_preserves_user_frontmatter_formatting_and_body(import_env):
@@ -240,6 +258,24 @@ def test_duplicate_source_ids_fail_closed(import_env):
         assert kb.list_tasks(conn) == []
 
 
+def test_duplicate_source_ids_skip_existing_import_reconciliation(import_env):
+    first_path = _write(import_env, "one", {
+        "id": "same", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    with kb.connect_closing() as conn:
+        imported = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool")
+        _write(import_env, "two", {
+            "id": "same", "title": "Two", "status": "pending", "assignee": "worker",
+        })
+        before = first_path.read_bytes()
+        result = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    assert [(row.source_id, row.action) for row in result] == [("same", "error")]
+    assert result[0].error == "duplicate source id"
+    assert first_path.read_bytes() == before
+    assert imported[0].task_id is not None
+
+
 def test_cli_import_json_exercises_public_surface(import_env):
     _write(import_env, "one", {
         "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
@@ -315,6 +351,52 @@ def test_concurrent_import_ids_create_one_native_card(import_env):
     with kb.connect_closing() as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
     assert sorted(result.action for result in outcomes) == ["conflict", "imported"]
+
+
+def test_concurrent_same_import_id_is_idempotent(import_env):
+    _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    barrier = threading.Barrier(2)
+
+    class ConcurrentAdapter(MarkdownAdapter):
+        def scan(self):
+            tasks = list(super().scan())
+            barrier.wait(timeout=5)
+            return tasks
+
+    outcomes = []
+
+    def run():
+        with kb.connect_closing() as conn:
+            outcomes.extend(sync_import(
+                conn, adapter=ConcurrentAdapter(import_env), import_id="pool",
+            ))
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_imports").fetchone()[0] == 1
+    assert sorted(result.action for result in outcomes) == ["imported", "unchanged"]
+    assert len({result.task_id for result in outcomes}) == 1
+
+
+@pytest.mark.linux_only
+def test_writeback_preserves_posix_file_mode(import_env):
+    path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    os.chmod(path, 0o640)
+    with kb.connect_closing() as conn:
+        result = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool")
+    assert result[0].action == "imported"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
 def test_later_import_id_rejects_existing_foreign_ownership(import_env):
@@ -441,23 +523,24 @@ def test_watch_continues_after_record_writeback_error(import_env, monkeypatch):
     assert task_ids["ext-1"] is not None
 
 
-def test_mirror_rejects_source_change_after_scan(import_env):
+def test_final_writeback_rejects_definition_change_after_claim(import_env):
     path = _write(import_env, "one", {
         "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
     })
     adapter = MarkdownAdapter(import_env)
-    with kb.connect_closing() as conn:
-        imported = sync_import(conn, adapter=adapter, import_id="pool")
-        task = next(adapter.scan())
-        metadata = task.metadata.copy()
-        metadata["status"] = "pending"
-        _write(import_env, "one", metadata)
-        result = adapter.write_state
-        with pytest.raises(ValueError, match="source changed before writeback"):
-            result(task, "done", {
-                "import_id": "pool", "task_id": imported[0].task_id, "state": "done",
-            })
-    assert _read(path)["status"] == "pending"
+    task = next(adapter.scan())
+    claim_marker = {"import_id": "pool", "state": "importing"}
+    adapter.write_state(task, "importing", claim_marker)
+    metadata = _read(path)
+    metadata["title"] = "Changed after claim"
+    _write(import_env, "one", metadata)
+
+    with pytest.raises(ValueError, match="source changed before writeback"):
+        adapter.write_state(task, "imported", {
+            "import_id": "pool", "task_id": "t_example", "state": "imported",
+        })
+    assert _read(path)["title"] == "Changed after claim"
+    assert _read(path)["status"] == "importing"
 
 
 def test_foreign_ledger_ownership_is_detected_before_source_mutation(import_env):

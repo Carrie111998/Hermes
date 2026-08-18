@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -64,6 +65,7 @@ class ExternalTask:
     tenant: str | None
     max_runtime_seconds: int | None
     revision: str
+    definition_revision: str
     path: Path
     metadata: dict[str, Any]
 
@@ -175,6 +177,13 @@ class MarkdownAdapter:
         revision = hashlib.sha256(
             (json.dumps(semantic, sort_keys=True, ensure_ascii=False) + "\n" + body).encode("utf-8")
         ).hexdigest()
+        definition = {
+            k: v for k, v in metadata.items()
+            if k not in {"status", "hermes_kanban"}
+        }
+        definition_revision = hashlib.sha256(
+            (json.dumps(definition, sort_keys=True, ensure_ascii=False) + "\n" + body).encode("utf-8")
+        ).hexdigest()
         return ExternalTask(
             source_id=source_id,
             title=title,
@@ -189,6 +198,7 @@ class MarkdownAdapter:
             tenant=(str(metadata["tenant"]).strip() if metadata.get("tenant") else None),
             max_runtime_seconds=self._duration(metadata.get("max_runtime"), path),
             revision=revision,
+            definition_revision=definition_revision,
             path=path,
             metadata=metadata,
         )
@@ -265,6 +275,8 @@ class MarkdownAdapter:
             original = source.read()
         current = self._read(task.path, original)
         current_marker = current.metadata.get("hermes_kanban") or {}
+        if current.status == state and current_marker == marker:
+            return
         unchanged = (
             current.revision == task.revision
             and current_marker == (task.metadata.get("hermes_kanban") or {})
@@ -273,6 +285,7 @@ class MarkdownAdapter:
             task.status in _SOURCE_RUNNABLE
             and current.status == "importing"
             and current_marker.get("import_id") == marker.get("import_id")
+            and current.definition_revision == task.definition_revision
         )
         if not unchanged and not resumable_claim:
             raise ValueError(f"{task.path.name}: source changed before writeback")
@@ -287,6 +300,8 @@ class MarkdownAdapter:
                 handle.write(text)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if os.name != "nt":
+                os.chmod(temp_name, stat.S_IMODE(task.path.stat().st_mode))
             os.replace(temp_name, task.path)
         finally:
             try:
@@ -342,8 +357,9 @@ class MarkdownAdapter:
             current = self._read(task.path)
             current_marker = current.metadata.get("hermes_kanban") or {}
             same_resume = (
-                current.status == "importing"
+                current.status in {"importing", "imported"}
                 and current_marker.get("import_id") == marker["import_id"]
+                and current.definition_revision == task.definition_revision
             )
             if not same_resume and (
                 current.revision != task.revision or current.status not in _SOURCE_RUNNABLE
@@ -432,6 +448,8 @@ def sync_import(
     )
     foreign_owned: set[str] = set()
     for source_id, task in by_id.items():
+        if source_id in duplicate_ids:
+            continue
         marker = task.metadata.get("hermes_kanban") or {}
         owner = marker.get("import_id")
         if owner and owner != import_id:
@@ -460,7 +478,7 @@ def sync_import(
     # Existing imports are mirror-only. A source-side transition back to a
     # runnable state is a conflict; Kanban remains the single lifecycle owner.
     for source_id, row in ledger.items():
-        if source_id in foreign_owned:
+        if source_id in foreign_owned or source_id in duplicate_ids:
             continue
         task = by_id.get(source_id)
         native = kb.get_task(conn, row["task_id"])
@@ -554,26 +572,34 @@ def sync_import(
                 with adapter.claim(task, claim_marker) as claimed:
                     source_key = hashlib.sha256(str(task.path).encode("utf-8")).hexdigest()
                     with kb.write_txn(conn):
-                        native_id = kb.create_task(
-                            conn,
-                            title=task.title,
-                            body=task.body or None,
-                            assignee=assignee,
-                            created_by=f"import:{import_id}",
-                            workspace_kind=task.workspace_kind,
-                            workspace_path=task.workspace_path,
-                            priority=task.priority,
-                            parents=parent_ids,
-                            tenant=task.tenant,
-                            idempotency_key=f"external-import:{source_key}",
-                            max_runtime_seconds=task.max_runtime_seconds,
-                            skills=task.skills,
-                        )
-                        conn.execute(
-                            "INSERT INTO task_imports VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (import_id, source_id, str(task.path), task.revision, native_id, "imported", int(time.time())),
-                        )
-                        _event(conn, native_id, "imported", {"import_id": import_id, "source_id": source_id, "source_revision": task.revision})
+                        existing = conn.execute(
+                            "SELECT task_id FROM task_imports WHERE import_id=? AND source_id=?",
+                            (import_id, source_id),
+                        ).fetchone()
+                        resumed_existing = existing is not None
+                        if resumed_existing:
+                            native_id = existing["task_id"]
+                        else:
+                            native_id = kb.create_task(
+                                conn,
+                                title=task.title,
+                                body=task.body or None,
+                                assignee=assignee,
+                                created_by=f"import:{import_id}",
+                                workspace_kind=task.workspace_kind,
+                                workspace_path=task.workspace_path,
+                                priority=task.priority,
+                                parents=parent_ids,
+                                tenant=task.tenant,
+                                idempotency_key=f"external-import:{source_key}",
+                                max_runtime_seconds=task.max_runtime_seconds,
+                                skills=task.skills,
+                            )
+                            conn.execute(
+                                "INSERT INTO task_imports VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (import_id, source_id, str(task.path), task.revision, native_id, "imported", int(time.time())),
+                            )
+                            _event(conn, native_id, "imported", {"import_id": import_id, "source_id": source_id, "source_revision": task.revision})
                 adapter.write_state(claimed, "imported", {
                     "import_id": import_id, "task_id": native_id, "state": "imported",
                 })
@@ -581,7 +607,9 @@ def sync_import(
                 results.append(ImportResult(source_id, "conflict", error=str(exc)))
                 del unresolved[source_id]
                 continue
-            results.append(ImportResult(source_id, "imported", native_id))
+            results.append(ImportResult(
+                source_id, "unchanged" if resumed_existing else "imported", native_id,
+            ))
             del unresolved[source_id]
             progressed = True
         if not progressed:
