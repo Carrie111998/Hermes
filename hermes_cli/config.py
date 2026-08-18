@@ -2187,6 +2187,26 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
     sys.stderr.write("\n".join(lines) + "\n\n")
 
 
+def _dotenv_cwd_keys() -> set:
+    """Return {MESSAGING_CWD, TERMINAL_CWD} keys actually set (uncommented) in .env."""
+    keys: set = set()
+    try:
+        from hermes_constants import get_hermes_home
+
+        env_path = get_hermes_home() / ".env"
+        if not env_path.exists():
+            return keys
+        for line in env_path.read_text(errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("MESSAGING_CWD="):
+                keys.add("MESSAGING_CWD")
+            elif stripped.startswith("TERMINAL_CWD="):
+                keys.add("TERMINAL_CWD")
+    except Exception:
+        pass
+    return keys
+
+
 def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> None:
     """Warn if MESSAGING_CWD or TERMINAL_CWD is set in .env instead of config.yaml.
 
@@ -2195,6 +2215,18 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
     """
     messaging_cwd = os.environ.get("MESSAGING_CWD")
     terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+
+    # Only warn when the var actually comes from .env.  TERMINAL_CWD is also
+    # set programmatically (session cwd restore, worktree launch, gateway cwd
+    # resolution), and warning on those in-process values is a false positive.
+    if messaging_cwd or terminal_cwd_env:
+        env_keys = _dotenv_cwd_keys()
+        if "MESSAGING_CWD" not in env_keys:
+            messaging_cwd = None
+        if "TERMINAL_CWD" not in env_keys:
+            terminal_cwd_env = None
+    if not messaging_cwd and not terminal_cwd_env:
+        return
 
     if config is None:
         try:
