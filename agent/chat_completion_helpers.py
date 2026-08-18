@@ -34,6 +34,10 @@ from agent.error_classifier import (
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
 from agent.errors import EmptyStreamError
+from agent.stream_repetition_guard import (
+    StreamingRepetitionGuard,
+    StreamingRepetitionError,
+)
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -3882,6 +3886,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _conn_cap = min(_base_timeout, 60.0) if _provider_timeout_cfg is not None else 30.0
         content_parts: list = []
         tool_calls_acc: dict = {}
+        # ── Streaming repetition guard ──
+        # Detects degenerate repetition IN the stream, before max_tokens is
+        # reached.  Without this, a model in a repetition loop can spend its
+        # entire output budget echoing one fragment while the user watches
+        # helplessly.  The existing repetition_guard.py only fires
+        # POST-truncation (finish_reason=length); this guard fires DURING
+        # streaming, tearing down the connection immediately.
+        _stream_rep_guard = StreamingRepetitionGuard()
         tool_gen_notified: set = set()
         # Ollama-compatible endpoints reuse index 0 for every tool call
         # in a parallel batch, distinguishing them only by id.  Track
@@ -4142,6 +4154,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
                 content_parts.append(delta.content)
+                # ── Live repetition check ──
+                # Cheap rolling-window check every ~200 chars.  When tripped,
+                # tear down the stream immediately instead of continuing to
+                # waste tokens on degenerate output.
+                if _stream_rep_guard.append(delta.content):
+                    _close_managed_stream()
+                    logger.warning(
+                        "Streaming repetition guard tripped at %d chars "
+                        "(model=%s) — aborting stream to prevent token waste.",
+                        _stream_rep_guard.accumulated_length,
+                        api_kwargs.get("model", "unknown"),
+                    )
+                    raise StreamingRepetitionError(
+                        f"Live stream repetition detected at "
+                        f"{_stream_rep_guard.accumulated_length} chars"
+                    )
                 if not tool_calls_acc:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
                         pending_text_parts.append(delta.content)
@@ -4739,6 +4767,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
+                    # Degenerate repetition is terminal — no retry, no
+                    # fallback.  The model is in a broken state; retrying
+                    # sends the same prompt and gets the same garbage.  Abort
+                    # immediately, mirroring the post-truncation guard in
+                    # conversation_loop.py.
+                    _is_stream_rep = isinstance(e, StreamingRepetitionError)
+                    if _is_stream_rep:
+                        logger.warning(
+                            "Streaming repetition guard tripped — aborting "
+                            "turn without retry (model=%s).",
+                            api_kwargs.get("model", "unknown"),
+                        )
+                        result["error"] = e
+                        try:
+                            agent._fire_stream_delta(
+                                "\n\n⚠️ **Response Stopped — "
+                                "Repetition Detected**\n\n"
+                                "The model entered a repetition loop during "
+                                "streaming.  The stream was aborted to "
+                                "prevent token waste.\n\n"
+                                "→ Switch to a different model with `/model`\n"
+                                "→ Or resend your message"
+                            )
+                        except Exception:
+                            pass
+                        return
 
                     # If the stream died AFTER some tokens were delivered:
                     # normally we don't retry (the user already saw text,
