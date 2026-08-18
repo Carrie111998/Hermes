@@ -4169,13 +4169,16 @@ class AIAgent:
             "commandcode-anthropic",
             "commandcode-claude",
         }:
+            self._clear_account_usage_notices()
             return False
         if not os.environ.get("COMMANDCODE_SESSION_COOKIE"):
+            self._clear_account_usage_notices()
             return False
         if (
             getattr(self, "notice_callback", None) is None
             and getattr(self, "notice_clear_callback", None) is None
         ) or not self._credits_notices_enabled():
+            self._clear_account_usage_notices()
             return False
 
         import threading
@@ -4207,15 +4210,30 @@ class AIAgent:
                     api_key=getattr(self, "api_key", None),
                 )
                 if snapshot is None:
+                    self._clear_account_usage_notices()
                     return
-                latch = getattr(self, "_account_usage_notice_latch", None)
-                if latch is None:
-                    latch = self._account_usage_notice_latch = new_account_usage_notice_latch()
-                to_show, to_clear = evaluate_account_usage_notices(snapshot, latch)
-                for key in to_clear:
-                    self._emit_notice_clear(key)
-                for notice in to_show:
-                    self._emit_notice(notice)
+                with lock:
+                    # A fallback/model switch or cookie removal can race the
+                    # network request. Never publish the old provider's result
+                    # after the current runtime has left that account.
+                    if (
+                        str(getattr(self, "provider", "") or "").strip().lower()
+                        != provider
+                        or not os.environ.get("COMMANDCODE_SESSION_COOKIE")
+                        or not self._credits_notices_enabled()
+                    ):
+                        return
+                    latch = getattr(self, "_account_usage_notice_latch", None)
+                    if latch is None:
+                        latch = self._account_usage_notice_latch = (
+                            new_account_usage_notice_latch()
+                        )
+                    to_show, to_clear = evaluate_account_usage_notices(snapshot, latch)
+                    # Keep clear/show ordering serialized with lifecycle cleanup.
+                    for key in to_clear:
+                        self._emit_notice_clear(key)
+                    for notice in to_show:
+                        self._emit_notice(notice)
             except Exception:
                 logger.debug("provider account usage notice refresh failed", exc_info=True)
             finally:
@@ -4228,6 +4246,23 @@ class AIAgent:
             daemon=True,
         ).start()
         return True
+
+    def _clear_account_usage_notices(self) -> bool:
+        """Clear provider-account sticky notices and discard their latch."""
+        import threading
+
+        lock = getattr(self, "_account_usage_refresh_lock", None)
+        if lock is None:
+            lock = self._account_usage_refresh_lock = threading.Lock()
+        with lock:
+            latch = getattr(self, "_account_usage_notice_latch", None)
+            if not isinstance(latch, dict):
+                return False
+            active = list(latch.get("active", ()))
+            self._account_usage_notice_latch = None
+            for key in active:
+                self._emit_notice_clear(key)
+        return bool(active)
 
     def _emit_credits_notices(self) -> None:
         """Run the threshold policy on the current credits state and emit notices.
