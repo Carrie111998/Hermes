@@ -694,6 +694,7 @@ class TelegramNotifier(BaseSubscriber):
         event: Optional[Event] = None,
         topic_key: Optional[str] = None,
         batch_count: Optional[int] = None,
+        buttons: Optional[List[List[Dict[str, str]]]] = None,
     ) -> bool:
         """Send a message to a Telegram chat/thread. Returns True when
         the send succeeded, False when it raised (exceptions are swallowed
@@ -716,6 +717,14 @@ class TelegramNotifier(BaseSubscriber):
         original_event_type="batch_flush" (routing-v3 observability gap,
         2026-07-20: without it a "Batched (N events)" chat message left
         zero ledger rows, so per-topic delivery audits undercounted).
+
+        ``buttons``, when provided, is the serializable spec from
+        ``events.override_buttons.buttons_for`` and is forwarded to
+        ``_deliver_result`` (the production path here, since ``_send_fn``
+        is unset outside tests). It is never passed to ``_send_fn``, so a
+        test double's call signature is unaffected. Defaults to ``None``,
+        in which case this method's behavior is unchanged from before this
+        parameter existed.
         """
         t0 = time.monotonic()
         try:
@@ -732,6 +741,7 @@ class TelegramNotifier(BaseSubscriber):
                     {"deliver": target_str, "id": "event-bus", "name": "event-bus"},
                     message,
                     skip_cron_framing=True,
+                    buttons=buttons,
                 )
             latency_ms = int((time.monotonic() - t0) * 1000)
             if event is not None:

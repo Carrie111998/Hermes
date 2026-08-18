@@ -775,12 +775,18 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, *, buttons=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
     using the same smart-splitting algorithm as the gateway adapters
     (preserves code-block boundaries, adds part indicators).
+
+    ``buttons``, when provided, is the serializable spec from
+    ``events.override_buttons.buttons_for``. It is forwarded only on the
+    Telegram branch below (the only platform that currently renders it);
+    every other platform ignores it. Defaults to ``None``, in which case
+    no code path here differs from before this parameter existed.
     """
     from gateway.config import Platform
 
@@ -855,6 +861,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            buttons=buttons,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1112,13 +1119,22 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, *, buttons=None):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
     so that bold, links, and headers render correctly.  If the message
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
+
+    ``buttons``, when provided, is the serializable spec returned by
+    ``events.override_buttons.buttons_for`` (a list of rows of
+    ``{"label", "callback_data"}`` dicts). It is converted to a real
+    ``telegram.InlineKeyboardMarkup`` here -- the one place in this send
+    path that already imports telegram types -- and attached as
+    ``reply_markup`` on the final text message. Defaults to ``None``, in
+    which case no ``reply_markup`` is ever added and behavior is unchanged
+    from before this parameter existed.
     """
     try:
         from telegram import Bot
@@ -1221,6 +1237,31 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
 
+        # Convert the serializable button spec (see events.override_buttons)
+        # into a real InlineKeyboardMarkup here -- the one place in this send
+        # path that already imports telegram types. `buttons` is None on the
+        # default path, so `reply_markup` stays None and nothing below
+        # changes: no new kwarg is ever added to the send calls.
+        reply_markup = None
+        if buttons:
+            try:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+                reply_markup = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(b["label"], callback_data=b["callback_data"])
+                        for b in row
+                    ]
+                    for row in buttons
+                ])
+            except Exception:
+                logger.warning(
+                    "Failed to build InlineKeyboardMarkup from buttons spec, "
+                    "sending without buttons",
+                    exc_info=True,
+                )
+                reply_markup = None
+
         last_msg = None
         warnings = []
 
@@ -1253,12 +1294,20 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_chunks = BasePlatformAdapter.truncate_message(
                 formatted, 4096, len_fn=utf16_len
             )
-            for chunk in text_chunks:
+            for _chunk_idx, chunk in enumerate(text_chunks):
+                # Buttons attach only to the final text chunk (the bubble the
+                # user actually taps). `send_kwargs` is a fresh copy so a
+                # None `buttons` (the default) never touches `text_kwargs`
+                # at all -- the send call below gets the exact same kwargs
+                # as before this parameter existed.
+                send_kwargs = dict(text_kwargs)
+                if reply_markup is not None and _chunk_idx == len(text_chunks) - 1:
+                    send_kwargs["reply_markup"] = reply_markup
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode, **send_kwargs
                     )
                 except Exception as md_error:
                     # Thread not found — retry without message_thread_id so the
@@ -1270,10 +1319,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             text_kwargs.get("message_thread_id"),
                         )
                         text_kwargs.pop("message_thread_id", None)
+                        send_kwargs.pop("message_thread_id", None)
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode, **send_kwargs
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
@@ -1292,7 +1342,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None, **send_kwargs
                         )
                     else:
                         raise

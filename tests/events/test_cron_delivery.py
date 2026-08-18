@@ -18,7 +18,7 @@ def test_deliver_result_with_skip_cron_framing_omits_wrapper():
 
     captured = {}
 
-    async def fake_send_to_platform(platform, pconfig, chat_id, content, thread_id=None, media_files=None):
+    async def fake_send_to_platform(platform, pconfig, chat_id, content, thread_id=None, media_files=None, buttons=None):
         captured["text"] = content
         captured["thread_id"] = thread_id
         return {"ok": True}
@@ -42,7 +42,7 @@ def test_deliver_result_without_skip_keeps_wrapper_for_backcompat():
 
     captured = {}
 
-    async def fake_send_to_platform(platform, pconfig, chat_id, content, thread_id=None, media_files=None):
+    async def fake_send_to_platform(platform, pconfig, chat_id, content, thread_id=None, media_files=None, buttons=None):
         captured["text"] = content
         return {"ok": True}
 
