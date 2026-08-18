@@ -839,6 +839,32 @@ class TestInterimCommentaryMessages:
         assert final_metadata == {"thread_id": "thread_7", "notify": True}
         assert consumer.final_response_sent is True
 
+    @pytest.mark.asyncio
+    async def test_suppressed_commentary_is_not_recorded_as_visible_delivery(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="suppressed",
+                delivered=False,
+            )
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        new_messages = []
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(),
+            on_new_message=lambda: new_messages.append(True),
+        )
+
+        result = await consumer._send_commentary("Final answer")
+
+        assert result is True
+        assert consumer.has_delivered_text("Final answer") is False
+        assert consumer._delivered_commentary_texts == []
+        assert new_messages == []
+
 
 class TestCancelledConsumerSetsFlags:
     """Cancellation must set final_response_sent when already_sent is True.

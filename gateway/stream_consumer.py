@@ -1852,7 +1852,7 @@ class GatewayStreamConsumer:
             # tool..."), not the final response. Setting already_sent would cause
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
-            if result.success:
+            if result.success and getattr(result, "delivered", None) is not False:
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
