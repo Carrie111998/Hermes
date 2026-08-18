@@ -43,6 +43,7 @@ from hermes_cli.gateway_diag import SPAWN_SITE_ENV as GATEWAY_SPAWN_SITE_ENV
 from hermes_cli.gateway_diag import (
     SPAWN_SITE_UNSPECIFIED as GATEWAY_SPAWN_SITE_UNSPECIFIED,
 )
+from hermes_cli.gateway_diag import parent_chain, raw_cmdline, write_diag
 from hermes_cli._subprocess_compat import (
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
@@ -1687,6 +1688,21 @@ def _force_terminate_known_gateway_pids(pids: list[int]) -> int:
         try:
             if not _pid_exists(pid):
                 continue
+            # Attribute the kill from the KILLER's side, before it lands. This is
+            # the only side that can: `terminate_pid(force=True)` is taskkill /F,
+            # and Windows TerminateProcess does not run `atexit` — so the victim
+            # writes no `atexit.hook` and no `gateway.exit_*` record and simply
+            # vanishes. Two gateways died that way on 2026-08-18 leaving nothing
+            # to read, while the victim-side instrumentation was working fine
+            # (30 exit records the previous day). Never a control-flow risk:
+            # `write_diag` swallows its own failures by contract.
+            write_diag(
+                "gateway.force_kill",
+                victim_pid=pid,
+                killer_pid=own_pid,
+                killer_cmdline=raw_cmdline(),
+                killer_parent_chain=parent_chain(),
+            )
             terminate_pid(pid, force=True)
             killed += 1
         except ProcessLookupError:

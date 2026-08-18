@@ -798,3 +798,47 @@ def test_cmd_update_force_bypasses_concurrent_check(_winp, tmp_path):
 
     # When --force is set, we should not have even consulted psutil.
     detect.assert_not_called()
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_cold_start_does_not_respawn_inside_the_discovery_window(
+    _winp,
+    monkeypatch,
+    capsys,
+):
+    """A second cold start must not spawn while the first gateway is still coming up.
+
+    Regression for the 2026-08-17 triplet race: `_cold_start_windows_gateway_after_update`
+    guards on `find_gateway_pids()`, but a freshly spawned gateway needs ~28s to become
+    discoverable (measured: spawn 10:18:06 -> :8642 listening 10:18:34). Every re-check
+    inside that window truthfully reports "nothing running", so one parent spawned THREE
+    gateways in 1.4s (pids 24760/44860/35144, all ppid 48796).
+
+    A liveness poll cannot serve as an idempotence guard for something that takes 28s to
+    appear, so the guard must also remember that IT already spawned.
+    """
+    import hermes_cli.gateway as gateway_mod
+    from hermes_cli import gateway_windows
+
+    # Start from a clean window — the guard is module-level state and an earlier
+    # test in this file legitimately spawns, which would otherwise suppress the
+    # first call here and hide what this test is asserting.
+    monkeypatch.setattr(cli_main, "_COLD_START_SPAWNED_AT", None)
+
+    # The window: the spawned gateway is never discoverable during this test.
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [])
+    spawned = []
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda *_a, reason="", **_kw: spawned.append(reason) or 4242,
+    )
+
+    cli_main._cold_start_windows_gateway_after_update()
+    cli_main._cold_start_windows_gateway_after_update()
+    cli_main._cold_start_windows_gateway_after_update()
+
+    assert spawned == ["update:windows-cold-start"], (
+        f"expected exactly one spawn, got {len(spawned)}: {spawned}"
+    )
+    capsys.readouterr()
