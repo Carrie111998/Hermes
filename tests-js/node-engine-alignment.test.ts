@@ -59,12 +59,9 @@ function satisfiesClause(version: string, clause: string): boolean {
 }
 
 function satisfiesRange(version: string, range: string): boolean {
-  return range.split('||').some(alternative =>
-    alternative
-      .trim()
-      .split(/\s+/)
-      .every(clause => satisfiesClause(version, clause))
-  )
+  const alternatives = range.split('||').map(alternative => alternative.trim().split(/\s+/))
+  alternatives.flat().forEach(clause => satisfiesClause(version, clause))
+  return alternatives.some(clauses => clauses.every(clause => satisfiesClause(version, clause)))
 }
 
 const rootManifest = readJson<Manifest>('package.json')
@@ -104,4 +101,8 @@ describe('Node engine alignment', () => {
       assert.throws(() => satisfiesRange('26.0.0', clause), /unsupported semver clause/)
     }
   )
+
+  test('unsupported clauses are rejected even after a matching alternative', () => {
+    assert.throws(() => satisfiesRange('26.0.0', '>=26.0.0 || ~28.0.0'), /unsupported semver clause/)
+  })
 })
