@@ -20,7 +20,7 @@ those older snapshots to infer the current PR or runtime state.
 | Reference | Verified state |
 |---|---|
 | Repository | `https://github.com/cwliao/hermes-agent` |
-| `origin/main` | `a5bebea8f8af78ea6996fbc10d2ea9e77d23b286` (merge commit for PR #48; pre-merge base was `2b5eb8437a...`) |
+| `origin/main` | PR #48's merge commit `a5bebea8f8af78ea6996fbc10d2ea9e77d23b286` plus this docs-only handover update on top; pre-merge base was `2b5eb8437a...`. Re-read `origin/main` directly |
 | Primary checkout | Recorded as `D:/PROJECT/Hermes`, `ticket/hermes-auth-001`, HEAD `c192e863d8dc9df98c2bd9d066ce49bc4f9cb3e8`; intentionally dirty. Carried forward: that path is absent on the Linux host used for the 2026-08-18 Claude continuation session, where `~/.hermes/hermes-agent` sits on `main` at `b7b362b2f1bcf494ba7f0acf2236452caacb05b6` and is clean |
 | Isolated ticket worktree | `ticket/hermes-multi-agent-claude-worker-001`, implementation HEAD `af3034993fae20b6d6a552cd014fa0646cbf7af2` |
 | Pull request | PR #48 **merged and closed** 2026-08-18T07:30:25Z; head `f97f3402f38bb735430c3296fbb19fc387dc7348`, merge commit `a5bebea8f8...`; required CI was green on that head before merge |

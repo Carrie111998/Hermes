@@ -11,9 +11,11 @@ Verified in this session unless marked carried forward.
 - Repository: `https://github.com/cwliao/hermes-agent`
 - `origin` = `git@github.com:cwliao/hermes-agent.git`; `upstream` fetch is
   `NousResearch/hermes-agent` with push set to `DISABLE`.
-- Verified `origin/main`: `a5bebea8f8af78ea6996fbc10d2ea9e77d23b286`, the
-  merge commit for PR #48. The previous value `2b5eb8437a...` was the pre-merge
-  base.
+- PR #48's merge commit `a5bebea8f8af78ea6996fbc10d2ea9e77d23b286` landed on
+  `main`; the pre-merge base was `2b5eb8437a...`. This handover update is the
+  docs-only commit sitting directly on top of that merge commit, so the current
+  `origin/main` is this commit. Re-read `origin/main` rather than trusting a
+  SHA quoted inside the file it names.
 - Local primary checkout in this environment: `~/.hermes/hermes-agent`,
   branch `main`, HEAD `b7b362b2f1bcf494ba7f0acf2236452caacb05b6`, clean
   (`git status --porcelain` empty). It is behind `origin/main`.
