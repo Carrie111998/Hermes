@@ -60,7 +60,7 @@ def _(rid, params: dict) -> dict:
             return text[:80] + "..."
         return text
 
-    def _preferred_session_row(profile_path, session_id):
+    def _preferred_session_row(profile_name, session_id):
         """Precise summary for ONE caller-pinned session id, or None.
 
         Complements ``last_session``: that field answers "what is the newest
@@ -77,17 +77,15 @@ def _(rid, params: dict) -> dict:
         count as absent. The reported ``id`` stays the caller's durable pin
         while ``resolved_id`` names the live tip. Best-effort: any failure
         degrades to None rather than failing the whole profiles.list call.
+
+        Routes through ``open_store_for_profile`` so a Postgres-backed profile
+        is read from its live Postgres DB, not from an empty/stale state.db.
         """
         try:
-            from pathlib import Path
-
-            db_path = Path(profile_path) / "state.db"
-            if not db_path.exists():
-                return None
-            from hermes_state import SessionDB
+            from hermes_state_postgres import open_store_for_profile
 
             deny = frozenset({"kanban", "tool"})
-            db = SessionDB(db_path=db_path)
+            db = open_store_for_profile(profile_name)
             try:
                 row = db.get_session(session_id)
                 if not row:
@@ -129,7 +127,7 @@ def _(rid, params: dict) -> dict:
         except Exception:
             return None
 
-    def _latest_profile_session_rows(profile_path):
+    def _latest_profile_session_rows(profile_name):
         """(newest human-facing session, newest worker session) for a profile.
 
         First element mirrors session.list's deny-list (drops ``tool``
@@ -142,17 +140,15 @@ def _(rid, params: dict) -> dict:
         client can apply its own liveness window. Best-effort: any failure
         (missing state.db, locked db, older schema) degrades to (None, None)
         rather than failing the whole profiles.list call.
+
+        Routes through ``open_store_for_profile`` so a Postgres-backed profile
+        is read from its live Postgres DB, not from an empty/stale state.db.
         """
         try:
-            from pathlib import Path
-
-            db_path = Path(profile_path) / "state.db"
-            if not db_path.exists():
-                return None, None
-            from hermes_state import SessionDB
+            from hermes_state_postgres import open_store_for_profile
 
             deny = frozenset({"kanban", "tool"})
-            db = SessionDB(db_path=db_path)
+            db = open_store_for_profile(profile_name)
             try:
                 human = None
                 worker = None
@@ -225,7 +221,7 @@ def _(rid, params: dict) -> dict:
                 "skill_count": getattr(p, "skill_count", 0) or 0,
             }
             if include_sessions:
-                last_row, worker_row = _latest_profile_session_rows(p.path)
+                last_row, worker_row = _latest_profile_session_rows(p.name)
                 row["last_session"] = last_row
                 # Freshest kanban/tool worker (or None) — lets rosters count
                 # a profile as active while its worker runs (#90268). Older
@@ -233,7 +229,7 @@ def _(rid, params: dict) -> dict:
                 row["worker_session"] = worker_row
                 pin = preferred_ids.get(p.name)
                 if isinstance(pin, str) and pin.strip():
-                    row["preferred_session"] = _preferred_session_row(p.path, pin.strip())
+                    row["preferred_session"] = _preferred_session_row(p.name, pin.strip())
 
             # Client-agnostic UI metadata (avatars, accent colors, pinned
             # order, …) — stored server-side in profile.yaml so every

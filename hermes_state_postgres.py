@@ -1793,6 +1793,131 @@ def maybe_open_postgres(
     return conn
 
 
+def open_store_for_profile(
+    profile_name: str,
+    read_only: bool = False,
+) -> "Any":  # returns hermes_state.SessionDB; typed as Any to avoid circular import
+    """Open the session store for *profile_name*, honouring its own backend.
+
+    This is the ONE backend-aware seam for all profile-scoped readers.  Every
+    call site that previously hard-coded ``SessionDB(db_path=<profile>/state.db,
+    read_only=True)`` must go through here instead.
+
+    Resolution order (per-profile, env vars are NOT consulted — they reflect the
+    *active* process's backend, not the target profile's):
+
+    1. Load ``<profile_dir>/config.yaml`` (soft-fail: missing / unreadable file
+       is treated as no Postgres config).
+    2. Read ``sessions.state_backend`` from that file.
+       * ``"postgres"``  →  resolve DSN from ``sessions.postgres_dsn`` in the
+         same config file, then open a ``_PostgresConnection`` and return a
+         ``SessionDB`` that routes through it.
+       * anything else  →  open ``<profile_dir>/state.db`` as SQLite.
+    3. If the target profile declares ``state_backend = "postgres"`` but has no
+       ``postgres_dsn``, raise ``RuntimeError`` — silently falling back to an
+       empty SQLite file is the very bug this seam was introduced to fix.
+
+    The ``read_only`` flag is forwarded to the SQLite path only; Postgres
+    connections do not have a "read-only attach" mode — the full adapter is
+    opened, which already issues only SELECTs when callers only call SELECT
+    methods.
+
+    Raises:
+        ValueError   – unknown profile name (via ``profiles_mod``)
+        RuntimeError – Postgres selected but no DSN provided, or psycopg
+                       unavailable
+    """
+    from pathlib import Path
+
+    # Resolve the target profile's home directory.
+    from hermes_cli import profiles as profiles_mod
+
+    canon = profiles_mod.normalize_profile_name(profile_name)
+    profiles_mod.validate_profile_name(canon)
+    if not profiles_mod.profile_exists(canon):
+        raise ValueError(f"profile '{canon}' does not exist")
+
+    profile_dir = Path(profiles_mod.get_profile_dir(canon))
+
+    # Load the *target* profile's own config.yaml — deliberately NOT using
+    # load_config() which reads the ACTIVE process's HERMES_HOME.
+    config: Dict[str, Any] = {}
+    config_path = profile_dir / "config.yaml"
+    if config_path.is_file():
+        try:
+            import yaml as _yaml  # PyYAML — always present in the runtime env
+
+            with open(config_path, encoding="utf-8") as _f:
+                loaded = _yaml.safe_load(_f)
+            if isinstance(loaded, dict):
+                config = loaded
+        except Exception:
+            logger.debug(
+                "open_store_for_profile: could not load config.yaml for %r",
+                canon,
+                exc_info=True,
+            )
+
+    sessions_cfg = (config.get("sessions") or {}) if config else {}
+    backend = str(sessions_cfg.get("state_backend") or "sqlite").strip().lower()
+    if backend in ("postgresql", "pg"):
+        backend = "postgres"
+
+    if backend == "postgres":
+        # Resolve DSN from the target profile's config only.  Env vars are
+        # intentionally skipped here — they name the ACTIVE process's DB, not
+        # the target profile's.
+        dsn = (sessions_cfg.get("postgres_dsn") or "").strip()
+        if not dsn:
+            raise RuntimeError(
+                f"profile '{canon}' has sessions.state_backend = 'postgres' "
+                f"but sessions.postgres_dsn is not set in its config.yaml; "
+                f"cannot open the store for that profile"
+            )
+        conn = connect_postgres(dsn)
+        # Use the same schema_version the calling process's SessionDB uses.
+        # Import lazily to avoid circular dependency at module load time.
+        from hermes_state import SCHEMA_VERSION, SessionDB
+
+        init_postgres_schema(conn, SCHEMA_VERSION)
+        db = object.__new__(SessionDB)
+        # Initialise only the attributes that all read paths touch.  The full
+        # __init__ would try to open a SQLite file and run pragmas; bypassing
+        # it is the established pattern in the retry-boundary tests.
+        import queue
+        import threading
+
+        db.db_path = profile_dir / "state.db"  # nominal fallback path (unused)
+        db.read_only = False  # Postgres has no read-only attach mode
+        db._lock = threading.Lock()
+        db._read_pool = queue.LifoQueue(maxsize=0)  # unused for Postgres
+        db._read_permits = threading.BoundedSemaphore(1)  # ditto
+        db._read_conns_lock = threading.Lock()
+        db._read_conns_closed = False
+        db._read_open_failed_at = 0.0
+        db._read_permit_exhausted = 0
+        db._wal_active = False
+        db._write_count = 0
+        db._fts_runtime_rebuild_attempted = False
+        db._notadb_reconnect_attempted = False
+        db._fts_usermerge_floor_applied = False
+        db._fts_enabled = False
+        db._fts_stale = False
+        db._trigram_available = False
+        db._fts_cjk_loaded = False
+        db._fts_cjk_available = False
+        db._fts_unavailable_warned = False
+        db._is_postgres = True
+        db._conn = conn
+        return db
+
+    # SQLite path — straightforward.
+    db_path = profile_dir / "state.db"
+    from hermes_state import SessionDB
+
+    return SessionDB(db_path=db_path, read_only=read_only)
+
+
 def is_postgres_retryable(exc: BaseException) -> bool:
     """True if a PostgreSQL exception is a transient serialization/deadlock that
     warrants the jittered write retry (the PG analogue of SQLite "locked").

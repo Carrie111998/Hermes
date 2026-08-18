@@ -344,26 +344,24 @@ def _shape_message(
 
 
 def _resolve_profile_db(profile: str):
-    """Open another profile's ``state.db`` read-only, or None for the current one.
+    """Open another profile's session store read-only, or None for the current one.
 
     The desktop's ``@session:<profile>/<id>`` links always carry the source
     profile, so a linked session from profile B can be read while the agent
-    runs in profile A. ``read_only=True`` (mode=ro) takes no write lock — safe
-    to point at a live profile's DB, including our own. Returns None when no
-    profile is given (use the caller's default db).
+    runs in profile A.  Returns None when no profile is given (use the
+    caller's default db).
+
+    Routes through ``open_store_for_profile`` so a profile configured for
+    Postgres is read from Postgres, not from a stale local state.db.
+    Raises loudly if the target profile selects Postgres but has no DSN —
+    silently reading the wrong store is the bug this seam was introduced to fix.
     """
     if profile is None or not str(profile).strip():
         return None
 
-    from hermes_cli import profiles as profiles_mod
-    from hermes_state import SessionDB
+    from hermes_state_postgres import open_store_for_profile
 
-    canon = profiles_mod.normalize_profile_name(profile)
-    profiles_mod.validate_profile_name(canon)
-    if not profiles_mod.profile_exists(canon):
-        raise ValueError(f"profile '{canon}' does not exist")
-
-    return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
+    return open_store_for_profile(profile, read_only=True)
 
 
 def _session_link(session_id: str, profile: str = None) -> str:
@@ -389,19 +387,20 @@ def _session_link(session_id: str, profile: str = None) -> str:
 
 
 def _locate_session_db(session_id: str):
-    """Scan every profile's ``state.db`` (read-only) for a session id.
+    """Scan every profile's session store (read-only) for a session id.
 
     Returns ``(db, profile_name)`` for the first profile that owns the id, or
     ``(None, None)``. Session ids are globally unique (timestamp + random hex),
     so the first hit is authoritative. This is the safety net for linked-session
     reads where the model dropped the owning profile from the link and passed a
     bare id — we find it wherever it actually lives instead of failing.
-    """
-    from pathlib import Path
 
+    Routes through ``open_store_for_profile`` so a profile on Postgres is
+    scanned against its live Postgres DB, not against an empty/stale state.db.
+    """
     try:
         from hermes_cli import profiles as profiles_mod
-        from hermes_state import SessionDB
+        from hermes_state_postgres import open_store_for_profile
     except Exception:
         return None, None
 
@@ -413,20 +412,26 @@ def _locate_session_db(session_id: str):
 
     seen: set = set()
     for name, home in targets:
-        db_path = Path(home) / "state.db"
-        key = str(db_path)
-        if key in seen or not db_path.exists():
+        key = str(home)
+        if key in seen:
             continue
         seen.add(key)
         try:
-            pdb = SessionDB(db_path=db_path, read_only=True)
+            pdb = open_store_for_profile(name, read_only=True)
         except Exception:
+            logging.debug(
+                "open_store_for_profile failed for %r during session locate",
+                name,
+                exc_info=True,
+            )
             continue
         try:
             if pdb.get_session(session_id):
                 return pdb, name
         except Exception:
-            logging.debug("get_session probe failed for %s in %s", session_id, name, exc_info=True)
+            logging.debug(
+                "get_session probe failed for %s in %s", session_id, name, exc_info=True
+            )
         pdb.close()
 
     return None, None
