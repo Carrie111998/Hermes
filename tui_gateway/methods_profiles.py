@@ -85,7 +85,7 @@ def _(rid, params: dict) -> dict:
             from hermes_state_postgres import open_store_for_profile
 
             deny = frozenset({"kanban", "tool"})
-            db = open_store_for_profile(profile_name)
+            db = open_store_for_profile(profile_name, read_only=True)
             try:
                 row = db.get_session(session_id)
                 if not row:
@@ -148,7 +148,7 @@ def _(rid, params: dict) -> dict:
             from hermes_state_postgres import open_store_for_profile
 
             deny = frozenset({"kanban", "tool"})
-            db = open_store_for_profile(profile_name)
+            db = open_store_for_profile(profile_name, read_only=True)
             try:
                 human = None
                 worker = None

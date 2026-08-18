@@ -291,41 +291,40 @@ class TestResolveProfileDb:
         assert read_only is True  # cross-profile reads must be read-only
         assert result is sentinel
 
-    def test_does_not_hardcode_state_db_path(self, monkeypatch, tmp_path):
-        """_resolve_profile_db must NOT construct a SessionDB with a raw db_path.
+    def test_never_opens_sqlite_for_a_postgres_backed_profile(
+        self, monkeypatch, tmp_path
+    ):
+        """A Postgres-backed profile must never be read through a SQLite file.
 
-        If it still uses the old hardcoded path, a Postgres-backed profile
-        would silently read from an empty/stale state.db.
+        Behavioral counterpart to the source-shape check this replaces: rather
+        than inspecting how ``_resolve_profile_db`` is written, drive it and
+        assert the object it returns is the one the backend seam produced. If a
+        regression reinstates a direct ``SessionDB(db_path=...)`` open, the
+        returned object is no longer the seam's, and this fails.
         """
-        import inspect
         from tools import session_search_tool
 
-        src = inspect.getsource(session_search_tool._resolve_profile_db)
+        seam_calls: list = []
+        sentinel = object()
 
-        # Must route through open_store_for_profile
-        assert "open_store_for_profile" in src, (
-            "_resolve_profile_db does not call open_store_for_profile; "
-            "it will bypass the backend seam for Postgres-backed profiles"
+        def fake_open(profile, read_only=False):
+            seam_calls.append((profile, read_only))
+            return sentinel
+
+        monkeypatch.setattr(
+            hermes_state_postgres, "open_store_for_profile", fake_open
         )
-        # The implementation body must not construct SessionDB with a hardcoded path.
-        # We check by stripping the docstring (first triple-quoted block) and
-        # verifying no SessionDB(db_path= call remains.
-        import ast
-        tree = ast.parse(src)
-        # Find all Call nodes; none should be SessionDB(db_path=...)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                func_name = (
-                    func.id if isinstance(func, ast.Name) else
-                    func.attr if isinstance(func, ast.Attribute) else ""
-                )
-                if func_name == "SessionDB":
-                    for kw in node.keywords:
-                        assert kw.arg != "db_path", (
-                            "_resolve_profile_db constructs SessionDB(db_path=...) — "
-                            "a Postgres profile will silently read the wrong store"
-                        )
+
+        result = session_search_tool._resolve_profile_db("someprofile")
+
+        assert result is sentinel, (
+            "cross-profile read bypassed the backend seam — a Postgres-backed "
+            "profile would be served from an empty/stale state.db"
+        )
+        assert seam_calls == [("someprofile", True)], (
+            f"seam called with {seam_calls}; cross-profile reads must be "
+            "read-only and scoped to the requested profile"
+        )
 
 
 
@@ -382,24 +381,20 @@ class TestTuiGatewayRosterPath:
             "is_truthy_value": lambda v: bool(v),
         }
 
-        # Find the actual registered handler via _registry
-        # (it's stored as a dict key in HandlerRegistry).
+        # Locate the registered handler. HandlerRegistry defers registration
+        # into ``_pending`` as a list of (name, fn) tuples.
         from tui_gateway.methods_profiles import _registry
 
-        # The handler is the function registered for "profiles.list"
-        handler_fn = _registry._handlers.get("profiles.list")
-        if handler_fn is None:
-            # Try alternate access pattern
-            for k, v in vars(_registry).items():
-                if isinstance(v, dict):
-                    handler_fn = v.get("profiles.list")
-                    if handler_fn:
-                        break
+        handler_fn = None
+        for name, fn in getattr(_registry, "_pending", []):
+            if name == "profiles.list":
+                handler_fn = fn
+                break
 
-        if handler_fn is None:
-            pytest.skip("Cannot locate profiles.list handler — skipping structural test")
-
-        import functools
+        assert handler_fn is not None, (
+            "could not locate the 'profiles.list' handler in the registry — "
+            "the test cannot prove the seam is used"
+        )
 
         # Patch sys.modules for hermes_cli.profiles within the call
         profiles_stub = types.ModuleType("hermes_cli.profiles")
@@ -414,34 +409,33 @@ class TestTuiGatewayRosterPath:
                 fake_open,
                 create=True,
             ):
-                try:
-                    # Call with include_sessions=True to trigger roster reads
-                    handler_fn.__globals__.update(handler_globals)
-                    handler_fn("req1", {"include_sessions": True})
-                except Exception:
-                    pass  # Best-effort; we care about the seam calls
+                handler_fn.__globals__.update(handler_globals)
+                handler_fn("req1", {"include_sessions": True})
 
         return seam_calls
 
+
     def test_profiles_list_uses_seam_for_session_rows(self, monkeypatch, tmp_path):
-        """profiles.list session reads route through open_store_for_profile."""
-        # This is a structural test: we verify the module-level import changed.
-        # The actual routing is tested via TestOpenStoreForProfile above.
-        import tui_gateway.methods_profiles as mod
+        """profiles.list session reads route through open_store_for_profile.
 
-        # After our edits, the helpers should import open_store_for_profile,
-        # not SessionDB directly. Check the source text.
-        import inspect
-        src = inspect.getsource(mod)
+        Behavioral, not structural: drive the handler and assert the seam was
+        actually invoked for the profile's session rows. A regression that goes
+        back to opening ``<profile>/state.db`` directly records no seam call and
+        fails here.
+        """
+        seam_calls = self._check_helper_uses_seam(
+            monkeypatch, "profiles.list"
+        )
 
-        assert "open_store_for_profile" in src, (
-            "tui_gateway/methods_profiles.py does not import open_store_for_profile — "
-            "roster session reads will bypass the backend seam"
+        assert seam_calls, (
+            "profiles.list read session rows without calling "
+            "open_store_for_profile — a Postgres-backed profile's roster would "
+            "be served from an empty/stale state.db"
         )
-        assert "SessionDB(db_path=" not in src or "state.db" not in src, (
-            "tui_gateway/methods_profiles.py still hardcodes state.db path — "
-            "Postgres-backed profiles will silently read the wrong store"
-        )
+        assert all(
+            read_only is True for _profile, read_only in seam_calls
+        ), f"roster reads must be read-only; got {seam_calls}"
+
 
 
 # ---------------------------------------------------------------------------
