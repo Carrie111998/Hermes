@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 
 import { type MockBackendFixture, setupMockBackend } from './fixtures'
@@ -47,6 +48,34 @@ conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (archived,))
 conn.commit()
 conn.close()
 `)
+}
+
+interface BoardIdentity {
+  events: Array<[number, string, string]>
+  tasks: Array<[string, string]>
+}
+
+function readBoardIdentity(hermesHome: string, kanbanDb?: string): BoardIdentity {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    HERMES_HOME: hermesHome,
+    HERMES_KANBAN_DB: kanbanDb,
+    PYTHONPATH: REPO_ROOT,
+  }
+  delete env.HERMES_KANBAN_BOARD
+  delete env.HERMES_KANBAN_TASK
+  const result = spawnSync(process.env.PYTHON ?? 'python', ['-c', `
+import json
+from hermes_cli import kanban_db
+conn = kanban_db.connect()
+print(json.dumps({
+    "events": [list(row) for row in conn.execute("SELECT id, task_id, kind FROM task_events ORDER BY id")],
+    "tasks": [list(row) for row in conn.execute("SELECT id, title FROM tasks ORDER BY id")],
+}, sort_keys=True))
+conn.close()
+`], { cwd: REPO_ROOT, encoding: 'utf8', env })
+  if (result.status !== 0) throw new Error(`Kanban identity read failed: ${result.stderr}`)
+  return JSON.parse(result.stdout) as BoardIdentity
 }
 
 async function setContentViewport(fixture: MockBackendFixture, width: number) {
@@ -108,19 +137,42 @@ async function expectMobileTargetsAndClipping(page: MockBackendFixture['page']) 
 }
 
 let fixture: MockBackendFixture | null = null
+let canonicalRoot: string | null = null
+let canonicalDb = ''
+let canonicalDbLink = ''
+let canonicalBytes: Buffer
+let canonicalIdentity: BoardIdentity
 
 test.describe.configure({ mode: 'serial', timeout: 180_000 })
 test.use({ trace: 'off' })
 
 test.beforeAll(async () => {
+  canonicalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-e2e-canonical-shell-'))
+  const canonicalHome = path.join(canonicalRoot, 'home')
+  canonicalDb = path.join(canonicalRoot, 'sentinel.db')
+  canonicalDbLink = path.join(canonicalRoot, 'sentinel-link.db')
+  fs.mkdirSync(canonicalHome)
+  runBoardScript(canonicalHome, `
+from hermes_cli import kanban_db
+kanban_db.init_db()
+conn = kanban_db.connect()
+kanban_db.create_task(conn, title="canonical spawned-app sentinel", body="must remain immutable", created_by="desktop-e2e-sentinel")
+conn.commit()
+conn.close()
+`)
+  fs.renameSync(path.join(canonicalHome, 'kanban.db'), canonicalDb)
+  fs.symlinkSync(canonicalDb, canonicalDbLink)
+  canonicalIdentity = readBoardIdentity(canonicalHome, canonicalDb)
+  canonicalBytes = fs.readFileSync(canonicalDb)
+
   fixture = await setupMockBackend({
     extraConfig: 'plugins:\n  enabled:\n    - kanban',
     // The actual Electron/backend launch must remain pinned to this fixture's
     // HERMES_HOME even when a caller supplies ambient board selectors.
     appEnv: {
-      HERMES_HOME: path.join(REPO_ROOT, '.forbidden-e2e-home'),
-      HERMES_KANBAN_DB: path.join(REPO_ROOT, '.forbidden-e2e-kanban.db'),
-      HERMES_KANBAN_BOARD: 'forbidden-e2e-board',
+      HERMES_HOME: canonicalHome,
+      HERMES_KANBAN_DB: canonicalDbLink,
+      HERMES_KANBAN_BOARD: 'hostile-canonical-board',
     },
     prepareSandbox: sandbox => seedBoard(sandbox.hermesHome)
   })
@@ -139,6 +191,7 @@ test.afterAll(async () => {
   fixture?.app.process().kill()
   await fixture?.mock.close()
   fixture?.sandbox.cleanup()
+  if (canonicalRoot) fs.rmSync(canonicalRoot, { recursive: true, force: true })
   fixture = null
 })
 
@@ -281,4 +334,17 @@ test('1280 desktop regression keeps lanes, navigation, and drawer geometry', asy
   const actionBox = await page.getByRole('button', { name: 'Task actions' }).boundingBox()
   expect(actionBox?.width).toBe(24)
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0)
+})
+
+// eslint-disable-next-line no-empty-pattern
+test('spawned app leaves hostile canonical sentinel immutable and uses only its sandbox board', async ({}) => {
+  expect(fs.realpathSync(canonicalDbLink)).toBe(fs.realpathSync(canonicalDb))
+  expect(fs.readFileSync(canonicalDb).equals(canonicalBytes)).toBe(true)
+  expect(readBoardIdentity(fixture!.sandbox.hermesHome, canonicalDb)).toEqual(canonicalIdentity)
+
+  const sandboxDb = path.join(fixture!.sandbox.hermesHome, 'kanban.db')
+  expect(fs.existsSync(sandboxDb)).toBe(true)
+  const sandboxIdentity = readBoardIdentity(fixture!.sandbox.hermesHome)
+  expect(sandboxIdentity.tasks.some(([, title]) => title.startsWith('Synthetic '))).toBe(true)
+  expect(sandboxIdentity.tasks.some(([, title]) => title === 'canonical spawned-app sentinel')).toBe(false)
 })
