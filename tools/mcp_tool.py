@@ -2164,7 +2164,9 @@ class MCPServerTask:
             return float(_PARKED_RETRY_INTERVAL)
         try:
             interval = float(configured)
-        except (TypeError, ValueError):
+            if not math.isfinite(interval):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
             logger.warning(
                 "MCP config parked_retry_interval must be a number of seconds; "
                 "using default %s instead of %r",
