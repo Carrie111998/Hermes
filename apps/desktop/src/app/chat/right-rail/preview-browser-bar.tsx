@@ -20,6 +20,7 @@ import { Input } from '@/components/ui/input'
 import { PaneStripGlyph } from '@/components/ui/pane-tab'
 import { useI18n } from '@/i18n'
 
+import { PreviewElementPickControl } from './preview-element-pick-control'
 import { type ViewportMode } from './preview-viewport'
 import { PreviewViewportControl } from './preview-viewport-control'
 
@@ -35,7 +36,9 @@ interface PreviewBrowserBarProps {
   onReload: () => void
   onToggleConsole: () => void
   onToggleDevTools: () => void
+  onTogglePick: () => void
   onViewportChange: (next: ViewportMode) => void
+  picking: boolean
   /** The page's CURRENT address (it moves as the user navigates), not the
    *  target the tab was opened with. */
   url: string
@@ -99,7 +102,9 @@ export function PreviewBrowserBar({
   onReload,
   onToggleConsole,
   onToggleDevTools,
+  onTogglePick,
   onViewportChange,
+  picking,
   url,
   viewport
 }: PreviewBrowserBarProps) {
@@ -169,6 +174,7 @@ export function PreviewBrowserBar({
         value={draft ?? url}
       />
       <PreviewViewportControl mode={viewport} onModeChange={onViewportChange} />
+      <PreviewElementPickControl onToggle={onTogglePick} picking={picking} />
       <PaneStripGlyph
         active={consoleOpen}
         icon={<Codicon name="terminal" size="0.8125rem" />}

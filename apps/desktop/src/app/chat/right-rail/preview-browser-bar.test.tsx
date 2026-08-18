@@ -15,7 +15,9 @@ const baseProps = {
   onReload: vi.fn(),
   onToggleConsole: vi.fn(),
   onToggleDevTools: vi.fn(),
+  onTogglePick: vi.fn(),
   onViewportChange: vi.fn(),
+  picking: false,
   url: 'https://example.com',
   viewport: { kind: 'free' as const }
 }
@@ -82,6 +84,7 @@ describe('PreviewBrowserBar', () => {
     expect(rendered.getByRole('button', { name: 'Show preview console' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Open preview DevTools' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Preview viewport' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Select page element for chat' })).toBeTruthy()
     expect(address(rendered)).toBeTruthy()
   })
 

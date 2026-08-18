@@ -124,6 +124,7 @@ describe('PreviewPane console state', () => {
 
     expect(rendered.queryByRole('textbox', { name: 'Address' })).not.toBeNull()
     expect(rendered.queryByRole('button', { name: 'Preview viewport' })).not.toBeNull()
+    expect(rendered.queryByRole('button', { name: 'Select page element for chat' })).not.toBeNull()
 
     await act(async () => {
       rendered.rerender(

@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { requestComposerFocus, requestComposerInsert } from '@/app/chat/composer/focus'
 import { PanelEmpty } from '@/app/overlays/panel'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
@@ -26,6 +27,7 @@ import {
 } from './preview-console'
 import { type ConsoleEntry } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
+import { CANCEL_PICKER_SCRIPT, formatPickedElement, isPickerResult, PICKER_SCRIPT } from './preview-element-picker'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
@@ -187,6 +189,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [localReloadKey, setLocalReloadKey] = useState(0)
   const [viewport, setViewport] = useState<ViewportMode>(() => loadViewportMode())
   const [hostSize, setHostSize] = useState({ width: 0, height: 0 })
+  const [picking, setPicking] = useState(false)
+  const pickingRef = useRef(false)
   const guestSize = modeSize(viewport)
   const guestScale = guestSize ? scaleFor(hostSize, guestSize) : 1
 
@@ -399,6 +403,57 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     setViewport(next)
     saveViewportMode(next)
   }, [])
+
+  const stopPicking = useCallback(() => {
+    pickingRef.current = false
+    setPicking(false)
+    void webviewRef.current?.executeJavaScript?.(CANCEL_PICKER_SCRIPT).catch(() => undefined)
+  }, [])
+
+  const startPicking = useCallback(async () => {
+    const webview = webviewRef.current
+
+    if (!webview?.executeJavaScript) {
+      notify({ kind: 'error', title: copy.pickFailed, message: copy.pickUnavailable })
+
+      return
+    }
+
+    pickingRef.current = true
+    setPicking(true)
+
+    try {
+      const raw = await webview.executeJavaScript(PICKER_SCRIPT)
+
+      if (!pickingRef.current) {
+        return
+      }
+
+      if (!isPickerResult(raw) || raw.status === 'cancelled') {
+        return
+      }
+
+      requestComposerInsert(formatPickedElement(raw.element), { mode: 'block' })
+      requestComposerFocus('active')
+    } catch (error) {
+      if (pickingRef.current) {
+        notifyError(error, copy.pickFailed)
+      }
+    } finally {
+      pickingRef.current = false
+      setPicking(false)
+    }
+  }, [copy.pickFailed, copy.pickUnavailable])
+
+  const togglePicking = useCallback(() => {
+    if (pickingRef.current) {
+      stopPicking()
+
+      return
+    }
+
+    void startPicking()
+  }, [startPicking, stopPicking])
 
   // Gestures that land on the app's chrome (⌘R from the address bar, a mouse
   // button over the frame). A gesture made INSIDE the page is answered by main
@@ -735,7 +790,15 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       setLoading(false)
     }
 
-    const onStart = () => setLoading(true)
+    const onStart = () => {
+      setLoading(true)
+
+      if (pickingRef.current) {
+        pickingRef.current = false
+        setPicking(false)
+        void webview.executeJavaScript?.(CANCEL_PICKER_SCRIPT).catch(() => undefined)
+      }
+    }
 
     const onStop = () => {
       setLoading(false)
@@ -834,7 +897,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             onReload={reloadPreview}
             onToggleConsole={() => consoleState.setOpen(open => !open)}
             onToggleDevTools={toggleDevTools}
+            onTogglePick={togglePicking}
             onViewportChange={handleViewportChange}
+            picking={picking}
             url={currentUrl}
             viewport={viewport}
           />
