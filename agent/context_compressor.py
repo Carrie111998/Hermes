@@ -3203,7 +3203,7 @@ class ContextCompressor(ContextEngine):
         projected_real = self.last_real_prompt_tokens + growth
         return projected_real < self.threshold_tokens
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int = None, n_messages: int = None) -> bool:
         """Check if context exceeds the compression threshold.
 
         Returns ``True`` when compression should run now. For the caller-facing
@@ -3215,11 +3215,11 @@ class ContextCompressor(ContextEngine):
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
-        decision, _reason = self.should_compress_info(prompt_tokens)
+        decision, _reason = self.should_compress_info(prompt_tokens, n_messages=n_messages)
         return decision
 
     def should_compress_info(
-        self, prompt_tokens: int = None
+        self, prompt_tokens: int = None, n_messages: int = None
     ) -> "tuple[bool, str | None]":
         """Check if context exceeds the compression threshold.
 
@@ -3243,10 +3243,24 @@ class ContextCompressor(ContextEngine):
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
+
+        Includes message-eligibility check (#88778): when the caller provides
+        ``n_messages`` and every message falls inside the protected head/tail
+        window, there is structurally nothing to compress.  Returning
+        ``False`` early avoids a guaranteed no-op LLM summarization pass.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False, None
+        # Message-eligibility guard (#88778): when the caller supplies the
+        # message count, check whether there are enough messages outside the
+        # protected head/tail window to make compression worthwhile.  Uses a
+        # conservative head-size estimate (system prompt + protect_first_n)
+        # so the check works without access to the full messages list.
+        if n_messages is not None:
+            head_estimate = 1 + self.protect_first_n
+            if n_messages <= self.protect_last_n + head_estimate + 1:
+                return False, None
         if self._automatic_compression_blocked():
             return False, self._compression_block_reason() or "blocked"
         return True, None
