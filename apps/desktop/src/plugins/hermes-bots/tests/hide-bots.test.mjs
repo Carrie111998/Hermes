@@ -57,7 +57,6 @@ globalThis.__hide = {
   $botUnread,
   $selectedBot,
   $lastRoster,
-  $showHiddenBots,
   $activityToasts,
   setPluginCtx: value => { pluginCtx = value }
 };
@@ -192,11 +191,6 @@ test('shape: roster list filters through isBotHidden unless the show-hidden togg
     /const visibleRoster = showHidden \? roster : roster\.filter\(bot => !isBotHidden\(bot, allMeta\)\)/
   )
   assert.match(pluginSource, /const filteredRoster = filterBots\(visibleRoster, allMeta, query\)/)
-})
-
-test('shape: header eye toggle renders only when at least one bot is hidden', () => {
-  assert.match(pluginSource, /hiddenBots\.length\s*\n?\s*\? jsx\(Tip, \{/)
-  assert.match(pluginSource, /onClick: \(\) => \$showHiddenBots\.set\(!showHidden\)/)
 })
 
 test('shape: revealed hidden rows are dimmed and flagged with the eye-closed glyph', () => {

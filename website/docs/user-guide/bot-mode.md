@@ -21,7 +21,7 @@ The roster shows one row per agent profile: avatar, latest-message preview, and 
 - **Sessions** (from a Bot's context menu) browses and filters that profile's 200 most recent stored conversations, without changing the primary click-to-chat flow.
 - **Active now** — a presence strip above the roster shows every Bot currently working: the gateway-busy profile plus any Bot that wrote within the last 90 seconds. Each chip opens that Bot's chat. The strip never reorders the roster and disappears when the fleet is idle.
 - **Search** filters the roster as you type.
-- **Hide a Bot** — right-click a row → **Hide Bot** to take a Bot you don't use out of the roster and the Active-now strip. Hiding is display-only: @mentions still resolve, group-chat memberships are untouched, and routines keep running. Once at least one Bot is hidden, an **eye toggle** appears in the pane header — click it to reveal hidden Bots dimmed in place, then right-click → **Unhide Bot** to bring one back. Hidden Bots never toast, but they accumulate unread activity silently and the eye badges a dot so you know something happened. Hidden state is saved in the Bot's profile metadata, so it follows the Bot to every desktop connected to that backend.
+- **Hide a Bot** — right-click a row → **Hide Bot** to take a Bot you don't use out of the roster and the Active-now strip. Hiding is display-only: @mentions still resolve, group-chat memberships are untouched, and routines keep running. Reveal hidden Bots (dimmed in place) with the **View → Show hidden bots** toggle, then right-click → **Unhide Bot** to bring one back. Hidden Bots never toast, but they accumulate unread activity silently and the View menu button badges a dot so you know something happened. Hidden state is saved in the Bot's profile metadata, so it follows the Bot to every desktop connected to that backend.
 
 :::note The canonical Bot Chat is a forever-chat
 Typing `/new` (or `/reset`) inside a Bot's canonical chat would fork the relationship into a scratch session — the one thing Bot Mode promises never happens. The composer reroutes it to `/compact` instead: fresh working context, same conversation. Regular sessions on the same profile keep full `/new` freedom.
@@ -78,7 +78,7 @@ Routines are plain [Hermes cron jobs](./features/cron.md) namespaced `[bot:<name
 
 Right-click a local Bot → **Manage groups** to add or remove it from any number of group chats. Pick existing groups independently or create one inline. Local membership is stored in the Bot's backend-synced profile metadata, so it follows that profile across desktops; older profiles with one legacy group continue to work. Connections Bots join through the New Group Chat picker and remain source-qualified in that room's local Desktop state.
 
-Groups are standalone rows in the same activity-ordered roster as Bot DMs. A Bot keeps one DM row even when it belongs to several groups, while every group gets its own room row with member count, latest-message preview, timestamp, and needs-you state.
+**Important: Bot Mode groups and user-created visual Sections are different concepts.** Groups are membership labels stored in Bot metadata — they determine which Bots belong to which group chat rooms and appear in the group-chat member roster. Visual Sections (see below) are manual divider headers for display only; they never alter Bot groups, room membership, routing, or canonical chats.
 
 **Open chat** on any group row (2–6 Bots) opens a shared room where the whole group coordinates:
 
@@ -88,6 +88,38 @@ Groups are standalone rows in the same activity-ordered roster as Bot DMs. A Bot
 - Each member keeps its own persistent `Group: <name>` session, so room context survives like any other conversation.
 - **Not every Bot replies to every message.** Speaking is each member's own choice — a Bot replies only when it has something new to add and passes otherwise, and @-mentioning specific members scopes the round to them. Expect the members you addressed (or whoever has something to say) to speak, and the rest to stay quiet.
 - **Rooms can span machines.** The New Group Chat picker seats Bots from any registered connection; each member's turns run on its own machine, in its own `Group: <name>` session there. Cross-machine members carry a device badge (`dixie · Mac Mini`) in the room and in other members' transcripts, and the disambiguated `@name-device` handle works in room mentions — so same-named agents on two machines never blur together.
+
+## View controls
+
+The **View** menu (list-filter icon in the Bots header) controls how the roster is displayed. All preferences persist across app restarts via local plugin storage:
+
+### Grouping (single select)
+
+- **None** — every Bot and group row is a flat list. No automatic section dividers. Group rows remain visible.
+- **Sections** — peers are partitioned by manually created visual Section dividers (see below). Unassigned peer rows appear above the first section. Section headers are individually collapsible.
+- **Groups** — every Bot remains as a standalone row, followed by automatic named group shortcuts in alphabetical order. Each shortcut duplicates its members beneath it, and multi-group Bots appear under every group they belong to.
+
+### Sorting (single select)
+
+- **Alphabetical A–Z** — peers sorted by display name (case-insensitive). Bots and groups intermix alphabetically.
+- **Pinned first then recent** — pinned Bots at the top (newest activity first), then unpinned Bots by recency, then group rows by room activity. Groups are never pinned. This is the default.
+- **Manual order** — drag-and-drop reorder the roster, or focus a row and press **Alt+↑ / Alt+↓** to move it one slot; new peers append deterministically at the bottom. Order is persisted per grouping mode and per range: the flat list in None mode, each visual Section (and the Unassigned range) in Sections mode, and each automatic group in Groups mode.
+
+### Group display
+
+- **Nest group members** — in None and Sections modes: ON expands group rows into shortcuts that duplicate their member Bots beneath them; every Bot still keeps its standalone draggable row. Multi-group Bots appear under EVERY group they belong to. OFF hides the shortcut copies while group rows and standalone Bots remain visible. In Groups mode, shortcut nesting is inherent and the toggle is ignored.
+
+### Display
+
+- **Show hidden bots** — reveal Bots hidden via right-click → Hide Bot. This is the single place to reveal hidden Bots; there is no separate eye button.
+
+### Manage Sections…
+
+Opens a dialog for creating, renaming, reordering, and deleting visual Sections, and assigning Bot peers and group peers to sections. Deleting a visual Section makes its assigned rows unassigned; it never deletes a group or Bot.
+
+In Sections grouping mode, right-click any Bot row or group row → **Move to section** to assign it to a visual Section or return it to Unassigned. You can also **drag-and-drop**: drag a Section header to reorder Sections, and drag a Bot or group row into a Section or onto the always-reserved **Unassigned** target above the first Section. The target highlights during an active drag without shifting the roster under the pointer. In Manual order, dropping a peer inside its own range also reorders that range; in Alphabetical and Pinned-then-recent sorts, a cross-range drop changes assignment only and the sort stays authoritative. In Groups mode + Manual order, Bots reorder only within their own automatic group — cross-group drops are ignored and never alter group membership. Visual Section headers are individually collapsible — collapse hides only rows assigned to that section (rows hidden by similar group-collapse state stay visible).
+
+**Search composes after the selected grouping and sort projection.** In None and Sections modes: a Bot query retains matching Bot rows; a group name or member query retains the group row. In Groups mode, the current group search behavior is preserved. A collapsed visual Section never buries a search match — active search reveals matching rows.
 
 ## Bot-to-bot messaging
 

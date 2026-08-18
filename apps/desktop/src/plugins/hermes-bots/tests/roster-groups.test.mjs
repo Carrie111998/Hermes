@@ -188,16 +188,3 @@ test('stripPreviewMarkdown: flattens bold, quotes, code, and links out of previe
   assert.equal(stripPreviewMarkdown('## Heading\nbody'), 'Heading body')
   assert.equal(stripPreviewMarkdown(''), '')
 })
-
-test('source contract: the roster stays a flat list of bot and group rows', () => {
-  // Ordering is deliberately unchanged in this PR; sectioned ordering follows separately.
-  assert.doesNotMatch(pluginSource, /function groupRoster\(/)
-  assert.match(pluginSource, /rosterRows\.map\(row =>/)
-  assert.match(pluginSource, /function GroupRow\(/)
-  assert.match(pluginSource, /onGroup: setGrouping/)
-})
-
-test('source contract: group rows carry the needs-you badge and open via openGroupChat', () => {
-  assert.match(pluginSource, /needsYou: Boolean\(groupNeedsYou\[row\.name\]\)/)
-  assert.match(pluginSource, /onOpen: openGroupChat/)
-})

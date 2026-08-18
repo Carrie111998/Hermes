@@ -82,6 +82,32 @@ function ContextMenuCheckboxItem({
   )
 }
 
+function ContextMenuRadioGroup({ ...props }: React.ComponentProps<typeof ContextMenuPrimitive.RadioGroup>) {
+  return <ContextMenuPrimitive.RadioGroup data-slot="context-menu-radio-group" {...props} />
+}
+
+function ContextMenuRadioItem({
+  className,
+  children,
+  ...props
+}: React.ComponentProps<typeof ContextMenuPrimitive.RadioItem>) {
+  return (
+    <ContextMenuPrimitive.RadioItem
+      className={cn(
+        "relative flex cursor-default items-center gap-2 rounded-md px-2 py-1 text-xs outline-hidden select-none focus:bg-(--ui-control-active-background) focus:text-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
+        className
+      )}
+      data-slot="context-menu-radio-item"
+      {...props}
+    >
+      {children}
+      <ContextMenuPrimitive.ItemIndicator className="ml-auto flex items-center pl-2 text-foreground">
+        <Codicon name="circle-filled" size="0.75rem" />
+      </ContextMenuPrimitive.ItemIndicator>
+    </ContextMenuPrimitive.RadioItem>
+  )
+}
+
 function ContextMenuLabel({
   className,
   inset,
@@ -172,6 +198,8 @@ export {
   ContextMenuItem,
   ContextMenuLabel,
   ContextMenuPortal,
+  ContextMenuRadioGroup,
+  ContextMenuRadioItem,
   ContextMenuSeparator,
   ContextMenuSub,
   ContextMenuSubContent,

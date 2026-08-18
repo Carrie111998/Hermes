@@ -26,7 +26,13 @@ import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuRadioGroup,
+  ContextMenuRadioItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
   ContextMenuTrigger,
   ConfirmDialog,
   CopyButton,
@@ -37,8 +43,13 @@ import {
   DialogHeader,
   DialogTitle,
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
   EmptyState,
   GlyphSpinner,
@@ -83,6 +94,79 @@ const blobatarSvg = typeof sdk === 'undefined' ? undefined : sdk.blobatarSvg
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
 
 const ID = 'hermes-bots'
+
+const BOT_ROSTER_EN = {
+  view: {
+    options: 'View options', grouping: 'Grouping', none: 'None', sections: 'Sections', groups: 'Groups', sorting: 'Sorting',
+    alphabetical: 'Alphabetical A–Z', recent: 'Pinned first then recent', manual: 'Manual order', groupDisplay: 'Group display',
+    nestMembers: 'Nest group members', groupsMode: 'Groups mode', display: 'Display', showHidden: 'Show hidden bots',
+    manageSections: 'Manage Sections…', hiddenUnread: 'A hidden Bot has unread activity'
+  },
+  bot: {
+    backInRoster: name => `${name} is back in the roster`,
+    hidden: name => `${name} hidden — use View → Show hidden bots in the Bots header to see them`
+  },
+  sections: {
+    manage: 'Manage Sections',
+    description: 'Visual Sections partition the roster for display only. They never alter Bot groups or room membership.',
+    save: 'Save', cancel: 'Cancel', noSections: 'No sections yet. Create one to partition the roster.', newName: 'New section name…',
+    add: 'Add', peerAssignments: 'Peer assignments', unassigned: 'Unassigned', done: 'Done', moveTo: 'Move to section',
+    assignTo: (peer, destination) => `Move ${peer} to ${destination}`,
+    peers: count => `${count} peer${count === 1 ? '' : 's'}`, moveUp: title => `Move ${title} up`, moveDown: title => `Move ${title} down`,
+    rename: title => `Rename ${title}`, delete: title => `Delete ${title}`, collapse: title => `Collapse ${title}`, expand: title => `Expand ${title}`,
+    noMatch: query => `No bots match “${query}”`, allHidden: 'All bots are hidden — use View → Show hidden bots to show them.'
+  }
+}
+
+const BOT_LOCALES = {
+  en: BOT_ROSTER_EN,
+  ja: {
+    view: { options: '表示オプション', grouping: 'グループ化', none: 'なし', sections: 'セクション', groups: 'グループ', sorting: '並べ替え', alphabetical: 'アルファベット順 A–Z', recent: 'ピン留め優先、次に最近', manual: '手動順序', groupDisplay: 'グループ表示', nestMembers: 'グループメンバーを入れ子表示', groupsMode: 'グループモード', display: '表示', showHidden: '非表示のBotを表示', manageSections: 'セクションを管理…', hiddenUnread: '非表示のBotに未読のアクティビティがあります' },
+    bot: { backInRoster: name => `${name}を名簿に戻しました`, hidden: name => `${name}を非表示にしました — Botヘッダーの「表示」→「非表示のBotを表示」で確認できます` },
+    sections: { manage: 'セクションを管理', description: '表示用セクションは名簿の見た目だけを分けます。Botグループやルーム所属は変更しません。', save: '保存', cancel: 'キャンセル', noSections: 'セクションはまだありません。名簿を分けるセクションを作成してください。', newName: '新しいセクション名…', add: '追加', peerAssignments: '割り当て', unassigned: '未割り当て', done: '完了', moveTo: 'セクションへ移動', assignTo: (peer, destination) => `${peer}を${destination}へ移動`, peers: count => `${count}件`, moveUp: title => `${title}を上へ`, moveDown: title => `${title}を下へ`, rename: title => `${title}の名前を変更`, delete: title => `${title}を削除`, collapse: title => `${title}を折りたたむ`, expand: title => `${title}を展開`, noMatch: query => `「${query}」に一致するBotはありません`, allHidden: 'すべてのBotが非表示です。「表示」→「非表示のBotを表示」を使用してください。' }
+  },
+  zh: {
+    view: { options: '视图选项', grouping: '分组', none: '无', sections: '分区', groups: '群组', sorting: '排序', alphabetical: '按字母 A–Z', recent: '置顶优先，其次最近', manual: '手动顺序', groupDisplay: '群组显示', nestMembers: '嵌套群组成员', groupsMode: '群组模式', display: '显示', showHidden: '显示隐藏 Bot', manageSections: '管理分区…', hiddenUnread: '隐藏的 Bot 有未读活动' },
+    bot: { backInRoster: name => `${name} 已恢复到名册`, hidden: name => `${name} 已隐藏 — 可在 Bot 标题栏中使用“视图 → 显示隐藏 Bot”查看` },
+    sections: { manage: '管理分区', description: '可视分区只改变名册显示，不会修改 Bot 群组或房间成员关系。', save: '保存', cancel: '取消', noSections: '尚无分区。创建一个分区来整理名册。', newName: '新分区名称…', add: '添加', peerAssignments: '成员分配', unassigned: '未分配', done: '完成', moveTo: '移动到分区', assignTo: (peer, destination) => `将 ${peer} 移动到 ${destination}`, peers: count => `${count} 个成员`, moveUp: title => `上移 ${title}`, moveDown: title => `下移 ${title}`, rename: title => `重命名 ${title}`, delete: title => `删除 ${title}`, collapse: title => `折叠 ${title}`, expand: title => `展开 ${title}`, noMatch: query => `没有匹配“${query}”的 Bot`, allHidden: '所有 Bot 均已隐藏，请使用“视图 → 显示隐藏 Bot”。' }
+  },
+  'zh-hant': {
+    view: { options: '檢視選項', grouping: '分組', none: '無', sections: '分區', groups: '群組', sorting: '排序', alphabetical: '依字母 A–Z', recent: '釘選優先，其次最近', manual: '手動順序', groupDisplay: '群組顯示', nestMembers: '巢狀顯示群組成員', groupsMode: '群組模式', display: '顯示', showHidden: '顯示隱藏 Bot', manageSections: '管理分區…', hiddenUnread: '隱藏的 Bot 有未讀活動' },
+    bot: { backInRoster: name => `${name} 已恢復到名冊`, hidden: name => `${name} 已隱藏 — 可在 Bot 標題列中使用「檢視 → 顯示隱藏 Bot」查看` },
+    sections: { manage: '管理分區', description: '視覺分區只改變名冊顯示，不會修改 Bot 群組或房間成員關係。', save: '儲存', cancel: '取消', noSections: '尚無分區。建立一個分區來整理名冊。', newName: '新分區名稱…', add: '新增', peerAssignments: '成員分配', unassigned: '未分配', done: '完成', moveTo: '移動到分區', assignTo: (peer, destination) => `將 ${peer} 移動到 ${destination}`, peers: count => `${count} 位成員`, moveUp: title => `上移 ${title}`, moveDown: title => `下移 ${title}`, rename: title => `重新命名 ${title}`, delete: title => `刪除 ${title}`, collapse: title => `收合 ${title}`, expand: title => `展開 ${title}`, noMatch: query => `沒有符合「${query}」的 Bot`, allHidden: '所有 Bot 均已隱藏，請使用「檢視 → 顯示隱藏 Bot」。' }
+  }
+}
+
+function fallbackBotTranslate(key, ...args) {
+  let value = BOT_ROSTER_EN
+  for (const part of String(key).split('.')) value = value && value[part]
+  return typeof value === 'function' ? value(...args) : String(value || key)
+}
+
+const useBotRosterTranslate =
+  typeof sdk !== 'undefined' && typeof sdk.usePluginI18n === 'function'
+    ? sdk.usePluginI18n
+    : () => fallbackBotTranslate
+
+function bindBotText(t, template, prefix = '') {
+  const out = {}
+  for (const [key, value] of Object.entries(template)) {
+    const path = prefix ? `${prefix}.${key}` : key
+    out[key] = typeof value === 'function'
+      ? (...args) => t(path, ...args)
+      : value && typeof value === 'object'
+        ? bindBotText(t, value, path)
+        : t(path)
+  }
+  return out
+}
+
+function useBotRosterText() {
+  const reactive = useBotRosterTranslate(ID)
+  const translate = globalThis.__HERMES_BOTS_TEST__ && pluginCtx?.i18n?.t ? pluginCtx.i18n.t : reactive
+  return bindBotText(translate, BOT_ROSTER_EN)
+}
+
 const ROSTER_KEY = [ID, 'roster']
 const ROUTINES_KEY = [ID, 'routines']
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
@@ -296,8 +380,137 @@ async function saveBotMeta(name, patch) {
 // that asymmetry lets mergeServerMeta resurrect a stale truthy copy. A
 // literal false round-trips identically through both stores.
 
-/** Session-only view toggle: reveal hidden bots (dimmed) in the roster. */
-const $showHiddenBots = atom(false)
+// ── View state: grouping, sorting, visual sections ────────────────────────
+// Persisted view preferences for the Bots roster. Uses race-safe hydration
+// to prevent old storage-read cycles from overwriting newer local mutations.
+
+const VIEW_GROUPING_NONE = 'none'
+const VIEW_GROUPING_SECTIONS = 'sections'
+const VIEW_GROUPING_GROUPS = 'groups'
+const VIEW_SORT_ALPHA = 'alpha'
+const VIEW_SORT_PINNED_RECENCY = 'pinned-recency'
+const VIEW_SORT_MANUAL = 'manual'
+const ROSTER_VIEW_STORAGE_KEY = 'roster-view:window'
+
+/** Current view state wrapper { state, token, localGeneration }. It must be
+ * renderable synchronously: plugin storage hydration always yields at least
+ * once, while the bundled pane may mount immediately after registration. */
+const $viewStateWrapper = atom({ state: normalizeViewState(null), token: 0, localGeneration: 0 })
+function getOrInitViewState() {
+  return $viewStateWrapper.get()
+}
+let viewHydrationToken = 0
+
+/** Persist view state to plugin storage (fire-and-forget). */
+function persistViewState() {
+  const wrapper = getOrInitViewState()
+  if (!pluginCtx?.storage?.set) {
+    return
+  }
+
+  const toStore = { ...wrapper.state }
+  Promise.resolve(pluginCtx.storage.set(ROSTER_VIEW_STORAGE_KEY, toStore)).catch(() => undefined)
+}
+
+/** Hydrate view state from storage with lifecycle and mutation race safety. */
+async function hydrateViewStateFromStorage(requestToken, ctxAtStart = pluginCtx) {
+  const startedGeneration = getOrInitViewState().localGeneration
+  let stored = null
+  try {
+    stored = await ctxAtStart?.storage?.get?.(ROSTER_VIEW_STORAGE_KEY)
+    if (stored == null) stored = await ctxAtStart?.storage?.get?.('view-state')
+  } catch {
+    /* storage unavailable */
+  }
+
+  if (pluginCtx !== ctxAtStart) {
+    return
+  }
+
+  const current = getOrInitViewState()
+  const next = hydrateViewState(current, stored, requestToken, startedGeneration)
+  $viewStateWrapper.set(next)
+}
+
+/** Write a view state patch and persist. Returns the new normalized state. */
+function updateViewState(patch) {
+  const wrapper = getOrInitViewState()
+  const nextState = normalizeViewState({ ...wrapper.state, ...patch })
+
+  $viewStateWrapper.set({
+    state: nextState,
+    token: wrapper.token,
+    localGeneration: (wrapper.localGeneration || 0) + 1
+  })
+
+  persistViewState()
+
+  return nextState
+}
+
+/** Mutation helpers that call updateViewState and return the new state. */
+function setGroupingMode(mode) { return updateViewState({ grouping: mode }) }
+function setSortMode(mode) { return updateViewState({ sort: mode }) }
+function toggleNestMembers() { return updateViewState({ nestMembers: !getOrInitViewState().state.nestMembers }) }
+function toggleShowHidden() { return updateViewState({ showHidden: !getOrInitViewState().state.showHidden }) }
+
+function addVisualSection(title) {
+  const state = getOrInitViewState().state
+  const section = createVisualSection(state.visualSections, title)
+  const nextSections = [...state.visualSections, section]
+  const nextOrder = [...state.sectionOrder, section.key]
+
+  return updateViewState({ visualSections: nextSections, sectionOrder: nextOrder })
+}
+
+function editVisualSection(key, newTitle) {
+  const state = getOrInitViewState().state
+  return updateViewState({ visualSections: renameVisualSection(state.visualSections, key, newTitle) })
+}
+
+function removeVisualSection(key) {
+  const state = getOrInitViewState().state
+  const result = deleteVisualSection(state.visualSections, state.sectionAssignments, state.sectionOrder, key)
+
+  return updateViewState({
+    visualSections: result.sections,
+    sectionAssignments: result.assignments,
+    sectionOrder: result.order
+  })
+}
+
+function changeVisualSectionOrder(key, newIndex) {
+  const state = getOrInitViewState().state
+  const result = reorderVisualSections(state.visualSections, state.sectionOrder, key, newIndex)
+
+  return updateViewState({ visualSections: result.sections, sectionOrder: result.order })
+}
+
+function movePeerToSection(peerId, sectionKey) {
+  const state = getOrInitViewState().state
+  const assignments = sectionKey
+    ? assignPeerToSection(state.sectionAssignments, peerId, sectionKey)
+    : unassignPeerFromSection(state.sectionAssignments, peerId)
+
+  return updateViewState({ sectionAssignments: assignments })
+}
+
+function toggleSectionCollapse(sectionKey) {
+  const state = getOrInitViewState().state
+  const collapsed = collapseSection(state.sectionCollapsed, sectionKey, !isSectionCollapsed(state.sectionCollapsed, sectionKey))
+
+  return updateViewState({ sectionCollapsed: collapsed })
+}
+
+/** Collapse/expand a nested group row (None/Sections Nest ON). Reuses the
+ *  generic collapse-map helpers against `nestedExpansion`, which is already
+ *  normalized and persisted by the view-state layer. */
+function toggleNestedGroupCollapse(groupKey) {
+  const state = getOrInitViewState().state
+  const expanded = collapseSection(state.nestedExpansion, groupKey, !isSectionCollapsed(state.nestedExpansion, groupKey))
+
+  return updateViewState({ nestedExpansion: expanded })
+}
 
 /** Hidden flag for a roster row. Thin remote-source rows never read local
  *  meta (botRosterMeta returns null for them), so hide is by NAME on the
@@ -3392,6 +3605,29 @@ function displayName(bot, meta) {
   return raw.replace(/\b\w/g, ch => ch.toUpperCase())
 }
 
+/** Per-descriptor search match against the four identities a row can carry:
+ *  the customizable display name, the profile name, its @handle, and the
+ *  multi-source connection label. Shared by roster filtering and section
+ *  search so a remote-only room member matches by the same semantics as a
+ *  local roster row (remote descriptors can't ride the precomputed visible
+ *  roster, so they need the filter applied directly). */
+function matchesBotDescriptor(bot, metaByName, query) {
+  const needle = String(query || '').trim().toLowerCase().replace(/^@/, '')
+
+  if (!needle) {
+    return true
+  }
+
+  const display = displayName(bot, botRosterMeta(bot, metaByName)).toLowerCase()
+  const profile = (bot.name || '').toLowerCase()
+  const handle = botHandle(bot.name, bot).toLowerCase()
+  // Multi-source rows also match on their device name ("homelab" finds
+  // every bot living on the Homelab connection).
+  const sourceLabel = (bot.connectionLabel || '').toLowerCase()
+
+  return display.includes(needle) || profile.includes(needle) || handle.includes(needle) || sourceLabel.includes(needle)
+}
+
 /** Filter by the two stable identities rendered in every roster row: the
  * customizable display name and the profile's @handle. Keep the current
  * activity order — search narrows the roster, it never re-ranks it. */
@@ -3402,17 +3638,7 @@ function filterBots(roster, metaByName, query) {
     return roster
   }
 
-  return roster.filter(bot => {
-    const display = displayName(bot, botRosterMeta(bot, metaByName)).toLowerCase()
-    const profile = (bot.name || '').toLowerCase()
-    const handle = botHandle(bot.name, bot).toLowerCase()
-    // Multi-source rows also match on their device name ("homelab" finds
-    // every bot living on the Homelab connection).
-    const sourceLabel = (bot.connectionLabel || '').toLowerCase()
-    return (
-      display.includes(needle) || profile.includes(needle) || handle.includes(needle) || sourceLabel.includes(needle)
-    )
-  })
+  return roster.filter(bot => matchesBotDescriptor(bot, metaByName, needle))
 }
 
 function slugify(value) {
@@ -3497,7 +3723,7 @@ function groupChatNames(metaByName, rooms) {
 }
 
 /** Millisecond timestamp of a room's newest log entry (0 for a silent room) —
- *  the group's recency key, competing in the same ordering as bot rows. */
+ *  the group header's relative-time label. */
 function groupLastActivity(room) {
   const log = Array.isArray(room?.log) ? room.log : []
 
@@ -3506,12 +3732,14 @@ function groupLastActivity(room) {
 
 /** Seat a group's member roster: local bots whose meta names the group, plus
  *  the room record's stored descriptors (remote members can't ride bot-meta).
- *  Prefers the LIVE roster row for a stored descriptor when present. */
-function groupChatMemberBots(group, roster, metaByName) {
+ *  Prefers the LIVE roster row for a stored descriptor when present. `rooms`
+ *  defaults to the live room map; callers that project pure sections pass it
+ *  explicitly so the helper stays free of hidden store reads. */
+function groupChatMemberBots(group, roster, metaByName, rooms = $groupChats.get()) {
   const local = (roster || []).filter(
     bot => !bot.remoteSource && botGroups(botRosterMeta(bot, metaByName)).includes(group)
   )
-  const stored = ($groupChats.get()[group] || {}).members || []
+  const stored = ((rooms || {})[group] || {}).members || []
   const seated = new Set(local.map(botRosterKey))
   const remote = []
 
@@ -3555,6 +3783,1022 @@ function knownGroups(metaByName) {
   }
 
   return [...names].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+}
+
+// ── View model: grouping, sorting, visual sections, nesting ─────────────────
+//
+// Bot Mode groups and user-created visual Sections are DIFFERENT concepts.
+// Groups are Bot membership labels stored in bot-meta. Visual Sections are
+// manually created divider headers that partition the peer row list for
+// display only — they never alter Bot groups[], room membership, routing, or
+// canonical chats.
+//
+// View modes:
+//   None     — flat list: every visible Bot + every known group, no dividers.
+//   Sections — peers partitioned by manual visual Sections (unassigned first).
+//   Groups   — every Bot standalone, followed by alphabetical group shortcuts
+//              that duplicate every seated member beneath each membership.
+
+// ── Peer identity ─────────────────────────────────────────────────────────
+
+/** Source-qualified Bot identity — delegates to botRosterKey. */
+function botPeerIdentity(bot) {
+  return botRosterKey(bot)
+}
+
+/** Kind-qualified group identity — always 'group:<name>', never collides with
+ *  Bot ids (which are source-qualified, e.g. 'legacy::name'). */
+function groupPeerIdentity(name) {
+  return `group:${name}`
+}
+
+// ── Peer list construction ────────────────────────────────────────────────
+
+/** Build the top-level peer list: every visible Bot (respecting showHidden)
+ *  plus every durable/known group row exactly once. Groups never depend on
+ *  roster visibility — they stay visible even with zero local members. */
+function buildPeerList(roster, metaByName, rooms, showHidden) {
+  const peers = []
+  const seen = new Set()
+
+  for (const bot of (roster || [])) {
+    if (!showHidden && isBotHidden(bot, metaByName)) {
+      continue
+    }
+
+    const id = botPeerIdentity(bot)
+
+    if (seen.has(id)) {
+      continue
+    }
+
+    seen.add(id)
+    const meta = botRosterMeta(bot, metaByName)
+
+    peers.push({
+      kind: 'bot',
+      peerId: id,
+      name: bot.name,
+      remoteSource: bot.remoteSource || false,
+      sourceScoped: bot.sourceScoped || false,
+      connectionId: bot.connectionId,
+      connectionLabel: bot.connectionLabel,
+      handle: bot.handle,
+      last_session: bot.last_session,
+      groups: botGroups(meta),
+      meta,
+      botRow: bot
+    })
+  }
+
+  // Durable group rows: union bot-meta groups + room records.
+  const names = groupChatNames(metaByName, rooms || {})
+
+  for (const name of [...names].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))) {
+    const id = groupPeerIdentity(name)
+
+    if (seen.has(id)) {
+      continue
+    }
+
+    seen.add(id)
+    const room = (rooms || {})[name] || null
+
+    peers.push({
+      kind: 'group',
+      peerId: id,
+      title: name,
+      meta: null,
+      members: groupChatMemberBots(name, roster, metaByName, rooms || {}),
+      groupActivity: groupLastActivity(room),
+      groupRoom: room
+    })
+  }
+
+  return peers
+}
+
+// ── Sorting ────────────────────────────────────────────────────────────────
+
+/** Alphabetical A–Z: bots by display name, groups by group name. Case-insensitive. */
+function sortAlpha(items) {
+  return [...items].sort((a, b) => {
+    const aLabel = (a.kind === 'group' ? a.title : displayName(a.botRow, a.meta || null)).toLowerCase()
+    const bLabel = (b.kind === 'group' ? b.title : displayName(b.botRow, b.meta || null)).toLowerCase()
+
+    return aLabel.localeCompare(bLabel, undefined, { sensitivity: 'base' })
+  })
+}
+
+/** Pinned first then recency: pinned bots (newest activity first), then
+ *  unpinned bots (newest first), then groups (by room activity, newest
+ *  first). Groups are never pinned. */
+function sortPinnedRecency(items) {
+  const bots = items.filter(i => i.kind === 'bot')
+  const groups = items.filter(i => i.kind === 'group')
+
+  const pinned = bots.filter(b => b.meta?.pinned).sort((a, b) => (b.activity || 0) - (a.activity || 0))
+  const unpinned = bots.filter(b => !b.meta?.pinned).sort((a, b) => (b.activity || 0) - (a.activity || 0))
+  const sortedGroups = groups.sort((a, b) => (b.groupActivity || 0) - (a.groupActivity || 0))
+
+  return [...pinned, ...unpinned, ...sortedGroups]
+}
+
+/** Manual order: uses persisted peer-id array as the authoritative order.
+ *  New peers (not in persisted) append deterministically at the end; stale
+ *  IDs (not in current peers) are silently ignored. */
+function sortManual(items, persistedOrder) {
+  const idx = new Map()
+  const order = Array.isArray(persistedOrder) ? persistedOrder : []
+  const currentIds = new Set(items.map(i => i.peerId))
+
+  for (let i = 0; i < order.length; i++) {
+    const id = order[i]
+
+    if (currentIds.has(id)) {
+      idx.set(id, i)
+    }
+  }
+
+  const sorted = [...items].sort((a, b) => {
+    const ai = idx.has(a.peerId) ? idx.get(a.peerId) : Infinity
+    const bi = idx.has(b.peerId) ? idx.get(b.peerId) : Infinity
+
+    return ai - bi
+  })
+
+  return sorted
+}
+
+/** Dispatch to the correct sort function based on mode. */
+function resolveSortOrder(sortMode, items, manualOrder, pinnedRecencyActivity) {
+  switch (sortMode) {
+    case VIEW_SORT_ALPHA:
+      return sortAlpha(items)
+    case VIEW_SORT_MANUAL:
+      return sortManual(items, manualOrder)
+    case VIEW_SORT_PINNED_RECENCY:
+    default:
+      return sortPinnedRecency(items)
+  }
+}
+
+// ── Visual Sections ────────────────────────────────────────────────────────
+
+/** Generate a collision-safe section key. */
+function visualSectionKey(title, existingKeys) {
+  const base = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32) || 'section'
+  let key = `section:${base}`
+  let n = 1
+
+  while (existingKeys && existingKeys.has(key)) {
+    key = `section:${base}-${n++}`
+  }
+
+  return key
+}
+
+/** Create a new visual section. Returns the new section object. */
+function createVisualSection(existingSections, title) {
+  const keys = new Set((existingSections || []).map(s => s.key))
+  const maxOrder = (existingSections || []).reduce((max, s) => Math.max(max, s.order || 0), -1)
+  const key = visualSectionKey(title, keys)
+
+  return { key, title: title.trim(), order: maxOrder + 1 }
+}
+
+/** Rename a visual section. Returns new sections array. */
+function renameVisualSection(sections, key, newTitle) {
+  return (sections || []).map(s => (s.key === key ? { ...s, title: newTitle.trim() } : s))
+}
+
+/** Reorder visual sections by moving one section to a new index. Returns
+ *  { sections, order } with updated order fields. */
+function reorderVisualSections(sections, currentOrder, key, newIndex) {
+  const order = (currentOrder || []).filter(k => k !== key)
+
+  order.splice(Math.min(Math.max(0, newIndex), order.length), 0, key)
+
+  const sectionMap = new Map((sections || []).map(s => [s.key, s]))
+
+  return {
+    sections: order.map((k, i) => {
+      const s = sectionMap.get(k)
+
+      return s ? { ...s, order: i } : s
+    }).filter(Boolean),
+    order
+  }
+}
+
+/** Delete a visual section. Unassigns all peers assigned to it and removes
+ *  it from sections, order, and collapsed state. Never deletes a group or Bot.
+ *  Returns { sections, assignments, order, collapsed }. */
+function deleteVisualSection(sections, assignments, sectionOrder, key) {
+  const nextAssignments = { ...(assignments || {}) }
+
+  for (const peerId of Object.keys(nextAssignments)) {
+    if (nextAssignments[peerId] === key) {
+      delete nextAssignments[peerId]
+    }
+  }
+
+  const nextCollapsed = {}
+  const nextSections = (sections || []).filter(s => s.key !== key)
+  const nextOrder = (sectionOrder || []).filter(k => k !== key)
+
+  return {
+    sections: nextSections,
+    assignments: nextAssignments,
+    order: nextOrder,
+    collapsed: nextCollapsed
+  }
+}
+
+/** Assign a peer to a visual section. Returns new assignments map. */
+function assignPeerToSection(assignments, peerId, sectionKey) {
+  return { ...(assignments || {}), [peerId]: sectionKey }
+}
+
+/** Unassign a peer from a visual section. Returns new assignments map. */
+function unassignPeerFromSection(assignments, peerId) {
+  const next = { ...(assignments || {}) }
+  delete next[peerId]
+
+  return next
+}
+
+/** Collapse/expand a section. Returns new collapsed map. */
+function collapseSection(collapsed, sectionKey, value) {
+  const next = { ...(collapsed || {}) }
+
+  if (value) {
+    next[sectionKey] = true
+  } else {
+    delete next[sectionKey]
+  }
+
+  return next
+}
+
+/** Check if a section is collapsed. */
+function isSectionCollapsed(collapsed, sectionKey) {
+  return Boolean((collapsed || {})[sectionKey])
+}
+
+// ── Grouping mode application ──────────────────────────────────────────────
+
+/** Apply the selected grouping mode to a peer list and optional view state.
+ *  Returns a flat or sectioned render array.
+ *
+ *  In None mode: every peer is a flat row (no section dividers).
+ *  In Sections mode: peers are partitioned by visual sections with unassigned
+ *    first, each section with header + peer list.
+ *  In Groups mode: every Bot remains standalone, followed by automatic group
+ *    shortcuts alphabetically with duplicated members under every membership.
+ *
+ *  `nestMembers` controls whether group shortcuts expose duplicated member
+ *  children in None and Sections modes; canonical Bot rows remain top-level.
+ *  Groups mode shortcut nesting is inherent.
+ *
+ *  `searchOpts` is optional { query, matchesBotId }. When provided, the
+ *  projection is filtered: only matching Bots and group rows (by name match
+ *  or containing a matching member) survive. Collapsed sections do not bury
+ *  search matches — active search reveals matching rows. */
+function applyGroupingMode(mode, peers, viewState, nestMembers, searchOpts) {
+  const vsSections = (viewState || {}).visualSections || []
+  const vsAssignments = (viewState || {}).sectionAssignments || {}
+  const vsCollapsed = (viewState || {}).sectionCollapsed || {}
+  const vsOrder = (viewState || {}).sectionOrder || []
+  const vsNestedExpansion = (viewState || {}).nestedExpansion || {}
+  const manualSort = (viewState || {}).sort === VIEW_SORT_MANUAL
+  const manualOrderUnassigned = (viewState || {}).manualOrderUnassigned || {}
+  const manualOrderGroups = (viewState || {}).manualOrderGroups || {}
+  const searching = searchOpts && String(searchOpts.query || '').trim().toLowerCase()
+  const matchesBotId = searchOpts ? (searchOpts.matchesBotId || new Set()) : null
+
+  /** Whether a peer matches the current search. */
+  function peerMatches(peer) {
+    if (!searching) {
+      return true
+    }
+
+    if (peer.kind === 'bot' && matchesBotId && matchesBotId.has(peer.peerId)) {
+      return true
+    }
+
+    if (peer.kind === 'group' && peer.title.toLowerCase().includes(searching)) {
+      return true
+    }
+
+    // A group matches if any nested member would match
+    if (peer.kind === 'group' && matchesBotId && peer.children) {
+      return peer.children.some(c => matchesBotId.has(c.peerId))
+    }
+
+    // A raw group peer (from buildPeerList) carries `members` descriptors, not
+    // `children`. Match against those members by source-qualified identity and
+    // by descriptor so a member-name search keeps the group row even before
+    // nesting computes children (Sections Nest ON filters peers first).
+    if (peer.kind === 'group' && Array.isArray(peer.members)) {
+      return peer.members.some(member => {
+        if (matchesBotId && matchesBotId.has(botRosterKey(member))) {
+          return true
+        }
+
+        return matchesBotDescriptor(member, null, searching)
+      })
+    }
+
+    return false
+  }
+
+  /** Compute nested shortcut children from authoritative room seating first,
+   * falling back to local `groups[]` metadata for legacy/local-only rows. */
+  function nestChildren(groupPeer, botPeers) {
+    const seated = Array.isArray(groupPeer.members) ? groupPeer.members : []
+
+    return botPeers.filter(peer => {
+      const bot = peer.botRow || peer
+      const seatedMatch = seated.some(member => {
+        if (member?.remoteSource || member?.connectionId) {
+          return botRosterKey(member) === peer.peerId
+        }
+        return !bot?.remoteSource && member?.name === bot?.name
+      })
+
+      return seatedMatch || Boolean(peer.groups && peer.groups.includes(groupPeer.title))
+    })
+  }
+
+  if (mode === VIEW_GROUPING_GROUPS) {
+    // Group shortcuts are alphabetical; every Bot also stays standalone above.
+    const botPeers = peers.filter(p => p.kind === 'bot')
+    const groupPeers = peers.filter(p => p.kind === 'group')
+
+    const result = []
+
+    // Every Bot remains standalone; groups below are shortcuts that duplicate
+    // their members without replacing the canonical Bot rows.
+    const standaloneBots = manualSort
+      ? sortManual(botPeers, manualOrderGroups[MANUAL_ORDER_UNASSIGNED_KEY])
+      : botPeers
+    const filteredStandalone = searching
+      ? standaloneBots.filter(peerMatches)
+      : standaloneBots
+
+    for (const bot of filteredStandalone) {
+      result.push({ ...bot, level: 0 })
+    }
+
+    // Group sections alphabetically
+    const sortedGroups = [...groupPeers].sort((a, b) =>
+      a.title.localeCompare(b.title, undefined, { sensitivity: 'base' })
+    )
+
+    for (const gp of sortedGroups) {
+      const children = manualSort
+        ? sortManual(nestChildren(gp, botPeers), manualOrderGroups[groupPeerIdentity(gp.title)])
+        : nestChildren(gp, botPeers)
+      const filteredChildren = searching ? children.filter(b => matchesBotId.has(b.peerId)) : children
+
+      // Skip empty group sections during search (unless group name matches)
+      if (searching && filteredChildren.length === 0 && !gp.title.toLowerCase().includes(searching)) {
+        continue
+      }
+
+      result.push({
+        ...gp,
+        level: 0,
+        children: filteredChildren.map(c => ({ ...c, level: 1, parentId: gp.peerId })),
+        isGroupHeader: true
+      })
+    }
+
+    return result
+  }
+
+  if (mode === VIEW_GROUPING_SECTIONS) {
+    // Visual Section assignment and Bot group membership are independent. When
+    // nesting is enabled, each group draws children from the complete visible
+    // Bot peer set, so a multi-group Bot appears under every group even when
+    // those group rows live in different visual Sections.
+    const allSectionBotPeers = peers.filter(p => p.kind === 'bot')
+
+    // Partition peers by visual sections, unassigned first.
+    const unassigned = []
+    const bySection = new Map()
+
+    // Build the section-key → title lookup
+    const sectionMeta = new Map(vsSections.map(s => [s.key, s]))
+
+    for (const peer of peers) {
+      const assigned = vsAssignments[peer.peerId]
+      const sectionKey = assigned && sectionMeta.has(assigned) ? assigned : null
+
+      if (sectionKey) {
+        if (!bySection.has(sectionKey)) {
+          bySection.set(sectionKey, [])
+        }
+
+        bySection.get(sectionKey).push(peer)
+      } else {
+        unassigned.push(peer)
+      }
+    }
+
+    // Manual sort: order each range (unassigned + each section) by its own
+    // collision-safe bucket. Peers not yet in a bucket append deterministically.
+    if (manualSort) {
+      const unassignedOrder = sortManual(unassigned, manualOrderUnassigned[MANUAL_ORDER_UNASSIGNED_KEY])
+
+      unassigned.splice(0, unassigned.length, ...unassignedOrder)
+
+      for (const [key, list] of bySection) {
+        bySection.set(key, sortManual(list, manualOrderUnassigned[key]))
+      }
+    }
+
+    const result = []
+
+    // For searching, filter within sections but never hide matches
+    function filterPeers(sectionPeers) {
+      if (!searching) {
+        return sectionPeers.map(p => ({ ...p, level: 0 }))
+      }
+
+      return sectionPeers.filter(peerMatches).map(p => ({ ...p, level: 0 }))
+    }
+
+    // Unassigned section (always first, no header)
+    const filteredUnassigned = searching
+      ? unassigned.filter(peerMatches)
+      : unassigned
+
+    // Apply nesting within unassigned if requested
+    if (nestMembers) {
+      const nestedResult = []
+
+      for (const peer of filteredUnassigned) {
+        if (peer.kind === 'bot') {
+          nestedResult.push({ ...peer, level: 0 })
+          continue
+        }
+
+        const children = nestChildren(peer, allSectionBotPeers)
+        const visibleChildren = searching
+          ? children.filter(b => matchesBotId.has(b.peerId))
+          : children
+
+        if (searching && visibleChildren.length === 0 && !peerMatches(peer)) {
+          continue
+        }
+
+        nestedResult.push({
+          ...peer,
+          level: 0,
+          children: visibleChildren.map(c => ({ ...c, level: 1, parentId: peer.peerId })),
+          isGroupHeader: true,
+          collapsed: searching ? false : isSectionCollapsed(vsNestedExpansion, peer.peerId)
+        })
+      }
+
+      if (nestedResult.length > 0) {
+        result.push({ sectionKey: undefined, title: null, peers: nestedResult, level: 0 })
+      }
+    } else {
+      if (filteredUnassigned.length > 0) {
+        result.push({
+          sectionKey: undefined,
+          title: null,
+          peers: filteredUnassigned.map(p => ({ ...p, level: 0 })),
+          level: 0
+        })
+      }
+    }
+
+    // Named sections in persisted order
+    const orderedKeys = vsOrder.filter(k => sectionMeta.has(k))
+
+    for (const key of orderedKeys) {
+      const meta = sectionMeta.get(key)
+      const sectionPeers = bySection.get(key) || []
+      const collapsed = isSectionCollapsed(vsCollapsed, key)
+
+      let filteredPeers = filterPeers(sectionPeers)
+
+      // Apply nesting within this section if requested
+      if (nestMembers) {
+        const nestedResult = []
+
+        for (const peer of filteredPeers) {
+          if (peer.kind === 'bot') {
+            nestedResult.push({ ...peer, level: 0 })
+            continue
+          }
+
+          const children = nestChildren(peer, allSectionBotPeers)
+          const visibleChildren = searching
+            ? children.filter(b => matchesBotId.has(b.peerId))
+            : children
+
+          if (searching && visibleChildren.length === 0 && !peerMatches(peer)) {
+            continue
+          }
+
+          nestedResult.push({
+            ...peer,
+            level: 0,
+            children: visibleChildren.map(c => ({ ...c, level: 1, parentId: peer.peerId })),
+            isGroupHeader: true,
+            collapsed: searching ? false : isSectionCollapsed(vsNestedExpansion, peer.peerId)
+          })
+        }
+
+        filteredPeers = nestedResult
+      }
+
+      // During search: skip empty sections unless group name matches
+      if (searching && filteredPeers.length === 0 && !(meta.title && meta.title.toLowerCase().includes(searching))) {
+        continue
+      }
+
+      // During search, collapsed sections still show matching peers
+      const effectivePeers = (searching || !collapsed) ? filteredPeers : []
+
+      result.push({
+        sectionKey: key,
+        title: meta ? meta.title : key,
+        peers: effectivePeers,
+        peerCount: sectionPeers.length,
+        level: 0,
+        collapsed: searching ? false : collapsed
+      })
+    }
+
+    return result
+  }
+
+  // VIEW_GROUPING_NONE — default: flat list, no dividers
+  const result = []
+
+  if (nestMembers) {
+    const botPeers = peers.filter(p => p.kind === 'bot')
+
+    for (const peer of peers) {
+      if (peer.kind === 'bot') {
+        if (peerMatches(peer)) {
+          result.push({ ...peer, level: 0 })
+        }
+        continue
+      }
+
+      const children = nestChildren(peer, botPeers)
+      const visibleChildren = searching
+        ? children.filter(b => matchesBotId && matchesBotId.has(b.peerId))
+        : children
+
+      if (!peerMatches(peer) && searching && visibleChildren.length === 0) {
+        continue
+      }
+
+      result.push({
+        ...peer,
+        level: 0,
+        children: visibleChildren.map(c => ({ ...c, level: 1, parentId: peer.peerId })),
+        isGroupHeader: true,
+        collapsed: searching ? false : isSectionCollapsed(vsNestedExpansion, peer.peerId)
+      })
+    }
+  } else {
+    // Flat mode: every peer at level 0, no nesting
+    for (const peer of peers) {
+      if (peerMatches(peer)) {
+        result.push({ ...peer, level: 0 })
+      }
+    }
+  }
+
+  return result
+}
+
+// ── Drag-and-drop (native HTML5; no dependencies) ──────────────────────────
+//
+// Dragging is layered on the pure view model. Peer identities are opaque
+// strings (`botPeerIdentity` / `groupPeerIdentity`) that are compared by
+// equality only — never parsed — so adversarial names (a Bot literally named
+// "group:x", a group named "unassigned", …) can never corrupt assignments or
+// order buckets. All of these helpers are pure and unit-tested.
+
+/** Reserved bucket key for the top-level/unassigned range in Sections and
+ *  Groups manual orders. It cannot collide with a section key (always
+ *  `section:…`) or a group key (always `group:…`), so a section or group can
+ *  never be confused with the unassigned range. */
+const MANUAL_ORDER_UNASSIGNED_KEY = 'unassigned'
+
+/** Canonical, collision-free manual-order bucket key for a range within a
+ *  grouping mode:
+ *  - None: a single flat bucket (stored in `manualOrderNone`), key unused.
+ *  - Sections: the section key itself (`section:…`), or the reserved
+ *    `unassigned` key for the unassigned range.
+ *  - Groups: `group:<name>` for a named group, or `unassigned` for the
+ *    ungrouped top-level range. */
+function manualOrderBucketKey(groupingMode, rangeKey) {
+  if (groupingMode === VIEW_GROUPING_SECTIONS) {
+    return rangeKey == null ? MANUAL_ORDER_UNASSIGNED_KEY : rangeKey
+  }
+  if (groupingMode === VIEW_GROUPING_GROUPS) {
+    return rangeKey == null ? MANUAL_ORDER_UNASSIGNED_KEY : groupPeerIdentity(rangeKey)
+  }
+  return MANUAL_ORDER_UNASSIGNED_KEY
+}
+
+/** Compute the new manual-order bucket after dragging `peerId` onto
+ *  `targetPeerId` within `rangePeerIds` (the range's current, authoritative
+ *  peer-id order). A null `targetPeerId` means "drop at the end". Handles both
+ *  an in-range move (peer already in the list) and a cross-range insert (peer
+ *  not yet in the list — it is inserted at the target's slot). Returns the new
+ *  array, or null when the drag is a no-op (peer or target absent, or already
+ *  in place). Pure — never mutates its inputs.
+ *
+ *  `position` is 'before' (default) or 'after' and controls whether the peer
+ *  lands directly before or after the target. With a null target, both
+ *  positions append to the end. */
+function reorderPeerInto(rangePeerIds, peerId, targetPeerId, position = 'before') {
+  const input = Array.isArray(rangePeerIds) ? rangePeerIds : []
+  const list = [...input]
+  const from = list.indexOf(peerId)
+
+  if (!peerId || peerId === targetPeerId) {
+    return null
+  }
+
+  let to
+
+  if (targetPeerId == null) {
+    to = list.length
+  } else {
+    to = list.indexOf(targetPeerId)
+
+    if (to < 0) {
+      return null
+    }
+  }
+
+  if (from >= 0) {
+    // In-range move: splice out, then re-insert. Adjust the target index when
+    // the removal shifts later indices down by one, and respect the position
+    // parameter so 'after' landings move past the target.
+    const [moved] = list.splice(from, 1)
+
+    let insertAt = to
+
+    if (to > from) {
+      // Removing the peer from an earlier slot shifted the target left by one.
+      insertAt = to - 1
+    }
+
+    if (position === 'after') {
+      insertAt += 1
+    }
+
+    list.splice(insertAt, 0, moved)
+  } else {
+    // Cross-range insert: drop the peer at the target's slot (before it), or
+    // after it when position is 'after'; append when dropped on empty space.
+    const insertAt = position === 'after' && targetPeerId != null ? to + 1 : to
+    list.splice(insertAt, 0, peerId)
+  }
+
+  if (list.length === input.length && list.every((id, i) => id === input[i])) {
+    return null
+  }
+
+  return list
+}
+
+/** Resolve a peer (Bot or group row) drop into a view-state patch, or null if
+ *  the drop is disallowed / a no-op. Encodes every drag semantic:
+ *
+ *  - Sections mode: dropping a peer on a section assigns it; dropping on the
+ *    Unassigned range unassigns it. In Manual sort the drop also inserts the
+ *    peer into the target range's collision-safe order bucket.
+ *  - None mode: Manual sort reorders the flat `manualOrderNone` bucket; Alpha
+ *    and Recency sort are authoritative and never reorder.
+ *  - Groups mode: Manual sort reorders Bots only WITHIN the automatic group
+ *    they were dragged from; cross-group drops are ignored and never mutate
+ *    `groups[]`, room membership, or canonical chats. Alpha/Recency are
+ *    authoritative.
+ *
+ *  `drag` = {
+ *    peerId, kind ('bot'|'group'), grouping, sort,
+ *    fromRangeKey, toRangeKey, targetPeerId, rangePeerIds, position
+ *  }
+ *  where `toRangeKey` is a section key / group name / null (unassigned).
+ *  Returns a patch for `updateViewState`, or null. */
+function applyPeerDrop(viewState, drag) {
+  if (!drag || !drag.peerId) {
+    return null
+  }
+
+  const grouping = drag.grouping
+  const sort = drag.sort
+  const peerId = drag.peerId
+
+  if (grouping === VIEW_GROUPING_SECTIONS) {
+    const assignments = { ...((viewState && viewState.sectionAssignments) || {}) }
+    const toKey = drag.toRangeKey
+
+    if (toKey) {
+      assignments[peerId] = toKey
+    } else {
+      delete assignments[peerId]
+    }
+
+    const patch = { sectionAssignments: assignments }
+
+    if (sort === VIEW_SORT_MANUAL && drag.rangePeerIds) {
+      const buckets = { ...((viewState && viewState.manualOrderUnassigned) || {}) }
+      const bucketKey = manualOrderBucketKey(grouping, toKey)
+      const persistedRange = Array.isArray(buckets[bucketKey]) ? buckets[bucketKey] : []
+      const visibleRange = Array.isArray(drag.rangePeerIds) ? drag.rangePeerIds : []
+      // A collapsed Section projects no visible peers. Preserve its persisted
+      // manual order and append the dropped peer instead of replacing the
+      // hidden bucket with a one-item list.
+      const targetRange = visibleRange.length === 0 && persistedRange.length > 0 ? persistedRange : visibleRange
+      const next = reorderPeerInto(targetRange, peerId, drag.targetPeerId, drag.position)
+
+      if (next) {
+        buckets[bucketKey] = next
+        patch.manualOrderUnassigned = buckets
+      }
+    }
+
+    return patch
+  }
+
+  if (grouping === VIEW_GROUPING_NONE) {
+    if (sort !== VIEW_SORT_MANUAL || !drag.rangePeerIds) {
+      return null
+    }
+
+    const next = reorderPeerInto(drag.rangePeerIds, peerId, drag.targetPeerId, drag.position)
+
+    return next ? { manualOrderNone: next } : null
+  }
+
+  if (grouping === VIEW_GROUPING_GROUPS) {
+    if (sort !== VIEW_SORT_MANUAL) {
+      return null
+    }
+
+    // Cross-group guard: a Bot may only reorder within the group it was
+    // dragged from. Never mutate groups[] or room membership.
+    if (drag.kind === 'bot' && drag.fromRangeKey !== drag.toRangeKey) {
+      return null
+    }
+
+    if (!drag.rangePeerIds) {
+      return null
+    }
+
+    const buckets = { ...((viewState && viewState.manualOrderGroups) || {}) }
+    const bucketKey = manualOrderBucketKey(grouping, drag.toRangeKey)
+    const next = reorderPeerInto(drag.rangePeerIds, peerId, drag.targetPeerId, drag.position)
+
+    if (next) {
+      buckets[bucketKey] = next
+      return { manualOrderGroups: buckets }
+    }
+
+    return null
+  }
+
+  return null
+}
+
+/** Keyboard-equivalent of a one-slot manual drag. */
+function applyKeyboardPeerMove(viewState, move) {
+  const rangePeerIds = Array.isArray(move?.rangePeerIds) ? move.rangePeerIds : []
+  const from = rangePeerIds.indexOf(move?.peerId)
+  const delta = move?.delta < 0 ? -1 : move?.delta > 0 ? 1 : 0
+  const to = from + delta
+
+  if (!delta || from < 0 || to < 0 || to >= rangePeerIds.length) {
+    return null
+  }
+
+  return applyPeerDrop(viewState, {
+    peerId: move.peerId,
+    kind: move.kind,
+    grouping: move.grouping,
+    sort: VIEW_SORT_MANUAL,
+    fromRangeKey: move.rangeKey,
+    toRangeKey: move.rangeKey,
+    targetPeerId: rangePeerIds[to],
+    rangePeerIds,
+    position: delta < 0 ? 'before' : 'after'
+  })
+}
+
+/** Resolve a visual-Section header drop (reorder Sections) into a view-state
+ *  patch, or null if the drop is a no-op. Only reorders — never changes a
+ *  Section's peers, assignments, or collapse state. */
+function applySectionDrop(viewState, drag) {
+  const sectionKey = drag && drag.sectionKey
+  const toSectionKey = drag && drag.toSectionKey
+
+  if (!sectionKey || !toSectionKey || sectionKey === toSectionKey) {
+    return null
+  }
+
+  const sections = (viewState && viewState.visualSections) || []
+  const order = (viewState && viewState.sectionOrder) || []
+  const nextOrder = reorderPeerInto(order, sectionKey, toSectionKey, drag.position)
+
+  if (!nextOrder) {
+    return null
+  }
+
+  const rank = new Map(nextOrder.map((key, index) => [key, index]))
+  const nextSections = sections
+    .map(section => ({ ...section, order: rank.has(section.key) ? rank.get(section.key) : section.order }))
+    .sort((a, b) => (a.order || 0) - (b.order || 0))
+
+  return { visualSections: nextSections, sectionOrder: nextOrder }
+}
+
+// ── View state normalization and hydration ─────────────────────────────────
+
+/** Rename or remove every renderer-local reference to a group shortcut. */
+function remapGroupViewState(viewState, oldName, newName) {
+  const oldId = groupPeerIdentity(oldName)
+  const nextId = newName ? groupPeerIdentity(newName) : null
+  const remapList = list => (Array.isArray(list) ? list.flatMap(id => id === oldId ? (nextId ? [nextId] : []) : [id]) : [])
+
+  const sectionAssignments = { ...((viewState && viewState.sectionAssignments) || {}) }
+  if (Object.hasOwn(sectionAssignments, oldId)) {
+    const section = sectionAssignments[oldId]
+    delete sectionAssignments[oldId]
+    if (nextId) sectionAssignments[nextId] = section
+  }
+
+  const manualOrderUnassigned = {}
+  for (const [key, list] of Object.entries((viewState && viewState.manualOrderUnassigned) || {})) {
+    manualOrderUnassigned[key] = remapList(list)
+  }
+
+  const manualOrderGroups = {}
+  for (const [key, list] of Object.entries((viewState && viewState.manualOrderGroups) || {})) {
+    const mappedKey = key === oldId ? nextId : key
+    if (mappedKey) manualOrderGroups[mappedKey] = remapList(list)
+  }
+
+  const nestedExpansion = { ...((viewState && viewState.nestedExpansion) || {}) }
+  if (Object.hasOwn(nestedExpansion, oldId)) {
+    const expanded = nestedExpansion[oldId]
+    delete nestedExpansion[oldId]
+    if (nextId) nestedExpansion[nextId] = expanded
+  }
+
+  return {
+    sectionAssignments,
+    manualOrderNone: remapList(viewState && viewState.manualOrderNone),
+    manualOrderUnassigned,
+    manualOrderGroups,
+    nestedExpansion
+  }
+}
+
+/** Normalize a stored view state: fill defaults, strip stale section
+ *  assignments, deduplicate order, remove unknown section keys. Safe to call
+ *  with null/undefined/malformed input. */
+function normalizeViewState(raw) {
+  const input = raw && typeof raw === 'object' ? raw : {}
+
+  const grouping =
+    input.grouping === VIEW_GROUPING_NONE ||
+    input.grouping === VIEW_GROUPING_SECTIONS ||
+    input.grouping === VIEW_GROUPING_GROUPS
+      ? input.grouping
+      : VIEW_GROUPING_NONE
+  const sort =
+    input.sort === VIEW_SORT_ALPHA ||
+    input.sort === VIEW_SORT_PINNED_RECENCY ||
+    input.sort === VIEW_SORT_MANUAL
+      ? input.sort
+      : VIEW_SORT_PINNED_RECENCY
+  const nestMembers = Boolean(input.nestMembers)
+  const showHidden = Boolean(input.showHidden)
+
+  const visualSections = Array.isArray(input.visualSections)
+    ? input.visualSections.filter(s => s && typeof s.key === 'string' && typeof s.title === 'string')
+    : []
+  const validKeys = new Set(visualSections.map(s => s.key))
+
+  // Strip stale assignments
+  const rawAssignments = input.sectionAssignments && typeof input.sectionAssignments === 'object'
+    ? input.sectionAssignments
+    : {}
+  const sectionAssignments = {}
+
+  for (const peerId of Object.keys(rawAssignments)) {
+    if (validKeys.has(rawAssignments[peerId])) {
+      sectionAssignments[peerId] = rawAssignments[peerId]
+    }
+  }
+
+  // Strip stale collapsed
+  const rawCollapsed = input.sectionCollapsed && typeof input.sectionCollapsed === 'object'
+    ? input.sectionCollapsed
+    : {}
+  const sectionCollapsed = {}
+
+  for (const key of Object.keys(rawCollapsed)) {
+    if (validKeys.has(key) && rawCollapsed[key]) {
+      sectionCollapsed[key] = true
+    }
+  }
+
+  // Deduplicate and filter section order
+  const rawOrder = Array.isArray(input.sectionOrder) ? input.sectionOrder : []
+  const seen = new Set()
+  const sectionOrder = []
+
+  for (const key of rawOrder) {
+    if (validKeys.has(key) && !seen.has(key)) {
+      seen.add(key)
+      sectionOrder.push(key)
+    }
+  }
+
+  // Add any valid sections not in the order
+  for (const s of visualSections) {
+    if (!seen.has(s.key)) {
+      sectionOrder.push(s.key)
+    }
+  }
+
+  const manualOrderNone = Array.isArray(input.manualOrderNone) ? input.manualOrderNone : []
+  const manualOrderUnassigned =
+    input.manualOrderUnassigned && typeof input.manualOrderUnassigned === 'object'
+      ? input.manualOrderUnassigned
+      : {}
+  const manualOrderGroups =
+    input.manualOrderGroups && typeof input.manualOrderGroups === 'object'
+      ? input.manualOrderGroups
+      : {}
+  const nestedExpansion =
+    input.nestedExpansion && typeof input.nestedExpansion === 'object'
+      ? input.nestedExpansion
+      : {}
+
+  return {
+    grouping,
+    sort,
+    nestMembers,
+    showHidden,
+    visualSections,
+    sectionAssignments,
+    sectionCollapsed,
+    sectionOrder,
+    manualOrderNone,
+    manualOrderUnassigned,
+    manualOrderGroups,
+    nestedExpansion
+  }
+}
+
+/** Apply a stored hydration only when it is newer and no local mutation landed
+ * after that read began. `startedGeneration` is captured before awaiting the
+ * storage backend. */
+function hydrateViewState(current, stored, requestToken, startedGeneration = current?.localGeneration || 0) {
+  if (requestToken === 0) {
+    return {
+      state: normalizeViewState(null),
+      token: current?.token || 0,
+      localGeneration: 0
+    }
+  }
+
+  if (!current || requestToken <= (current.token || 0)) {
+    return current
+  }
+
+  if ((current.localGeneration || 0) !== startedGeneration) {
+    return current
+  }
+
+  return {
+    state: normalizeViewState(stored),
+    token: requestToken,
+    localGeneration: current.localGeneration || 0
+  }
 }
 
 // ── group chats: bounded round-robin coordination over a shared room log ─────
@@ -3823,6 +5067,7 @@ async function disbandGroupChat(group, members) {
   }
 
   $groupChats.set(all)
+  updateViewState(remapGroupViewState(getOrInitViewState().state, group, null))
 
   if ($groupChatWorkspace.get() === group) {
     $groupChatWorkspace.set(null)
@@ -3922,6 +5167,7 @@ async function renameGroupChat(oldName, newName, members) {
   }
 
   $groupChats.set(all)
+  updateViewState(remapGroupViewState(getOrInitViewState().state, oldName, next))
 
   const needs = { ...$groupNeedsYou.get() }
 
@@ -4638,7 +5884,13 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
-function BotRow({ bot, onDelete, onEdit, onGroup }) {
+function BotRow({ bot, onDelete, onEdit, onGroup, peerId, viewState, draggable, onDragStart, onDragOver, onDrop, onDragEnd, onKeyDown, insertion }) {
+  const rowText = (key, name) => {
+    if (typeof pluginCtx !== 'undefined' && pluginCtx?.i18n?.t) return pluginCtx.i18n.t(key, name)
+    return key === 'bot.backInRoster'
+      ? `${name} is back in the roster`
+      : `${name} hidden — use View → Show hidden bots in the Bots header to see them`
+  }
   const activeProfile = useValue(host.state.profile)
   const meta = botRosterMeta(bot, useValue($botMeta))
   const groups = botGroups(meta)
@@ -4760,15 +6012,25 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
 
   const row = jsxs('button', {
     type: 'button',
+    draggable: Boolean(draggable),
+    'data-drop-position': insertion && insertion.targetId === peerId ? insertion.position : undefined,
+    onDragStart,
+    onDragOver,
+    onDrop,
+    onDragEnd,
+    onKeyDown,
+    'aria-keyshortcuts': onKeyDown ? 'Alt+ArrowUp Alt+ArrowDown' : undefined,
     onPointerEnter: warm,
     onClick: open,
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
       isActive && 'bg-(--chrome-action-hover)',
-      // Hidden bots only render while the header eye toggle is on — dimmed,
-      // so the temporary reveal reads as a different state from the roster.
-      meta?.hidden && 'opacity-60'
+      // Hidden bots only render while the View menu's Show hidden toggle is on
+      // — dimmed, so the temporary reveal reads as a different state from the
+      // roster.
+      meta?.hidden && 'opacity-60',
+      draggable && 'cursor-grab active:cursor-grabbing'
     ),
     children: [
       jsx('div', {
@@ -4862,11 +6124,25 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     ]
   })
 
-  // Thin rows from another source are navigation targets only. Their profile
-  // metadata is not loaded yet, so edit/delete/pin/group actions would mutate
-  // whichever backend happens to be active. A normal click activates the
-  // owner; the refreshed rich row then exposes the full context menu.
+  // Thin rows from another source must never expose profile mutations against
+  // the active backend. Visual Section placement is renderer-local, however,
+  // so it remains safely available from the remote row's context menu.
   if (bot.remoteSource) {
+    if (viewState?.grouping === 'sections' && peerId) {
+      return jsxs(ContextMenu, {
+        children: [
+          jsx(ContextMenuTrigger, { asChild: true, children: row }),
+          jsx(ContextMenuContent, {
+            children: jsx(MoveToSectionSubmenu, {
+              peerId,
+              sectionAssignments: viewState?.sectionAssignments || {},
+              sections: viewState?.visualSections || []
+            })
+          })
+        ]
+      })
+    }
+
     return row
   }
 
@@ -4900,8 +6176,8 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
               host.notify({
                 kind: 'info',
                 message: hidden
-                  ? `${displayName(bot, meta)} is back in the roster`
-                  : `${displayName(bot, meta)} hidden — use the eye button in the Bots header to see hidden bots`
+                  ? rowText('bot.backInRoster', displayName(bot, meta))
+                  : rowText('bot.hidden', displayName(bot, meta))
               })
             },
             children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
@@ -4916,6 +6192,13 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
             ? jsx(ContextMenuItem, {
                 onSelect: () => onGroup(bot),
                 children: groups.length ? `Groups: ${groups.join(', ')}…` : 'Manage groups…'
+              })
+            : null,
+          viewState?.grouping === 'sections' && peerId
+            ? jsx(MoveToSectionSubmenu, {
+                peerId,
+                sectionAssignments: viewState?.sectionAssignments || {},
+                sections: viewState?.visualSections || []
               })
             : null,
           jsx(ContextMenuItem, {
@@ -9141,14 +10424,707 @@ function openGroupChat(group) {
   $groupChatWorkspace.set(group)
 }
 
-/** One group chat as ONE roster row — the Discord shape: stacked member
- *  avatars, group name, member count, the newest room line as the preview
- *  (markdown flattened), relative time of the last activity, and the
- *  needs-you badge on the row itself. Sorts into the same recency ordering
- *  as bot rows; clicking opens the room in the main chat window. */
-function GroupRow({ group, members, needsYou, onOpen }) {
+// ── View Menu ──────────────────────────────────────────────────────────────
+
+/** Dropdown content for the View menu. Renders grouping (single-select),
+ *  sorting (single-select), nest toggle, show hidden toggle, and a
+ *  "Manage Sections…" action. */
+function ViewMenuContent({ viewState, onSetGrouping, onSetSort, onToggleNest, onToggleShowHidden, onManageSections }) {
+  const copy = useBotRosterText()
+  const grouping = viewState?.grouping || VIEW_GROUPING_NONE
+  const sort = viewState?.sort || VIEW_SORT_PINNED_RECENCY
+  const nestMembers = viewState?.nestMembers || false
+  const showHidden = viewState?.showHidden || false
+
+  return jsxs(DropdownMenuContent, {
+    align: 'end',
+    className: 'w-52',
+    children: [
+      jsx(DropdownMenuLabel, { children: copy.view.grouping }),
+      jsxs(DropdownMenuRadioGroup, {
+        value: grouping,
+        onValueChange: onSetGrouping,
+        children: [
+          jsx(DropdownMenuRadioItem, { value: VIEW_GROUPING_NONE, children: copy.view.none }),
+          jsx(DropdownMenuRadioItem, { value: VIEW_GROUPING_SECTIONS, children: copy.view.sections }),
+          jsx(DropdownMenuRadioItem, { value: VIEW_GROUPING_GROUPS, children: copy.view.groups })
+        ]
+      }),
+      jsx(DropdownMenuSeparator, {}),
+      jsx(DropdownMenuLabel, { children: copy.view.sorting }),
+      jsxs(DropdownMenuRadioGroup, {
+        value: sort,
+        onValueChange: onSetSort,
+        children: [
+          jsx(DropdownMenuRadioItem, { value: VIEW_SORT_ALPHA, children: copy.view.alphabetical }),
+          jsx(DropdownMenuRadioItem, { value: VIEW_SORT_PINNED_RECENCY, children: copy.view.recent }),
+          jsx(DropdownMenuRadioItem, { value: VIEW_SORT_MANUAL, children: copy.view.manual })
+        ]
+      }),
+      jsx(DropdownMenuSeparator, {}),
+      jsx(DropdownMenuLabel, { children: copy.view.groupDisplay }),
+      grouping !== VIEW_GROUPING_GROUPS
+        ? jsx(DropdownMenuCheckboxItem, {
+            checked: nestMembers,
+            onCheckedChange: onToggleNest,
+            onSelect: event => event.preventDefault(),
+            children: copy.view.nestMembers
+          })
+        : jsxs(DropdownMenuCheckboxItem, {
+            checked: true,
+            disabled: true,
+            children: [
+              copy.view.nestMembers,
+              jsx('span', { className: 'ml-auto text-[0.625rem] text-(--ui-text-quaternary)', children: copy.view.groupsMode })
+            ]
+          }),
+      jsx(DropdownMenuSeparator, {}),
+      jsx(DropdownMenuLabel, { children: copy.view.display }),
+      jsx(DropdownMenuCheckboxItem, {
+        checked: showHidden,
+        onCheckedChange: onToggleShowHidden,
+        onSelect: event => event.preventDefault(),
+        children: copy.view.showHidden
+      }),
+      jsx(DropdownMenuSeparator, {}),
+      jsxs(DropdownMenuItem, {
+        onSelect: () => onManageSections(),
+        children: [jsx(Codicon, { name: 'list-tree', className: 'mr-1.5' }), copy.view.manageSections]
+      })
+    ]
+  })
+}
+
+// ── Manage Sections dialog ─────────────────────────────────────────────────
+
+/** Dialog for creating, renaming, reordering, deleting, and assigning
+ *  peers to visual Sections. */
+function ManageSectionsDialog({ open, onClose }) {
+  const copy = useBotRosterText()
+  const viewState = useValue($viewStateWrapper).state
+  const roster = useValue($lastRoster)
+  const allMeta = useValue($botMeta)
+  const groupRooms = useValue($groupChats)
+  const showHidden = viewState.showHidden || false
+  const [newTitle, setNewTitle] = useState('')
+  const [editingSection, setEditingSection] = useState(null)
+  const [editingTitle, setEditingTitle] = useState('')
+
+  const sections = viewState.visualSections || []
+  const assignments = viewState.sectionAssignments || {}
+  const order = viewState.sectionOrder || []
+
+  // Build peer list for assignment
+  const peers = buildPeerList(roster, allMeta, groupRooms, showHidden)
+
+  function handleCreate() {
+    const title = newTitle.trim()
+    if (!title) return
+    addVisualSection(title)
+    setNewTitle('')
+  }
+
+  function handleRename(key) {
+    const title = editingTitle.trim()
+    if (!title) return
+    editVisualSection(key, title)
+    setEditingSection(null)
+    setEditingTitle('')
+  }
+
+  function handleDelete(key) {
+    removeVisualSection(key)
+  }
+
+  function handleMoveUp(key) {
+    const idx = order.indexOf(key)
+    if (idx > 0) {
+      changeVisualSectionOrder(key, idx - 1)
+    }
+  }
+
+  function handleMoveDown(key) {
+    const idx = order.indexOf(key)
+    if (idx < order.length - 1) {
+      changeVisualSectionOrder(key, idx + 1)
+    }
+  }
+
+  // Ordered sections
+  const orderedSections = order
+    .map(k => sections.find(s => s.key === k))
+    .filter(Boolean)
+
+  if (!open) return null
+
+  return jsx(Dialog, {
+    open: true,
+    onOpenChange: open => { if (!open) onClose() },
+    children: jsxs(DialogContent, {
+      className: 'max-h-[80vh] max-w-md',
+      children: [
+        jsx(DialogHeader, {
+          children: jsx(DialogTitle, { children: copy.sections.manage })
+        }),
+        jsx(DialogDescription, {
+          className: 'text-xs',
+          children: copy.sections.description
+        }),
+        jsxs('div', {
+          className: 'mt-3 space-y-3',
+          children: [
+            // Section list with reorder/rename/delete
+            orderedSections.length
+              ? jsxs('div', {
+                  className: 'space-y-1',
+                  children: orderedSections.map((section, i) => {
+                    const isEditing = editingSection === section.key
+                    const peerCount = Object.values(assignments).filter(v => v === section.key).length
+
+                    return jsxs('div', {
+                      key: section.key,
+                      className: 'flex items-center gap-1 py-1',
+                      children: [
+                        isEditing
+                          ? jsxs('div', {
+                              className: 'flex flex-1 items-center gap-1',
+                              children: [
+                                jsx(Input, {
+                                  'aria-label': copy.sections.rename(section.title),
+                                  value: editingTitle,
+                                  onChange: e => setEditingTitle(e.target.value),
+                                  onKeyDown: e => { if (e.key === 'Enter') handleRename(section.key) },
+                                  autoFocus: true
+                                }),
+                                jsx(Button, { size: 'sm', variant: 'ghost', onClick: () => handleRename(section.key), children: copy.sections.save }),
+                                jsx(Button, { size: 'sm', variant: 'ghost', onClick: () => { setEditingSection(null); setEditingTitle('') }, children: copy.sections.cancel })
+                              ]
+                            })
+                          : jsxs('div', {
+                              className: 'flex flex-1 items-center gap-1 min-w-0',
+                              children: [
+                                jsx('span', { className: 'truncate text-xs font-medium', children: section.title }),
+                                jsx('span', { className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)', children: copy.sections.peers(peerCount) })
+                              ]
+                            }),
+                        jsxs('div', {
+                          className: 'flex items-center gap-0.5',
+                          children: [
+                            jsx(Button, {
+                              variant: 'ghost',
+                              size: 'icon-xs',
+                              disabled: i === 0,
+                              'aria-label': copy.sections.moveUp(section.title),
+                              onClick: () => handleMoveUp(section.key),
+                              children: jsx(Codicon, { name: 'chevron-up' })
+                            }),
+                            jsx(Button, {
+                              variant: 'ghost',
+                              size: 'icon-xs',
+                              disabled: i === orderedSections.length - 1,
+                              'aria-label': copy.sections.moveDown(section.title),
+                              onClick: () => handleMoveDown(section.key),
+                              children: jsx(Codicon, { name: 'chevron-down' })
+                            }),
+                            jsx(Button, {
+                              variant: 'ghost',
+                              size: 'icon-xs',
+                              'aria-label': copy.sections.rename(section.title),
+                              onClick: () => { setEditingSection(section.key); setEditingTitle(section.title) },
+                              children: jsx(Codicon, { name: 'edit' })
+                            }),
+                            jsx(Button, {
+                              variant: 'ghost',
+                              size: 'icon-xs',
+                              'aria-label': copy.sections.delete(section.title),
+                              onClick: () => handleDelete(section.key),
+                              className: 'hover:text-destructive',
+                              children: jsx(Codicon, { name: 'trash' })
+                            })
+                          ]
+                        })
+                      ]
+                    }, section.key)
+                  })
+                })
+              : jsx('div', {
+                  className: 'py-4 text-center text-xs text-(--ui-text-tertiary)',
+                  children: copy.sections.noSections
+                }),
+
+            // Create new section
+            jsxs('div', {
+              className: 'flex gap-1',
+              children: [
+                jsx(Input, {
+                  'aria-label': copy.sections.newName,
+                  placeholder: copy.sections.newName,
+                  value: newTitle,
+                  onChange: e => setNewTitle(e.target.value),
+                  onKeyDown: e => { if (e.key === 'Enter') handleCreate() }
+                }),
+                jsx(Button, { size: 'sm', variant: 'secondary', onClick: handleCreate, disabled: !newTitle.trim(), children: copy.sections.add })
+              ]
+            }),
+
+            // Peer assignments — every Bot and group peer exactly once, with a
+            // current-assignment label and controls for Unassigned + every section.
+            peers.length
+              ? jsxs('div', {
+                  className: 'border-t border-(--ui-stroke-secondary) pt-2',
+                  children: [
+                    jsx('div', {
+                      className: 'mb-1 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+                      children: copy.sections.peerAssignments
+                    }),
+                    jsxs('div', {
+                      className: 'max-h-48 space-y-1 overflow-y-auto',
+                      children: peers.map(peer => {
+                        const currentKey = assignments[peer.peerId] || null
+                        const currentTitle = currentKey
+                          ? (sections.find(s => s.key === currentKey)?.title || currentKey)
+                          : copy.sections.unassigned
+                        const peerLabel = peer.kind === 'bot' ? displayName(peer.botRow, peer.meta) : peer.title
+
+                        return jsxs('div', {
+                          key: peer.peerId,
+                          className: 'flex flex-wrap items-center gap-1 py-0.5',
+                          children: [
+                            jsx('span', {
+                              className: 'min-w-0 flex-1 truncate text-xs',
+                              children: peerLabel
+                            }),
+                            jsx('span', {
+                              className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                              children: currentTitle
+                            }),
+                            jsxs('div', {
+                              className: 'flex flex-wrap gap-1',
+                              children: [
+                                jsx(Button, {
+                                  variant: !currentKey ? 'default' : 'secondary',
+                                  size: 'xs',
+                                  'aria-pressed': !currentKey,
+                                  'aria-label': copy.sections.assignTo(peerLabel, copy.sections.unassigned),
+                                  onClick: () => movePeerToSection(peer.peerId, null),
+                                  children: copy.sections.unassigned
+                                }),
+                                ...orderedSections.map(s =>
+                                  jsx(Button, {
+                                    key: s.key,
+                                    variant: currentKey === s.key ? 'default' : 'secondary',
+                                    size: 'xs',
+                                    'aria-pressed': currentKey === s.key,
+                                    'aria-label': copy.sections.assignTo(peerLabel, s.title),
+                                    onClick: () => movePeerToSection(peer.peerId, s.key),
+                                    children: s.title
+                                  }, `assignto:${s.key}`)
+                                )
+                              ]
+                            })
+                          ]
+                        }, peer.peerId)
+                      })
+                    })
+                  ]
+                })
+              : null
+          ]
+        }),
+        jsx(DialogFooter, {
+          children: jsx(Button, { variant: 'secondary', onClick: onClose, children: copy.sections.done })
+        })
+      ]
+    })
+  })
+}
+
+/** Match insertion feedback to one concrete roster range. A Bot can have the
+ * same peer ID in its standalone row and several group shortcuts. */
+function insertionMatches(insertion, targetId, rangeKey, position) {
+  return Boolean(
+    insertion &&
+    insertion.type === 'peer' &&
+    insertion.targetId === targetId &&
+    insertion.rangeKey === rangeKey &&
+    insertion.position === position
+  )
+}
+
+/** Render projected roster items. Handles all three grouping modes.
+ *  In None/Groups: flat render with nesting support.
+ *  In Sections: section headers + peer rows per section, collapsible.
+ *  Drag-and-drop is wired through `ctx.drag` (native HTML5; no deps). */
+function renderProjectedRoster(projected, mode, ctx) {
+  const { setDeleting, setEditing, setGrouping, groupNeedsYou, openGroupChat, viewState, drag, toggleNestedGroup } = ctx
+
+  /** Drag affordance for a group's nested member rows. In Groups mode the
+   *  members are draggable within their automatic group; in None/Sections
+   *  nesting the members are a re-projection of the flat/section peers and are
+   *  NOT independently draggable. */
+  function dragInfoForChildren(groupItem, children) {
+    if (mode === VIEW_GROUPING_GROUPS) {
+      return {
+        draggable: drag.canDragPeer,
+        rangeKey: groupItem.title,
+        rangePeerIds: children.map(c => c.peerId)
+      }
+    }
+
+    return { draggable: false, rangeKey: null, rangePeerIds: [] }
+  }
+
+  function renderPeerRow(item, dragInfo) {
+    const insertion = drag.insertion
+    const showInsertionBefore = insertionMatches(insertion, item.peerId, dragInfo.rangeKey, 'before')
+    const showInsertionAfter = insertionMatches(insertion, item.peerId, dragInfo.rangeKey, 'after')
+    const keyboardMovable = Boolean(drag.canKeyboardMovePeer && dragInfo.draggable && dragInfo.rangePeerIds.length > 1)
+
+    let row = null
+
+    if (item.kind === 'group') {
+      // Group row with optional children
+      const children = item.isGroupHeader && Array.isArray(item.children) ? item.children : []
+      const collapsed = item.collapsed
+      const childDragInfo = children.length ? dragInfoForChildren(item, children) : null
+      // Collapse chevron only for the None/Sections nest projection; Groups mode
+      // rich headers keep their current behavior.
+      const collapsible = children.length > 0 && mode !== VIEW_GROUPING_GROUPS
+
+      const groupRow = jsx(
+        GroupRowEnhanced,
+        {
+          group: item.title,
+          members: item.members || [],
+          needsYou: Boolean((groupNeedsYou || {})[item.title]),
+          onOpen: openGroupChat,
+          collapsed,
+          peerId: item.peerId,
+          viewState,
+          collapsible,
+          onToggleCollapse: toggleNestedGroup,
+          draggable: dragInfo.draggable,
+          onDragStart: dragInfo.draggable ? event => drag.beginPeerDrag(event, item.peerId, 'group', dragInfo.rangeKey, item.title, '👥') : undefined,
+          onDragOver: dragInfo.draggable ? event => drag.allowPeerDrop(event, dragInfo.rangeKey, item.peerId) : undefined,
+          onDrop: dragInfo.draggable ? event => drag.dropPeer(event, dragInfo.rangeKey, item.peerId, dragInfo.rangePeerIds) : undefined,
+          onDragEnd: drag.endPeerDrag,
+          onKeyDown: keyboardMovable
+            ? event => drag.keyboardMovePeer(event, item.peerId, 'group', dragInfo.rangeKey, dragInfo.rangePeerIds)
+            : undefined,
+          insertion
+        },
+        `group:${item.title}`
+      )
+
+      const childrenTree = !collapsed && children.length
+        ? jsx('div', {
+            className: 'grid gap-0.5 pl-4',
+            children: children.map(child =>
+              renderPeerRow(child, childDragInfo)
+            )
+          }, `group-members:${item.title}`)
+        : null
+
+      const pieces = [
+        showInsertionBefore ? jsx(InsertionLine, { position: 'before' }, `insertion-before:${item.peerId}`) : null,
+        groupRow,
+        childrenTree,
+        showInsertionAfter ? jsx(InsertionLine, { position: 'after' }, `insertion-after:${item.peerId}`) : null
+      ].filter(Boolean)
+
+      row = pieces
+      return row.flat()
+    }
+
+    // Bot row
+    row = jsx(
+      BotRow,
+      {
+        bot: item.botRow,
+        onDelete: setDeleting,
+        onEdit: setEditing,
+        onGroup: setGrouping,
+        peerId: item.peerId,
+        viewState,
+        draggable: dragInfo.draggable,
+        onDragStart: dragInfo.draggable
+          ? event => drag.beginPeerDrag(event, item.peerId, 'bot', dragInfo.rangeKey, displayName(item.botRow, item.meta || null), '🤖')
+          : undefined,
+        onDragOver: dragInfo.draggable ? event => drag.allowPeerDrop(event, dragInfo.rangeKey, item.peerId) : undefined,
+        onDrop: dragInfo.draggable ? event => drag.dropPeer(event, dragInfo.rangeKey, item.peerId, dragInfo.rangePeerIds) : undefined,
+        onDragEnd: drag.endPeerDrag,
+        onKeyDown: keyboardMovable
+          ? event => drag.keyboardMovePeer(event, item.peerId, 'bot', dragInfo.rangeKey, dragInfo.rangePeerIds)
+          : undefined,
+        insertion
+      },
+      `bot:${item.peerId}`
+    )
+
+    const botPieces = [showInsertionBefore ? jsx(InsertionLine, { position: 'before' }, `insertion-before:${item.peerId}`) : null, row, showInsertionAfter ? jsx(InsertionLine, { position: 'after' }, `insertion-after:${item.peerId}`) : null].filter(Boolean)
+
+    return botPieces.flat()
+  }
+
+  if (mode === VIEW_GROUPING_SECTIONS) {
+    // Sections mode: an unassigned range (always first, no header unless a drag
+    // is active) followed by named sections with draggable headers + peers.
+    const namedSections = projected.filter(s => s.sectionKey)
+    const unassignedSection = projected.find(s => !s.sectionKey)
+    const unassignedPeers = unassignedSection?.peers || []
+    const unassignedPeerIds = unassignedPeers.map(p => p.peerId)
+
+    const pieces = []
+
+    // Unassigned peers (no header normally).
+    pieces.push(
+      unassignedPeers.map(p =>
+        renderPeerRow(p, { draggable: drag.canDragPeer, rangeKey: null, rangePeerIds: unassignedPeerIds })
+      )
+    )
+
+    // Permanently reserve the Unassigned target so beginning a drag never
+    // reflows assigned rows or Section headers under the pointer.
+    if (namedSections.length) {
+      pieces.push(
+        jsx(UnassignedDropZone, {
+          active: drag.isDragging,
+          onDragOver: event => drag.allowPeerDrop(event, null, null),
+          onDrop: event => drag.dropPeer(event, null, null, unassignedPeerIds)
+        }, 'unassigned-drop-zone')
+      )
+    }
+
+    for (const section of namedSections) {
+      const peers = section.peers || []
+      const peerIds = peers.map(p => p.peerId)
+      const sectionMeta = (viewState?.visualSections || []).find(s => s.key === section.sectionKey)
+      const sectionTitle = sectionMeta?.title || section.sectionKey
+      const sectionInsertion = drag.insertion
+      const showSectionBefore = sectionInsertion && sectionInsertion.targetId === section.sectionKey && sectionInsertion.position === 'before'
+      const showSectionAfter = sectionInsertion && sectionInsertion.targetId === section.sectionKey && sectionInsertion.position === 'after'
+
+      if (showSectionBefore) {
+        pieces.push(
+          jsx(InsertionLine, { position: 'before' }, `insertion-before-section:${section.sectionKey}`)
+        )
+      }
+
+      const sectionChildren = [
+        jsx(
+          SectionHeader,
+          {
+            key: section.sectionKey,
+            sectionKey: section.sectionKey,
+            title: sectionTitle,
+            collapsed: section.collapsed,
+            peerCount: section.peerCount ?? peers.length,
+            draggable: drag.canDragSection,
+            onDragStart: drag.canDragSection ? event => drag.beginSectionDrag(event, section.sectionKey, sectionTitle, section.peerCount ?? peers.length) : undefined,
+            onDragOver: drag.canDragSection ? event => drag.allowSectionTarget(event, section.sectionKey) : undefined,
+            onDrop: drag.canDragSection ? event => drag.dropOnSection(event, section.sectionKey, peerIds) : undefined,
+            onDragEnd: drag.endSectionDrag,
+            insertion: sectionInsertion
+          },
+          `section:${section.sectionKey}`
+        )
+      ]
+
+      if (!section.collapsed) {
+        sectionChildren.push(
+          jsx('div', {
+            className: 'ml-5 grid gap-0.5',
+            children: peers.map(p =>
+              renderPeerRow(p, { draggable: drag.canDragPeer, rangeKey: section.sectionKey, rangePeerIds: peerIds })
+            )
+          }, `section-peers:${section.sectionKey}`)
+        )
+      }
+
+      pieces.push(
+        jsx('div', {
+          className: 'min-w-0',
+          children: sectionChildren
+        }, `section-container:${section.sectionKey}`)
+      )
+
+      if (showSectionAfter) {
+        pieces.push(
+          jsx(InsertionLine, { position: 'after' }, `insertion-after-section:${section.sectionKey}`)
+        )
+      }
+    }
+
+    return pieces.flat()
+  }
+
+  if (mode === VIEW_GROUPING_GROUPS) {
+    // Groups mode: ungrouped bots (level 0) are draggable within the ungrouped
+    // range; automatic group headers are not draggable; members are draggable
+    // within their own group (see dragInfoForChildren).
+    const ungroupedBots = projected.filter(i => i.level === 0 && i.kind === 'bot')
+    const ungroupedPeerIds = ungroupedBots.map(i => i.peerId)
+
+    return projected
+      .flatMap(item => {
+        if (item.kind === 'bot') {
+          return renderPeerRow(item, { draggable: drag.canDragPeer, rangeKey: null, rangePeerIds: ungroupedPeerIds })
+        }
+
+        return renderPeerRow(item, { draggable: false, rangeKey: null, rangePeerIds: [] })
+      })
+      .flat()
+  }
+
+  // None mode: flat list. Nested members (nest toggle on) are a re-projection
+  // and are not independently draggable; the flat bucket reorders top-level
+  // peers only.
+  const flatPeerIds = projected.filter(i => i.level === 0).map(i => i.peerId)
+
+  return projected
+    .flatMap(item =>
+      renderPeerRow(item, {
+        draggable: item.level === 0 ? drag.canDragPeer : false,
+        rangeKey: null,
+        rangePeerIds: flatPeerIds
+      })
+    )
+    .flat()
+}
+
+/** A permanently reserved "Unassigned" target above the first named Section.
+ *  Keeping its footprint stable prevents drag-start from shifting every assigned
+ *  row and Section header under the pointer; active drag only changes styling. */
+function UnassignedDropZone({ active, onDragOver, onDrop }) {
+  const copy = useBotRosterText()
+  return jsx('div', {
+    onDragOver,
+    onDrop,
+    'data-unassigned-drop-target': 'true',
+    'aria-hidden': active ? undefined : 'true',
+    className: cn(
+      'my-0.5 flex items-center justify-center rounded-md border px-2 py-1.5 text-[0.6875rem] font-semibold uppercase tracking-wider transition-colors',
+      active
+        ? 'border-dashed border-(--ui-accent) text-(--ui-accent)'
+        : 'border-transparent text-(--ui-text-quaternary)'
+    ),
+    children: copy.sections.unassigned
+  })
+}
+
+/** Create a compact drag preview element, attach to dataTransfer, and return
+ *  a cleanup function. The element is positioned offscreen and
+ *  pointer-events: none — the browser shows it as the drag ghost instead of
+ *  the giant transparent full-row default. Pure DOM helper — no framework
+ *  deps, testable with an injected document/dataTransfer seam. */
+function createDragPreview(event, opts) {
+  const { kind, label, icon, sectionTitle, peerCount } = opts
+  try {
+    const wrapper = document.createElement('div')
+    wrapper.style.cssText = [
+      'position: fixed',
+      'top: -9999px',
+      'left: -9999px',
+      'pointer-events: none',
+      'z-index: 2147483647',
+      'display: flex',
+      'align-items: center',
+      'gap: 6px',
+      'padding: 4px 8px',
+      'border-radius: 6px',
+      'background: var(--card)',
+      'color: var(--foreground)',
+      'font-size: 12px',
+      'font-family: inherit',
+      'white-space: nowrap',
+      'border: 1px solid var(--border)'
+    ].join(';')
+
+    if (kind === 'section') {
+      wrapper.textContent = `${sectionTitle} (${peerCount})`
+    } else if (kind === 'bot' || kind === 'group') {
+      if (icon) {
+        const iconSpan = document.createElement('span')
+        iconSpan.style.cssText = 'font-size:14px;line-height:1'
+        iconSpan.textContent = icon
+        wrapper.appendChild(iconSpan)
+      }
+      const labelSpan = document.createElement('span')
+      labelSpan.textContent = label
+      wrapper.appendChild(labelSpan)
+    } else {
+      wrapper.textContent = String(label || '')
+    }
+
+    document.body.appendChild(wrapper)
+    event.dataTransfer.setDragImage(wrapper, 0, 0)
+    return () => { try { wrapper.remove() } catch { /* already removed */ } }
+  } catch {
+    return () => {}
+  }
+}
+
+/** A thin accent insertion line rendered during drag-over, indicating where the
+ *  dragged peer or section will land. Respects position='before'|'after'. */
+function InsertionLine({ position }) {
+  return jsx('div', {
+    'data-drop-position': position,
+    'aria-hidden': 'true',
+    className: 'h-[2px] rounded-full mx-1 my-0.5 bg-(--ui-accent) opacity-80',
+    style: { transition: 'opacity 0.1s ease' }
+  })
+}
+
+/** Section header with collapse toggle. The title row is the drag handle while
+ *  the dedicated left chevron mirrors nested group rows exactly. */
+function SectionHeader({ title, collapsed, peerCount, sectionKey, draggable, onDragStart, onDragOver, onDrop, onDragEnd, insertion }) {
+  const copy = useBotRosterText()
+  return jsxs('div', {
+    'data-drop-position': insertion && insertion.targetId === sectionKey ? insertion.position : undefined,
+    onDragOver,
+    onDrop,
+    className: 'flex w-full items-center gap-0.5',
+    children: [
+      jsx(Button, {
+        variant: 'ghost',
+        size: 'icon-xs',
+        onClick: () => toggleSectionCollapse(sectionKey),
+        'aria-label': collapsed ? copy.sections.expand(title) : copy.sections.collapse(title),
+        'aria-expanded': !collapsed,
+        children: jsx(Codicon, {
+          name: collapsed ? 'chevron-right' : 'chevron-down',
+          className: 'text-xs'
+        })
+      }),
+      jsxs(Button, {
+        variant: 'ghost',
+        size: 'xs',
+        draggable: Boolean(draggable),
+        onDragStart,
+        onDragEnd,
+        onClick: () => toggleSectionCollapse(sectionKey),
+        className: cn(
+          'min-w-0 flex-1 justify-start overflow-hidden text-(--ui-text-tertiary)',
+          draggable && 'cursor-grab active:cursor-grabbing'
+        ),
+        children: [
+          jsx('span', { className: 'flex-1 uppercase tracking-wide', children: title }),
+          jsx('span', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            children: peerCount
+          })
+        ]
+      })
+    ]
+  })
+}
+
+/** Group row with optional context menu (for move-to-section in Sections mode). */
+function GroupRowEnhanced({ group, members, needsYou, onOpen, collapsed, peerId, viewState, draggable, onDragStart, onDragOver, onDrop, onDragEnd, onKeyDown, collapsible, onToggleCollapse, insertion }) {
+  const copy = useBotRosterText()
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
+  const mode = viewState?.grouping || VIEW_GROUPING_NONE
   const room = rooms[group] || { log: [] }
   const log = Array.isArray(room.log) ? room.log : []
   const last = log.length ? log[log.length - 1] : null
@@ -9158,20 +11134,27 @@ function GroupRow({ group, members, needsYou, onOpen }) {
     : 'No messages yet — say hi to the room'
   const faces = members.slice(0, 3)
 
-  return jsxs('button', {
+  const row = jsxs('button', {
     type: 'button',
+    draggable: Boolean(draggable),
+    'data-drop-position': insertion && insertion.targetId === peerId ? insertion.position : undefined,
+    onDragStart,
+    onDragOver,
+    onDrop,
+    onDragEnd,
+    onKeyDown,
+    'aria-keyshortcuts': onKeyDown ? 'Alt+ArrowUp Alt+ArrowDown' : undefined,
     onClick: () => {
       haptic('tap')
       onOpen(group)
     },
     className: cn(
-      'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
-      'hover:bg-(--chrome-action-hover)'
+      'flex min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
+      collapsible ? 'flex-1' : 'w-full',
+      'hover:bg-(--chrome-action-hover)',
+      draggable && 'cursor-grab active:cursor-grabbing'
     ),
     children: [
-      // Room picture when the user set one; else a composite avatar of up to
-      // three member faces fanned like Discord's group-DM icon; a bare glyph
-      // when the room has no seated members.
       jsx('div', {
         className: 'flex w-[34px] shrink-0 items-center justify-center',
         children: room.image
@@ -9225,8 +11208,8 @@ function GroupRow({ group, members, needsYou, onOpen }) {
               needsYou
                 ? jsx('span', {
                     className:
-                      'shrink-0 rounded-full bg-(--ui-accent,#4f9cf9) px-1.5 text-[0.6rem] font-semibold text-white',
-                    title: 'A bot in this room needs your input',
+                      'shrink-0 rounded-full bg-primary px-1.5 text-[0.6rem] font-semibold text-primary-foreground',
+                    'aria-label': 'A bot in this room needs your input',
                     children: 'needs you'
                   })
                 : null,
@@ -9246,9 +11229,111 @@ function GroupRow({ group, members, needsYou, onOpen }) {
       })
     ]
   })
+
+  // Nested group rows (None/Sections Nest ON) expose a sibling collapse chevron
+  // — a separate button next to the room-open action, never nested inside it
+  // (a nested button would be invalid HTML). Groups mode headers keep their
+  // current behavior (no chevron) because `collapsible` is only set for the
+  // None/Sections nest projection.
+  const rowWithToggle = collapsible
+    ? jsxs('div', {
+        className: 'flex w-full items-center gap-0.5',
+        children: [
+          jsx(Button, {
+            variant: 'ghost',
+            size: 'icon-xs',
+            onClick: () => onToggleCollapse(peerId),
+            'aria-label': collapsed ? copy.sections.expand(group) : copy.sections.collapse(group),
+            'aria-expanded': !collapsed,
+            children: jsx(Codicon, { name: collapsed ? 'chevron-right' : 'chevron-down', className: 'text-xs' })
+          }),
+          row
+        ]
+      })
+    : row
+
+  // In Sections mode, add right-click context menu for move-to-section
+  if (mode === VIEW_GROUPING_SECTIONS && peerId) {
+    return jsxs(ContextMenu, {
+      children: [
+        jsx(ContextMenuTrigger, { asChild: true, children: rowWithToggle }),
+        jsx(MoveToSectionMenu, {
+          peerId,
+          viewState,
+          sectionAssignments: viewState?.sectionAssignments || {},
+          sections: viewState?.visualSections || []
+        })
+      ]
+    })
+  }
+
+  return rowWithToggle
+}
+
+/** "Move to section" submenu for the Bot context menu: a proper
+ *  `ContextMenuSub` whose trigger is a normal hover/click target (a context
+ *  menu gesture is NOT a submenu trigger). The content lists Unassigned +
+ *  every visual Section. The SubTrigger renders its own chevron. */
+function MoveToSectionSubmenu({ peerId, sectionAssignments, sections }) {
+  const copy = useBotRosterText()
+  const currentSection = sectionAssignments[peerId] || null
+
+  return jsxs(ContextMenuSub, {
+    children: [
+      jsx(ContextMenuSubTrigger, { children: copy.sections.moveTo }),
+      jsx(ContextMenuSubContent, {
+        children: jsxs(ContextMenuRadioGroup, {
+          value: currentSection || MANUAL_ORDER_UNASSIGNED_KEY,
+          onValueChange: value => movePeerToSection(peerId, value === MANUAL_ORDER_UNASSIGNED_KEY ? null : value),
+          children: [
+            jsx(ContextMenuRadioItem, {
+              value: MANUAL_ORDER_UNASSIGNED_KEY,
+              children: copy.sections.unassigned
+            }),
+            ...(sections || []).map(s =>
+              jsx(ContextMenuRadioItem, {
+                value: s.key,
+                children: s.title
+              }, `move-to:${s.key}`)
+            )
+          ]
+        })
+      })
+    ]
+  })
+}
+
+/** "Move to section" submenu for Bot and Group context menus.
+ *  Shows "Unassigned" + every visual Section. */
+function MoveToSectionMenu({ peerId, viewState, sectionAssignments, sections }) {
+  const copy = useBotRosterText()
+  const currentSection = sectionAssignments[peerId] || null
+
+  return jsxs(ContextMenuContent, {
+    children: [
+      jsx(ContextMenuLabel, { children: copy.sections.moveTo }),
+      jsxs(ContextMenuRadioGroup, {
+        value: currentSection || MANUAL_ORDER_UNASSIGNED_KEY,
+        onValueChange: value => movePeerToSection(peerId, value === MANUAL_ORDER_UNASSIGNED_KEY ? null : value),
+        children: [
+          jsx(ContextMenuRadioItem, {
+            value: MANUAL_ORDER_UNASSIGNED_KEY,
+            children: copy.sections.unassigned
+          }),
+          ...(sections || []).map(s =>
+            jsx(ContextMenuRadioItem, {
+              value: s.key,
+              children: s.title
+            }, `move-to:${s.key}`)
+          )
+        ]
+      })
+    ]
+  })
 }
 
 function BotsPane() {
+  const copy = useBotRosterText()
   const { data, error, isLoading, refetch } = useRoster()
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
@@ -9258,12 +11343,21 @@ function BotsPane() {
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
   const [grouping, setGrouping] = useState(null)
+  const [managingSections, setManagingSections] = useState(false)
   const [query, setQuery] = useState('')
   const activityToasts = useValue($activityToasts)
   const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
+
+  // View state from the persisted atom
+  const viewWrapper = useValue($viewStateWrapper)
+  const viewState = viewWrapper.state
+  const groupingMode = viewState.grouping || VIEW_GROUPING_NONE
+  const sortMode = viewState.sort || VIEW_SORT_PINNED_RECENCY
+  const nestMembers = groupingMode === VIEW_GROUPING_GROUPS ? true : (viewState.nestMembers || false)
+  const showHidden = viewState.showHidden || false
 
   // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
   // retry immediately instead of waiting out the poll interval.
@@ -9305,41 +11399,305 @@ function BotsPane() {
   })
   const activeSourceRoster = roster.filter(bot => !bot.remoteSource)
   // Hidden bots (right-click → Hide Bot) drop out of the roster list unless
-  // the header eye toggle reveals them. Display-only: every other consumer
-  // (mentions, group chats, name-collision checks, merge/avatar/activity
+  // the View menu's Show hidden toggle reveals them. Display-only: every other
+  // consumer (mentions, group chats, name-collision checks, merge/avatar/activity
   // sweeps) keeps the FULL roster.
-  const showHidden = useValue($showHiddenBots)
   const unreadByName = useValue($botUnread)
   const hiddenBots = roster.filter(bot => isBotHidden(bot, allMeta))
   const hiddenUnread = hiddenBots.some(bot => !bot.remoteSource && unreadByName[bot.name])
   const visibleRoster = showHidden ? roster : roster.filter(bot => !isBotHidden(bot, allMeta))
   const filteredRoster = filterBots(visibleRoster, allMeta, query)
-  // Group chats are first-class roster rows (Discord-style): one standalone
-  // row per room, competing in the SAME recency ordering as bot rows — a
-  // group's activity is its newest room-log line. Pinned bots still lead;
-  // groups and unpinned bots interleave by recency below them.
-  const needle = query.trim().toLowerCase()
-  const groupRows = groupChatNames(allMeta, groupRooms)
-    .filter(name => !needle || name.toLowerCase().includes(needle))
-    .map(name => ({
-      kind: 'group',
-      name,
-      members: groupChatMemberBots(name, roster, allMeta),
-      activity: groupLastActivity(groupRooms[name])
-    }))
-  const rosterRows = [
-    ...filteredRoster.map(bot => ({ kind: 'bot', bot, pinned: isPinned(bot), activity: activityOf(bot) })),
-    ...groupRows
-  ].sort((a, b) => {
-    const pa = a.pinned ? 1 : 0
-    const pb = b.pinned ? 1 : 0
 
-    if (pa !== pb) {
-      return pb - pa
+  // ── New view pipeline ─────────────────────────────────────────────────┐
+  // Build peers, sort, then project through the selected grouping mode.
+
+  // 1. Build the peer list (Bots + Groups)
+  const allPeers = buildPeerList(roster, allMeta, groupRooms, showHidden)
+
+  // 2. Annotate with activity for recency sort
+  const peersWithActivity = allPeers.map(p => ({
+    ...p,
+    activity: p.kind === 'bot' ? activityOf(p.botRow) : (p.groupActivity || 0)
+  }))
+
+  // 3. Sort peers according to selected sort mode. In Sections and Groups the
+  // manual order is per-range and applied inside applyGroupingMode; the flat
+  // manual bucket applies only to None mode here.
+  const manualOrder = sortMode === VIEW_SORT_MANUAL && groupingMode === VIEW_GROUPING_NONE
+    ? viewState.manualOrderNone || []
+    : null
+  const sortedPeers = resolveSortOrder(sortMode, peersWithActivity, manualOrder, null)
+
+  // 4. Project through grouping mode
+  const needle = query.trim().toLowerCase()
+  const matchingBots = new Set(filteredRoster.map(botRosterKey))
+
+  const searchOpts = needle ? { query, matchesBotId: matchingBots } : undefined
+
+  const projected = applyGroupingMode(groupingMode, sortedPeers, viewState, nestMembers, searchOpts)
+
+  // 5. For search in Sections mode: filter section peers by search
+  // (applyGroupingMode handles this internally via searchOpts)
+
+  // Map projected items to peer renders for flat None/Groups modes,
+  // or section groups for Sections mode.
+
+  // ── drag-and-drop (native HTML5; no dependencies) ─────────────────────────
+  // Drag payload lives in a ref (ephemeral interaction, no re-render churn);
+  // `isDragging` is a lightweight state flag that reveals drop zones while a
+  // drag is in flight. Peer drops resolve through applyPeerDrop (assignment in
+  // Sections mode, manual reorder in Manual sort); section-header drops reorder
+  // Sections through applySectionDrop.
+  const dragRef = useRef(null)
+  const [isDragging, setIsDragging] = useState(false)
+  const [insertion, setInsertion] = useState(null) // {type,targetId,position,rangeKey}|null
+  const canDragPeer = groupingMode === VIEW_GROUPING_SECTIONS || sortMode === VIEW_SORT_MANUAL
+  const canKeyboardMovePeer = sortMode === VIEW_SORT_MANUAL
+  const canDragSection = groupingMode === VIEW_GROUPING_SECTIONS
+
+  const clearDragState = () => {
+    const drag = dragRef.current
+    if (drag && drag.cleanupPreview) {
+      try { drag.cleanupPreview() } catch { /* noop */ }
+    }
+    dragRef.current = null
+    setIsDragging(false)
+    setInsertion(null)
+  }
+
+  // A mode/sort change invalidates the active drag contract. Clean up the
+  // preview and insertion feedback immediately instead of leaving stale UI.
+  useEffect(() => {
+    const drag = dragRef.current
+    if (!drag) return
+    if (drag.cleanupPreview) {
+      try { drag.cleanupPreview() } catch { /* noop */ }
+    }
+    dragRef.current = null
+    setIsDragging(false)
+    setInsertion(null)
+  }, [groupingMode, sortMode])
+
+  // Unmount can happen mid-drag (workspace navigation/plugin disposal). Remove
+  // the temporary preview node without scheduling state on an unmounted tree.
+  useEffect(() => () => {
+    const drag = dragRef.current
+    if (drag?.cleanupPreview) {
+      try { drag.cleanupPreview() } catch { /* noop */ }
+    }
+    dragRef.current = null
+  }, [])
+
+  const beginPeerDrag = (event, peerId, kind, rangeKey, label, icon) => {
+    if (!canDragPeer) return
+    const previewLabel = String(label || peerId)
+    const previewIcon = kind === 'group' ? (icon || '\uD83D\uDC65') : (icon || '\uD83E\uDD16')
+    const cleanupPreview = createDragPreview(event, { kind, label: previewLabel, icon: previewIcon })
+    dragRef.current = { type: 'peer', peerId, kind, fromRangeKey: rangeKey, cleanupPreview }
+    setIsDragging(true)
+    try {
+      event.dataTransfer.effectAllowed = 'move'
+      event.dataTransfer.setData('text/plain', peerId)
+    } catch {
+      /* dataTransfer may be absent in tests */
+    }
+  }
+
+  const allowPeerDrop = (event, rangeKey, targetPeerId) => {
+    const drag = dragRef.current
+    if (!drag || drag.type !== 'peer') return
+    if (targetPeerId === drag.peerId) {
+      drag.dropPosition = null
+      setInsertion(null)
+      return
+    }
+    // In Groups mode a cross-group drop is disallowed — never advertise a
+    // valid target outside the peer's own automatic group.
+    if (groupingMode === VIEW_GROUPING_GROUPS && drag.kind === 'bot' && drag.fromRangeKey !== rangeKey) {
+      drag.dropPosition = null
+      setInsertion(null)
+      return
+    }
+    event.preventDefault()
+    try {
+      event.dataTransfer.dropEffect = 'move'
+    } catch {
+      /* noop */
     }
 
-    return b.activity - a.activity
-  })
+    // Compute insertion position from pointer Y relative to target midpoint.
+    try {
+      const rect = event.currentTarget.getBoundingClientRect()
+      const midY = rect.top + rect.height / 2
+      const position = event.clientY < midY ? 'before' : 'after'
+      drag.dropPosition = position
+      const next = { type: 'peer', targetId: targetPeerId, position, rangeKey }
+      setInsertion(prev =>
+        prev && prev.targetId === next.targetId && prev.position === next.position && prev.rangeKey === next.rangeKey
+          ? prev
+          : next
+      )
+    } catch {
+      /* no bounding rect available — skip insertion line */
+    }
+  }
+
+  const endPeerDrag = () => {
+    clearDragState()
+  }
+
+  const dropPeer = (event, rangeKey, targetPeerId, rangePeerIds) => {
+    const drag = dragRef.current
+    if (!drag || drag.type !== 'peer') return
+    event.preventDefault()
+    const patch = applyPeerDrop(viewState, {
+      peerId: drag.peerId,
+      kind: drag.kind,
+      grouping: groupingMode,
+      sort: sortMode,
+      fromRangeKey: drag.fromRangeKey,
+      toRangeKey: rangeKey,
+      targetPeerId,
+      rangePeerIds,
+      position: drag.dropPosition || (insertion ? insertion.position : undefined)
+    })
+    if (patch) updateViewState(patch)
+    clearDragState()
+  }
+
+  const keyboardMovePeer = (event, peerId, kind, rangeKey, rangePeerIds) => {
+    if (sortMode !== VIEW_SORT_MANUAL || !event.altKey) return
+    const delta = event.key === 'ArrowUp' ? -1 : event.key === 'ArrowDown' ? 1 : 0
+    if (!delta) return
+
+    const patch = applyKeyboardPeerMove(viewState, {
+      peerId,
+      kind,
+      grouping: groupingMode,
+      rangeKey,
+      rangePeerIds,
+      delta
+    })
+    if (!patch) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    updateViewState(patch)
+  }
+
+  const beginSectionDrag = (event, sectionKey, title, peerCount) => {
+    if (!canDragSection) return
+    const cleanupPreview = createDragPreview(event, { kind: 'section', sectionTitle: String(title || sectionKey), peerCount: peerCount || 0 })
+    dragRef.current = { type: 'section', sectionKey, cleanupPreview }
+    setIsDragging(true)
+    try {
+      event.dataTransfer.effectAllowed = 'move'
+      event.dataTransfer.setData('text/plain', sectionKey)
+    } catch {
+      /* dataTransfer may be absent in tests */
+    }
+  }
+
+  const allowSectionTarget = (event, sectionKey) => {
+    const drag = dragRef.current
+    if (!drag) {
+      setInsertion(null)
+      return
+    }
+    // A section header accepts both a section-reorder drop and a peer drop
+    // (assign to that section, including when the section is empty).
+    if (drag.type === 'section' || drag.type === 'peer') {
+      event.preventDefault()
+      try {
+        event.dataTransfer.dropEffect = 'move'
+      } catch {
+        /* noop */
+      }
+      // Compute section insertion position from pointer Y.
+      try {
+        const rect = event.currentTarget.getBoundingClientRect()
+        const midY = rect.top + rect.height / 2
+        // A peer dropped on a Section header is appended to that Section, so
+        // its feedback belongs after the complete Section container. Section
+        // reorders still use the pointer midpoint for before/after placement.
+        const position = drag.type === 'peer' ? 'after' : (event.clientY < midY ? 'before' : 'after')
+        drag.dropPosition = position
+        const next = { type: 'section', targetId: sectionKey, position, rangeKey: sectionKey }
+        setInsertion(prev =>
+          prev && prev.targetId === next.targetId && prev.position === next.position && prev.rangeKey === next.rangeKey
+            ? prev
+            : next
+        )
+      } catch {
+        /* no bounding rect */
+      }
+    } else {
+      drag.dropPosition = null
+      setInsertion(null)
+    }
+  }
+
+  const endSectionDrag = () => {
+    clearDragState()
+  }
+
+  const dropOnSection = (event, toSectionKey, sectionPeerIds) => {
+    const drag = dragRef.current
+    if (!drag) return
+    event.preventDefault()
+
+    if (drag.type === 'section') {
+      const patch = applySectionDrop(viewState, {
+        sectionKey: drag.sectionKey,
+        toSectionKey,
+        position: drag.dropPosition || (insertion ? insertion.position : undefined)
+      })
+      if (patch) updateViewState(patch)
+    } else if (drag.type === 'peer') {
+      // Dropping a peer on a section header assigns it to that section (at the
+      // end of its manual-order bucket when sort is Manual).
+      const patch = applyPeerDrop(viewState, {
+        peerId: drag.peerId,
+        kind: drag.kind,
+        grouping: groupingMode,
+        sort: sortMode,
+        fromRangeKey: drag.fromRangeKey,
+        toRangeKey: toSectionKey,
+        targetPeerId: null,
+        rangePeerIds: sectionPeerIds,
+        position: drag.dropPosition || (insertion ? insertion.position : undefined)
+      })
+      if (patch) updateViewState(patch)
+    }
+
+    clearDragState()
+  }
+
+  const drag = {
+    canDragPeer,
+    canKeyboardMovePeer,
+    canDragSection,
+    isDragging,
+    insertion,
+    beginPeerDrag,
+    allowPeerDrop,
+    dropPeer,
+    keyboardMovePeer,
+    endPeerDrag,
+    beginSectionDrag,
+    allowSectionTarget,
+    dropOnSection,
+    endSectionDrag
+  }
+
+  // Active styling on the View trigger whenever any non-default view setting is
+  // live (the old standalone eye button carried this signal; it now rides the
+  // single View trigger alongside the hidden-unread dot).
+  const viewActive =
+    groupingMode !== VIEW_GROUPING_NONE ||
+    sortMode !== VIEW_SORT_PINNED_RECENCY ||
+    showHidden ||
+    (groupingMode !== VIEW_GROUPING_GROUPS && nestMembers)
 
   if (live) {
     $lastRoster.set(roster)
@@ -9387,35 +11745,41 @@ function BotsPane() {
                   children: jsx(Codicon, { name: activityToasts ? 'bell' : 'bell-slash' })
                 })
               }),
-              // Eye toggle appears only once something is hidden — zero
-              // hidden bots means zero extra chrome. It stays visible while
-              // hidden rows are revealed, so Unhide is always reachable.
-              hiddenBots.length
-                ? jsx(Tip, {
-                    label: showHidden
-                      ? 'Hide hidden bots again'
-                      : `Show ${hiddenBots.length} hidden bot${hiddenBots.length === 1 ? '' : 's'}`,
-                    children: jsxs('button', {
-                      type: 'button',
-                      'aria-label': showHidden ? 'Hide hidden bots' : 'Show hidden bots',
-                      className: cn(
-                        'relative flex size-6 items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
-                        showHidden ? 'text-foreground' : 'text-(--ui-text-tertiary)'
-                      ),
-                      onClick: () => $showHiddenBots.set(!showHidden),
+              // The single View menu carries grouping, sorting, nest toggle,
+              // Show hidden, and Manage Sections. The old standalone eye button
+              // is gone — its hidden-unread dot now rides the View trigger
+              // (below), and Show hidden lives in the menu.
+              jsxs(DropdownMenu, {
+                children: [
+                  jsx(DropdownMenuTrigger, {
+                    asChild: true,
+                    children: jsx(Button, {
+                      variant: 'ghost',
+                      size: 'icon-xs',
+                      'aria-label': copy.view.options,
+                      className: cn('relative', viewActive ? 'text-(--ui-accent)' : 'text-(--ui-text-tertiary)'),
                       children: [
-                        jsx(Codicon, { name: showHidden ? 'eye' : 'eye-closed' }),
+                        jsx(Codicon, { name: 'list-filter' }),
                         hiddenUnread && !showHidden
                           ? jsx('span', {
                               className:
-                                'absolute right-0.5 top-0.5 size-1.5 rounded-full bg-(--ui-accent,#4f9cf9)',
-                              'aria-label': 'a hidden bot has unread activity'
+                                'absolute right-0.5 top-0.5 size-1.5 rounded-full bg-(--ui-accent)',
+                              'aria-label': copy.view.hiddenUnread
                             })
                           : null
                       ]
                     })
+                  }),
+                  jsx(ViewMenuContent, {
+                    viewState,
+                    onSetGrouping: setGroupingMode,
+                    onSetSort: setSortMode,
+                    onToggleNest: toggleNestMembers,
+                    onToggleShowHidden: toggleShowHidden,
+                    onManageSections: () => setManagingSections(true)
                   })
-                : null,
+                ]
+              }),
               jsxs(DropdownMenu, {
                 children: [
                   jsx(Tip, {
@@ -9570,40 +11934,36 @@ function BotsPane() {
                 title: 'No agents yet',
                 description: 'Create your first teammate.'
               })
-            : filteredRoster.length === 0 && rosterRows.length === 0
+            : projected.length === 0
               ? jsx('div', {
                   'aria-live': 'polite',
                   className:
                     'flex flex-1 items-center justify-center px-4 text-center text-xs text-(--ui-text-tertiary)',
                   role: 'status',
                   children: query.trim()
-                    ? `No bots match “${query.trim()}”`
-                    : 'All bots are hidden — use the eye button above to show them.'
+                    ? copy.sections.noMatch(query.trim())
+                    : copy.sections.allHidden
                 })
               : jsx(ScrollArea, {
                   className: 'hermes-bots-roster min-h-0 flex-1',
                   children: jsx('div', {
                     className: 'grid w-full min-w-0 gap-0.5 px-1.5 pb-2',
-                    // Flat, Discord-style list: bot rows and group rows
-                    // interleaved by recency — no section headers.
-                    children: rosterRows.map(row =>
-                      row.kind === 'group'
-                        ? jsx(
-                            GroupRow,
-                            {
-                              group: row.name,
-                              members: row.members,
-                              needsYou: Boolean(groupNeedsYou[row.name]),
-                              onOpen: openGroupChat
-                            },
-                            `group:${row.name}`
-                          )
-                        : jsx(
-                            BotRow,
-                            { bot: row.bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping },
-                            botRosterKey(row.bot)
-                          )
-                    )
+                    onDragLeave: event => {
+                      if (!event.currentTarget.contains(event.relatedTarget)) {
+                        if (dragRef.current) dragRef.current.dropPosition = null
+                        setInsertion(null)
+                      }
+                    },
+                    children: renderProjectedRoster(projected, groupingMode, {
+                      setDeleting,
+                      setEditing,
+                      setGrouping,
+                      groupNeedsYou,
+                      openGroupChat,
+                      viewState,
+                      drag,
+                      toggleNestedGroup: toggleNestedGroupCollapse
+                    })
                   })
                 }),
       jsx('div', {
@@ -9640,6 +12000,7 @@ function BotsPane() {
         }
       }),
       grouping ? jsx(GroupDialog, { bot: grouping, onClose: () => setGrouping(null) }) : null,
+      jsx(ManageSectionsDialog, { open: managingSections, onClose: () => setManagingSections(false) }),
       jsx(ConfirmDialog, {
         open: Boolean(deleting),
         title: 'Delete bot and profile?',
@@ -9682,11 +12043,32 @@ export default {
   description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
   register(ctx) {
     pluginCtx = ctx
+    ctx.i18n?.register?.(BOT_LOCALES)
     startFaceClock()
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(stopFaceClock)
+    }
+
+    // Hydrate view state from plugin-scoped storage. The atom already contains
+    // a normalized default, so the pane can render before this async read lands.
+    const requestToken = ++viewHydrationToken
+    void hydrateViewStateFromStorage(requestToken, ctx)
+    if (typeof ctx.onDispose === 'function') {
+      ctx.onDispose(() => {
+        // Advance rather than reset the lifecycle token so every in-flight read
+        // from this registration is permanently stale.
+        const disposeToken = ++viewHydrationToken
+        $viewStateWrapper.set({
+          state: normalizeViewState(null),
+          token: disposeToken,
+          localGeneration: 0
+        })
+        if (pluginCtx === ctx) {
+          pluginCtx = null
+        }
+      })
     }
 
     // @-mention autocomplete: typing "@rese…" in ANY composer offers the
@@ -10072,4 +12454,63 @@ export default {
         }      }
     })
   }
+}
+
+// Runtime-import tests opt into this non-enumerable seam before evaluating the
+// real bundled module. Production and legacy source harnesses never set it.
+if (globalThis.__HERMES_BOTS_TEST__) {
+  Object.defineProperty(globalThis, '__HERMES_BOTS_TEST_API__', {
+    configurable: true,
+    value: {
+      $botMeta,
+      $groupChats,
+      $lastRoster,
+      $viewStateWrapper,
+      BOT_LOCALES,
+      BotRow,
+      GroupRowEnhanced,
+      ManageSectionsDialog,
+      MoveToSectionMenu,
+      SectionHeader,
+      UnassignedDropZone,
+      ViewMenuContent,
+      setPluginCtxForTest: value => { pluginCtx = value },
+      applyGroupingMode,
+      applyKeyboardPeerMove,
+      applyPeerDrop,
+      applySectionDrop,
+      assignPeerToSection,
+      botPeerIdentity,
+      botRosterKey,
+      buildPeerList,
+      collapseSection,
+      createDragPreview,
+      createVisualSection,
+      deleteVisualSection,
+      groupPeerIdentity,
+      hydrateViewState,
+      insertionMatches,
+      isSectionCollapsed,
+      MANUAL_ORDER_UNASSIGNED_KEY,
+      manualOrderBucketKey,
+      normalizeViewState,
+      remapGroupViewState,
+      renameVisualSection,
+      renderProjectedRoster,
+      reorderPeerInto,
+      reorderVisualSections,
+      resolveSortOrder,
+      sortAlpha,
+      sortManual,
+      sortPinnedRecency,
+      unassignPeerFromSection,
+      visualSectionKey,
+      VIEW_GROUPING_GROUPS,
+      VIEW_GROUPING_NONE,
+      VIEW_GROUPING_SECTIONS,
+      VIEW_SORT_ALPHA,
+      VIEW_SORT_MANUAL,
+      VIEW_SORT_PINNED_RECENCY
+    }
+  })
 }
