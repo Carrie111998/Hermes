@@ -1142,6 +1142,13 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
       result.push({ heading: t.commandCenter.settingsFields, items: fieldItems })
     }
 
+    if (settingsCatalog.pluginEntries.length > 0) {
+      result.push({
+        heading: t.settings.nav.plugins,
+        items: settingsCatalog.pluginEntries.map(settingsEntryItem)
+      })
+    }
+
     if (settingsCatalog.credentialEntries.length > 0) {
       result.push({
         heading: t.settings.nav.apiKeys,
@@ -1244,6 +1251,13 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
         heading: cc.settingsFields,
         items: [...settingsCatalog.appearanceEntries, ...settingsCatalog.configEntries].map(settingsEntryItem)
       })
+
+      if (settingsCatalog.pluginEntries.length > 0) {
+        result.push({
+          heading: t.settings.nav.plugins,
+          items: settingsCatalog.pluginEntries.map(settingsEntryItem)
+        })
+      }
 
       if (settingsCatalog.credentialEntries.length > 0) {
         result.push({

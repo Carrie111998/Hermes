@@ -1,9 +1,14 @@
 import { useQuery } from '@tanstack/react-query'
-import { useCallback } from 'react'
+import { useCallback, useEffect } from 'react'
+import { useStore } from '@nanostores/react'
 
+import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
+import { $pluginRecords } from '@/contrib/plugins-store'
 import { getEnvVars, getHermesConfigSchema } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { Palette, Settings2, Wrench } from '@/lib/icons'
+import { Package, Palette, Settings2, Wrench } from '@/lib/icons'
+import { $agentPlugins, isDesktopRelevantPlugin, loadAgentPlugins } from '@/store/agent-plugins'
+import { $gatewayState } from '@/store/session'
 
 import { useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
@@ -49,6 +54,44 @@ export function useSettingsSearchCatalog(enabled: boolean) {
   }, [refetchEnvVars])
 
   useOnProfileSwitch(refreshCatalog)
+
+  // Plugin rows: desktop plugins are already in their store (discovered at
+  // boot); agent plugins ride the gateway, so load them the first time the
+  // catalog is wanted — same RPC the Plugins page fires on mount, deduped by
+  // the store's own inflight guard.
+  const { requestGateway } = useGatewayRequest()
+  const gatewayState = useStore($gatewayState)
+  const desktopPluginRecords = useStore($pluginRecords)
+  const agentPlugins = useStore($agentPlugins)
+
+  useEffect(() => {
+    if (enabled && gatewayState === 'open') {
+      void loadAgentPlugins(requestGateway)
+    }
+  }, [enabled, gatewayState, requestGateway])
+
+  const pluginContext = t.settings.nav.plugins
+
+  const pluginEntries: SettingsSearchEntry[] = [
+    ...Object.values(desktopPluginRecords).map(record => ({
+      context: pluginContext,
+      description: record.description,
+      icon: Package,
+      id: `plugin:desktop:${record.id}`,
+      keywords: ['plugin', 'extension', record.id],
+      label: record.name,
+      target: { plugin: record.id, view: 'plugins' as const }
+    })),
+    ...agentPlugins.filter(isDesktopRelevantPlugin).map(row => ({
+      context: pluginContext,
+      description: row.description || undefined,
+      icon: Package,
+      id: `plugin:agent:${row.key ?? row.name}`,
+      keywords: ['plugin', 'extension', ...(row.key ? [row.key] : [])],
+      label: row.name,
+      target: { plugin: row.key ?? row.name, view: 'plugins' as const }
+    }))
+  ]
 
   // Never expose stale profile-scoped targets while a catalog is refreshing.
   // Field/key results wait for the current profile's data rather than briefly
@@ -142,6 +185,7 @@ export function useSettingsSearchCatalog(enabled: boolean) {
   return {
     appearanceEntries,
     configEntries,
-    credentialEntries
+    credentialEntries,
+    pluginEntries
   }
 }
