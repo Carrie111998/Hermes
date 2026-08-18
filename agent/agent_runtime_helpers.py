@@ -1309,6 +1309,18 @@ def restore_primary_runtime(agent) -> bool:
 
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
+
+    Enforcement read #2: a long-lived gateway session must not stay
+    diverted onto a rate-limit reroute for the whole process lifetime.
+    ``agent._primary_runtime`` is what this function considers "primary"
+    (it may itself be a replacement -- see ``agent_init._apply_model_
+    override``, which runs before the snapshot is taken).  Before
+    restoring it, re-check whether an override is still active for that
+    (provider, model).  Still active -> the snapshot's primary is still
+    rate-limited, so stay on the current fallback rather than bouncing
+    back onto it.  Gone/expired -> proceed with the normal restore below.
+    Central invariant: with no override, this check is a no-op and the
+    restore is byte-identical to before.
     """
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
@@ -1325,6 +1337,21 @@ def restore_primary_runtime(agent) -> bool:
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     rt = agent._primary_runtime
+
+    try:
+        from events import model_override
+        override = model_override.get_override(
+            rt.get("provider", ""), rt.get("model", ""),
+        )
+    except Exception:
+        # Fail open: an override-lookup failure must not block restoration.
+        override = None
+    if override:
+        # The primary this function would restore is still covered by an
+        # active reroute -- keep the replacement in place rather than
+        # bouncing back onto a model that is still rate-limited.
+        return False
+
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
