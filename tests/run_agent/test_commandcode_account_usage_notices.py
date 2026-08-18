@@ -22,6 +22,7 @@ def _bare_commandcode_agent():
     agent.notice_callback = None
     agent.notice_clear_callback = None
     agent._credits_notices_enabled = lambda: True
+    agent._account_usage_refreshed_at = None
     return agent
 
 
@@ -39,6 +40,7 @@ def test_commandcode_notice_refresh_is_backgrounded_and_ttl_cached(monkeypatch):
     )
 
     monkeypatch.setenv("COMMANDCODE_SESSION_COOKIE", "session-token")
+    monkeypatch.setattr("time.monotonic", lambda: 100.0)
     monkeypatch.setattr("threading.Thread", _ImmediateThread)
     monkeypatch.setattr("agent.account_usage.fetch_account_usage", lambda *args, **kwargs: snapshot)
 
@@ -109,7 +111,7 @@ def test_commandcode_notice_clears_when_refresh_becomes_unavailable(monkeypatch)
     )
 
     assert agent._refresh_account_usage_notices() is True
-    agent._account_usage_refreshed_at = 0.0
+    agent._account_usage_refreshed_at -= 301.0
     assert agent._refresh_account_usage_notices() is True
     assert cleared == ["account_usage.commandcode.weekly-limit"]
 

@@ -1004,7 +1004,7 @@ def init_agent(
     agent._account_usage_notice_latch = None
     agent._account_usage_refresh_lock = threading.Lock()
     agent._account_usage_refresh_inflight = False
-    agent._account_usage_refreshed_at = 0.0
+    agent._account_usage_refreshed_at = None
 
     # OpenRouter response cache hit counter — incremented when
     # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.
