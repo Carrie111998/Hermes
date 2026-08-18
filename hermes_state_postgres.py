@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1494,6 +1495,10 @@ def _is_connection_broken_error(exc: BaseException) -> bool:
         or "connection is bad" in msg
         or "ssl connection has been closed" in msg
         or "terminating connection" in msg
+        # Raw TCP teardown: psycopg surfaces this when the server is killed
+        # mid-query and no SQLSTATE is available.
+        or "connection reset by peer" in msg
+        or "broken pipe" in msg
     )
 
 
@@ -1694,6 +1699,12 @@ def connect_postgres(database_url: str) -> _PostgresConnection:
 _ENV_DSN_KEYS = ("HERMES_STATE_DATABASE_URL", "HERMES_STATE_POSTGRES_DSN")
 _ENV_BACKEND_KEYS = ("HERMES_STATE_BACKEND",)
 
+# Serializes the env-var pinning ``open_store_for_profile`` performs around
+# ``SessionDB()``. The backend selectors are process-global, so two threads
+# opening stores for different profiles concurrently could otherwise observe
+# each other's DSN.
+_SEAM_ENV_LOCK = threading.Lock()
+
 
 def resolve_postgres_dsn(config: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Return the configured PostgreSQL DSN, or None when not selected.
@@ -1874,41 +1885,43 @@ def open_store_for_profile(
                 f"but sessions.postgres_dsn is not set in its config.yaml; "
                 f"cannot open the store for that profile"
             )
-        conn = connect_postgres(dsn)
-        # Use the same schema_version the calling process's SessionDB uses.
-        # Import lazily to avoid circular dependency at module load time.
-        from hermes_state import SCHEMA_VERSION, SessionDB
+        # Build the SessionDB through its real ``__init__`` rather than
+        # ``object.__new__`` + a hand-copied attribute list.  A hand-copied list
+        # is the same drift bug this PR fixed for the migration column set one
+        # layer down: it was already missing every ``_token_*`` attribute, so
+        # ``close()`` -> ``_stop_token_writer()`` raised AttributeError on any
+        # seam-built store.  Driving ``__init__`` means future additions to it
+        # are picked up for free.
+        #
+        # ``__init__`` resolves the backend from the environment, so the target
+        # profile's DSN/backend is pinned for the duration of the constructor.
+        # This is process-global state, hence the lock and the restore.
+        from hermes_state import SessionDB
 
-        init_postgres_schema(conn, SCHEMA_VERSION)
-        db = object.__new__(SessionDB)
-        # Initialise only the attributes that all read paths touch.  The full
-        # __init__ would try to open a SQLite file and run pragmas; bypassing
-        # it is the established pattern in the retry-boundary tests.
-        import queue
-        import threading
+        with _SEAM_ENV_LOCK:
+            _saved = {
+                key: os.environ.get(key)
+                for key in ("HERMES_STATE_BACKEND", *_ENV_DSN_KEYS)
+            }
+            try:
+                os.environ["HERMES_STATE_BACKEND"] = "postgres"
+                os.environ["HERMES_STATE_DATABASE_URL"] = dsn
+                os.environ.pop("HERMES_STATE_POSTGRES_DSN", None)
+                db = SessionDB()
+            finally:
+                for key, value in _saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
-        db.db_path = profile_dir / "state.db"  # nominal fallback path (unused)
-        db.read_only = False  # Postgres has no read-only attach mode
-        db._lock = threading.Lock()
-        db._read_pool = queue.LifoQueue(maxsize=0)  # unused for Postgres
-        db._read_permits = threading.BoundedSemaphore(1)  # ditto
-        db._read_conns_lock = threading.Lock()
-        db._read_conns_closed = False
-        db._read_open_failed_at = 0.0
-        db._read_permit_exhausted = 0
-        db._wal_active = False
-        db._write_count = 0
-        db._fts_runtime_rebuild_attempted = False
-        db._notadb_reconnect_attempted = False
-        db._fts_usermerge_floor_applied = False
-        db._fts_enabled = False
-        db._fts_stale = False
-        db._trigram_available = False
-        db._fts_cjk_loaded = False
-        db._fts_cjk_available = False
-        db._fts_unavailable_warned = False
-        db._is_postgres = True
-        db._conn = conn
+        if not getattr(db, "_is_postgres", False):
+            db.close()
+            raise RuntimeError(
+                f"profile {canon!r} selects the Postgres state backend but the "
+                "store opened on SQLite; refusing to serve reads from the wrong "
+                "physical store"
+            )
         return db
 
     # SQLite path — straightforward.

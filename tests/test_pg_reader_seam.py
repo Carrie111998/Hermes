@@ -640,3 +640,65 @@ class TestWebServerProfileChokepoint:
 
         # No such profile -> helper soft-fails to False rather than raising.
         assert web_server._profile_selects_postgres("no-such-profile-xyz") is False
+
+
+class TestSeamBuiltStoreIsFullyInitialised:
+    """A seam-built Postgres store must be a COMPLETE SessionDB.
+
+    Regression guard: the seam originally built its store with
+    ``object.__new__(SessionDB)`` plus a hand-copied attribute list. That list
+    had already drifted — every ``_token_*`` attribute was missing, so
+    ``close()`` -> ``_stop_token_writer()`` raised AttributeError. Same class of
+    bug as the hand-maintained migration column list, one layer down.
+    """
+
+    # Attributes __init__ sets that the async token writer needs. close()
+    # touches these, so their absence is a crash rather than a latent gap.
+    _TOKEN_ATTRS = (
+        "_token_queue",
+        "_token_queue_cond",
+        "_token_writer_thread",
+        "_token_writer_stop",
+        "_token_writer_busy",
+        "_token_atexit_hook",
+    )
+
+    def test_stop_token_writer_needs_attributes_init_provides(self):
+        """Pin the coupling: _stop_token_writer reads _token_queue_cond.
+
+        A store assembled without running __init__ lacks it and crashes. This
+        asserts the dependency exists so the seam can never go back to
+        hand-copying attributes without failing here.
+        """
+        import threading
+
+        from hermes_state import SessionDB
+
+        partial = object.__new__(SessionDB)
+        partial._lock = threading.Lock()
+        partial._is_postgres = True
+        partial._conn = None
+
+        for attr in self._TOKEN_ATTRS:
+            assert not hasattr(partial, attr), (
+                f"{attr} appeared without __init__ — update this test"
+            )
+
+        with pytest.raises(AttributeError, match="_token_queue_cond"):
+            partial._stop_token_writer()
+
+    def test_real_init_provides_every_token_attribute(self, tmp_path):
+        """__init__ is the source of truth for the attribute set.
+
+        The seam builds via __init__ precisely so additions to it are picked up
+        for free; this pins that __init__ really does provide them.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "probe.db")
+        try:
+            missing = [a for a in self._TOKEN_ATTRS if not hasattr(db, a)]
+            assert not missing, f"__init__ no longer sets: {missing}"
+            db._stop_token_writer()  # must not raise
+        finally:
+            db.close()
