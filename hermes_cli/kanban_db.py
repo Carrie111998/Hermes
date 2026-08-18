@@ -1311,6 +1311,11 @@ class Attachment:
     stored_path: str
     content_type: Optional[str]
     size: int
+    sha256: Optional[str]
+    source_path: Optional[str]
+    source_run_id: Optional[int]
+    artifact_role: Optional[str]
+    capture_key: Optional[str]
     uploaded_by: Optional[str]
     created_at: int
 
@@ -1490,6 +1495,11 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     stored_path  TEXT NOT NULL,
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
+    sha256       TEXT,
+    source_path  TEXT,
+    source_run_id INTEGER,
+    artifact_role TEXT,
+    capture_key  TEXT,
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
 );
@@ -2707,6 +2717,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    attachment_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_attachments'"
+    ).fetchone() is not None
+    if attachment_table_exists:
+        attachment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")
+        }
+        for column_name, definition in (
+            ("sha256", "sha256 TEXT"),
+            ("source_path", "source_path TEXT"),
+            ("source_run_id", "source_run_id INTEGER"),
+            ("artifact_role", "artifact_role TEXT"),
+            ("capture_key", "capture_key TEXT"),
+        ):
+            if column_name not in attachment_cols:
+                _add_column_if_missing(conn, "task_attachments", column_name, definition)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_attachments_capture_key "
+            "ON task_attachments(capture_key) WHERE capture_key IS NOT NULL"
+        )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -4067,6 +4098,15 @@ class AttachmentTooLarge(ValueError):
     """
 
 
+def _sha256_file(path: Path) -> str:
+    """Return a streaming SHA-256 digest for one regular file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _safe_attachment_name(raw: str) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
@@ -4142,6 +4182,7 @@ def store_attachment_bytes(
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
+    artifact_sha256 = hashlib.sha256(data).hexdigest()
     try:
         return add_attachment(
             conn,
@@ -4150,6 +4191,7 @@ def store_attachment_bytes(
             stored_path=str(dest_path.resolve()),
             content_type=content_type,
             size=len(data),
+            sha256=artifact_sha256,
             uploaded_by=uploaded_by,
         )
     except Exception:
@@ -4170,6 +4212,11 @@ def add_attachment(
     stored_path: str,
     content_type: Optional[str] = None,
     size: int = 0,
+    sha256: Optional[str] = None,
+    source_path: Optional[str] = None,
+    source_run_id: Optional[int] = None,
+    artifact_role: Optional[str] = None,
+    capture_key: Optional[str] = None,
     uploaded_by: Optional[str] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
@@ -4182,6 +4229,15 @@ def add_attachment(
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
+    stored_file = Path(stored_path)
+    artifact_sha256 = sha256 or (
+        _sha256_file(stored_file) if stored_file.is_file() else None
+    )
+    if artifact_sha256 is not None and (
+        len(artifact_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in artifact_sha256.lower())
+    ):
+        raise ValueError("attachment sha256 must be a 64-character hex digest")
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -4190,14 +4246,20 @@ def add_attachment(
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(task_id, filename, stored_path, content_type, size, sha256, "
+            "source_path, source_run_id, artifact_role, capture_key, uploaded_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 filename.strip(),
                 stored_path,
                 content_type,
                 int(size),
+                artifact_sha256.lower() if artifact_sha256 else None,
+                source_path,
+                source_run_id,
+                artifact_role,
+                capture_key,
                 uploaded_by,
                 now,
             ),
@@ -4224,6 +4286,11 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             stored_path=r["stored_path"],
             content_type=r["content_type"],
             size=r["size"] or 0,
+            sha256=r["sha256"],
+            source_path=r["source_path"],
+            source_run_id=r["source_run_id"],
+            artifact_role=r["artifact_role"],
+            capture_key=r["capture_key"],
             uploaded_by=r["uploaded_by"],
             created_at=r["created_at"],
         )
@@ -4244,6 +4311,11 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         stored_path=r["stored_path"],
         content_type=r["content_type"],
         size=r["size"] or 0,
+        sha256=r["sha256"],
+        source_path=r["source_path"],
+        source_run_id=r["source_run_id"],
+        artifact_role=r["artifact_role"],
+        capture_key=r["capture_key"],
         uploaded_by=r["uploaded_by"],
         created_at=r["created_at"],
     )
@@ -5478,14 +5550,18 @@ def complete_task(
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
+            for staged_artifact in metadata.pop("_staged_artifacts", []):
                 _insert_completion_attachment(
                     conn,
                     task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
+                    filename=staged_artifact["filename"],
+                    stored_path=staged_artifact["stored_path"],
+                    size=staged_artifact["size"],
+                    sha256=staged_artifact["sha256"],
+                    source_path=staged_artifact["source_path"],
+                    source_run_id=staged_artifact["source_run_id"],
+                    artifact_role=staged_artifact["artifact_role"],
+                    capture_key=staged_artifact["capture_key"],
                     created_at=now,
                 )
         run_id = _end_run(
@@ -5649,7 +5725,14 @@ def _persist_scratch_completion_artifacts(
     task_id: str,
     metadata: dict,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Capture scratch deliverables into content-addressed durable custody.
+
+    The worker supplies task-local source paths, but never chooses the durable
+    destination.  The completion hook streams each regular file into a staging
+    path, computes its digest, atomically seals it below the task attachment
+    root, and records the exact lineage for the closing run.  Scratch cleanup
+    may therefore run immediately after the transaction commits.
+    """
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
@@ -5673,25 +5756,28 @@ def _persist_scratch_completion_artifacts(
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
-    used_destinations: set[Path] = set()
+    staged_records: list[dict[str, Any]] = []
+    created_paths: set[Path] = set()
     changed = False
+    source_run_id = _current_run_id(conn, task_id)
 
     def _discard_copies() -> None:
-        for copied in used_destinations:
+        for copied in created_paths:
             try:
                 copied.unlink(missing_ok=True)
             except OSError:
                 pass
-        try:
-            attachment_dir.rmdir()
-        except OSError:
-            pass
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
         if not artifact:
             continue
         src = Path(artifact).expanduser()
+        if src.is_symlink():
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact is symlinked: {artifact}"
+            )
         try:
             resolved_src = src.resolve()
         except OSError:
@@ -5705,10 +5791,11 @@ def _persist_scratch_completion_artifacts(
         if not src.is_file():
             _discard_copies()
             raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
+                f"declared scratch artifact is unavailable, symlinked, or not a regular file: {artifact}"
             )
 
-        size = resolved_src.stat().st_size
+        before = resolved_src.stat()
+        size = before.st_size
         if size > KANBAN_ATTACHMENT_MAX_BYTES:
             _discard_copies()
             raise ArtifactPreservationError(
@@ -5716,11 +5803,13 @@ def _persist_scratch_completion_artifacts(
                 f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
             )
 
-        dest: Optional[Path] = None
+        temporary: Optional[Path] = None
         try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
+            staging_dir = attachment_dir / ".staging"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            temporary = staging_dir / f"{secrets.token_hex(16)}.tmp"
+            digest = hashlib.sha256()
+            with resolved_src.open("rb") as source_file, temporary.open("xb") as destination_file:
                 copied = 0
                 while chunk := source_file.read(1024 * 1024):
                     copied += len(chunk)
@@ -5729,10 +5818,36 @@ def _persist_scratch_completion_artifacts(
                             f"declared scratch artifact grew beyond the size limit: {artifact}"
                         )
                     destination_file.write(chunk)
+                    digest.update(chunk)
+                destination_file.flush()
+                os.fsync(destination_file.fileno())
+            after = resolved_src.stat()
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or copied != after.st_size
+            ):
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact changed during capture: {artifact}"
+                )
+            artifact_sha256 = digest.hexdigest()
+            filename = _safe_attachment_name(resolved_src.name)
+            dest_dir = attachment_dir / "sha256" / artifact_sha256[:2] / artifact_sha256
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / filename
+            if dest.exists():
+                if not dest.is_file() or dest.stat().st_size != copied or _sha256_file(dest) != artifact_sha256:
+                    raise ArtifactPreservationError(
+                        f"content-addressed custody conflict for {artifact}"
+                    )
+                temporary.unlink(missing_ok=True)
+            else:
+                os.replace(temporary, dest)
+                created_paths.add(dest)
         except Exception as exc:
-            if dest is not None:
+            if temporary is not None:
                 try:
-                    dest.unlink(missing_ok=True)
+                    temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
             _discard_copies()
@@ -5742,15 +5857,36 @@ def _persist_scratch_completion_artifacts(
                 f"could not preserve declared scratch artifact {artifact}: {exc}"
             ) from exc
 
-        used_destinations.add(dest)
         persisted.append(str(dest.resolve()))
+        capture_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "source_run_id": source_run_id,
+                    "artifact_role": filename,
+                    "sha256": artifact_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        staged_records.append(
+            {
+                "filename": filename,
+                "stored_path": str(dest.resolve()),
+                "source_path": str(resolved_src),
+                "source_run_id": source_run_id,
+                "artifact_role": filename,
+                "size": copied,
+                "sha256": artifact_sha256,
+                "capture_key": capture_key,
+            }
+        )
         changed = True
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        metadata["_staged_artifacts"] = staged_records
 
 
 def _insert_completion_attachment(
@@ -5760,38 +5896,38 @@ def _insert_completion_attachment(
     filename: str,
     stored_path: str,
     size: int,
+    sha256: str,
+    source_path: str,
+    source_run_id: Optional[int],
+    artifact_role: str,
+    capture_key: str,
     created_at: int,
 ) -> None:
-    """Record a worker-produced artifact in the existing attachment table."""
-    conn.execute(
-        "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
+    """Record one immutable completion capture, idempotently by capture key."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO task_attachments "
+        "(task_id, filename, stored_path, content_type, size, sha256, source_path, "
+        " source_run_id, artifact_role, capture_key, uploaded_by, created_at) "
+        "VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'kanban_complete', ?)",
+        (
+            task_id, filename, stored_path, size, sha256, source_path,
+            source_run_id, artifact_role, capture_key, created_at,
+        ),
     )
-    _append_event(
-        conn,
-        task_id,
-        "attached",
-        {"filename": filename, "size": size, "by": "kanban_complete"},
-    )
-
-
-def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
-    """Return a non-conflicting path under ``directory`` for ``filename``."""
-    safe_name = Path(filename).name or "artifact"
-    candidate = directory / safe_name
-    if candidate not in used and not candidate.exists():
-        return candidate
-
-    stem = Path(safe_name).stem or "artifact"
-    suffix = Path(safe_name).suffix
-    idx = 1
-    while True:
-        candidate = directory / f"{stem}_{idx}{suffix}"
-        if candidate not in used and not candidate.exists():
-            return candidate
-        idx += 1
+    if cur.rowcount:
+        _append_event(
+            conn,
+            task_id,
+            "attached",
+            {
+                "filename": filename,
+                "size": size,
+                "sha256": sha256,
+                "artifact_role": artifact_role,
+                "by": "kanban_complete",
+            },
+            run_id=source_run_id,
+        )
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -9341,6 +9477,168 @@ def _record_spawn_failure(
         release_claim=True,
         end_run=True,
     )
+
+
+class ParentAttachmentHydrationError(RuntimeError):
+    """A successor's admitted parent-artifact package is missing or ambiguous."""
+
+
+def hydrate_parent_attachments(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path,
+    *,
+    board: Optional[str] = None,
+) -> list[tuple[str, str, str]]:
+    """Copy verified direct-parent attachments into ``workspace`` exactly once.
+
+    This is opt-in at dispatch.  It gives isolated successor workers the exact
+    filenames their parent handoffs declare, without allowing the worker to
+    discover or substitute ambient paths.  All sources and filename collisions
+    are qualified before any destination is written; existing byte-identical
+    files are accepted, while conflicting bytes fail closed.
+    """
+
+    parent_rows = conn.execute(
+        "SELECT p.id, p.status FROM tasks p "
+        "JOIN task_links l ON l.parent_id = p.id "
+        "WHERE l.child_id = ? ORDER BY p.id",
+        (task_id,),
+    ).fetchall()
+    if not parent_rows:
+        return []
+
+    planned: dict[str, dict[str, Any]] = {}
+    for parent in parent_rows:
+        if parent["status"] not in ("done", "archived"):
+            raise ParentAttachmentHydrationError(
+                f"parent {parent['id']} is not complete"
+            )
+        attachments = conn.execute(
+            "SELECT id, filename, stored_path, size, sha256, source_run_id, "
+            "artifact_role FROM task_attachments "
+            "WHERE task_id = ? ORDER BY created_at, id",
+            (parent["id"],),
+        ).fetchall()
+        if not attachments:
+            raise ParentAttachmentHydrationError(
+                f"completed parent {parent['id']} has no attached artifact"
+            )
+        attachment_root = task_attachments_dir(parent["id"], board=board).resolve()
+        for attachment in attachments:
+            filename = str(attachment["filename"] or "")
+            if not filename or Path(filename).name != filename or filename in (".", ".."):
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} has unsafe attachment filename {filename!r}"
+                )
+            source = Path(attachment["stored_path"]).resolve()
+            if not source.is_relative_to(attachment_root) or not source.is_file():
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} attachment {filename} is outside custody or missing"
+                )
+            size = source.stat().st_size
+            if size != int(attachment["size"]):
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} attachment {filename} size drifted"
+                )
+            digest = _sha256_file(source)
+            admitted_digest = attachment["sha256"]
+            if admitted_digest is not None and digest != admitted_digest:
+                raise ParentAttachmentHydrationError(
+                    f"parent {parent['id']} attachment {filename} digest drifted"
+                )
+            origin = {
+                "parent_task_id": parent["id"],
+                "attachment_id": int(attachment["id"]),
+                "source_run_id": attachment["source_run_id"],
+                "artifact_role": attachment["artifact_role"] or filename,
+            }
+            prior = planned.get(filename)
+            if prior is not None and (prior["size"], prior["sha256"]) != (size, digest):
+                raise ParentAttachmentHydrationError(
+                    f"parent attachments conflict for declared filename {filename}"
+                )
+            if prior is None:
+                planned[filename] = {
+                    "source": source,
+                    "size": size,
+                    "sha256": digest,
+                    "origins": [origin],
+                }
+            else:
+                prior["origins"].append(origin)
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    hydrated: list[tuple[str, str, str]] = []
+    try:
+        for filename, package in sorted(planned.items()):
+            source = package["source"]
+            size = package["size"]
+            digest = package["sha256"]
+            destination = workspace / filename
+            if destination.exists():
+                if not destination.is_file():
+                    raise ParentAttachmentHydrationError(
+                        f"destination {filename} exists but is not a regular file"
+                    )
+                existing_digest = _sha256_file(destination)
+                if destination.stat().st_size != size or existing_digest != digest:
+                    raise ParentAttachmentHydrationError(
+                        f"destination {filename} conflicts with admitted parent bytes"
+                    )
+            else:
+                temporary = workspace / f".{filename}.{secrets.token_hex(8)}.tmp"
+                try:
+                    shutil.copyfile(source, temporary)
+                    copied_digest = _sha256_file(temporary)
+                    if temporary.stat().st_size != size or copied_digest != digest:
+                        raise ParentAttachmentHydrationError(
+                            f"custody verification failed while hydrating {filename}"
+                        )
+                    os.replace(temporary, destination)
+                    created.append(destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            hydrated.append((task_id, filename, digest))
+    except Exception:
+        for destination in created:
+            destination.unlink(missing_ok=True)
+        raise
+
+    if hydrated:
+        event_payload = {
+            "artifacts": [
+                {
+                    "filename": filename,
+                    "sha256": package["sha256"],
+                    "origins": package["origins"],
+                }
+                for filename, package in sorted(planned.items())
+            ]
+        }
+        with write_txn(conn):
+            replayed = False
+            for row in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind='parent_attachments_hydrated' ORDER BY id",
+                (task_id,),
+            ).fetchall():
+                try:
+                    if json.loads(row["payload"] or "{}") == event_payload:
+                        replayed = True
+                        break
+                except json.JSONDecodeError:
+                    continue
+            if not replayed:
+                _append_event(
+                    conn,
+                    task_id,
+                    "parent_attachments_hydrated",
+                    event_payload,
+                    run_id=_current_run_id(conn, task_id),
+                )
+    return hydrated
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:

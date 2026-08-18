@@ -599,7 +599,11 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
 
     assert not ws.exists(), "scratch workspace should still be cleaned up"
     assert persisted.exists(), "artifact copy should survive scratch cleanup"
-    assert persisted.parent == kb.task_attachments_dir(t)
+    expected_digest = "ea80334363eed145dfeee51ebae7dc3f1cd7d0c7879f8bfd2070c061d3c33f56"
+    assert persisted == (
+        kb.task_attachments_dir(t)
+        / "sha256" / expected_digest[:2] / expected_digest / "chart.png"
+    )
     assert persisted.name == "chart.png"
     assert persisted.read_bytes() == b"png-bytes"
     assert str(persisted) != str(artifact)
@@ -607,9 +611,43 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     assert run.metadata["artifacts"] == [str(persisted)]
     with kb.connect() as conn:
         attachments = kb.list_attachments(conn, t)
-    assert [(a.filename, a.stored_path) for a in attachments] == [
-        ("chart.png", str(persisted.resolve()))
+    assert [
+        (a.filename, a.stored_path, a.sha256, a.source_path, a.artifact_role)
+        for a in attachments
+    ] == [
+        (
+            "chart.png",
+            str(persisted.resolve()),
+            expected_digest,
+            str(artifact.resolve()),
+            "chart.png",
+        )
     ]
+
+
+def test_complete_task_rejects_symlinked_scratch_artifact_without_cleanup(kanban_home):
+    """A worker cannot smuggle ambient bytes into custody through a symlink."""
+    ambient = kanban_home / "ambient.txt"
+    ambient.write_text("outside")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="capture safely")
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        declared = workspace / "declared.txt"
+        declared.symlink_to(ambient)
+
+        with pytest.raises(kb.ArtifactPreservationError, match="symlinked"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="unsafe",
+                metadata={"artifacts": [str(declared)]},
+            )
+
+        assert kb.get_task(conn, task_id).status != "done"
+        assert kb.list_attachments(conn, task_id) == []
+    assert workspace.exists(), "rejected capture must preserve scratch for repair"
 
 
 
@@ -1127,6 +1165,33 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
     # Running migration on an already-migrated schema must not raise.
     kb._migrate_add_optional_columns(conn)
     conn.close()
+
+
+def test_init_db_migrates_legacy_attachment_rows_for_durable_custody(tmp_path):
+    board = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(board) as conn:
+        conn.execute(
+            """
+            CREATE TABLE task_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                content_type TEXT,
+                size INTEGER NOT NULL DEFAULT 0,
+                uploaded_by TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+    kb.init_db(db_path=board)
+    with sqlite3.connect(board) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_attachments)")}
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(task_attachments)")}
+
+    assert {"sha256", "source_path", "source_run_id", "artifact_role", "capture_key"} <= columns
+    assert "idx_attachments_capture_key" in indexes
 
 
 # ---------------------------------------------------------------------------
