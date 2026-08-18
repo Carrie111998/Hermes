@@ -183,3 +183,54 @@ def _stub_lazy_feature_refresh(request, monkeypatch):
         _cli_main, "_refresh_active_lazy_features", lambda *_a, **_k: None,
         raising=False,
     )
+
+
+_SEEN_RESUME_HOOKS: set = set()
+
+
+@pytest.fixture(autouse=True)
+def _unarm_gateway_resume_atexit_hook():
+    """Never let a test leave a gateway-resume ``atexit`` hook armed.
+
+    ``_cmd_update_impl`` registers ``_resume_windows_gateways_after_update``
+    with ``atexit`` so an update that dies partway still restores the gateway
+    it paused. In production that is a safety net. In a test process it is a
+    live grenade: ``atexit`` hooks fire at INTERPRETER SHUTDOWN, long after
+    pytest has torn down every ``monkeypatch`` and restored the real
+    ``gateway_windows._spawn_detached``.
+
+    Observed 2026-08-18 -- a ``pytest tests/hermes_cli/`` run printed
+    "Starting Windows gateway after update (PID 43828)" *after* its own summary
+    line. That was a real detached gateway (gateway-exit-diag.log recorded the
+    spawn with ``site='update:windows-cold-start'`` and a parent_chain naming
+    the pytest process). It lost the double-run race 7s later and the watchdog
+    spawned a replacement, so the test suite restarted production.
+
+    Unconditional and cheap: ``atexit.unregister`` removes every registration
+    of the callable and is a no-op when none exist. Tested end-to-end in
+    tests/hermes_cli/test_gateway_resume_atexit_leak.py.
+
+    ATTEMPT 1 FAILED and this is why it accumulates. Unregistering only the
+    CURRENT ``hermes_cli.main._resume_windows_gateways_after_update`` is not
+    enough: the ``isolated_kanban_home*`` fixtures purge and re-import every
+    ``hermes_cli*`` module (see ``restore_purged_modules`` above), so the
+    session runs through several distinct module objects, each with its own
+    distinct function object. ``atexit.unregister`` matches by equality, so a
+    hook armed by incarnation #1 is untouched by unregistering incarnation #2's
+    function -- verified 2026-08-18, a full-suite run still spawned real
+    gateway PID 51880 with the single-incarnation version of this fixture.
+
+    So remember every incarnation seen and unregister them all.
+    """
+    yield
+    import atexit
+
+    try:
+        from hermes_cli import main as _cli_main
+    except Exception:
+        return
+    hook = getattr(_cli_main, "_resume_windows_gateways_after_update", None)
+    if hook is not None:
+        _SEEN_RESUME_HOOKS.add(hook)
+    for seen in _SEEN_RESUME_HOOKS:
+        atexit.unregister(seen)
