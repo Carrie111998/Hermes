@@ -4337,9 +4337,11 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     if annotations is None:
         return False
     if isinstance(annotations, dict):
-        hint = annotations.get("readOnlyHint")
+        hint = annotations.get("readOnlyHint") or annotations.get("read_only_hint")
     else:
-        hint = getattr(annotations, "readOnlyHint", None)
+        hint = getattr(annotations, "readOnlyHint", None) or getattr(
+            annotations, "read_only_hint", None
+        )
     return hint is True
 
 
