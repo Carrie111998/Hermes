@@ -3363,15 +3363,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 _pg_explicitly_selected = _pg_env_backend == "postgres" or bool(_pg_env_dsn)
                 try:
                     from hermes_state_postgres import maybe_open_postgres
+
+                    # Also check config.yaml so the fallback is never silent
+                    # regardless of which configuration path the user took.
+                    if not _pg_explicitly_selected:
+                        try:
+                            from hermes_cli.config import load_config as _lc
+
+                            _c = _lc()
+                            if (
+                                str(
+                                    (_c.get("sessions") or {}).get(
+                                        "state_backend", ""
+                                    )
+                                ).strip().lower() == "postgres"
+                            ):
+                                _pg_explicitly_selected = True
+                        except Exception:
+                            pass
                 except Exception as _pg_import_exc:
                     if _pg_explicitly_selected:
                         raise RuntimeError(
                             "Postgres backend is explicitly configured "
-                            "(HERMES_STATE_BACKEND/HERMES_STATE_DATABASE_URL) "
+                            "(HERMES_STATE_BACKEND/HERMES_STATE_DATABASE_URL "
+                            "or sessions.state_backend in config.yaml) "
                             "but the hermes_state_postgres module could not be "
                             f"imported: {_pg_import_exc}"
                         ) from _pg_import_exc
-                    maybe_open_postgres = None
+                    logger.warning(
+                        "hermes_state_postgres could not be imported; "
+                        "falling back to SQLite backend: %s",
+                        _pg_import_exc,
+                    )
+                    maybe_open_postgres = None  # type: ignore[assignment]
                 if maybe_open_postgres is not None:
                     pg_conn = maybe_open_postgres(read_only, SCHEMA_VERSION)
                     if pg_conn is not None:
@@ -3382,6 +3406,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # any path that leaves this block without setting it.
                         initialization_complete = True
                         return
+                    if _pg_explicitly_selected:
+                        # postgres configured but no DSN resolved — warn so the
+                        # operator knows writes are going to SQLite, not their
+                        # intended backend.
+                        logger.warning(
+                            "Postgres backend is configured "
+                            "(sessions.state_backend=postgres) but no DSN was "
+                            "resolved from sessions.postgres_dsn, "
+                            "HERMES_STATE_DATABASE_URL, or "
+                            "HERMES_STATE_POSTGRES_DSN; falling back to SQLite. "
+                            "Set the DSN to engage the Postgres backend."
+                        )
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
