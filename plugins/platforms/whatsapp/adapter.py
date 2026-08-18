@@ -1873,7 +1873,9 @@ async def _standalone_send(
         # a caption is never silently repeated across a multi-file send.
         media_caption = caption if (caption and len(media) == 1) else None
         last_message_id = None
-        bridge_url = f"http://localhost:{bridge_port}"
+        # Match the bridge's IPv4-only bind exactly. Using localhost could
+        # select ::1 and authenticate a different process on the same port.
+        bridge_url = f"http://127.0.0.1:{bridge_port}"
         auth_headers = _bridge_auth_headers(bridge_token)
         async with aiohttp.ClientSession() as session:
             health = await _request_authenticated_bridge_health(

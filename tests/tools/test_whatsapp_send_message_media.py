@@ -218,6 +218,7 @@ def test_standalone_delivery_authenticates_text_caption_fallback_and_media(tmp_p
             assert "headers" not in call.kwargs
         assert authenticate.await_count == 2
         for call in authenticate.await_args_list:
+            assert call.args[1] == "http://127.0.0.1:3000"
             assert call.args[2] == token
         for call in session_ctx.__aenter__.return_value.post.call_args_list:
             assert call.kwargs["headers"] == {"Authorization": f"Bearer {token}"}
