@@ -23,6 +23,7 @@ act/
 .notebooklm-home/
 .notebooklm-cli-venv/
 .notebooklm-playwright/
+.playwright-cli/
 .pip-cache/
 .uv-cache/
 compose.hermes.local.yml
