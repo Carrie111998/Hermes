@@ -6158,7 +6158,7 @@ def _agent_cbs(sid: str) -> dict:
         # the exact pre-multi-select shape.
         if multi_select:
             payload["multi_select"] = True
-        return _block(
+        response = _block(
             "clarify.request",
             sid,
             payload,
@@ -6167,6 +6167,14 @@ def _agent_cbs(sid: str) -> dict:
                 ClarifyTimeoutError() if on_timeout == "abort" else None
             ),
         )
+        # Fail closed on a blank result in abort mode. _block raises on a real
+        # timeout, but a released-without-answer wait (session interrupt, or a
+        # renderer that signals completion without a payload) returns "". In
+        # abort mode that absence of an answer must not read as a successful
+        # clarification; proceed mode keeps the historical empty-string result.
+        if on_timeout == "abort" and not str(response).strip():
+            raise ClarifyTimeoutError()
+        return response
 
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(

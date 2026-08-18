@@ -1279,7 +1279,7 @@ When the agent calls the `clarify` tool — to ask which approach you prefer, ge
 
 Tap a button to answer, or tap **Other** to type a free-form response (the next message you send becomes the answer). Open-ended `clarify` calls (no preset choices) skip the buttons and just capture your next message.
 
-Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `3600` seconds). Timeout behavior is controlled by `agent.clarify_on_timeout`: `proceed` (the default) unblocks the agent with an adaptive response, while `abort` returns a tool error meaning approval was not granted. An individual `clarify` call can override that default with `on_timeout`.
+Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `3600` seconds). Timeout behavior is controlled by `agent.clarify_on_timeout`: `proceed` (the default) unblocks the agent with an adaptive response, while `abort` returns a tool error so the agent handles the clarification as failed rather than assuming an answer. An individual `clarify` call can override that default with `on_timeout`.
 
 ## Push notification volume
 
