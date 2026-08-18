@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
+import { exec as execCallback, execFile, spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -275,6 +275,20 @@ test('remotePidAlive maps kill -0 ALIVE/DEAD', async () => {
   assert.equal(await remotePidAlive(fakeSsh([]), null), false)
 })
 
+test('process probes reject PIDs outside the Linux pid_max range without executing SSH', async () => {
+  for (const pid of ['1', 1.5, 0, -1, 4194305, Number.NaN]) {
+    const aliveSsh = fakeSsh([])
+    const ownershipSsh = fakeSsh([])
+    assert.equal(await remotePidAlive(aliveSsh, pid), false)
+    assert.equal(
+      await pidIsOurDashboard(ownershipSsh, pid, SPAWN_NONCE, '/x/hermes', '~/.hermes', OWNERSHIP_ID, ''),
+      false
+    )
+    assert.deepEqual(aliveSsh.calls, [])
+    assert.deepEqual(ownershipSsh.calls, [])
+  }
+})
+
 test('metadata and process proof transport failures remain indeterminate', async () => {
   const failure = new Error('connection reset')
   await assert.rejects(
@@ -460,6 +474,65 @@ test.skipIf(process.platform === 'win32')(
         false,
         'a duplicate conflicting profile must remain foreign'
       )
+
+      const equalsForm = spawnInstaller([
+        '--profile=ops',
+        'serve',
+        '--isolated',
+        '--host=127.0.0.1',
+        '--port=0',
+        `--ssh-session-token-file=${tokenPath}`,
+        `--ssh-owner-nonce=${SPAWN_NONCE}`
+      ])
+
+      assert.equal(await waitForEntrypoint(equalsForm), true)
+      assert.equal(
+        await pidIsOurDashboard(
+          ssh,
+          equalsForm.pid,
+          SPAWN_NONCE,
+          launcher,
+          '/unrelated/hermes-home',
+          OWNERSHIP_ID,
+          'ops'
+        ),
+        true,
+        'wrapper proof must accept equals-form profile, host, port, token, and nonce arguments'
+      )
+
+      for (const [label, args] of [
+        ['wrong host', ['--host', '0.0.0.0', '--port', '0']],
+        ['wrong port', ['--host', '127.0.0.1', '--port', '8000']],
+        ['duplicate host', ['--host', '127.0.0.1', '--host=0.0.0.0', '--port', '0']],
+        ['duplicate token', ['--host', '127.0.0.1', '--port', '0', '--ssh-session-token-file', '/tmp/foreign']]
+      ] as const) {
+        const candidate = spawnInstaller([
+          '--profile',
+          'ops',
+          'serve',
+          '--isolated',
+          ...args,
+          '--ssh-session-token-file',
+          tokenPath,
+          '--ssh-owner-nonce',
+          SPAWN_NONCE
+        ])
+
+        assert.equal(await waitForEntrypoint(candidate), true)
+        assert.equal(
+          await pidIsOurDashboard(
+            ssh,
+            candidate.pid,
+            SPAWN_NONCE,
+            launcher,
+            '/unrelated/hermes-home',
+            OWNERSHIP_ID,
+            'ops'
+          ),
+          false,
+          `${label} must remain foreign`
+        )
+      }
     } finally {
       for (const process of children) {
         process.kill('SIGTERM')
@@ -469,6 +542,81 @@ test.skipIf(process.platform === 'win32')(
     }
   }
 )
+
+test.skipIf(process.platform !== 'linux')(
+  'pidIsOurDashboard preserves backslashes in a direct entrypoint path',
+  async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes direct ownership '))
+    const entrypoint = path.join(temp, String.raw`hermes\new`)
+    const python = (await exec('command -v python3')).stdout.trim()
+    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
+
+    const child = spawn(python, [entrypoint, 'serve', '--isolated', '--ssh-owner-nonce', SPAWN_NONCE], {
+      stdio: 'ignore'
+    })
+
+    const ssh = {
+      exec: async (command: string) => (await exec(command, { shell: '/bin/bash' })).stdout
+    }
+
+    try {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const command = (await exec(`ps -ww -o command= -p ${child.pid}`)).stdout
+
+        if (command.includes(entrypoint)) {
+          break
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+
+      assert.equal(await pidIsOurDashboard(ssh, child.pid, SPAWN_NONCE, entrypoint), true)
+    } finally {
+      child.kill('SIGTERM')
+      await rm(temp, { force: true, recursive: true })
+    }
+  }
+)
+
+test.skipIf(process.platform === 'win32')('pidIsOurDashboard never authorizes wrapper ownership from flattened ps', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes flattened ps '))
+
+  const sitecustomize = `
+import builtins, os, subprocess
+real_open = builtins.open
+def fallback_open(name, *args, **kwargs):
+    if isinstance(name, str) and name.startswith('/proc/') and name.endswith('/cmdline'):
+        raise OSError('forced ps fallback')
+    return real_open(name, *args, **kwargs)
+builtins.open = fallback_open
+subprocess.check_output = lambda *args, **kwargs: os.environ['HERMES_TEST_PS_LINE']
+`
+
+  await writeFile(path.join(temp, 'sitecustomize.py'), sitecustomize, 'utf8')
+  const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
+  const line = `/x/venv/bin/hermes --profile ops serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file ${tokenPath} --ssh-owner-nonce ${SPAWN_NONCE}`
+
+  const ssh = {
+    exec: (command: string) =>
+      new Promise<string>((resolve, reject) => {
+        execFile(
+          '/bin/sh',
+          ['-c', command],
+          { encoding: 'utf8', env: { ...process.env, PYTHONPATH: temp, HERMES_TEST_PS_LINE: line } },
+          (error, stdout) => (error ? reject(error) : resolve(String(stdout)))
+        )
+      })
+  }
+
+  try {
+    assert.equal(
+      await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/launcher', '/x/home', OWNERSHIP_ID, 'ops'),
+      false
+    )
+  } finally {
+    await rm(temp, { force: true, recursive: true })
+  }
+})
 
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
   const notOurs = fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']])
