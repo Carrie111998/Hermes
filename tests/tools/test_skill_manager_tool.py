@@ -1,7 +1,6 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
 import json
-import sys
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -164,9 +163,7 @@ class TestCreateSkill:
         assert result["success"] is False
         assert "already exists" in result["error"]
 
-    @pytest.mark.skipif(
-        sys.platform.startswith("win"), reason="POSIX hard-link race injection"
-    )
+    @pytest.mark.linux_only
     def test_create_never_replaces_concurrent_leaf_at_publish(
         self, tmp_path, monkeypatch
     ):

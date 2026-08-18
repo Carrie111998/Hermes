@@ -285,7 +285,7 @@ def test_pending_validator_rejects_invalid_v2_metadata(
     assert reason in message
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX modes are not enforced")
+@pytest.mark.linux_only
 def test_pending_store_creates_owner_only_directories_and_record(hermes_home):
     from pathlib import Path
     from tools import write_approval as wa
@@ -386,7 +386,7 @@ def test_skill_manage_stages_bound_v2_record(hermes_home, monkeypatch):
     assert wa.validate_pending_record(record) == (True, "")
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX link semantics differ")
+@pytest.mark.linux_only
 @pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink"])
 def test_skill_stage_refuses_linked_target_files(hermes_home, monkeypatch, unsafe_kind):
     from pathlib import Path
@@ -608,7 +608,7 @@ def test_skill_approval_revalidates_immediately_before_publish(
     assert "updated body" not in skill_md.read_text(encoding="utf-8")
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlink semantics required")
+@pytest.mark.linux_only
 def test_descriptor_anchored_publish_never_follows_late_symlink(
     hermes_home, monkeypatch
 ):
@@ -836,7 +836,7 @@ def test_scanner_rollback_never_clobbers_concurrent_leaf_update(
     assert wa.get_pending(wa.SKILLS, record["id"]) is not None
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX descriptors required")
+@pytest.mark.linux_only
 def test_scanner_rejected_create_removes_unchanged_hermes_tree(
     hermes_home, monkeypatch
 ):
@@ -872,7 +872,7 @@ def test_scanner_rejected_create_removes_unchanged_hermes_tree(
     assert wa.get_pending(wa.SKILLS, record["id"]) is not None
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX descriptors required")
+@pytest.mark.linux_only
 def test_scanner_rejected_create_is_scanned_before_publish(
     hermes_home, monkeypatch
 ):
@@ -922,7 +922,7 @@ def test_scanner_rejected_create_is_scanned_before_publish(
     assert wa.get_pending(wa.SKILLS, record["id"]) is not None
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX descriptors required")
+@pytest.mark.linux_only
 def test_scanner_create_cannot_scan_different_bytes_than_published(
     hermes_home, monkeypatch
 ):
@@ -961,7 +961,7 @@ def test_scanner_create_cannot_scan_different_bytes_than_published(
     assert wa.get_pending(wa.SKILLS, record["id"]) is not None
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX descriptors required")
+@pytest.mark.linux_only
 def test_first_create_never_replaces_concurrent_leaf_at_publish(
     hermes_home, monkeypatch
 ):
@@ -1242,7 +1242,7 @@ def test_skill_approval_applies_unchanged_v2_record(hermes_home, monkeypatch):
     assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is None
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX descriptors required")
+@pytest.mark.linux_only
 def test_first_approved_skill_create_builds_missing_skills_root(
     hermes_home, monkeypatch
 ):
@@ -1271,7 +1271,7 @@ def test_first_approved_skill_create_builds_missing_skills_root(
     assert wa.get_pending(wa.SKILLS, record["id"]) is None
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX descriptors required")
+@pytest.mark.linux_only
 @pytest.mark.parametrize("action", ["create", "edit", "write_file", "remove_file"])
 def test_descriptor_anchored_skill_apply_supports_every_mutation(
     hermes_home, monkeypatch, action
@@ -1399,7 +1399,7 @@ def test_background_delete_approval_fails_closed_without_pathname_archive(
     assert skill_dir.exists()
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX modes are not enforced")
+@pytest.mark.linux_only
 def test_stage_write_refuses_existing_non_owner_only_store(hermes_home):
     from pathlib import Path
     from tools import write_approval as wa
@@ -1427,7 +1427,7 @@ def test_stage_write_refuses_existing_non_owner_only_store(hermes_home):
     assert not (root / "skills").exists()
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="symlink semantics differ")
+@pytest.mark.linux_only
 def test_stage_write_refuses_symlinked_pending_root(hermes_home):
     from pathlib import Path
     from tools import write_approval as wa
@@ -1454,7 +1454,7 @@ def test_stage_write_refuses_symlinked_pending_root(hermes_home):
     assert not list(outside.iterdir())
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX fd semantics differ")
+@pytest.mark.linux_only
 def test_pending_read_stays_bound_to_opened_directory(hermes_home):
     from pathlib import Path
     from tools import write_approval as wa
@@ -1485,7 +1485,7 @@ def test_pending_read_stays_bound_to_opened_directory(hermes_home):
     assert not list((outside / "memory").iterdir())
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX modes are not enforced")
+@pytest.mark.linux_only
 def test_pending_reads_reject_non_owner_only_record(hermes_home):
     from pathlib import Path
     from tools import write_approval as wa
@@ -1504,7 +1504,7 @@ def test_pending_reads_reject_non_owner_only_record(hermes_home):
     assert wa.list_pending(wa.MEMORY) == []
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX link semantics differ")
+@pytest.mark.linux_only
 @pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink"])
 def test_pending_reads_reject_linked_records(hermes_home, unsafe_kind):
     from pathlib import Path
@@ -1671,7 +1671,7 @@ def test_legacy_record_is_untouched_and_unavailable(hermes_home):
     assert path.read_bytes() == before
 
 
-@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX modes are not enforced")
+@pytest.mark.linux_only
 @pytest.mark.parametrize("unsafe_kind", ["mode", "symlink"])
 def test_stage_write_refuses_unsafe_subsystem_directory(
     hermes_home, unsafe_kind
