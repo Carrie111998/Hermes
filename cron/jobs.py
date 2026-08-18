@@ -712,7 +712,19 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
-    
+
+    # Round-trip our own display strings (#89560): jobs list/edit surfaces
+    # re-submit the serializer's "once at <ts>" / "once in <duration>"
+    # display as the new schedule, and the parser used to reject its own
+    # output with ValueError (surfacing as HTTP 500 on one-shot edits).
+    # Strip the prefix and re-parse the payload verbatim.
+    if schedule_lower.startswith("once at "):
+        schedule = schedule[len("once at "):].strip()
+        schedule_lower = schedule.lower()
+    elif schedule_lower.startswith("once in "):
+        schedule = schedule[len("once in "):].strip()
+        schedule_lower = schedule.lower()
+
     # "every X" pattern → recurring interval
     if schedule_lower.startswith("every "):
         duration_str = schedule[6:].strip()
