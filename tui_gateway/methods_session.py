@@ -2654,6 +2654,30 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"removed": removed})
 
 
+def _compute_host_compress_wait_s() -> float:
+    """Wait budget for the remote compute-host /compress acknowledgement.
+
+    Compression of a large session legitimately exceeds the old fixed 120s
+    wait — the host reported success at ~134s (#88988) AFTER the desktop had
+    already failed the RPC. Budget = per-attempt compression timeout x
+    retry rounds + a 30s completion grace (shipped defaults: 120 x 3 + 30 =
+    390s). Reads auxiliary.compression.timeout and compression.max_attempts
+    the same way the compression paths do; fails open to the 390s default.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+        comp_cfg = aux.get("compression", {}) if isinstance(aux.get("compression"), dict) else {}
+        root_comp = cfg.get("compression", {}) if isinstance(cfg.get("compression"), dict) else {}
+        per_attempt = float(comp_cfg.get("timeout") or 120)
+        attempts = int(root_comp.get("max_attempts") or 3)
+        return max(per_attempt, per_attempt * attempts + 30.0)
+    except Exception:
+        return 390.0
+
+
 @method("session.compress")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
@@ -2670,7 +2694,7 @@ def _(rid, params: dict) -> dict:
                 route_name="session.compress",
                 command=command,
                 wait=True,
-                timeout=120.0,
+                timeout=_compute_host_compress_wait_s(),
             )
         except Exception as exc:
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
