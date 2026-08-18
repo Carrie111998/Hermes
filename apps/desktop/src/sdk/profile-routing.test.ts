@@ -368,6 +368,34 @@ describe('profile-aware plugin session opens', () => {
     expect($gatewaySwapTarget.get()).toBeNull()
   })
 
+  it('requests an explicit resume on a cold open before main selection settles (#89206)', async () => {
+    // The failing trace: target profile already active, but the target stored
+    // session is NOT yet selected in the main surface, no runtime, no
+    // transcript. The old gate required settled selection and skipped the
+    // resume, so hydration waited on conditions nothing would ever satisfy.
+    $activeGatewayProfile.set('hyoseob')
+    setMockAtom($selectedStoredSessionId, null)
+    setMockAtom($activeSessionId, null)
+    setMockAtom($messages, [])
+
+    const opening = host.openSession('bot-chat', {
+      profile: 'hyoseob',
+      awaitHydration: true,
+      expectHistory: true,
+      hydrationTimeoutMs: 1_000
+    })
+
+    await Promise.resolve()
+    expect(requestSessionResume).toHaveBeenCalledWith('bot-chat')
+
+    setMockAtom($selectedStoredSessionId, 'bot-chat')
+    setMockAtom($activeSessionId, 'runtime-cold')
+    setMockAtom($messages, [{ id: 'history-cold', parts: [], role: 'assistant' }] as never)
+
+    await opening
+    expect($gatewaySwapTarget.get()).toBeNull()
+  })
+
   it('accepts an explicitly empty Bot Chat once its main runtime is bound', async () => {
     $activeGatewayProfile.set('hyoseob')
 

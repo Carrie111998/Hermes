@@ -488,9 +488,19 @@ export const host = {
 
     const mainMessages = $messages.get()
 
+    // Deliberately NOT gated on the target already being the selected main
+    // session: on a cold named-profile open, selection has not settled yet
+    // when this check runs (the openSession navigate below is what settles
+    // it), and the route may not change at all on a same-route retry. Gating
+    // on settled selection skipped the explicit resume exactly in the failing
+    // path (#89206: hydrate-wait with runtime=false selected=false
+    // messages=0 timing out). Firing when the main surface lacks a runtime or
+    // expected transcript is safe regardless of selection state: route-resume
+    // only consumes the request once the route points at this session, the
+    // sequence counter dedupes it against a pathname-driven resume in the
+    // same effect run, and superseded opens die on the generation check.
     const needsExplicitResume =
       options.awaitHydration &&
-      $selectedStoredSessionId.get() === storedSessionId &&
       (!$activeSessionId.get() || (expectHistory && !mainMessages.length))
 
     try {
