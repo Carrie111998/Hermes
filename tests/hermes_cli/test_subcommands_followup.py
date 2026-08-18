@@ -55,6 +55,23 @@ def test_followup_builders_dispatch(name, builder, kw, argv):
     assert ns.func is handler
 
 
+def test_plugins_singular_alias_dispatches():
+    # `hermes plugin` (singular) is a muscle-memory alias for `plugins`; it must
+    # reach the same handler and still parse the nested action, rather than
+    # failing as an invalid choice.
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    handler = _h("plugins")
+    build_plugins_parser(sub, cmd_plugins=handler)
+
+    ns = parser.parse_args(["plugin"])
+    assert ns.func is handler
+
+    ns = parser.parse_args(["plugin", "list"])
+    assert ns.func is handler
+    assert ns.plugins_action == "list"
+
+
 def test_mcp_and_acp_accept_hooks_flag():
     # mcp/acp parser blocks use the shared add_accept_hooks_flag helper.
     parser = argparse.ArgumentParser(prog="hermes")

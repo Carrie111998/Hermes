@@ -13,6 +13,11 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
     """Attach the ``plugins`` subcommand to ``subparsers``."""
     plugins_parser = subparsers.add_parser(
         "plugins",
+        # Accept the singular `plugin` too: users reach for it out of muscle
+        # memory and argparse would otherwise reject it as an invalid choice
+        # with no hint. The alias shares this parser, so `hermes plugin ...`
+        # dispatches through the same handler as `hermes plugins ...`.
+        aliases=["plugin"],
         help="Manage and validate plugins",
         description=(
             "Install, update, remove, list, or validate native Hermes plugins "
