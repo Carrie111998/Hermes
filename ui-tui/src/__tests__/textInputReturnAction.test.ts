@@ -17,6 +17,22 @@ afterEach(() => {
 const key = (overrides: Record<string, unknown> = {}) =>
   ({ ctrl: false, meta: false, return: true, shift: false, super: false, ...overrides }) as any
 
+describe('isCtrlJNewline', () => {
+  it('recognizes the normalized Ctrl+J event emitted by extended-key protocols', async () => {
+    const { isCtrlJNewline } = await importTextInput('linux')
+
+    expect(isCtrlJNewline('j', key({ ctrl: true, return: false }))).toBe(true)
+  })
+
+  it('does not consume plain J or chords with additional modifiers', async () => {
+    const { isCtrlJNewline } = await importTextInput('linux')
+
+    expect(isCtrlJNewline('j', key({ return: false }))).toBe(false)
+    expect(isCtrlJNewline('j', key({ ctrl: true, meta: true, return: false }))).toBe(false)
+    expect(isCtrlJNewline('j', key({ ctrl: true, return: false, shift: true }))).toBe(false)
+  })
+})
+
 describe('shouldInsertNewlineOnReturn', () => {
   it('keeps plain Enter (CR) as submit on macOS', async () => {
     const { shouldInsertNewlineOnReturn } = await importTextInput('darwin')
