@@ -6867,25 +6867,44 @@ def get_model_info(profile: Optional[str] = None):
         if not model_name:
             return dict(_EMPTY_MODEL_INFO, provider=provider)
 
-        # Resolve auto-detected context length (pass config_ctx=None to get
-        # purely auto-detected value, then separately report the override)
-        try:
-            from agent.model_metadata import get_model_context_length
-            auto_ctx = get_model_context_length(
-                model=model_name,
-                base_url=base_url,
-                provider=provider,
-                config_context_length=None,  # ignore override — we want auto value
-            )
-        except Exception:
-            auto_ctx = 0
-
+        # ``config_ctx`` is the operator-configured override
+        # (model.context_length or model_overrides.<provider>.<model>.context_window).
+        # It must be threaded into get_model_context_length so the dashboard
+        # reports the same value the agent will actually use, not the catalog
+        # fallback (#88931). The override-vs-auto split is still surfaced
+        # in the response payload so the UI can show both.
         config_ctx_int = 0
         if isinstance(config_ctx, int) and config_ctx > 0:
             config_ctx_int = config_ctx
 
-        # Effective is what the agent actually uses
-        effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx
+        # Effective value: what the agent actually uses. Honors the override.
+        try:
+            from agent.model_metadata import get_model_context_length
+            effective_ctx = get_model_context_length(
+                model=model_name,
+                base_url=base_url,
+                provider=provider,
+                config_context_length=config_ctx_int or None,
+            )
+        except Exception:
+            effective_ctx = 0
+
+        # Auto-detected value: catalog/endpoint answer WITHOUT the operator
+        # override applied. Surfaces alongside the override so the UI can
+        # display "Catalog says 131K, you configured 99K". Resolved with
+        # the override temporarily cleared so the catalog path runs.
+        auto_ctx = 0
+        if config_ctx_int:
+            try:
+                from agent.model_metadata import get_model_context_length
+                auto_ctx = get_model_context_length(
+                    model=model_name,
+                    base_url=base_url,
+                    provider=provider,
+                    config_context_length=None,
+                )
+            except Exception:
+                auto_ctx = 0
 
         # Try to get model capabilities from models.dev
         caps = {}
