@@ -431,6 +431,7 @@ async function pidIsOurDashboard(
       'expected_entries={expected}\n' +
       'if hermes_home:\n' +
       ' expected_entries.add(os.path.join(hermes_home,"hermes-agent","venv","bin","hermes"))\n' +
+      ' expected_entries.add(os.path.join(hermes_home,"hermes-agent","hermes"))\n' +
       `expected_token=os.path.expanduser(${JSON.stringify(ownershipId ? spawnTokenPath(ownershipId, spawnNonce) : '')})\n` +
       `expected_profile=${JSON.stringify(String(profile))}\n` +
       `nonce=${JSON.stringify(String(spawnNonce))}\n` +
@@ -449,6 +450,8 @@ async function pidIsOurDashboard(
       'ok=False\n' +
       'try:\n' +
       ' serve=args.index("serve")\n' +
+      ' unique_options=("--ssh-owner-nonce","--ssh-session-token-file","--host","--port")\n' +
+      ' if any(sum(arg==name or arg.startswith(name+"=") for arg in args)>1 for name in unique_options):raise ValueError\n' +
       ' def option(name,start=0,end=None):\n' +
       '  matches=[(i,arg) for i,arg in enumerate(args[start:end],start) if arg==name or arg.startswith(name+"=")]\n' +
       '  if len(matches)>1:raise ValueError\n' +

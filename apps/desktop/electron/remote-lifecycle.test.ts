@@ -343,7 +343,7 @@ test('pidIsOurDashboard accepts the venv entrypoint an installer wrapper execs i
   assert.match(ownershipProbe, /expected_profile=.*ops/)
 })
 
-test.skipIf(process.platform === 'win32')(
+test.skipIf(process.platform !== 'linux')(
   'pidIsOurDashboard recognizes an installer wrapper after it execs python + entrypoint',
   async () => {
     const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes wrapper ownership '))
@@ -473,6 +473,33 @@ test.skipIf(process.platform === 'win32')(
         ),
         false,
         'a duplicate conflicting profile must remain foreign'
+      )
+
+      const splitBoundaryDuplicate = spawnInstaller([
+        '--profile',
+        'ops',
+        '--ssh-owner-nonce',
+        'fedcba9876543210',
+        '--ssh-session-token-file',
+        '/tmp/foreign',
+        'serve',
+        '--isolated',
+        ...backendFlags
+      ])
+
+      assert.equal(await waitForEntrypoint(splitBoundaryDuplicate), true)
+      assert.equal(
+        await pidIsOurDashboard(
+          ssh,
+          splitBoundaryDuplicate.pid,
+          SPAWN_NONCE,
+          launcher,
+          '/unrelated/hermes-home',
+          OWNERSHIP_ID,
+          'ops'
+        ),
+        false,
+        'duplicates split across the serve boundary must remain foreign'
       )
 
       const equalsForm = spawnInstaller([
@@ -617,6 +644,49 @@ subprocess.check_output = lambda *args, **kwargs: os.environ['HERMES_TEST_PS_LIN
     await rm(temp, { force: true, recursive: true })
   }
 })
+
+test.skipIf(process.platform === 'win32')(
+  'pidIsOurDashboard accepts the known HERMES_HOME entrypoint from flattened ps',
+  async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes flattened entrypoint '))
+
+    const sitecustomize = `
+import builtins, os, subprocess
+real_open = builtins.open
+def fallback_open(name, *args, **kwargs):
+    if isinstance(name, str) and name.startswith('/proc/') and name.endswith('/cmdline'):
+        raise OSError('forced ps fallback')
+    return real_open(name, *args, **kwargs)
+builtins.open = fallback_open
+subprocess.check_output = lambda *args, **kwargs: os.environ['HERMES_TEST_PS_LINE']
+`
+
+    await writeFile(path.join(temp, 'sitecustomize.py'), sitecustomize, 'utf8')
+    const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
+    const line = `/x/home/hermes-agent/venv/bin/python /x/home/hermes-agent/hermes --profile ops serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file ${tokenPath} --ssh-owner-nonce ${SPAWN_NONCE}`
+
+    const ssh = {
+      exec: (command: string) =>
+        new Promise<string>((resolve, reject) => {
+          execFile(
+            '/bin/sh',
+            ['-c', command],
+            { encoding: 'utf8', env: { ...process.env, PYTHONPATH: temp, HERMES_TEST_PS_LINE: line } },
+            (error, stdout) => (error ? reject(error) : resolve(String(stdout)))
+          )
+        })
+    }
+
+    try {
+      assert.equal(
+        await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/launcher', '/x/home', OWNERSHIP_ID, 'ops'),
+        true
+      )
+    } finally {
+      await rm(temp, { force: true, recursive: true })
+    }
+  }
+)
 
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
   const notOurs = fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']])
