@@ -124,6 +124,11 @@ def _emit_quota_findings(snapshot: dict) -> None:
                 detector="usage_poller",
                 outcome=finding["outcome"],
                 resets_at=finding.get("resets_at") or "",
+                # Without this the alert's `source` falls back through
+                # HERMES_CRON_JOB_NAME / HERMES_AGENT_SOURCE to the generic
+                # "agent-loop", which reads as if the agent runtime raised it.
+                # These come from the 5-minute usage poller, not a model call.
+                source_hint="usage-poller",
             )
         except Exception:
             continue
