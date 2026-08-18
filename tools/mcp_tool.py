@@ -3480,7 +3480,7 @@ class MCPServerTask:
                         logger.warning(
                             "MCP server '%s': %d consecutive reconnects "
                             "without a healthy session (rapid-drop budget "
-                            "exhausted), parking; will self-probe every %ds "
+                            "exhausted), parking; will self-probe every %gs "
                             "until it recovers (state: degraded → parked)",
                             self.name, _MAX_RECONNECT_RETRIES,
                             parked_retry_interval,
@@ -3662,7 +3662,7 @@ class MCPServerTask:
                     # immediately without burning the retry ladder.
                     logger.warning(
                         "MCP server '%s' hit a permanent error, parking "
-                        "without retries; will self-probe every %ds "
+                        "without retries; will self-probe every %gs "
                         "(state: connected → parked): %s: %s",
                         self.name, parked_retry_interval,
                         type(root).__name__, root,
@@ -3689,7 +3689,7 @@ class MCPServerTask:
                 if self._reconnect_retries > _MAX_RECONNECT_RETRIES:
                     logger.warning(
                         "MCP server '%s' failed after %d reconnection attempts, "
-                        "parking; will self-probe every %ds until it recovers "
+                        "parking; will self-probe every %gs until it recovers "
                         "(state: degraded → parked): %s: %s",
                         self.name, _MAX_RECONNECT_RETRIES,
                         parked_retry_interval,
