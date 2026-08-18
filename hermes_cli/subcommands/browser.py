@@ -98,7 +98,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
             print("Cancelled.")
             return 1
 
-    session = getattr(args, "session", None) or session_slug(target["name"])
+    session = session_slug(getattr(args, "session", None) or target["name"])
 
     cdp_url = target["cdp_url"]
     if not cdp_url:

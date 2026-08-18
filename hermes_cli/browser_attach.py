@@ -195,12 +195,9 @@ def load_registry() -> Dict[str, Dict[str, Any]]:
 
 
 def _write_registry(sessions: Dict[str, Dict[str, Any]]) -> None:
-    path = registry_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"sessions": sessions}, fh, indent=2)
-    os.replace(tmp, path)
+    from utils import atomic_json_write
+
+    atomic_json_write(registry_path(), {"sessions": sessions})
 
 
 def save_session_endpoint(name: str, cdp_url: str, app: str) -> None:
@@ -256,8 +253,8 @@ def _terminate_app(pid: int, timeout: float = 10.0) -> bool:
         # can skip their before-quit handlers.
         import subprocess
 
-        bundle = _bundle_path(exe_path) if (exe_path := _exe_of(proc)) else None
-        app_name = os.path.basename(bundle)[: -len(".app")] if bundle else proc.name()
+        exe_path = _exe_of(proc)
+        app_name = app_display_name(exe_path, proc.name()) if exe_path else proc.name()
         try:
             subprocess.run(
                 ["osascript", "-e", f'quit app "{app_name}"'],
