@@ -1839,6 +1839,26 @@ def _resolve_review_model(cfg: Dict[str, Any]) -> tuple[str, str]:
     return b.provider, b.model
 
 
+def _resolve_review_fallback_chain(cfg: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Resolve the curator slot's fallback chain, then the global chain.
+
+    A configured per-task chain intentionally takes precedence over the
+    top-level chain; an explicit empty list therefore disables fallback for
+    the curator rather than silently re-enabling global providers.
+    """
+    try:
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+        task = aux.get("curator", {}) if isinstance(aux.get("curator"), dict) else {}
+        if "fallback_chain" in task:
+            return get_fallback_chain({"fallback_model": task.get("fallback_chain")})
+        return get_fallback_chain(cfg)
+    except Exception:
+        logger.debug("Curator fallback-chain resolution failed", exc_info=True)
+        return None
+
+
 def _run_llm_review(prompt: str) -> Dict[str, Any]:
     """Spawn an AIAgent fork to run the curator review prompt.
 
@@ -1884,6 +1904,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _api_mode = None
     _resolved_provider = None
     _credential_pool = None
+    _fallback_chain = None
     _request_overrides: Dict[str, Any] = {}
     _max_tokens = None
     _acp_command = None
@@ -1893,6 +1914,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.runtime_provider import resolve_runtime_provider
         _cfg = load_config_readonly()
+        _fallback_chain = _resolve_review_fallback_chain(_cfg)
         _binding = _resolve_review_runtime(_cfg)
         _provider, _model_name = _binding.provider, _binding.model
         _rp = resolve_runtime_provider(
@@ -1929,6 +1951,8 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         if isinstance(_acp_command, str) and _acp_command:
             _agent_kwargs["acp_command"] = _acp_command
             _agent_kwargs["acp_args"] = _acp_args or []
+        if _fallback_chain is not None:
+            _agent_kwargs["fallback_model"] = _fallback_chain
         review_agent = AIAgent(
             model=_model_name,
             provider=_resolved_provider,

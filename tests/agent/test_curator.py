@@ -665,6 +665,29 @@ def test_review_model_auxiliary_curator_partial_override_falls_back(curator_env)
     )
 
 
+def test_review_fallback_chain_prefers_curator_slot(curator_env):
+    curator = curator_env["curator"]
+    cfg = {
+        "fallback_providers": [{"provider": "openrouter", "model": "global"}],
+        "auxiliary": {
+            "curator": {
+                "fallback_chain": [{"provider": "nous", "model": "curator"}],
+            },
+        },
+    }
+    assert curator._resolve_review_fallback_chain(cfg) == [
+        {"provider": "nous", "model": "curator"},
+    ]
+
+
+def test_review_fallback_chain_uses_global_when_slot_is_unset(curator_env):
+    curator = curator_env["curator"]
+    cfg = {"fallback_providers": [{"provider": "openrouter", "model": "global"}]}
+    assert curator._resolve_review_fallback_chain(cfg) == [
+        {"provider": "openrouter", "model": "global"},
+    ]
+
+
 
 
 
@@ -744,7 +767,16 @@ def test_review_fork_forwards_runtime_pool_and_overrides(curator_env, monkeypatc
     )
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
-        lambda: {"model": {"provider": "custom:hyper-charm", "default": "glm-5.2"}},
+        lambda: {
+            "model": {"provider": "custom:hyper-charm", "default": "glm-5.2"},
+            "auxiliary": {
+                "curator": {
+                    "fallback_chain": [
+                        {"provider": "openrouter", "model": "fallback-model"},
+                    ],
+                },
+            },
+        },
     )
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -757,6 +789,9 @@ def test_review_fork_forwards_runtime_pool_and_overrides(curator_env, monkeypatc
     assert meta.get("error") is None, meta.get("error")
     assert captured["kwargs"]["credential_pool"] is fake_pool
     assert captured["kwargs"]["request_overrides"] == fake_overrides
+    assert captured["kwargs"]["fallback_model"] == [
+        {"provider": "openrouter", "model": "fallback-model"},
+    ]
 
 
 def test_review_fork_uses_runtime_model_and_output_cap(curator_env, monkeypatch):
