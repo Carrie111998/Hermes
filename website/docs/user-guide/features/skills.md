@@ -436,10 +436,29 @@ Trust the repo once (from inside it, or by passing the path):
 ```bash
 hermes skills trust             # trust the current repo
 hermes skills trust ~/myproject # or explicitly
-hermes skills untrust           # revoke
+hermes skills untrust           # forget trust (the notice returns)
+hermes skills untrust --deny    # sticky deny: never load, never nag again
 ```
 
-Trusted roots are stored in `skills.trusted_project_dirs` in `~/.hermes/config.yaml`. Set `skills.project_discovery: false` to turn the feature off entirely (no scanning, no notices).
+Trust is recorded in a **machine-written sidecar**, `~/.hermes/project-trust.json` — never in `config.yaml`. That separation is deliberate: a file committed inside a repo (including a checked-in `config.yaml`) must never be able to grant itself trust, which would turn every `git clone` into an instruction-injection vector.
+
+Set `skills.project_discovery: false` in `config.yaml` to turn the feature off entirely (no scanning, no notices).
+
+### Re-approval on change (per-skill fingerprints)
+
+When you trust a repo, Hermes records a `sha256` manifest fingerprint covering every regular file in each project skill package (so editing a supporting script, reference, template, or asset also counts as a change). Line endings are normalised for `SKILL.md`, so a CRLF/LF change to that file alone is not a "change". At the start of each session it re-fingerprints the skills on disk and compares:
+
+- a skill whose **content changed** since you approved it, or a **newly added** skill, is **held back** (not loaded) — this is the injection-swap boundary: the content you approved is not silently replaced by an edit made after approval;
+- the banner surfaces a one-line nudge:
+
+  ```text
+  ◆ 2 project skill(s) changed/added since approval — run `hermes skills trust` to re-approve.
+  ```
+
+- re-running `hermes skills trust` re-fingerprints everything (that *is* the re-approval), which both clears the gate and prunes any skills that were removed from the repo;
+- a repo you `untrust --deny` is silent forever — no notice, no re-approval prompt.
+
+A legacy `skills.trusted_project_dirs` list in `config.yaml` (from older versions) still works: the first time Hermes sees such an entry it auto-migrates it into the sidecar by fingerprinting the repo's current skills, then removes the entry from `config.yaml` on the next `hermes skills trust`. From then on the project is hash-gated like any other.
 
 ### Precedence
 

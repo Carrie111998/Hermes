@@ -56,6 +56,7 @@ _config_files: List[Dict[str, str]] | None = None
 
 def _resolve_hermes_home() -> Path:
     from hermes_constants import get_hermes_home
+
     return get_hermes_home()
 
 
@@ -182,6 +183,7 @@ def _load_config_files() -> List[Dict[str, str]]:
     result: List[Dict[str, str]] = []
     try:
         from hermes_cli.config import read_raw_config
+
         hermes_home = _resolve_hermes_home()
         cfg = read_raw_config()
         cred_files = cfg_get(cfg, "terminal", "credential_files")
@@ -193,7 +195,8 @@ def _load_config_files() -> List[Dict[str, str]]:
                     rel = item.strip()
                     if os.path.isabs(rel):
                         logger.warning(
-                            "credential_files: rejected absolute config path %r", rel,
+                            "credential_files: rejected absolute config path %r",
+                            rel,
                         )
                         continue
                     host_path = hermes_home / rel
@@ -201,7 +204,8 @@ def _load_config_files() -> List[Dict[str, str]]:
                     if containment_error:
                         logger.warning(
                             "credential_files: rejected config path traversal %r (%s)",
-                            rel, containment_error,
+                            rel,
+                            containment_error,
                         )
                         continue
                     resolved_path = host_path.resolve()
@@ -238,10 +242,7 @@ def get_credential_file_mounts() -> List[Dict[str, str]]:
         if cp not in mounts and Path(entry["host_path"]).is_file():
             mounts[cp] = entry["host_path"]
 
-    return [
-        {"host_path": hp, "container_path": cp}
-        for cp, hp in mounts.items()
-    ]
+    return [{"host_path": hp, "container_path": cp} for cp, hp in mounts.items()]
 
 
 def get_skills_directory_mount(
@@ -275,7 +276,8 @@ def get_skills_directory_mount(
 
     # Mount external skill dirs
     try:
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+        from agent.skill_utils import approved_project_skills, get_external_skills_dirs
+
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if ext_dir.is_dir():
                 host_path = _safe_skills_path(ext_dir)
@@ -285,7 +287,8 @@ def get_skills_directory_mount(
                 })
         # Trusted project-local skill dirs (repo checkouts). Separate
         # namespace so container paths stay stable if external_dirs change.
-        for idx, proj_dir in enumerate(get_project_skills_dirs()):
+        for idx, project_skill in enumerate(approved_project_skills()):
+            proj_dir = project_skill.skill_dir
             if proj_dir.is_dir():
                 host_path = _safe_skills_path(proj_dir)
                 mounts.append({
@@ -310,8 +313,11 @@ def _safe_skills_path(skills_dir: Path) -> str:
         return str(skills_dir)
 
     for link in symlinks:
-        logger.warning("credential_files: skipping symlink in skills dir: %s -> %s",
-                       link, os.readlink(link))
+        logger.warning(
+            "credential_files: skipping symlink in skills dir: %s -> %s",
+            link,
+            os.readlink(link),
+        )
 
     import atexit
     import shutil
@@ -371,7 +377,8 @@ def iter_skills_files(
 
     # Include external skill dirs
     try:
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+        from agent.skill_utils import approved_project_skills, get_external_skills_dirs
+
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if not ext_dir.is_dir():
                 continue
@@ -384,7 +391,8 @@ def iter_skills_files(
                     "host_path": str(item),
                     "container_path": f"{container_root}/{rel}",
                 })
-        for idx, proj_dir in enumerate(get_project_skills_dirs()):
+        for idx, project_skill in enumerate(approved_project_skills()):
+            proj_dir = project_skill.skill_dir
             if not proj_dir.is_dir():
                 continue
             container_root = f"{container_base.rstrip('/')}/project_skills/{idx}"
@@ -588,5 +596,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

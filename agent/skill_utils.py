@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -25,24 +27,22 @@ PLATFORM_MAP = {
     "windows": "win32",
 }
 
-EXCLUDED_SKILL_DIRS = frozenset(
-    (
-        ".git",
-        ".github",
-        ".hub",
-        ".archive",
-        ".venv",
-        "venv",
-        "node_modules",
-        "site-packages",
-        "__pycache__",
-        ".tox",
-        ".nox",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-    )
-)
+EXCLUDED_SKILL_DIRS = frozenset((
+    ".git",
+    ".github",
+    ".hub",
+    ".archive",
+    ".venv",
+    "venv",
+    "node_modules",
+    "site-packages",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+))
 
 # Supporting files live inside a skill package and are loaded explicitly via
 # skill_view(skill, file_path=...). They are not standalone skills and must not
@@ -114,6 +114,7 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
         parts = path.parts  # Path
     except AttributeError:
         from pathlib import PurePath
+
         parts = PurePath(str(path)).parts
     return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
         path, root=root
@@ -341,9 +342,7 @@ def _detect_environment(env: str) -> bool:
         # its runtime scaffolding under /run/s6 and ships its admin tree under
         # /package/admin/s6-overlay. Either marker means we're inside an
         # s6-supervised container.
-        result = os.path.isdir("/run/s6") or os.path.isdir(
-            "/package/admin/s6-overlay"
-        )
+        result = os.path.isdir("/run/s6") or os.path.isdir("/package/admin/s6-overlay")
 
     _ENV_DETECT_CACHE[env] = result
     return result
@@ -457,6 +456,7 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         return set()
 
     from gateway.session_context import get_session_env
+
     resolved_platform = (
         platform
         or os.getenv("HERMES_PLATFORM")
@@ -633,10 +633,25 @@ def get_all_skills_dirs() -> List[Path]:
 # TRUST GATE: unlike AGENTS.md (plain instruction text), skills are load-on-
 # demand procedure documents an agent will follow — auto-sourcing them from any
 # cloned repo is a prompt-injection vector. Project skills therefore only load
-# when the project root is listed in ``skills.trusted_project_dirs`` in
-# config.yaml (Codex-style per-path trust). Untrusted dirs are still
-# *discoverable* via get_untrusted_project_skills_root() so the CLI can print
-# a one-line "run `hermes skills trust`" notice.
+# when the project root is trusted in the machine-written sidecar
+# ``~/.hermes/project-trust.json`` (see ``agent/project_trust.py``). Trust lives
+# in the sidecar — NEVER in config.yaml — precisely so a repo-committed file
+# (including a checked-in config.yaml) can never grant itself trust. Untrusted
+# dirs are still *discoverable* via get_untrusted_project_skills_root() so the
+# CLI can print a one-line "run `hermes skills trust`" notice.
+#
+# PER-SKILL FINGERPRINTS: trusting a project records a deterministic manifest
+# digest over every regular file in each package, keyed by its source root.
+# At agent-build time the gate re-fingerprints once and EXCLUDES any package
+# that is new, hash-changed, or contains a symlink, surfacing a one-line
+# "N project skill(s) changed/added since approval" notice. A denied project
+# (sticky deny) produces no notice ever.
+#
+# BACK-COMPAT: a legacy ``skills.trusted_project_dirs`` entry in config.yaml is
+# fingerprint-free, so honoring it as-is would be trust WITHOUT the hash gate.
+# The first time the agent/CLI sees such an entry for a project with no sidecar
+# record, it auto-migrates it into the sidecar by fingerprinting current skills;
+# thereafter it behaves like any sidecar-trusted project.
 #
 # PRECEDENCE: trusted project skills override same-named profile/bundled
 # skills (index scans project dirs first; skill_view resolves cross-tier
@@ -644,10 +659,11 @@ def get_all_skills_dirs() -> List[Path]:
 # harnesses and is the point of the feature: vendored repo skills win inside
 # their repo.
 #
-# CACHE SAFETY: cwd is fixed for the life of a session, and the trust list is
-# read from config at agent build time — the resolved dirs are stable for the
-# conversation, so the skills index (and with it the system prompt) stays
-# byte-stable. Same contract as AGENTS.md injection and project plugins.
+# CACHE SAFETY: cwd is fixed for the life of a session, and trust + fingerprints
+# are resolved into one approved-package snapshot at agent build time. Every
+# surface consumes that same immutable view, so the skills index (and with it
+# the system prompt) stays byte-stable. Same contract as AGENTS.md injection and
+# project plugins.
 
 PROJECT_SKILLS_SUBDIRS = (
     os.path.join(".hermes", "skills"),
@@ -722,11 +738,28 @@ def _project_trusted_dirs_from_config() -> Set[Path]:
 
 
 def is_project_root_trusted(root: Path) -> bool:
-    """True when *root* is listed in ``skills.trusted_project_dirs``."""
+    """True when *root* is trusted in the sidecar (``project-trust.json``).
+
+    A sidecar ``trusted`` entry wins. Otherwise, a legacy
+    ``skills.trusted_project_dirs`` entry auto-migrates into the sidecar on
+    first sight (fingerprinting current project skills) and then reads as
+    trusted; see :func:`agent.project_trust.migrate_legacy_if_needed`. A
+    ``denied`` sidecar entry (or no record at all) is not trusted.
+    """
+    from agent import project_trust as pt
+
     try:
-        return Path(root).resolve() in _project_trusted_dirs_from_config()
+        resolved = Path(root).resolve()
     except OSError:
         return False
+    if pt.is_trusted(resolved):
+        return True
+    if pt.is_denied(resolved):
+        return False
+    # No sidecar record — honor a legacy config entry by migrating it once.
+    if pt.migrate_legacy_if_needed(resolved, _candidate_project_skills_dirs(resolved)):
+        return pt.is_trusted(resolved)
+    return False
 
 
 def _candidate_project_skills_dirs(root: Path) -> List[Path]:
@@ -772,14 +805,20 @@ def get_untrusted_project_skills_root() -> Optional[Tuple[Path, int]]:
 
     Used by the CLI to print a one-line notice pointing at
     ``hermes skills trust``. Returns None when there is nothing to notify
-    about (no project, no skills, already trusted, or discovery disabled).
+    about (no project, no skills, already trusted, discovery disabled, or the
+    project is sticky-*denied* — a denied project is silent forever).
     """
+    from agent import project_trust as pt
+
     parsed = _load_raw_config()
     skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
     if isinstance(skills_cfg, dict) and skills_cfg.get("project_discovery") is False:
         return None
     root = find_project_root()
     if root is None or is_project_root_trusted(root):
+        return None
+    # Sticky deny: a denied project never nags.
+    if pt.is_denied(root):
         return None
     count = 0
     for d in _candidate_project_skills_dirs(root):
@@ -792,13 +831,175 @@ def get_untrusted_project_skills_root() -> Optional[Tuple[Path, int]]:
     return root, count
 
 
+def _relpath_for_gate(skills_dir: Path, skill_md: Path) -> str:
+    """Skill identity key used by the fingerprint gate for a SKILL.md path.
+
+    Matches :func:`agent.project_trust.fingerprint_project_skills`: the skill
+    directory relative to its containing skills root, falling back to the
+    directory basename.
+    """
+    from agent.project_trust import skill_identity
+
+    return skill_identity(skills_dir, Path(skill_md).parent)
+
+
+@dataclass(frozen=True)
+class ApprovedProjectSkill:
+    """One approved project skill package from the build-time snapshot."""
+
+    identity: str
+    source_root: Path
+    skill_dir: Path
+    skill_md: Path
+    skill_md_bytes: bytes
+    digest: str
+
+
+@dataclass(frozen=True)
+class ProjectSkillSnapshot:
+    """Resolved project-skill decision shared by every loading surface."""
+
+    root: Optional[Path]
+    approved: Tuple[ApprovedProjectSkill, ...] = ()
+    blocked_skill_md_paths: frozenset[str] = frozenset()
+
+
+@lru_cache(maxsize=32)
+def _resolve_project_skill_snapshot_cached(
+    root_key: str,
+    hermes_home_key: str,
+) -> ProjectSkillSnapshot:
+    """Hash project packages once and retain the exact approved SKILL.md bytes."""
+    del hermes_home_key  # cache partition only; lookup uses the active context
+    from agent import project_trust as pt
+
+    root = Path(root_key)
+    parsed = _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if isinstance(skills_cfg, dict) and skills_cfg.get("project_discovery") is False:
+        return ProjectSkillSnapshot(root=root)
+    if not is_project_root_trusted(root):
+        return ProjectSkillSnapshot(root=root)
+
+    approved_fingerprints = pt.approved_fingerprints(root)
+    approved: List[ApprovedProjectSkill] = []
+    blocked: Set[str] = set()
+    for source_root in _candidate_project_skills_dirs(root):
+        # Route enumeration through the quarantine chokepoint so a dangerous
+        # scan verdict and the fingerprint gate compose: a skill is skipped if
+        # quarantined (#48974) OR fingerprint-mismatched (#48970), never both
+        # surfaces seeing a different subset.
+        for skill_md in iter_project_skill_files(source_root):
+            skill_md = Path(skill_md)
+            identity = pt.skill_identity(source_root, skill_md.parent)
+            digest, skill_md_bytes = pt.fingerprint_skill_package(skill_md.parent)
+            try:
+                canonical_md = str(skill_md.resolve())
+            except OSError:
+                canonical_md = str(skill_md)
+            if (
+                digest is None
+                or skill_md_bytes is None
+                or approved_fingerprints.get(identity) != digest
+            ):
+                blocked.add(canonical_md)
+                continue
+            approved.append(
+                ApprovedProjectSkill(
+                    identity=identity,
+                    source_root=source_root,
+                    skill_dir=skill_md.parent,
+                    skill_md=skill_md,
+                    skill_md_bytes=skill_md_bytes,
+                    digest=digest,
+                )
+            )
+    return ProjectSkillSnapshot(
+        root=root,
+        approved=tuple(approved),
+        blocked_skill_md_paths=frozenset(blocked),
+    )
+
+
+def resolve_project_skill_snapshot() -> ProjectSkillSnapshot:
+    """Return the once-resolved approved view for this project/profile."""
+    root = find_project_root()
+    if root is None:
+        return ProjectSkillSnapshot(root=None)
+    from hermes_constants import get_hermes_home
+
+    try:
+        home_key = str(get_hermes_home().resolve())
+    except OSError:
+        home_key = str(get_hermes_home())
+    return _resolve_project_skill_snapshot_cached(str(root.resolve()), home_key)
+
+
+def approved_project_skills() -> Tuple[ApprovedProjectSkill, ...]:
+    """Exact approved project packages shared by prompt/tool/mount surfaces."""
+    return resolve_project_skill_snapshot().approved
+
+
+def approved_project_skill_dirs() -> List[Path]:
+    """Approved package directories, one entry per skill."""
+    return [entry.skill_dir for entry in approved_project_skills()]
+
+
+def read_approved_project_skill_md(path: Path) -> Optional[bytes]:
+    """Return verified bytes for an exact canonical project ``SKILL.md``."""
+    try:
+        wanted = str(Path(path).resolve())
+    except OSError:
+        wanted = str(path)
+    for entry in approved_project_skills():
+        try:
+            candidate = str(entry.skill_md.resolve())
+        except OSError:
+            candidate = str(entry.skill_md)
+        if candidate == wanted:
+            return entry.skill_md_bytes
+    return None
+
+
+def project_skill_paths_blocked() -> Set[str]:
+    """Resolved SKILL.md paths in the current project that are gated OUT.
+
+    A project skill is blocked when its name is new since approval OR its
+    normalised-content sha256 differs from the approved fingerprint (the
+    injection-swap boundary). Empty when the project is untrusted (the whole
+    tier is already excluded by :func:`get_project_skills_dirs`) or when every
+    skill matches its approved fingerprint.
+
+    The returned set is resolved absolute path strings so a scanner can test
+    membership cheaply per SKILL.md. Computed once per call from disk + the
+    sidecar; both are stable for the session so this is cache-safe.
+    """
+    return set(resolve_project_skill_snapshot().blocked_skill_md_paths)
+
+
+def get_project_skill_change_notice() -> Optional[Tuple[Path, int]]:
+    """When a trusted project has changed/new skills gated out: (root, count).
+
+    Drives the CLI banner's re-approval nudge. Returns None when the project is
+    untrusted (handled by :func:`get_untrusted_project_skills_root`), denied, or
+    when nothing changed since approval.
+    """
+    root = find_project_root()
+    if root is None or not is_project_root_trusted(root):
+        return None
+    blocked = project_skill_paths_blocked()
+    if not blocked:
+        return None
+    return root, len(blocked)
+
+
 def get_scan_ordered_skills_dirs() -> List[Path]:
     """All skill dirs in precedence order: project → local → external.
 
     First-wins name deduplication over this order gives project skills
     priority over profile-local and external ones.
     """
-    dirs = list(get_project_skills_dirs())
+    dirs = approved_project_skill_dirs()
     dirs.append(get_skills_dir())
     dirs.extend(get_external_skills_dirs())
     return dirs
@@ -919,13 +1120,29 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     # module cycle (tools.skills_tool imports agent.skill_utils).
     try:
         from tools import skills_tool as _skills_tool
+
         primary_root = Path(_skills_tool.SKILLS_DIR)
     except Exception:
         primary_root = get_skills_dir()
 
     trusted_roots = [primary_root]
     try:
-        trusted_roots.extend(get_project_skills_dirs())
+        for project_skill in approved_project_skills():
+            if identifier_path == project_skill.skill_dir:
+                return str(
+                    project_skill.skill_dir.relative_to(project_skill.source_root)
+                )
+            try:
+                if identifier_path.resolve() == project_skill.skill_dir.resolve():
+                    return str(
+                        project_skill.skill_dir.relative_to(project_skill.source_root)
+                    )
+            except OSError:
+                continue
+    except Exception:
+        pass
+    try:
+        trusted_roots.extend(approved_project_skill_dirs())
     except Exception:
         pass
     try:
@@ -977,7 +1194,7 @@ def is_external_skill_path(path) -> bool:
     # Trusted project-local dirs are repo-owned — same read-only boundary
     # for autonomous lifecycle maintenance as configured external dirs.
     try:
-        roots.extend(get_project_skills_dirs())
+        roots.extend(approved_project_skill_dirs())
     except Exception:
         pass
     for root in roots:
@@ -1176,7 +1393,7 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
     if not desc:
         return ""
     if len(desc) > SKILL_PROMPT_DESC_LIMIT:
-        return desc[:SKILL_PROMPT_DESC_LIMIT - 3] + "..."
+        return desc[: SKILL_PROMPT_DESC_LIMIT - 3] + "..."
     return desc
 
 
@@ -1210,7 +1427,11 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     matches: list[str] = []
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
         has_skill_md = "SKILL.md" in files
-        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+        if (
+            root == skills_dir_str
+            and ORG_MIRROR_DIR_NAME in dirs
+            and active_org is None
+        ):
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             # Inside _org/: descend ONLY into the active org's mirror.
