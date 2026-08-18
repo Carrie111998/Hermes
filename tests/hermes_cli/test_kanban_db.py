@@ -760,6 +760,39 @@ def test_complete_task_rejects_symlinked_custody_destination(kanban_home):
     assert workspace.exists()
 
 
+def test_complete_task_rejects_intermediate_custody_root_symlink(
+    kanban_home,
+    monkeypatch,
+):
+    """Custody setup must not resolve through an intermediate symlink."""
+    outside = kanban_home / "outside-custody"
+    outside.mkdir()
+    linked_parent = kanban_home / "linked-custody-parent"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    redirected_root = linked_parent / "attachments"
+    monkeypatch.setattr(kb, "attachments_root", lambda board=None: redirected_root)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="protect custody root")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "candidate.txt"
+        artifact.write_text("candidate")
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="unsafe root",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, task_id).status != "done"
+        assert kb.list_attachments(conn, task_id) == []
+    assert not (outside / "attachments").exists()
+    assert workspace.exists()
+
+
 def test_complete_task_fsyncs_custody_directories_before_commit(kanban_home, monkeypatch):
     fsynced_modes: list[int] = []
     original_fsync = kb.os.fsync

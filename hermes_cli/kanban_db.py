@@ -4160,27 +4160,22 @@ def _mkdir_open_nofollow(parent_fd: int, name: str) -> int:
 
 def _ensure_directory_tree_nofollow(path: Path) -> tuple[Path, int]:
     """Create an absolute directory tree with durable, no-follow components."""
-    try:
-        existing = path.lstat()
-    except FileNotFoundError:
-        existing = None
-    if existing is not None and stat.S_ISLNK(existing.st_mode):
-        raise OSError(f"refusing symlinked custody root: {path}")
-
-    resolved = path.resolve(strict=False)
+    absolute = Path(os.path.abspath(path))
     if os.name == "nt":
-        resolved.mkdir(parents=True, exist_ok=True)
-        return resolved, _open_nofollow(resolved, directory=True)
+        absolute.mkdir(parents=True, exist_ok=True)
+        return absolute, _open_nofollow(absolute, directory=True)
 
-    if not resolved.is_absolute():
-        raise OSError(f"custody root must be absolute: {resolved}")
-    current_fd = _open_nofollow(resolved.anchor, directory=True)
+    if not absolute.is_absolute():
+        raise OSError(f"custody root must be absolute: {absolute}")
+    # Walk the lexical path, not Path.resolve(): resolving first would follow
+    # an attacker-controlled intermediate symlink before no-follow admission.
+    current_fd = _open_nofollow(absolute.anchor, directory=True)
     try:
-        for component in resolved.parts[1:]:
+        for component in absolute.parts[1:]:
             next_fd = _mkdir_open_nofollow(current_fd, component)
             os.close(current_fd)
             current_fd = next_fd
-        return resolved, current_fd
+        return absolute, current_fd
     except Exception:
         os.close(current_fd)
         raise
@@ -6086,7 +6081,7 @@ def _persist_scratch_completion_artifacts(
                             os.fsync(staging_fd)
 
                     stored_path = (
-                        attachment_root.resolve()
+                        attachment_root
                         / task_id
                         / "sha256"
                         / artifact_sha256[:2]
