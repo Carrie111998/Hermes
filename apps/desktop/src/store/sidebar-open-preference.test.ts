@@ -8,20 +8,20 @@ describe('$sidebarSessionsOpenInNewTab', () => {
     vi.resetModules()
   })
 
-  it('defaults to false and canonicalizes an absent value to storage', async () => {
+  it('defaults to false without writing storage on read', async () => {
     const { $sidebarSessionsOpenInNewTab } = await import('./sidebar-open-preference')
 
     expect($sidebarSessionsOpenInNewTab.get()).toBe(false)
-    expect(window.localStorage.getItem(KEY)).toBe('false')
+    expect(window.localStorage.getItem(KEY)).toBeNull()
   })
 
-  it('falls back to false and canonicalizes malformed storage', async () => {
+  it('falls back to false but leaves malformed storage untouched until a write', async () => {
     window.localStorage.setItem(KEY, 'not-a-bool')
 
     const { $sidebarSessionsOpenInNewTab } = await import('./sidebar-open-preference')
 
     expect($sidebarSessionsOpenInNewTab.get()).toBe(false)
-    expect(window.localStorage.getItem(KEY)).toBe('false')
+    expect(window.localStorage.getItem(KEY)).toBe('not-a-bool')
   })
 
   it('persists true when the user enables it', async () => {

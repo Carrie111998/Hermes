@@ -19,6 +19,7 @@ import { Archive, ArchiveOff, FolderOpen, Loader2, Trash2 } from '@/lib/icons'
 import { notify, notifyError } from '@/store/notifications'
 import { untombstoneSessions } from '@/store/projects'
 import { applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd, setSessions } from '@/store/session'
+import { forgetSessionUnread } from '@/store/session-unread'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 import type { HermesConfigRecord, SessionInfo } from '@/types/hermes'
 
@@ -86,6 +87,9 @@ export function SessionsSettings() {
 
       try {
         await deleteSession(session.id, session.profile)
+        // Permanent delete bypasses removeSession, so retire the persisted
+        // unread state here too rather than leaving it to rot.
+        forgetSessionUnread([session.id, session._lineage_root_id], session.profile)
         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
         triggerHaptic('warning')
       } catch (err) {

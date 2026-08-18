@@ -1,11 +1,15 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
+import { createClientSessionState } from '@/lib/chat-runtime'
+import type * as ChatRuntime from '@/lib/chat-runtime'
+import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
 import type * as SessionStore from '@/store/session'
+import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 import type * as WindowsStore from '@/store/windows'
@@ -33,10 +37,17 @@ vi.mock('@/i18n', () => ({
           backgroundRunning: 'Running in background',
           finishedUnread: 'Finished',
           handoffOrigin: (platform: string) => `Started on ${platform}`,
+          messageCount: (count: number) => `${count} messages`,
           needsInput: 'Needs input',
           sessionActions: 'Session actions',
           sessionRunning: 'Running',
           waitingForAnswer: 'Waiting for answer'
+        }
+      },
+      assistant: {
+        thread: {
+          today: (time: string) => `Today at ${time}`,
+          yesterday: (time: string) => `Yesterday at ${time}`
         }
       }
     }
@@ -54,13 +65,28 @@ vi.mock('@/app/open-session', () => ({
 // props itself only proves the MOCK forwards them, not that the real
 // component does. This file exercises the actual production component so a
 // regression in its ref/prop forwarding fails here again.
-vi.mock('@/lib/chat-runtime', () => ({ sessionTitle: (s: SessionInfo) => (s as unknown as { title: string }).title }))
+// Only `sessionTitle` is overridden (makeSession fakes a bare `title` the real
+// one wouldn't read); the rest of the module is genuine so the arc test can
+// build session state with the same factory the app uses. It is a spy because
+// the row calls it exactly once per render, which is how the isolation test
+// below counts repaints.
+const sessionTitle = vi.fn((s: SessionInfo) => (s as unknown as { title: string }).title)
+
+vi.mock('@/lib/chat-runtime', async importOriginal => {
+  const actual = await importOriginal<typeof ChatRuntime>()
+
+  return { ...actual, sessionTitle: (s: SessionInfo) => sessionTitle(s) }
+})
 vi.mock('@/lib/haptics', () => ({ triggerHaptic: vi.fn() }))
 vi.mock('@/lib/session-source', () => ({
   handoffOriginSource: (state?: string, platform?: string) => (state && platform ? platform : null),
   sessionSourceLabel: (source: string) => source
 }))
-vi.mock('@/lib/time', () => ({ coarseElapsed: () => ({ unit: 'minute' as const, value: 5 }) }))
+vi.mock('@/lib/time', async importOriginal => {
+  const actual = await importOriginal<typeof Time>()
+
+  return { ...actual, coarseElapsed: () => ({ unit: 'minute' as const, value: 5 }) }
+})
 
 // These mocks use importOriginal rather than replacing the module wholesale:
 // session-row.tsx (and its transitive imports, e.g. session-color.ts) reads
@@ -127,11 +153,33 @@ function makeSession(overrides: Partial<SessionInfo> & { title: string }): Sessi
 
 const tipTrigger = (el: HTMLElement) => el.closest('[data-slot="tooltip-trigger"]')
 
+// The status dot always paints an aria-hidden placeholder so every row's title
+// keeps the same left edge, so "the row's aria-hidden span" no longer names the
+// avatar on its own. `inline-grid` is PlatformAvatar's own layout class in both
+// of its branches — brand glyph and first-letter fallback — and the row passes
+// it no display class that tailwind-merge could drop it for.
+const handoffAvatar = (container: HTMLElement) =>
+  container.querySelector<HTMLElement>('span[aria-hidden="true"].inline-grid')
+
 const noop = vi.fn()
 
-function renderRow(sessionOverrides: Partial<SessionInfo> & { title: string } = { title: 'Session 1' }) {
+const renderRow = (session: SessionInfo) =>
+  render(
+    <SidebarSessionRow
+      isPinned={false}
+      isSelected={false}
+      onArchive={noop}
+      onDelete={noop}
+      onPin={noop}
+      onResume={noop}
+      onToggleUnread={noop}
+      session={session}
+      unread={false}
+    />
+  )
+
+function renderClickableRow(sessionOverrides: Partial<SessionInfo> & { title: string }) {
   const onArchive = vi.fn()
-  const onDelete = vi.fn()
   const onPin = vi.fn()
   const onResume = vi.fn()
 
@@ -139,17 +187,76 @@ function renderRow(sessionOverrides: Partial<SessionInfo> & { title: string } = 
     <SidebarSessionRow
       isPinned={false}
       isSelected={false}
-      isWorking={false}
       onArchive={onArchive}
-      onDelete={onDelete}
+      onDelete={noop}
       onPin={onPin}
       onResume={onResume}
+      onToggleUnread={noop}
       session={makeSession(sessionOverrides)}
+      unread={false}
     />
   )
 
-  return { onArchive, onDelete, onPin, onResume }
+  return { onArchive, onPin, onResume }
 }
+
+// The row no longer takes its running state as a prop, so this drives the real
+// store the way the app does. $workingSessionIds is the actual computed here
+// (the mock above only overrides its siblings), which is what makes this cover
+// the wiring rather than the predicate — the arc has gone missing before.
+describe('SidebarSessionRow running arc', () => {
+  afterEach(() => {
+    clearAllSessionStates()
+  })
+
+  const arc = (container: HTMLElement) => container.querySelector('.arc-row')
+
+  it('paints no arc for a settled session', () => {
+    const { container } = renderRow(makeSession({ title: 'Settled' }))
+
+    expect(arc(container)).toBeNull()
+  })
+
+  it('paints the arc while the session is running', () => {
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+
+    const { container } = renderRow(makeSession({ title: 'Running' }))
+
+    expect(arc(container)).toBeTruthy()
+  })
+
+  // The row owns its status subscription so a turn starting repaints that row
+  // and nothing else — not its siblings, and not the list around them. Rows
+  // render once per fiber, so counting `sessionTitle` counts repaints.
+  it('repaints only the session whose turn started', () => {
+    render(
+      <>
+        {[makeSession({ id: 's1', title: 'One' }), makeSession({ id: 's2', title: 'Two' })].map(session => (
+          <SidebarSessionRow
+            isPinned={false}
+            isSelected={false}
+            key={session.id}
+            onArchive={noop}
+            onDelete={noop}
+            onPin={noop}
+            onResume={noop}
+            onToggleUnread={noop}
+            session={session}
+            unread={false}
+          />
+        ))}
+      </>
+    )
+    sessionTitle.mockClear()
+
+    act(() => {
+      publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+    })
+
+    expect(sessionTitle).toHaveBeenCalledTimes(1)
+    expect(sessionTitle).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }))
+  })
+})
 
 describe('SidebarSessionRow', () => {
   it('keeps an aria-label on the kebab without wrapping it in a Tip', () => {
@@ -157,12 +264,13 @@ describe('SidebarSessionRow', () => {
       <SidebarSessionRow
         isPinned={false}
         isSelected={false}
-        isWorking={false}
         onArchive={noop}
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({ title: 'Hermes doctor health check results' })}
+        unread={false}
       />
     )
 
@@ -170,25 +278,119 @@ describe('SidebarSessionRow', () => {
     expect(tipTrigger(kebab)).toBeNull()
   })
 
+  // Full-title tooltip on hover (#83000-class ask): the label is a tooltip
+  // trigger, but the tip only opens when the title is actually truncated.
+  describe('full-title overflow tooltip', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    const title = 'A very long session title that the sidebar cannot possibly fit'
+
+    /** The rendered title label (tooltip trigger is the label itself). */
+    const label = () => screen.getByText(title).closest('[data-slot="tooltip-trigger"]') as HTMLElement
+
+    const setWidths = (el: HTMLElement, scrollWidth: number, clientWidth: number) => {
+      Object.defineProperty(el, 'scrollWidth', { configurable: true, value: scrollWidth })
+      Object.defineProperty(el, 'clientWidth', { configurable: true, value: clientWidth })
+    }
+
+    it('wraps the title in a tooltip trigger', () => {
+      renderRow(makeSession({ title }))
+
+      expect(label()).toBeTruthy()
+    })
+
+    it('opens with the full title after a settled hover when the title overflows', () => {
+      vi.useFakeTimers()
+      renderRow(makeSession({ title }))
+
+      const el = label()
+      setWidths(el, 300, 100)
+
+      act(() => {
+        fireEvent.pointerEnter(el)
+        vi.advanceTimersByTime(700)
+      })
+
+      expect(screen.getByRole('tooltip').textContent).toContain(title)
+    })
+
+    it('stays closed when the title fits', () => {
+      vi.useFakeTimers()
+      renderRow(makeSession({ title }))
+
+      const el = label()
+      setWidths(el, 100, 100)
+
+      act(() => {
+        fireEvent.pointerEnter(el)
+        vi.advanceTimersByTime(700)
+      })
+
+      expect(screen.queryByRole('tooltip')).toBeNull()
+    })
+
+    it('cancels a pending open when the pointer leaves before the delay', () => {
+      vi.useFakeTimers()
+      renderRow(makeSession({ title }))
+
+      const el = label()
+      setWidths(el, 300, 100)
+
+      act(() => {
+        fireEvent.pointerEnter(el)
+        vi.advanceTimersByTime(200)
+        fireEvent.pointerLeave(el)
+        vi.advanceTimersByTime(700)
+      })
+
+      expect(screen.queryByRole('tooltip')).toBeNull()
+    })
+  })
+
+  it('exposes the exact session time through a focusable Tip trigger', () => {
+    const startedAt = Math.floor(Date.now() / 1000) - 5 * 60
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
+        onToggleUnread={noop}
+        session={makeSession({ started_at: startedAt, title: 'Timestamped session' })}
+        unread={false}
+      />
+    )
+
+    const age = screen.getByText('5m')
+    expect(age.tagName).toBe('TIME')
+    expect(age.getAttribute('datetime')).toBe(new Date(startedAt * 1000).toISOString())
+    expect(age.getAttribute('aria-label')).toMatch(/^5m, Today at /)
+    expect(age.getAttribute('tabindex')).toBe('0')
+    expect(age.getAttribute('title')).toBeNull()
+    expect(tipTrigger(age)).toBeTruthy()
+  })
+
   it('does not render a handoff avatar for a locally-started session', () => {
     const { container } = render(
       <SidebarSessionRow
         isPinned={false}
         isSelected={false}
-        isWorking={false}
         onArchive={noop}
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({ title: 'Local session' })}
+        unread={false}
       />
     )
 
-    // PlatformAvatar's span is the only aria-hidden SPAN this row ever
-    // renders (idle dot / arc-border / branch-stem are all inactive here) —
-    // Codicon icons (e.g. the kebab trigger) are also aria-hidden but render
-    // as <i>, not <span>, so this selector doesn't accidentally match them.
-    expect(container.querySelector('span[aria-hidden="true"]')).toBeNull()
+    expect(handoffAvatar(container)).toBeNull()
   })
 
   it('wraps the handoff platform avatar in a Tip for a session started on another platform', () => {
@@ -196,32 +398,33 @@ describe('SidebarSessionRow', () => {
       <SidebarSessionRow
         isPinned={false}
         isSelected={false}
-        isWorking={false}
         onArchive={noop}
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({
           handoff_platform: 'telegram',
           handoff_state: 'active',
           title: 'Continued from Telegram'
         })}
+        unread={false}
       />
     )
 
     // PlatformAvatar is the REAL component here (see the note above the vi.mock
     // block, #67500 third pass) — it renders the Telegram brand SVG rather
-    // than the platform name as text, so query the avatar span itself (the
-    // row's only aria-hidden span in this state) rather than text content,
-    // and confirm its tooltip trigger actually attaches to it — proving the
-    // real forwardRef/...rest path works, not a mock that fakes it.
-    const avatar = container.querySelector('span[aria-hidden="true"]')
+    // than the platform name as text, so query the avatar span itself rather
+    // than text content, and confirm its tooltip trigger actually attaches to
+    // it — proving the real forwardRef/...rest path works, not a mock that
+    // fakes it.
+    const avatar = handoffAvatar(container)
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
   })
 
   it('routes plain click to onResume by default', () => {
-    const { onResume } = renderRow({ title: 'Default route session' })
+    const { onResume } = renderClickableRow({ title: 'Default route session' })
 
     fireEvent.click(screen.getByRole('button', { name: 'Default route session' }))
 
@@ -231,7 +434,7 @@ describe('SidebarSessionRow', () => {
 
   it('routes plain click to tab intent when the preference is enabled', () => {
     $sidebarSessionsOpenInNewTab.set(true)
-    const { onResume } = renderRow({ title: 'Preference-enabled route' })
+    const { onResume } = renderClickableRow({ title: 'Preference-enabled route' })
 
     fireEvent.click(screen.getByRole('button', { name: 'Preference-enabled route' }))
 
@@ -241,7 +444,7 @@ describe('SidebarSessionRow', () => {
 
   it('applies the enabled plain-click tab route to cross-profile rows too', () => {
     $sidebarSessionsOpenInNewTab.set(true)
-    const { onResume } = renderRow({ profile: 'work', title: 'Cross profile route' })
+    const { onResume } = renderClickableRow({ profile: 'work', title: 'Cross profile route' })
 
     fireEvent.click(screen.getByRole('button', { name: 'Cross profile route' }))
 
@@ -251,11 +454,11 @@ describe('SidebarSessionRow', () => {
 
   it('routes keyboard activation (Enter/Space) through tab intent when enabled', () => {
     $sidebarSessionsOpenInNewTab.set(true)
-    const { onResume } = renderRow({ title: 'Keyboard route' })
+    const { onResume } = renderClickableRow({ title: 'Keyboard route' })
     const rowButton = screen.getByRole('button', { name: 'Keyboard route' })
 
-    fireEvent.click(rowButton, { detail: 0 }) // keyboard-synthesized click
-    fireEvent.click(rowButton, { detail: 0 }) // second activation path (e.g. Space)
+    fireEvent.click(rowButton, { detail: 0 })
+    fireEvent.click(rowButton, { detail: 0 })
 
     expect(mocks.openSession).toHaveBeenCalledTimes(2)
     expect(mocks.openSession).toHaveBeenNthCalledWith(1, 's1', expect.any(Function), 'tab')
@@ -265,7 +468,7 @@ describe('SidebarSessionRow', () => {
 
   it('keeps Shift-click pin behavior when the preference is enabled', () => {
     $sidebarSessionsOpenInNewTab.set(true)
-    const { onPin } = renderRow({ title: 'Shift pin route' })
+    const { onPin } = renderClickableRow({ title: 'Shift pin route' })
 
     fireEvent.click(screen.getByRole('button', { name: 'Shift pin route' }), { shiftKey: true })
 
@@ -275,7 +478,7 @@ describe('SidebarSessionRow', () => {
 
   it('keeps Cmd/Ctrl-click and Shift+Cmd/Ctrl-click intents when the preference is enabled', () => {
     $sidebarSessionsOpenInNewTab.set(true)
-    renderRow({ title: 'Modifier route' })
+    renderClickableRow({ title: 'Modifier route' })
 
     const rowButton = screen.getByRole('button', { name: 'Modifier route' })
     fireEvent.click(rowButton, { metaKey: true })
@@ -285,5 +488,17 @@ describe('SidebarSessionRow', () => {
     expect(mocks.openSession).toHaveBeenNthCalledWith(1, 's1', expect.any(Function), 'tab')
     expect(mocks.openSession).toHaveBeenNthCalledWith(2, 's1', expect.any(Function), 'tab')
     expect(mocks.openSession).toHaveBeenNthCalledWith(3, 's1', expect.any(Function), 'window')
+  })
+
+  it('keeps middle-click opening a tab regardless of the preference', () => {
+    const { onResume } = renderClickableRow({ title: 'Middle click route' })
+    const rowButton = screen.getByRole('button', { name: 'Middle click route' })
+
+    fireEvent.mouseDown(rowButton, { button: 1 })
+    fireEvent.pointerDown(rowButton, { button: 1 })
+    fireEvent.pointerUp(rowButton, { button: 1 })
+
+    expect(mocks.openSession).toHaveBeenCalledWith('s1', expect.any(Function), 'tab')
+    expect(onResume).not.toHaveBeenCalled()
   })
 })
