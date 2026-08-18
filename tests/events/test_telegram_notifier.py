@@ -636,6 +636,63 @@ class TestTelegramNotifier:
         assert "- detail line 79" not in msg
 
 
+class TestModelRateLimitedButtons:
+    """Task 6 review IMPORTANT 1/2 regression guard: buttons_for() had zero
+    callers before this — handle() never passed `buttons` into _deliver, so
+    no MODEL_RATE_LIMITED alert could ever carry a button no matter what
+    events.override_buttons computed. This pins the wiring at the
+    production call site (cron.scheduler._deliver_result, the path taken
+    when no send_fn is injected)."""
+
+    def _diverted_event(self):
+        return Event.create(
+            EventType.MODEL_RATE_LIMITED, "matcher",
+            {"provider": "deepseek", "model": "deepseek-v4-pro",
+             "reason": "rate_limit", "detector": "runtime",
+             "outcome": "diverted", "fallback_provider": "openai-codex",
+             "fallback_model": "gpt-5.6-sol", "resets_at": "",
+             "diverted_calls": 3, "episode_opened_at": "x"},
+        )
+
+    def test_diverted_event_reaches_deliver_result_with_buttons(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = self._diverted_event()
+
+        with patch("cron.scheduler._deliver_result") as deliver_result_mock:
+            notifier.handle(event)
+
+        deliver_result_mock.assert_called_once()
+        _args, kwargs = deliver_result_mock.call_args
+        assert kwargs.get("buttons") is not None, (
+            "a runtime-detector/diverted-outcome MODEL_RATE_LIMITED event "
+            "must reach _deliver_result with a non-None buttons spec"
+        )
+
+    def test_unrelated_event_type_reaches_deliver_result_without_buttons(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The buttons_for() call is guarded to MODEL_RATE_LIMITED only —
+        an unrelated event type must never compute or forward buttons."""
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.APPLICATION_FAILED, "applier", {"error": "timeout"},
+            priority=Priority.CRITICAL,
+        )
+
+        with patch("cron.scheduler._deliver_result") as deliver_result_mock:
+            notifier.handle(event)
+
+        deliver_result_mock.assert_called_once()
+        _args, kwargs = deliver_result_mock.call_args
+        assert kwargs.get("buttons") is None
+
+
 class TestSecretDetectedFormatting:
     """SR-408 regression (2026-04-19) — SECRET_DETECTED must render as a
     compact, human-readable Telegram message, not a generic key:value dump

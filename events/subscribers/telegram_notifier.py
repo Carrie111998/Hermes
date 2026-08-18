@@ -405,17 +405,40 @@ class TelegramNotifier(BaseSubscriber):
                 self._flush_batch_key(key)
             self._persist_batch_buffer()
         else:
+            # Model-rate-limit override buttons (2026-08-14 design). Scoped
+            # to MODEL_RATE_LIMITED only — buttons_for() already gates on
+            # detector/outcome internally, but calling it for every event
+            # type on this hot path would be needless work and blur the
+            # intent. Lazily imported (matching this module's existing
+            # local-import convention) so a broken import in
+            # events.override_buttons can't take the whole notifier down at
+            # module load. Wrapped so a runtime failure degrades to
+            # buttons=None (message still delivers, just without buttons)
+            # rather than dropping the alert.
+            buttons = None
+            if event.event_type == EventType.MODEL_RATE_LIMITED:
+                try:
+                    from events.override_buttons import buttons_for
+                    buttons = buttons_for(event)
+                except Exception:
+                    logger.exception(
+                        "TelegramNotifier: buttons_for() failed for event %s "
+                        "— delivering without buttons", event.event_id,
+                    )
+                    buttons = None
             # Pass event + topic_key so _deliver can emit the
             # NOTIFICATION_DELIVERED / NOTIFICATION_FAILED reverse
             # signal carrying original_event_id + target metadata.
             # Batched flushes call _deliver() without an event so
             # they DO NOT emit per-event reverse signals (Phase 1
             # scope per the design doc — keeps LOW-priority firehose
-            # volume bounded). Spec at
+            # volume bounded), and correspondingly never attach buttons —
+            # a coalesced "Batched (N events)" message has no single event
+            # to attach an override to. Spec at
             # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
             self._deliver(
                 chat_id, thread_id, message,
-                event=event, topic_key=topic_key,
+                event=event, topic_key=topic_key, buttons=buttons,
             )
 
         # Flush any batches older than 5 minutes

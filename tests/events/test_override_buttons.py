@@ -58,3 +58,40 @@ def test_callback_data_stays_within_telegrams_64_byte_cap():
     for row in buttons_for(_ev("diverted")) or []:
         for b in row:
             assert len(b["callback_data"].encode("utf-8")) <= 64
+
+
+def test_detector_and_outcome_are_case_and_whitespace_normalized():
+    """MINOR 3: routing_policy.py and whatsapp_escalator.py both normalize
+    payload["detector"]/["outcome"] with ``(x or "").strip().lower()`` before
+    comparing. This module compared the raw values, so a producer that ever
+    emitted "Runtime" or " diverted " would silently disagree with its
+    siblings (they'd treat the event as actionable; this module would return
+    no buttons). Align so they can't diverge."""
+    from events.override_buttons import buttons_for
+
+    event = _ev("diverted", detector="runtime")
+    event.payload["detector"] = "  Runtime  "
+    event.payload["outcome"] = " Diverted "
+    assert buttons_for(event) is not None
+
+
+def test_overlong_event_id_does_not_break_the_64_byte_cap():
+    """MINOR 4: event_id is always a short uuid4 from Event.create, but
+    Event.from_dict accepts whatever id a stored row carries. An unbounded
+    token pushes callback_data past Telegram's 64-byte cap; InlineKeyboardButton
+    builds fine on an oversized token and only fails later as a BadRequest at
+    send_message -- which re-raises in _send_telegram and DROPS THE ENTIRE
+    ALERT, not just the buttons. The bound must hold even for a pathological
+    (thousands-of-characters) event_id."""
+    import dataclasses
+
+    from events.override_buttons import buttons_for
+
+    event = _ev("diverted")
+    huge = dataclasses.replace(event, event_id="x" * 5000)
+
+    spec = buttons_for(huge)
+    assert spec is not None
+    for row in spec:
+        for b in row:
+            assert len(b["callback_data"].encode("utf-8")) <= 64
