@@ -3,8 +3,12 @@ from __future__ import annotations
 
 
 
+from pathlib import Path
+
 from curator.orchestrator import (
     AGENTS,
+    CONSTITUTIONAL,
+    PATTERNS_SEED,
     run_backfill,
 )
 
@@ -270,3 +274,110 @@ def test_emit_event_does_not_put_the_deployed_checkout_on_sys_path():
         "_emit_event mutated sys.path; entries added: "
         f"{[e for e in sys.path if e not in set(before)]}"
     )
+
+
+def test_seed_constants_are_populated_for_every_agent():
+    """CONSTITUTIONAL and PATTERNS_SEED are vendored, not loaded at import.
+
+    Regression pin for the silent-empty-seeds defect. ``_load_legacy_seeds()``
+    used to hard-wire the developer-machine absolute path
+    ``C:/Users/diego/.hermes/profiles/curator/workspace/memory_bootstrap.py``
+    and ``exec_module`` it at IMPORT time, returning ``({}, {})`` when
+    ``.exists()`` was False. That file lives in the ``~/.hermes`` PARENT repo,
+    not this one, and is marked DEPRECATED "do NOT invoke" -- so on any machine
+    or container that was not that laptop, ``curator.orchestrator`` imported
+    perfectly cleanly with BOTH dicts empty and no warning, and every agent's
+    Constitutional Principles and seed Learned Patterns silently vanished from
+    the rendered MEMORY.md. Found alongside the ``sys.path`` sweep (d506eae9f8)
+    but deliberately left out of scope there: different failure mode, same file.
+    """
+    for name, mapping in (("CONSTITUTIONAL", CONSTITUTIONAL), ("PATTERNS_SEED", PATTERNS_SEED)):
+        assert mapping, f"{name} is empty -- the seeds were dropped at import time"
+        assert sorted(mapping) == sorted(AGENTS), (
+            f"{name} does not cover exactly AGENTS; "
+            f"missing={sorted(set(AGENTS) - set(mapping))} "
+            f"extra={sorted(set(mapping) - set(AGENTS))}"
+        )
+        for agent, entries in mapping.items():
+            assert entries, f"{name}[{agent!r}] is empty"
+            assert all(isinstance(e, str) and e.strip() for e in entries), (
+                f"{name}[{agent!r}] contains a blank or non-string entry"
+            )
+
+
+def test_orchestrator_module_loads_no_seeds_from_an_absolute_host_path():
+    """No drive-absolute literal and no import-time ``exec_module`` remain.
+
+    The content assertions above would still pass on THIS machine if the
+    importlib loader came back, because the legacy file happens to exist here.
+    This one pins the mechanism instead, so a future "single source of truth"
+    refactor cannot silently reintroduce a host-specific read. Parsed with
+    ``ast`` rather than grepped so the explanatory comments in the module --
+    which necessarily name the old path and ``exec_module`` -- do not match.
+    """
+    import ast
+    import re
+
+    import curator.orchestrator as orchestrator
+
+    source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    drive_abs = re.compile(r"^[A-Za-z]:[\\/]")
+    offenders = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and drive_abs.match(node.value)
+    ]
+    assert not offenders, f"drive-absolute path literal(s) in orchestrator.py: {offenders}"
+
+    loaders = sorted(
+        {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr in {"exec_module", "spec_from_file_location"}
+        }
+    )
+    assert not loaders, f"orchestrator.py executes an external module: {loaders}"
+
+
+def test_backfill_seeds_principles_and_patterns_for_every_agent(tmp_path):
+    """The seeds actually reach the renderer for all 10 agents.
+
+    Pins the consequence rather than the constants: with the seeds empty, this
+    ran green end-to-end and merely produced MEMORY.md files with no
+    Constitutional Principles section and no seeded pattern candidates.
+    """
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    captured_principles: dict = {}
+    captured_patterns: dict = {}
+
+    def render_fn(agent, *_a, **kwargs):
+        captured_principles[agent] = kwargs.get("constitutional_principles")
+        drawer = kwargs.get("drawer_data") or {}
+        captured_patterns[agent] = drawer.get("pattern_candidates") or []
+        return f"# MEMORY — {agent}\n\nrendered\n"
+
+    run_backfill(
+        window_days=30, dry_run=True, emit_event=False,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=None,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+
+    for agent in AGENTS:
+        assert captured_principles.get(agent), (
+            f"{agent} was rendered with no constitutional_principles"
+        )
+        assert captured_principles[agent] == CONSTITUTIONAL[agent]
+        assert captured_patterns.get(agent), (
+            f"{agent} was rendered with no seeded pattern_candidates"
+        )
+        bodies = {p["body"] for p in captured_patterns[agent]}
+        assert bodies == set(PATTERNS_SEED[agent])

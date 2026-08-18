@@ -45,29 +45,137 @@ AGENTS: List[str] = [
 # main is APPENDED to (Diego-authored), never replaced.
 APPEND_ONLY_AGENTS = {"main"}
 
-# Curator default Constitutional Principles (one entry per agent) —
-# imported from the legacy bootstrap module so we maintain a single
-# source of truth. Same for the seed Learned Patterns.
-def _load_legacy_seeds() -> tuple:
-    import importlib.util
-    bootstrap_path = Path(r"C:/Users/diego/.hermes/profiles/curator/workspace/memory_bootstrap.py")
-    if not bootstrap_path.exists():
-        return ({}, {})
-    spec = importlib.util.spec_from_file_location("memory_bootstrap", str(bootstrap_path))
-    if spec is None or spec.loader is None:
-        return ({}, {})
-    try:
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return (
-            getattr(mod, "CONSTITUTIONAL", {}) or {},
-            getattr(mod, "PATTERNS_SEED", {}) or {},
-        )
-    except Exception:  # pragma: no cover — legacy script may import live deps
-        return ({}, {})
+# Curator default Constitutional Principles and seed Learned Patterns, one
+# entry per agent. VENDORED -- copied verbatim from the legacy bootstrap module
+# ``profiles/curator/workspace/memory_bootstrap.py``, which lives in the
+# ``~/.hermes`` PARENT repo, not in this one, and which has been marked
+# "DEPRECATED 2026-04-26 ... do NOT invoke" since the day this package
+# superseded it.
+#
+# The previous form hard-wired that developer-machine absolute path and
+# ``exec_module``'d the script at IMPORT time, falling back to ``({}, {})``
+# when ``.exists()`` was False. So on any machine or container that was not
+# this laptop -- a fresh clone, CI, a deploy -- ``curator.orchestrator``
+# imported clean with BOTH dicts empty, and every agent silently lost its
+# Constitutional Principles (used by ``_render_agent``) and its seeded pattern
+# candidates (``_seed_patterns``) from the rendered MEMORY.md. Silent, and
+# semantically significant: the docstring called that import "a single source
+# of truth" while it was really a cross-repo dependency on a deprecated script
+# with no warning anywhere on the failure path.
+#
+# Vendoring removes the runtime dependency instead of relocating it: resolving
+# the path via HERMES_HOME would still be a cross-repo read that legitimately
+# returns nothing on a standalone checkout. It is also what the sibling
+# constant already does -- ``audit_slicer.AGENT_SOURCES`` mirrors the very same
+# legacy file by copy (see the comment above it). If that file is ever revived,
+# these are kept in sync by hand; ``tests/curator/test_orchestrator.py`` pins
+# that both stay populated and cover every agent in ``AGENTS``.
+CONSTITUTIONAL: Dict[str, List[str]] = {
+    "scout": [
+        "Never submit scraped data without dedupe against last 30d.",
+        "Never auto-rotate sources without recording which source was retired and why.",
+        "Always emit SCOUT_DISCOVERY batch summary even if batch is empty.",
+    ],
+    "sentinel": [
+        "Never auto-apply to a VIP without Jaum's WhatsApp confirmation.",
+        "Never skip the LinkedIn rate-limit cool-down (30-60s between interactions).",
+        "Always route VIP fast-path through Tracker so pipeline state stays canonical.",
+    ],
+    "matcher": [
+        "Never score a role I don't have a full JD for.",
+        "Never skip CV Handler grounding before calibrating.",
+        "Always emit SCORE_BATCH_SUMMARY even if batch is empty.",
+    ],
+    "tailor": [
+        "Never fabricate experience. Grounding over fantasy.",
+        "Never reshuffle bullets in a way that creates false implications.",
+        "Always preserve user voice — reshuffle, don't rewrite from scratch.",
+    ],
+    "applier": [
+        "Never auto-submit without Jaum's explicit SUBMIT_CONFIRM (WhatsApp).",
+        "Never skip the dry-run capture (screenshots required for audit).",
+        "Always emit BLOCKED_QUESTION with full field spec if the form can't be completed.",
+    ],
+    "tracker": [
+        "Only Tracker writes canonical stage state; other agents emit STATE_TRANSITION_INTENT.",
+        "Never skip the 14-day follow-up scan even when the pipeline is quiet.",
+        "Always reconcile inconsistent state (e.g. stage=applied but no SUBMIT_RESULT) before advancing.",
+    ],
+    "notifier": [
+        "Respect quiet hours (23:00-07:00 ET) except for breakthrough events (interview_signal, offer_signal).",
+        "Never compose an empty digest — say 'quiet overnight' explicitly.",
+        "Apply ADR-0016 rate-limiting (token bucket per subscriber+event_type).",
+    ],
+    "cv-handler": [
+        "Read-only from other agents' perspective — never update source files autonomously.",
+        "Always return KB_RESPONSE even on lookup failure (with error payload); never silently drop.",
+        "Never expose raw files; scope KB_RESPONSE to requested variants/accomplishments.",
+    ],
+    "devflow": [
+        "Network / secret / deploy are deny-by-default — require explicit Jaum approval.",
+        "Never merge to main without all tests passing.",
+        "Always emit approval_requested for any sub-task that exceeds the gate policy.",
+    ],
+    "main": [
+        "Only main sends WhatsApp. Other agents route via main's mailbox.",
+        "Never auto-apply Critic's structural proposals — always confirm via WhatsApp first.",
+        "Preserve Diego's overrides above any agent's autonomous decision.",
+    ],
+}
 
-
-CONSTITUTIONAL, PATTERNS_SEED = _load_legacy_seeds()
+# Learned-patterns seed text per agent (from plan + session history).
+PATTERNS_SEED: Dict[str, List[str]] = {
+    "scout": [
+        "Discovery sources: Indeed, Glassdoor, LinkedIn, Workday, hiring.cafe. Plan expects 8+ eventually.",
+        "Workday JDs starting with 'we're on a mission to disrupt' → often boilerplate; downstream Matcher unreliable. Flag for boilerplate filter.",
+        "URL dedupe by hash is stable. Role-title dedupe is noisy (same role posted 3× with slightly different titles is common).",
+    ],
+    "sentinel": [
+        "LinkedIn saved-list scraping is the primary VIP input source.",
+        "Chrome profile is fragile — re-auth required after any LinkedIn activity-spike lockout.",
+        "VIP roles with <2 public engineers listed tend to benefit from a 'stealth mode' resume variant (Tailor skill candidate).",
+    ],
+    "matcher": [
+        "7 scoring dimensions with initial weights: role_match=0.25, seniority=0.15, domain=0.15, tech=0.20, salary=0.10, location=0.10, culture=0.05.",
+        "Bands: ≥8.75 auto-approve → Tailor; ≥7.0 → Jaum review; <7.0 archive with reason.",
+        "Critic will revisit weights weekly based on rejection reason clusters; reasoning_effort is auto-tunable.",
+    ],
+    "tailor": [
+        "7-phase workflow: parse JD → extract keywords → select summary variant → reshuffle bullets → cover letter anchor → ATS format check → grounding audit.",
+        "Skill library anchored to {industry}_{seniority} namespace (e.g. tailor_swe_startup, tailor_pm_scaleup).",
+        "Grounding audit is the last gate — if any bullet would require fabrication to match the JD, reject with reason.",
+    ],
+    "applier": [
+        "ATS platforms in scope: Workday, Lever, Greenhouse, iCIMS, Taleo. Each gets a {apply}_{platform} skill.",
+        "IPRoyal residential proxies are the current anti-bot baseline for captcha-heavy portals.",
+        "Dry-run → Jaum review → SUBMIT_CONFIRM → actual submit. Never skip the human gate.",
+    ],
+    "tracker": [
+        "15-stage pipeline: discovered → scoring → scored → approved → tailoring → review → ready → applying → final_submission → applied → response_received → interviewing → offer → rejected/withdrawn/archived.",
+        "14-day follow-up alerts fire daily 10am ET for applied entries with no response_received.",
+        "Weekly analytics (Monday 9am ET) computes apps sent, response rate, interview rate, offer rate, score-band → approval rate.",
+    ],
+    "notifier": [
+        "Quiet hours 23:00-07:00 ET. Breakthrough events (interview_signal, offer_signal) bypass.",
+        "Daily 7am AM digest consumes Tracker's overnight state.",
+        "Scribe will subsume narrative rendering (Weekend 1+); Notifier becomes a thin router after.",
+    ],
+    "cv-handler": [
+        "Knowledge base: master resume, 11 summary variants (by role_type), accomplishments index, certifications index, ATS-safe formats.",
+        "Read-only for other agents. Diego updates source files directly in workspace/.",
+        "Consumed by Matcher (scoring grounding) and Tailor (bundle fetch). No cron work.",
+    ],
+    "devflow": [
+        "12 specialist sub-roles: router, orchestrator, product-manager, architect, planner, implementer, reviewer, qa, security, release, docs, research.",
+        "Policy gates: network/secret/deploy are deny-by-default.",
+        "DevFlow dashboard at ~/.hermes/infra/devflow/ exists as docker-compose (Next.js + FastAPI + Postgres/Redis) — dormant; Weekend 3 resurrection + hermes_bridge.py.",
+    ],
+    "main": [
+        "jaum-skill-evolution cron has NEVER fired — Critic (Weekend 2) delegates or replaces.",
+        "Inbox sweeper runs every 10min; categorizes incoming mailbox messages into approval-needed / FYI / blocked.",
+        "Constitutional: only main sends WhatsApp; 8 WhatsApp escalation categories per plan §5.2.",
+    ],
+}
 
 
 RenderFn = Callable[..., str]
