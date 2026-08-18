@@ -17,12 +17,13 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| `main` runtime code baseline | `3bf3f21007eb77ce0a59c5868742174e37b74ec9` | Normal Telegram DM outbound correlation fix merged via PR #43; deployed evidence is recorded below. |
+| `main` runtime code baseline | `dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea` | HERMES-MULTI-AGENT-ORCHESTRATION-001 merged via PR #45; deployed evidence is recorded below. |
 | Primary laptop checkout | `D:/PROJECT/Hermes`, `ticket/hermes-auth-001`, HEAD `c192e863d8dc9df98c2bd9d066ce49bc4f9cb3e8` | Dirty audit checkout; preserve all pre-existing changes and untracked files. |
 | DGX live source checkout | `/home/cwliao/.hermes/hermes-agent`, clean HEAD `1c14d2b9df29da845fb2a56b2fbe12cf8ee507cb` | Deployment input only; do not reset or edit as active runtime source. |
-| DGX active release | `v2026.8.18-hermes-telegram-outbound-audit-fix-3bf3f210` | Immutable runtime snapshot selected by drop-in `41-hermes-telegram-outbound-audit-fix-3bf3f210.conf`; marker matches merge `3bf3f210...`. |
-| Gateway service | `active/running`, MainPID `2812244`, `NRestarts=0`, `ExecMainStatus=0` | Service/process health PASS after authorized restart and bounded stability check; effective cwd/PYTHONPATH match the new release. |
-| Rollback | Correction rollback manifest plus prior ARCH/Telegram releases retained | Rollback evidence remains available under the corresponding deployment-backups entry; no prior release was deleted. |
+| DGX active release | `v2026.8.18-hermes-multi-agent-orchestration-dd7a0164` | Immutable runtime snapshot selected by drop-in `42-hermes-multi-agent-orchestration-dd7a0164.conf`; marker matches merge `dd7a0164...`. |
+| Gateway service | `active/running`, MainPID `2919046`, `NRestarts=0`, `ExecMainStatus=0` | Service/process health PASS after authorized restart and bounded stability check; effective cwd/PYTHONPATH match the new release. |
+| Summary timer | `hermes-kanban-summary.timer` enabled/active | Ten-minute metadata-only summary service is installed; first run returned `success`/`sent`, which is outbound evidence only. |
+| Rollback | Multi-agent rollback manifest plus prior ARCH/Telegram releases retained | Rollback evidence remains available under the corresponding deployment-backups entry; no prior release was deleted. |
 
 ## Core engineering order
 
@@ -30,6 +31,8 @@
 2. ARCH-002 — extend the runtime-state contract. **Merged, deployed, and runtime marker verified.**
 3. ARCH-003 — audit/replay integration after the shared state boundary is stable. **Merged, deployed, and runtime marker verified.**
 4. ARCH-004 — redaction and SQLite/WAL safeguards. **Merged, deployed, and runtime marker verified.**
+
+5. HERMES-MULTI-AGENT-ORCHESTRATION-001: official worker skills, metadata-only Kanban summary, and existing dashboard/notifier integration. **Merged, deployed, timer enabled; Grok/AGY executable authentication and user-visible summary receipt remain separate gates.**
 
 ## Product priority
 
@@ -57,26 +60,26 @@
 | ARCH-003 | MERGED_DEPLOYED | PR #30; merge `e8cdfd1e...`; implementation review consensus PASS; CI run `31981532693` PASS after retrying an unrelated pre-existing stream-consumer slice; immutable DGX release active with rollback metadata. |
 | ARCH-004 | MERGED_DEPLOYED | PR #33; implementation commit `650a34808`; merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`; focused tests `32 passed`, compileall PASS; required CI run `31990198398` PASS; Claude + active DGX `.hermes` AGY implementation review PASS with no corrections; immutable DGX release active with rollback metadata. |
 | HERMES-TELEGRAM-DELIVERY-VERIFICATION-001 | PASS | PR #43 merged as `3bf3f210...`; required CI run `32075681273` passed; authenticated Claude and AGY reviewed the same metadata-only packet and returned PASS. One authorized test produced correlated inbound accepted and outbound delivered audit records, plus direct user-visible confirmation. No retry was issued. |
+| HERMES-MULTI-AGENT-ORCHESTRATION-001 | MERGED_DEPLOYED_TIMER_ENABLED | PR #45 merged as `dd7a0164...`; required CI run `32084903909` passed after the failed slice was rerun; Claude and AGY implementation review both PASS on the same correction set; immutable release, gateway restart, official skill parity, enabled summary timer, and first metadata-only outbound send audit are verified. Grok/AGY executable authentication and direct Telegram user-visible receipt remain separate. |
 
 ## Current next lane
 
-**HERMES-TELEGRAM-DELIVERY-VERIFICATION-001** is complete. The authorized
-test produced one correlated inbound accepted record, four same-correlation
-outbound delivered audit records with one platform message id, and direct
-user-visible confirmation. Polling progress, gateway health, token-protected
-API probes, and empty update batches remain separate supporting evidence only.
-Do not retry the conversation merely to manufacture more evidence.
+**HERMES-MULTI-AGENT-ORCHESTRATION-001** is merged, deployed, and timer-enabled.
+The first summary run returned `success`/`sent`, proving only the existing
+outbound send path was invoked successfully. Skill parity and gateway health
+are verified. Grok OAuth, AGY executable smoke, and direct Telegram
+user-visible receipt for this summary remain separate gates.
 
 ## Runtime and deployment boundary
 
-The active release is selected through the outbound-audit correction drop-in
+The active release is selected through the multi-agent orchestration drop-in
 while the prior ARCH-004, ARCH-003, and Telegram releases remain intact for
 rollback. The service restarted successfully and stayed active with zero
-restarts. The latest test independently established inbound acceptance,
-outbound delivery audit, and direct user-visible delivery. No Telegram
-credentials, allowlists, webhook state, or TLS verification were changed; one
-authorized Telegram test was performed, and no retry or second action was
-issued.
+restarts. The metadata-only summary timer is enabled and its first oneshot
+returned `success`/`sent`; this is not direct user-visible delivery evidence.
+No Telegram credentials, allowlists, webhook state, or TLS verification were
+changed. The non-secret summary target uses the existing Telegram home-channel
+configuration.
 
 ## Ticket inventory note
 

@@ -9,7 +9,7 @@
 
 - **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
 - **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Merged runtime code baseline:** `3bf3f21007eb77ce0a59c5868742174e37b74ec9` (PR #43, normal Telegram DM outbound correlation fix; ARCH-004 remains the prior runtime-state baseline).
+- **Merged runtime code baseline:** `dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea` (PR #45, HERMES-MULTI-AGENT-ORCHESTRATION-001; prior Telegram delivery baseline remains separately recorded).
 - **DGX runtime:** host `140.96.58.171`, hostname `55-0940189-03`, user service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
 - **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
@@ -20,22 +20,27 @@ The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`
 
 ## 2. Goal and roadmap
 
-- **Current goal:** preserve the merged ARCH-002/ARCH-003/ARCH-004 runtime-state contracts, keep Telegram service/inbound/outbound gates separate, and retain the completed end-to-end Telegram delivery evidence.
+- **Current goal:** preserve the merged ARCH-002/ARCH-003/ARCH-004 contracts, keep Telegram service/inbound/outbound/user-visible gates separate, and operate the merged multi-agent orchestration summary path with explicit worker-runtime boundaries.
 - **Completed and deployed:** ARCH-002, PR #29, merge `3e9fd48dc28b7df186c780992351ef01febaa070`; ARCH-003, PR #30, merge `e8cdfd1e65191b68423afd7e12248d3c6e728e00`; and ARCH-004, PR #33, merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`. Each has separate review, CI, immutable-release, rollback, and post-deploy evidence.
+- **Completed and deployed:** HERMES-MULTI-AGENT-ORCHESTRATION-001, PR #45, merge `dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea`; official Grok/AGY skills are installed with source parity, the metadata-only summary timer is enabled, and the gateway is running the matching immutable release.
 - **Telegram runtime:** the gateway recovered from a transient startup timeout through its bounded retry path. The latest authorized test produced a correlated inbound accepted audit, correlated outbound delivered audit records, and direct user confirmation of the visible response.
 - **Deferred/blocked:** HERMES-MONITORING-001 remains BLOCKED. Telegram user-visible delivery is not claimed from service or polling health.
-- **Next gate:** none remains for this Telegram delivery verification. Do not retry the conversation; select any future work as a separately ticketed roadmap item.
+- **Next gate:** user-owned Grok OAuth and AGY CLI smoke remain open; the summary timer's `hermes send` success is outbound evidence only. Direct Telegram user-visible receipt for the new summary remains a separate authorized verification gate.
 
 ## 3. Verified runtime and deployment state
 
 - **DGX host identity:** `cwliao@55-0940189-03`.
-- **Active release:** `v2026.8.18-hermes-telegram-outbound-audit-fix-3bf3f210`.
-- **Release marker:** `HERMES_RELEASE_SHA=3bf3f21007eb77ce0a59c5868742174e37b74ec9`.
-- **Effective service:** user `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `2812244`, `NRestarts=0`, `ExecMainStatus=0` after the authorized deployment restart and bounded stability check.
-- **Effective WorkingDirectory/PYTHONPATH:** the Telegram delivery audit correction release above; both resolved to that immutable release.
-- **Effective drop-in:** `41-hermes-telegram-outbound-audit-fix-3bf3f210.conf`.
+- **Active release:** `v2026.8.18-hermes-multi-agent-orchestration-dd7a0164`.
+- **Release marker:** `HERMES_RELEASE_SHA=dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea`.
+- **Effective service:** user `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `2919046`, `NRestarts=0`, `ExecMainStatus=0` after the authorized deployment restart and bounded stability check.
+- **Effective WorkingDirectory/PYTHONPATH:** the multi-agent orchestration release above; both resolved to that immutable release.
+- **Effective drop-in:** `42-hermes-multi-agent-orchestration-dd7a0164.conf`.
 - **Rollback:** ARCH-003 release `v2026.8.17-hermes-arch-003-e8cdfd1e`, ARCH-002 release `v2026.8.16-hermes-arch-002-3e9fd48dc2`, and prior Telegram releases/drop-ins remain available.
 - **Deployment manifest:** ARCH-004 rollback metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-arch-004-e2f94e26`; the prior ARCH-003 drop-in remains intact.
+- **Deployment manifest:** this deployment's prior-release metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-multi-agent-orchestration-dd7a0164`; the previous Telegram release/drop-in remains intact.
+
+- **Summary timer:** `hermes-kanban-summary.timer` is `enabled/active`; its ten-minute cadence and metadata-only oneshot service are installed from the matching release. The first run returned `success`/`sent`, which proves an outbound `hermes send` attempt only; no new user-visible Telegram receipt is claimed.
+- **Worker skills:** official `grok` and `antigravity-cli` skill directories are enabled and byte-identical to their optional sources. DGX `grok` and `agy` executables were not present during this check, so Grok OAuth and AGY smoke are not complete.
 
 The correction deployment retained its rollback manifest under the corresponding
 deployment-backups entry. The temporary staging directory was removed after
