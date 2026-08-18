@@ -357,11 +357,13 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
+        return _scrub_dispatch_result(name, result)
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)
@@ -506,6 +508,66 @@ registry = ToolRegistry()
 #   return tool_error("not found", code=404)
 #   return tool_result(success=True, data=payload)
 #   return tool_result(items)            # pass a dict directly
+
+
+_tripwire = None
+
+
+def _get_tripwire():
+    """Import the credential tripwire lazily and memoise it.
+
+    Function-level import matches this module's discipline of not importing
+    tool modules at load time, and avoids an import cycle through agent.*.
+    """
+    global _tripwire
+    if _tripwire is None:
+        from agent import credential_tripwire
+        _tripwire = credential_tripwire
+    return _tripwire
+
+
+def _scrub_dispatch_result(name: str, result):
+    """Scrub known credential values out of a tool result. FAIL-CLOSED.
+
+    Layer 2 of the Phase 9 credential read protection. This is the universal
+    funnel: every builtin AND MCP tool returns through ToolRegistry.dispatch,
+    including nested calls made by execute_code and plugin-initiated calls via
+    PluginAPI.call_tool.
+
+    This is defense in depth, not a boundary -- see agent/credential_tripwire.
+
+    Deliberately NOT implemented as a transform_tool_result plugin: that seam
+    is wrapped in try/except: pass and is plugin-config dependent, i.e. it
+    fails open. A security control that silently disables itself is not a
+    control. If the scan itself fails here, the result is WITHHELD.
+    """
+    try:
+        tripwire = _get_tripwire()
+        if isinstance(result, str):
+            scrubbed, hits = tripwire.scrub_known_secrets(result)
+        else:
+            # Handlers are contractually str; this branch is belt-and-braces.
+            # An opaque object cannot be safely rewritten, so withhold it.
+            scrubbed, hits = None, 0
+            if tripwire.contains_known_secret(str(result)):
+                logger.warning(
+                    "credential tripwire: withholding non-str result from %s", name,
+                )
+                return json.dumps({
+                    "error": "Tool result withheld: it contained a known credential value.",
+                })
+    except Exception:
+        logger.exception(
+            "credential tripwire failed for %s -- withholding result", name,
+        )
+        return json.dumps({"error": "Tool result withheld: credential scan failed."})
+
+    if hits:
+        # Never log the value itself.
+        logger.warning(
+            "credential tripwire scrubbed %d occurrence(s) from %s", hits, name,
+        )
+    return scrubbed if scrubbed is not None else result
 
 
 def tool_error(message, **extra) -> str:
