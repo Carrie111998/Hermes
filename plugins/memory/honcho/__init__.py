@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
 from plugins.memory.honcho.client import spawn_context_thread
+from plugins.memory.honcho.session import classify_delivery_error
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -1475,8 +1476,13 @@ class HonchoMemoryProvider(MemoryProvider):
                 # _flush_session() directly bypassed "session"/N batching
                 # and flushed every turn regardless of config.
                 self._manager.save(session)
-            except Exception as e:
-                logger.debug("Honcho sync_turn failed: %s", e)
+            except Exception as exc:
+                category, status = classify_delivery_error(exc)
+                logger.debug(
+                    "Honcho sync_turn failed category=%s status=%s",
+                    category,
+                    status if status is not None else "none",
+                )
 
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
@@ -1536,8 +1542,13 @@ class HonchoMemoryProvider(MemoryProvider):
             self._sync_thread.join(timeout=10.0)
         try:
             self._manager.flush_all()
-        except Exception as e:
-            logger.debug("Honcho session-end flush failed: %s", e)
+        except Exception as exc:
+            category, status = classify_delivery_error(exc)
+            logger.debug(
+                "Honcho session-end flush failed category=%s status=%s",
+                category,
+                status if status is not None else "none",
+            )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return tool schemas, respecting recall_mode.

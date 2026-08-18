@@ -12,6 +12,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -27,6 +28,79 @@ logger = logging.getLogger(__name__)
 _ASYNC_SHUTDOWN = object()
 _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
+
+
+class DeliveryState(str, Enum):
+    """Terminal state of one direct Honcho delivery boundary call."""
+
+    NOOP = "noop"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    """Content-free result of a bounded, immediate Honcho delivery attempt."""
+
+    state: DeliveryState
+    attempted_count: int = 0
+    delivered_count: int = 0
+    pending_count: int = 0
+    error_category: str | None = None
+    http_status: int | None = None
+
+    @classmethod
+    def aggregate(cls, outcomes: list[DeliveryOutcome]) -> DeliveryOutcome:
+        """Combine boundary results without losing any terminal failure."""
+        if not outcomes:
+            return cls(state=DeliveryState.NOOP)
+        failures = [
+            outcome for outcome in outcomes if outcome.state is DeliveryState.FAILED
+        ]
+        state = (
+            DeliveryState.FAILED
+            if failures
+            else DeliveryState.DELIVERED
+            if any(outcome.state is DeliveryState.DELIVERED for outcome in outcomes)
+            else DeliveryState.NOOP
+        )
+        latest_failure = failures[-1] if failures else None
+        return cls(
+            state=state,
+            attempted_count=sum(outcome.attempted_count for outcome in outcomes),
+            delivered_count=sum(outcome.delivered_count for outcome in outcomes),
+            pending_count=sum(outcome.pending_count for outcome in outcomes),
+            error_category=latest_failure.error_category if latest_failure else None,
+            http_status=latest_failure.http_status if latest_failure else None,
+        )
+
+
+def classify_delivery_error(exc: BaseException) -> tuple[str, int | None]:
+    """Classify a delivery error without retaining or rendering its text."""
+    raw_status = getattr(exc, "status_code", None)
+    if raw_status is None:
+        raw_status = getattr(exc, "status", None)
+    status = (
+        raw_status
+        if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+        else None
+    )
+    if status is not None and not 100 <= status <= 599:
+        status = None
+    if _is_auth_error(exc):
+        return "authentication", status
+    code = getattr(exc, "code", None)
+    if code == "timeout":
+        return "timeout", status
+    if code == "connection_error":
+        return "connection", status
+    if isinstance(exc, TimeoutError):
+        return "timeout", status
+    if isinstance(exc, ConnectionError):
+        return "connection", status
+    if status is not None:
+        return "http_error", status
+    return "sdk_error", None
 
 
 def _utc_now() -> datetime:
@@ -274,6 +348,7 @@ class HonchoSessionManager:
         self._message_metadata = copy.deepcopy(configured_metadata) if isinstance(configured_metadata, dict) else {}
         self._cache: dict[str, HonchoSession] = {}
         self._cache_lock = threading.RLock()
+        self._delivery_lock = threading.RLock()
         self._peers_cache: dict[str, Any] = {}
         self._sessions_cache: dict[str, Any] = {}
         # Bumped (under _cache_lock) whenever _force_reauth rebuilds the client.
@@ -289,6 +364,7 @@ class HonchoSessionManager:
         write_frequency = (config.write_frequency if config else "async")
         self._write_frequency = write_frequency
         self._turn_counter: int = 0
+        self._last_delivery_outcome = DeliveryOutcome(state=DeliveryState.NOOP)
 
         # Prefetch cache: session_key → last context result (consumed once per turn).
         # Dialectic results are cached on the plugin side (HonchoMemoryProvider
@@ -330,6 +406,15 @@ class HonchoSessionManager:
         self._async_thread_lock = threading.Lock()
         if write_frequency == "async":
             self._async_queue = queue.Queue()
+
+    @property
+    def last_delivery_outcome(self) -> DeliveryOutcome:
+        """Latest content-free direct delivery result, including async failures."""
+        return self._last_delivery_outcome
+
+    def _retain_delivery_outcome(self, outcome: DeliveryOutcome) -> DeliveryOutcome:
+        self._last_delivery_outcome = outcome
+        return outcome
 
     @staticmethod
     def new_source_record_id() -> str:
@@ -455,8 +540,7 @@ class HonchoSessionManager:
         if self._auth_failure is None:
             logger.error(
                 "Honcho authentication failed and token refresh did not recover; "
-                "memory sync and recall are paused until the user re-authenticates: %s",
-                detail,
+                "memory sync and recall are paused until the user re-authenticates"
             )
         self._auth_failure = detail
 
@@ -531,7 +615,7 @@ class HonchoSessionManager:
                     self._sessions_cache.clear()
             return True
         except Exception:
-            logger.warning("Honcho post-401 token refresh failed", exc_info=True)
+            logger.warning("Honcho post-401 token refresh failed")
             return False
 
     def _authed_call(self, op_name: str, operation: Callable[[], Any]) -> Any:
@@ -553,7 +637,8 @@ class HonchoSessionManager:
                 raise
             logger.warning(
                 "Honcho %s hit an auth error; forcing token refresh and "
-                "retrying once: %s", op_name, _redact_tokens(str(e)),
+                "retrying once",
+                op_name,
             )
             if not self._force_reauth():
                 self._record_auth_failure(e)
@@ -888,14 +973,23 @@ class HonchoSessionManager:
             self._cache[key] = session
         return session
 
-    def _flush_session(self, session: HonchoSession) -> bool:
-        """Internal: write unsynced messages to Honcho synchronously."""
+    def _flush_session(self, session: HonchoSession) -> DeliveryOutcome:
+        """The single structured boundary for direct Honcho message delivery."""
+        with self._delivery_lock:
+            return self._flush_session_locked(session)
+
+    def _flush_session_locked(self, session: HonchoSession) -> DeliveryOutcome:
+        """Deliver one session while holding the manager-wide delivery lock."""
         if not session.messages:
-            return True
+            return self._retain_delivery_outcome(
+                DeliveryOutcome(state=DeliveryState.NOOP)
+            )
 
         new_messages = [m for m in session.messages if not m.get("_synced")]
         if not new_messages:
-            return True
+            return self._retain_delivery_outcome(
+                DeliveryOutcome(state=DeliveryState.NOOP)
+            )
 
         # Backward-compatible guard for callers that populated the local cache
         # directly. Assign once before the first attempt so retries keep IDs.
@@ -939,17 +1033,46 @@ class HonchoSessionManager:
             synced = self._authed_call("message sync", _sync_messages)
             for msg in new_messages:
                 msg["_synced"] = True
-            logger.debug("Synced %d messages to Honcho for %s", synced, session.key)
+            pending = sum(
+                1 for message in session.messages if not message.get("_synced")
+            )
+            logger.debug("Honcho direct delivery succeeded count=%d", synced)
             with self._cache_lock:
                 self._cache[session.key] = session
-            return True
-        except Exception as e:
+            return self._retain_delivery_outcome(
+                DeliveryOutcome(
+                    state=DeliveryState.DELIVERED,
+                    attempted_count=len(new_messages),
+                    delivered_count=synced,
+                    pending_count=pending,
+                )
+            )
+        except Exception as exc:
             for msg in new_messages:
                 msg["_synced"] = False
-            logger.error("Failed to sync messages to Honcho: %s", e)
+            pending = sum(
+                1 for message in session.messages if not message.get("_synced")
+            )
+            category, status = classify_delivery_error(exc)
+            logger.error(
+                "Honcho direct delivery terminal failure category=%s status=%s attempted=%d pending=%d",
+                category,
+                status if status is not None else "none",
+                len(new_messages),
+                pending,
+            )
             with self._cache_lock:
                 self._cache[session.key] = session
-            return False
+            return self._retain_delivery_outcome(
+                DeliveryOutcome(
+                    state=DeliveryState.FAILED,
+                    attempted_count=len(new_messages),
+                    delivered_count=0,
+                    pending_count=pending,
+                    error_category=category,
+                    http_status=status,
+                )
+            )
 
     def _async_writer_loop(self) -> None:
         """Background daemon thread: drains the async write queue."""
@@ -959,38 +1082,43 @@ class HonchoSessionManager:
                 if item is _ASYNC_SHUTDOWN:
                     break
 
-                first_error: Exception | None = None
                 try:
-                    success = self._flush_session(item)
-                except Exception as e:
-                    success = False
-                    first_error = e
-
-                if success:
-                    continue
-
-                if first_error is not None:
-                    logger.warning("Honcho async write failed, retrying once: %s", first_error)
-                else:
-                    logger.warning("Honcho async write failed, retrying once")
-
-                import time as _time
-                _time.sleep(2)
-
-                try:
-                    retry_success = self._flush_session(item)
-                except Exception as e2:
-                    logger.error("Honcho async write retry failed, dropping batch: %s", e2)
-                    continue
-
-                if not retry_success:
-                    logger.error("Honcho async write retry failed, dropping batch")
+                    outcome = self._retain_delivery_outcome(self._flush_session(item))
+                except Exception as exc:
+                    category, status = classify_delivery_error(exc)
+                    pending = sum(
+                        1 for message in item.messages if not message.get("_synced")
+                    )
+                    outcome = self._retain_delivery_outcome(
+                        DeliveryOutcome(
+                            state=DeliveryState.FAILED,
+                            attempted_count=pending,
+                            delivered_count=0,
+                            pending_count=pending,
+                            error_category=category,
+                            http_status=status,
+                        )
+                    )
+                if outcome.state is DeliveryState.FAILED:
+                    logger.error(
+                        "Honcho async direct delivery terminal failure category=%s status=%s "
+                        "attempted=%d pending=%d; messages remain retryable",
+                        outcome.error_category,
+                        outcome.http_status if outcome.http_status is not None else "none",
+                        outcome.attempted_count,
+                        outcome.pending_count,
+                    )
             except queue.Empty:
                 continue
-            except Exception as e:
-                logger.error("Honcho async writer error: %s", e)
+            except Exception as exc:
+                category, status = classify_delivery_error(exc)
+                logger.error(
+                    "Honcho async writer error category=%s status=%s",
+                    category,
+                    status if status is not None else "none",
+                )
 
-    def save(self, session: HonchoSession) -> None:
+    def save(self, session: HonchoSession) -> DeliveryOutcome | None:
         """Save messages to Honcho, respecting write_frequency.
 
         write_frequency modes:
@@ -1007,15 +1135,16 @@ class HonchoSessionManager:
                 self._ensure_async_writer()
                 self._async_queue.put(session)
         elif wf == "turn":
-            self._flush_session(session)
+            return self._flush_session(session)
         elif wf == "session":
             # Accumulate; caller must call flush_all() at session end
             pass
         elif isinstance(wf, int) and wf > 0:
             if self._turn_counter % wf == 0:
-                self._flush_session(session)
+                return self._flush_session(session)
+        return None
 
-    def flush_all(self) -> None:
+    def flush_all(self) -> DeliveryOutcome:
         """Flush all pending unsynced messages for all cached sessions.
 
         Called at session end for "session" write_frequency, or to force
@@ -1023,21 +1152,49 @@ class HonchoSessionManager:
         """
         with self._cache_lock:
             sessions = list(self._cache.values())
-        for session in sessions:
-            try:
-                self._flush_session(session)
-            except Exception as e:
-                logger.error("Honcho flush_all error for %s: %s", session.key, e)
 
-        # Drain async queue synchronously if it exists
+        # Drain queued references before delivery, then de-duplicate sessions.
         if self._async_queue is not None:
             while not self._async_queue.empty():
                 try:
                     item = self._async_queue.get_nowait()
                     if item is not _ASYNC_SHUTDOWN:
-                        self._flush_session(item)
+                        sessions.append(item)
                 except queue.Empty:
                     break
+
+        outcomes = []
+        seen: set[int] = set()
+        for session in sessions:
+            if id(session) in seen:
+                continue
+            seen.add(id(session))
+            try:
+                outcomes.append(self._flush_session(session))
+            except Exception as exc:
+                category, status = classify_delivery_error(exc)
+                pending = sum(
+                    1 for message in session.messages if not message.get("_synced")
+                )
+                outcomes.append(
+                    self._retain_delivery_outcome(
+                        DeliveryOutcome(
+                            state=DeliveryState.FAILED,
+                            attempted_count=pending,
+                            delivered_count=0,
+                            pending_count=pending,
+                            error_category=category,
+                            http_status=status,
+                        )
+                    )
+                )
+                logger.error(
+                    "Honcho flush_all terminal failure category=%s status=%s pending=%d",
+                    category,
+                    status if status is not None else "none",
+                    pending,
+                )
+        return self._retain_delivery_outcome(DeliveryOutcome.aggregate(outcomes))
 
     def _ensure_async_writer(self) -> None:
         """Start the async writer on first enqueue (idempotent, thread-safe)."""
