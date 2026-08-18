@@ -20,6 +20,7 @@ time — no import cycle).
 """
 
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -911,7 +912,7 @@ def cmd_sessions(args, sessions_parser=None):
             verified = verify_archived_lineage(
                 db, resolved_session_id, args.root.expanduser()
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, sqlite3.DatabaseError, ValueError) as exc:
             print(f"Error: could not cold-verify session lineage: {exc}")
             db.close()
             return 1
@@ -937,7 +938,7 @@ def cmd_sessions(args, sessions_parser=None):
 
             try:
                 plan_archived_lineage(db, resolved_session_id)
-            except (OSError, ValueError) as exc:
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 print(f"Error: could not cold-store session lineage: {exc}")
                 db.close()
                 return 1
@@ -962,7 +963,7 @@ def cmd_sessions(args, sessions_parser=None):
             stored = store_archived_lineage(
                 db, resolved_session_id, archive_root
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, sqlite3.DatabaseError, ValueError) as exc:
             print(f"Error: could not cold-store session lineage: {exc}")
             db.close()
             return 1
@@ -990,7 +991,7 @@ def cmd_sessions(args, sessions_parser=None):
                 verified = validate_purge_archived_lineage(
                     db, resolved_session_id, archive_root
                 )
-            except (OSError, ValueError) as exc:
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 print(f"Error: could not cold-purge session lineage: {exc}")
                 db.close()
                 return 1
@@ -1012,7 +1013,7 @@ def cmd_sessions(args, sessions_parser=None):
             purged = purge_archived_lineage(
                 db, resolved_session_id, archive_root
             )
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (OSError, RuntimeError, sqlite3.DatabaseError, ValueError) as exc:
             print(f"Error: could not cold-purge session lineage: {exc}")
             db.close()
             return 1
