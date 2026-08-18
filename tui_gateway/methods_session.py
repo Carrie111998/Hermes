@@ -380,7 +380,9 @@ def _(rid, params: dict) -> dict:
     if profile_home is not None:
         from hermes_state import SessionDB
 
-        db = SessionDB(db_path=profile_home / "state.db")
+        from tui_gateway.server import _open_profile_store
+
+        db = _open_profile_store(None, profile_home)
         owns_db = True
     else:
         db = _get_db()
@@ -3094,7 +3096,9 @@ def _(rid, params: dict) -> dict:
             # DEDICATED handle, same ownership rule as session.resume: ours
             # until the branched agent takes it below. _make_agent raising, or
             # _init_session raising, both leave here without that transfer.
-            branch_db = SessionDB(db_path=Path(parent_home) / "state.db")
+            from tui_gateway.server import _open_profile_store
+
+            branch_db = _open_profile_store(None, parent_home)
             branch_owns_db = True
         home_token = (
             set_hermes_home_override(parent_home) if parent_home else None

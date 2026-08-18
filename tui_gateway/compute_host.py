@@ -563,7 +563,9 @@ class ComputeHost:
                 # server._sessions[sid] (via _init_session, or the fallback dict
                 # in the except below), so the agent is the right owner; a
                 # _make_agent that RAISES is the one path where nothing takes it.
-                session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                from tui_gateway.server import _open_profile_store
+
+                session_db = _open_profile_store(None, profile_home)
                 owns_db = True
             agent = server._make_agent(
                 sid,

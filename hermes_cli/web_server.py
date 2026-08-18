@@ -12156,34 +12156,15 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
 def _profile_selects_postgres(profile: str) -> bool:
     """True when *profile*'s own config selects the PostgreSQL state backend.
 
-    Reads the TARGET profile's ``config.yaml`` — never the active process's
-    env vars, which describe this process's backend rather than the peer's.
-    Soft-fails to False so an unreadable or absent peer config keeps the
-    existing SQLite reader path instead of breaking a roster listing.
+    Thin wrapper over the seam module's canonical implementation so the rule
+    lives in exactly one place; returns False when the Postgres backend is not
+    installed at all.
     """
     try:
-        from pathlib import Path as _Path
-
-        from hermes_cli import profiles as _profiles_mod
-
-        canon = _profiles_mod.normalize_profile_name(profile)
-        if not _profiles_mod.profile_exists(canon):
-            return False
-        config_path = _Path(_profiles_mod.get_profile_dir(canon)) / "config.yaml"
-        if not config_path.is_file():
-            return False
-        import yaml as _yaml
-
-        with open(config_path, encoding="utf-8") as _f:
-            loaded = _yaml.safe_load(_f)
-        if not isinstance(loaded, dict):
-            return False
-        backend = str(
-            ((loaded.get("sessions") or {}).get("state_backend") or "")
-        ).strip().lower()
-        return backend in ("postgres", "postgresql", "pg")
+        from hermes_state_postgres import profile_selects_postgres
     except Exception:
         return False
+    return profile_selects_postgres(profile)
 
 
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):

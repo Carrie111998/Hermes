@@ -1931,6 +1931,51 @@ def open_store_for_profile(
     return SessionDB(db_path=db_path, read_only=read_only)
 
 
+def profile_selects_postgres(profile_name: str) -> bool:
+    """True when *profile_name*'s own config selects the PostgreSQL backend.
+
+    Companion to :func:`open_store_for_profile` for callers that must decide
+    whether to divert BEFORE opening anything — e.g. a reader whose SQLite path
+    carries bootstrap/heal behaviour that must not be bypassed for profiles
+    still on SQLite.
+
+    Reads the TARGET profile's ``config.yaml``; env vars are deliberately not
+    consulted because they describe the ACTIVE process's backend, not the peer's.
+    Soft-fails to False so an absent or unreadable peer config keeps the existing
+    SQLite path rather than breaking a listing.
+    """
+    from pathlib import Path
+
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        canon = profiles_mod.normalize_profile_name(profile_name)
+        if not profiles_mod.profile_exists(canon):
+            return False
+        config_path = Path(profiles_mod.get_profile_dir(canon)) / "config.yaml"
+        if not config_path.is_file():
+            return False
+        import yaml as _yaml
+
+        with open(config_path, encoding="utf-8") as _f:
+            loaded = _yaml.safe_load(_f)
+        if not isinstance(loaded, dict):
+            return False
+        backend = (
+            str((loaded.get("sessions") or {}).get("state_backend") or "")
+            .strip()
+            .lower()
+        )
+        return backend in ("postgres", "postgresql", "pg")
+    except Exception:
+        logger.debug(
+            "profile_selects_postgres: could not resolve backend for %r",
+            profile_name,
+            exc_info=True,
+        )
+        return False
+
+
 def is_postgres_retryable(exc: BaseException) -> bool:
     """True if a PostgreSQL exception is a transient serialization/deadlock that
     warrants the jittered write retry (the PG analogue of SQLite "locked").

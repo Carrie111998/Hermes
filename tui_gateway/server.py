@@ -1434,7 +1434,7 @@ def _db_for_profile(profile: str | None = None):
     try:
         from hermes_state import SessionDB
 
-        return SessionDB(db_path=Path(profile_home) / "state.db"), True
+        return _open_profile_store(profile, profile_home), True
     except Exception as exc:
         logger.warning(
             "TUI profile session store unavailable for %s: %s",
@@ -1516,6 +1516,42 @@ def _db_unavailable_error(rid, *, code: int):
 # (a ContextVar override) for the duration of the call so config/skills/model and
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
+def _open_profile_store(profile: str | None, profile_home: Path | str):
+    """Open *profile*'s session store, honouring that profile's own backend.
+
+    The single backend-aware seam for tui_gateway's profile-scoped opens. A
+    profile configured for PostgreSQL is read from PostgreSQL; anything else
+    keeps the existing ``<profile_home>/state.db`` SQLite path unchanged.
+
+    Without this, a profile migrated to Postgres is served from an empty or
+    stale local file and the TUI/desktop silently shows the wrong history —
+    the dual-truth bug the seam exists to prevent.
+
+    ``profile`` may be None at call sites that only carry a home path; the name
+    is then derived from the directory, since profile homes are
+    ``<...>/profiles/<name>``.
+    """
+    from hermes_state import SessionDB
+
+    name = (profile or "").strip()
+    if not name and profile_home:
+        parent = Path(profile_home).parent.name
+        if parent == "profiles":
+            name = Path(profile_home).name
+    if name:
+        try:
+            from hermes_state_postgres import (
+                open_store_for_profile,
+                profile_selects_postgres,
+            )
+
+            if profile_selects_postgres(name):
+                return open_store_for_profile(name)
+        except ImportError:
+            pass  # Postgres backend not installed — SQLite is correct.
+    return SessionDB(db_path=Path(profile_home) / "state.db")
+
+
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
     name = (profile or "").strip()
@@ -2347,7 +2383,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # it to the built agent in the finally below. Every path
                     # that leaves this build without that transfer (the except
                     # below, and a session reaped mid-build) must close it.
-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    session_db = _open_profile_store(None, profile_home)
                     owns_db = True
                 except Exception:
                     session_db = None
@@ -2939,7 +2975,7 @@ def _ensure_session_db_row(session: dict) -> None:
         from hermes_state import SessionDB
 
         try:
-            db = SessionDB(db_path=Path(profile_home) / "state.db")
+            db = _open_profile_store(None, profile_home)
         except Exception:
             logger.debug("failed to open profile db for session row", exc_info=True)
             return
@@ -3124,7 +3160,7 @@ def _session_db(session: dict):
         from hermes_state import SessionDB
 
         try:
-            db, close_db = SessionDB(db_path=Path(profile_home) / "state.db"), True
+            db, close_db = _open_profile_store(None, profile_home), True
         except Exception:
             logger.debug("failed to open profile db for session", exc_info=True)
     else:
@@ -7257,7 +7293,7 @@ def _init_session(
         try:
             from hermes_state import SessionDB
 
-            db = SessionDB(db_path=Path(profile_home) / "state.db")
+            db = _open_profile_store(None, profile_home)
             _init_owns_db = True
         except Exception:
             db = _get_db()
