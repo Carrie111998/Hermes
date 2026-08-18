@@ -1590,9 +1590,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        created_requested_workspace = kb.get_created_requested_workspace(conn, task_id)
     from hermes_cli.kanban_workspace import supersession_warning
 
-    workspace_warning = supersession_warning(requested_workspace, task)
+    workspace_warning = supersession_warning(created_requested_workspace, task)
     if workspace_warning:
         print(f"kanban: warning: {workspace_warning}", file=sys.stderr)
     if getattr(args, "json", False):

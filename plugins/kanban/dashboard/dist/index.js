@@ -2922,6 +2922,7 @@
     const defaultWorkspacePath = props.defaultWorkspacePath || "";
     const [workspaceKind, setWorkspaceKind] = useState(defaultWorkspaceKind);
     const [workspacePath, setWorkspacePath] = useState(defaultWorkspacePath);
+    const [workspaceTouched, setWorkspaceTouched] = useState(false);
     // Goal-mode: when on, the dispatched worker runs the Ralph-style /goal
     // loop — a judge re-checks the card after each turn and the worker keeps
     // going in the same session until done, or the turn budget runs out
@@ -2948,14 +2949,18 @@
         .map(function (s) { return s.trim(); })
         .filter(function (s) { return s.length > 0; });
       if (skillList.length > 0) body.skills = skillList;
-      // Always send the selected kind. In particular, an explicit switch to
-      // scratch on a project-bound board must remain distinguishable from an
-      // omitted workspace so the API can preserve and warn on supersession.
+      // Always send the visible board-derived values so they remain the
+      // normalization inputs. Preserve whether the user actually changed the
+      // controls separately: untouched defaults are implicit, while an
+      // explicit switch to scratch can be preserved and warned on.
       if (workspaceKind) {
         body.workspace_kind = workspaceKind;
       }
-      const wpTrim = workspacePath.trim();
+      // Scratch is pathless. Ignore any hidden board-default path left in
+      // state after switching from dir/worktree to scratch.
+      const wpTrim = workspaceKind === "scratch" ? "" : workspacePath.trim();
       if (wpTrim) body.workspace_path = wpTrim;
+      body.workspace_explicit = workspaceTouched;
       // Goal-mode toggle. Only send the keys when enabled so the request
       // shape stays small and old dispatchers ignore it cleanly.
       if (goalMode) {
@@ -2966,6 +2971,7 @@
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
       setWorkspaceKind(defaultWorkspaceKind); setWorkspacePath(defaultWorkspacePath);
+      setWorkspaceTouched(false);
       setGoalMode(false); setGoalMaxTurns("");
     };
 
@@ -3062,7 +3068,10 @@
                 value: workspaceKind,
                 title: "Choose whether task files are temporary or preserved after completion.",
                 className: "h-8 text-sm flex-1",
-              }, selectChangeHandler(setWorkspaceKind)),
+              }, selectChangeHandler(function (value) {
+                setWorkspaceKind(value);
+                setWorkspaceTouched(true);
+              })),
                 h(SelectOption, { value: "scratch" },
                   tx(t, "workspaceScratch", "Temporary — deleted on completion")),
                 h(SelectOption, { value: "worktree" },
@@ -3072,7 +3081,10 @@
               ),
               showPathInput ? h(Input, {
                 value: workspacePath,
-                onChange: function (e) { setWorkspacePath(e.target.value); },
+                onChange: function (e) {
+                  setWorkspacePath(e.target.value);
+                  setWorkspaceTouched(true);
+                },
                 placeholder: pathPlaceholder,
                 className: "h-8 text-sm flex-1",
               }) : null,

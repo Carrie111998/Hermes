@@ -1474,15 +1474,12 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            created_requested_workspace = kb.get_created_requested_workspace(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
-            from hermes_cli.kanban_workspace import supersession_warning, workspace_spec
+            from hermes_cli.kanban_workspace import supersession_warning
 
             workspace_warning = supersession_warning(
-                (
-                    workspace_spec(str(requested_workspace_kind), workspace_path)
-                    if requested_workspace_kind is not None
-                    else None
-                ),
+                created_requested_workspace,
                 new_task,
             ) if new_task else None
             return _ok(

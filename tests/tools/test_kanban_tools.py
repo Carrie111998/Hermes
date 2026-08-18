@@ -902,6 +902,54 @@ def test_create_omitted_project_workspace_inherits_without_warning(worker_env, t
     assert out["warning"] is None
 
 
+def test_create_idempotent_retry_warning_uses_original_request(worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="Tool Project", folders=[str(repo)])
+    kb.write_board_metadata("default", project_id=project_id)
+
+    implicit = json.loads(
+        kt._handle_create(
+            {"title": "implicit", "assignee": "peer", "idempotency_key": "implicit"}
+        )
+    )
+    explicit_retry = json.loads(
+        kt._handle_create(
+            {
+                "title": "retry",
+                "assignee": "peer",
+                "idempotency_key": "implicit",
+                "workspace_kind": "scratch",
+            }
+        )
+    )
+    assert explicit_retry["task_id"] == implicit["task_id"]
+    assert explicit_retry["warning"] is None
+
+    explicit = json.loads(
+        kt._handle_create(
+            {
+                "title": "explicit",
+                "assignee": "peer",
+                "idempotency_key": "explicit",
+                "workspace_kind": "scratch",
+            }
+        )
+    )
+    omitted_retry = json.loads(
+        kt._handle_create(
+            {"title": "retry", "assignee": "peer", "idempotency_key": "explicit"}
+        )
+    )
+    assert omitted_retry["task_id"] == explicit["task_id"]
+    assert omitted_retry["warning"] == explicit["warning"]
+
+
 def _list_subs_for_task(task_id):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

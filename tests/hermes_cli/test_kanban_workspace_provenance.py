@@ -74,6 +74,37 @@ def test_unchanged_workspace_resolution_emits_no_event(kanban_home: Path) -> Non
         assert _event(conn, task_id, "workspace_resolved") == []
 
 
+def test_branch_only_workspace_resolution_emits_provenance(kanban_home: Path) -> None:
+    path = kanban_home / "workspace"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="branch healed",
+            workspace_kind="worktree",
+            workspace_path=str(path),
+            branch_name="old/branch",
+        )
+
+        changed = kb.set_workspace_path(
+            conn, task_id, path, branch_name="resolved/branch"
+        )
+        task = kb.get_task(conn, task_id)
+        events = _event(conn, task_id, "workspace_resolved")
+
+    assert changed is True
+    assert task is not None
+    assert task.branch_name == "resolved/branch"
+    assert [event.payload for event in events] == [
+        {
+            "previous_path": str(path),
+            "resolved_path": str(path),
+            "previous_branch_name": "old/branch",
+            "resolved_branch_name": "resolved/branch",
+            "branch_name": "resolved/branch",
+        }
+    ]
+
+
 def test_changed_workspace_resolution_updates_row_and_emits_payload_atomically(
     kanban_home: Path,
 ) -> None:
@@ -104,6 +135,8 @@ def test_changed_workspace_resolution_updates_row_and_emits_payload_atomically(
     assert events[0].payload == {
         "previous_path": str(previous),
         "resolved_path": str(resolved),
+        "previous_branch_name": "old/branch",
+        "resolved_branch_name": "wt/resolved",
         "branch_name": "wt/resolved",
     }
     assert created_after.id == created_before.id
@@ -140,6 +173,8 @@ def test_legacy_claim_time_healing_is_visible_without_rewriting_created_event(
     assert resolved_events[0].payload == {
         "previous_path": str(previous),
         "resolved_path": str(resolved),
+        "previous_branch_name": None,
+        "resolved_branch_name": "wt/legacy-child",
         "branch_name": "wt/legacy-child",
     }
 
@@ -190,6 +225,8 @@ def test_claim_heals_legacy_worktree_path_and_records_resolution(
         {
             "previous_path": str(legacy_path),
             "resolved_path": str(expected_path),
+            "previous_branch_name": None,
+            "resolved_branch_name": f"wt/{task_id}",
             "branch_name": f"wt/{task_id}",
         }
     ]
@@ -271,6 +308,8 @@ def test_project_normalization_and_claim_resolution_keep_all_provenance_stages(
         {
             "previous_path": str(repo),
             "resolved_path": str(normalized_path),
+            "previous_branch_name": created_payload["branch_name"],
+            "resolved_branch_name": created_payload["branch_name"],
             "branch_name": created_payload["branch_name"],
         }
     ]

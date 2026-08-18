@@ -4265,6 +4265,33 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+def get_created_requested_workspace(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Return the immutable workspace request recorded at task creation.
+
+    Legacy or malformed ``created`` events may not carry the additive field;
+    those are treated like an omitted request. Reading the durable event (not
+    the current create invocation) keeps idempotent retries from inventing or
+    suppressing a supersession warning for the pre-existing task they return.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'created' ORDER BY created_at ASC, id ASC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    requested = payload.get("requested_workspace")
+    return requested if isinstance(requested, str) else None
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7785,9 +7812,9 @@ def set_workspace_path(
     """Persist a claim-resolved workspace and its provenance atomically.
 
     Emit ``workspace_resolved`` only when resolution changes the persisted
-    path. The row update and event share one transaction, so history cannot
-    claim a resolution whose task update rolled back. Returns whether the path
-    changed.
+    path or branch. The row update and event share one transaction, so history
+    cannot claim a resolution whose task update rolled back. Returns whether
+    either resolved value changed.
     """
     resolved_path = str(path)
     with write_txn(conn):
@@ -7800,13 +7827,9 @@ def set_workspace_path(
             raise ValueError(f"unknown task: {task_id}")
 
         previous_path = row["workspace_path"]
-        resolved_branch = branch_name if branch_name is not None else row["branch_name"]
-        if previous_path == resolved_path:
-            if branch_name is not None and branch_name != row["branch_name"]:
-                conn.execute(
-                    "UPDATE tasks SET branch_name = ? WHERE id = ?",
-                    (branch_name, task_id),
-                )
+        previous_branch = row["branch_name"]
+        resolved_branch = branch_name if branch_name is not None else previous_branch
+        if previous_path == resolved_path and previous_branch == resolved_branch:
             return False
 
         conn.execute(
@@ -7820,6 +7843,9 @@ def set_workspace_path(
             {
                 "previous_path": previous_path,
                 "resolved_path": resolved_path,
+                "previous_branch_name": previous_branch,
+                "resolved_branch_name": resolved_branch,
+                # Backward-compatible alias retained for existing consumers.
                 "branch_name": resolved_branch,
             },
             run_id=(

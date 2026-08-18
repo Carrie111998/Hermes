@@ -52,6 +52,9 @@ def test_cli_prints_explicit_workspace_supersession_to_stderr(monkeypatch, capsy
     monkeypatch.setattr(kanban.kb, "connect_closing", lambda: nullcontext(object()))
     monkeypatch.setattr(kanban.kb, "create_task", create_task)
     monkeypatch.setattr(kanban.kb, "get_task", lambda *args, **kwargs: task)
+    monkeypatch.setattr(
+        kanban.kb, "get_created_requested_workspace", lambda *args: "scratch"
+    )
 
     assert kanban._cmd_create(_create_args()) == 0
 
@@ -78,8 +81,51 @@ def test_cli_omitted_workspace_inherits_silently(monkeypatch, capsys):
     monkeypatch.setattr(kanban.kb, "connect_closing", lambda: nullcontext(object()))
     monkeypatch.setattr(kanban.kb, "create_task", create_task)
     monkeypatch.setattr(kanban.kb, "get_task", lambda *args, **kwargs: task)
+    monkeypatch.setattr(
+        kanban.kb, "get_created_requested_workspace", lambda *args: None
+    )
 
     assert kanban._cmd_create(_create_args(workspace=None)) == 0
 
     assert capsys.readouterr().err == ""
     assert captured_kwargs["requested_workspace"] is None
+
+
+def test_cli_retry_warning_uses_immutable_created_request(monkeypatch, capsys):
+    task = SimpleNamespace(
+        workspace_kind="worktree",
+        workspace_path="/repo/.worktrees/t_123",
+        project_id="project-id",
+        status="todo",
+        assignee=None,
+    )
+    monkeypatch.setattr(kanban.kb, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kanban.kb, "create_task", lambda *args, **kwargs: "t_123")
+    monkeypatch.setattr(kanban.kb, "get_task", lambda *args, **kwargs: task)
+    monkeypatch.setattr(
+        kanban.kb, "get_created_requested_workspace", lambda *args: "scratch"
+    )
+
+    assert kanban._cmd_create(_create_args(workspace=None)) == 0
+
+    assert "requested workspace 'scratch'" in capsys.readouterr().err
+
+
+def test_cli_retry_does_not_invent_warning_from_current_request(monkeypatch, capsys):
+    task = SimpleNamespace(
+        workspace_kind="worktree",
+        workspace_path="/repo/.worktrees/t_123",
+        project_id="project-id",
+        status="todo",
+        assignee=None,
+    )
+    monkeypatch.setattr(kanban.kb, "connect_closing", lambda: nullcontext(object()))
+    monkeypatch.setattr(kanban.kb, "create_task", lambda *args, **kwargs: "t_123")
+    monkeypatch.setattr(kanban.kb, "get_task", lambda *args, **kwargs: task)
+    monkeypatch.setattr(
+        kanban.kb, "get_created_requested_workspace", lambda *args: None
+    )
+
+    assert kanban._cmd_create(_create_args(workspace="scratch")) == 0
+
+    assert capsys.readouterr().err == ""
