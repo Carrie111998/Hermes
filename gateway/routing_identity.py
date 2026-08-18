@@ -54,7 +54,14 @@ def normalize_profile(value: object, *, default: str = DEFAULT_PROFILE) -> str:
     ``main``.
     """
 
-    text = str(value or "").strip()
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        # Non-string values (e.g. MagicMock attributes on test doubles) are
+        # not profile claims. Coercing a repr would fabricate a profile name
+        # that collides with a real one; treat them as absent instead.
+        return default
+    text = value.strip()
     if not text or text in {DEFAULT_PROFILE, LEGACY_SESSION_NAMESPACE}:
         return default
     return text

@@ -54,16 +54,23 @@ def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
 
 
 def _event(*, profile: str | None) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="user-1",
+        profile=profile,
+    )
+    # A multiplex source must carry a trusted transport/persistence binding to
+    # be treated as a proven routed message (what the adapter's build_source
+    # stamps in real operation); otherwise the runner's fail-closed gate drops
+    # it as an unbound restored/synthetic source.
+    source._transport_profile = profile or "default"
+    source._persistence_profile = profile or "default"
     return MessageEvent(
         text="follow up",
         message_type=MessageType.TEXT,
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="chat-1",
-            chat_type="dm",
-            user_id="user-1",
-            profile=profile,
-        ),
+        source=source,
         message_id="message-1",
     )
 

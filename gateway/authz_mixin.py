@@ -154,10 +154,13 @@ class GatewayAuthorizationMixin:
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         transport_profile = getattr(source, "_transport_profile", None)
-        if not transport_profile:
+        if not isinstance(transport_profile, str) or not transport_profile.strip():
+            transport_profile = None
             carried = getattr(source, "routing_identity", None)
             if isinstance(carried, dict):
-                transport_profile = carried.get("transport_profile")
+                carried_tp = carried.get("transport_profile")
+                if isinstance(carried_tp, str) and carried_tp.strip():
+                    transport_profile = carried_tp
         return self._authorization_adapter(
             getattr(source, "platform", None),
             transport_profile or getattr(source, "profile", None),
@@ -199,10 +202,13 @@ class GatewayAuthorizationMixin:
                 if adapter is profile_adapters.get(platform):
                     return profile
         transport_profile = getattr(source, "_transport_profile", None)
-        if not transport_profile:
+        if not isinstance(transport_profile, str) or not transport_profile.strip():
+            transport_profile = None
             carried = getattr(source, "routing_identity", None)
             if isinstance(carried, dict):
-                transport_profile = carried.get("transport_profile")
+                carried_tp = carried.get("transport_profile")
+                if isinstance(carried_tp, str) and carried_tp.strip():
+                    transport_profile = carried_tp
         return transport_profile or getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(
