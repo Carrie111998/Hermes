@@ -24,6 +24,10 @@ from typing import Any, Iterable, Optional
 from hermes_cli import kanban_db as kb
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
+CONTRACT_PREFIX = "[swarm:contract] "
+MULTI_AGENT_LANE_IDS = ("native_hermes", "claude", "grok", "agy")
+DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 120
+DEFAULT_GOAL_MAX_TURNS = 5
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,8 @@ class SwarmWorkerSpec:
     skills: list[str] = field(default_factory=list)
     priority: int = 0
     max_runtime_seconds: Optional[int] = None
+    lane_id: Optional[str] = None
+    preflight_skill_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,67 @@ def _swarm_context(root_id: str, goal: str) -> str:
     )
 
 
+def _contract_line(contract: dict[str, Any]) -> str:
+    return CONTRACT_PREFIX + json.dumps(contract, ensure_ascii=False, sort_keys=True)
+
+
+def extract_contract(body: Optional[str]) -> Optional[dict[str, Any]]:
+    """Read the last machine-readable swarm contract from a task body."""
+
+    for line in reversed((body or "").splitlines()):
+        if not line.startswith(CONTRACT_PREFIX):
+            continue
+        try:
+            value = json.loads(line[len(CONTRACT_PREFIX):])
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def validate_completion(
+    task: Any,
+    *,
+    metadata: Optional[dict[str, Any]],
+    result: Optional[str] = None,
+) -> Optional[str]:
+    """Return a rejection reason for a contract-bound task, else ``None``."""
+
+    contract = extract_contract(getattr(task, "body", None))
+    if not contract:
+        return None
+    metadata = metadata if isinstance(metadata, dict) else {}
+    role = contract.get("role")
+    if metadata.get("role") != role:
+        return f"swarm {role} completion requires metadata role={role!r}"
+    if metadata.get("root_id") != contract.get("root_id"):
+        return "swarm completion root_id does not match the task contract"
+    if role == "worker":
+        if metadata.get("lane_id") != contract.get("expected_lane_id"):
+            return "worker lane_id does not match the expected lane"
+        expected_skill = contract.get("preflight_skill_id") or ""
+        if metadata.get("preflight_skill_id", "") != expected_skill:
+            return "worker preflight_skill_id does not match the expected skill"
+        if metadata.get("outcome") != "completed":
+            return "worker completion requires outcome='completed'"
+        if metadata.get("verified_clean") is not True:
+            return "worker completion requires verified_clean=true"
+    elif role == "verifier":
+        if metadata.get("gate") != "pass":
+            return "verifier completion requires gate='pass'"
+        expected = contract.get("expected_lane_count")
+        if metadata.get("expected_lane_count") != expected:
+            return "verifier completion requires the expected lane count"
+        if metadata.get("verified_lane_count") != expected:
+            return "verifier completion requires all expected lanes verified"
+    elif role == "synthesizer":
+        if metadata.get("outcome") != "completed":
+            return "synthesizer completion requires outcome='completed'"
+        if metadata.get("result_present") is not True or not (result or "").strip():
+            return "synthesizer completion requires result_present=true and a result"
+    return None
+
+
 def create_swarm(
     conn: sqlite3.Connection,
     *,
@@ -90,6 +157,8 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    goal_max_turns: int = DEFAULT_GOAL_MAX_TURNS,
+    worker_max_runtime_seconds: int = DEFAULT_WORKER_MAX_RUNTIME_SECONDS,
 ) -> SwarmCreated:
     """Create a durable Kanban swarm graph.
 
@@ -107,6 +176,19 @@ def create_swarm(
     for i, spec in enumerate(worker_specs, start=1):
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
+    lane_mode = any(spec.lane_id for spec in worker_specs)
+    if lane_mode:
+        lane_ids = [str(spec.lane_id or "").strip() for spec in worker_specs]
+        if any(not lane for lane in lane_ids):
+            raise ValueError("lane-bound swarms require a lane_id for every worker")
+        if len(set(lane_ids)) != len(lane_ids):
+            raise ValueError("worker lane_id values must be unique")
+        if set(lane_ids) != set(MULTI_AGENT_LANE_IDS):
+            raise ValueError(
+                "lane-bound swarms require exactly native_hermes, claude, grok, agy"
+            )
+        if goal_max_turns < 1 or worker_max_runtime_seconds < 1:
+            raise ValueError("goal_max_turns and worker_max_runtime_seconds must be positive")
 
     root = kb.create_task(
         conn,
@@ -124,6 +206,8 @@ def create_swarm(
         idempotency_key=idempotency_key,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        goal_mode=lane_mode,
+        goal_max_turns=goal_max_turns if lane_mode else None,
     )
 
     # If idempotency returned an existing non-archived root, do not duplicate the
@@ -156,10 +240,30 @@ def create_swarm(
     context_suffix = _swarm_context(root, goal)
     worker_ids: list[str] = []
     for spec in worker_specs:
+        worker_lane = str(spec.lane_id).strip() if lane_mode else None
+        expected_skill = (
+            spec.preflight_skill_id.strip()
+            if spec.preflight_skill_id.strip()
+            else (spec.skills[0].strip() if len(spec.skills) == 1 else "")
+        )
+        if lane_mode and worker_lane != "native_hermes" and not expected_skill:
+            raise ValueError(f"worker {worker_lane} requires a preflight skill id")
+        contract = None
+        if lane_mode:
+            contract = {
+                "version": 1,
+                "role": "worker",
+                "root_id": root,
+                "expected_lane_id": worker_lane,
+                "preflight_skill_id": expected_skill,
+            }
+        worker_body = (spec.body or "") + context_suffix
+        if contract:
+            worker_body += "\n" + _contract_line(contract)
         worker_id = kb.create_task(
             conn,
             title=spec.title,
-            body=(spec.body or "") + context_suffix,
+            body=worker_body,
             assignee=spec.profile,
             created_by=created_by,
             parents=[root],
@@ -168,7 +272,13 @@ def create_swarm(
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
             skills=spec.skills or None,
-            max_runtime_seconds=spec.max_runtime_seconds,
+            max_runtime_seconds=(
+                spec.max_runtime_seconds
+                if spec.max_runtime_seconds is not None
+                else (worker_max_runtime_seconds if lane_mode else None)
+            ),
+            goal_mode=lane_mode,
+            goal_max_turns=goal_max_turns if lane_mode else None,
         )
         worker_ids.append(worker_id)
 
@@ -178,6 +288,13 @@ def create_swarm(
         "sufficient; otherwise block with exact missing work."
         + context_suffix
     )
+    if lane_mode:
+        verifier_body += "\n" + _contract_line({
+            "version": 1,
+            "role": "verifier",
+            "root_id": root,
+            "expected_lane_count": len(worker_specs),
+        })
     verifier = kb.create_task(
         conn,
         title=verifier_title,
@@ -197,6 +314,13 @@ def create_swarm(
         "Do not start until the verifier has passed the gate."
         + context_suffix
     )
+    if lane_mode:
+        synthesizer_body += "\n" + _contract_line({
+            "version": 1,
+            "role": "synthesizer",
+            "root_id": root,
+            "verifier_id": verifier,
+        })
     synthesizer = kb.create_task(
         conn,
         title=synthesizer_title,
@@ -209,6 +333,8 @@ def create_swarm(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["humanizer"],
+        goal_mode=lane_mode,
+        goal_max_turns=goal_max_turns if lane_mode else None,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
@@ -275,4 +401,6 @@ def parse_worker_arg(raw: str) -> SwarmWorkerSpec:
     skills: list[str] = []
     if len(parts) == 3 and parts[2]:
         skills = [s.strip() for s in parts[2].split(",") if s.strip()]
+    # The optional third segment is a comma-separated skill list only.  Bounded
+    # worker instructions belong in the title/body, never in a skill token.
     return SwarmWorkerSpec(profile=parts[0], title=parts[1], body=parts[1], skills=skills)

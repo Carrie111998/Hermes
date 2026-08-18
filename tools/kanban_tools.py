@@ -598,6 +598,14 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            from hermes_cli import kanban_swarm as _kanban_swarm
+            contract_error = _kanban_swarm.validate_completion(
+                task,
+                metadata=metadata,
+                result=result,
+            ) if task else None
+            if contract_error:
+                return tool_error(f"kanban_complete rejected: {contract_error}")
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
