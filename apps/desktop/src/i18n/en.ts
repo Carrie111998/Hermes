@@ -868,12 +868,8 @@ export const en: Translations = {
       noMatch: 'No entries match your search.'
     },
     search: {
-      root: 'Settings',
       placeholder: 'Search all settings…',
-      loading: 'Searching settings…',
-      noResults: 'No settings match your search.',
-      catalogError: 'Some settings could not be searched.',
-      resultCount: count => `${count} matching ${count === 1 ? 'setting' : 'settings'}.`
+      pill: 'Search'
     },
     profileScope: {
       appliesTo: 'Applies to',

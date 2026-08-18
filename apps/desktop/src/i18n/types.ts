@@ -738,12 +738,8 @@ export interface Translations {
       noMatch: string
     }
     search: {
-      root: string
       placeholder: string
-      loading: string
-      noResults: string
-      catalogError: string
-      resultCount: (count: number) => string
+      pill: string
     }
     profileScope: {
       appliesTo: string

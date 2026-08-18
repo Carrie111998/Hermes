@@ -1065,12 +1065,8 @@ export const zh: Translations = {
       noMatch: '没有与搜索匹配的条目。'
     },
     search: {
-      root: '设置',
       placeholder: '搜索所有设置...',
-      loading: '正在搜索设置...',
-      noResults: '没有与搜索匹配的设置。',
-      catalogError: '部分设置无法搜索。',
-      resultCount: count => `${count} 项设置匹配。`
+      pill: '搜索'
     },
     profileScope: {
       appliesTo: '应用于',

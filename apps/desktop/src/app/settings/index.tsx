@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useStore } from '@nanostores/react'
 import { useLocation, useNavigate } from 'react-router'
 
-import { Button } from '@/components/ui/button'
 import { codiconIcon } from '@/components/ui/codicon'
-import { Loader } from '@/components/ui/loader'
-import { ScopedCommandSearch } from '@/components/ui/scoped-command-search'
+import { KbdCombo } from '@/components/ui/kbd'
 import { Tip } from '@/components/ui/tooltip'
 import { getHermesConfigDefaults, getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -13,7 +12,6 @@ import {
   Archive,
   BarChart3,
   Bell,
-  ChevronRight,
   Download,
   Globe,
   Info,
@@ -21,11 +19,17 @@ import {
   KeyRound,
   Package,
   RefreshCw,
+  Search,
   Settings2,
   Upload,
   Wrench,
   Zap
 } from '@/lib/icons'
+import { isEditableTarget } from '@/lib/keybinds/combo'
+import { typeToFocusChar } from '@/lib/keybinds/composer-focus-keys'
+import { cn } from '@/lib/utils'
+import { $commandPaletteOpen, openCommandPalettePage } from '@/store/command-palette'
+import { bindingsFor } from '@/store/keybinds'
 import { notifyError } from '@/store/notifications'
 
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -47,7 +51,6 @@ import { PluginsSettings } from './plugins-settings'
 import { PROVIDER_VIEWS, ProvidersSettings, type ProviderView } from './providers-settings'
 import { SessionsSettings } from './sessions-settings'
 import type { SettingsPageProps, SettingsView as SettingsViewId } from './types'
-import { useSettingsSearch } from './use-settings-search'
 
 const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   ...SECTIONS.map(s => `config:${s.id}` as SettingsViewId),
@@ -69,7 +72,6 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
   const { t } = useI18n()
   const navigate = useNavigate()
   const { hash, pathname, search } = useLocation()
-  const [settingsQuery, setSettingsQuery] = useState('')
 
   // MCP moved out of Settings into Capabilities (/skills?tab=mcp). Keep old
   // `/settings?tab=mcp` deep links working — `useRouteEnumParam` would silently
@@ -99,21 +101,11 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
   const [providerView, setProviderView] = useRouteEnumParam<ProviderView>('pview', PROVIDER_VIEWS, 'accounts')
   const [keysView] = useRouteEnumParam<KeysView>('kview', KEYS_VIEWS, 'tools')
 
-  const selectActiveView = useCallback(
-    (view: SettingsViewId) => {
-      setSettingsQuery('')
-      setActiveView(view)
-    },
-    [setActiveView]
-  )
-
   // Jump to a section + its sub-view in one navigate. Two sequential setters
   // would each read the same stale `search` and the second would clobber the
   // first's `tab` — so the sub-view never opened on narrow screens.
   const openSubView = useCallback(
     (tab: SettingsViewId, param: string, value: string, fallback: string) => {
-      setSettingsQuery('')
-
       const params = new URLSearchParams(search)
       params.set('tab', tab)
 
@@ -178,7 +170,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
           icon: s.icon,
           id: view,
           label: t.settings.sections[s.id] ?? s.label,
-          onSelect: () => selectActiveView(view)
+          onSelect: () => setActiveView(view)
         }
       }),
       {
@@ -186,14 +178,14 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         icon: Bell,
         id: 'notifications',
         label: t.settings.nav.notifications,
-        onSelect: () => selectActiveView('notifications')
+        onSelect: () => setActiveView('notifications')
       },
       {
         active: activeView === 'billing',
         icon: BarChart3,
         id: 'billing',
         label: t.settings.nav.billing,
-        onSelect: () => selectActiveView('billing')
+        onSelect: () => setActiveView('billing')
       },
       {
         active: activeView === 'providers',
@@ -224,21 +216,21 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         icon: Zap,
         id: 'providers',
         label: t.settings.nav.providers,
-        onSelect: () => selectActiveView('providers')
+        onSelect: () => setActiveView('providers')
       },
       {
         active: activeView === 'gateway',
         icon: Globe,
         id: 'gateway',
         label: t.settings.nav.gateway,
-        onSelect: () => selectActiveView('gateway')
+        onSelect: () => setActiveView('gateway')
       },
       {
         active: activeView === 'keybinds',
         icon: Keyboard,
         id: 'keybinds',
         label: t.settings.nav.keybinds,
-        onSelect: () => selectActiveView('keybinds')
+        onSelect: () => setActiveView('keybinds')
       },
       {
         active: activeView === 'keys',
@@ -261,21 +253,21 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         icon: KeyRound,
         id: 'keys',
         label: t.settings.nav.apiKeys,
-        onSelect: () => selectActiveView('keys')
+        onSelect: () => setActiveView('keys')
       },
       {
         active: activeView === 'plugins',
         icon: Package,
         id: 'plugins',
         label: t.settings.nav.plugins,
-        onSelect: () => selectActiveView('plugins')
+        onSelect: () => setActiveView('plugins')
       },
       {
         active: activeView === 'sessions',
         icon: Archive,
         id: 'sessions',
         label: t.settings.nav.archivedChats,
-        onSelect: () => selectActiveView('sessions')
+        onSelect: () => setActiveView('sessions')
       },
       {
         active: activeView === 'about',
@@ -283,77 +275,61 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         icon: Info,
         id: 'about',
         label: t.settings.nav.about,
-        onSelect: () => selectActiveView('about')
+        onSelect: () => setActiveView('about')
       }
     ],
-    [activeView, keysView, providerView, t, selectActiveView, openProviderView, openKeysView]
+    [activeView, keysView, providerView, t, setActiveView, openProviderView, openKeysView]
   )
 
-  const settingsSearch = useSettingsSearch({
-    groups: navGroups,
-    onSelect: () => setSettingsQuery(''),
-    query: settingsQuery
-  })
-
-  const searchHeader = (
-    <ScopedCommandSearch
-      busy={settingsSearch.loading}
-      emptyMessage={settingsSearch.loading ? null : t.settings.search.noResults}
-      itemClassName="grid-cols-[auto_minmax(0,1fr)_auto]"
-      items={settingsSearch.entries}
-      listClassName="min-h-0 max-h-none flex-1"
-      listHeader={
-        <>
-          {settingsSearch.error && (
-            <div
-              className="flex items-center justify-between gap-3 px-3 py-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)"
-              role="alert"
-            >
-              <span>{t.settings.search.catalogError}</span>
-              <Button onClick={settingsSearch.retry} size="inline" variant="textStrong">
-                {t.common.retry}
-              </Button>
-            </div>
-          )}
-          {settingsSearch.loading && (
-            <div className="flex items-center gap-2 px-3 py-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-              <Loader className="size-3.5" />
-              <span>{t.settings.search.loading}</span>
-            </div>
-          )}
-        </>
+  // Type-to-search: printable keystrokes on the Settings surface (outside any
+  // field) open the settings-scoped palette, seeded with the character — same
+  // reflex as the chat surface's type-to-focus, pointed at search instead.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ($commandPaletteOpen.get() || isEditableTarget(event.target)) {
+        return
       }
-      onSelect={settingsSearch.selectEntry}
-      onValueChange={setSettingsQuery}
-      placeholder={t.settings.search.placeholder}
-      popoverClassName="left-0 flex max-h-[calc(100vh-9rem)] w-[min(32rem,calc(100vw-4rem))] flex-col max-[47.5rem]:inset-x-0 max-[47.5rem]:w-auto"
-      renderItem={entry => {
-        const Icon = entry.icon
 
-        return (
-          <>
-            <Icon className="size-4 self-center text-muted-foreground" />
-            <span className="min-w-0">
-              <span className="flex min-w-0 items-baseline gap-2">
-                <span className="truncate font-medium">{entry.label}</span>
-                <span className="shrink-0 text-xs text-muted-foreground">{entry.context}</span>
-              </span>
-              {entry.description && (
-                <span className="mt-0.5 block truncate text-xs text-muted-foreground">{entry.description}</span>
-              )}
-            </span>
-            <ChevronRight className="size-4 self-center text-muted-foreground opacity-0 transition-opacity group-data-[selected=true]:opacity-100" />
-          </>
-        )
+      const char = typeToFocusChar(event)
+
+      if (char === null || char === ' ') {
+        return
+      }
+
+      event.preventDefault()
+      openCommandPalettePage('settings', char)
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  // Fake search pill riding the card's top edge, dead-center and half off it.
+  // Clicking (or just typing) opens the ⌘K palette scoped to settings; while
+  // the palette is up the pill hands over to it — grows slightly and fades,
+  // then fades back when the palette closes. It renders as chrome, not an
+  // input — no border, recessed fill, live ⌘K hint.
+  const searchCombo = bindingsFor('nav.commandPalette')[0]
+  const paletteOpen = useStore($commandPaletteOpen)
+
+  const searchPill = (
+    <button
+      className={cn(
+        'flex h-(--titlebar-control-height) items-center gap-1.5 rounded-full border border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background) px-2.5 text-(--ui-text-tertiary) shadow-sm transition-all duration-200 ease-out hover:text-foreground motion-reduce:transition-none',
+        paletteOpen && 'pointer-events-none scale-110 opacity-0'
+      )}
+      onClick={() => {
+        triggerHaptic('open')
+        openCommandPalettePage('settings')
       }}
-      resultSummary={
-        settingsSearch.loading
-          ? t.settings.search.loading
-          : t.settings.search.resultCount(settingsSearch.entries.length)
-      }
-      shouldFilter={false}
-      value={settingsQuery}
-    />
+      tabIndex={paletteOpen ? -1 : undefined}
+      type="button"
+    >
+      <Search className="size-3" />
+      <span className="text-xs">{t.settings.search.pill}</span>
+      {searchCombo && <KbdCombo combo={searchCombo} size="sm" variant="ghost" />}
+    </button>
   )
 
   const navFooter = (
@@ -426,11 +402,11 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
     )
 
   return (
-    <OverlayView closeLabel={t.settings.closeSettings} onClose={onClose}>
+    <OverlayView closeLabel={t.settings.closeSettings} edgeBadge={searchPill} onClose={onClose}>
       <OverlaySplitLayout>
-        <OverlayNav footer={navFooter} groups={navGroups} header={searchHeader} />
+        <OverlayNav footer={navFooter} groups={navGroups} />
 
-        <OverlayMain className="px-0 pb-0 pt-[calc(var(--titlebar-height)+1rem)]">{activeSettingsContent}</OverlayMain>
+        <OverlayMain className="px-0 pb-0">{activeSettingsContent}</OverlayMain>
       </OverlaySplitLayout>
     </OverlayView>
   )
