@@ -3478,7 +3478,8 @@ def repair_empty_non_final_messages(
         return messages
 
     repaired: List[Dict[str, Any]] = []
-    healed = 0
+    healed_corruptions = 0
+    substituted_placeholders = 0
     last_idx = len(messages) - 1
     for idx, msg in enumerate(messages):
         if (
@@ -3493,19 +3494,27 @@ def repair_empty_non_final_messages(
             fixed = dict(msg)
             fixed["content"] = _INTERRUPTED_PLACEHOLDER
             repaired.append(fixed)
-            healed += 1
+            substituted_placeholders += 1
+            # Only count and warn on unexpected corruptions. Intentional hidden
+            # assistant placeholders from active turn redirects or group-chat
+            # member interruptions (#88955) are designed-empty placeholders for
+            # role alternation; substituting [response interrupted] on the wire
+            # prevents provider 400s cleanly without recurring warning spam.
+            if not (msg.get("display_kind") == "hidden" and msg.get("role") == "assistant"):
+                healed_corruptions += 1
         else:
             repaired.append(msg)
 
-    if healed:
+    if healed_corruptions:
         _ra().logger.warning(
             "Pre-call sanitizer: healed %d empty non-final message(s) by "
             "substituting placeholder content — an empty-content turn was in "
             "the transcript and would 400 the request ('messages must have "
             "non-empty content' / INVALID_REQUEST_BODY). Self-recovering the "
             "poisoned transcript in memory; no restart needed.",
-            healed,
+            healed_corruptions,
         )
+    if substituted_placeholders:
         return repaired
     return messages
 

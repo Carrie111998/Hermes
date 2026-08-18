@@ -2119,6 +2119,19 @@ def run_conversation(
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)
 
+            from agent.agent_runtime_helpers import _msg_has_payload, _INTERRUPTED_PLACEHOLDER
+
+            # An empty hidden assistant placeholder from active turn redirect /
+            # interruption (#88955): populate placeholder content on the wire copy
+            # so strict providers accept the request without triggering pre-call
+            # sanitizer healing warnings on every turn.
+            if (
+                api_msg.get("role") == "assistant"
+                and api_msg.get("display_kind") == "hidden"
+                and not _msg_has_payload(api_msg)
+            ):
+                api_msg["content"] = _INTERRUPTED_PLACEHOLDER
+
             # Display-only timeline metadata. Never a provider field — strip
             # from every outgoing copy so strict OpenAI-compatible backends
             # don't reject the request after a model switch or resumed typed
