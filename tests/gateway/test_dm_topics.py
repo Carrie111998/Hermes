@@ -413,8 +413,17 @@ def test_persist_dm_topic_thread_id_preserves_config_on_write_failure(tmp_path):
     def fail_dump(*args, **kwargs):
         raise RuntimeError("boom")
 
+    # atomic_config_write has TWO serializers and the failure has to be
+    # injected into both. It first tries the ruamel comment-preserving path
+    # (utils.atomic_roundtrip_yaml_dump); that path swallows exceptions and
+    # returns False so a write is never lost to a formatting nicety, which
+    # means failing it alone just falls through to the plain PyYAML dump.
+    # Patching only "yaml.dump" therefore stopped simulating a failed write
+    # when the round-trip path landed on 2026-08-17 — the write succeeded and
+    # this test asserted against a config that really had been rewritten.
     with patch.object(Path, "home", return_value=tmp_path), \
          patch.dict(os.environ, {"HERMES_HOME": str(tmp_path / ".hermes")}), \
+         patch("utils.atomic_roundtrip_yaml_dump", side_effect=fail_dump), \
          patch("yaml.dump", side_effect=fail_dump):
         adapter._persist_dm_topic_thread_id(111, "General", 999)
 
