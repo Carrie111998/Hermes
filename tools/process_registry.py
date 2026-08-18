@@ -150,6 +150,15 @@ class ProcessRegistry:
         "no job control in this shell",
         "cannot set terminal process group",
         "tcsetattr: Inappropriate ioctl for device",
+        # Localized equivalents — bash translates these startup warnings when
+        # LANG/LC_MESSAGES is a non-English locale (e.g. zh_CN.UTF-8), so the
+        # English-only substrings above fail to match and the noise leaks
+        # through into background-process completion notifications.
+        "bash: 无法设定终端进程组",
+        "bash: 此 shell 中无任务控制",
+        "无法设定终端进程组",
+        "此 shell 中无任务控制",
+        "对设备不适当的 ioctl 操作",
     )
 
     def __init__(self):

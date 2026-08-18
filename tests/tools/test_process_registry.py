@@ -1225,3 +1225,57 @@ class TestTerminateHostPidPosix:
         pr.ProcessRegistry._terminate_host_pid(12345)
 
         assert kill_calls == [(12345, signal.SIGTERM)]
+
+
+# ------------------------------------------------------------------
+# _clean_shell_noise — localized (non-English) bash startup warnings
+# ------------------------------------------------------------------
+
+def test_clean_shell_noise_strips_english_bash_warnings():
+    """English bash job-control warnings at the start of output are stripped."""
+    noisy = (
+        "bash: cannot set terminal process group (123): Inappropriate ioctl for device\n"
+        "bash: no job control in this shell\n"
+        "real command output\n"
+    )
+    assert ProcessRegistry._clean_shell_noise(noisy) == "real command output\n"
+
+
+def test_clean_shell_noise_strips_chinese_bash_warnings():
+    """Chinese-locale (LANG=zh_CN.UTF-8) bash warnings are stripped too.
+
+    bash localizes these startup warnings, so the English-only substrings
+    previously missed them and the noise leaked into background-process
+    completion notifications (observed on a zh_CN.UTF-8 system).
+    """
+    noisy = (
+        "bash: 无法设定终端进程组 (-1): 对设备不适当的 ioctl 操作\n"
+        "bash: 此 shell 中无任务控制\n"
+        "real command output\n"
+    )
+    assert ProcessRegistry._clean_shell_noise(noisy) == "real command output\n"
+
+
+def test_clean_shell_noise_strips_multiple_leading_noise_lines():
+    """Several noise lines (mixed locale) before real output are all stripped."""
+    noisy = (
+        "bash: cannot set terminal process group (123): Inappropriate ioctl for device\n"
+        "bash: 此 shell 中无任务控制\n"
+        "bash: 无法设定终端进程组 (-1): 对设备不适当的 ioctl 操作\n"
+        "bash: no job control in this shell\n"
+        "output line 1\n"
+        "output line 2\n"
+    )
+    assert ProcessRegistry._clean_shell_noise(noisy) == "output line 1\noutput line 2\n"
+
+
+def test_clean_shell_noise_keeps_clean_output_unchanged():
+    """Output without shell startup noise is returned untouched."""
+    clean = "line 1\nline 2\n"
+    assert ProcessRegistry._clean_shell_noise(clean) == clean
+
+
+def test_clean_shell_noise_only_strips_leading_lines():
+    """A matching substring in the middle of output is NOT stripped."""
+    text = "first line\nbash: 此 shell 中无任务控制\nlast line\n"
+    assert ProcessRegistry._clean_shell_noise(text) == text
