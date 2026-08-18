@@ -67,4 +67,40 @@ class TestNormalizeCustomProviderEntry:
         assert result is not None
         assert result["base_url"] == "${PROVIDER_A_BASE_URL}"
 
+    def test_max_output_tokens_preserved_without_warning(self, caplog):
+        """max_output_tokens and max_tokens alias must be preserved in normalized
+        entry without triggering unknown key warning (#88997)."""
+        entry = {
+            "name": "ollama-local",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "ollama",
+            "model": "gpt-oss:20b-64k",
+            "max_output_tokens": 8192,
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _normalize_custom_provider_entry(entry, provider_key="ollama-local")
+        assert result is not None
+        assert result["max_output_tokens"] == 8192
+        assert not [r for r in caplog.records if "unknown config keys" in r.message.lower()]
 
+    def test_max_tokens_alias_and_camelcase_preserved(self, caplog):
+        """max_tokens and camelCase maxOutputTokens/maxTokens are preserved."""
+        entry1 = {
+            "name": "vllm-local",
+            "base_url": "http://localhost:8000/v1",
+            "api_key": "vllm",
+            "max_tokens": 4096,
+        }
+        result1 = _normalize_custom_provider_entry(entry1, provider_key="vllm-local")
+        assert result1 is not None
+        assert result1["max_output_tokens"] == 4096
+
+        entry2 = {
+            "name": "lmstudio-local",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "lmstudio",
+            "maxOutputTokens": 2048,
+        }
+        result2 = _normalize_custom_provider_entry(entry2, provider_key="lmstudio-local")
+        assert result2 is not None
+        assert result2["max_output_tokens"] == 2048
