@@ -20,6 +20,7 @@ import {
   $activeGatewayProfile,
   $gatewaySwapTarget,
   $newChatProfile,
+  ensureGatewayAgent,
   ensureGatewayProfile,
   normalizeProfileKey
 } from '@/store/profile'
@@ -734,7 +735,14 @@ export function useSessionActions({
         return
       }
 
-      await ensureGatewayProfile(sessionProfile)
+      // A row spliced from a CONNECTED registry gateway (#88880) carries its
+      // owning connection — activate THAT gateway, not a same-named local
+      // profile. Rows without the tag keep the legacy profile path.
+      if (storedForProfile?.connection_id) {
+        await ensureGatewayAgent(storedForProfile.connection_id, sessionProfile || 'default')
+      } else {
+        await ensureGatewayProfile(sessionProfile)
+      }
 
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
