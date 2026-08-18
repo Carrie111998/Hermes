@@ -45,8 +45,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -301,11 +303,28 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+def _safe_temp_dirname(file: Path, repo_root: Path) -> str:
+    """Build a filesystem-safe, unique-per-file basetemp dirname.
+
+    Derived from the test file's path relative to ``repo_root`` so runs are
+    stable/human-debuggable across retries, with non-alphanumeric
+    characters collapsed so the result is safe as a single path component
+    on both POSIX and Windows.
+    """
+    try:
+        rel = file.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        rel = file
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", str(rel)).strip("_")
+    return stem or "file"
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    runner_tmp_root: Path,
     retries: int = 0,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
@@ -341,14 +360,14 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, runner_tmp_root
     )
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, runner_tmp_root
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -376,10 +395,35 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    runner_tmp_root: Path,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
-    """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    """Single attempt of a per-file pytest subprocess (see _run_one_file).
+
+    Each subprocess gets its OWN isolated temp root under
+    ``runner_tmp_root`` (derived from the test file's path, filesystem-safe)
+    instead of sharing one across every concurrently-running subprocess.
+    Previously every subprocess inherited the parent's ``TMPDIR`` unchanged,
+    so pytest's own ``tmp_path_factory`` startup GC — which prunes old
+    sibling ``pytest-<N>`` dirs under that shared root with no cross-process
+    lock — could delete a still-running sibling's temp tree mid-test,
+    producing non-deterministic failures under concurrency (matches the
+    ~34-file swing observed between two otherwise-identical PR #28
+    verification runs). Giving each subprocess its own basetemp/TMPDIR
+    removes the shared mutable state entirely.
+    """
+    per_file_tmp = runner_tmp_root / _safe_temp_dirname(file, repo_root)
+    per_file_tmp.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, "-m", "pytest", str(file),
+        f"--basetemp={per_file_tmp}", *pytest_args,
+    ]
+
+    # Copy, don't forward, the parent environment: override TMPDIR per
+    # subprocess so any raw tempfile.* usage (not routed through pytest's
+    # tmp_path/--basetemp machinery) is also isolated per file.
+    subproc_env = dict(os.environ)
+    subproc_env["TMPDIR"] = str(per_file_tmp)
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -388,7 +432,7 @@ def _run_one_file_once(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
+        env=subproc_env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
@@ -1095,21 +1139,37 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
-        for file in files:
-            t0 = time.monotonic()
-            fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
-            )
-            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
-            futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+    # Runner-owned temp root: each subprocess gets its own isolated
+    # sub-directory under here (see _run_one_file_once), so concurrently
+    # running subprocesses never share a mutable TMPDIR/basetemp again.
+    # Placed under the parent's TMPDIR (or the OS default) so it still
+    # lands on whatever disk-backed location the caller configured.
+    parent_tmp_base = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    runner_tmp_root = parent_tmp_base / f"hermes-run-tests-parallel-{os.getpid()}-{int(time.time())}"
+    runner_tmp_root.mkdir(parents=True, exist_ok=True)
+    try:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures: List[Future] = []
+            for file in files:
+                t0 = time.monotonic()
+                fut = pool.submit(
+                    _run_one_file, file, pytest_passthrough, repo_root,
+                    args.file_timeout, runner_tmp_root, args.file_retries,
+                )
+                fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
+                futures.append(fut)
+            # Block until everything's done. ThreadPoolExecutor.__exit__ waits
+            # for all submitted work, but doing it explicitly here makes the
+            # control flow obvious.
+            for fut in futures:
+                fut.result() if fut.exception() is None else None
+    finally:
+        # Per-file basetemps aren't cleaned up by pytest's own automatic
+        # cross-run GC (that's the mechanism we just removed from the
+        # shared-TMPDIR race) — reclaim them ourselves once every subprocess
+        # has finished, so this doesn't silently leak disk space run over
+        # run.
+        shutil.rmtree(runner_tmp_root, ignore_errors=True)
 
     elapsed = time.monotonic() - started
     print()
