@@ -339,14 +339,14 @@ class TestCronDenyModeAllGuards:
             assert not result["approved"]
             assert "BLOCKED" in result["message"]
 
-    def test_tirith_import_error_fail_closed_blocks_in_cron_deny(self, monkeypatch):
+    def test_tirith_fail_closed_precedes_inherited_exec_ask(self, monkeypatch):
         """When tirith is unavailable and security.tirith_fail_open is false,
         cron-deny mode blocks rather than silently allowing (a cron session has
         no user to approve). Mirrors the fail-closed handling in the main flow."""
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
         from unittest.mock import patch as mock_patch
