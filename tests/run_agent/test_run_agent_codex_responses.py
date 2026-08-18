@@ -1451,6 +1451,15 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     agent.context_compressor.context_length = 20_000
     agent.context_compressor.threshold_tokens = 20_000
 
+    # Long enough to clear the protected head/tail window (production
+    # default protect_last_n=20): the pre-API gate is structurally
+    # eligibility-aware (#88778) and a turn-local-only message list would be
+    # refused as a guaranteed no-op before the wiring under test runs.
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(30)
+    ]
+
     responses = [
         _codex_tool_call_response(),
         _codex_message_response("Summary after compaction."),
@@ -1483,7 +1492,9 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
     monkeypatch.setattr(agent, "_compress_context", _fake_compress_context)
 
-    result = agent.run_conversation("do a tool-heavy task")
+    result = agent.run_conversation(
+        "do a tool-heavy task", conversation_history=history
+    )
 
     assert result["completed"] is True
     assert result["final_response"] == "Summary after compaction."
@@ -1517,6 +1528,14 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     agent.context_compressor.context_length = 20_000
     agent.context_compressor.threshold_tokens = 20_000
 
+    # Same protection-window clearance as the sibling test above (#88778):
+    # the mid-turn pre-API gate refuses structurally ineligible passes, so
+    # the history must extend past the protected head/tail window.
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(30)
+    ]
+
     agent._session_db = SessionDB()
     agent._ensure_db_session()
 
@@ -1548,7 +1567,9 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
     monkeypatch.setattr(agent, "_compress_context", _fake_compress_context)
 
-    result = agent.run_conversation("do a tool-heavy task")
+    result = agent.run_conversation(
+        "do a tool-heavy task", conversation_history=history
+    )
     assert result["completed"] is True
 
     # The compacted summary row must appear exactly once in the active
