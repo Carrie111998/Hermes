@@ -1076,10 +1076,14 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
+    # Tri-state semantics (fail closed on explicit empty grant), same as the
+    # local path: None -> legacy default (allow all); [] -> explicit deny-all
+    # (do NOT broaden back to the full sandbox allowlist); [...] -> intersection.
+    if enabled_tools is None:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    else:
+        session_tools = set(enabled_tools)
+        sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1333,12 +1337,21 @@ def execute_code(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
+    # Determine which tools the sandbox can call.
+    # Tri-state semantics (fail closed on explicit empty grant):
+    #   - None  -> legacy default: no explicit restriction, allow all sandbox tools
+    #   - []    -> EXPLICIT empty grant: deny everything (fail closed) — an
+    #              empty set is a real restriction, NOT "no restriction"
+    #   - [...] -> intersection of the requested set with the sandbox allowlist
+    if enabled_tools is None:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    else:
+        session_tools = set(enabled_tools)
+        sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
+        # Do NOT broaden an empty (explicit deny-all) grant back to the full
+        # sandbox allowlist — that would turn "no tools" into "every tool".
+        # `[]` means deny-all; the generated module will carry no tool stubs
+        # and RPC will reject every tool call (#84271).
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")

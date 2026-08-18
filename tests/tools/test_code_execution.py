@@ -117,6 +117,41 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("with _seq_lock:", src)
 
 
+class TestExecuteCodeTriStateDenyAll(unittest.TestCase):
+    """Regression for #84271: an explicit empty enabled_tools=[] must FAIL
+    CLOSED (deny all), not broaden back to every sandbox tool."""
+
+    def _sandbox_tools_for(self, enabled_tools):
+        """Reproduce the tri-state decision the local + remote paths now make."""
+        from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS
+        if enabled_tools is None:
+            return set(SANDBOX_ALLOWED_TOOLS)
+        return set(SANDBOX_ALLOWED_TOOLS) & set(enabled_tools)
+
+    def test_none_allows_all(self):
+        self.assertEqual(
+            self._sandbox_tools_for(None),
+            set(SANDBOX_ALLOWED_TOOLS),
+        )
+
+    def test_empty_denies_all(self):
+        # Explicit empty grant must yield ZERO tools (fail closed).
+        self.assertEqual(self._sandbox_tools_for([]), set())
+
+    def test_nonempty_is_intersection(self):
+        self.assertEqual(
+            self._sandbox_tools_for(["terminal"]),
+            {"terminal"},
+        )
+
+    def test_empty_does_not_broaden_to_all(self):
+        # The actual bug: previously `[]` broadened back to SANDBOX_ALLOWED_TOOLS.
+        tools = self._sandbox_tools_for([])
+        self.assertNotEqual(tools, set(SANDBOX_ALLOWED_TOOLS))
+        self.assertEqual(tools, set())
+
+
+
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:
@@ -630,12 +665,15 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
 
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_nonoverlapping_tools_fallback(self):
-        """When enabled_tools has no overlap with SANDBOX_ALLOWED_TOOLS,
-        should fall back to all allowed tools."""
+    def test_nonoverlapping_tools_deny_all(self):
+        """When enabled_tools has no overlap with SANDBOX_ALLOWED_TOOLS, the
+        sandbox must DENY all tools (fail closed) — not fall back to the full
+        allowlist. Regression for #84271: an explicit non-empty grant of
+        non-sandbox tools (e.g. vision_analyze, browser_snapshot) previously
+        broadened to every sandbox tool."""
         code = (
             "from hermes_tools import terminal\n"
-            "print('fallback ok')\n"
+            "print('should not run')\n"
         )
         with patch("model_tools.handle_function_call",
                     return_value=json.dumps({"ok": True})):
@@ -643,8 +681,9 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
                 code, task_id="test-nonoverlap",
                 enabled_tools=["vision_analyze", "browser_snapshot"],
             ))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("fallback ok", result["output"])
+        # The `terminal` stub is NOT generated for a deny-all grant, so the
+        # import fails and execution does not succeed.
+        self.assertNotEqual(result.get("status"), "success")
 
 
 # ---------------------------------------------------------------------------
