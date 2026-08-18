@@ -3,7 +3,8 @@ user_inbound_message and action events in a 4-hour window.
 
 Per design spec: docs/superpowers/specs/2026-04-28-scribe-action-telemetry-and-voice-tuning-design.md
 
-State persisted at ~/.hermes/profiles/scribe/workspace/action_telemetry.json.
+State persisted at <hermes-root>/profiles/scribe/workspace/action_telemetry.json
+(resolved per call via events.paths, never snapshotted at import).
 Critic reads completed_digests during weekly retros.
 """
 from __future__ import annotations
@@ -14,14 +15,26 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from events import paths
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-STATE_PATH = Path(os.path.expanduser(
-    "~/.hermes/profiles/scribe/workspace/action_telemetry.json"
-))
+
+def _state_path() -> Path:
+    """Resolved per call, never at import.
+
+    This was a module constant built from ``os.path.expanduser("~/...")``,
+    which ignores HERMES_HOME entirely (and on Windows ignores $HOME too --
+    ntpath.expanduser reads USERPROFILE). Every test that drove a subscriber
+    poll therefore rewrote the developer's real scribe workspace. Going
+    through events.paths keeps the production location identical while
+    letting the test harness redirect it.
+    """
+    return paths.scribe_action_telemetry_path()
+
+
 SCHEMA_VERSION = 1
 WINDOW_HOURS_DEFAULT = 4
 COMPLETED_RETENTION_DAYS = 30
@@ -45,10 +58,11 @@ def _load_state() -> dict:
         "active_digests": [],
         "completed_digests": [],
     }
-    if not STATE_PATH.exists():
+    state_path = _state_path()
+    if not state_path.exists():
         return fresh
     try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(state_path.read_text(encoding="utf-8"))
         if data.get("schema_version") != SCHEMA_VERSION:
             logger.warning("action_telemetry: schema mismatch, resetting")
             return fresh
@@ -61,10 +75,11 @@ def _load_state() -> dict:
 
 
 def _save_state(data: dict) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".json.tmp")
+    state_path = _state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, STATE_PATH)
+    os.replace(tmp, state_path)
 
 
 class ScribeActionTelemetry(BaseSubscriber):

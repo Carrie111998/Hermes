@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._home_isolation import redirect_home
 from gateway import status as gw_status
 from hermes_cli import gateway as gw
 
@@ -183,6 +184,28 @@ class TestCleanupGatewayStateFiles:
 
 
 class TestLaunchGatewayDetached:
+    @pytest.fixture(autouse=True)
+    def _isolate_detached_gateway_logs(self, tmp_path, monkeypatch):
+        """Keep the detached-spawn log files out of the developer's ~/.claude.
+
+        ``launch_gateway_detached`` opens its child's stdout/stderr at
+        ``Path.home() / ".claude" / "logs" / "hermes-gateway.{out,err}.log"``
+        (gateway.py ~:1733-1745) BEFORE it calls ``subprocess.Popen`` -- so
+        mocking Popen, as every test in this class does, does not stop the
+        open. An audit hook caught all three tests mkdir'ing the real
+        ``~/.claude/logs`` and opening the two live gateway logs.
+
+        Append mode ("ab") meant nothing was truncated and the mocked Popen
+        wrote nothing, so no data was lost -- but the files are real forensic
+        logs shared with gateway_watchdog._restart_gateway and
+        laptop-start.ps1, and a test has no business holding handles on them.
+
+        ``redirect_home`` works here (unlike the shell-based tilde test in
+        tests/tools/test_file_tools_live.py) because this path is resolved by
+        ``Path.home()`` inside THIS process.
+        """
+        redirect_home(monkeypatch, tmp_path)
+
     def test_invokes_subprocess_popen_with_detach_flags(self, monkeypatch):
         """Smoke test: the helper must call subprocess.Popen with the
         ``hermes gateway run`` argv plus platform-appropriate detach

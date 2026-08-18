@@ -24,7 +24,9 @@ import gc
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,77 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ── HERMES_HOME must be pinned at IMPORT time, not per test ────────────────
+# The autouse ``_hermetic_environment`` fixture below redirects HERMES_HOME for
+# every test, but a fixture is function-scoped: it cannot run until collection
+# has already imported every test module. Several production modules do real
+# work to the Hermes home *at import*, so by the time the first fixture fires,
+# the damage is done and is process-wide:
+#
+#   * ``tools/approval.py`` ends with a module-level ``load_permanent_allowlist()``
+#     -> ``load_config()`` -> ``ensure_hermes_home()``, which mkdir+chmods the
+#     whole live tree (``cron/ sessions/ logs/ logs/curator/ memories/ pairing/
+#     hooks/ image_cache/ audio_cache/ skills/``) and the ``~/.hermes`` root.
+#   * ``hermes_cli/main.py`` calls ``setup_logging()`` at module level, which
+#     attaches a RotatingFileHandler to the ROOT logger pointed at the real
+#     ``logs/agent.log`` and sets ``hermes_logging._logging_initialized``. Every
+#     later call is then a no-op, so *every log record the rest of the session
+#     emits* — from any test — lands in the developer's production log. That is
+#     how ``agent.log`` filled with test turns against fabricated providers, and
+#     how a ``Shutdown watchdog fired after 0s`` CRITICAL line carrying a
+#     ``pytest-of-<user>`` tmpdir path got into ``agent.log.3``/``errors.log.2``,
+#     falsifying an absence proof drawn from grepping those logs.
+#   * ``hermes_cli/banner.py``'s background update-check thread writes
+#     ``profiles/<p>/.update_check``.
+#
+# Pinning the env var here — before pytest imports a single test module — makes
+# all of them resolve into a throwaway directory instead. The per-test fixture
+# still narrows HERMES_HOME to ``tmp_path`` for isolation between tests; this
+# only closes the window that opens before any test exists.
+#
+# Verified with an audit hook (``tests/_live_root_audit.py``): 89 writes into
+# the real home during collection alone, every one attributed to
+# ``<import/collection>`` rather than to any test.
+# The developer's real Hermes tree. NOTE this repo lives *inside* it
+# (~/.hermes/agent-src/...), so anything comparing against it must exclude
+# PROJECT_ROOT or it will reject the checkout under test.
+_REAL_HERMES_ROOT = Path(os.path.expanduser("~")).resolve() / ".hermes"
+
+_SESSION_HERMES_HOME = None
+
+
+def _pin_hermes_home_before_collection():
+    """Point HERMES_HOME at a throwaway dir unless it is already redirected."""
+    global _SESSION_HERMES_HOME
+
+    real_root = _REAL_HERMES_ROOT
+    current = os.environ.get("HERMES_HOME")
+    if current:
+        try:
+            resolved = Path(current).resolve()
+        except OSError:
+            resolved = None
+        # Respect a HERMES_HOME the caller already redirected (CI, docker,
+        # a deliberate profile run). Only override one that still resolves
+        # into the developer's live tree -- or, of course, an unset one.
+        if resolved is not None and resolved != real_root and real_root not in resolved.parents:
+            return
+
+    session_home = Path(tempfile.mkdtemp(prefix="hermes-collection-home-"))
+    # Same layout ensure_hermes_home() would create, so import-time code that
+    # expects these to exist finds them without touching the real tree.
+    for subdir in (
+        "cron", "sessions", "logs", "logs/curator", "memories",
+        "pairing", "hooks", "image_cache", "audio_cache", "skills",
+    ):
+        (session_home / subdir).mkdir(parents=True, exist_ok=True)
+    os.environ["HERMES_HOME"] = str(session_home)
+    _SESSION_HERMES_HOME = session_home
+
+
+_pin_hermes_home_before_collection()
 
 
 # ── importorskip husk guard ────────────────────────────────────────────────
@@ -480,6 +553,21 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+    # 3b. Gateway scope locks are MACHINE-local, not HERMES_HOME-local:
+    #     gateway.status._get_lock_dir() resolves
+    #     $HERMES_GATEWAY_LOCK_DIR -> $XDG_STATE_HOME/hermes/gateway-locks ->
+    #     ~/.local/state/hermes/gateway-locks. The last of those is a
+    #     Path.home() call, so redirecting HERMES_HOME does nothing for it and
+    #     any test that drives a real platform connect() takes a lock in the
+    #     developer's live state dir -- and can collide with a running gateway.
+    #     Fifteen-odd tests already set this by hand (tests/gateway/test_status.py,
+    #     test_platform_lock_takeover.py, tests/hermes_cli/test_gateway_restart_helpers.py);
+    #     tests/gateway/test_qqbot.py did not, and an audit hook caught it
+    #     writing ~/.local/state/hermes/gateway-locks/qqbot-appid-*.lock.
+    #     Defaulting it here covers the ones nobody remembered. Tests that set
+    #     it themselves still win -- their monkeypatch runs after this fixture.
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "gateway_locks"))
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
@@ -2420,3 +2508,74 @@ def pytest_runtest_teardown(item, nextitem):
         _collect_armed = bool(_sqlite_opened_since_collect)
         _sqlite_opened_since_collect = 0
         gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_checkout_on_sys_path():
+    """Strip live-``~/.hermes`` entries a test leaves behind on ``sys.path``.
+
+    Several tests exec a DEPLOYED script out of the live Hermes root --
+    ``tests/devflow_delegation/test_observability.py::_load_observability``
+    walks its own ancestors up out of the worktree until it finds
+    ``profiles/main/scripts/devflow_observability.py`` and ``exec_module``s it.
+    That script's line 34 is::
+
+        sys.path.insert(0, str(HERMES_ROOT / "agent-src"))
+
+    which is correct for the script and catastrophic for the test process: the
+    entry is never removed, so it accumulates (22 copies after that one file)
+    and sits AHEAD of the checkout under test. Every later first-time import of
+    a Hermes package then comes from the shared ``~/.hermes/agent-src``
+    checkout instead of this worktree.
+
+    Measured: after that file, ``events.subscribers.scribe_action_telemetry``
+    resolved to the shared checkout, so a full-suite audit reported live-root
+    writes from code that had already been fixed here. Worse, the repo runs
+    ``pytest-randomly`` by default, so which tests get the deployed copy varies
+    run to run -- a verification can pass or fail on ordering alone.
+
+    Only entries that (a) were not present before the test and (b) resolve
+    inside the real ``~/.hermes`` but outside this repo are removed, so a test
+    that legitimately extends ``sys.path`` is untouched. Deliberately NOT
+    evicting ``sys.modules``: anything already imported from the shared
+    checkout stays bound -- a narrower, known residue -- because blanket
+    eviction defangs monkeypatches other fixtures are holding.
+    """
+    before = list(sys.path)
+    try:
+        yield
+    finally:
+        if sys.path != before:
+            seen = set(before)
+            kept = []
+            for entry in sys.path:
+                if entry in seen:
+                    kept.append(entry)
+                    continue
+                try:
+                    resolved = Path(entry).resolve()
+                except (OSError, ValueError):
+                    kept.append(entry)
+                    continue
+                inside_live_hermes = (
+                    resolved == _REAL_HERMES_ROOT or _REAL_HERMES_ROOT in resolved.parents
+                )
+                inside_repo = resolved == PROJECT_ROOT or PROJECT_ROOT in resolved.parents
+                if inside_live_hermes and not inside_repo:
+                    continue
+                kept.append(entry)
+            sys.path[:] = kept
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Reclaim the collection-time HERMES_HOME pinned at conftest import.
+
+    ``ignore_errors`` because the import-time ``setup_logging()`` this
+    directory exists to absorb still holds an open handle on
+    ``logs/agent.log``, and on Windows that blocks the unlink. Leaving a few
+    KB in %TEMP% is the correct trade against failing a green run -- but do
+    not drop the call: a per-session temp home that is never removed is the
+    leak documented for the stress suite's e2e temp home.
+    """
+    if _SESSION_HERMES_HOME is not None:
+        shutil.rmtree(_SESSION_HERMES_HOME, ignore_errors=True)
