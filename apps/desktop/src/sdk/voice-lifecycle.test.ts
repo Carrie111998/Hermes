@@ -27,7 +27,13 @@ describe('host voice lifecycle', () => {
     const events: string[] = []
     const off = host.onVoiceEvent('*', event => events.push(event.type))
 
-    setVoicePlaybackState({ audioElement: null, messageId: null, sequence: 1, source: 'read-aloud', status: 'speaking' })
+    setVoicePlaybackState({
+      audioElement: null,
+      messageId: null,
+      sequence: 1,
+      source: 'read-aloud',
+      status: 'speaking'
+    })
     setVoicePlaybackState({ audioElement: null, messageId: null, sequence: 1, source: null, status: 'idle' })
 
     expect(events).toEqual(['tts_started', 'tts_ended'])
