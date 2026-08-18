@@ -4867,8 +4867,20 @@ def test_sample_file_pages_rejects_a_file_descriptor_like_path():
 
     Direct unit-level pin on the helper that actually performs the ``open``,
     so the guarantee survives a refactor of its caller.
+
+    ``open`` is patched rather than left live on purpose. Called for real with a
+    MagicMock this closes fd 1 -- verified: a bare ``os.fstat(1)`` afterwards
+    raises ``WinError 6``. A regression here must fail as a clean red, not by
+    destroying the session's stdout and truncating the very run that was meant to
+    catch it.
     """
-    assert kb._sample_file_pages(unittest.mock.MagicMock(), 4096) is None
+    with unittest.mock.patch("builtins.open") as mock_open:
+        assert kb._sample_file_pages(unittest.mock.MagicMock(), 4096) is None
+
+    assert not mock_open.called, (
+        f"open() was handed a non-str path; args={mock_open.call_args_list!r}. "
+        "A MagicMock there is read as file descriptor 1."
+    )
     # fd 1 unharmed.
     os.fstat(1)
 
