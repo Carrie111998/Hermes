@@ -279,10 +279,12 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  secondaryWindowSupportsVibrancy,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
@@ -300,7 +302,9 @@ import {
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {
+  effectiveTranslucencyState,
   glassActive,
+  nativeTranslucencyChanges,
   normalizeState as normalizeTranslucency,
   vibrancyFor as vibrancyForTranslucency,
   windowBackingOptions,
@@ -917,14 +921,23 @@ function writePersistedTranslucency(state) {
 
 let translucencyState = readPersistedTranslucency()
 
-// Chat windows whose webContents backing follows translucency (primary,
-// instance peers, session windows). The HUD / pet overlay / quick entry /
-// wake indicator are `transparent: true` windows that own their backgrounds —
-// painting a themed backing onto them would turn them into opaque rectangles.
-const translucencyBackedWindows = new WeakSet()
+interface ChatWindowSurface {
+  supportsVibrancy: boolean
+}
 
-function windowOpacity() {
-  return windowOpacityFor(translucencyState)
+const PRIMARY_CHAT_WINDOW_SURFACE: ChatWindowSurface = { supportsVibrancy: IS_MAC }
+
+// Chat windows whose webContents backing follows translucency (primary,
+// instance peers, session windows), plus whether that exact native window has
+// a material for Glass to ride. The HUD / pet overlay / quick entry / wake
+// indicator are `transparent: true` windows that own their backgrounds —
+// painting a themed backing onto them would turn them into opaque rectangles.
+const translucencyBackedWindows = new WeakMap<any, ChatWindowSurface>()
+
+function secondaryChatWindowSurface(): ChatWindowSurface {
+  return {
+    supportsVibrancy: secondaryWindowSupportsVibrancy({ isMac: IS_MAC, darwinMajor: DARWIN_MAJOR })
+  }
 }
 
 // Re-apply translucency to a live window (runtime toggle, no recreation).
@@ -935,12 +948,12 @@ function windowOpacity() {
 // every other state needs the opaque themed backing (anti-flash, and it is
 // what makes clear mode fade to the desktop instead of to black).
 //
-// `changed` says which native properties actually need touching. Dragging the
-// intensity slider emits ~100 updates, and in glass mode NONE of them change
-// anything native — the effect is painted by the renderer and windowOpacityFor
-// returns 1 throughout. Re-issuing setVibrancy on every tick restarts its
-// 150ms animation before macOS can settle the material, which reads as jank
-// and flattens the frost levels into each other.
+// The native diff is resolved per window. Dragging the intensity slider emits
+// ~100 updates: a material-backed Glass window still changes nothing native,
+// while a no-material Tahoe secondary/peer resolves Glass to Clear and updates
+// only its opacity. Re-issuing setVibrancy on every tick restarts its 150ms
+// animation before macOS can settle the material, which reads as jank and
+// flattens the frost levels into each other.
 //
 // CAUTION (measured, macOS 26 / Electron 40): a runtime
 // setBackgroundColor('#00000000') is silently LOST on a window whose
@@ -949,29 +962,38 @@ function windowOpacity() {
 // rely on this path: windows are BORN with the right backing
 // (windowBackingOptions at each creation site). This path only has to cover
 // live toggles from Settings, where the window is long settled.
-function applyWindowTranslucency(win, changed = { backing: true, material: true, opacity: true }) {
+function applyWindowTranslucency(win, previous, next) {
   if (!win || win.isDestroyed()) {
+    return
+  }
+
+  const surface = translucencyBackedWindows.get(win)
+  const supportsVibrancy = surface?.supportsVibrancy ?? true
+  const effective = effectiveTranslucencyState(next, supportsVibrancy)
+  const changed = nativeTranslucencyChanges(previous, next, supportsVibrancy)
+
+  if (!changed.backing && !changed.material && !changed.opacity) {
     return
   }
 
   try {
     // Backing swap + material are scoped to registered chat windows (see
     // translucencyBackedWindows above).
-    if (translucencyBackedWindows.has(win)) {
+    if (surface) {
       if (changed.backing && typeof win.setBackgroundColor === 'function') {
-        win.setBackgroundColor(glassActive(translucencyState) ? '#00000000' : getWindowBackgroundColor())
+        win.setBackgroundColor(glassActive(effective) ? '#00000000' : getWindowBackgroundColor())
       }
 
       // Glass frost level = the vibrancy material (macOS has no blur-radius
       // knob). Animate the hop so a deliberate frost switch feels continuous —
       // which only works if we don't re-issue it on unrelated updates.
-      if (changed.material && IS_MAC && typeof win.setVibrancy === 'function') {
-        win.setVibrancy(vibrancyForTranslucency(translucencyState), { animationDuration: 150 })
+      if (changed.material && supportsVibrancy && typeof win.setVibrancy === 'function') {
+        win.setVibrancy(vibrancyForTranslucency(effective), { animationDuration: 150 })
       }
     }
 
     if (changed.opacity && typeof win.setOpacity === 'function') {
-      win.setOpacity(windowOpacity())
+      win.setOpacity(windowOpacityFor(effective))
     }
   } catch (error) {
     rememberLog(`[translucency] apply failed: ${error.message}`)
@@ -981,26 +1003,29 @@ function applyWindowTranslucency(win, changed = { backing: true, material: true,
 // Constructor options every chat window shares for its translucency surface:
 // the vibrancy material, the native opacity, and the webContents backing under
 // the CURRENT state. Glass omits backgroundColor so vibrancy shows from the
-// first frame (a non-transparent window silently ignores constructor alpha,
-// and runtime swaps are lost early in a window's life — see
-// applyWindowTranslucency); otherwise the opaque themed anti-flash backing.
+// first frame. A no-material surface resolves Glass to Clear instead, retaining
+// the opaque themed backing and using native opacity. A non-transparent window
+// silently ignores constructor alpha, and runtime swaps are lost early in a
+// window's life — see applyWindowTranslucency.
 //
 // Call sites also register the window in translucencyBackedWindows so a live
 // toggle can re-apply. The HUD, pet overlay, quick entry and wake indicator
 // are `transparent: true` windows that own their backgrounds and are
 // deliberately not chat windows.
-function chatWindowSurfaceOptions() {
+function chatWindowSurfaceOptions(surface: ChatWindowSurface = PRIMARY_CHAT_WINDOW_SURFACE) {
+  const effective = effectiveTranslucencyState(translucencyState, surface.supportsVibrancy)
+
   return {
-    vibrancy: IS_MAC ? vibrancyForTranslucency(translucencyState) : undefined,
+    vibrancy: surface.supportsVibrancy ? vibrancyForTranslucency(effective) : undefined,
     // Pin the material to its ACTIVE appearance: several NSVisualEffectView
     // materials collapse to a shared inactive look when the window blurs
     // (measured on macOS 26: sidebar, popover and under-window composited
     // pixel-identically once unfocused), which would quietly erase the
     // user's frost choice whenever they click elsewhere. Only observable
     // under glass — everywhere else the page buries the material.
-    visualEffectState: IS_MAC ? ('active' as const) : undefined,
-    opacity: windowOpacity(),
-    ...windowBackingOptions(translucencyState, getWindowBackgroundColor())
+    visualEffectState: surface.supportsVibrancy ? ('active' as const) : undefined,
+    opacity: windowOpacityFor(effective),
+    ...windowBackingOptions(effective, getWindowBackgroundColor())
   }
 }
 
@@ -10842,6 +10867,7 @@ function focusWindow(win) {
 
 function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
   const icon = getAppIconPath()
+  const surface = secondaryChatWindowSurface()
 
   const win = new BrowserWindow({
     width: SESSION_WINDOW_MIN_WIDTH,
@@ -10852,7 +10878,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
-    ...chatWindowSurfaceOptions(),
+    ...chatWindowSurfaceOptions(surface),
     icon,
     // Don't show until the renderer's first themed paint is ready. macOS
     // `vibrancy` ignores `backgroundColor` and paints a translucent OS
@@ -10865,8 +10891,8 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
   })
 
   // Chat-surface registration: applyWindowTranslucency swaps this window's
-  // backing between opaque-themed and alpha-0 when glass toggles.
-  translucencyBackedWindows.add(win)
+  // backing when supported, or keeps the no-material Clear fallback live.
+  translucencyBackedWindows.set(win, surface)
 
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
@@ -10903,6 +10929,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+      supportsVibrancy: surface.supportsVibrancy,
       watch
     }),
     'Session window'
@@ -10945,6 +10972,7 @@ function nextInstanceBounds() {
 // plain renderer URL so the full app renders.
 function createInstanceWindow() {
   const icon = getAppIconPath()
+  const surface = secondaryChatWindowSurface()
 
   const win = new BrowserWindow({
     ...nextInstanceBounds(),
@@ -10954,7 +10982,7 @@ function createInstanceWindow() {
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
-    ...chatWindowSurfaceOptions(),
+    ...chatWindowSurfaceOptions(surface),
     icon,
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
@@ -10963,7 +10991,7 @@ function createInstanceWindow() {
   instanceWindows.add(win)
 
   // Chat-surface registration: see applyWindowTranslucency.
-  translucencyBackedWindows.add(win)
+  translucencyBackedWindows.set(win, surface)
 
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
@@ -11000,7 +11028,15 @@ function createInstanceWindow() {
   })
 
   attachRendererConsoleCapture(win, 'instance', rememberLog)
-  loadWindowUrl(win, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Instance window')
+  loadWindowUrl(
+    win,
+    buildInstanceWindowUrl({
+      devServer: DEV_SERVER,
+      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+      supportsVibrancy: surface.supportsVibrancy
+    }),
+    'Instance window'
+  )
 
   return win
 }
@@ -11833,7 +11869,7 @@ function createWindow() {
   const createdMainWindow = mainWindow
 
   // Chat-surface registration: see applyWindowTranslucency.
-  translucencyBackedWindows.add(mainWindow)
+  translucencyBackedWindows.set(mainWindow, PRIMARY_CHAT_WINDOW_SURFACE)
 
   if (IS_MAC) {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
@@ -14040,12 +14076,12 @@ ipcMain.on('hermes:native-theme', (_event, mode) => {
 // runtime (no recreation, so caching/sessions are untouched).
 //
 // The intensity slider is a HOT path: ~100 updates per drag. Two things make
-// that cheap. Native work is diffed, so an intensity-only change under glass
-// touches nothing (it's painted by the renderer). And the disk write is
-// coalesced onto a trailing timer, because writePersistedTranslucency is a
-// synchronous writeFileSync and doing one per tick blocks the main process
-// mid-drag. Only a cold launch reads that file, so it just has to be correct
-// once the hand comes off the slider.
+// that cheap. Native work is diffed per window, so an intensity-only change
+// under material-backed Glass touches nothing; only a no-material Clear
+// fallback updates opacity. And the disk write is coalesced onto a trailing
+// timer, because writePersistedTranslucency is a synchronous writeFileSync and
+// doing one per tick blocks the main process mid-drag. Only a cold launch reads
+// that file, so it just has to be correct once the hand comes off the slider.
 let translucencyWriteTimer = null
 
 function scheduleTranslucencyWrite() {
@@ -14084,21 +14120,13 @@ ipcMain.on('hermes:translucency', (_event, payload) => {
 
   translucencyState = next
 
-  // Which native properties actually moved. `scope` is renderer-only (which
-  // surfaces thin), so it never appears here.
-  const changed = {
-    // The backing follows whether glass is ON, not the intensity behind it.
-    backing: glassActive(previous) !== glassActive(next),
-    material: vibrancyForTranslucency(previous) !== vibrancyForTranslucency(next),
-    opacity: windowOpacityFor(previous) !== windowOpacityFor(next)
-  }
-
   scheduleTranslucencyWrite()
 
-  if (changed.backing || changed.material || changed.opacity) {
-    for (const win of BrowserWindow.getAllWindows()) {
-      applyWindowTranslucency(win, changed)
-    }
+  // Resolve the native diff per window: a material-backed Glass window does no
+  // native work while its intensity moves, while a Tahoe secondary/peer maps
+  // that same selected state to Clear and must update opacity on every tick.
+  for (const win of BrowserWindow.getAllWindows()) {
+    applyWindowTranslucency(win, previous, next)
   }
 })
 

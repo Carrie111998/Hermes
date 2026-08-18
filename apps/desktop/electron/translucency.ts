@@ -11,12 +11,19 @@
  * then fail to bundle.
  */
 
-import { glassActive, type TranslucencyState } from '../../shared/src/translucency'
+import {
+  effectiveTranslucencyState,
+  glassActive,
+  type TranslucencyState,
+  vibrancyFor,
+  windowOpacityFor
+} from '../../shared/src/translucency'
 
 export {
   clampIntensity,
   DEFAULT_GLASS_MATERIAL,
   DEFAULT_GLASS_SCOPE,
+  effectiveTranslucencyState,
   GLASS_MATERIALS,
   GLASS_SCOPES,
   glassActive,
@@ -34,6 +41,22 @@ export {
   vibrancyFor,
   windowOpacityFor
 } from '../../shared/src/translucency'
+
+/** Native properties that differ between two states for one window surface. */
+export function nativeTranslucencyChanges(
+  previous: TranslucencyState,
+  next: TranslucencyState,
+  supportsVibrancy: boolean
+) {
+  const previousEffective = effectiveTranslucencyState(previous, supportsVibrancy)
+  const nextEffective = effectiveTranslucencyState(next, supportsVibrancy)
+
+  return {
+    backing: glassActive(previousEffective) !== glassActive(nextEffective),
+    material: vibrancyFor(previousEffective) !== vibrancyFor(nextEffective),
+    opacity: windowOpacityFor(previousEffective) !== windowOpacityFor(nextEffective)
+  }
+}
 
 /**
  * BrowserWindow constructor options for a chat window's backing, given the

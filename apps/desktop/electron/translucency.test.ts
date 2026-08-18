@@ -14,11 +14,13 @@ import {
   clampIntensity,
   DEFAULT_GLASS_MATERIAL,
   DEFAULT_GLASS_SCOPE,
+  effectiveTranslucencyState,
   GLASS_MATERIALS,
   GLASS_SCOPES,
   glassActive,
   type GlassMaterial,
   glassSurfaceKeep,
+  nativeTranslucencyChanges,
   normalizeMaterial,
   normalizeMode,
   normalizeScope,
@@ -298,6 +300,31 @@ describe('windowBackingOptions', () => {
     expect(windowBackingOptions(glass(0), '#111111')).toEqual({ backgroundColor: '#111111' })
     expect(windowBackingOptions(clear(60), '#111111')).toEqual({ backgroundColor: '#111111' })
     expect(windowBackingOptions(clear(0), '#f7f7f7')).toEqual({ backgroundColor: '#f7f7f7' })
+  })
+})
+
+describe('a chat window without native vibrancy', () => {
+  it('falls a selected Glass state back to Clear without changing the saved choice', () => {
+    const selected = glass(60, 'header')
+    const effective = effectiveTranslucencyState(selected, false)
+
+    expect(selected.mode).toBe('glass')
+    expect(effective).toEqual({ ...selected, mode: 'clear' })
+    expect(windowBackingOptions(effective, '#111111')).toEqual({ backgroundColor: '#111111' })
+    expect(windowOpacityFor(effective)).toBeLessThan(1)
+  })
+
+  it('turns Glass slider ticks into native opacity updates only for the Clear fallback', () => {
+    expect(nativeTranslucencyChanges(glass(40), glass(41), true)).toEqual({
+      backing: false,
+      material: false,
+      opacity: false
+    })
+    expect(nativeTranslucencyChanges(glass(40), glass(41), false)).toEqual({
+      backing: false,
+      material: false,
+      opacity: true
+    })
   })
 })
 

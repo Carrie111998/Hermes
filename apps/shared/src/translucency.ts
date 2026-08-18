@@ -132,6 +132,18 @@ export function normalizeState(payload: unknown, isMac: boolean): TranslucencySt
 }
 
 /**
+ * Resolve the user's shared setting for one native window surface.
+ *
+ * Glass is only meaningful when the window has a vibrancy material beneath
+ * the renderer. A window that deliberately omits that material must use the
+ * Clear mapping instead, while the persisted cross-window choice stays Glass
+ * for windows that can support it.
+ */
+export function effectiveTranslucencyState(state: TranslucencyState, supportsVibrancy: boolean): TranslucencyState {
+  return state.mode === 'glass' && !supportsVibrancy ? { ...state, mode: 'clear' } : state
+}
+
+/**
  * Native window opacity for a state. Glass never fades the native window — its
  * see-through effect is painted by the renderer over the vibrancy material.
  */
