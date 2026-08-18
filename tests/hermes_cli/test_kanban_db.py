@@ -675,6 +675,41 @@ def test_create_worktree_task_rejects_primary_checkout_branch_reuse(
             )
 
 
+@pytest.mark.parametrize("branch", ["bad..name", "bad~name", "bad^name", "bad name"])
+def test_create_worktree_task_rejects_invalid_branch_name(
+    kanban_home, tmp_path, branch,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="invalid branch name"):
+            kb.create_task(
+                conn,
+                title="invalid branch",
+                workspace_kind="worktree",
+                workspace_path=str(repo),
+                branch_name=branch,
+            )
+
+
+def test_worktree_inspection_failure_is_logged_and_fails_closed(
+    tmp_path, monkeypatch, caplog,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    def fail_worktree_list(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("git worktree list", 30)
+
+    monkeypatch.setattr(kb.subprocess, "run", fail_worktree_list)
+
+    with pytest.raises(kb.WorktreeInspectionError, match="could not inspect Git worktrees"):
+        kb._git_worktrees_for_branch(repo, "wt/inspection-failure")
+
+    assert "could not inspect Git worktrees" in caplog.text
+
+
 @pytest.mark.parametrize("status", ["ready", "review"])
 def test_dispatch_blocks_worktree_branch_collision_without_retry(
     kanban_home, tmp_path, monkeypatch, status,
@@ -716,6 +751,57 @@ def test_dispatch_blocks_worktree_branch_collision_without_retry(
     assert task.consecutive_failures == 1
     assert task.last_failure_error is not None
     assert "already checked out" in task.last_failure_error
+
+    assert kb.unblock_task(conn, task_id)
+    unblocked = kb.get_task(conn, task_id)
+    assert unblocked is not None
+    assert unblocked.status == status
+    assert unblocked.consecutive_failures == 0
+    assert unblocked.last_failure_error is None
+
+
+def test_dispatch_blocks_worktree_inspection_failure_without_retry(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    branch = "wt/inspection-failure"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="verify inspection failure",
+            assignee="coder",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+        )
+
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        kb,
+        "_git_worktrees_for_branch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            kb.WorktreeInspectionError(
+                "could not inspect Git worktrees: git worktree list timed out"
+            )
+        ),
+    )
+
+    with kb.connect() as conn:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: 123,
+            failure_limit=99,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned == []
+    assert result.auto_blocked == [task_id]
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 1
+    assert task.last_failure_error is not None
+    assert "could not inspect Git worktrees" in task.last_failure_error
 
 
 def test_dispatch_blocks_branch_collision_created_during_worktree_add(

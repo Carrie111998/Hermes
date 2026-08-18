@@ -3001,6 +3001,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if branch_name:
+        branch_name = validate_branch_name(branch_name)
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -7234,6 +7236,41 @@ class WorktreeBranchConflictError(ValueError):
     """A requested branch is already checked out by another worktree."""
 
 
+class WorktreeInspectionError(RuntimeError):
+    """Git could not report the repository's registered worktrees."""
+
+
+def validate_branch_name(branch_name: str) -> str:
+    """Validate a branch name before any worktree inspection or creation."""
+    candidate = str(branch_name).strip()
+    if not candidate:
+        raise ValueError("branch name must not be empty")
+    try:
+        result = subprocess.run(
+            ["git", "check-ref-format", "--branch", candidate],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"could not validate branch name {candidate!r}: git is unavailable"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "invalid Git branch name").strip()
+        raise ValueError(f"invalid branch name {candidate!r}: {detail}")
+    return candidate
+
+
+def _worktree_branch_conflict_message(branch_name: str, conflict: Path) -> str:
+    """Build the user-facing message for a branch checkout conflict."""
+    return (
+        f"branch {branch_name!r} is already checked out at {conflict}; "
+        "use that exact linked worktree path to reuse it, or choose another branch"
+    )
+
+
 def _same_path(left: Path, right: Path) -> bool:
     """Compare paths after resolving links and normalizing Windows case."""
     return os.path.normcase(str(left.resolve(strict=False))) == os.path.normcase(
@@ -7256,10 +7293,23 @@ def _git_worktrees_for_branch(repo_root: Path, branch_name: str) -> list[Path]:
             timeout=30,
             check=False,
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        _log.warning(
+            "could not inspect Git worktrees for branch %r in %s: %s",
+            branch_name, repo_root, exc,
+        )
+        raise WorktreeInspectionError(
+            f"could not inspect Git worktrees in {repo_root}: {exc}"
+        ) from exc
     if result.returncode != 0:
-        return []
+        detail = (result.stderr or result.stdout or "unknown git error").strip()
+        _log.warning(
+            "git worktree inspection failed for branch %r in %s (exit %s): %s",
+            branch_name, repo_root, result.returncode, detail,
+        )
+        raise WorktreeInspectionError(
+            f"could not inspect Git worktrees in {repo_root}: {detail}"
+        )
 
     checkouts: list[Path] = []
     checkout: Optional[Path] = None
@@ -7289,6 +7339,7 @@ def _worktree_branch_conflict(
 def _validate_worktree_branch_available(target: Path, branch_name: str) -> None:
     """Reject implicit reuse of a branch checked out by another worktree."""
     target = target.expanduser()
+    branch_name = validate_branch_name(branch_name)
     requested = target.resolve(strict=False)
     repo_root = _git_toplevel(target) or _repo_root_for_worktree_target(target.parent)
     if repo_root is None:
@@ -7307,8 +7358,7 @@ def _validate_worktree_branch_available(target: Path, branch_name: str) -> None:
         checkouts[0],
     )
     raise WorktreeBranchConflictError(
-        f"branch {branch_name!r} is already checked out at {conflict}; "
-        "use that exact linked worktree path to reuse it, or choose another branch"
+        _worktree_branch_conflict_message(branch_name, conflict)
     )
 
 
@@ -7433,6 +7483,7 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
+    branch_name = validate_branch_name(branch_name)
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
@@ -7442,8 +7493,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     conflict = _worktree_branch_conflict(repo_root, target, branch_name)
     if conflict is not None:
         raise WorktreeBranchConflictError(
-            f"branch {branch_name!r} is already checked out at {conflict}; "
-            "use that exact linked worktree path to reuse it, or choose another branch"
+            _worktree_branch_conflict_message(branch_name, conflict)
         )
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -7465,8 +7515,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         conflict = _worktree_branch_conflict(repo_root, target, branch_name)
         if conflict is not None:
             raise WorktreeBranchConflictError(
-                f"branch {branch_name!r} is already checked out at {conflict}; "
-                "use that exact linked worktree path to reuse it, or choose another branch"
+                _worktree_branch_conflict_message(branch_name, conflict)
             )
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
@@ -7488,6 +7537,7 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = validate_branch_name(branch_name)
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -9652,11 +9702,13 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            is_branch_conflict = isinstance(exc, WorktreeBranchConflictError)
+            is_terminal_workspace_failure = isinstance(
+                exc, (WorktreeBranchConflictError, WorktreeInspectionError)
+            )
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
-                force_trip=is_branch_conflict,
+                force_trip=is_terminal_workspace_failure,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -9774,11 +9826,13 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            is_branch_conflict = isinstance(exc, WorktreeBranchConflictError)
+            is_terminal_workspace_failure = isinstance(
+                exc, (WorktreeBranchConflictError, WorktreeInspectionError)
+            )
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
-                force_trip=is_branch_conflict,
+                force_trip=is_terminal_workspace_failure,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)

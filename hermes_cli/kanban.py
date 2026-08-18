@@ -130,7 +130,10 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
         raise argparse.ArgumentTypeError("--branch must not start with '-'")
     if any(ch.isspace() for ch in branch):
         raise argparse.ArgumentTypeError("--branch must not contain whitespace")
-    return branch
+    try:
+        return kb.validate_branch_name(branch)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _check_dispatcher_presence(
