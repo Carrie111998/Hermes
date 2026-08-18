@@ -4191,7 +4191,8 @@ class AIAgent:
             now = time.monotonic()
             if getattr(self, "_account_usage_refresh_inflight", False):
                 return False
-            if now - getattr(self, "_account_usage_refreshed_at", 0.0) < 300.0:
+            refreshed_at = getattr(self, "_account_usage_refreshed_at", None)
+            if refreshed_at is not None and now - refreshed_at < 300.0:
                 return False
             self._account_usage_refresh_inflight = True
             self._account_usage_refreshed_at = now
