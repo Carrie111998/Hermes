@@ -57,7 +57,7 @@ function runtime() {
   return context
 }
 
-test('botConnectionRoute: remote rows get a route descriptor, local rows do not', () => {
+test('botConnectionRoute: every explicit non-active source gets a route descriptor', () => {
   const ctx = runtime()
   const { botConnectionRoute } = ctx.__x
 
@@ -73,9 +73,22 @@ test('botConnectionRoute: remote rows get a route descriptor, local rows do not'
     profile: 'dixie',
     targetProfile: 'dixie'
   })
+
+  const localRoute = botConnectionRoute({
+    name: 'archie',
+    connectionId: 'local',
+    connectionKind: 'local',
+    remoteSource: true
+  })
+  assert.deepEqual(JSON.parse(JSON.stringify(localRoute)), {
+    connectionId: 'local',
+    mode: 'local',
+    profile: 'archie',
+    targetProfile: 'archie'
+  })
 })
 
-test('requestForBot: remote members go through requestProfile, local through host.request', async () => {
+test('requestForBot: source-scoped members route explicitly; active rows use host.request', async () => {
   const ctx = runtime()
   const calls = []
   ctx.host.request = async (method, params) => {
@@ -90,13 +103,21 @@ test('requestForBot: remote members go through requestProfile, local through hos
   const { requestForBot } = ctx.__x
 
   await requestForBot({ name: 'local-bot' }, 'session.create', { title: 'x' })
+  await requestForBot(
+    { name: 'archie', connectionId: 'local', connectionKind: 'local', remoteSource: true },
+    'prompt.submit',
+    { text: 'local hi' }
+  )
   await requestForBot({ name: 'dixie', connectionId: 'mac-mini', remoteSource: true }, 'prompt.submit', { text: 'hi' })
 
   assert.equal(calls[0][0], 'active')
   assert.equal(calls[0][1], 'session.create')
   assert.equal(calls[1][0], 'routed')
-  assert.equal(calls[1][1], 'mac-mini')
+  assert.equal(calls[1][1], 'local')
   assert.equal(calls[1][2], 'prompt.submit')
+  assert.equal(calls[2][0], 'routed')
+  assert.equal(calls[2][1], 'mac-mini')
+  assert.equal(calls[2][2], 'prompt.submit')
 })
 
 test('groupMemberKey: local members keep bare names (persisted-room compat), remote members are source-qualified', () => {
@@ -122,6 +143,41 @@ test('mentions: @name-device handle resolves the remote member; same-named agent
   const responders = resolveGroupResponders(log, members)
   assert.equal(responders.length, 1)
   assert.equal(responders[0].remoteSource, true)
+})
+
+test('mentions: a remote default profile answers to its friendly machine identity', () => {
+  const ctx = runtime()
+  const { parseGroupChatMentions, resolveGroupResponders } = ctx.__x
+  const members = [
+    {
+      name: 'default',
+      handle: 'default-maya',
+      connectionId: 'maya',
+      connectionKind: 'remote',
+      connectionLabel: 'Maya',
+      remoteSource: true
+    },
+    {
+      name: 'archie',
+      handle: 'archie',
+      connectionId: 'local',
+      connectionKind: 'local',
+      connectionLabel: 'This device',
+      remoteSource: true
+    }
+  ]
+
+  const parsed = parseGroupChatMentions('@Maya and @Archie introduce yourselves', members)
+  assert.deepEqual([...parsed.mentioned], ['maya::default', 'local::archie'])
+
+  const responders = resolveGroupResponders(
+    [{ from: { kind: 'user', name: 'You' }, text: '@Maya and @Archie hello', at: 1 }],
+    members
+  )
+  assert.deepEqual(
+    responders.map(member => `${member.connectionId}::${member.name}`),
+    ['maya::default', 'local::archie']
+  )
 })
 
 test('room lines and turn prompts badge cross-connection speakers with their device', () => {

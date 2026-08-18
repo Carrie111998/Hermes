@@ -334,6 +334,47 @@ export function parseRemoteProfileListing(text: string): string[] {
   return ['default', ...[...names].filter(name => name !== 'default').sort()]
 }
 
+/** Turn `/api/profiles` rows into roster names while respecting each
+ *  profile's own Bot Mode visibility. Unlike renderer-local metadata, this
+ *  flag belongs to the enumerated source, so hiding `default` on one machine
+ *  cannot hide a same-named agent on another. Older backends that omit the
+ *  root row still receive the compatibility `default` entry. */
+export function visibleApiProfileNames(rows: unknown): string[] {
+  if (!Array.isArray(rows)) {
+    return ['default']
+  }
+
+  const names = new Set<string>()
+  let sawDefault = false
+
+  for (const row of rows) {
+    const profile = row && typeof row === 'object' ? (row as Record<string, unknown>) : null
+    const name = String(profile?.name || '').trim()
+
+    if (!name || !PROFILE_NAME_RE.test(name)) {
+      continue
+    }
+
+    if (name === 'default') {
+      sawDefault = true
+    }
+
+    const uiMeta = profile?.ui_meta
+    const botMeta = uiMeta && typeof uiMeta === 'object' ? (uiMeta as Record<string, unknown>)['hermes-bots'] : null
+    const hidden = botMeta && typeof botMeta === 'object' && (botMeta as Record<string, unknown>).hidden === true
+
+    if (!hidden) {
+      names.add(name)
+    }
+  }
+
+  if (!sawDefault) {
+    return ['default', ...names]
+  }
+
+  return [...names]
+}
+
 /**
  * Flatten per-connection profile enumerations into the union roster, applying
  * the duplicate-handle rule ONCE across all sources. Pure so the disambiguation

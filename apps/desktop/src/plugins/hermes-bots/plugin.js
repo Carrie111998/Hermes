@@ -2413,11 +2413,12 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
   if (!activeId && liveProvided) {
     const primaryId = String(union?.primaryConnectionId || '').trim()
     const richNames = new Set(localProfiles.map(profile => String(profile?.name || '').trim()).filter(Boolean))
-    const localMatches = agents.some(
-      agent => agent?.connectionKind === 'local' && richNames.has(String(agent?.profile || '').trim())
-    )
-    const primaryMatches = agents.some(
-      agent => String(agent?.connectionId || '').trim() === primaryId && richNames.has(String(agent?.profile || '').trim())
+    const sourceNames = predicate =>
+      new Set(agents.filter(predicate).map(agent => String(agent?.profile || '').trim()).filter(Boolean))
+    const sameInventory = names => names.size === richNames.size && [...richNames].every(name => names.has(name))
+    const localMatches = sameInventory(sourceNames(agent => agent?.connectionKind === 'local'))
+    const primaryMatches = sameInventory(
+      sourceNames(agent => String(agent?.connectionId || '').trim() === primaryId)
     )
 
     if (!localMatches && primaryId && primaryMatches) {
@@ -2549,6 +2550,13 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
  *  callable alias is 'hermes' — the mention middleware resolves it back to
  *  'default' — so the word 'default' never surfaces in the UI. */
 function botHandle(name, bot) {
+  // A thin default-profile row represents the machine itself in a
+  // multi-source roster. Give it the machine's friendly identity instead of
+  // leaking an implementation handle such as @default-maya.
+  if (bot?.remoteSource && (name || '').trim().toLowerCase() === 'default' && bot.connectionLabel) {
+    return slugify(bot.connectionLabel) || 'hermes'
+  }
+
   if (bot?.handle && bot.handle !== name) {
     return bot.handle
   }
@@ -2592,6 +2600,10 @@ function resolveRosterMentions(text, roster, active = {}) {
 
     if (bot.handle) {
       forms.add(String(bot.handle).toLowerCase())
+    }
+
+    if (bot.remoteSource && name === 'default' && bot.connectionLabel) {
+      forms.add(slugify(String(bot.connectionLabel)))
     }
 
     for (const form of forms) {
@@ -2821,18 +2833,21 @@ function botRosterKey(bot) {
 // active-gateway door. Feature-detected: older desktops without
 // requestProfile simply have no remote routes (callers fall back / disable).
 
-/** Route descriptor for a bot on another connection, or null for the local /
- *  active source (or when the desktop can't route). */
+/** Route descriptor for a bot on a source other than the active gateway, or
+ *  null for an unscoped / active-source row (or when the desktop can't
+ *  route). `local` is still an explicit source when a remote gateway is
+ *  active, so its durable descriptors must go through requestProfile too. */
 function botConnectionRoute(bot) {
   const id = String(bot?.connectionId || '').trim()
 
-  if (!bot?.remoteSource || !id || id === 'local' || typeof host.requestProfile !== 'function') {
+  if (!bot?.remoteSource || !id || typeof host.requestProfile !== 'function') {
     return null
   }
 
   const profile = String(bot?.name || '').trim() || 'default'
+  const mode = bot?.connectionKind === 'local' || id === 'local' ? 'local' : 'remote'
 
-  return { connectionId: id, mode: 'remote', profile, targetProfile: profile }
+  return { connectionId: id, mode, profile, targetProfile: profile }
 }
 
 /** Gateway RPC on the bot's OWN source: requestProfile for remote rows,
@@ -3205,7 +3220,7 @@ function groupChatMemberBots(group, roster, metaByName) {
 function durableGroupChatMembers(bots) {
   return (bots || []).map(bot => ({
     name: bot.name,
-    handle: bot.handle || bot.name,
+    handle: botHandle(bot.name, bot),
     connectionId: bot.connectionId,
     connectionKind: bot.connectionKind,
     connectionLabel: bot.connectionLabel,
@@ -3272,11 +3287,22 @@ function parseGroupChatMentions(text, members) {
     // Cross-connection members are also addressable by their @name-device
     // handle (the roster's disambiguated form) — same-named agents on two
     // machines resolve to the right one.
-    const handle = String(member.handle || botHandle(member.name, member) || '').trim()
+    const handle = String(botHandle(member.name, member) || '').trim()
+    const storedHandle = String(member.handle || '').trim()
+    const sourceAlias =
+      member.remoteSource && String(member.name || '').trim().toLowerCase() === 'default'
+        ? String(member.connectionLabel || '').trim()
+        : ''
     const forms = new Set([
       member.name.toLowerCase(),
       member.name.toLowerCase().replace(/[\s_-]+/g, ''),
       ...(handle ? [handle.toLowerCase(), handle.toLowerCase().replace(/[\s_-]+/g, '')] : []),
+      ...(storedHandle
+        ? [storedHandle.toLowerCase(), storedHandle.toLowerCase().replace(/[\s_-]+/g, '')]
+        : []),
+      ...(sourceAlias
+        ? [sourceAlias.toLowerCase(), sourceAlias.toLowerCase().replace(/[\s_-]+/g, '')]
+        : []),
       ...(title
         ? [title.toLowerCase(), title.toLowerCase().replace(/[\s_-]+/g, ''), title.split(/\s+/)[0].toLowerCase()]
         : [])

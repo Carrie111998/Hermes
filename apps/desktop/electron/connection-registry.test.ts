@@ -34,7 +34,8 @@ import {
   shouldRetrySshInventory,
   uniqueLabel,
   updateEligibility,
-  upsertConnection
+  upsertConnection,
+  visibleApiProfileNames
 } from './connection-registry'
 
 function emptyRegistry(): ConnectionRegistry {
@@ -242,6 +243,21 @@ test('parseRemoteProfileListing: Mini/Spark dirs become roster names and drop ro
 
 test('parseRemoteProfileListing: empty listing is still the default agent', () => {
   assert.deepEqual(parseRemoteProfileListing(''), ['default'])
+})
+
+test('visibleApiProfileNames: source-owned hidden profiles stay out of the union roster', () => {
+  assert.deepEqual(
+    visibleApiProfileNames([
+      { name: 'default', ui_meta: { 'hermes-bots': { hidden: true } } },
+      { name: 'archie', ui_meta: { 'hermes-bots': { hidden: false } } },
+      { name: 'retired', ui_meta: { 'hermes-bots': { hidden: true } } }
+    ]),
+    ['archie']
+  )
+})
+
+test('visibleApiProfileNames: older backends that omit root still expose default', () => {
+  assert.deepEqual(visibleApiProfileNames([{ name: 'worker' }]), ['default', 'worker'])
 })
 
 test('roster: unreachable sources contribute no rows and cannot fake duplicates', () => {

@@ -251,13 +251,43 @@ test('default rows use source identity without borrowing another source title', 
   assert.equal(name(active, undefined), 'Hermes')
 })
 
-test('botHandle: precomputed multi-source handle wins; default stays hermes', () => {
+test('botHandle: remote defaults use the friendly source identity; local default stays hermes', () => {
   const { __botHandle: botHandle } = runtime()
 
   assert.equal(botHandle('research', { handle: 'research-homelab' }), 'research-homelab')
   assert.equal(botHandle('research', { handle: 'research' }), 'research')
   assert.equal(botHandle('research'), 'research')
   assert.equal(botHandle('default'), 'hermes')
+  assert.equal(
+    botHandle('default', {
+      handle: 'default-maya',
+      connectionLabel: 'Maya',
+      remoteSource: true
+    }),
+    'maya'
+  )
+})
+
+test('resolveRosterMentions: @Maya resolves a remote default profile without matching other defaults', () => {
+  const { __resolveRosterMentions: resolve } = runtime()
+  const maya = {
+    name: 'default',
+    handle: 'default-maya',
+    connectionId: 'maya',
+    connectionLabel: 'Maya',
+    remoteSource: true
+  }
+  const romeo = {
+    name: 'default',
+    handle: 'default-romeo',
+    connectionId: 'romeo',
+    connectionLabel: 'Romeo',
+    remoteSource: true
+  }
+
+  const hits = resolve('@Maya please take this', [maya, romeo], { name: 'default', connectionId: 'noah' })
+  assert.equal(hits.length, 1)
+  assert.equal(hits[0], maya)
 })
 
 test('filterBots: matches the source device name for remote rows', () => {
@@ -401,6 +431,44 @@ test('merge: legacy remote descriptor infers a matching remote primary when loca
   assert.equal(out.profiles.find(p => p.name === 'default').remoteSource, undefined)
   assert.equal(out.profiles.find(p => p.name === 'archie').connectionId, 'local')
   assert.equal(out.profiles.find(p => p.name === 'archie').remoteSource, true)
+})
+
+test('merge: remote primary wins when both sources have default but local has an extra worker', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const rich = { profiles: [{ name: 'default', last_session: { id: 'noah-chat' } }] }
+  const union = {
+    primaryConnectionId: 'noah',
+    agents: [
+      {
+        connectionId: 'local',
+        connectionKind: 'local',
+        connectionLabel: 'This device',
+        profile: 'default',
+        handle: 'default-this-device'
+      },
+      {
+        connectionId: 'local',
+        connectionKind: 'local',
+        connectionLabel: 'This device',
+        profile: 'archie',
+        handle: 'archie'
+      },
+      {
+        connectionId: 'noah',
+        connectionKind: 'remote',
+        connectionLabel: 'Noah',
+        profile: 'default',
+        handle: 'default-noah'
+      }
+    ]
+  }
+
+  const out = merge(rich, union, null)
+  const noah = out.profiles.find(p => p.name === 'default' && p.connectionId === 'noah')
+
+  assert.equal(noah.last_session.id, 'noah-chat')
+  assert.equal(noah.remoteSource, undefined)
+  assert.equal(out.profiles.filter(p => p.name === 'default').length, 2)
 })
 
 test('merge: previously seen remotes survive a connect-on-demand empty union', () => {
