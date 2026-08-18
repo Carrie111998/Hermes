@@ -14,6 +14,7 @@ from cron.scheduler import (
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
+    _resolve_cron_disabled_toolsets,
     _resolve_cron_enabled_toolsets,
     _resolve_delivery_target,
     _resolve_origin,
@@ -649,6 +650,62 @@ class TestRunJobSessionPersistence:
         assert kwargs["skip_memory"] is True
         assert kwargs["enabled_toolsets"] == ["memory", "file"]
         assert "memory" in kwargs["disabled_toolsets"]
+
+    def test_run_job_allow_memory_enables_store_and_memory_toolset(self, tmp_path):
+        """A job with allow_memory:true must get skip_memory=False AND keep
+        the memory toolset enabled — the two-half fix for #88448.
+
+        When allow_memory opts in, a real memory store IS initialised, so
+        memory must NOT be in disabled_toolsets; otherwise
+        memory_provider_tools_enabled() short-circuits False and the
+        provider's tools (fact_store/fact_feedback, Mnemosyne) are never
+        injected even though the manager is live.
+        """
+        job = {
+            "id": "allow-memory-job",
+            "name": "test",
+            "prompt": "harvest durable facts",
+            "allow_memory": True,
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is False, (
+            "allow_memory:true must initialise the memory store"
+        )
+        assert "memory" not in (kwargs["disabled_toolsets"] or []), (
+            "allow_memory:true must not disable the memory toolset — else "
+            "memory-provider tools are never injected (#88448)"
+        )
+
+    def test_resolve_cron_disabled_toolsets_default_disables_memory(self):
+        """Without allow_memory, memory is in the base cron denylist."""
+        disabled = _resolve_cron_disabled_toolsets({})
+        assert "memory" in disabled
+        assert "cronjob" in disabled
+        assert "messaging" in disabled
+        assert "clarify" in disabled
+
+    def test_resolve_cron_disabled_toolsets_allow_memory_omits_memory(self):
+        """allow_memory=True drops memory from the denylist, keeping the
+        other protected toolsets intact."""
+        disabled = _resolve_cron_disabled_toolsets({}, allow_memory=True)
+        assert "memory" not in disabled
+        # The other protections are unaffected by the memory opt-in.
+        assert "cronjob" in disabled
+        assert "messaging" in disabled
+        assert "clarify" in disabled
+
+    def test_resolve_cron_disabled_toolsets_allow_memory_respects_user_denylist(self):
+        """A user config.yaml agent.disabled_toolsets: [memory] still wins
+        over the per-job opt-in — policy is not bypassable per-job (#25752)."""
+        cfg = {"agent": {"disabled_toolsets": ["memory"]}}
+        disabled = _resolve_cron_disabled_toolsets(cfg, allow_memory=True)
+        assert "memory" in disabled, (
+            "explicit user-level disable of memory must not be overridden by "
+            "a per-job allow_memory opt-in"
+        )
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""

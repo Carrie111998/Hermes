@@ -355,14 +355,23 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
-def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
+def _resolve_cron_disabled_toolsets(cfg: dict, allow_memory: bool = False) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
-    Three toolsets are always disabled in cron context regardless of config:
+    Two toolsets are always disabled in cron context regardless of config:
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
-      - ``memory`` — cron agents are constructed with ``skip_memory=True``, so
-        exposing this tool only gives the model an unbacked tool that fails
+
+    ``memory`` is disabled by default for the same reason cron agents pass
+    ``skip_memory=True``: with no memory store initialised, the tool would
+    dispatch against ``store=None`` and fail. A job may opt in with
+    ``allow_memory: true``, which flips ``skip_memory=False`` at the call site
+    (so a store IS initialised) — in that case ``memory`` must stay enabled so
+    the memory-provider tool schemas (``fact_store``/``fact_feedback``,
+    Mnemosyne, etc.) are actually exposed. Keeping ``memory`` disabled while
+    ``skip_memory=False`` is the bug in #88448: ``memory_provider_tools_enabled``
+    short-circuits ``False`` the instant ``memory`` is in ``disabled_toolsets``,
+    so the provider spins up but its tools are never injected.
 
     ``cronjob`` is policy-denied by default (loop prevention, not a security
     boundary) and config-gated: setting ``cron.allow_agent_scheduling: true``
@@ -377,9 +386,11 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """
     cron_cfg = (cfg or {}).get("cron") or {}
     if cron_cfg.get("allow_agent_scheduling"):
-        disabled = ["messaging", "clarify", "memory"]
+        disabled = ["messaging", "clarify"]
     else:
-        disabled = ["cronjob", "messaging", "clarify", "memory"]
+        disabled = ["cronjob", "messaging", "clarify"]
+    if not allow_memory:
+        disabled.append("memory")
     agent_cfg = (cfg or {}).get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 
@@ -4969,6 +4980,11 @@ def run_job(
         )
         _job_workdir = None
 
+    # Per-job opt-in to persistent memory. Off by default (cron system prompts
+    # would corrupt user representations); a job sets ``allow_memory: true`` to
+    # get a real memory store AND the memory-provider tools exposed (#88448).
+    _cron_allow_memory = bool(job.get("allow_memory", False))
+
     _ctx_tokens = set_session_vars(
         platform="",
         chat_id="",
@@ -5569,7 +5585,9 @@ def run_job(
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            disabled_toolsets=_resolve_cron_disabled_toolsets(
+                _cfg, allow_memory=_cron_allow_memory
+            ),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -5577,7 +5595,13 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Cron system prompts corrupt user representations by default, so
+            # memory stays off unless a job explicitly opts in with
+            # ``allow_memory: true``. When it opts in, ``skip_memory=False``
+            # initialises the store AND ``memory`` stays out of the disabled
+            # toolsets above, so the provider's tools are actually exposed
+            # (both halves are required — see #88448).
+            skip_memory=not _cron_allow_memory,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
