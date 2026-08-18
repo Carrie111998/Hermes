@@ -36,6 +36,19 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# ``sys.path`` as the RUNNER handed it to us, snapshotted before pytest has
+# imported a single test module. Everything here was put there deliberately by
+# the harness -- PYTHONPATH, the venv, plugin dirs -- so it is the baseline the
+# live-checkout leak is measured against, exactly as ``_no_live_checkout_on_sys_path``
+# below measures per-test deltas rather than absolutes.
+#
+# This box's mandated long-run wrapper (``~/.hermes/ops/pytest-run.cmd``) and
+# BOTH cron gates (``hermes_repo_test_gate.py``, ``nightly_gate.py``) set
+# ``PYTHONPATH=~/.hermes/ops`` so ``-p pytest_fd_guard`` can be imported. That
+# directory is inside the live ``~/.hermes`` and outside this checkout, so an
+# absolute assertion flags the guard itself and every guarded run goes red.
+SYS_PATH_AT_IMPORT = tuple(sys.path)
+
 
 # ── HERMES_HOME must be pinned at IMPORT time, not per test ────────────────
 # The autouse ``_hermetic_environment`` fixture below redirects HERMES_HOME for

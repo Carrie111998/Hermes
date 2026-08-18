@@ -160,6 +160,36 @@ def test_ensure_hermes_home_never_ensured_the_real_tree():
 
 # ── sys.path must not keep the live checkout after a test ──────────────────
 
+def _offending_sys_path_entries(entries) -> list[str]:
+    """Entries pointing into the live Hermes tree but outside this checkout.
+
+    Exemptions, each for a different reason:
+
+    * ``conftest.SYS_PATH_AT_IMPORT`` -- the runner put it there before
+      collection. ``~/.hermes/ops`` arrives this way on every guarded run.
+    * ``PROJECT_ROOT`` and below -- the repo lives under ~/.hermes/agent-src,
+      so the checkout under test is inside the live tree by construction.
+    * ``sys.prefix`` and below -- the venv is ~/.hermes/agent-src/.venv, so
+      its site-packages are the running interpreter, not deployed code.
+    """
+    project_root = Path(conftest.PROJECT_ROOT).resolve()
+    venv_root = Path(sys.prefix).resolve()
+    from_runner = set(conftest.SYS_PATH_AT_IMPORT)
+    offenders = []
+    for entry in entries:
+        if not entry or entry in from_runner:
+            continue
+        try:
+            resolved = Path(entry).resolve()
+        except (OSError, ValueError):
+            continue
+        inside_live = resolved == REAL_HERMES or REAL_HERMES in resolved.parents
+        inside_repo = resolved == project_root or project_root in resolved.parents
+        inside_venv = resolved == venv_root or venv_root in resolved.parents
+        if inside_live and not inside_repo and not inside_venv:
+            offenders.append(entry)
+    return offenders
+
 
 def test_sys_path_carries_no_live_hermes_entry_outside_this_repo():
     """The deployed-script leak, checked as a standing invariant.
@@ -174,28 +204,41 @@ def test_sys_path_carries_no_live_hermes_entry_outside_this_repo():
     The repo itself lives under ~/.hermes/agent-src, so PROJECT_ROOT and
     anything beneath it is explicitly allowed -- that is the checkout under
     test, not the deployed one.
+
+    This is a delta, not an absolute: entries the RUNNER supplied before
+    collection (``conftest.SYS_PATH_AT_IMPORT``) are deliberate and exempt.
+    The concrete case is ``~/.hermes/ops``, which this box's mandated
+    ``pytest-run.cmd`` wrapper and both cron gates put on PYTHONPATH so
+    ``-p pytest_fd_guard`` is importable -- an absolute assertion reds every
+    guarded run, including the 02:30 and 04:30 nightly gates, on a path that
+    is not a deployed-code leak at all.
     """
-    project_root = Path(conftest.PROJECT_ROOT).resolve()
-    # The interpreter's own venv lives at ~/.hermes/agent-src/.venv, so its
-    # site-packages entries sit inside the live tree and outside the repo. They
-    # are the running interpreter, not a deployed-code leak -- exclude them or
-    # this assertion can never pass.
-    venv_root = Path(sys.prefix).resolve()
-    offenders = []
-    for entry in sys.path:
-        if not entry:
-            continue
-        try:
-            resolved = Path(entry).resolve()
-        except (OSError, ValueError):
-            continue
-        inside_live = resolved == REAL_HERMES or REAL_HERMES in resolved.parents
-        inside_repo = resolved == project_root or project_root in resolved.parents
-        inside_venv = resolved == venv_root or venv_root in resolved.parents
-        if inside_live and not inside_repo and not inside_venv:
-            offenders.append(entry)
+    offenders = _offending_sys_path_entries(sys.path)
 
     assert not offenders, (
         "sys.path points at the live Hermes tree outside this checkout; imports "
         f"may resolve to the DEPLOYED code instead of the code under test: {offenders}"
     )
+
+
+def test_the_sys_path_invariant_still_catches_a_real_deployed_leak():
+    """Non-vacuity guard for the exemption above.
+
+    ``_offending_sys_path_entries`` skips whatever the runner already had on
+    ``sys.path``, so it must be shown to still flag what it exists for: an
+    entry inserted into the live Hermes tree DURING a test, which is what
+    ``devflow_observability.py``'s line 34 does.
+    """
+    # A live-tree path that is outside every checkout no matter which one is
+    # under test -- the deployed script directory those tests exec out of.
+    probe = str(REAL_HERMES / "profiles" / "main" / "scripts")
+    assert probe not in conftest.SYS_PATH_AT_IMPORT
+    assert _offending_sys_path_entries([probe]) == [probe]
+
+    # The literal leak, when this checkout is not itself the deployed one.
+    # In the shared checkout PROJECT_ROOT *is* ~/.hermes/agent-src, and an
+    # entry equal to the repo under test is correct rather than a leak.
+    leak = REAL_HERMES / "agent-src"
+    if leak.resolve() != Path(conftest.PROJECT_ROOT).resolve():
+        assert leak not in [Path(e) for e in conftest.SYS_PATH_AT_IMPORT]
+        assert _offending_sys_path_entries([str(leak)]) == [str(leak)]
