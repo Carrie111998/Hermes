@@ -39,6 +39,12 @@ const SESSION_WINDOW_MIN_HEIGHT = 620
 // session is silent" bug. Manual voice-start worked only because the button
 // click counted as the gesture. This is a native app the user deliberately
 // launched; there is no drive-by-autoplay concern to protect against.
+//
+// `focusOnNavigation: false` keeps renderer-driven work passive. Electron's
+// default is true, so an in-page/SPA navigation can activate a blurred chat
+// window while its transcript is streaming. Explicit user actions still call
+// the main-process window focus paths (session re-open, notification/deep-link,
+// app activation), preserving intentional raises without background focus theft.
 function chatWindowWebPreferences(preloadPath: string) {
   return {
     preload: preloadPath,
@@ -47,7 +53,8 @@ function chatWindowWebPreferences(preloadPath: string) {
     sandbox: true,
     nodeIntegration: false,
     devTools: true,
-    autoplayPolicy: 'no-user-gesture-required' as const
+    autoplayPolicy: 'no-user-gesture-required' as const,
+    focusOnNavigation: false
   }
 }
 
@@ -59,8 +66,12 @@ function chatWindowWebPreferences(preloadPath: string) {
 // onboarding overlays and the global session sidebar. `watch=1` marks a
 // spectator window (e.g. a running subagent's session): the renderer resumes it
 // lazily so the gateway never builds an agent just to stream into it.
-function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath, watch }: any = {}) {
-  const query = `?win=secondary${watch ? '&watch=1' : ''}`
+// `vibrancy=0` makes only that window paint the selected Glass state as Clear.
+function buildSessionWindowUrl(
+  sessionId: string,
+  { devServer, rendererIndexPath, supportsVibrancy = true, watch }: any = {}
+) {
+  const query = `?win=secondary${watch ? '&watch=1' : ''}${supportsVibrancy ? '' : '&vibrancy=0'}`
   const route = `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {
@@ -70,6 +81,15 @@ function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath
   }
 
   return `${pathToFileURL(rendererIndexPath).toString()}${query}${route}`
+}
+
+// Full peer windows carry no `win` query flag, but a Tahoe peer still needs to
+// tell its renderer that Glass is falling back to Clear. Preserve the existing
+// URL byte-for-byte everywhere a native material is available.
+function buildInstanceWindowUrl({ devServer, rendererIndexPath, supportsVibrancy = true }: any = {}) {
+  const base = devServer || pathToFileURL(rendererIndexPath).toString()
+
+  return supportsVibrancy ? base : `${base}${base.includes('?') ? '&' : '?'}vibrancy=0`
 }
 
 // Full "instance" windows (⌘⇧N / the "New Window" command) open a complete app
@@ -98,8 +118,8 @@ function instanceWindowBounds(base: { x: number; y: number; width: number; heigh
 // vibrancy material on Tahoe even though their renderers have painted. Keep the
 // working primary-window appearance unchanged, but omit vibrancy for compact
 // session and full peer windows on Darwin 25+.
-function secondaryWindowVibrancy({ isMac = false, darwinMajor = 0 } = {}): 'sidebar' | undefined {
-  return isMac && darwinMajor < MACOS_TAHOE_DARWIN_MAJOR ? 'sidebar' : undefined
+function secondaryWindowSupportsVibrancy({ isMac = false, darwinMajor = 0 } = {}): boolean {
+  return isMac && darwinMajor < MACOS_TAHOE_DARWIN_MAJOR
 }
 
 // A small registry keyed by sessionId that guarantees one window per chat:
@@ -163,11 +183,12 @@ function createSessionWindowRegistry() {
 }
 
 export {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
-  secondaryWindowVibrancy,
+  secondaryWindowSupportsVibrancy,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 }

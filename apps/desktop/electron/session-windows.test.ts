@@ -3,11 +3,12 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
-  secondaryWindowVibrancy
+  secondaryWindowSupportsVibrancy
 } from './session-windows'
 import { MACOS_TAHOE_DARWIN_MAJOR } from './titlebar-overlay-width'
 
@@ -90,6 +91,30 @@ test('buildSessionWindowUrl adds the watch flag for spectator windows, before th
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1#/abc')
 })
 
+test('buildSessionWindowUrl tells a secondary renderer when native vibrancy is unavailable', () => {
+  const url = buildSessionWindowUrl('abc', {
+    devServer: 'http://localhost:5173',
+    supportsVibrancy: false
+  })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&vibrancy=0#/abc')
+})
+
+test('buildInstanceWindowUrl preserves the peer URL unless native vibrancy is unavailable', () => {
+  assert.equal(
+    buildInstanceWindowUrl({ devServer: 'http://localhost:5173/', supportsVibrancy: true }),
+    'http://localhost:5173/'
+  )
+  assert.equal(
+    buildInstanceWindowUrl({ devServer: 'http://localhost:5173/', supportsVibrancy: false }),
+    'http://localhost:5173/?vibrancy=0'
+  )
+  assert.match(
+    buildInstanceWindowUrl({ rendererIndexPath: '/opt/app/index.html', supportsVibrancy: false }),
+    /^file:\/\/.*index\.html\?vibrancy=0$/
+  )
+})
+
 test('instanceWindowBounds cascades a new window off its source bounds', () => {
   const bounds = instanceWindowBounds({ x: 100, y: 120, width: 1400, height: 900 }, { width: 1, height: 1 })
 
@@ -103,16 +128,16 @@ test('instanceWindowBounds falls back to the persisted geometry with no source w
 })
 
 test('secondary windows omit vibrancy on Tahoe and later so their renderer remains visible', () => {
-  assert.equal(secondaryWindowVibrancy({ isMac: true, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR }), undefined)
-  assert.equal(secondaryWindowVibrancy({ isMac: true, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR + 1 }), undefined)
+  assert.equal(secondaryWindowSupportsVibrancy({ isMac: true, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR }), false)
+  assert.equal(secondaryWindowSupportsVibrancy({ isMac: true, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR + 1 }), false)
 })
 
-test('secondary windows preserve sidebar vibrancy before Tahoe', () => {
-  assert.equal(secondaryWindowVibrancy({ isMac: true, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR - 1 }), 'sidebar')
+test('secondary windows preserve native vibrancy before Tahoe', () => {
+  assert.equal(secondaryWindowSupportsVibrancy({ isMac: true, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR - 1 }), true)
 })
 
 test('secondary windows never request macOS vibrancy on other platforms', () => {
-  assert.equal(secondaryWindowVibrancy({ isMac: false, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR }), undefined)
+  assert.equal(secondaryWindowSupportsVibrancy({ isMac: false, darwinMajor: MACOS_TAHOE_DARWIN_MAJOR }), false)
 })
 
 test('registry opens one window per session and focuses on re-open', () => {
@@ -216,6 +241,22 @@ test('chatWindowWebPreferences leaves background throttling to the runtime strea
   const prefs = chatWindowWebPreferences('/tmp/preload.cjs')
 
   assert.equal('backgroundThrottling' in prefs, false)
+})
+
+test('chat renderer navigation stays passive while explicit window actions may focus', () => {
+  const prefs = chatWindowWebPreferences('/tmp/preload.cjs')
+
+  // In-page/SPA navigation can happen while a transcript keeps streaming. It
+  // must not use Electron's default navigation focus path to activate Hermes.
+  assert.equal(prefs.focusOnNavigation, false)
+
+  // Re-opening a session is an explicit user action and must still raise the
+  // existing window; the passive navigation guard does not disable that path.
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+  registry.openOrFocus('s1', () => win)
+  registry.openOrFocus('s1', () => win)
+  assert.equal(win.calls.focus, 1)
 })
 
 test('chatWindowWebPreferences passes the preload path through and keeps the hardened defaults', () => {

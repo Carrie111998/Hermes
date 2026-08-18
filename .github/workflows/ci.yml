@@ -46,6 +46,7 @@ jobs:
       site: ${{ steps.classify.outputs.site }}
       scan: ${{ steps.classify.outputs.scan }}
       deps: ${{ steps.classify.outputs.deps }}
+      uv_lock: ${{ steps.classify.outputs.uv_lock }}
       npm_lock: ${{ steps.classify.outputs.npm_lock }}
       installer: ${{ steps.classify.outputs.installer }}
       docker_meta: ${{ steps.classify.outputs.docker_meta }}
@@ -72,6 +73,16 @@ jobs:
     uses: ./.github/workflows/tests.yml
     with:
       slice_count: 12
+
+  # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
+  # the OS-marked tests it collects are skipped there by design (see the
+  # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
+  # Same `python` lane gate: if no Python changed, neither runs.
+  tests-os:
+    name: OS-specific tests
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/tests-os.yml
 
   lint:
     name: Python lints
@@ -133,6 +144,12 @@ jobs:
   uv-lockfile:
     name: Check uv.lock
     needs: detect
+    # Gated: `uv lock --check` re-resolves the whole dependency graph against
+    # PyPI, so on every PR it spent a network round-trip — and, on a registry
+    # blip, a blocking red X — for diffs that cannot desync the lockfile
+    # (docs, frontend, prose). Only pyproject.toml / uv.lock can. A
+    # `.github/` change still forces it on via the classifier's fail-open.
+    if: needs.detect.outputs.uv_lock == 'true'
     uses: ./.github/workflows/uv-lockfile-check.yml
 
   infographic-check:
@@ -192,6 +209,7 @@ jobs:
     needs:
       - detect
       - tests
+      - tests-os
       - lint
       - js-tests
       - installer-tests
