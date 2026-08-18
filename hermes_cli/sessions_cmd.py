@@ -318,7 +318,8 @@ def cmd_sessions(args, sessions_parser=None):
         from hermes_state import SessionDB
 
         read_only = action == "cold-verify" or (
-            action == "cold-purge" and bool(getattr(args, "dry_run", False))
+            action in {"cold-store", "cold-purge"}
+            and bool(getattr(args, "dry_run", False))
         )
         db = SessionDB(read_only=read_only)
     except Exception as e:

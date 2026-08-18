@@ -114,6 +114,18 @@ def _purge_database_rows() -> tuple[list[tuple[object, ...]], ...]:
                     "SELECT * FROM async_delegations ORDER BY delegation_id"
                 ).fetchall()
             ],
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT * FROM compression_locks ORDER BY session_id"
+                ).fetchall()
+            ],
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT * FROM session_turn_leases ORDER BY conversation_id"
+                ).fetchall()
+            ],
         )
     finally:
         db.close()
@@ -409,6 +421,16 @@ def test_cold_purge_refuses_routed_verified_lineage_and_retains_database_rows(
             "origin_session_id",
             id="delegation-origin-session-id",
         ),
+        pytest.param(
+            "compression_locks",
+            "session_id",
+            id="compression-lock",
+        ),
+        pytest.param(
+            "session_turn_leases",
+            "conversation_id",
+            id="session-turn-lease",
+        ),
     ],
 )
 def test_cold_purge_refuses_unsnapshotted_soft_references_without_mutation(
@@ -449,7 +471,7 @@ def test_cold_purge_refuses_unsnapshotted_soft_references_without_mutation(
                 "INSERT INTO state_meta(key, value) VALUES (?, ?)",
                 (f"{reference_name}:lineage-root", '{"keep":"unchanged"}'),
             )
-        else:
+        elif reference_kind == "async_delegations":
             reference_values = {
                 "origin_session": "unrelated-origin",
                 "parent_session_id": None,
@@ -470,6 +492,13 @@ def test_cold_purge_refuses_unsnapshotted_soft_references_without_mutation(
                     1.0,
                     2.0,
                 ),
+            )
+        else:
+            db._conn.execute(
+                f"INSERT INTO {reference_kind} "
+                f"({reference_name}, holder, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("lineage-root", "keep-holder", 1.0, 2.0),
             )
         assert (
             db._conn.execute("SELECT COUNT(*) FROM gateway_routing").fetchone()[0]
@@ -641,6 +670,35 @@ def test_cold_verify_database_open_failure_exits_nonzero(
     assert "Error: Could not open session database: read-only open failed" in out
 
 
+def test_cold_store_database_open_failure_exits_nonzero(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+
+    def fail_writable_open(*args, **kwargs):
+        assert kwargs.get("read_only") is False
+        raise sqlite3.OperationalError("writable open failed")
+
+    monkeypatch.setattr("hermes_state.SessionDB", fail_writable_open)
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-store",
+        str(session_home.parent / "cold-root"),
+        "--session-id",
+        "lineage-terminal",
+        "--yes",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "Error: Could not open session database: writable open failed" in out
+
+
 @pytest.mark.parametrize(
     ("action", "execution_flags"),
     [
@@ -751,6 +809,56 @@ def test_cold_store_dry_run_creates_nothing_and_does_not_prompt(
     assert "nothing was written" in out
     assert not archive_root.exists()
     assert _lineage_rows() == before
+
+
+def test_cold_store_dry_run_opens_database_read_only_without_reconciliation(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage()
+    db_path = session_home / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP INDEX idx_compression_locks_expires")
+        schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        before_rows = conn.execute(
+            "SELECT id, archived FROM sessions ORDER BY id"
+        ).fetchall()
+
+    opens: list[bool] = []
+
+    def tracked_open(*args, **kwargs):
+        opens.append(bool(kwargs.get("read_only")))
+        return SessionDB(*args, **kwargs)
+
+    monkeypatch.setattr("hermes_state.SessionDB", tracked_open)
+    archive_root = session_home.parent / "cold-root"
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-store",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--dry-run",
+    )
+
+    assert code == 0
+    assert err == ""
+    assert "nothing was written" in out
+    assert opens == [True]
+    assert not archive_root.exists()
+    with sqlite3.connect(db_path) as conn:
+        assert int(conn.execute("PRAGMA schema_version").fetchone()[0]) == schema_version
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_schema "
+            "WHERE type = 'index' AND name = 'idx_compression_locks_expires'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT id, archived FROM sessions ORDER BY id"
+        ).fetchall() == before_rows
 
 
 @pytest.mark.parametrize("execution_flag", ["--yes", "--dry-run"])

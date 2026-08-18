@@ -28,6 +28,10 @@ _ASYNC_DELEGATION_SESSION_COLUMNS = (
     "parent_session_id",
     "origin_session_id",
 )
+_COORDINATION_SESSION_REFERENCES = (
+    ("compression_locks", "session_id"),
+    ("session_turn_leases", "conversation_id"),
+)
 
 
 @dataclass(frozen=True)
@@ -747,6 +751,29 @@ def _reject_async_delegation_references(
             )
 
 
+def _reject_coordination_references(
+    conn: sqlite3.Connection, physical_ids: tuple[str, ...]
+) -> None:
+    """Reject locks or turn leases naming any covered session."""
+    for table, column in _COORDINATION_SESSION_REFERENCES:
+        _required_table_columns(conn, table, (column,))
+        quoted_table = _quoted_identifier(table)
+        quoted_column = _quoted_identifier(column)
+        for ids in _id_chunks(physical_ids):
+            placeholders = ",".join("?" for _ in ids)
+            row = conn.execute(
+                f"SELECT {quoted_column} FROM {quoted_table} "
+                f"WHERE {quoted_column} IN ({placeholders}) LIMIT 1",
+                ids,
+            ).fetchone()
+            if row is None:
+                continue
+            raise ValueError(
+                f"cold purge refuses {table}.{column} soft reference to "
+                f"lineage session {row[0]}"
+            )
+
+
 def _reject_uncovered_session_references(
     conn: sqlite3.Connection, physical_ids: tuple[str, ...]
 ) -> None:
@@ -754,6 +781,7 @@ def _reject_uncovered_session_references(
     _reject_gateway_routing_references(conn, physical_ids)
     _reject_state_meta_references(conn, physical_ids)
     _reject_async_delegation_references(conn, physical_ids)
+    _reject_coordination_references(conn, physical_ids)
     covered = set(physical_ids)
     chunks = _id_chunks(physical_ids)
     for ids in chunks:
