@@ -83,6 +83,52 @@ def _supports_budget(fetch_usage: Callable[..., object]) -> bool:
     )
 
 
+def _episode_model_for(finding: dict) -> str:
+    """Synthesize collect()'s (provider, model) episode key for a finding.
+
+    Deliberately NOT a routable model slug -- same shape as detector B's
+    "{provider}:pool" -- which is what keeps Phase 2's reroute buttons off
+    these alerts (events.override_buttons.buttons_for gates on
+    detector == "runtime").
+    """
+    if finding.get("kind") == "balance":
+        return "balance"
+    return f"{finding.get('window_id')}-window"
+
+
+def _emit_quota_findings(snapshot: dict) -> None:
+    """Report ai_usage.quota_signal findings as MODEL_RATE_LIMITED alerts.
+
+    REPORT-ONLY (the defining constraint of Phase 3): Claude Code and the
+    Codex CLI are separate processes with their own model selection, so
+    Hermes cannot reroute them from here. This calls record() only -- never
+    clear() -- so a window that goes missing from one snapshot to the next
+    (Codex nulls its 5h window exactly when the weekly is capped) is never
+    misread as a recovery that closes an open episode. evaluate() already
+    treats an absent/None window as "no finding"; the absence of a finding
+    here is therefore silently dropped, not translated into a clear().
+
+    Each finding is emitted independently so one detector/record failure
+    (e.g. a raising record()) cannot suppress the rest of this snapshot's
+    findings.
+    """
+    from ai_usage.quota_signal import evaluate
+    from events.rate_limit_signal import record
+
+    for finding in evaluate(snapshot):
+        try:
+            record(
+                provider=finding["provider"],
+                model=_episode_model_for(finding),
+                reason="quota_window",
+                detector="usage_poller",
+                outcome=finding["outcome"],
+                resets_at=finding.get("resets_at") or "",
+            )
+        except Exception:
+            continue
+
+
 def _diagnostic(key: str, outcome: str, elapsed: float, budget: float) -> dict:
     return {
         "key": key,
@@ -189,7 +235,7 @@ def collect(
             conn.close()
 
     elapsed = max(0.0, _monotonic() - started)
-    return {
+    result = {
         "generated_at": iso(now),
         "providers": providers,
         "diagnostics": {
@@ -198,6 +244,18 @@ def collect(
             "providers": attempts,
         },
     }
+
+    # Phase 3: report quota-threshold findings as MODEL_RATE_LIMITED alerts.
+    # This must never affect the snapshot collect() returns -- it runs last,
+    # over the already-built result, behind a blanket try/except. The
+    # collector feeds the tray; a detector defect must never break usage
+    # collection or corrupt the snapshot it returns.
+    try:
+        _emit_quota_findings(result)
+    except Exception:
+        pass
+
+    return result
 
 
 def write_atomic(path: Path, data: dict) -> None:
