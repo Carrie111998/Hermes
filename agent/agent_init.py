@@ -287,7 +287,7 @@ _OVERRIDE_MUTATED_ATTRS = (
     "_client_kwargs", "_config_context_length",
     "_use_prompt_caching", "_use_native_cache_layout", "_credential_pool",
     "_anthropic_api_key", "_anthropic_base_url", "_anthropic_client",
-    "_is_anthropic_oauth",
+    "_is_anthropic_oauth", "reasoning_config",
 )
 
 
@@ -310,6 +310,20 @@ def _snapshot_primary_runtime(agent) -> Dict[str, Any]:
         "client_kwargs": dict(getattr(agent, "_client_kwargs", {}) or {}),
         "use_prompt_caching": getattr(agent, "_use_prompt_caching", False),
         "use_native_cache_layout": getattr(agent, "_use_native_cache_layout", False),
+        # Mirrors switch_model's _primary_runtime shape (agent/agent_
+        # runtime_helpers.py) so restore_primary_runtime's "restore
+        # reasoning_config if it was saved" branch has something to find.
+        # Without this, a model-override swap's re-resolved reasoning_config
+        # (see _apply_model_override below) is never carried by either the
+        # blessed-primary snapshot or the pre-override origin snapshot, so a
+        # revert leaves the REPLACEMENT's reasoning_config active on the
+        # restored PRIMARY -- the same "wrong params sent to the wrong
+        # model" shape as C1, just for reasoning_config instead of cache
+        # policy/compressor/etc.
+        "reasoning_config": (
+            dict(getattr(agent, "reasoning_config", None) or {})
+            if getattr(agent, "reasoning_config", None) else None
+        ),
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).
@@ -552,6 +566,40 @@ def _apply_model_override(agent) -> None:
                 custom_providers=getattr(agent, "_custom_providers", None),
             )
 
+        # (6) reasoning_config.  Mirrors try_activate_fallback (Closes
+        # #21256, agent/chat_completion_helpers.py) and switch_model
+        # (agent/agent_runtime_helpers.py): the replacement model may carry
+        # a different per-model reasoning_effort override than the primary
+        # (or none), resolved through the shared chokepoint (per-model
+        # override > global reasoning_effort; YAML boolean False =
+        # disabled). Left unresolved, the primary's reasoning_config (e.g.
+        # {"effort": "high"}) keeps flowing into every request built for
+        # the replacement -- a 400 on every call for a replacement that
+        # rejects the parameter, the exact same shape as C1's five, just
+        # for a sixth field the original fix enumeration missed.
+        # _MISSING = "resolution failed or produced nothing to apply -- do
+        # not touch agent.reasoning_config below", matching both
+        # references' "keep whatever reasoning_config was active" fallback.
+        # Deliberately wrapped in try/except (unlike the cache-policy call
+        # above): a config load failure here is not the defect this swap
+        # exists to prevent, and must not block the swap the way a bad
+        # cache policy would.
+        new_reasoning_config = _MISSING
+        try:
+            from hermes_cli.config import load_config as _override_load_config
+            from hermes_constants import (
+                resolve_reasoning_config as _override_resolve_reasoning_config,
+            )
+
+            new_reasoning_config = _override_resolve_reasoning_config(
+                _override_load_config() or {}, replacement_model
+            )
+        except Exception as _reasoning_exc:
+            logger.debug(
+                "Model override -> %s/%s: could not resolve reasoning_config: %s",
+                replacement_provider, replacement_model, _reasoning_exc,
+            )
+
         # Enforcement read #2 needs the runtime this override is displacing:
         # once the override expires, restore_primary_runtime() has to put a
         # long-lived (gateway-cached) agent back on the TRULY configured
@@ -617,6 +665,8 @@ def _apply_model_override(agent) -> None:
             )
             if new_credential_pool is not _MISSING:
                 agent._credential_pool = new_credential_pool
+            if new_reasoning_config is not _MISSING:
+                agent.reasoning_config = new_reasoning_config
 
             if _compressor is not None:
                 _compressor.update_model(

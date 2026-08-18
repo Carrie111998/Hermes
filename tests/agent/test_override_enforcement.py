@@ -756,3 +756,133 @@ def test_explicit_model_switch_retires_the_override_stash(monkeypatch):
         )
 
     assert getattr(agent, "_override_origin", None) is None
+
+
+# =============================================================================
+# Re-review finding: reasoning_config is a SIXTH item of the C1 class.
+#
+# The C1 fix mirrored five things the two reference swap paths do
+# (try_activate_fallback, agent/chat_completion_helpers.py:1936-1945;
+# switch_model, agent/agent_runtime_helpers.py:2344-2360). Both references
+# ALSO re-resolve reasoning_config for the new model -- _apply_model_override
+# did not, and _snapshot_primary_runtime did not carry it either, so a
+# revert never restored it (it is resolved once at init for the configured
+# PRIMARY and flows straight into every request build). A divert from a
+# primary carrying e.g. {"effort": "high"} to a replacement that rejects the
+# parameter reproduces C1's exact "400 on every call, caused solely by the
+# override" shape.
+# =============================================================================
+
+def test_divert_reresolves_reasoning_config_for_the_replacement(
+        monkeypatch, _stub_context_length):
+    """Mirrors try_activate_fallback (#21256) and switch_model: the
+    replacement model's reasoning_config must be re-resolved from config,
+    not inherited from the primary.
+
+    Mutation check: deleting the reasoning_config re-resolution block in
+    _apply_model_override leaves agent.reasoning_config at the primary's
+    stale {"enabled": True, "effort": "medium"} and fails this test.
+    """
+    from events import model_override
+    from unittest.mock import patch as _patch
+
+    agent = _anthropic_primary_agent()
+    agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+    monkeypatch.setattr(model_override, "get_override", lambda p, m: {
+        "replacement_provider": "deepseek", "replacement_model": "deepseek-v4-pro"})
+
+    fake_cfg = {
+        "agent": {
+            "reasoning_effort": "medium",
+            "reasoning_overrides": {"deepseek-v4-pro": "high"},
+        },
+    }
+    with _patch("hermes_cli.config.load_config", return_value=fake_cfg):
+        _apply_model_override(agent)
+
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}, (
+        "the replacement's per-model reasoning_overrides entry must win, "
+        "not the primary's stale reasoning_config"
+    )
+
+
+def test_divert_reasoning_config_resolution_failure_keeps_current(
+        monkeypatch, _stub_context_length):
+    """A config-load failure while resolving the replacement's
+    reasoning_config must not kill the swap (mirrors both references'
+    try/except) -- and must not silently null out reasoning_config either,
+    it just leaves the prior value in place."""
+    from events import model_override
+    from unittest.mock import patch as _patch
+
+    agent = _anthropic_primary_agent()
+    agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+    monkeypatch.setattr(model_override, "get_override", lambda p, m: {
+        "replacement_provider": "deepseek", "replacement_model": "deepseek-v4-pro"})
+
+    def _boom(*a, **k):
+        raise RuntimeError("config unavailable")
+    with _patch("hermes_cli.config.load_config", _boom):
+        _apply_model_override(agent)   # must not raise
+
+    assert (agent.provider, agent.model) == ("deepseek", "deepseek-v4-pro"), (
+        "the swap itself must still succeed"
+    )
+    assert agent.reasoning_config == {"enabled": True, "effort": "medium"}, (
+        "on resolution failure, reasoning_config must be left untouched"
+    )
+
+
+def test_revert_restores_the_primarys_reasoning_config(monkeypatch):
+    """The other half: once the override expires and restore_primary_
+    runtime() puts the agent back on its configured primary, the PRIMARY's
+    reasoning_config must come back too -- not stay pinned to whatever the
+    replacement re-resolved to.
+
+    Mutation check: without "reasoning_config" in _snapshot_primary_runtime's
+    returned dict, restore_primary_runtime's "if saved_reasoning is not
+    None" guard never fires and the replacement's resolved value survives
+    the revert.
+    """
+    from events import model_override
+    from agent.agent_init import _snapshot_primary_runtime
+    from unittest.mock import patch as _patch
+
+    agent = _make_real_agent(provider="deepseek", model="deepseek-v4-pro",
+                              base_url="https://api.deepseek.com")
+    agent.reasoning_config = {"enabled": True, "effort": "low"}
+
+    monkeypatch.setattr(model_override, "get_override", lambda p, m: (
+        {"replacement_provider": "openai-codex", "replacement_model": "gpt-5.6-sol"}
+        if (p, m) == ("deepseek", "deepseek-v4-pro") else None
+    ))
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length", lambda *a, **k: 64000)
+
+    fake_cfg = {
+        "agent": {
+            "reasoning_effort": "medium",
+            "reasoning_overrides": {"gpt-5.6-sol": "xhigh"},
+        },
+    }
+    with _patch("hermes_cli.config.load_config", return_value=fake_cfg):
+        _apply_model_override(agent)
+        agent._primary_runtime = _snapshot_primary_runtime(agent)
+
+    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}, (
+        "precondition: the replacement's reasoning_config was resolved")
+
+    # `hermes overrides clear`, or simply 24h elapsing.
+    monkeypatch.setattr(model_override, "get_override", lambda p, m: None)
+
+    with _patch("run_agent.OpenAI", return_value=MagicMock()):
+        result = agent._restore_primary_runtime()
+
+    assert result is True
+    assert (agent.provider, agent.model) == ("deepseek", "deepseek-v4-pro")
+    assert agent.reasoning_config == {"enabled": True, "effort": "low"}, (
+        "the primary's reasoning_config must be restored, not left on the "
+        "replacement's re-resolved value"
+    )
