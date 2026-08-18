@@ -1603,6 +1603,7 @@ def _pending_fs_identity(info: os.stat_result) -> tuple:
         info.st_ino,
         info.st_size,
         info.st_mtime_ns,
+        info.st_ctime_ns,
         info.st_nlink,
         info.st_mode,
     )
@@ -1707,6 +1708,7 @@ def _hash_skill_tree_fd(
                 "st_ino",
                 "st_size",
                 "st_mtime_ns",
+                "st_ctime_ns",
                 "st_nlink",
                 "st_mode",
             )
@@ -1723,7 +1725,14 @@ def _hash_skill_tree_fd(
             digest.update(file_digest.digest())
             digest.update(b"\0")
         directory_after = os.fstat(directory_fd)
-        directory_fields = ("st_dev", "st_ino", "st_mtime_ns", "st_nlink", "st_mode")
+        directory_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mtime_ns",
+            "st_ctime_ns",
+            "st_nlink",
+            "st_mode",
+        )
         if any(
             getattr(directory_before, field) != getattr(directory_after, field)
             for field in directory_fields
@@ -2063,22 +2072,12 @@ def _pending_read_text(target: Path) -> str:
                 if total > MAX_SKILL_FILE_BYTES:
                     raise ValueError("pending skill target file exceeds size limit")
             after = os.fstat(fd)
-            if (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_mtime_ns,
-                after.st_size,
-            ):
+            if _pending_fs_identity(before) != _pending_fs_identity(after):
                 raise ValueError("pending skill target changed while reading")
             relative_key = target.relative_to(Path(anchor["root_path"])).as_posix()
-            anchor.setdefault("read_identities", {})[relative_key] = (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_nlink,
-                after.st_mode,
-            )
+            anchor.setdefault("read_identities", {})[
+                relative_key
+            ] = _pending_fs_identity(after)
             return b"".join(chunks).decode("utf-8")
         finally:
             os.close(fd)
@@ -2194,14 +2193,7 @@ def _pending_atomic_write_text(
             except FileNotFoundError:
                 before_publish_identity = None
             else:
-                before_publish_identity = (
-                    before_publish.st_dev,
-                    before_publish.st_ino,
-                    before_publish.st_size,
-                    before_publish.st_mtime_ns,
-                    before_publish.st_nlink,
-                    before_publish.st_mode,
-                )
+                before_publish_identity = _pending_fs_identity(before_publish)
             if before_publish_identity != current_identity:
                 raise ValueError("Pending skill write target pre-image changed")
             if expect_absent:

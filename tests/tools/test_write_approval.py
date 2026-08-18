@@ -837,6 +837,92 @@ def test_scanner_rollback_never_clobbers_concurrent_leaf_update(
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "mutation",
+    ["edit", "patch", "write_file", "supporting_patch"],
+)
+def test_scanner_rollback_detects_same_size_mtime_restored_update(
+    hermes_home, monkeypatch, mutation
+):
+    from pathlib import Path
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as sm
+    from tools import write_approval as wa
+
+    skills_dir = Path(hermes_home) / "skills"
+    skill_dir = skills_dir / "demo"
+    references = skill_dir / "references"
+    references.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(_SKILL, encoding="utf-8")
+    supporting = references / "note.md"
+    supporting.write_text("approved-original", encoding="utf-8")
+    monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
+
+    payloads = {
+        "edit": {
+            "action": "edit",
+            "name": "demo",
+            "content": _SKILL.replace("body", "edited body"),
+        },
+        "patch": {
+            "action": "patch",
+            "name": "demo",
+            "old_string": "body",
+            "new_string": "edited body",
+        },
+        "write_file": {
+            "action": "write_file",
+            "name": "demo",
+            "file_path": "references/note.md",
+            "file_content": "scanner-rejected",
+        },
+        "supporting_patch": {
+            "action": "patch",
+            "name": "demo",
+            "file_path": "references/note.md",
+            "old_string": "approved-original",
+            "new_string": "scanner-rejected",
+        },
+    }
+    target = skill_md if mutation in {"edit", "patch"} else supporting
+    observed = {}
+
+    def _reject_after_stealth_update(_path):
+        published = target.stat()
+        concurrent = b"X" * published.st_size
+        target.write_bytes(concurrent)
+        os.utime(
+            target,
+            ns=(published.st_atime_ns, published.st_mtime_ns),
+        )
+        changed = target.stat()
+        assert changed.st_size == published.st_size
+        assert changed.st_mtime_ns == published.st_mtime_ns
+        assert changed.st_ctime_ns != published.st_ctime_ns
+        observed["concurrent"] = concurrent
+        return "scanner blocked"
+
+    monkeypatch.setattr(sm, "_security_scan_skill", _reject_after_stealth_update)
+    record = wa.stage_write(
+        wa.SKILLS,
+        payloads[mutation],
+        summary=f"stealth rollback race {mutation}",
+        origin="foreground",
+        session_context=_SESSION_CONTEXT,
+        target_tree_pre_image_hash=sm._target_tree_pre_image_hash("demo"),
+    )
+
+    output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert output is not None
+    assert "Approved 0 skills write(s)." in output
+    assert "target pre-image changed" in output.lower()
+    assert target.read_bytes() == observed["concurrent"]
+    assert wa.get_pending(wa.SKILLS, record["id"]) is not None
+
+
+@pytest.mark.linux_only
 def test_scanner_rejected_create_removes_unchanged_hermes_tree(
     hermes_home, monkeypatch
 ):

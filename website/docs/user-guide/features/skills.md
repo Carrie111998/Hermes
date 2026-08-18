@@ -617,8 +617,9 @@ create in a clean profile anchors at the existing Hermes home, binds every
 absent path component, and creates `skills/`, optional categories, and the
 skill descriptor-relatively. If the content scanner rejects a supporting-file
 write, identity-bound rollback restores the pre-apply bytes and leaves the claimed
-record pending; if another writer changes the published leaf first, rollback
-fails closed instead of overwriting that concurrent content. New skills are
+record pending; the bound leaf identity includes filesystem change time, so even
+a same-size concurrent update that restores its modification time makes rollback
+fail closed instead of overwriting that concurrent content. New skills are
 scanned from the exact in-memory `SKILL.md` content before publication, so the
 scanner input cannot diverge from the bytes selected for publish and a rejected
 create never becomes discoverable. Absent leaves are published with an atomic
