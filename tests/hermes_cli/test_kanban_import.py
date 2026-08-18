@@ -38,7 +38,11 @@ def _write(source: Path, name: str, metadata: dict, body: str = "work") -> Path:
 
 
 def _read(path: Path) -> dict:
-    return next(MarkdownAdapter(path.parent).scan()).metadata
+    resolved = path.resolve()
+    return next(
+        task.metadata for task in MarkdownAdapter(path.parent).scan()
+        if task.path == resolved
+    )
 
 
 def test_dry_run_validates_without_mutating_source_or_schema(import_env):
