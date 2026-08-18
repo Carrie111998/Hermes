@@ -1172,6 +1172,76 @@ class CLICommandsMixin:
         # /sessions <id_or_title> behaves the same as /resume <id_or_title>.
         self._handle_resume_command(f"/resume {arg}")
 
+    def _handle_pool_command(self, cmd_original: str) -> None:
+        """Handle /pool [list|add|remove|switch|test|discover] — manage multiple Hermes connections."""
+        from cli import _cprint
+        parts = cmd_original.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        sub = arg.lower().split()[0] if arg else "list"
+
+        from tui_gateway.connection_manager import get_connection_manager
+        mgr = get_connection_manager()
+
+        if sub == "list" or not arg:
+            # List all connections
+            lines = mgr.format_list()
+            _cprint(lines)
+            return
+
+        if sub == "add":
+            # /pool add <name> <url> [--token <token>]
+            tokens = arg.split()
+            if len(tokens) < 3:
+                _cprint("Usage: /pool add <name> <url> [--token <token>]")
+                return
+            name = tokens[1]
+            url = tokens[2]
+            token = None
+            if "--token" in tokens:
+                idx = tokens.index("--token")
+                if idx + 1 < len(tokens):
+                    token = tokens[idx + 1]
+            ok, msg = mgr.add(name, url, token=token)
+            _cprint(f"  {'✓' if ok else '✗'} {msg}")
+            return
+
+        if sub == "remove":
+            name = arg.split()[1] if len(arg.split()) > 1 else ""
+            if not name:
+                _cprint("Usage: /pool remove <name>")
+                return
+            ok, msg = mgr.remove(name)
+            _cprint(f"  {'✓' if ok else '✗'} {msg}")
+            return
+
+        if sub == "switch":
+            name = arg.split()[1] if len(arg.split()) > 1 else ""
+            if not name:
+                _cprint("Usage: /pool switch <name>")
+                return
+            ok, msg = mgr.switch(name)
+            _cprint(f"  {'✓' if ok else '✗'} {msg}")
+            if ok:
+                _cprint("  Reconnect to the new backend to use it.")
+            return
+
+        if sub == "test":
+            name = arg.split()[1] if len(arg.split()) > 1 else ""
+            if not name:
+                _cprint("Usage: /pool test <name>")
+                return
+            ok, msg = mgr.test_connection(name)
+            _cprint(f"  {'✓' if ok else '✗'} {msg}")
+            return
+
+        if sub == "discover":
+            count, msg = mgr.discover_tailscale()
+            _cprint(f"  {'✓' if count > 0 else '✗'} {msg}")
+            return
+
+        _cprint(f"  Unknown subcommand: {sub}")
+        _cprint("  Usage: /pool [list|add|remove|switch|test|discover]")
+
     def _handle_branch_command(self, cmd_original: str) -> None:
         """Handle /branch [name] — fork the current session into a new independent copy.
 

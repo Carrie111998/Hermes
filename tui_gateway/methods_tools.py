@@ -1239,6 +1239,103 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5017, str(e))
 
 
+@method("pool.list")
+def _(rid, params: dict) -> dict:
+    """List all configured connections and their status."""
+    try:
+        from tui_gateway.connection_manager import get_connection_manager
+        mgr = get_connection_manager()
+        return _ok(rid, {"connections": mgr.list_status()})
+    except Exception as e:
+        return _err(rid, 5017, str(e))
+
+
+@method("pool.add")
+def _(rid, params: dict) -> dict:
+    """Add a new connection."""
+    try:
+        from tui_gateway.connection_manager import get_connection_manager
+        mgr = get_connection_manager()
+        name = params.get("name", "").strip()
+        url = params.get("url", "").strip()
+        mode = params.get("mode", "remote")
+        auth = params.get("auth", "tailscale")
+        token = params.get("token")
+        if not name or not url:
+            return _err(rid, 4004, "name and url required")
+        ok, msg = mgr.add(name, url, mode=mode, auth=auth, token=token)
+        if ok:
+            return _ok(rid, {"message": msg})
+        return _err(rid, 4018, msg)
+    except Exception as e:
+        return _err(rid, 5017, str(e))
+
+
+@method("pool.remove")
+def _(rid, params: dict) -> dict:
+    """Remove a connection."""
+    try:
+        from tui_gateway.connection_manager import get_connection_manager
+        mgr = get_connection_manager()
+        name = params.get("name", "").strip()
+        if not name:
+            return _err(rid, 4004, "name required")
+        ok, msg = mgr.remove(name)
+        if ok:
+            return _ok(rid, {"message": msg})
+        return _err(rid, 4018, msg)
+    except Exception as e:
+        return _err(rid, 5017, str(e))
+
+
+@method("pool.switch")
+def _(rid, params: dict) -> dict:
+    """Switch to a different connection."""
+    try:
+        from tui_gateway.connection_manager import get_connection_manager
+        mgr = get_connection_manager()
+        name = params.get("name", "").strip()
+        if not name:
+            return _err(rid, 4004, "name required")
+        ok, msg = mgr.switch(name)
+        if ok:
+            return _ok(rid, {"message": msg, "url": mgr.active_url})
+        return _err(rid, 4018, msg)
+    except Exception as e:
+        return _err(rid, 5017, str(e))
+
+
+@method("pool.test")
+def _(rid, params: dict) -> dict:
+    """Test a connection by probing its health endpoint."""
+    try:
+        from tui_gateway.connection_manager import get_connection_manager
+        mgr = get_connection_manager()
+        name = params.get("name", "").strip()
+        if not name:
+            return _err(rid, 4004, "name required")
+        ok, msg = mgr.test_connection(name)
+        if ok:
+            return _ok(rid, {"message": msg})
+        return _err(rid, 4018, msg)
+    except Exception as e:
+        return _err(rid, 5017, str(e))
+
+
+@method("pool.discover")
+def _(rid, params: dict) -> dict:
+    """Discover Hermes instances on Tailscale."""
+    try:
+        from tui_gateway.connection_manager import get_connection_manager
+        mgr = get_connection_manager()
+        count, msg = mgr.discover_tailscale()
+        if count > 0:
+            return _ok(rid, {"message": msg, "count": count})
+        return _err(rid, 4018, msg)
+    except Exception as e:
+        return _err(rid, 5017, str(e))
+
+
 @method("rollback.list")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)

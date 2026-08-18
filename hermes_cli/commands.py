@@ -192,6 +192,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
 
+    # Pool (multi-connection management)
+    CommandDef("pool", "Manage and monitor multiple Hermes connections (Tailscale, remote, local)", "Session",
+               args_hint="[list|add|remove|switch|test|discover]",
+               subcommands=("list", "add", "remove", "switch", "test", "discover")),
+
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),

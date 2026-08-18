@@ -189,6 +189,96 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
+    help: 'manage and monitor multiple Hermes connections (Tailscale, remote, local)',
+    name: 'pool',
+    usage: '/pool [list|add|remove|switch|test|discover]',
+    run: (arg, ctx) => {
+      const trimmed = arg.trim()
+      const parts = trimmed.split(/\s+/)
+      const sub = parts[0]?.toLowerCase() || 'list'
+
+      if (sub === 'list' || !trimmed) {
+        ctx.gateway.rpc<{ connections: Array<{ name: string; url: string; active: boolean; status: string }> }>(
+          'pool.list',
+          { session_id: ctx.sid }
+        ).then(
+          ctx.guarded(r => {
+            const lines = ['Configured connections:']
+            for (const c of r.connections) {
+              const marker = c.active ? ' * ' : '   '
+              lines.push(`${marker}${c.name.padEnd(15)} ${c.url.padEnd(45)} [${c.status}]`)
+            }
+            lines.push('')
+            lines.push("Use '/pool switch <name>' to switch active connection.")
+            ctx.transcript.sys(lines.join('\n'))
+          })
+        )
+        return
+      }
+
+      if (sub === 'add') {
+        const name = parts[1]
+        const url = parts[2]
+        if (!name || !url) {
+          return ctx.transcript.sys('Usage: /pool add <name> <url> [--token <token>]')
+        }
+        const tokenIdx = parts.indexOf('--token')
+        const token = tokenIdx >= 0 && parts[tokenIdx + 1] ? parts[tokenIdx + 1] : undefined
+        ctx.gateway.rpc('pool.add', { name, url, token, session_id: ctx.sid }).then(
+          ctx.guarded(r => ctx.transcript.sys(r.message))
+        )
+        return
+      }
+
+      if (sub === 'remove') {
+        const name = parts[1]
+        if (!name) {
+          return ctx.transcript.sys('Usage: /pool remove <name>')
+        }
+        ctx.gateway.rpc('pool.remove', { name, session_id: ctx.sid }).then(
+          ctx.guarded(r => ctx.transcript.sys(r.message))
+        )
+        return
+      }
+
+      if (sub === 'switch') {
+        const name = parts[1]
+        if (!name) {
+          return ctx.transcript.sys('Usage: /pool switch <name>')
+        }
+        ctx.gateway.rpc('pool.switch', { name, session_id: ctx.sid }).then(
+          ctx.guarded(r => {
+            ctx.transcript.sys(r.message)
+            ctx.transcript.sys('Reconnect to use the new backend.')
+          })
+        )
+        return
+      }
+
+      if (sub === 'test') {
+        const name = parts[1]
+        if (!name) {
+          return ctx.transcript.sys('Usage: /pool test <name>')
+        }
+        ctx.gateway.rpc('pool.test', { name, session_id: ctx.sid }).then(
+          ctx.guarded(r => ctx.transcript.sys(r.message))
+        )
+        return
+      }
+
+      if (sub === 'discover') {
+        ctx.gateway.rpc('pool.discover', { session_id: ctx.sid }).then(
+          ctx.guarded(r => ctx.transcript.sys(r.message))
+        )
+        return
+      }
+
+      ctx.transcript.sys(`Unknown subcommand: ${sub}`)
+      ctx.transcript.sys('Usage: /pool [list|add|remove|switch|test|discover]')
+    }
+  },
+
+  {
     help: 'attach an image',
     name: 'image',
     run: (arg, ctx) => ctx.composer.attachImagePath(arg)
