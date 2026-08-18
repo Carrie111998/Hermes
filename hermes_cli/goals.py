@@ -671,7 +671,7 @@ _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
 # still returns a real DB (no silently dropped goal writes); a contended
 # init (locked state.db mid-migration) blows past this and the caller
 # degrades, with the loop stalled far under the watchdog's probe window.
-_DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
+_DB_BOOTSTRAP_LOOP_WAIT_S = 0.75
 
 
 def _bootstrap_session_db(home: str, done: threading.Event) -> None:
