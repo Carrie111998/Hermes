@@ -121,6 +121,15 @@ class TestTokenAuth:
         assert conn.auth == "token"
         assert conn.token == "some-token"
 
+    def test_explicit_auth_overrides_auto_detect(self, tmp_home):
+        """If auth is explicitly provided, it takes precedence over auto-detect."""
+        mgr = get_connection_manager()
+        # Explicitly set auth=tailscale even with a token
+        mgr.add("explicit", "http://127.0.0.1:9999", auth="tailscale", token="some-token")
+        conn = mgr.get_connection("explicit")
+        assert conn.auth == "tailscale"
+        assert conn.token == "some-token"
+
 
 class TestTailscaleDiscovery:
     """Test Tailscale peer discovery with realistic JSON."""

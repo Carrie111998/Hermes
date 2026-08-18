@@ -1259,7 +1259,7 @@ def _(rid, params: dict) -> dict:
         name = params.get("name", "").strip()
         url = params.get("url", "").strip()
         mode = params.get("mode", "remote")
-        auth = params.get("auth", "tailscale")
+        auth = params.get("auth")  # None triggers auto-detect: token -> "token", else "tailscale"
         token = params.get("token")
         if not name or not url:
             return _err(rid, 4004, "name and url required")
