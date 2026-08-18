@@ -206,7 +206,7 @@ def test_feasibility_inherits_main_context_pin_for_same_runtime(
     agent.base_url = "https://api.z.ai/api/coding/paas/v4"
     agent._config_context_length = 1_000_000
     mock_client = MagicMock()
-    mock_client.base_url = "https://api.z.ai/api/coding/paas/v4/"
+    mock_client.base_url = "https://API.Z.AI:443/api/coding/paas/v4/"
     mock_client.api_key = "zai-test"
     mock_get_client.return_value = (mock_client, "glm-5.3")
 

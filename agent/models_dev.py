@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from utils import atomic_json_write
+from utils import atomic_json_write, base_url_identity
 
 import requests
 
@@ -836,15 +836,15 @@ def _catalog_search_order(
     if mdev_provider_id.endswith(_CODING_PLAN_CATALOG_SUFFIX):
         return (mdev_provider_id,)
 
-    requested_url = str(base_url or "").strip().lower().rstrip("/")
-    if requested_url:
+    requested_identity = base_url_identity(base_url)
+    if requested_identity is not None:
         for provider_id, provider_data in data.items():
             if not provider_id.endswith(_CODING_PLAN_CATALOG_SUFFIX):
                 continue
             if not isinstance(provider_data, dict):
                 continue
-            catalog_url = str(provider_data.get("api") or "").strip().lower().rstrip("/")
-            if catalog_url and catalog_url == requested_url:
+            catalog_identity = base_url_identity(str(provider_data.get("api") or ""))
+            if catalog_identity is not None and catalog_identity == requested_identity:
                 return (provider_id, mdev_provider_id)
 
     return (mdev_provider_id,)

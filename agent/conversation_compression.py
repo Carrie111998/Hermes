@@ -76,6 +76,7 @@ from agent.model_metadata import (
     estimate_request_tokens_rough,
 )
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
+from utils import base_url_identity
 
 logger = logging.getLogger(__name__)
 
@@ -1698,7 +1699,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
             same_model = str(aux_model).strip().casefold() == str(
                 getattr(agent, "model", "") or ""
             ).strip().casefold()
-            main_base_url = str(getattr(agent, "base_url", "") or "").rstrip("/")
+            main_base_url = str(getattr(agent, "base_url", "") or "")
             aux_provider = (
                 _aux_cfg_provider
                 if _aux_cfg_provider and _aux_cfg_provider != "auto"
@@ -1707,10 +1708,11 @@ def check_compression_model_feasibility(agent: Any) -> None:
             same_provider = str(aux_provider or "").casefold() == str(
                 getattr(agent, "provider", "") or ""
             ).casefold()
-            normalized_aux_url = aux_base_url.rstrip("/")
+            main_identity = base_url_identity(main_base_url)
+            aux_identity = base_url_identity(aux_base_url)
             same_endpoint = (
-                normalized_aux_url == main_base_url
-                if normalized_aux_url or main_base_url
+                bool(main_identity and aux_identity and main_identity == aux_identity)
+                if aux_base_url or main_base_url
                 else same_provider
             )
             if same_model and same_endpoint:

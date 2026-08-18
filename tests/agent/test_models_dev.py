@@ -155,7 +155,7 @@ class TestLookupModelsDevContext:
         assert lookup_models_dev_context(
             "zai",
             "glm-5.2-highspeed",
-            base_url="https://api.z.ai/api/coding/paas/v4/",
+            base_url="https://API.Z.AI:443/api/coding/paas/v4/",
         ) == 1_000_000
         assert lookup_models_dev_context(
             "zai",
@@ -178,7 +178,7 @@ class TestLookupModelsDevContext:
         assert lookup_models_dev_context(
             "zai",
             "glm-5.3",
-            base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+            base_url="https://OPEN.BIGMODEL.CN:443/api/coding/paas/v4/",
         ) == 1_000_000
 
     @patch("agent.models_dev.fetch_models_dev")
@@ -196,7 +196,7 @@ class TestLookupModelsDevContext:
         assert lookup_models_dev_context(
             "alibaba",
             "glm-5",
-            base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
+            base_url="https://CODING-INTL.DASHSCOPE.ALIYUNCS.COM:443/v1/",
         ) == 202_752
         assert lookup_models_dev_context("alibaba", "glm-5") is None
         assert lookup_models_dev_context("alibaba-coding-plan", "glm-5") == 202_752
