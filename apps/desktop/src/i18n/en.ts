@@ -699,6 +699,7 @@ export const en: Translations = {
       duplicateLocal: 'This app already manages a local connection — there can only be one.',
       duplicateUrl: (label: string) => `A connection to this gateway URL already exists (“${label}”).`,
       duplicateSsh: (label: string) => `A connection to this SSH host already exists (“${label}”).`,
+      sameBackendHint: (label: string) => `Same backend as “${label}”`,
       localAddHint: 'Local is unavailable: the managed local connection already exists (there is only ever one).',
       cloudAddHint:
         'Tip: signing in under Hermes Cloud above discovers your agents automatically — use this form only to register a known instance URL by hand.',
@@ -714,25 +715,13 @@ export const en: Translations = {
       title: 'Gateway Connection',
       envOverride: 'env override',
       intro:
-        'Local by default. Use remote when this app should drive a Hermes backend elsewhere. Per-profile overrides below.',
-      allProfiles: 'All profiles',
-      defaultConnection: 'Default connection for every profile that has no override of its own.',
-      profileConnection: profile =>
-        `Connection used only when “${profile}” is the active profile. Choose Use default gateway to remove its override.`,
-      profileOverridesTitle: 'Per-profile overrides',
-      profileOverridesDesc:
-        'Each profile can point at its own gateway. The connection controls below edit the selected target; everything else on this page is app-wide.',
-      overrideEdit: 'Edit',
-      overrideEditing: 'Editing',
-      overrideSelectHint: 'Select to view or change the gateway this profile uses.',
+        'Local by default. Use remote when this app should drive a Hermes backend elsewhere. Gateway connections are machine-level; profiles are discovered from the gateways you connect.',
       envOverrideTitle: 'Environment variables are controlling this desktop session.',
       envOverrideDesc:
         'Unset HERMES_DESKTOP_REMOTE_URL and HERMES_DESKTOP_REMOTE_TOKEN to use the saved setting below.',
       modeTitle: 'Connection mode',
       localTitle: 'Local gateway',
       localDesc: 'Start a private Hermes backend on localhost. This is the default and works offline.',
-      inheritTitle: 'Use default gateway',
-      inheritDesc: "Remove this profile's override and use the default connection.",
       remoteTitle: 'Remote gateway',
       remoteDesc: 'Connect this desktop shell to a remote Hermes backend.',
       remoteAuthHint: 'Hosted gateways use OAuth or a username and password; self-hosted ones may use a session token.',
@@ -849,8 +838,6 @@ export const en: Translations = {
       sshHermesPathTitle: 'Hermes path (optional)',
       sshHermesPathDesc: 'Full path to the remote hermes binary. Blank = auto-detect.',
       sshHermesPathPlaceholder: 'auto-detect',
-      sshRemoteProfileTitle: 'Remote profile (optional)',
-      sshRemoteProfileDesc: 'Profile name on the remote host. Blank = use the Desktop profile name.',
       sshTestConnection: 'Test SSH',
       sshConnect: 'Connect',
       sshButtonsHint: 'Save applies on the next launch. Connect reconnects now.',

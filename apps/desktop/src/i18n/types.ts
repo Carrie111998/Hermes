@@ -586,6 +586,7 @@ export interface Translations {
       duplicateLocal: string
       duplicateUrl: (label: string) => string
       duplicateSsh: (label: string) => string
+      sameBackendHint: (label: string) => string
       localAddHint: string
       cloudAddHint: string
       save: string
@@ -600,21 +601,11 @@ export interface Translations {
       title: string
       envOverride: string
       intro: string
-      allProfiles: string
-      defaultConnection: string
-      profileConnection: (profile: string) => string
-      profileOverridesTitle: string
-      profileOverridesDesc: string
-      overrideEdit: string
-      overrideEditing: string
-      overrideSelectHint: string
       envOverrideTitle: string
       envOverrideDesc: string
       modeTitle: string
       localTitle: string
       localDesc: string
-      inheritTitle: string
-      inheritDesc: string
       remoteTitle: string
       remoteDesc: string
       remoteAuthHint: string
@@ -722,8 +713,6 @@ export interface Translations {
       sshHermesPathTitle: string
       sshHermesPathDesc: string
       sshHermesPathPlaceholder: string
-      sshRemoteProfileTitle: string
-      sshRemoteProfileDesc: string
       sshTestConnection: string
       sshConnect: string
       sshButtonsHint: string

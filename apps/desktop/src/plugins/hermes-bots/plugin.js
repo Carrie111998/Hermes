@@ -132,6 +132,12 @@ function trackInboundActivity(roster) {
 
     $botUnread.set({ ...$botUnread.get(), [bot.name]: true })
 
+    // Roster-hidden bots stay quiet: the unread flag above accumulates
+    // silently (unhiding reveals the badge) but a hidden bot never toasts.
+    if ($botMeta.get()[bot.name]?.hidden) {
+      continue
+    }
+
     // Toasts are opt-in: the unread badge is always set above, but the
     // per-message notification fires only when the user enabled it.
     if ($activityToasts.get()) {
@@ -269,11 +275,57 @@ async function saveBotMeta(name, patch) {
   return { serverPersisted: serverOutcome === 'persisted', serverOutcome }
 }
 
+// ── hidden bots (right-click → Hide Bot) ────────────────────────────────────
+// Hiding is a ROSTER-DISPLAY concern only: a hidden bot keeps working —
+// @mentions still resolve, group-chat membership is untouched, its name
+// still counts as taken, and an open chat stays open. The flag lives in bot
+// meta (`hidden: true`), so it rides the same local-storage + server
+// ui_meta pipeline as pins/titles and follows the profile across machines.
+// Unhide writes `hidden: false` (never null): a null key survives the local
+// `{ ...prev, ...patch }` merge while the server DELETES None keys, and
+// that asymmetry lets mergeServerMeta resurrect a stale truthy copy. A
+// literal false round-trips identically through both stores.
+
+/** Session-only view toggle: reveal hidden bots (dimmed) in the roster. */
+const $showHiddenBots = atom(false)
+
+/** Hidden flag for a roster row. Thin remote-source rows never read local
+ *  meta (botRosterMeta returns null for them), so hide is by NAME on the
+ *  active source; remote rows of the same name stay visible. */
+function isBotHidden(bot, metaByName) {
+  return Boolean(botRosterMeta(bot, metaByName)?.hidden)
+}
+
+/** Hiding the selected bot re-homes the selection (the Routines pane
+ *  follows it): first visible bot wins, then 'default' — unless default is
+ *  itself hidden with nothing else visible, in which case the selection
+ *  stays put rather than pointing somewhere even less real. */
+function fallbackSelectionAfterHide(name) {
+  if ($selectedBot.get() !== name) {
+    return
+  }
+
+  const meta = $botMeta.get()
+  const visible = $lastRoster
+    .get()
+    .filter(bot => !bot.remoteSource && bot.name !== name && !meta[bot.name]?.hidden)
+
+  if (visible.length) {
+    $selectedBot.set(visible[0].name)
+    return
+  }
+
+  if (name !== 'default' && !meta.default?.hidden) {
+    $selectedBot.set('default')
+  }
+}
+
 /** One-time reconciliation: Bot Mode sessions are always hidden, but rooms
  *  and Bot Chats created before this policy (or while the old pref was off)
  *  left visible rows behind. On every plugin load, sweep every session id we
  *  own — canonical chats from bot meta plus each group room's member
- *  sessions — through the core session.set_hidden RPC. Idempotent (the DB
+ *  sessions — through the core session.set_hidden RPC, then run the
+ *  ownership-based sweep for the rows we DON'T know by id. Idempotent (the DB
  *  setter is a no-op on already-hidden rows) and feature-detected: older
  *  gateways lack session.set_hidden and simply keep the rows visible. */
 function hideOwnedBotSessions() {
@@ -285,10 +337,82 @@ function hideOwnedBotSessions() {
     .filter(sid => Boolean(sid) && sid !== true)
   const ids = [...new Set([...canonical, ...rooms])]
 
-  return Promise.all(
+  const known = Promise.all(
     ids.map(sid =>
       Promise.resolve(host.request('session.set_hidden', { session_id: sid, hidden: true })).catch(() => undefined)
     )
+  )
+
+  return Promise.all([known, sweepBotProfileSessions().catch(() => undefined)])
+}
+
+// Titles Bot Mode itself mints for its plumbing sessions. Bot-to-bot CLI
+// handoffs (`hermes -p <bot> chat --in ~ -c "Bot Chat" --create-if-missing`)
+// and mention handoffs create sessions with EXACTLY these titles; the
+// "Group: " prefix is the member-session title ensureGroupChatSession has
+// used since group chats shipped. Exact/prefix matching is deliberate — a
+// user's real conversation inside a bot profile keeps whatever title the
+// user gave it and is never touched.
+const BOT_MODE_SWEEP_TITLES = new Set(['Bot Chat', 'Agent Inbox'])
+
+function isBotModeSweepTitle(title) {
+  const t = String(title || '').trim()
+  return BOT_MODE_SWEEP_TITLES.has(t) || t.startsWith('Group: ')
+}
+
+/** Ownership-based sweep: the id-based sweep above only covers sessions the
+ *  plugin recorded ($botMeta canonical chats, $groupChats member sids), but
+ *  Bot Mode sessions are ALSO minted outside the plugin — bot-to-bot CLI
+ *  handoffs ("Agent Inbox" / extra "Bot Chat" rows born visible in a bot's
+ *  profile) — and those ids the plugin never learns. So: enumerate each
+ *  roster bot's OWN profile sessions (only bot profiles — a non-bot profile
+ *  is never listed, so its sessions are never touched) and hide any VISIBLE
+ *  row whose title is Bot Mode plumbing. session.list without include_hidden
+ *  returns only visible rows, which keeps the sweep naturally idempotent.
+ *  Remote-source bots route to their own connection via requestForBot.
+ *  Feature-detected + fire-and-forget: older gateways without per-profile
+ *  session.list / session.set_hidden simply reject and the sweep no-ops. */
+async function sweepBotProfileSessions() {
+  const cached = $lastRoster.get()
+  let roster = Array.isArray(cached) && cached.length ? cached : null
+
+  if (!roster) {
+    // Plugin load can run before the Bots pane hydrates $lastRoster — fall
+    // back to the active gateway's own profile list (local bots; remote
+    // sources get covered by the next sweep once the roster cache exists).
+    try {
+      const res = await host.request('profiles.list', {})
+      roster = Array.isArray(res?.profiles) ? res.profiles : []
+    } catch {
+      return
+    }
+  }
+
+  await Promise.all(
+    roster.map(async bot => {
+      const name = String(bot?.name || '').trim()
+
+      if (!name) {
+        return
+      }
+
+      try {
+        const res = await requestForBot(bot, 'session.list', { profile: name, limit: PROFILE_SESSION_LIST_LIMIT })
+        const rows = Array.isArray(res?.sessions) ? res.sessions : []
+
+        await Promise.all(
+          rows
+            .filter(row => row && row.id && isBotModeSweepTitle(row.title))
+            .map(row =>
+              Promise.resolve(
+                requestForBot(bot, 'session.set_hidden', { session_id: row.id, hidden: true, profile: name })
+              ).catch(() => undefined)
+            )
+        )
+      } catch {
+        /* older gateway / unreachable source — leave this profile alone */
+      }
+    })
   )
 }
 
@@ -3240,7 +3364,7 @@ function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLines }) {
     ...deltaLines.map(line => `  ${line}`),
     '',
     'Rules for this room:',
-    '- Reply with ONE short conversational message (1-3 sentences) ONLY if you have something new worth adding: build on what was just said, claim or hand off work, answer a question aimed at you, or report a real result.',
+    '- Reply with ONE conversational message ONLY if you have something new worth adding: build on what was just said, claim or hand off work, answer a question aimed at you, or report a real result. Keep chatter short (1-3 sentences) — but when you are delivering a result, an answer the user asked for, or substantive work, give it at full quality and length; never thin out real content to fit the room.',
     '- If you have nothing new to add, reply with exactly "(pass)". Passing is good — it lets the conversation settle.',
     '- Mention a teammate as @name to pull them in; mention @user only for a judgment call or a result the user needs. Do not repeat points already made.',
     '- Never reveal content from your private 1:1 chats. Your reply text goes to the room verbatim — no preamble, no meta-commentary.'
@@ -3284,6 +3408,10 @@ function updateGroupChat(group, mutate) {
         log: room.log,
         watermarks: room.watermarks,
         sessions: room.sessions || {},
+        // Timed-out turns awaiting a late reply — keyed by member, valued
+        // with the pre-turn message baseline. Survives reloads so finished
+        // work is still harvested after a window restart.
+        stranded: room.stranded || {},
         // Cross-connection member descriptors — remote bots can't ride
         // bot-meta, so the room record carries who they are.
         members: Array.isArray(room.members) ? room.members : []
@@ -3425,10 +3553,20 @@ async function ensureGroupChatSession(group, member) {
 
 const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
+// A member turn that is VISIBLY still working (session reports
+// inflight/running) keeps its slot alive up to this hard cap. The base
+// timeout alone silently dropped long real turns: a 7-minute research run
+// timed out at 3 minutes, read as a pass, and its finished result never
+// reached the room (db's Aug 2026 report).
+const GROUP_TURN_HARD_CAP_MS = 20 * 60000
 
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
- *  assistant message lands (or timeout → pass). No shell composition. */
+ *  assistant message lands (or timeout → pass). While the session visibly
+ *  reports work in flight the deadline extends (bounded by the hard cap),
+ *  so slow models aren't cut off mid-run. A turn that still times out
+ *  records a stranded marker so the finished reply can be harvested into
+ *  the room at the member's next turn instead of being lost. */
 async function runGroupChatMemberTurn(group, member, prompt) {
   const { runtime, stored } = await ensureGroupChatSession(group, member)
 
@@ -3451,7 +3589,8 @@ async function runGroupChatMemberTurn(group, member, prompt) {
 
   await requestForBot(member, 'prompt.submit', { session_id: runtime, text: prompt })
 
-  const deadline = Date.now() + GROUP_TURN_TIMEOUT_MS
+  const started = Date.now()
+  let deadline = started + GROUP_TURN_TIMEOUT_MS
 
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
@@ -3468,7 +3607,8 @@ async function runGroupChatMemberTurn(group, member, prompt) {
     }
 
     const messages = Array.isArray(state?.messages) ? state.messages : []
-    const done = !state?.inflight && !state?.running
+    const busy = Boolean(state?.inflight || state?.running)
+    const done = !busy
 
     if (messages.length > before && done) {
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -3487,9 +3627,91 @@ async function runGroupChatMemberTurn(group, member, prompt) {
 
       return null
     }
+
+    // Still visibly working: extend the deadline (never past the hard cap).
+    if (busy) {
+      deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+    }
   }
 
-  return null // timeout — reads as a pass
+  // Timeout — reads as a pass, but remember the baseline (runtime-only) so
+  // the finished reply can be posted late instead of vanishing.
+  updateGroupChat(group, r => {
+    r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: before }
+    return r
+  })
+
+  return null
+}
+
+/** Post a timed-out member's finished reply into the room, if it landed
+ *  after we stopped waiting. Called at the member's next turn boundary and
+ *  on user sends, so long-running work is delivered late rather than lost. */
+async function harvestStrandedGroupReply(group, member) {
+  const memberKey = groupMemberKey(member)
+  const room = $groupChats.get()[group] || {}
+  const strandedBefore = room.stranded?.[memberKey]
+
+  if (typeof strandedBefore !== 'number') {
+    return
+  }
+
+  let state = null
+
+  try {
+    const stored = room.sessions?.[memberKey]
+    state = await requestForBot(member, 'session.resume', {
+      session_id: stored || `Group: ${group}`,
+      profile: member.name
+    })
+  } catch {
+    return // source unreachable — leave the marker for the next boundary
+  }
+
+  if (state?.inflight || state?.running) {
+    return // still grinding — keep waiting
+  }
+
+  // Done (or dead): the marker is consumed either way.
+  updateGroupChat(group, r => {
+    const next = { ...(r.stranded || {}) }
+    delete next[memberKey]
+    r.stranded = next
+    return r
+  })
+
+  const messages = Array.isArray(state?.messages) ? state.messages : []
+
+  if (messages.length <= strandedBefore) {
+    return
+  }
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+
+    if (msg?.role === 'assistant') {
+      const text = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
+          : msg?.text || ''
+      const reply = String(text).trim()
+
+      if (reply && !isGroupPassText(reply)) {
+        appendGroupChatEntry(
+          group,
+          { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
+          reply
+        )
+        updateGroupChat(group, r => {
+          r.watermarks[memberKey] = r.log.length
+          return r
+        })
+      }
+
+      return
+    }
+  }
 }
 
 /** Drive one bounded round-robin room turn. Serial — one member at a time.
@@ -3502,6 +3724,17 @@ async function runGroupChatRounds(group, members) {
 
   try {
     for (let round = 0; round < GROUP_CHAT_MAX_ROUNDS; round++) {
+      // Deliver any replies that finished after their turn timed out —
+      // every member, not just this round's responders, so long work is
+      // late, never lost.
+      for (const member of members) {
+        if (!isCurrent()) {
+          return
+        }
+
+        await harvestStrandedGroupReply(group, member)
+      }
+
       const roomLog = ($groupChats.get()[group] || {}).log || []
       const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
       let spokeThisRound = 0
@@ -3525,6 +3758,14 @@ async function runGroupChatRounds(group, members) {
           members,
           viewer: member,
           deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
+        })
+
+        // Surface WHO is on turn (runtime-only, like running/epoch) so the
+        // room shows "Radar is thinking…" instead of a generic working line —
+        // long model turns otherwise read as the room being stuck.
+        updateGroupChat(group, r => {
+          r.turn = member.name
+          return r
         })
 
         let reply = null
@@ -3565,6 +3806,7 @@ async function runGroupChatRounds(group, members) {
     if (isCurrent()) {
       updateGroupChat(group, r => {
         r.running = false
+        r.turn = null
         return r
       })
     }
@@ -3953,7 +4195,10 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
-      isActive && 'bg-(--chrome-action-hover)'
+      isActive && 'bg-(--chrome-action-hover)',
+      // Hidden bots only render while the header eye toggle is on — dimmed,
+      // so the temporary reveal reads as a different state from the roster.
+      meta?.hidden && 'opacity-60'
     ),
     children: [
       jsx('div', {
@@ -3974,6 +4219,13 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                         className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
                         title: 'Pinned',
                         children: '📌'
+                      })
+                    : null,
+                  meta?.hidden
+                    ? jsx(Codicon, {
+                        name: 'eye-closed',
+                        className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                        title: 'Hidden from the roster'
                       })
                     : null,
                   jsx('span', {
@@ -4063,6 +4315,26 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
               })
             },
             children: meta?.pinned ? 'Unpin' : 'Pin to top'
+          }),
+          jsx(ContextMenuItem, {
+            onSelect: () => {
+              const hidden = Boolean($botMeta.get()[bot.name]?.hidden)
+              // `hidden: false` (not null) so unhide round-trips through the
+              // server ui_meta merge the same way the local merge sees it.
+              saveBotMeta(bot.name, { hidden: !hidden })
+
+              if (!hidden) {
+                fallbackSelectionAfterHide(bot.name)
+              }
+
+              host.notify({
+                kind: 'info',
+                message: hidden
+                  ? `${displayName(bot, meta)} is back in the roster`
+                  : `${displayName(bot, meta)} hidden — use the eye button in the Bots header to see hidden bots`
+              })
+            },
+            children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
@@ -7049,10 +7321,35 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const canCreate = selected.length >= 2 && Boolean(name.trim() || selected.length)
 
   const create = () => {
-    const groupName = (name.trim() || placeholder).slice(0, 64)
+    let groupName = (name.trim() || placeholder).slice(0, 64)
 
     if (selected.length < 2 || !groupName) {
       return
+    }
+
+    // Creating a group is always a FRESH room. Without this, re-creating a
+    // group under an existing name (easy — the default name is just the
+    // member names) silently reopens the old room with its full log, which
+    // reads as "not a fresh group" (db's Aug 2026 report). Uniquify against
+    // both live rooms and any bot's current grouping.
+    const taken = new Set(Object.keys($groupChats.get()))
+
+    for (const meta of Object.values($botMeta.get() || {})) {
+      const existing = String(meta?.group || '').trim()
+
+      if (existing) {
+        taken.add(existing)
+      }
+    }
+
+    if (taken.has(groupName)) {
+      let n = 2
+
+      while (taken.has(`${groupName} ${n}`)) {
+        n += 1
+      }
+
+      groupName = `${groupName} ${n}`.slice(0, 64)
     }
 
     for (const bot of selected) {
@@ -7382,7 +7679,8 @@ function GroupChatWorkspace({ group, members, onBack }) {
                             ]
                           }),
                           jsx('div', {
-                            className: 'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0',
+                            className:
+                              'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0 [&_ul]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_pre]:overflow-x-auto',
                             children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                           })
                         ]
@@ -7399,7 +7697,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: 'The room is working…'
+                  children: room.turn
+                    ? `${groupSpeakerLabel(room.turn)} is thinking…`
+                    : 'The room is working…'
                 }, 'working')
               : null
           ]
@@ -7665,7 +7965,16 @@ function BotsPane() {
     return activityOf(b) - activityOf(a)
   })
   const activeSourceRoster = roster.filter(bot => !bot.remoteSource)
-  const filteredRoster = filterBots(roster, allMeta, query)
+  // Hidden bots (right-click → Hide Bot) drop out of the roster list unless
+  // the header eye toggle reveals them. Display-only: every other consumer
+  // (mentions, group chats, name-collision checks, merge/avatar/activity
+  // sweeps) keeps the FULL roster.
+  const showHidden = useValue($showHiddenBots)
+  const unreadByName = useValue($botUnread)
+  const hiddenBots = roster.filter(bot => isBotHidden(bot, allMeta))
+  const hiddenUnread = hiddenBots.some(bot => !bot.remoteSource && unreadByName[bot.name])
+  const visibleRoster = showHidden ? roster : roster.filter(bot => !isBotHidden(bot, allMeta))
+  const filteredRoster = filterBots(visibleRoster, allMeta, query)
   // Group chats are first-class roster rows (Discord-style): one standalone
   // row per room, competing in the SAME recency ordering as bot rows — a
   // group's activity is its newest room-log line. Pinned bots still lead;
@@ -7739,6 +8048,35 @@ function BotsPane() {
                   children: jsx(Codicon, { name: activityToasts ? 'bell' : 'bell-slash' })
                 })
               }),
+              // Eye toggle appears only once something is hidden — zero
+              // hidden bots means zero extra chrome. It stays visible while
+              // hidden rows are revealed, so Unhide is always reachable.
+              hiddenBots.length
+                ? jsx(Tip, {
+                    label: showHidden
+                      ? 'Hide hidden bots again'
+                      : `Show ${hiddenBots.length} hidden bot${hiddenBots.length === 1 ? '' : 's'}`,
+                    children: jsxs('button', {
+                      type: 'button',
+                      'aria-label': showHidden ? 'Hide hidden bots' : 'Show hidden bots',
+                      className: cn(
+                        'relative flex size-6 items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                        showHidden ? 'text-foreground' : 'text-(--ui-text-tertiary)'
+                      ),
+                      onClick: () => $showHiddenBots.set(!showHidden),
+                      children: [
+                        jsx(Codicon, { name: showHidden ? 'eye' : 'eye-closed' }),
+                        hiddenUnread && !showHidden
+                          ? jsx('span', {
+                              className:
+                                'absolute right-0.5 top-0.5 size-1.5 rounded-full bg-(--ui-accent,#4f9cf9)',
+                              'aria-label': 'a hidden bot has unread activity'
+                            })
+                          : null
+                      ]
+                    })
+                  })
+                : null,
               jsxs(DropdownMenu, {
                 children: [
                   jsx(Tip, {
@@ -7775,7 +8113,7 @@ function BotsPane() {
         ]
       }),
       jsx(ActiveNowStrip, {
-        roster,
+        roster: visibleRoster,
         activeProfile,
         gatewayState,
         metaByName: allMeta,
@@ -7882,7 +8220,9 @@ function BotsPane() {
                   className:
                     'flex flex-1 items-center justify-center px-4 text-center text-xs text-(--ui-text-tertiary)',
                   role: 'status',
-                  children: `No bots match “${query.trim()}”`
+                  children: query.trim()
+                    ? `No bots match “${query.trim()}”`
+                    : 'All bots are hidden — use the eye button above to show them.'
                 })
               : jsx(ScrollArea, {
                   className: 'hermes-bots-roster min-h-0 flex-1',
@@ -8105,6 +8445,7 @@ export default {
                   log: room.log,
                   watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
+                  stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   members: Array.isArray(room.members) ? room.members : [],
                   epoch: 0,
                   running: false
@@ -8165,30 +8506,77 @@ export default {
       id: 'pane',
       area: 'panes',
       title: 'Bots',
-      // dock: explicit adoption gesture. Without it the tree adopts a
-      // same-placement pane by CENTER-STACKING it into the sessions zone —
-      // and when that zone's header is hidden (lone-pane auto-hide is the
-      // default the user never changed), the sessions pane vanishes behind
-      // the Bots tab with no visible strip to switch back. Splitting below
-      // the sessions pane keeps both surfaces visible instead.
-      data: { placement: 'left', width: '260px', dock: { pane: 'sessions', pos: 'bottom' } },
+      // dock: explicit adoption gesture — CENTER-STACK into the sessions zone
+      // so the sidebar grows a SESSIONS | BOTS tab strip instead of splitting
+      // two cramped panes down the column. Center is safe now: insertAtGroup
+      // pins the zone's header explicitly shown on a center gain (and it
+      // stays shown once the zone has stacked), so the sessions pane can
+      // never vanish behind a stripless Bots tab — the lone-pane auto-hide
+      // trap this dock used to work around with a 'bottom' split.
+      // enforce: standing invariant, not a one-shot migration — the pane
+      // re-homes into the sessions strip at EVERY boot it isn't already
+      // there, whatever tokens or user placement an older install persisted.
+      // The one-time heal ('sessions-tab-v1') burned its token even when its
+      // guards skipped the move, so exactly the users who had fought the old
+      // stacked layout (dragged panes → $userPlacedPanes) stayed stacked
+      // forever. Owner's order: SESSIONS | BOTS is always a tab strip.
+      // An intra-session drag still sticks until the next launch (the
+      // invariant runs at adoption time only — see enforceDockedPanes in the
+      // tree store).
+      data: { placement: 'left', width: '260px', dock: { pane: 'sessions', pos: 'center', enforce: true } },
       render: () => jsx(BotsPane, {})
     })
 
     // Routines — its OWN tiling pane splitting the workspace's right edge
     // (NOT the collapsible right sidebar; placement 'right' is that sidebar's
     // role and hides the pane until "Show Right Sidebar").
-    ctx.register({
-      id: 'routines',
-      area: 'panes',
-      title: 'Cronjobs',
-      data: {
-        placement: 'main',
-        dock: { pane: 'workspace', pos: 'right' },
-        width: '250px'
-      },
-      render: () => jsx(RoutinesPane, {})
-    })
+    //
+    // Registered ONLY while Bot Mode is on screen: the pane exists while the
+    // Bots pane is visible (its zone's active tab, or a lone pane in a
+    // stacked pre-heal layout) and unregisters when the user tabs back to
+    // Sessions — no Cronjobs tile squatting beside the chat outside Bot Mode.
+    // `ctx.register` returns the disposer that makes this cheap; the tree
+    // keeps the pane's spot, so re-registering re-adopts it where it was.
+    // host.paneVisibility is feature-detected: older desktops without the SDK
+    // export keep the always-registered behavior.
+    const registerRoutinesPane = () =>
+      ctx.register({
+        id: 'routines',
+        area: 'panes',
+        title: 'Cronjobs',
+        data: {
+          placement: 'main',
+          dock: { pane: 'workspace', pos: 'right' },
+          width: '250px'
+        },
+        render: () => jsx(RoutinesPane, {})
+      })
+
+    if (typeof host.paneVisibility === 'function') {
+      // The contribution-scoped pane id (`register` prefixes `${ID}:`).
+      const $botsPaneVisible = host.paneVisibility(`${ID}:pane`)
+      let unregisterRoutines = null
+
+      const syncRoutinesPane = visible => {
+        if (visible) {
+          unregisterRoutines ??= registerRoutinesPane()
+        } else if (unregisterRoutines) {
+          unregisterRoutines()
+          unregisterRoutines = null
+        }
+      }
+
+      const stopRoutinesSync = $botsPaneVisible.listen(syncRoutinesPane)
+      syncRoutinesPane($botsPaneVisible.get())
+
+      if (typeof ctx.onDispose === 'function') {
+        // The registration disposer is already tracked by ctx.register; only
+        // the listener needs explicit teardown or it survives plugin disable.
+        ctx.onDispose(stopRoutinesSync)
+      }
+    } else {
+      registerRoutinesPane()
+    }
 
     ctx.register({
       id: 'new-agent',
