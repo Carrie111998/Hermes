@@ -738,7 +738,13 @@ def _reject_gateway_routing_references(
                 f"scope={scope!r}, session_key={session_key!r}"
             )
         session_id = entry.get("session_id")
-        if isinstance(session_id, str) and session_id in covered:
+        if not isinstance(session_id, str):
+            raise ValueError(
+                "cold purge refuses gateway_routing row whose session reference "
+                "cannot be verified: "
+                f"scope={scope!r}, session_key={session_key!r}"
+            )
+        if session_id in covered:
             raise ValueError(
                 "cold purge refuses gateway_routing soft reference to lineage "
                 f"session {session_id}: scope={scope!r}, "

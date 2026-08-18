@@ -169,7 +169,10 @@ def test_purge_rejects_uncovered_child_and_preserves_foreign_key_rows(
         db.close()
 
 
-@pytest.mark.parametrize("entry_json", ["{malformed", "[]"])
+@pytest.mark.parametrize(
+    "entry_json",
+    ["{malformed", "[]", '{"session_id": 123}'],
+)
 def test_purge_rejects_unverifiable_routing_entries_and_retains_all_rows(
     tmp_path: Path,
     entry_json: str,
