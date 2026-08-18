@@ -1540,6 +1540,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
         if args.interval <= 0:
             raise ValueError("--interval must be greater than zero")
         results = []
+        had_failures = False
         while True:
             with kb.connect_closing() as conn:
                 results = sync_import(
@@ -1549,6 +1550,12 @@ def _cmd_import(args: argparse.Namespace) -> int:
                     assignee_map=mapping,
                     dry_run=bool(args.dry_run),
                 )
+            cycle_failed = any(
+                result.action in {"error", "conflict"} for result in results
+            )
+            had_failures = had_failures or cycle_failed
+            if args.watch:
+                _emit_import_results(results, json_output=bool(args.json))
             if not args.watch:
                 break
             # A source-wide scan failure cannot recover records this cycle.
@@ -1557,12 +1564,18 @@ def _cmd_import(args: argparse.Namespace) -> int:
                 break
             time.sleep(args.interval)
     except KeyboardInterrupt:
-        return 0
+        return 1 if had_failures else 0
     except (OSError, ValueError) as exc:
         print(f"kanban import: {exc}", file=sys.stderr)
         return 1
+    if not args.watch:
+        _emit_import_results(results, json_output=bool(args.json))
+    return 1 if any(result.action in {"error", "conflict"} for result in results) else 0
+
+
+def _emit_import_results(results, *, json_output: bool) -> None:
     payload = [result.__dict__ for result in results]
-    if args.json:
+    if json_output:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         for result in results:
@@ -1570,7 +1583,6 @@ def _cmd_import(args: argparse.Namespace) -> int:
             if result.error:
                 detail += f" ({result.error})"
             print(f"{result.source_id or '(source)'}: {result.action}{detail}")
-    return 1 if any(result.action in {"error", "conflict"} for result in results) else 0
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:

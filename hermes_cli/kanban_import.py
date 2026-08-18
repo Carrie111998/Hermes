@@ -19,6 +19,7 @@ from typing import Any, Iterable, Protocol
 
 import yaml
 from yaml.nodes import MappingNode, ScalarNode
+from yaml.tokens import AliasToken, AnchorToken
 
 from hermes_cli import kanban_db as kb
 
@@ -101,8 +102,11 @@ class MarkdownAdapter:
             end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
         except StopIteration as exc:
             raise ValueError(f"{path.name}: unterminated YAML frontmatter") from exc
+        frontmatter = "\n".join(lines[1:end])
         try:
-            metadata = yaml.safe_load("\n".join(lines[1:end])) or {}
+            if any(isinstance(token, (AliasToken, AnchorToken)) for token in yaml.scan(frontmatter)):
+                raise ValueError(f"{path.name}: YAML anchors and aliases are not supported")
+            metadata = yaml.safe_load(frontmatter) or {}
         except yaml.YAMLError as exc:
             raise ValueError(f"{path.name}: invalid YAML frontmatter: {exc}") from exc
         if not isinstance(metadata, dict):
@@ -133,8 +137,10 @@ class MarkdownAdapter:
         except (ValueError, KeyError) as exc:
             raise ValueError(f"{path.name}: invalid max_runtime {value!r}") from exc
 
-    def _read(self, path: Path) -> ExternalTask:
-        metadata, body = self._split(path.read_text(encoding="utf-8"), path)
+    def _read(self, path: Path, text: str | None = None) -> ExternalTask:
+        if text is None:
+            text = path.read_text(encoding="utf-8")
+        metadata, body = self._split(text, path)
         unknown = sorted(set(metadata) - _SUPPORTED_FIELDS)
         if unknown:
             raise ValueError(f"{path.name}: unsupported field(s): {', '.join(unknown)}")
@@ -249,10 +255,27 @@ class MarkdownAdapter:
             )
         return text[:content_start] + frontmatter + text[content_end:]
 
-    def write_state(self, task: ExternalTask, state: str, marker: dict[str, Any]) -> None:
-        self._read(task.path)
+    def _write_state_locked(
+        self,
+        task: ExternalTask,
+        state: str,
+        marker: dict[str, Any],
+    ) -> None:
         with task.path.open("r", encoding="utf-8", newline="") as source:
             original = source.read()
+        current = self._read(task.path, original)
+        current_marker = current.metadata.get("hermes_kanban") or {}
+        unchanged = (
+            current.revision == task.revision
+            and current_marker == (task.metadata.get("hermes_kanban") or {})
+        )
+        resumable_claim = (
+            task.status in _SOURCE_RUNNABLE
+            and current.status == "importing"
+            and current_marker.get("import_id") == marker.get("import_id")
+        )
+        if not unchanged and not resumable_claim:
+            raise ValueError(f"{task.path.name}: source changed before writeback")
         text = self._patch_frontmatter(
             original,
             task.path,
@@ -272,9 +295,8 @@ class MarkdownAdapter:
                 pass
 
     @contextmanager
-    def claim(self, task: ExternalTask, marker: dict[str, Any]):
-        """Serialize ownership transfer and compare against the scanned record."""
-        lock_path = task.path.with_name(f".{task.path.name}.hermes.lock")
+    def _source_lock(self, path: Path):
+        lock_path = path.with_name(f".{path.name}.hermes.lock")
         lock_path.touch(exist_ok=True)
         with lock_path.open("r+b") as handle:
             deadline = time.monotonic() + 5.0
@@ -296,23 +318,10 @@ class MarkdownAdapter:
                     break
                 except (OSError, BlockingIOError):
                     if time.monotonic() >= deadline:
-                        raise ValueError(f"{task.path.name}: timed out acquiring source ownership")
+                        raise ValueError(f"{path.name}: timed out acquiring source ownership")
                     time.sleep(0.05)
             try:
-                current = self._read(task.path)
-                current_marker = current.metadata.get("hermes_kanban") or {}
-                same_resume = (
-                    current.status == "importing"
-                    and current_marker.get("import_id") == marker["import_id"]
-                )
-                if not same_resume and (
-                    current.revision != task.revision or current.status not in _SOURCE_RUNNABLE
-                ):
-                    raise ValueError(
-                        f"{task.path.name}: source changed or is already owned by another importer"
-                    )
-                self.write_state(current, "importing", marker)
-                yield current
+                yield
             finally:
                 if os.name == "nt":
                     import msvcrt
@@ -321,6 +330,29 @@ class MarkdownAdapter:
                 else:
                     import fcntl
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def write_state(self, task: ExternalTask, state: str, marker: dict[str, Any]) -> None:
+        with self._source_lock(task.path):
+            self._write_state_locked(task, state, marker)
+
+    @contextmanager
+    def claim(self, task: ExternalTask, marker: dict[str, Any]):
+        """Serialize ownership transfer and compare against the scanned record."""
+        with self._source_lock(task.path):
+            current = self._read(task.path)
+            current_marker = current.metadata.get("hermes_kanban") or {}
+            same_resume = (
+                current.status == "importing"
+                and current_marker.get("import_id") == marker["import_id"]
+            )
+            if not same_resume and (
+                current.revision != task.revision or current.status not in _SOURCE_RUNNABLE
+            ):
+                raise ValueError(
+                    f"{task.path.name}: source changed or is already owned by another importer"
+                )
+            self._write_state_locked(current, "importing", marker)
+            yield current
 
 
 def _ensure_schema(conn) -> None:
@@ -391,6 +423,13 @@ def sync_import(
         }
         if table_exists else {}
     )
+    path_owners = (
+        {
+            row["source_path"]: row
+            for row in conn.execute("SELECT * FROM task_imports")
+        }
+        if table_exists else {}
+    )
     foreign_owned: set[str] = set()
     for source_id, task in by_id.items():
         marker = task.metadata.get("hermes_kanban") or {}
@@ -401,6 +440,19 @@ def sync_import(
                 "conflict",
                 marker.get("task_id"),
                 f"source is owned by importer {owner!r}",
+            ))
+            foreign_owned.add(source_id)
+            continue
+        path_owner = path_owners.get(str(task.path))
+        if path_owner and (
+            path_owner["import_id"] != import_id
+            or path_owner["source_id"] != source_id
+        ):
+            results.append(ImportResult(
+                source_id,
+                "conflict",
+                path_owner["task_id"],
+                f"source path is owned by importer {path_owner['import_id']!r}",
             ))
             foreign_owned.add(source_id)
     known_profiles = set(kb.list_profiles_on_disk())
@@ -425,7 +477,14 @@ def sync_import(
         marker = {"import_id": import_id, "task_id": native.id, "state": desired}
         if task.status != desired or task.metadata.get("hermes_kanban") != marker:
             if not dry_run:
-                adapter.write_state(task, desired, marker)
+                try:
+                    adapter.write_state(task, desired, marker)
+                except ValueError as exc:
+                    results.append(ImportResult(source_id, "conflict", native.id, str(exc)))
+                    continue
+                except OSError as exc:
+                    results.append(ImportResult(source_id, "error", native.id, str(exc)))
+                    continue
                 with kb.write_txn(conn):
                     conn.execute(
                         "UPDATE task_imports SET mirrored_status=?, updated_at=? WHERE import_id=? AND source_id=?",

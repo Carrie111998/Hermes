@@ -99,7 +99,7 @@ def test_import_is_idempotent_and_mirrors_terminal_state(import_env):
 
 def test_writeback_preserves_user_frontmatter_formatting_and_body(import_env):
     path = import_env / "formatted.md"
-    path.write_text(
+    original = (
         "---\n"
         "id: 'ext-1' # stable external id\n"
         "title: \"One\"\n"
@@ -110,9 +110,9 @@ def test_writeback_preserves_user_frontmatter_formatting_and_body(import_env):
         "---\n"
         "Body with trailing spaces.  \n\n"
         "Second paragraph.\n",
-        encoding="utf-8",
     )
-    original = path.read_text(encoding="utf-8")
+    original = "".join(original).replace("\n", "\r\n").encode()
+    path.write_bytes(original)
 
     with kb.connect_closing() as conn:
         result = sync_import(
@@ -120,13 +120,30 @@ def test_writeback_preserves_user_frontmatter_formatting_and_body(import_env):
         )
 
     assert result[0].action == "imported"
-    updated = path.read_text(encoding="utf-8")
-    assert "id: 'ext-1' # stable external id" in updated
-    assert 'title: "One"' in updated
-    assert "status: imported # lifecycle" in updated
-    assert "  - github-code-review # keep this layout" in updated
-    assert updated[updated.index("---\n", 4) + 4:] == original[original.index("---\n", 4) + 4:]
+    updated = path.read_bytes()
+    assert b"id: 'ext-1' # stable external id" in updated
+    assert b'title: "One"' in updated
+    assert b"status: imported # lifecycle" in updated
+    assert b"  - github-code-review # keep this layout" in updated
+    assert b"\r\n" in updated and b"\n" not in updated.replace(b"\r\n", b"")
+    assert updated[updated.index(b"---\r\n", 4) + 5:] == original[original.index(b"---\r\n", 4) + 5:]
     assert _read(path)["hermes_kanban"]["task_id"] == result[0].task_id
+
+
+def test_yaml_anchors_fail_closed_without_mutating_source(import_env):
+    path = import_env / "anchored.md"
+    path.write_text(
+        "---\nid: ext-1\ntitle: One\nstatus: &lifecycle pending\n"
+        "assignee: worker\ntenant: *lifecycle\n---\nwork\n",
+        encoding="utf-8",
+    )
+    original = path.read_bytes()
+    with kb.connect_closing() as conn:
+        result = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool")
+        assert kb.list_tasks(conn) == []
+    assert result[0].action == "error"
+    assert "anchors and aliases" in result[0].error
+    assert path.read_bytes() == original
 
 
 def test_import_maps_dependency_graph(import_env):
@@ -343,7 +360,9 @@ def test_watch_mirrors_lifecycle_changes_without_manual_rerun(import_env, monkey
     assert _read(path)["status"] == "done"
 
 
-def test_watch_continues_after_record_conflict_to_mirror_other_tasks(import_env, monkeypatch):
+def test_watch_continues_after_record_conflict_to_mirror_other_tasks(
+    import_env, monkeypatch, capsys,
+):
     first_path = _write(import_env, "one", {
         "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
     })
@@ -376,9 +395,87 @@ def test_watch_continues_after_record_conflict_to_mirror_other_tasks(import_env,
         source=str(import_env), assignee_map=None, adapter="markdown",
         import_id="pool", dry_run=False, watch=True, interval=0.01, json=False,
     )
-    assert kc._cmd_import(args) == 0
+    assert kc._cmd_import(args) == 1
     assert sleeps == 2
     assert _read(second_path)["status"] == "done"
+    assert "ext-1: conflict" in capsys.readouterr().out
+
+
+def test_watch_continues_after_record_writeback_error(import_env, monkeypatch):
+    first_path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    second_path = _write(import_env, "two", {
+        "id": "ext-2", "title": "Two", "status": "pending", "assignee": "worker",
+    })
+    adapter = MarkdownAdapter(import_env)
+    with kb.connect_closing() as conn:
+        imported = sync_import(conn, adapter=adapter, import_id="pool")
+        task_ids = {result.source_id: result.task_id for result in imported}
+        conn.execute("UPDATE tasks SET status='done', completed_at=1")
+        conn.commit()
+    original_write = MarkdownAdapter.write_state
+
+    def fail_one(self, task, state, marker):
+        if task.path == first_path.resolve():
+            raise OSError("read-only source")
+        return original_write(self, task, state, marker)
+
+    sleeps = 0
+
+    def stop_after_cycle(_interval):
+        nonlocal sleeps
+        sleeps += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(MarkdownAdapter, "write_state", fail_one)
+    monkeypatch.setattr(kc.time, "sleep", stop_after_cycle)
+    args = argparse.Namespace(
+        source=str(import_env), assignee_map=None, adapter="markdown",
+        import_id="pool", dry_run=False, watch=True, interval=0.01, json=False,
+    )
+    assert kc._cmd_import(args) == 1
+    assert sleeps == 1
+    assert _read(first_path)["status"] == "imported"
+    assert _read(second_path)["status"] == "done"
+    assert task_ids["ext-1"] is not None
+
+
+def test_mirror_rejects_source_change_after_scan(import_env):
+    path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    adapter = MarkdownAdapter(import_env)
+    with kb.connect_closing() as conn:
+        imported = sync_import(conn, adapter=adapter, import_id="pool")
+        task = next(adapter.scan())
+        metadata = task.metadata.copy()
+        metadata["status"] = "pending"
+        _write(import_env, "one", metadata)
+        result = adapter.write_state
+        with pytest.raises(ValueError, match="source changed before writeback"):
+            result(task, "done", {
+                "import_id": "pool", "task_id": imported[0].task_id, "state": "done",
+            })
+    assert _read(path)["status"] == "pending"
+
+
+def test_foreign_ledger_ownership_is_detected_before_source_mutation(import_env):
+    path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    with kb.connect_closing() as conn:
+        first = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool-a")
+        metadata = _read(path)
+        metadata.pop("hermes_kanban")
+        metadata["status"] = "pending"
+        _write(import_env, "one", metadata)
+        before = path.read_bytes()
+        conflict = sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool-b")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    assert [(row.action, row.task_id) for row in conflict] == [("conflict", first[0].task_id)]
+    assert "source path is owned" in conflict[0].error
+    assert path.read_bytes() == before
 
 
 def test_watch_stops_on_source_wide_scan_error(import_env, monkeypatch):
