@@ -1319,8 +1319,31 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         try:
             import shutil
             shutil.copy2(auth_file, corrupt_path)
-            preserved = True
+            # F10 (P4): copy2 copies bytes + metadata but NOT the Windows
+            # DACL — the .corrupt artifact would inherit the parent
+            # directory's broader ACL while the protected original was
+            # user-only. Restrict the copy the same way; if restriction
+            # fails, remove the copy rather than leaving a credential
+            # artifact LESS protected than the file it preserves.
+            from hermes_constants import (
+                credential_file_is_user_restricted,
+                restrict_credential_file,
+            )
+
+            if restrict_credential_file(corrupt_path) and credential_file_is_user_restricted(
+                corrupt_path
+            ):
+                preserved = True
+            else:
+                try:
+                    corrupt_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         except Exception:
+            try:
+                corrupt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             logger.debug(
                 "auth: could not preserve a copy of the corrupt store at %s",
                 corrupt_path, exc_info=True,

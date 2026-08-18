@@ -74,6 +74,59 @@ def test_unparseable_json_fails_closed_and_preserves_a_copy(store_file):
     assert corrupt.read_text(encoding="utf-8") == "{ not json"
 
 
+def test_corrupt_copy_is_user_restricted(store_file, monkeypatch):
+    """F10/P4: the .corrupt recovery copy inherits the parent directory ACL
+    on Windows (copy2 copies bytes + metadata, not the DACL) — it must be
+    restricted to the current user exactly like the protected original, or
+    removed. A credential-bearing recovery artifact LESS protected than the
+    store it preserves is a new exposure introduced by the guard itself."""
+    import hermes_constants as hc
+
+    store_file.write_text("{ not json", encoding="utf-8")
+
+    state = {"restricted": []}
+    real_restrict = hc.restrict_credential_file
+    real_check = hc.credential_file_is_user_restricted
+
+    def _restrict_and_record(path):
+        ok = real_restrict(path)
+        state["restricted"].append(str(path))
+        return ok
+
+    monkeypatch.setattr(hc, "restrict_credential_file", _restrict_and_record)
+
+    with pytest.raises(ValueError, match="fail closed"):
+        auth._load_auth_store(store_file)
+
+    corrupt = store_file.with_suffix(".json.corrupt")
+    assert corrupt.exists(), "corrupt copy must be preserved"
+    assert str(corrupt) in state["restricted"], (
+        "the .corrupt recovery copy must be restricted to the current user"
+    )
+    assert hc.credential_file_is_user_restricted(corrupt), (
+        "recovery copy must verify as user-restricted"
+    )
+
+
+def test_corrupt_copy_removed_when_restriction_fails(store_file, monkeypatch):
+    """F10/P4: if the recovery copy cannot be restricted, it must be REMOVED
+    rather than left as an unprotected credential artifact."""
+    import hermes_constants as hc
+
+    store_file.write_text("{ not json", encoding="utf-8")
+
+    monkeypatch.setattr(hc, "restrict_credential_file", lambda p: False)
+    monkeypatch.setattr(hc, "credential_file_is_user_restricted", lambda p: False)
+
+    with pytest.raises(ValueError, match="fail closed"):
+        auth._load_auth_store(store_file)
+
+    corrupt = store_file.with_suffix(".json.corrupt")
+    assert not corrupt.exists(), (
+        "unrestrictable corrupt copy must be removed, not left exposed"
+    )
+
+
 @pytest.mark.parametrize("payload", ["", "   \n\t  "], ids=["zero-byte", "whitespace-only"])
 def test_empty_store_file_fails_closed(store_file, payload):
     """F10: an existing zero-byte / whitespace-only store is corruption,
