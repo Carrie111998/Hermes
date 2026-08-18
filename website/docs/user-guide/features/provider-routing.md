@@ -27,6 +27,9 @@ provider_routing:
   order: []               # Explicit provider priority order
   require_parameters: false  # Only use providers that support all parameters
   data_collection: null   # Control data collection ("allow" or "deny")
+  quantizations: []       # Optional global quantization restriction
+  allow_fallbacks: true   # Allow another eligible endpoint if routing fails
+  model_overrides: {}     # Exact-model OpenRouter routing overrides
 ```
 
 :::info
@@ -101,6 +104,99 @@ Controls whether providers can use your prompts for training. Options are `"allo
 provider_routing:
   data_collection: "deny"
 ```
+
+### `quantizations`
+
+Restricts OpenRouter to endpoint quantizations such as `fp8`, `bf16`, or
+`unknown`. It can be set globally or inside an exact-model override.
+
+```yaml
+provider_routing:
+  quantizations: ["fp8"]
+```
+
+### `allow_fallbacks`
+
+Controls whether OpenRouter may try another eligible endpoint when the requested
+route is unavailable. `false` is meaningful and is preserved in the request.
+
+```yaml
+provider_routing:
+  allow_fallbacks: false
+```
+
+## Model-Specific OpenRouter Routes
+
+Use `model_overrides.openrouter` to constrain one exact OpenRouter model without
+changing other models or direct-provider connections:
+
+```yaml
+provider_routing:
+  sort: "price"
+  allow_fallbacks: true
+  model_overrides:
+    openrouter:
+      "deepseek/deepseek-v4-flash":
+        only: ["baidu/fp8"]
+        quantizations: ["fp8"]
+        allow_fallbacks: false
+```
+
+The model key must match the active OpenRouter model ID exactly. Endpoint tags
+come from OpenRouter and may include a variant suffix such as `baidu/fp8`; Hermes
+stores the full returned tag rather than the display name.
+
+Merge behavior is explicit:
+
+- A missing field inherits the global `provider_routing` value.
+- An empty list clears an inherited list restriction.
+- Any blank string entry invalidates the entire list; ambiguous locks fail closed
+  instead of silently narrowing the selected provider set.
+- `false` remains `false`; it is not treated as missing.
+- `null` omits that field from the request.
+- Unknown routing keys are rejected by config validation.
+
+### Automatic, Prefer, and Lock
+
+Hermes Desktop exposes three modes for OpenRouter models:
+
+- **Automatic** — no model-specific entry is stored. OpenRouter uses its normal
+  behavior plus global routing defaults.
+- **Prefer this endpoint** — stores `order`, `quantizations`, and
+  `allow_fallbacks: true`.
+- **Lock to this endpoint** — stores `only`, `quantizations`, and
+  `allow_fallbacks: false`.
+
+Selecting Automatic deletes the model's override entry entirely; it does not
+save an object filled with empty lists.
+
+Endpoint discovery is optional metadata. If discovery is unavailable, the model
+picker remains usable and the Desktop manual editor accepts the exact provider
+tag and quantization. A discovery failure never disables the selected model.
+The same routing controls are available in Settings → Model and in profile
+creation/setup; profile changes are saved to that profile rather than the active
+profile. For OpenRouter, the model field accepts a typed `author/slug` ID (with
+an optional `:suffix`) in addition to filtering the fetched suggestions, so new
+or unlisted OpenRouter models remain usable.
+
+:::warning Windows development builds and Desktop instance locking
+When testing a Windows development or packaged Desktop build with an external
+Python virtual environment, set all three variables in that build's environment:
+
+```text
+HERMES_HOME=%USERPROFILE%\.hermes-dev\openrouter-routing
+HERMES_DESKTOP_HERMES_ROOT=C:\path\to\your\hermes-agent
+HERMES_DESKTOP_PYTHON=%USERPROFILE%\.hermes\venvs\hermes-openrouter-dev\Scripts\python.exe
+```
+
+`HERMES_DESKTOP_HERMES_ROOT` must point to the fork root. If these variables are
+not set, Desktop may fall back to bare system Python and fail imports such as
+`yaml` even though the external virtual environment is correctly installed.
+
+**Do not run the development/packaged Electron build alongside the production
+Hermes Desktop app.** They share Electron's single-instance lock; close the
+production app before launching the development build, and vice versa.
+:::
 
 ## Practical Examples
 
@@ -181,7 +277,14 @@ providers_order    ← from provider_routing.order
 provider_sort      ← from provider_routing.sort
 provider_require_parameters ← from provider_routing.require_parameters
 provider_data_collection    ← from provider_routing.data_collection
+provider_quantizations      ← from provider_routing.quantizations
+provider_allow_fallbacks    ← from provider_routing.allow_fallbacks
 ```
+
+For OpenRouter, Hermes then overlays the exact active model entry from
+`provider_routing.model_overrides.openrouter` before building the request's
+`provider` object. Auxiliary models keep their independent routing configuration
+and never inherit an override belonging to a different model.
 
 :::tip
 You can combine multiple options. For example, sort by price but exclude certain providers and require parameter support:

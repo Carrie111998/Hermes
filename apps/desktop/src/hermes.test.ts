@@ -15,6 +15,7 @@ import {
   getHermesConfigDefaults,
   getLatestSessionMessages,
   getOlderSessionMessages,
+  getOpenRouterEndpoints,
   getProfiles,
   getSessionMessages,
   getStatus,
@@ -55,6 +56,35 @@ describe('Hermes REST helpers', () => {
     setApiRequestProfile(null)
     vi.restoreAllMocks()
     Reflect.deleteProperty(window, 'hermesDesktop')
+  })
+
+  it('encodes OpenRouter endpoint model IDs and scopes the active profile', async () => {
+    setApiRequestProfile('routing-profile')
+
+    await getOpenRouterEndpoints('meta-llama/llama-3.2-3b-instruct:free')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/model/openrouter/endpoints?model=meta-llama%2Fllama-3.2-3b-instruct%3Afree',
+      profile: 'routing-profile'
+    })
+  })
+
+  it('adds the optional OpenRouter endpoint refresh query only when requested', async () => {
+    await getOpenRouterEndpoints('deepseek/deepseek-v4-flash')
+    await getOpenRouterEndpoints('deepseek/deepseek-v4-flash', { refresh: true })
+
+    expect(api).toHaveBeenNthCalledWith(1, {
+      path: '/api/model/openrouter/endpoints?model=deepseek%2Fdeepseek-v4-flash'
+    })
+    expect(api).toHaveBeenNthCalledWith(2, {
+      path: '/api/model/openrouter/endpoints?model=deepseek%2Fdeepseek-v4-flash&refresh=true'
+    })
+  })
+
+  it('surfaces OpenRouter endpoint backend errors unchanged', async () => {
+    api.mockRejectedValueOnce(new Error('429: endpoint discovery rate limited'))
+
+    await expect(getOpenRouterEndpoints('deepseek/deepseek-v4-flash')).rejects.toThrow('429')
   })
 
   it('uses a longer timeout for the single-profile session list', async () => {

@@ -16,6 +16,7 @@ const getGlobalModelInfo = vi.fn()
 const getGlobalModelOptions = vi.fn()
 const getAuxiliaryModels = vi.fn()
 const getMoaModels = vi.fn()
+const getOpenRouterEndpoints = vi.fn()
 const setModelAssignment = vi.fn()
 const getRecommendedDefaultModel = vi.fn()
 const saveMoaModels = vi.fn()
@@ -33,11 +34,13 @@ vi.mock('@/hermes', () => ({
   getAuxiliaryModels: () => getAuxiliaryModels(),
   getApiRequestProfile: () => 'default',
   getMoaModels: () => getMoaModels(),
+  getOpenRouterEndpoints: (model: string, opts?: unknown) =>
+    opts === undefined ? getOpenRouterEndpoints(model) : getOpenRouterEndpoints(model, opts),
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   saveMoaModels: (body: unknown) => saveMoaModels(body),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
-  getHermesConfigRecord: () => getHermesConfigRecord(),
+  getHermesConfigRecord: (profile?: string | null) => getHermesConfigRecord(profile),
   saveHermesConfig: (config: unknown) => saveHermesConfig(config),
   setApiRequestProfile: () => {}
 }))
@@ -72,6 +75,7 @@ beforeEach(() => {
     tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
   })
   getMoaModels.mockResolvedValue(null)
+  getOpenRouterEndpoints.mockResolvedValue({ model: '', endpoints: [], cached: false })
   setModelAssignment.mockResolvedValue({ ok: true, provider: 'nous', model: 'hermes-4', gateway_tools: [] })
   getRecommendedDefaultModel.mockResolvedValue({ provider: 'nous', model: 'hermes-4', free_tier: null })
   setEnvVar.mockResolvedValue({ ok: true })
@@ -100,7 +104,473 @@ async function renderModelSettings() {
   )
 }
 
+function setupOpenRouter(overrides: Record<string, unknown> = {}) {
+  getGlobalModelInfo.mockResolvedValue({ provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' })
+  getGlobalModelOptions.mockResolvedValue({
+    providers: [
+      {
+        name: 'OpenRouter',
+        slug: 'openrouter',
+        models: ['deepseek/deepseek-v4-flash', 'openai/gpt-5.4'],
+        authenticated: true
+      }
+    ]
+  })
+  getAuxiliaryModels.mockResolvedValue({
+    main: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' },
+    tasks: []
+  })
+  getHermesConfigRecord.mockResolvedValue({
+    agent: { reasoning_effort: 'medium', service_tier: 'normal' },
+    provider_routing: { model_overrides: { openrouter: {} } },
+    ...overrides
+  })
+  getOpenRouterEndpoints.mockResolvedValue({
+    model: 'deepseek/deepseek-v4-flash',
+    endpoints: [
+      { provider_name: 'Baidu Qianfan', tag: 'baidu/fp8', quantization: 'fp8', status: 0 },
+      { provider_name: 'DigitalOcean', tag: 'digitalocean', quantization: 'unknown', status: 0 }
+    ],
+    cached: false
+  })
+  setModelAssignment.mockResolvedValue({
+    ok: true,
+    provider: 'openrouter',
+    model: 'deepseek/deepseek-v4-flash',
+    gateway_tools: []
+  })
+}
+
 describe('ModelSettings', () => {
+  it('hides OpenRouter routing controls for non-OpenRouter providers', async () => {
+    await renderModelSettings()
+
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
+    expect(screen.queryByText('OpenRouter route')).toBeNull()
+    expect(getOpenRouterEndpoints).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['openrouter', true],
+    ['OpenRouter', true],
+    ['OPENROUTER', true],
+    ['custom:openrouter', false],
+    ['anthropic', false]
+  ])('gates the OpenRouter model typeahead on provider slug %s (expected visible=%s)', async (slug, expectVisible) => {
+    getGlobalModelInfo.mockResolvedValue({ provider: slug, model: 'deepseek/deepseek-v4-flash' })
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          name: 'OpenRouter',
+          slug,
+          models: ['deepseek/deepseek-v4-flash', 'openai/gpt-5.4'],
+          authenticated: true
+        }
+      ]
+    })
+    getHermesConfigRecord.mockResolvedValue({
+      agent: { reasoning_effort: 'medium', service_tier: 'normal' },
+      provider_routing: { model_overrides: { openrouter: {} } }
+    })
+    getOpenRouterEndpoints.mockResolvedValue({ model: 'deepseek/deepseek-v4-flash', endpoints: [], cached: false })
+
+    await renderModelSettings()
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
+
+    if (expectVisible) {
+      expect(await screen.findByRole('combobox', { name: 'OpenRouter model' })).toBeTruthy()
+    } else {
+      expect(screen.queryByRole('combobox', { name: 'OpenRouter model' })).toBeNull()
+    }
+  })
+
+  it('lets OpenRouter users type a custom model and discovers endpoints for it', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    const input = await screen.findByRole('combobox', { name: 'OpenRouter model' })
+    fireEvent.change(input, { target: { value: 'meta-llama/llama-3.3-70b-instruct:free' } })
+
+    await waitFor(() => expect(getOpenRouterEndpoints).toHaveBeenCalledWith('meta-llama/llama-3.3-70b-instruct:free'))
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'meta-llama/llama-3.3-70b-instruct:free', provider: 'openrouter' })
+      )
+    )
+  })
+
+  it('filters OpenRouter model suggestions while preserving free text', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    const input = await screen.findByRole('combobox', { name: 'OpenRouter model' })
+    fireEvent.focus(input)
+    fireEvent.change(input, { target: { value: 'gpt-5' } })
+
+    expect(await screen.findByRole('option', { name: 'openai/gpt-5.4' })).toBeTruthy()
+    expect(screen.queryByRole('option', { name: 'deepseek/deepseek-v4-flash' })).toBeNull()
+  })
+
+  it('shows a non-blocking shape hint for invalid OpenRouter model text', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    fireEvent.change(await screen.findByRole('combobox', { name: 'OpenRouter model' }), {
+      target: { value: 'not-a-model' }
+    })
+
+    expect(await screen.findByText(/author\/slug/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('keeps the closed model select for non-OpenRouter providers', async () => {
+    await renderModelSettings()
+
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
+    expect(screen.queryByRole('combobox', { name: 'OpenRouter model' })).toBeNull()
+    expect(screen.getAllByRole('combobox')[1].tagName).toBe('BUTTON')
+  })
+
+  it('discovers and displays endpoints for the selected OpenRouter model', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    expect(await screen.findByText('OpenRouter route')).toBeTruthy()
+    await waitFor(() => expect(getOpenRouterEndpoints).toHaveBeenCalledWith('deepseek/deepseek-v4-flash'))
+    expect(await screen.findByText(/Baidu Qianfan/)).toBeTruthy()
+  })
+
+  it('persists a selected endpoint as an exclusive route by default', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('radio', { name: /Baidu Qianfan/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    const saved = saveHermesConfig.mock.calls.at(-1)?.[0] as any
+    expect(saved.provider_routing.model_overrides.openrouter['deepseek/deepseek-v4-flash']).toEqual({
+      only: ['baidu/fp8'],
+      quantizations: ['fp8'],
+      allow_fallbacks: false
+    })
+    expect(screen.getByText('Requests use Baidu Qianfan (fp8) only.')).toBeTruthy()
+  })
+
+  it('persists a selected endpoint as preferred when fallback is checked', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('radio', { name: /DigitalOcean/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Allow fallback providers' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    const saved = saveHermesConfig.mock.calls.at(-1)?.[0] as any
+    expect(saved.provider_routing.model_overrides.openrouter['deepseek/deepseek-v4-flash']).toEqual({
+      order: ['digitalocean'],
+      quantizations: ['unknown'],
+      allow_fallbacks: true
+    })
+  })
+
+  it('Automatic clears a saved selected endpoint', async () => {
+    setupOpenRouter({
+      provider_routing: {
+        model_overrides: {
+          openrouter: {
+            'deepseek/deepseek-v4-flash': {
+              only: ['baidu/fp8'],
+              quantizations: ['fp8'],
+              allow_fallbacks: false
+            }
+          }
+        }
+      }
+    })
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('radio', { name: /Automatic/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    const saved = saveHermesConfig.mock.calls.at(-1)?.[0] as any
+    expect(saved.provider_routing.model_overrides.openrouter['deepseek/deepseek-v4-flash']).toBeUndefined()
+  })
+
+  it('keeps blocked rows visible with accessible destructive state and persists ignore', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    const block = await screen.findByRole('button', { name: /Block DigitalOcean/ })
+    fireEvent.click(block)
+
+    expect(screen.getByText('DigitalOcean')).toBeTruthy()
+    expect(screen.getByText('Blocked')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Unblock DigitalOcean/ }).getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    const saved = saveHermesConfig.mock.calls.at(-1)?.[0] as any
+    expect(saved.provider_routing.model_overrides.openrouter['deepseek/deepseek-v4-flash']).toEqual({
+      ignore: ['digitalocean']
+    })
+  })
+
+  it('prevents a selected provider from remaining selected when it is blocked', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('radio', { name: /Baidu Qianfan/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Block Baidu Qianfan/ }))
+
+    expect(screen.getByRole('radio', { name: /Automatic/ }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('button', { name: /Unblock Baidu Qianfan/ }).getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+
+    const override = (saveHermesConfig.mock.calls.at(-1)?.[0] as any).provider_routing.model_overrides.openrouter[
+      'deepseek/deepseek-v4-flash'
+    ]
+
+    expect(override).toEqual({ ignore: ['baidu/fp8'] })
+    expect(override.only).toBeUndefined()
+    expect(override.order).toBeUndefined()
+  })
+
+  it('normalizes a padded manual tag before blocking its selected row', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('radio', { name: /Baidu Qianfan/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Enter provider tag manually' }))
+    const tagInput = screen.getByRole('textbox', { name: 'Provider tag' }) as HTMLInputElement
+    fireEvent.change(tagInput, { target: { value: '  baidu/fp8  ' } })
+
+    expect(tagInput.value).toBe('baidu/fp8')
+    fireEvent.click(screen.getByRole('button', { name: /Block Baidu Qianfan/ }))
+
+    expect(screen.getByRole('radio', { name: /Automatic/ }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('radio', { name: /Baidu Qianfan/ }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('button', { name: /Unblock Baidu Qianfan/ }).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('selecting a blocked row selects it and removes its blocked state', async () => {
+    setupOpenRouter()
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('button', { name: /Block DigitalOcean/ }))
+    fireEvent.click(screen.getByRole('radio', { name: /DigitalOcean/ }))
+
+    expect(screen.getByRole('radio', { name: /DigitalOcean/ }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('button', { name: /Block DigitalOcean/ }).getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('shows every discovered endpoint instead of truncating after four', async () => {
+    setupOpenRouter()
+    getOpenRouterEndpoints.mockResolvedValue({
+      model: 'deepseek/deepseek-v4-flash',
+      endpoints: Array.from({ length: 6 }, (_, index) => ({
+        provider_name: `Provider ${index + 1}`,
+        tag: `provider-${index + 1}`,
+        quantization: 'fp8',
+        status: 0
+      }))
+    })
+    await renderModelSettings()
+
+    expect(await screen.findByRole('radio', { name: /Provider 6/ })).toBeTruthy()
+  })
+
+  it('never persists an empty only or order from manual routing', async () => {
+    setupOpenRouter({
+      provider_routing: {
+        model_overrides: { openrouter: { 'deepseek/deepseek-v4-flash': { only: [] } } }
+      }
+    })
+    getOpenRouterEndpoints.mockRejectedValue(new Error('offline'))
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Enter provider tag manually' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Provider tag' }), { target: { value: '   ' } })
+    expect(screen.getByRole('radio', { name: /Automatic/ }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.queryByRole('checkbox', { name: 'Allow fallback providers' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    const saved = saveHermesConfig.mock.calls.at(-1)?.[0] as any
+    expect(saved.provider_routing.model_overrides.openrouter['deepseek/deepseek-v4-flash']).toBeUndefined()
+  })
+
+  it('ignores a stale endpoint response after the selected model changes', async () => {
+    setupOpenRouter()
+    let resolveOld!: (value: unknown) => void
+
+    const oldResponse = new Promise(resolve => {
+      resolveOld = resolve
+    })
+
+    getOpenRouterEndpoints.mockImplementation((model: string) =>
+      model === 'deepseek/deepseek-v4-flash'
+        ? oldResponse
+        : Promise.resolve({
+            model,
+            endpoints: [{ provider_name: 'New Endpoint', tag: 'new', quantization: 'fp8' }]
+          })
+    )
+    await renderModelSettings()
+    await waitFor(() => expect(getOpenRouterEndpoints).toHaveBeenCalledWith('deepseek/deepseek-v4-flash'))
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'OpenRouter model' }), {
+      target: { value: 'openai/gpt-5.4' }
+    })
+    expect(await screen.findByText(/New Endpoint/)).toBeTruthy()
+
+    await act(async () => {
+      resolveOld({
+        model: 'deepseek/deepseek-v4-flash',
+        endpoints: [{ provider_name: 'Stale Endpoint', tag: 'stale', quantization: 'fp8' }]
+      })
+    })
+    expect(screen.queryByText(/Stale Endpoint/)).toBeNull()
+  })
+
+  it('ignores endpoint responses from the previous profile epoch', async () => {
+    setupOpenRouter()
+    let resolveOld!: (value: unknown) => void
+    getOpenRouterEndpoints
+      .mockImplementationOnce(
+        () =>
+          new Promise(resolve => {
+            resolveOld = resolve
+          })
+      )
+      .mockResolvedValueOnce({
+        model: 'openai/gpt-5.4',
+        endpoints: [{ provider_name: 'Profile B Endpoint', tag: 'profile-b', quantization: 'fp8' }]
+      })
+    await renderModelSettings()
+    await waitFor(() => expect(getOpenRouterEndpoints).toHaveBeenCalledTimes(1))
+
+    getGlobalModelInfo.mockResolvedValue({ provider: 'openrouter', model: 'openai/gpt-5.4' })
+    await act(async () => profileSwitchHandler?.())
+    expect(await screen.findByText(/Profile B Endpoint/)).toBeTruthy()
+
+    await act(async () => {
+      resolveOld({
+        model: 'deepseek/deepseek-v4-flash',
+        endpoints: [{ provider_name: 'Profile A Stale', tag: 'profile-a', quantization: 'fp8' }]
+      })
+    })
+    expect(screen.queryByText(/Profile A Stale/)).toBeNull()
+  })
+
+  it('keeps model selection usable and exposes manual routing when discovery fails', async () => {
+    setupOpenRouter()
+    getOpenRouterEndpoints.mockRejectedValue(new Error('discovery offline'))
+    await renderModelSettings()
+
+    expect(await screen.findByText(/Endpoint discovery failed/)).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Enter provider tag manually' }))
+    expect(screen.getByRole('textbox', { name: 'Provider tag' })).toBeTruthy()
+    expect(screen.getByRole('textbox', { name: 'Quantization' })).toBeTruthy()
+  })
+
+  it('rolls the optimistic routing config back when save fails', async () => {
+    setupOpenRouter()
+    saveHermesConfig.mockRejectedValueOnce(new Error('route save failed'))
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('radio', { name: /Baidu Qianfan/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    expect(await screen.findByText('route save failed')).toBeTruthy()
+    expect(saveHermesConfig).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-fetches the authoritative config after the model assignment lands before saving routing, so a concurrent write cannot be clobbered', async () => {
+    setupOpenRouter()
+    // The query's initial load sees a STALE record (as if fetched before some
+    // other write landed server-side). After setMainModelAssignment resolves,
+    // applyMainModel must re-fetch the AUTHORITATIVE record and apply the
+    // routing delta to THAT — never to the stale snapshot captured at click time.
+    getHermesConfigRecord
+      .mockReset()
+      .mockResolvedValueOnce({
+        agent: { reasoning_effort: 'medium', service_tier: 'normal' },
+        provider_routing: { model_overrides: { openrouter: {} } },
+        _sentinel: 'stale-before-assignment'
+      })
+      .mockResolvedValueOnce({
+        agent: { reasoning_effort: 'medium', service_tier: 'normal' },
+        provider_routing: { model_overrides: { openrouter: {} } },
+        _sentinel: 'fresh-after-assignment'
+      })
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('radio', { name: /Baidu Qianfan/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveHermesConfig).toHaveBeenCalled())
+    const saved = saveHermesConfig.mock.calls.at(-1)?.[0] as any
+
+    // The saved record must be built from the FRESH re-fetch, not the stale
+    // snapshot the component held when Apply was clicked.
+    expect(saved._sentinel).toBe('fresh-after-assignment')
+    // The routing delta the user actually selected must still be present on
+    // top of that fresh record.
+    expect(saved.provider_routing.model_overrides.openrouter['deepseek/deepseek-v4-flash']).toEqual({
+      only: ['baidu/fp8'],
+      quantizations: ['fp8'],
+      allow_fallbacks: false
+    })
+  })
+
+  it('discards a stale apply when the profile is switched mid-flight, never writing or repainting for the old profile', async () => {
+    setupOpenRouter()
+    // Hold setMainModelAssignment open so we can bump the profile epoch
+    // while the apply is still in flight, simulating a slow response from
+    // profile A arriving after the user has already switched to profile B.
+    let resolveAssignment!: (value: { ok: true; provider: string; model: string; gateway_tools: never[] }) => void
+    setModelAssignment.mockReset().mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveAssignment = resolve
+        })
+    )
+
+    await renderModelSettings()
+    fireEvent.click(await screen.findByRole('radio', { name: /Baidu Qianfan/ }))
+
+    const configFetchCountBeforeApply = getHermesConfigRecord.mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    // Profile switch lands BEFORE the in-flight assignment resolves.
+    await act(async () => {
+      profileSwitchHandler?.()
+    })
+
+    await act(async () => {
+      resolveAssignment({
+        ok: true,
+        provider: 'openrouter',
+        model: 'deepseek/deepseek-v4-flash',
+        gateway_tools: []
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // The stale response landing after the switch must not re-fetch config
+    // (the epoch guard should short-circuit before the re-fetch) or save
+    // routing for the profile that is no longer active.
+    expect(getHermesConfigRecord.mock.calls.length).toBe(configFetchCountBeforeApply)
+    expect(saveHermesConfig).not.toHaveBeenCalled()
+  })
+
   it('loads the current main model and lists configured providers only', async () => {
     await renderModelSettings()
 
