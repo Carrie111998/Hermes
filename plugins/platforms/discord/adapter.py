@@ -6718,6 +6718,15 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_auto_thread_free_response(self) -> bool:
+        """Whether free-response channel messages should auto-create threads."""
+        raw = self.config.extra.get("auto_thread_free_response")
+        if raw is None:
+            raw = self._gate_env("DISCORD_AUTO_THREAD_FREE_RESPONSE")
+        if isinstance(raw, bool):
+            return raw
+        return str(raw or "").strip().lower() in {"true", "1", "yes"}
+
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
 
@@ -8073,6 +8082,8 @@ class DiscordAdapter(BasePlatformAdapter):
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+        #   discord.auto_thread_free_response: Also auto-create threads for
+        #       messages admitted by free_response_channels (default: false)
 
         thread_id = None
         parent_channel_id = None
@@ -8159,7 +8170,13 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            # Free-response channels historically reply inline.  Keep that
+            # default, but allow an explicit opt-in for thread-first workflows
+            # where every admitted message should become its own conversation.
+            auto_thread_free_response = self._discord_auto_thread_free_response()
+            skip_thread = bool(channel_keys & no_thread_channels) or (
+                is_free_channel and not auto_thread_free_response
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:

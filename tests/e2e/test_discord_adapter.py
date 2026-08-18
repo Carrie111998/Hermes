@@ -12,6 +12,7 @@ import pytest
 
 from tests.e2e.conftest import (
     BOT_USER_ID,
+    CHANNEL_ID,
     E2E_MESSAGE_SETTLE_DELAY,
     get_response_text,
     make_discord_message,
@@ -105,6 +106,21 @@ class TestAutoThreadingPreservesCommand:
         response = get_response_text(discord_adapter)
         assert response is not None
         assert "/new" in response
+
+    async def test_free_response_channel_can_opt_into_auto_threads(
+        self, discord_adapter, monkeypatch
+    ):
+        """Free-response ingress can retain thread-first behavior explicitly."""
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        discord_adapter.config.extra["free_response_channels"] = [str(CHANNEL_ID)]
+        discord_adapter.config.extra["auto_thread_free_response"] = True
+        fake_thread = make_fake_thread(thread_id=90002, name="free-response")
+        msg = make_discord_message(content="message without a mention")
+        msg.create_thread = AsyncMock(return_value=fake_thread)
+
+        await dispatch(discord_adapter, msg)
+
+        msg.create_thread.assert_awaited_once()
 
 
 class TestRepliedToMediaDispatch:
