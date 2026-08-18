@@ -64,6 +64,43 @@ class TestShouldCompressInfo:
         assert result is False
         assert not isinstance(result, tuple)
 
+    def test_all_protected_messages_skip_compression(self):
+        """Over threshold but every message inside the protected head/tail:
+        an LLM summarization pass is a guaranteed no-op, so the gate must
+        refuse to run it instead of burning an API round-trip (#88778).
+        Mirrors prune_tool_results_only()'s eligibility bail."""
+        comp = _make_compressor()  # protect_first_n=2, protect_last_n=3
+        # head = 1 (system) + 2 = 3; full protection at len <= 3 + 3 + 1 = 7.
+        msgs = [{"role": "system", "content": "sys"}]
+        msgs += [{"role": "user", "content": f"m{i}"} for i in range(6)]
+        assert len(msgs) == 7
+        # Token-only decision would fire (73_000 >= 72_000 threshold)...
+        assert comp.should_compress_info(73_000) == (True, None)
+        # ...but with the message list it must refuse — nothing is eligible.
+        assert comp.should_compress_info(73_000, msgs) == (False, None)
+        assert comp.should_compress(73_000, msgs) is False
+
+    def test_long_history_still_compresses_over_threshold(self):
+        comp = _make_compressor()  # full protection at len <= 7
+        msgs = [{"role": "system", "content": "sys"}]
+        msgs += [{"role": "user", "content": f"m{i}"} for i in range(11)]
+        assert len(msgs) == 12
+        assert comp.should_compress_info(73_000, msgs) == (True, None)
+
+    def test_legacy_one_arg_engine_falls_back_to_token_only(self):
+        """External plugin engines may still override the one-argument
+        should_compress signature; the wiring helper must degrade to the
+        token-only decision for them instead of raising (#88778)."""
+        from agent.context_engine import should_compress_with_messages
+
+        class _LegacyEngine:
+            def should_compress(self, prompt_tokens=None):
+                return prompt_tokens >= 72_000
+
+        msgs = [{"role": "user", "content": "m"}]
+        assert should_compress_with_messages(_LegacyEngine(), 73_000, msgs) is True
+        assert should_compress_with_messages(_LegacyEngine(), 71_000, msgs) is False
+
 
 # ---------------------------------------------------------------------------
 # Integration tests: build_turn_context surfaces the warning
@@ -92,8 +129,13 @@ def _build_warn_agent(compressor: ContextCompressor) -> _WarnAgent:
     return agent
 
 
-def _run_build(agent):
-    """Run build_turn_context with the prologue-side effects stubbed."""
+def _run_build(agent, history=None):
+    """Run build_turn_context with the prologue-side effects stubbed.
+
+    ``history`` overrides conversation_history — pass a list long enough to
+    clear the protected head/tail window when a test needs the compression
+    branch to actually run (#88778 made should_compress structurally
+    eligibility-aware, so a short/empty history over threshold is refused)."""
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
          patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
          patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
@@ -101,7 +143,7 @@ def _run_build(agent):
             agent=agent,
             user_message="hello",
             system_message=None,
-            conversation_history=None,
+            conversation_history=history,
             task_id=None,
             stream_callback=None,
             persist_user_message=None,
@@ -113,6 +155,12 @@ def _run_build(agent):
             set_current_write_origin=lambda _o: None,
             ra=lambda: type("R", (), {"_set_interrupt": lambda *a, **k: None})(),
         )
+
+
+# History long enough that messages exist outside the protected head/tail
+# (protect_first_n=2 + system head, protect_last_n=3) — required for the
+# compression branch to be structurally eligible (#88778).
+_LONG_HISTORY = [{"role": "user", "content": f"prior message {i}"} for i in range(12)]
 
 
 class TestTurnContextOverflowWarning:
@@ -143,12 +191,12 @@ class TestTurnContextOverflowWarning:
         comp._summary_failure_cooldown_until = time.monotonic() + 30
         agent = _build_warn_agent(comp)
         # Turn 1: over threshold + cooldown -> warn.
-        _run_build(agent)
+        _run_build(agent, history=_LONG_HISTORY)
         assert len(agent._warnings) == 1
         # Turn 2: cooldown expires while STILL over threshold -> compression
         # branch runs; the reset must happen there (not in the else branch).
         comp._summary_failure_cooldown_until = 0.0
-        _run_build(agent)
+        _run_build(agent, history=_LONG_HISTORY)
         assert agent._compress_calls > 0
         assert agent._last_ctx_overflow_warn is None
         # Turn 3: cooldown re-arms -> the warning must re-fire.

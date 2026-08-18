@@ -38,7 +38,10 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
     recover_rotated_compression_session,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import (
+    automatic_compaction_status_message,
+    should_compress_with_messages,
+)
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
@@ -946,7 +949,9 @@ def build_turn_context(
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
         else:
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            _should_compress_now = should_compress_with_messages(
+                _compressor, _preflight_tokens, messages
+            )
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -957,7 +962,9 @@ def build_turn_context(
                 _info = getattr(_compressor, "should_compress_info", None)
                 if callable(_info):
                     try:
-                        _compress_block_reason = _info(_preflight_tokens)[1]
+                        _compress_block_reason = _info(
+                            _preflight_tokens, messages
+                        )[1]
                     except Exception:
                         _compress_block_reason = None
         if _should_compress_now:

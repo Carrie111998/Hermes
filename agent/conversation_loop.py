@@ -35,7 +35,10 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import (
+    automatic_compaction_status_message,
+    should_compress_with_messages,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
@@ -2528,7 +2531,9 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and should_compress_with_messages(
+                _compressor, request_pressure_tokens, messages
+            )
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
@@ -2655,7 +2660,7 @@ def run_conversation(
             _block_reason = None
             try:
                 _block_reason = _compressor.should_compress_info(
-                    request_pressure_tokens
+                    request_pressure_tokens, messages
                 )[1]
             except Exception:
                 _block_reason = None
