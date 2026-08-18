@@ -1615,6 +1615,39 @@ _TRANSIENT_TRANSPORT_ERRORS = frozenset({
 
 
 
+def _usable_reasoning_text(value, source):
+    """Return `value` if it is real reasoning text, else None.
+
+    Every element of ``reasoning_parts`` is fed to ``"
+
+".join(...)``, so a
+    single non-str member raises TypeError out of extract_reasoning, up through
+    build_assistant_message, and out of run_conversation -- killing the turn.
+    Observed live 2026-08-18: two "Outer loop error in API call #89" failures,
+    `TypeError: sequence item 0: expected str instance, MagicMock found`.
+
+    A MagicMock is the shape that exposes this reliably -- it is truthy and
+    satisfies every hasattr, so it passes the `hasattr(...) and <truthy>` gates
+    that guard these fields. But the fault is not mock-specific: dict, list and
+    int reasoning values all crash identically, so ANY provider returning a
+    non-string here takes the conversation down.
+
+    Skipped rather than coerced: str(MagicMock) would inject "<MagicMock id=...>"
+    into the transcript, and str(dict) is no better. Logged at WARNING because a
+    silently dropped reasoning block is itself a known hazard here -- see the
+    Refs #21944 note below about thinking text that must be passed back.
+    """
+    if isinstance(value, str):
+        return value or None
+    logger.warning(
+        "extract_reasoning: ignoring non-str %s reasoning (%s); "
+        "joining it would raise TypeError and abort the turn",
+        source,
+        type(value).__name__,
+    )
+    return None
+
+
 def extract_reasoning(agent, assistant_message) -> Optional[str]:
     """
     Extract reasoning/thinking content from an assistant message.
@@ -1634,13 +1667,18 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
     
     # Check direct reasoning field
     if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
-        reasoning_parts.append(assistant_message.reasoning)
+        _text = _usable_reasoning_text(assistant_message.reasoning, "message.reasoning")
+        if _text:
+            reasoning_parts.append(_text)
     
     # Check reasoning_content field (alternative name used by some providers)
     if hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
         # Don't duplicate if same as reasoning
-        if assistant_message.reasoning_content not in reasoning_parts:
-            reasoning_parts.append(assistant_message.reasoning_content)
+        _text = _usable_reasoning_text(
+            assistant_message.reasoning_content, "message.reasoning_content"
+        )
+        if _text and _text not in reasoning_parts:
+            reasoning_parts.append(_text)
     
     # Check reasoning_details array (OpenRouter unified format)
     # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
@@ -1654,8 +1692,9 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
                     or detail.get('content')
                     or detail.get('text')
                 )
-                if summary and summary not in reasoning_parts:
-                    reasoning_parts.append(summary)
+                _text = _usable_reasoning_text(summary, "reasoning_details[].summary")
+                if _text and _text not in reasoning_parts:
+                    reasoning_parts.append(_text)
 
     # Some providers embed reasoning directly inside assistant content
     # instead of returning structured reasoning fields.  Only fall back
