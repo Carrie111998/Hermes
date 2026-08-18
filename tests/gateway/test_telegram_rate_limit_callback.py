@@ -404,6 +404,11 @@ class TestRateLimitPayloadCannotNameAModel:
 class TestRateLimitChooseAndDismiss:
     @pytest.mark.asyncio
     async def test_choose_does_not_write_an_override(self):
+        """"Choose model…" is not wired up yet, so it must be a true no-op:
+        acknowledge, write nothing, and leave the message (and therefore the
+        keyboard) alone. Replacing the message body with reply_markup=None
+        would strip the buttons -- see the test below for why that matters.
+        """
         from events.model_override import get_override
 
         adapter = _make_adapter()
@@ -416,8 +421,63 @@ class TestRateLimitChooseAndDismiss:
 
         assert get_override("deepseek", "deepseek-v4-pro") is None
         query.answer.assert_called_once()
-        query.edit_message_text.assert_called_once()
-        assert query.edit_message_text.call_args[1]["reply_markup"] is None
+        query.edit_message_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_choose_does_not_consume_the_token(self):
+        """The token is single-use and popped BEFORE the action dispatch. If
+        "choose" is handled after that pop it burns the token, so the
+        alert's only functioning control is gone."""
+        from events import override_callback_state
+
+        adapter = _make_adapter()
+        _record_target("tok-choose-token")
+        query = _make_query("rl:choose:tok-choose-token")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(_make_update(query), MagicMock())
+
+        # No public peek() (and events/override_callback_state.py is out of
+        # scope), so read the map directly rather than pop()ping it here.
+        assert "tok-choose-token" in override_callback_state._state
+
+    @pytest.mark.asyncio
+    async def test_choose_then_divert_still_diverts(self):
+        """THE BLOCKER (I3): tapping "Choose model…" first — the most likely
+        first tap — must not permanently disarm the working Divert button.
+
+        Before the fix the token was pop()ed before the dispatch and the
+        choose branch fell through to edit_message_text(reply_markup=None),
+        so the first tap destroyed both the alert body and the only working
+        control, and the follow-up Divert tap got "This prompt has already
+        been resolved."
+
+        Mutation check: delete the early ``if action == "choose"`` return in
+        plugins/platforms/telegram/adapter.py and this test fails on the
+        get_override assertion.
+        """
+        from events.model_override import get_override
+
+        adapter = _make_adapter()
+        _record_target("tok-choose-then-divert")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            choose = _make_query("rl:choose:tok-choose-then-divert")
+            await adapter._handle_callback_query(_make_update(choose), MagicMock())
+
+            divert = _make_query("rl:divert:tok-choose-then-divert")
+            await adapter._handle_callback_query(_make_update(divert), MagicMock())
+
+        rec = get_override("deepseek", "deepseek-v4-pro")
+        assert rec is not None, (
+            "the Divert button must still work after a 'Choose model' tap")
+        assert rec["replacement_model"] == "gpt-5.6-sol"
+        toast = divert.answer.call_args[1]["text"]
+        assert "already been resolved" not in toast.lower()
+        assert "diverted" in toast.lower()
+        # The divert tap is the one that legitimately retires the buttons.
+        divert.edit_message_text.assert_called_once()
+        assert divert.edit_message_text.call_args[1]["reply_markup"] is None
 
     @pytest.mark.asyncio
     async def test_dismiss_retires_buttons_and_writes_nothing(self):

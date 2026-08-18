@@ -6156,6 +6156,23 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⚠️ Unknown action.")
                     return
 
+                # "Choose model…" is not wired up yet, so it must be a true
+                # NO-OP -- handled BEFORE the pop() below and returning
+                # immediately. Handling it after the pop would consume the
+                # single-use token AND fall through to the
+                # edit_message_text at the end of this branch, which
+                # replaces the alert body and passes reply_markup=None:
+                # the most likely FIRST tap would destroy the alert text
+                # and permanently disarm the only working control in one
+                # go, and the user's follow-up Divert tap would get "This
+                # prompt has already been resolved." Answering here leaves
+                # the token AND the keyboard intact, so Divert still works.
+                if action == "choose":
+                    await query.answer(
+                        text="🔧 Model picker isn't wired up yet — coming soon.",
+                    )
+                    return
+
                 # Pop BEFORE acting — this is what makes a double-tap
                 # idempotent (the second tap finds nothing and answers
                 # "already resolved"), mirroring the sc: branch above.
@@ -6171,11 +6188,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 if action == "dismiss":
                     label = "❌ Dismissed"
-                elif action == "choose":
-                    # Model-picker integration is out of scope for this
-                    # task; explicitly acknowledge rather than silently
-                    # doing nothing. No override is written.
-                    label = "🔧 Model picker isn't wired up yet — coming soon."
                 elif action == "divert":
                     if not target["replacement_provider"] or not target["replacement_model"]:
                         # The record behind this token has no usable
