@@ -41,6 +41,28 @@ describe('AttachmentList', () => {
     expect(screen.getByText('img.png')).toBeDefined()
   })
 
+  it('exposes a visible remove control that drops the attachment', async () => {
+    const onRemove = vi.fn()
+    const image: ComposerAttachment = {
+      id: 'image:shot.png',
+      kind: 'image',
+      label: 'shot.png',
+      thumbnailUrl: THUMBNAIL_URL
+    }
+
+    const { container } = await renderWithI18n(<AttachmentList attachments={[image]} onRemove={onRemove} />)
+    const chip = container.querySelector('[data-composer-attachment-id="image:shot.png"]')
+    const remove = screen.getByRole('button', { name: 'Remove shot.png' })
+
+    expect(chip).not.toBeNull()
+    expect(remove.getAttribute('data-slot')).toBe('composer-attachment-remove')
+    expect(remove.className.includes('opacity-0')).toBe(false)
+
+    fireEvent.click(remove)
+    expect(onRemove).toHaveBeenCalledOnce()
+    expect(onRemove).toHaveBeenCalledWith('image:shot.png')
+  })
+
   it('renders empty list without error', async () => {
     const { container } = await renderWithI18n(<AttachmentList attachments={[]} />)
 
