@@ -1121,6 +1121,13 @@ def _print_update_completion(message: str) -> None:
     action_id = os.environ.get("HERMES_ACTION_ID", "")
     if len(action_id) == 32 and all(char in "0123456789abcdef" for char in action_id):
         print(f"=== hermes-update completed {action_id} ===")
+        # The next phase may restart the dashboard systemd unit, terminating
+        # this child before Python's block-buffered action-log stream exits.
+        # Flush the receipt now so the relaunched backend can prove success.
+        try:
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
 
 
 def _read_project_version() -> str | None:

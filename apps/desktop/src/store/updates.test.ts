@@ -68,6 +68,7 @@ const {
   $updateOverlayTarget,
   requestActiveUpdate,
   resetUpdateApplyState,
+  startUpdateFor,
   startUpdatePoller,
   stopUpdatePoller,
   $updateStatus
@@ -90,7 +91,11 @@ const status = (over: Partial<DesktopUpdateStatus> = {}): DesktopUpdateStatus =>
   ...over
 })
 
-const lastToast = () => notifySpy.mock.calls.at(-1)?.[0] as { onDismiss: () => void }
+const lastToast = () =>
+  notifySpy.mock.calls.at(-1)?.[0] as {
+    action: { onClick: () => void }
+    onDismiss: () => void
+  }
 
 const setRemote = (on: boolean) =>
   setConnection({
@@ -152,6 +157,15 @@ describe('maybeNotifyUpdateAvailable', () => {
     maybeNotifyUpdateAvailable(status({ behind: null, updateAvailable: true }))
     expect(notifySpy).toHaveBeenCalledTimes(1)
     expect(notifySpy.mock.calls[0]?.[0]).toMatchObject({ message: 'A new update is available.' })
+  })
+
+  it('opens the CLIENT update from a client toast while connected remotely', () => {
+    setRemote(true)
+    maybeNotifyUpdateAvailable(status(), 'client')
+
+    lastToast().action.onClick()
+
+    expect($updateOverlayTarget.get()).toBe('client')
   })
 })
 
@@ -352,6 +366,16 @@ describe('requestActiveUpdate', () => {
 
     expect(applyClientMock).not.toHaveBeenCalled()
     expect($updateOverlayTarget.get()).toBe('backend')
+  })
+
+  it('can explicitly apply the CLIENT update while connected remotely', async () => {
+    setRemote(true)
+
+    startUpdateFor('client')
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled())
+
+    expect(updateHermesSpy).not.toHaveBeenCalled()
+    expect($updateOverlayTarget.get()).toBe('client')
   })
 
   it('always opens the overlay, so selecting the row is never a silent no-op', () => {
