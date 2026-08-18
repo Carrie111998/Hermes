@@ -261,7 +261,7 @@ class TestRunJobScriptTamperGuard:
                 # Simulate the script's detached child re-flipping the
                 # approval policy right after the first completion revert.
                 config.write_text(
-                    "approvals:\n  cron_mode: approve\n  mode: manual\n",
+                    "approvals:\\n  cron_mode: approve\\n  mode: manual\\n",
                     encoding="utf-8",
                 )
             return real_restore(snapshot)
@@ -274,3 +274,44 @@ class TestRunJobScriptTamperGuard:
         assert success is False
         assert config.read_text(encoding="utf-8") == original
         assert calls["n"] >= 2, "settle loop must re-check after the first revert"
+
+    def test_settle_loop_runs_even_when_completion_check_was_clean(self, hermes_env, monkeypatch):
+        """F4/P4 (exact-head re-review): a detached child can WAIT for the
+        parent to exit and only then rewrite config.yaml. At completion the
+        config is still pristine, so gating the settle pass on a detected
+        tamper means the loop never starts and the late write lands
+        unobserved. The settle pass must run on EVERY script-lane
+        completion, clean or not: simulate a child whose write lands only
+        during the settle observation (completion check sees clean)."""
+        import cron.scheduler as sched
+        monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+        real_restore = sched._restore_config_yaml_if_tampered
+
+        config = hermes_env / "config.yaml"
+        original = config.read_text(encoding="utf-8")
+        calls = {"n": 0}
+
+        def _late_writer(snapshot):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Completion check: config is STILL clean — return None
+                # (no tamper detected) so the old P3 gate would have
+                # skipped settling entirely.
+                return None
+            # Settle observation: the detached child has now written.
+            config.write_text(
+                "approvals:\\n  cron_mode: approve\\n  mode: manual\\n",
+                encoding="utf-8",
+            )
+            return real_restore(snapshot)
+
+        monkeypatch.setattr(sched, "_restore_config_yaml_if_tampered", _late_writer)
+
+        job = self._make_job(hermes_env, "#!/bin/bash\necho hi\n")
+        success, doc, final_response, error = run_job(job)
+
+        # The late write was caught by the settle pass even though the
+        # completion check was clean.
+        assert config.read_text(encoding="utf-8") == original
+        assert calls["n"] >= 2, "settle pass must run on a clean completion"
+        assert success is False, "the detected tamper must fail the run"

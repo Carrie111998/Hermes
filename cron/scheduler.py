@@ -4387,15 +4387,29 @@ def _run_job_script(
         # a detached child can write AFTER that observation and would
         # otherwise win. The full settle window is checked whenever
         # tampering was detected.
+        # F4/P4 (exact-head re-review): the settle window must ALSO run on
+        # runs whose completion check saw a clean config. A detached child
+        # can WAIT for the parent process to exit and only then rewrite
+        # config.yaml — at completion the config is still pristine, so
+        # gating settling on ``tamper_message`` means the loop never starts
+        # and the write lands unobserved. We cannot know whether a script
+        # detached a child, so a short bounded settle pass runs on EVERY
+        # script-lane completion; the full window applies once tampering is
+        # observed (either at completion or during the settle pass).
         if tamper_message:
-            for _delay in (1.0, 2.0, 4.0):
-                time.sleep(_delay)
-                _later = _restore_config_yaml_if_tampered(config_snapshot)
-                if _later is not None:
-                    tamper_message = _later
-                # P3: NO break on a clean observation. A detached child may
-                # write AFTER the first clean check; the full settle window
-                # must be watched once tampering was detected.
+            settle_delays = (1.0, 2.0, 4.0)
+        else:
+            settle_delays = (1.0,)
+        _settle_idx = 0
+        while _settle_idx < len(settle_delays):
+            time.sleep(settle_delays[_settle_idx])
+            _later = _restore_config_yaml_if_tampered(config_snapshot)
+            if _later is not None:
+                tamper_message = _later
+                # A late write was caught — extend to the full window so a
+                # second detached writer cannot win after the short pass.
+                settle_delays = (1.0, 2.0, 4.0)
+            _settle_idx += 1
 
         if early_error:
             return False, early_error
