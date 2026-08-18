@@ -61,12 +61,56 @@ _MIN_TIMEOUT_SECONDS = 60.0
 # Match delegate_task's sane upper bound for a returned summary so a verbose
 # Devin run can't blow out the conversation context.
 _DEFAULT_MAX_RESULT_CHARS = 20000
-# permission_mode sent to Devin for unattended delegation. "dangerous" is the
-# explicit opt-in for non-interactive runs — the whole tool is already gated
-# behind delegation.devin.enabled, so the user has acknowledged Devin will act
-# autonomously on the delegated subtask.
-_DEFAULT_PERMISSION_MODE = "dangerous"
+# permission_mode sent to Devin for unattended delegation. "accept-edits" is
+# the safe default — Devin can modify files but still prompts for dangerous
+# operations (shell commands, etc.). Users who want fully autonomous Devin
+# must explicitly set permission_mode: dangerous in config.yaml.
+_DEFAULT_PERMISSION_MODE = "accept-edits"
 _VALID_PERMISSION_MODES = ("auto", "accept-edits", "smart", "dangerous")
+# Ceiling for model-controllable timeout override. The model can request a
+# timeout up to this value, but not beyond — prevents a prompt-injected model
+# from stalling the turn with an arbitrarily long subprocess.run. The config
+# value (timeout_seconds) is the real ceiling for unattended runs; this only
+# caps the model-facing override.
+_MAX_MODEL_TIMEOUT_SECONDS = 7200.0  # 2 hours
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Kill the child and its entire process tree.
+
+    On POSIX, ``start_new_session=True`` puts the child in a new process
+    group, so ``killpg`` reaches all descendants (Devin spawns shell,
+    browser, etc.). On Windows, fall back to psutil-based tree kill
+    (mirrors ``tools/code_execution_tool.py:_kill_process_group``).
+    """
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        # Windows: no killpg, use psutil to kill the tree
+        try:
+            import psutil
+            parent = psutil.Process(proc.pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            try:
+                parent.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        except ImportError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 def _devin_config() -> Dict[str, Any]:
@@ -164,19 +208,41 @@ def _resolve_permission_mode(cfg: Dict[str, Any]) -> str:
 
 
 def _resolve_timeout(cfg: Dict[str, Any], override: Any) -> float:
-    raw = override if override is not None else cfg.get("timeout_seconds")
-    if raw is None:
-        return _DEFAULT_TIMEOUT_SECONDS
+    """Resolve the effective timeout, clamping the model override.
+
+    Config ``timeout_seconds`` is the real ceiling (user-set, not model-
+    controllable). When the model passes a ``timeout`` override, it is
+    clamped to ``[60, min(config_timeout, _MAX_MODEL_TIMEOUT_SECONDS)]``
+    so a prompt-injected model cannot stall the turn with an arbitrarily
+    long subprocess, but can still shorten the cap for a quick task.
+    """
+    config_timeout = cfg.get("timeout_seconds")
+    if config_timeout is not None:
+        try:
+            config_timeout = float(config_timeout)
+        except (TypeError, ValueError):
+            config_timeout = _DEFAULT_TIMEOUT_SECONDS
+    else:
+        config_timeout = _DEFAULT_TIMEOUT_SECONDS
+    config_timeout = max(_MIN_TIMEOUT_SECONDS, config_timeout)
+
+    if override is None:
+        return config_timeout
+
     try:
-        parsed = float(raw)
+        parsed = float(override)
     except (TypeError, ValueError):
         logger.warning(
-            "delegation.devin.timeout_seconds=%r is not a valid number; "
-            "using default %.0f",
-            raw, _DEFAULT_TIMEOUT_SECONDS,
+            "delegate_to_devin timeout=%r is not a valid number; "
+            "using config default %.0f",
+            override, config_timeout,
         )
-        return _DEFAULT_TIMEOUT_SECONDS
-    return _MIN_TIMEOUT_SECONDS if parsed < _MIN_TIMEOUT_SECONDS else parsed
+        return config_timeout
+    # Clamp model override: floor 60s, ceiling = min(config, hard cap).
+    # The model can shorten the timeout but cannot extend it beyond what
+    # the user configured (or the hard safety cap).
+    ceiling = min(config_timeout, _MAX_MODEL_TIMEOUT_SECONDS)
+    return max(_MIN_TIMEOUT_SECONDS, min(parsed, ceiling))
 
 
 def _resolve_max_result_chars(cfg: Dict[str, Any]) -> int:
@@ -255,44 +321,63 @@ def delegate_to_devin(
         argv += ["--model", resolved_model]
     argv += ["--", prompt]
 
+    # Resolve cwd the same way the terminal tool does — TERMINAL_CWD is
+    # force-exported from config.yaml's terminal.cwd by cli.py, so messaging
+    # gateway sessions delegate to the user's configured workspace, not the
+    # gateway launch directory.
+    workdir = os.environ.get("TERMINAL_CWD") or os.getcwd()
+
     start = time.monotonic()
     try:
-        proc = subprocess.run(
+        # Use Popen with start_new_session so we can kill the entire process
+        # group on timeout — Devin spawns child processes (shell, browser,
+        # etc.) and subprocess.run only kills the direct child, leaving
+        # descendants running. Mirrors tools/code_execution_tool.py's pattern.
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            cwd=os.getcwd(),
+            cwd=workdir,
+            start_new_session=True,  # creates a new process group (POSIX)
         )
-    except subprocess.TimeoutExpired:
-        duration = time.monotonic() - start
-        return json.dumps(
-            {"results": [{
-                "task_index": 0,
-                "status": "timeout",
-                "summary": "",
-                "error": (
-                    f"Devin did not finish within {timeout_seconds:.0f}s. "
-                    "Raise delegation.devin.timeout_seconds if the task needs "
-                    "more time."
-                ),
-                "duration_seconds": round(duration, 3),
-                "model": resolved_model,
-                "exit_reason": "timeout",
-                "truncated": False,
-                "backend": "devin",
-            }]},
-            ensure_ascii=False,
-        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group so Devin's children don't outlive it.
+            _kill_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except Exception:
+                stdout, stderr = "", ""
+            duration = time.monotonic() - start
+            return json.dumps(
+                {"results": [{
+                    "task_index": 0,
+                    "status": "timeout",
+                    "summary": "",
+                    "error": (
+                        f"Devin did not finish within {timeout_seconds:.0f}s. "
+                        "Raise delegation.devin.timeout_seconds if the task needs "
+                        "more time."
+                    ),
+                    "duration_seconds": round(duration, 3),
+                    "model": resolved_model,
+                    "exit_reason": "timeout",
+                    "truncated": False,
+                    "backend": "devin",
+                }]},
+                ensure_ascii=False,
+            )
     except Exception as exc:  # pragma: no cover — environment-dependent
         return tool_error(f"Failed to spawn Devin: {exc}")
 
     duration = time.monotonic() - start
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
+    stdout = stdout or ""
+    stderr = stderr or ""
 
     if proc.returncode != 0:
-        err, _ = _truncate(stderr.strip() or stdout.strip(), max_chars)
+        err, err_truncated = _truncate(stderr.strip() or stdout.strip(), max_chars)
         return json.dumps(
             {"results": [{
                 "task_index": 0,
@@ -302,7 +387,7 @@ def delegate_to_devin(
                 "duration_seconds": round(duration, 3),
                 "model": resolved_model,
                 "exit_reason": "error",
-                "truncated": False,
+                "truncated": err_truncated,
                 "backend": "devin",
             }]},
             ensure_ascii=False,

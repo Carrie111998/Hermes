@@ -1890,8 +1890,8 @@ DEFAULT_CONFIG = {
         "devin": {
             "enabled": False,            # opt-in gate for the delegate_to_devin tool
             "model": "",                 # optional Devin model short name (opus/swe/codex/...); empty = Devin default
-            "permission_mode": "dangerous",  # auto|accept-edits|smart|dangerous — Devin autonomy for unattended runs
-            "timeout_seconds": 1800,     # per-call wall-clock cap (floor 60)
+            "permission_mode": "accept-edits",  # auto|accept-edits|smart|dangerous — accept-edits is the safe default; dangerous requires explicit opt-in
+            "timeout_seconds": 1800,     # per-call wall-clock cap (floor 60, model override clamped to this)
             "max_result_chars": 20000,   # truncate Devin stdout above this in the returned summary
         },
     },

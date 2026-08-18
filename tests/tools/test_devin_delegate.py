@@ -10,9 +10,10 @@ Run with:  python -m pytest tests/tools/test_devin_delegate.py -v
 """
 
 import json
+import os
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import tools.devin_delegate as mod
 from tools.devin_delegate import (
@@ -26,11 +27,15 @@ from tools.devin_delegate import (
 )
 
 
-def _ok_proc(stdout="", stderr="", returncode=0):
-    """A CompletedProcess-like object for mocked subprocess.run."""
-    return subprocess.CompletedProcess(
-        args=["devin"], returncode=returncode, stdout=stdout, stderr=stderr
-    )
+def _mock_popen(stdout="", stderr="", returncode=0):
+    """A mock Popen for the handler's Popen+communicate pattern."""
+    proc = MagicMock()
+    proc.stdout = stdout
+    proc.stderr = stderr
+    proc.returncode = returncode
+    proc.pid = 12345
+    proc.communicate = MagicMock(return_value=(stdout, stderr))
+    return proc
 
 
 class TestCheckRequirements(unittest.TestCase):
@@ -59,13 +64,16 @@ class TestCheckRequirements(unittest.TestCase):
 
 class TestConfigResolution(unittest.TestCase):
     def test_permission_mode_default(self):
-        self.assertEqual(_resolve_permission_mode({}), "dangerous")
+        self.assertEqual(_resolve_permission_mode({}), "accept-edits")
 
     def test_permission_mode_override(self):
         self.assertEqual(_resolve_permission_mode({"permission_mode": "auto"}), "auto")
 
     def test_permission_mode_invalid_falls_back(self):
-        self.assertEqual(_resolve_permission_mode({"permission_mode": "yolo"}), "dangerous")
+        self.assertEqual(_resolve_permission_mode({"permission_mode": "yolo"}), "accept-edits")
+
+    def test_permission_mode_dangerous_requires_explicit_config(self):
+        self.assertEqual(_resolve_permission_mode({"permission_mode": "dangerous"}), "dangerous")
 
     def test_timeout_default(self):
         self.assertEqual(_resolve_timeout({}, None), 1800.0)
@@ -81,6 +89,23 @@ class TestConfigResolution(unittest.TestCase):
 
     def test_timeout_invalid_falls_back(self):
         self.assertEqual(_resolve_timeout({"timeout_seconds": "abc"}, None), 1800.0)
+
+    def test_timeout_model_override_clamped_to_config(self):
+        """Model override cannot exceed config timeout (prompt-injection guard)."""
+        self.assertEqual(_resolve_timeout({"timeout_seconds": 300}, 99999), 300.0)
+
+    def test_timeout_model_override_clamped_to_hard_cap(self):
+        """With a high config timeout, model override is still capped at
+        _MAX_MODEL_TIMEOUT_SECONDS (the hard safety ceiling)."""
+        from tools.devin_delegate import _MAX_MODEL_TIMEOUT_SECONDS
+        self.assertEqual(
+            _resolve_timeout({"timeout_seconds": 999999}, 999999),
+            _MAX_MODEL_TIMEOUT_SECONDS,
+        )
+
+    def test_timeout_model_override_can_shorten(self):
+        """Model can shorten the timeout for a quick task."""
+        self.assertEqual(_resolve_timeout({"timeout_seconds": 1800}, 120), 120.0)
 
     def test_max_result_chars_default(self):
         self.assertEqual(_resolve_max_result_chars({}), 20000)
@@ -137,8 +162,8 @@ class TestDelegateToDevin(unittest.TestCase):
     def test_success_returns_completed_result(self):
         p1, p2, p3 = self._patch_env()
         with p1, p2, p3, \
-             patch.object(mod.subprocess, "run",
-                          return_value=_ok_proc(stdout="All done. Fixed the bug.")):
+             patch.object(mod.subprocess, "Popen",
+                          return_value=_mock_popen(stdout="All done. Fixed the bug.")):
             result = json.loads(delegate_to_devin(goal="fix the bug", context="see foo.py"))
         self.assertEqual(result["results"][0]["status"], "completed")
         self.assertEqual(result["results"][0]["summary"], "All done. Fixed the bug.")
@@ -150,9 +175,9 @@ class TestDelegateToDevin(unittest.TestCase):
     def test_nonzero_exit_returns_error_result(self):
         p1, p2, p3 = self._patch_env()
         with p1, p2, p3, \
-             patch.object(mod.subprocess, "run",
-                          return_value=_ok_proc(stdout="", stderr="boom",
-                                                returncode=2)):
+             patch.object(mod.subprocess, "Popen",
+                          return_value=_mock_popen(stdout="", stderr="boom",
+                                                   returncode=2)):
             result = json.loads(delegate_to_devin(goal="do thing"))
         entry = result["results"][0]
         self.assertEqual(entry["status"], "error")
@@ -160,11 +185,26 @@ class TestDelegateToDevin(unittest.TestCase):
         self.assertIn("code 2", entry["error"])
         self.assertIn("boom", entry["error"])
 
+    def test_error_truncation_flag_when_stderr_exceeds_limit(self):
+        """Error path must report truncated=True when error text is clipped."""
+        p1, p2, p3 = self._patch_env(cfg={"enabled": True, "max_result_chars": 256})
+        long_err = "e" * 1000
+        with p1, p2, p3, \
+             patch.object(mod.subprocess, "Popen",
+                          return_value=_mock_popen(stdout="", stderr=long_err,
+                                                   returncode=1)):
+            result = json.loads(delegate_to_devin(goal="do thing"))
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "error")
+        self.assertTrue(entry["truncated"])
+
     def test_timeout_returns_timeout_result(self):
         p1, p2, p3 = self._patch_env(cfg={"enabled": True, "timeout_seconds": 60})
+        proc = _mock_popen()
+        proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["devin"], timeout=60)
         with p1, p2, p3, \
-             patch.object(mod.subprocess, "run",
-                          side_effect=subprocess.TimeoutExpired(cmd=["devin"], timeout=60)):
+             patch.object(mod.subprocess, "Popen", return_value=proc), \
+             patch.object(mod, "_kill_process_group", lambda p: None):
             result = json.loads(delegate_to_devin(goal="do thing"))
         entry = result["results"][0]
         self.assertEqual(entry["status"], "timeout")
@@ -175,8 +215,8 @@ class TestDelegateToDevin(unittest.TestCase):
         p1, p2, p3 = self._patch_env(cfg={"enabled": True, "max_result_chars": 256})
         long_out = "x" * 1000
         with p1, p2, p3, \
-             patch.object(mod.subprocess, "run",
-                          return_value=_ok_proc(stdout=long_out)):
+             patch.object(mod.subprocess, "Popen",
+                          return_value=_mock_popen(stdout=long_out)):
             result = json.loads(delegate_to_devin(goal="do thing"))
         entry = result["results"][0]
         self.assertEqual(entry["status"], "completed")
@@ -187,11 +227,11 @@ class TestDelegateToDevin(unittest.TestCase):
         p1, p2, p3 = self._patch_env()
         captured = {}
 
-        def fake_run(argv, **kw):
+        def fake_popen(argv, **kw):
             captured["argv"] = argv
-            return _ok_proc(stdout="ok")
+            return _mock_popen(stdout="ok")
 
-        with p1, p2, p3, patch.object(mod.subprocess, "run", side_effect=fake_run):
+        with p1, p2, p3, patch.object(mod.subprocess, "Popen", side_effect=fake_popen):
             delegate_to_devin(goal="do thing", model="opus")
         argv = captured["argv"]
         self.assertIn("--model", argv)
@@ -199,25 +239,40 @@ class TestDelegateToDevin(unittest.TestCase):
         # Print mode + unattended defaults always present.
         self.assertIn("-p", argv)
         self.assertIn("--permission-mode", argv)
-        self.assertIn("dangerous", argv)
+        self.assertIn("accept-edits", argv)  # new safe default
         self.assertIn("--respect-workspace-trust", argv)
         self.assertIn("false", argv)
         # Prompt after the -- separator.
         self.assertEqual(argv[argv.index("--") + 1:], ["do thing"])
 
     def test_permission_mode_from_config_not_model_controllable(self):
-        p1, p2, p3 = self._patch_env(cfg={"enabled": True, "permission_mode": "accept-edits"})
+        p1, p2, p3 = self._patch_env(cfg={"enabled": True, "permission_mode": "dangerous"})
         captured = {}
 
-        def fake_run(argv, **kw):
+        def fake_popen(argv, **kw):
             captured["argv"] = argv
-            return _ok_proc(stdout="ok")
+            return _mock_popen(stdout="ok")
 
-        with p1, p2, p3, patch.object(mod.subprocess, "run", side_effect=fake_run):
+        with p1, p2, p3, patch.object(mod.subprocess, "Popen", side_effect=fake_popen):
             delegate_to_devin(goal="do thing")
         argv = captured["argv"]
         idx = argv.index("--permission-mode")
-        self.assertEqual(argv[idx + 1], "accept-edits")
+        self.assertEqual(argv[idx + 1], "dangerous")
+
+    def test_uses_terminal_cwd_when_set(self):
+        """Devin should launch in TERMINAL_CWD, not os.getcwd()."""
+        p1, p2, p3 = self._patch_env()
+        captured = {}
+
+        def fake_popen(argv, **kw):
+            captured["cwd"] = kw.get("cwd")
+            return _mock_popen(stdout="ok")
+
+        with p1, p2, p3, \
+             patch.dict(os.environ, {"TERMINAL_CWD": "/tmp/test-workspace"}), \
+             patch.object(mod.subprocess, "Popen", side_effect=fake_popen):
+            delegate_to_devin(goal="do thing")
+        self.assertEqual(captured["cwd"], "/tmp/test-workspace")
 
 
 class TestSchema(unittest.TestCase):
@@ -248,9 +303,12 @@ class TestRegistryWiring(unittest.TestCase):
         self.assertEqual(entry.toolset, "delegation")
         self.assertEqual(entry.check_fn, check_devin_requirements)
 
-    def test_listed_in_core_tools_and_delegation_toolset(self):
+    def test_listed_in_delegation_toolset_not_core(self):
+        """delegate_to_devin is in the delegation toolset but NOT in
+        _HERMES_CORE_TOOLS — it's a third-party opt-in backend, not a
+        core tool that ships on every API call."""
         import toolsets
-        self.assertIn("delegate_to_devin", toolsets._HERMES_CORE_TOOLS)
+        self.assertNotIn("delegate_to_devin", toolsets._HERMES_CORE_TOOLS)
         self.assertIn("delegate_to_devin", toolsets.TOOLSETS["delegation"]["tools"])
 
 
