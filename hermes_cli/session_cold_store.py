@@ -167,8 +167,9 @@ def _is_explicit_fork(row: dict[str, Any]) -> bool:
     parent_id = row.get("parent_session_id")
     branched = config.get("_branched_from")
     delegated = config.get("_delegate_from")
+    reset = config.get("_reset_from")
     if parent_id:
-        return branched == parent_id or delegated == parent_id
+        return branched == parent_id or delegated == parent_id or reset == parent_id
     return branched is not None or delegated is not None
 
 
@@ -305,7 +306,7 @@ def _open_or_create_directory(parent_fd: int, name: str, path: Path) -> int:
         return os.open(name, flags, dir_fd=parent_fd)
     except FileNotFoundError:
         try:
-            os.mkdir(name, dir_fd=parent_fd)
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
         except FileExistsError:
             pass
         except OSError as exc:
@@ -929,6 +930,20 @@ def _reject_uncovered_session_references(
     chunks = _id_chunks(physical_ids)
     for ids in chunks:
         placeholders = ",".join("?" for _ in ids)
+        delegates = conn.execute(
+            "SELECT id FROM sessions "
+            "WHERE json_extract(COALESCE(model_config, '{}'), '$._delegate_from') "
+            f"IN ({placeholders})",
+            ids,
+        ).fetchall()
+        uncovered_delegates = [
+            str(row[0]) for row in delegates if str(row[0]) not in covered
+        ]
+        if uncovered_delegates:
+            raise ValueError(
+                "cold purge refuses an uncovered child session referencing the "
+                f"lineage: {uncovered_delegates[0]}"
+            )
         children = conn.execute(
             f"SELECT id FROM sessions WHERE parent_session_id IN ({placeholders})",
             ids,

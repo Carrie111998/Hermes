@@ -170,6 +170,42 @@ def test_purge_rejects_uncovered_child_and_preserves_foreign_key_rows(
         db.close()
 
 
+@pytest.mark.parametrize("delegate_parent_id", [None, "different-parent"])
+def test_purge_rejects_uncovered_delegate_marker_and_retains_source_rows(
+    tmp_path: Path,
+    delegate_parent_id: str | None,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("source", source="cli")
+        db.append_message("source", role="user", content="keep source")
+        db.end_session("source", "completed")
+        assert db.set_session_archived("source", True)
+        store_archived_lineage(db, "source", archive_root)
+        if delegate_parent_id is not None:
+            db.create_session(delegate_parent_id, source="cli")
+        db.create_session(
+            "delegate",
+            source="delegate",
+            parent_session_id=delegate_parent_id,
+            model_config={"_delegate_from": "source"},
+        )
+        db.append_message("delegate", role="assistant", content="keep delegate")
+
+        with pytest.raises(ValueError, match="uncovered child"):
+            purge_archived_lineage(db, "source", archive_root)
+
+        assert db.get_session("source") is not None
+        assert db.get_messages("source")[0]["content"] == "keep source"
+        delegate = db.get_session("delegate")
+        assert delegate is not None
+        assert delegate["parent_session_id"] == delegate_parent_id
+        assert db.get_messages("delegate")[0]["content"] == "keep delegate"
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize(
     "entry_json",
     ["{malformed", "[]", '{"session_id": 123}'],
@@ -407,6 +443,30 @@ def test_store_reports_the_same_canonical_path_it_writes(tmp_path: Path) -> None
         db.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are required")
+def test_store_creates_archive_hierarchy_directories_with_private_modes(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    original_umask = os.umask(0)
+    try:
+        db.create_session("terminal", source="cli")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        result = store_archived_lineage(db, "terminal", archive_root)
+
+        hierarchy = [archive_root]
+        relative_parent = result.snapshot_dir.parent.relative_to(archive_root)
+        for part in relative_parent.parts:
+            hierarchy.append(hierarchy[-1] / part)
+        assert all(path.stat().st_mode & 0o777 == 0o700 for path in hierarchy)
+    finally:
+        os.umask(original_umask)
+        db.close()
+
+
 def test_store_keeps_distinct_ids_that_only_differ_by_trailing_space(
     tmp_path: Path,
 ) -> None:
@@ -482,6 +542,58 @@ def test_store_keeps_a_compression_child_with_an_inherited_old_delegate_marker(t
         result = store_archived_lineage(db, "terminal", tmp_path / "archive")
 
         assert result.physical_ids == ("root", "terminal")
+    finally:
+        db.close()
+
+
+def test_store_and_purge_isolate_a_direct_reset_from_its_compression_parent(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("compression-parent", source="cli")
+        db.end_session("compression-parent", "compression")
+        db.create_session(
+            "reset-child",
+            source="cli",
+            parent_session_id="compression-parent",
+            model_config={"_reset_from": "compression-parent"},
+        )
+        db.end_session("reset-child", "completed")
+        assert db.set_session_archived("reset-child", True)
+
+        stored = store_archived_lineage(db, "reset-child", archive_root)
+        purged = purge_archived_lineage(db, "reset-child", archive_root)
+
+        assert stored.physical_ids == ("reset-child",)
+        assert purged.physical_ids == ("reset-child",)
+        assert db.get_session("reset-child") is None
+        assert db.get_session("compression-parent") is not None
+    finally:
+        db.close()
+
+
+def test_store_keeps_a_compression_child_with_an_inherited_old_reset_marker(
+    tmp_path: Path,
+) -> None:
+    """An inherited reset marker names an older parent, not a new reset."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("reset-root", source="cli")
+        db.end_session("reset-root", "compression")
+        db.create_session(
+            "terminal",
+            source="cli",
+            parent_session_id="reset-root",
+            model_config={"_reset_from": "pre-reset-parent"},
+        )
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+
+        result = store_archived_lineage(db, "terminal", tmp_path / "archive")
+
+        assert result.physical_ids == ("reset-root", "terminal")
     finally:
         db.close()
 
