@@ -70,6 +70,22 @@ def _seed_exact_failures(agent: AIAgent, tool_name: str, args: dict, count: int 
         )
 
 
+def _seed_successes(
+    agent: AIAgent,
+    tool_name: str,
+    args: dict,
+    result: str,
+    count: int = 2,
+) -> None:
+    for _ in range(count):
+        agent._tool_guardrails.after_call(
+            tool_name,
+            args,
+            result,
+            failed=False,
+        )
+
+
 def _hard_stop_config(**overrides) -> dict:
     cfg = {
         "tool_loop_guardrails": {
@@ -79,6 +95,7 @@ def _hard_stop_config(**overrides) -> dict:
                 "exact_failure": 2,
                 "same_tool_failure": 8,
                 "idempotent_no_progress": 5,
+                "repeated_success": 2,
             },
         }
     }
@@ -151,6 +168,43 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert messages[0]["tool_call_id"] == "c-warn"
     assert "Tool loop warning" in messages[0]["content"]
     assert "repeated_exact_failure_warning" in messages[0]["content"]
+
+
+def test_default_sequential_path_warns_repeated_successful_terminal_call():
+    agent = _make_agent("terminal")
+    args = {"command": "hermes config get memory.provider"}
+    result = json.dumps({"output": "local", "exit_code": 0, "error": None})
+    _seed_successes(agent, "terminal", args, result, count=1)
+    tc = _mock_tool_call("terminal", json.dumps(args), "c-success-warn")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=result) as dispatch:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    dispatch.assert_called_once()
+    assert len(messages) == 1
+    assert "repeated_success_warning" in messages[0]["content"]
+    assert "successful result already provided" in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_config_enabled_hard_stop_blocks_repeated_successful_terminal_call():
+    agent = _make_agent("terminal", config=_hard_stop_config())
+    args = {"command": "hermes config get memory.provider"}
+    result = json.dumps({"output": "local", "exit_code": 0, "error": None})
+    _seed_successes(agent, "terminal", args, result)
+    tc = _mock_tool_call("terminal", json.dumps(args), "c-success-block")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as dispatch:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    dispatch.assert_not_called()
+    assert len(messages) == 1
+    assert "repeated_success_block" in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is not None
 
 
 def test_same_tool_failure_warning_tells_model_to_recover_with_tools():

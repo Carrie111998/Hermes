@@ -77,6 +77,8 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    repeated_success_warn_after: int = 2
+    repeated_success_block_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
@@ -110,6 +112,12 @@ class ToolCallGuardrailConfig:
                 warn_after.get("idempotent_no_progress", data.get("no_progress_warn_after")),
                 defaults.no_progress_warn_after,
             ),
+            repeated_success_warn_after=_positive_int(
+                warn_after.get(
+                    "repeated_success", data.get("repeated_success_warn_after")
+                ),
+                defaults.repeated_success_warn_after,
+            ),
             exact_failure_block_after=_positive_int(
                 hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
                 defaults.exact_failure_block_after,
@@ -121,6 +129,12 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            repeated_success_block_after=_positive_int(
+                hard_stop_after.get(
+                    "repeated_success", data.get("repeated_success_block_after")
+                ),
+                defaults.repeated_success_block_after,
             ),
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
@@ -280,7 +294,7 @@ class ToolCallGuardrailController:
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
-        self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._successful_results: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -325,25 +339,41 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
-            record = self._no_progress.get(signature)
-            if record is not None:
-                _result_hash, repeat_count = record
-                if repeat_count >= self.config.no_progress_block_after:
-                    decision = ToolGuardrailDecision(
-                        action="block",
-                        code="idempotent_no_progress_block",
-                        message=(
-                            f"Blocked {tool_name}: this read-only call returned the same "
-                            f"result {repeat_count} times. Stop repeating it unchanged; "
-                            "use the result already provided or try a different query."
-                        ),
-                        tool_name=tool_name,
-                        count=repeat_count,
-                        signature=signature,
+        record = self._successful_results.get(signature)
+        if record is not None:
+            _result_hash_value, repeat_count = record
+            is_idempotent = self._is_idempotent(tool_name)
+            block_after = (
+                self.config.no_progress_block_after
+                if is_idempotent
+                else self.config.repeated_success_block_after
+            )
+            if repeat_count >= block_after:
+                if is_idempotent:
+                    code = "idempotent_no_progress_block"
+                    message = (
+                        f"Blocked {tool_name}: this read-only call returned the same "
+                        f"result {repeat_count} times. Stop repeating it unchanged; "
+                        "use the result already provided or try a different query."
                     )
-                    self._halt_decision = decision
-                    return decision
+                else:
+                    code = "repeated_success_block"
+                    message = (
+                        f"Blocked {tool_name}: this successful call returned the same "
+                        f"result {repeat_count} times with identical arguments. Stop "
+                        "repeating it unchanged; use the successful result already "
+                        "provided or change strategy."
+                    )
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code=code,
+                    message=message,
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -363,7 +393,7 @@ class ToolCallGuardrailController:
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
-            self._no_progress.pop(signature, None)
+            self._successful_results.pop(signature, None)
 
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
@@ -412,26 +442,45 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
-        if not self._is_idempotent(tool_name):
-            self._no_progress.pop(signature, None)
+        # Multimodal results use structured content that warning guidance cannot
+        # safely append to. Keep the existing textual guardrail boundary.
+        if result is not None and not isinstance(result, str):
+            self._successful_results.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         result_hash = _result_hash(result)
-        previous = self._no_progress.get(signature)
+        previous = self._successful_results.get(signature)
         repeat_count = 1
         if previous is not None and previous[0] == result_hash:
             repeat_count = previous[1] + 1
-        self._no_progress[signature] = (result_hash, repeat_count)
+        self._successful_results[signature] = (result_hash, repeat_count)
 
-        if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
-            return ToolGuardrailDecision(
-                action="warn",
-                code="idempotent_no_progress_warning",
-                message=(
+        is_idempotent = self._is_idempotent(tool_name)
+        warn_after = (
+            self.config.no_progress_warn_after
+            if is_idempotent
+            else self.config.repeated_success_warn_after
+        )
+        if self.config.warnings_enabled and repeat_count >= warn_after:
+            if is_idempotent:
+                code = "idempotent_no_progress_warning"
+                message = (
                     f"{tool_name} returned the same result {repeat_count} times. "
                     "Use the result already provided or change the query instead of "
                     "repeating it unchanged."
-                ),
+                )
+            else:
+                code = "repeated_success_warning"
+                message = (
+                    f"{tool_name} succeeded with identical arguments and the same "
+                    f"result {repeat_count} times. This looks like a loop; use the "
+                    "successful result already provided. Repeat only if external "
+                    "state is expected to change, otherwise change strategy."
+                )
+            return ToolGuardrailDecision(
+                action="warn",
+                code=code,
+                message=message,
                 tool_name=tool_name,
                 count=repeat_count,
                 signature=signature,

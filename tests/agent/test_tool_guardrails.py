@@ -44,11 +44,13 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
                 "exact_failure": 3,
                 "same_tool_failure": 4,
                 "idempotent_no_progress": 5,
+                "repeated_success": 6,
             },
             "hard_stop_after": {
                 "exact_failure": 6,
                 "same_tool_failure": 7,
                 "idempotent_no_progress": 8,
+                "repeated_success": 9,
             },
         }
     )
@@ -58,9 +60,11 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.exact_failure_warn_after == 3
     assert cfg.same_tool_failure_warn_after == 4
     assert cfg.no_progress_warn_after == 5
+    assert cfg.repeated_success_warn_after == 6
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+    assert cfg.repeated_success_block_after == 9
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():
@@ -119,16 +123,69 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+def test_mutating_or_unknown_tools_warn_without_blocking_repeated_success_by_default():
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
+        ToolCallGuardrailConfig(
+            repeated_success_warn_after=2,
+            repeated_success_block_after=2,
+        )
     )
 
-    for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+    calls = [
+        ("write_file", {"path": "/tmp/x", "content": "x"}),
+        ("custom_tool", {"x": 1}),
+    ]
+    for tool_name, args in calls:
+        assert controller.before_call(tool_name, args).action == "allow"
+        assert controller.after_call(tool_name, args, "ok", failed=False).action == "allow"
+
+        assert controller.before_call(tool_name, args).action == "allow"
+        warning = controller.after_call(tool_name, args, "ok", failed=False)
+        assert warning.action == "warn"
+        assert warning.code == "repeated_success_warning"
+        assert warning.count == 2
+
+        # Hard stops remain opt-in even after the configured threshold.
+        assert controller.before_call(tool_name, args).action == "allow"
+
+
+def test_hard_stop_blocks_repeated_success_before_next_execution():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            repeated_success_warn_after=2,
+            repeated_success_block_after=2,
+        )
+    )
+    args = {"command": "hermes config get memory.provider"}
+    result = '{"output":"local","exit_code":0,"error":null}'
+
+    assert controller.before_call("terminal", args).action == "allow"
+    assert controller.after_call("terminal", args, result, failed=False).action == "allow"
+    assert controller.before_call("terminal", args).action == "allow"
+    warning = controller.after_call("terminal", args, result, failed=False)
+    assert warning.code == "repeated_success_warning"
+
+    blocked = controller.before_call("terminal", args)
+    assert blocked.action == "block"
+    assert blocked.code == "repeated_success_block"
+    assert blocked.count == 2
+
+
+def test_changed_success_result_resets_repeated_success_count():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(repeated_success_warn_after=2)
+    )
+    args = {"command": "check-state"}
+
+    first = controller.after_call("terminal", args, "pending", failed=False)
+    repeated = controller.after_call("terminal", args, "pending", failed=False)
+    changed = controller.after_call("terminal", args, "ready", failed=False)
+
+    assert first.action == "allow"
+    assert repeated.code == "repeated_success_warning"
+    assert changed.action == "allow"
+    assert changed.count == 1
 
 
 
@@ -167,7 +224,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 
