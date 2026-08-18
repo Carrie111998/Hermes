@@ -411,6 +411,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+        try:
+            from tools.anchors import ANCHORED_EDIT_GUIDANCE
+            stable_parts.append(ANCHORED_EDIT_GUIDANCE)
+        except Exception:
+            pass
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

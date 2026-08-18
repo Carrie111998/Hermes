@@ -134,14 +134,15 @@ def _anchor_id_of(anchored_line: str) -> str:
 
 
 ANCHORED_EDIT_GUIDANCE = (
-    "# Anchored editing\n"
-    "After a read with include_anchors=true, you may edit by the anchored "
-    "coordinates instead of the Cline search blocks: each source line is "
-    "ANCHOR<id>≫CONTENT. An edit is {anchor: <ANCHOR line>, "
-    "end_anchor: <ANCHOR line>, text: <new lines>} — the tool locates the "
-    "line by its ID and verifies the content exactly, so the old block never "
-    "needs to be re-sent. Copy the complete anchored line verbatim; never "
-    "retype it or combine an ID with another line's content. If an anchor no "
-    "longer resolves (the file changed externally), re-read with "
-    "include_anchors=true first."
+    "# Anchored editing is the default\n"
+    "After a read with include_anchors=true, ALWAYS edit with anchored_edit "
+    "instead of the Cline patch: each source line is ANCHOR<id>≫CONTENT, and "
+    "an edit is {anchor: <ANCHOR line>, end_anchor: <ANCHOR line>, "
+    "text: <new lines>}. The tool locates the line by its ID and verifies "
+    "the content EXACTLY — a wrong or stale coordinate is REFUSED (the "
+    "model re-reads) instead of silently corrupting the file, and the old "
+    "block never needs to be re-sent. Copy the complete anchored line "
+    "verbatim; never retype it or combine an ID with another line's content. "
+    "The Cline patch remains only as the fallback for edits without a fresh "
+    "anchored read — prefer the anchors whenever they are available."
 )
