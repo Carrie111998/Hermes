@@ -16,8 +16,15 @@ def _hermes_home_path() -> Path:
         return Path(os.path.expanduser("~/.hermes"))
 
 
-def build_write_denied_paths(home: str) -> set[str]:
-    """Return exact sensitive paths that must never be written."""
+def build_credential_denied_paths(home: str) -> set[str]:
+    """Return exact paths whose *contents* are credentials.
+
+    This is the credential-bearing subset of the write denylist, split out so
+    the read-side deny can reuse it without also denying reads of files that
+    are write-protected for non-credential reasons (shell rc files,
+    /etc/passwd, ...).  Denying *reads* of those would break ordinary work for
+    no credential benefit.
+    """
     hermes_home = _hermes_home_path()
     return {
         os.path.realpath(p)
@@ -27,15 +34,44 @@ def build_write_denied_paths(home: str) -> set[str]:
             os.path.join(home, ".ssh", "id_ed25519"),
             os.path.join(home, ".ssh", "config"),
             str(hermes_home / ".env"),
+            os.path.join(home, ".netrc"),
+            os.path.join(home, ".pgpass"),
+            os.path.join(home, ".npmrc"),
+            os.path.join(home, ".pypirc"),
+        ]
+    }
+
+
+def build_credential_denied_prefixes(home: str) -> list[str]:
+    """Return directory prefixes that are credential stores."""
+    return [
+        os.path.realpath(p) + os.sep
+        for p in [
+            os.path.join(home, ".ssh"),
+            os.path.join(home, ".aws"),
+            os.path.join(home, ".gnupg"),
+            os.path.join(home, ".kube"),
+            os.path.join(home, ".docker"),
+            os.path.join(home, ".azure"),
+            os.path.join(home, ".config", "gh"),
+        ]
+    ]
+
+
+def build_write_denied_paths(home: str) -> set[str]:
+    """Return exact sensitive paths that must never be written.
+
+    Composed of the credential subset plus paths that are write-protected for
+    non-credential reasons.  Membership is unchanged from before the split.
+    """
+    return build_credential_denied_paths(home) | {
+        os.path.realpath(p)
+        for p in [
             os.path.join(home, ".bashrc"),
             os.path.join(home, ".zshrc"),
             os.path.join(home, ".profile"),
             os.path.join(home, ".bash_profile"),
             os.path.join(home, ".zprofile"),
-            os.path.join(home, ".netrc"),
-            os.path.join(home, ".pgpass"),
-            os.path.join(home, ".npmrc"),
-            os.path.join(home, ".pypirc"),
             "/etc/sudoers",
             "/etc/passwd",
             "/etc/shadow",
@@ -45,18 +81,11 @@ def build_write_denied_paths(home: str) -> set[str]:
 
 def build_write_denied_prefixes(home: str) -> list[str]:
     """Return sensitive directory prefixes that must never be written."""
-    return [
+    return build_credential_denied_prefixes(home) + [
         os.path.realpath(p) + os.sep
         for p in [
-            os.path.join(home, ".ssh"),
-            os.path.join(home, ".aws"),
-            os.path.join(home, ".gnupg"),
-            os.path.join(home, ".kube"),
             "/etc/sudoers.d",
             "/etc/systemd",
-            os.path.join(home, ".docker"),
-            os.path.join(home, ".azure"),
-            os.path.join(home, ".config", "gh"),
         ]
     ]
 
