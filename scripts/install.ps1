@@ -1578,18 +1578,37 @@ function Test-NodeVersionOk {
     return (($v.Major -eq 24) -or ($v.Major -ge 26))
 }
 
+function Test-NpmVersionOk {
+    param([string]$Version)
+    if ($Version -match '-') { return $false }
+    try {
+        $v = [version]($Version -replace '^v', '')
+    } catch {
+        return $false
+    }
+    return -not ($v.Major -eq 11 -and $v.Minor -ge 10 -and $v.Minor -le 16)
+}
+
 function Test-Node {
     Write-Info "Checking Node.js (for browser tools)..."
 
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $version = node --version
-        if (Test-NodeVersionOk $version) {
+        $npmCmd = Resolve-NpmCmd
+        $npmVersion = if ($npmCmd) { & $npmCmd --version 2>$null } else { $null }
+        if ((Test-NodeVersionOk $version) -and $npmCmd -and (Test-NpmVersionOk $npmVersion)) {
             Ensure-NodeExeOnPath | Out-Null
             Write-Success "Node.js $version found"
             $script:HasNode = $true
             return $true
         }
-        Write-Warn "Node.js $version is unsupported (Hermes requires Node 22.22+, 24, or 26+)"
+        if (-not (Test-NodeVersionOk $version)) {
+            Write-Warn "Node.js $version is unsupported (Hermes requires Node 22.22+, 24, or 26+)"
+        } elseif (-not $npmCmd) {
+            Write-Warn "Node.js $version has no npm.cmd on PATH"
+        } else {
+            Write-Warn "npm $npmVersion is unsupported (Hermes rejects npm 11.10 through 11.16)"
+        }
     }
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
