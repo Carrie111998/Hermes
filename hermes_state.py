@@ -11355,7 +11355,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 continue
         return lineage if session_id in lineage else [session_id]
 
-    def get_compression_lineage_totals(self, session_id: str) -> Dict[str, int]:
+    def get_compression_lineage_totals(
+        self, session_id: str
+    ) -> Optional[Dict[str, int]]:
         """Return durable usage and compaction totals for one logical session.
 
         Physical session rows rotate at compression boundaries.  Aggregate the
@@ -11374,8 +11376,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         totals = {column: 0 for column in columns}
         lineage = list(dict.fromkeys(self.get_compression_lineage(session_id)))
         if not lineage:
-            totals["total_tokens"] = 0
-            return totals
+            return None
 
         placeholders = ",".join("?" for _ in lineage)
         select = ", ".join(
@@ -11396,7 +11397,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "output_tokens",
                 "cache_read_tokens",
                 "cache_write_tokens",
-                "reasoning_tokens",
             )
         )
         return totals

@@ -129,8 +129,12 @@ def test_lineage_totals_sum_each_compression_segment_once(db: SessionDB) -> None
         "cache_read_tokens": 37,
         "cache_write_tokens": 5,
         "reasoning_tokens": 8,
-        "total_tokens": 230,
+        "total_tokens": 222,
     }
+
+
+def test_missing_session_has_no_durable_totals(db: SessionDB) -> None:
+    assert db.get_compression_lineage_totals("missing") is None
 
 
 def test_reset_child_starts_a_fresh_accounting_scope(db: SessionDB) -> None:

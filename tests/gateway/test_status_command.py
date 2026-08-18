@@ -559,7 +559,7 @@ async def test_context_command_reports_durable_totals_without_resident_agent(tmp
     assert "Compressions this session: 4" in result
     assert "cumulative across 27 API calls" in result
     assert "Input 110,000 · Output 9,000 · Reasoning 6,000" in result
-    assert "Total billed: 197,000" in result
+    assert "Total billed: 191,000" in result
     assert "Full compression and throughput stats available" not in result
 
 
@@ -631,6 +631,27 @@ async def test_context_command_prefers_durable_totals_after_agent_reconstruction
     assert "Input 800,000 · Output 70,000 · Reasoning 20,000" in result
     assert "Total billed: 1,400,000" in result
     assert "cumulative across 2 API calls" not in result
+
+
+@pytest.mark.asyncio
+async def test_context_command_uses_resident_totals_when_durable_row_is_missing():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-not-persisted",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._running_agents[session_entry.session_key] = _stub_agent()
+    runner._session_db._db.get_compression_lineage_totals.return_value = None
+
+    result = await runner._handle_context_command(_make_event("/context"))
+
+    assert "Compressions this session: 2" in result
+    assert "cumulative across 47 API calls" in result
+    assert "Total billed: 3,158,641" in result
 
 
 @pytest.mark.asyncio
