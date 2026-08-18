@@ -457,6 +457,18 @@ def decompose_task(
         for idx, child in enumerate(children)
         if _normalize_title(child["title"]) in existing_by_title
     }
+    # A duplicate that a surviving sibling depends on can't be dropped:
+    # decompose_triage_task's children schema has no way to express
+    # "depend on an existing task id" (parents are indices into this same
+    # list), so the edge would either be silently dropped or need to be
+    # redirected onto the existing card after the fact — which conflicts
+    # with the existing card already being linked as a dependent of this
+    # root below. Rather than lose the dependency or fight that conflict,
+    # refuse to dedup a duplicate with dependents and let it be created as
+    # a twin — the same "don't lose data" principle as the all-duplicates
+    # fallback below.
+    depended_on = {p for child in children for p in child["parents"]}
+    duplicates = {idx: eid for idx, eid in duplicates.items() if idx not in depended_on}
     if duplicates and len(duplicates) < len(children):
         index_map: dict[int, int] = {}
         deduped_children: list[dict] = []
