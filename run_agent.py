@@ -6202,8 +6202,7 @@ class AIAgent:
         # This hook exists to rotate expiring OAuth credentials.  A selected
         # regular API key is static and must never be replaced by an
         # auto-discovered Claude Code subscription token at request time.
-        # API-key edits are handled separately by
-        # _try_refresh_env_client_credentials().
+        # Static API-key changes are outside this OAuth-only refresh hook.
         if not getattr(self, "_is_anthropic_oauth", False):
             return False
         # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
