@@ -1159,6 +1159,28 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def should_run_pre_gateway_dispatch_hook(event: Any, is_internal: bool) -> bool:
+    """Whether ``pre_gateway_dispatch`` plugins should see this event.
+
+    User-originated events always qualify.  Internal/synthetic events normally
+    do NOT — background-process completion notices and similar machinery are
+    not user input and plugins should not be asked to police them.
+
+    The ONE exception is the startup auto-resume continuation event
+    (``auto_resume=True``, fired by ``_schedule_resume_pending_sessions``).  It
+    is synthetic and carries no user text, yet it makes the agent continue
+    whatever unfinished work it finds in history — the single highest-risk
+    dispatch path in the gateway, and precisely what guard plugins exist to
+    constrain.  Excluding it left e.g. ``stale-session-guard`` blind while a
+    six-week-old task was silently resumed (2026-08-18 incident).  It is also
+    user-attributable (it replays that user's own session), so running the hook
+    on it is consistent with the "user-originated" intent.
+    """
+    if not is_internal:
+        return True
+    return bool(getattr(event, "auto_resume", False))
+
+
 def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
@@ -11882,6 +11904,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    def _resume_transcript_marker_ts(self, entry) -> Optional[float]:
+        """Newest durable transcript timestamp for ``entry``, or None.
+
+        None means "no durable signal available" — the caller then falls back
+        to the in-memory ``last_resume_marked_at``/``updated_at`` markers.
+        Never raises: a DB hiccup must not block gateway startup recovery.
+        """
+        session_id = getattr(entry, "session_id", None)
+        if not session_id:
+            return None
+        db = getattr(self, "session_db", None) or getattr(
+            getattr(self, "session_store", None), "_db", None
+        )
+        getter = getattr(db, "get_last_message_timestamp", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter(str(session_id))
+        except Exception as exc:  # noqa: BLE001 — freshness probe must fail soft
+            logger.debug(
+                "Transcript freshness probe failed for %s: %s", session_id, exc
+            )
+            return None
+        # Only accept a genuine numeric epoch. Duck-typed coercion (``float(x)``)
+        # is unsafe here: test doubles / proxies expose ``__float__`` and would
+        # silently yield a bogus epoch (e.g. 1.0 -> 1970), turning every session
+        # stale and disabling auto-resume entirely.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -11946,9 +11999,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
-                continue
+            # Freshness marker: prefer the newest DURABLE transcript timestamp.
+            #
+            # ``last_resume_marked_at``/``updated_at`` are routing bookkeeping
+            # that a gateway restart (and DB session recovery, which sets
+            # ``updated_at=now``) resets to the boot time.  Reading those made
+            # the freshness gate self-defeating: right after every restart every
+            # resume-pending session looked 0s idle, so a session interrupted
+            # weeks earlier was auto-resumed and silently continued old work
+            # with no user request (2026-08-18 incident).  The module comment
+            # above always specified "the timestamp of the last transcript
+            # row" — this reads that.  Falls back to the in-memory markers when
+            # the transcript timestamp is unavailable (legacy/no-DB), so
+            # behaviour is unchanged where there is nothing better to read.
+            marker_ts = self._resume_transcript_marker_ts(entry)
+            if marker_ts is not None:
+                if (now.timestamp() - marker_ts) > window:
+                    logger.info(
+                        "Skipping auto-resume for %s: last transcript activity "
+                        "%.1fh ago exceeds the %.1fh freshness window",
+                        entry.session_key,
+                        (now.timestamp() - marker_ts) / 3600.0,
+                        window / 3600.0,
+                    )
+                    continue
+            else:
+                marker = entry.last_resume_marked_at or entry.updated_at
+                if marker is not None and (now - marker).total_seconds() > window:
+                    continue
 
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
@@ -12004,6 +12082,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                auto_resume=True,
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -16313,7 +16392,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
+        #
+        # Internal events are normally excluded (background-process completions
+        # etc. are not user input).  The one exception is the synthetic
+        # auto-resume continuation turn — see
+        # ``should_run_pre_gateway_dispatch_hook`` for why.
+        if should_run_pre_gateway_dispatch_hook(event, is_internal):
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(

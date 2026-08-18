@@ -2372,6 +2372,16 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Set on the synthetic empty-text continuation event that
+    # ``_schedule_resume_pending_sessions`` fires after a gateway restart to
+    # auto-continue a restart-interrupted turn.  It is ``internal`` (bypasses
+    # auth) yet carries the highest risk of any internal event: with no user
+    # text, the agent continues whatever unfinished work it finds in history.
+    # ``pre_gateway_dispatch`` plugins therefore MUST see it — guard plugins
+    # that constrain stale/empty-body resumes are otherwise blind to the one
+    # path that most needs them.
+    auto_resume: bool = False
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins

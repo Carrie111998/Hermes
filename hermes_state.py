@@ -10135,6 +10135,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def get_last_message_timestamp(self, session_id: str) -> Optional[float]:
+        """Return the newest transcript timestamp for ``session_id``.
+
+        Used by the gateway auto-resume freshness gate: "when did we last do
+        anything on this transcript" must be read from the durable transcript,
+        NOT from in-memory routing bookkeeping (which a gateway restart resets
+        to ``now`` and thereby makes every stale session look fresh).
+
+        Returns None when the session has no messages or on any DB error —
+        callers treat None as "unknown" and fall back to their previous signal.
+        """
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MAX(timestamp) FROM messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row or row[0] is None:
+            return None
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return None
+
     def get_messages(
         self,
         session_id: str,
