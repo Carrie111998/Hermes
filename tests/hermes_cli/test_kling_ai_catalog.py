@@ -19,7 +19,7 @@ def test_kling_ai_catalog_manifest() -> None:
     assert entry.auth.env[0].default == "https://klingai.com/mcp"
     assert entry.auth.env[0].secret is False
     assert entry.suggest is not None
-    assert entry.suggest.keywords == ["kling", "kling ai", "可灵"]
+    assert entry.suggest.keywords == ["kling", "kling ai", "klingai", "可灵", "可灵ai"]
     assert entry.suggest.hosts == ["klingai.com", "kling.ai"]
     assert "https://kling.ai/mcp" in entry.post_install
 
