@@ -286,6 +286,20 @@ A delegation the stall monitor has flagged shows as
 children show their quiet time so you can tell "slow" from "stuck" at a
 glance.
 
+For a durable view of one child's current work plan, use the child
+`session_id` returned by `delegate_task(action='list')`:
+
+```bash
+hermes sessions inspect <child-session-id>
+hermes sessions inspect <child-session-id> --json
+```
+
+The inspection combines the session's latest activity heartbeat with its most
+recent `todo` plan, including the active step and derived completion percentage.
+It remains useful when no plan was created: the session state and last activity
+are still shown. Use the profile flag (`hermes -p <name> sessions inspect ...`)
+when the child belongs to another profile's session store.
+
 ## Steering a Running Subagent
 
 Interrupting a child throws away its in-flight work; often you just want to redirect it.
