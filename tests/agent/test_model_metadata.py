@@ -221,6 +221,7 @@ class TestDefaultContextLengths:
         registry = {
             "zai": {"models": {}},
             "zai-coding-plan": {
+                "api": "https://api.z.ai/api/coding/paas/v4",
                 "models": {
                     "glm-5.3": {"limit": {"context": 1_000_000}},
                 },
