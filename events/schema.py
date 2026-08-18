@@ -169,6 +169,18 @@ class EventType(Enum):
     # from all 80 pre-existing icons; 🚦 was the first pick and collides with
     # DEVFLOW_MERGE_PENDING.
     MODEL_RATE_LIMITED = ("model_rate_limited", Priority.HIGH, "🛑")
+    # Model reroute override audit trail — added 2026-08-18 (Phase 2 task 5).
+    # Emitted by events/model_override.py's set_override()/clear_override()
+    # on every write that actually LANDS (a rejected set_override — self-
+    # target, divert-into-a-wall — emits nothing; a no-op clear_override on
+    # an absent key emits nothing either). Spec §Containment: "each write
+    # emits an event, so audit.jsonl records who diverted what, when" — a
+    # forgotten override is the main way this feature can hurt the operator,
+    # and this is how it gets found later. INFO, not WARN/ACT: it is a
+    # record of a deliberate operator action, not a decision or a fault.
+    # Icon: scroll = a written record/audit trail. Verified disjoint from
+    # all 25 existing watchdog_alerts icons (and from every icon globally).
+    MODEL_OVERRIDE_SET = ("model_override_set", Priority.NORMAL, "📜")
     MEMORY_CONSOLIDATED = ("memory_consolidated", Priority.LOW, "🧠")
     SKILL_EVOLVED = ("skill_evolved", Priority.LOW, "🚀")
     MAILBOX_MESSAGE = ("mailbox_message", Priority.LOW, "📨")

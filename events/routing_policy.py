@@ -198,6 +198,13 @@ _POLICY: Dict[EventType, _Spec] = {
     # ACT always pages WhatsApp, and paging for every successfully-diverted
     # 429 would make this feature intolerable within a week.
     _E.MODEL_RATE_LIMITED: _Spec(Attention.WARN, ALERTS),
+    # Model override audit trail (Phase 2 task 5) — a RECORD of a deliberate
+    # operator action (a Telegram tap diverting or un-diverting traffic), not
+    # a decision or a fault: INFO on watchdog_alerts, never WARN/ACT, so it
+    # never pages and never lands in Action Required. wa="none" for the same
+    # reason WATCHDOG_SILENCE_ALERT does — INFO/WARN may suppress WhatsApp
+    # entirely; ACT alone can never be silenced.
+    _E.MODEL_OVERRIDE_SET: _Spec(Attention.INFO, ALERTS, wa="none"),
     # The boot report fires only when a boot broke something (2026-07-27):
     # degraded host, not an operator action. HIGH default + WARN means it
     # survives significant_only but does not page unless emitted CRITICAL.

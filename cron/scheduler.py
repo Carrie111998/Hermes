@@ -2623,7 +2623,15 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None, skip_cron_framing: bool = False) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    skip_cron_framing: bool = False,
+    *,
+    buttons=None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2635,6 +2643,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, skip_cron
     When ``skip_cron_framing`` is True, the "Cronjob Response" header/footer
     wrapper is omitted. Use this for event-bus subscribers where the cron
     framing is misleading.
+
+    ``buttons``, when provided, is the serializable spec from
+    ``events.override_buttons.buttons_for``. It is forwarded only to the
+    standalone ``_send_to_platform`` fallback below (the verified production
+    path for event-bus deliveries, since ``adapters``/``loop`` are None for
+    those callers) and is otherwise inert. Defaults to ``None``, in which
+    case this function's behavior is unchanged from before this parameter
+    existed.
 
     Returns None on success, or an error string on failure.
     """
@@ -3138,7 +3154,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, skip_cron
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, buttons=buttons)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3167,7 +3183,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, skip_cron
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, buttons=buttons))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

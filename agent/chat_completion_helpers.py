@@ -1637,6 +1637,26 @@ def try_activate_fallback(
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)  # skip invalid, try next
 
+    # Enforcement read #3: skip chain entries that currently have an open
+    # rate-limit episode, so a dodge does not land on a model that is
+    # already known to be limited. This is dynamic state (an episode can
+    # close mid-session) so -- unlike the local-usability skip below -- the
+    # entry is NOT added to `unavailable`; it is simply re-checked next
+    # time. Fails open (no skip) on any lookup error so a broken/missing
+    # state file never blocks failover, which is the whole point of the
+    # chain. Central invariant: with no open episodes, this is a no-op and
+    # chain-walking is byte-identical to before.
+    try:
+        from events.rate_limit_signal import _episode_key, _load_state
+        if _episode_key(fb_provider, fb_model) in _load_state():
+            logger.warning(
+                "Fallback skip: %s/%s has an open rate-limit episode",
+                fb_provider, fb_model,
+            )
+            return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)
+    except Exception:
+        pass
+
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)

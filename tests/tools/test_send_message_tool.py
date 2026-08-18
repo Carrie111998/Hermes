@@ -241,13 +241,33 @@ def _make_config():
     ), telegram_cfg
 
 
+class _FakeInlineKeyboardButton:
+    def __init__(self, label, callback_data=None):
+        self.text = label
+        self.callback_data = callback_data
+
+
+class _FakeInlineKeyboardMarkup:
+    def __init__(self, rows):
+        self.inline_keyboard = rows
+
+
 def _install_telegram_mock(monkeypatch, bot):
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
     # MessageEntity needed by #27865 mention-detection path; tests don't
     # inspect it but the import must succeed.
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot, MessageEntity=_MessageEntity, constants=constants_mod)
+    telegram_mod = SimpleNamespace(
+        Bot=lambda token: bot,
+        MessageEntity=_MessageEntity,
+        constants=constants_mod,
+        # Needed by _send_telegram's local `from telegram import
+        # InlineKeyboardButton, InlineKeyboardMarkup` when a non-None
+        # `buttons` spec is passed (events.override_buttons wiring).
+        InlineKeyboardButton=_FakeInlineKeyboardButton,
+        InlineKeyboardMarkup=_FakeInlineKeyboardMarkup,
+    )
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
@@ -704,6 +724,103 @@ class TestSendTelegramMediaDelivery:
         assert "error" in result
         assert "No deliverable text or media remained" in result["error"]
         bot.send_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# events.override_buttons wiring: reply_markup reaches _send_telegram
+# (Task 6 review IMPORTANT 2 — no test anywhere passed a non-None `buttons`
+# into any layer before this; deleting `buttons=buttons` at any hop left
+# the full 931-test gate green.)
+# ---------------------------------------------------------------------------
+
+
+class TestSendTelegramButtons:
+    def test_buttons_attach_only_to_the_last_chunk(self, monkeypatch):
+        """Buttons must land on the final text chunk only — the bubble the
+        user actually taps — and NOT on any earlier chunk."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock(
+            side_effect=[SimpleNamespace(message_id=i) for i in range(1, 5)]
+        )
+        _install_telegram_mock(monkeypatch, bot)
+
+        long_msg = "lorem ipsum " * 500  # ~6000 chars, over the 4096 cap
+        buttons = [[{"label": "Choose model…", "callback_data": "rl:choose:tok"}]]
+
+        result = asyncio.run(
+            _send_telegram("token", "12345", long_msg, buttons=buttons)
+        )
+
+        assert result["success"] is True
+        assert bot.send_message.await_count >= 2, (
+            "test setup must actually produce more than one chunk"
+        )
+        calls = bot.send_message.await_args_list
+        for call in calls[:-1]:
+            assert "reply_markup" not in call.kwargs
+        assert calls[-1].kwargs.get("reply_markup") is not None
+
+    def test_buttons_none_never_adds_reply_markup_to_any_chunk(self, monkeypatch):
+        """The default (buttons=None) path must stay byte-identical to
+        before this parameter existed: no chunk ever gets a reply_markup
+        kwarg, chunked or not."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock(
+            side_effect=[SimpleNamespace(message_id=i) for i in range(1, 5)]
+        )
+        _install_telegram_mock(monkeypatch, bot)
+
+        long_msg = "lorem ipsum " * 500
+
+        result = asyncio.run(
+            _send_telegram("token", "12345", long_msg, buttons=None)
+        )
+
+        assert result["success"] is True
+        assert bot.send_message.await_count >= 2, (
+            "test setup must actually produce more than one chunk"
+        )
+        for call in bot.send_message.await_args_list:
+            assert "reply_markup" not in call.kwargs
+
+    def test_overlong_event_id_bounded_token_still_sends_the_alert(self, monkeypatch):
+        """MINOR 4 end-to-end: buttons_for() bounds the callback_data token
+        before it ever reaches _send_telegram, so an event with a
+        pathological event_id still produces a deliverable message —
+        proving the alert still sends — instead of InlineKeyboardMarkup
+        construction later blowing up Telegram's 64-byte callback_data cap
+        and dropping the whole alert."""
+        import dataclasses
+
+        from events.override_buttons import buttons_for
+        from events.schema import Event, EventType
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        _install_telegram_mock(monkeypatch, bot)
+
+        event = Event.create(
+            EventType.MODEL_RATE_LIMITED, "matcher",
+            {"provider": "deepseek", "model": "deepseek-v4-pro",
+             "reason": "rate_limit", "detector": "runtime",
+             "outcome": "diverted", "fallback_provider": "openai-codex",
+             "fallback_model": "gpt-5.6-sol", "resets_at": "",
+             "diverted_calls": 3, "episode_opened_at": "x"},
+        )
+        huge = dataclasses.replace(event, event_id="x" * 5000)
+        buttons = buttons_for(huge)
+        assert buttons is not None
+
+        result = asyncio.run(
+            _send_telegram(
+                "token", "12345", "deepseek-v4-pro is rate limited",
+                buttons=buttons,
+            )
+        )
+
+        assert result["success"] is True
+        bot.send_message.assert_awaited_once()
+        assert bot.send_message.await_args.kwargs.get("reply_markup") is not None
 
 
 # ---------------------------------------------------------------------------

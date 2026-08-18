@@ -95,6 +95,12 @@ def rate_limit_state_path() -> Path:
     return notifications_home() / "rate_limit_state.json"
 
 
+def model_overrides_path() -> Path:
+    """Active model-reroute overrides. Global, never profile-scoped — an
+    override is a routing decision for the whole host."""
+    return notifications_home() / "model_overrides.json"
+
+
 def cron_stale_thresholds_path() -> Path:
     """Optional per-job stale-threshold overrides (CronStaleMonitor).
 

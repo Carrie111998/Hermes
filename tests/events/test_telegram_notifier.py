@@ -636,6 +636,115 @@ class TestTelegramNotifier:
         assert "- detail line 79" not in msg
 
 
+class TestModelRateLimitedButtons:
+    """Task 6 review IMPORTANT 1/2 regression guard: buttons_for() had zero
+    callers before this — handle() never passed `buttons` into _deliver, so
+    no MODEL_RATE_LIMITED alert could ever carry a button no matter what
+    events.override_buttons computed. This pins the wiring at the
+    production call site (cron.scheduler._deliver_result, the path taken
+    when no send_fn is injected)."""
+
+    def _diverted_event(self):
+        return Event.create(
+            EventType.MODEL_RATE_LIMITED, "matcher",
+            {"provider": "deepseek", "model": "deepseek-v4-pro",
+             "reason": "rate_limit", "detector": "runtime",
+             "outcome": "diverted", "fallback_provider": "openai-codex",
+             "fallback_model": "gpt-5.6-sol", "resets_at": "",
+             "diverted_calls": 3, "episode_opened_at": "x"},
+        )
+
+    def test_diverted_event_reaches_deliver_result_with_buttons(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = self._diverted_event()
+
+        with patch("cron.scheduler._deliver_result") as deliver_result_mock:
+            notifier.handle(event)
+
+        deliver_result_mock.assert_called_once()
+        _args, kwargs = deliver_result_mock.call_args
+        assert kwargs.get("buttons") is not None, (
+            "a runtime-detector/diverted-outcome MODEL_RATE_LIMITED event "
+            "must reach _deliver_result with a non-None buttons spec"
+        )
+
+    def test_unrelated_event_type_reaches_deliver_result_without_buttons(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The buttons_for() call is guarded to MODEL_RATE_LIMITED only —
+        an unrelated event type must never compute or forward buttons."""
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.APPLICATION_FAILED, "applier", {"error": "timeout"},
+            priority=Priority.CRITICAL,
+        )
+
+        with patch("cron.scheduler._deliver_result") as deliver_result_mock:
+            notifier.handle(event)
+
+        deliver_result_mock.assert_called_once()
+        _args, kwargs = deliver_result_mock.call_args
+        assert kwargs.get("buttons") is None
+
+    def test_record_call_uses_the_actual_buttons_for_token_and_payload(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Task 7 review Important-2: the record() block at
+        telegram_notifier.py:429-461 had zero test coverage. Every other
+        test in this suite seeds events.override_callback_state via a
+        hardcoded token through a local ``_record_target()`` helper that
+        never calls buttons_for() -- so a mis-parse of
+        ``buttons[0][0]["callback_data"].split(":", 2)[2]``, or the
+        ``if buttons:`` guard shifting, would leave every real button
+        answering "This prompt has already been resolved." in production
+        with no test failing.
+
+        This drives a REAL event through handle(), reads the token out of
+        buttons_for()'s ACTUAL output (never recomputed), and asserts
+        events.override_callback_state.pop() returns a target matching
+        the event's own payload -- pinning both the parse and the
+        no-desync property between the two.
+        """
+        from events import override_callback_state
+
+        override_callback_state.reset()
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = self._diverted_event()
+
+        try:
+            with patch("cron.scheduler._deliver_result") as deliver_result_mock:
+                notifier.handle(event)
+
+            deliver_result_mock.assert_called_once()
+            _args, kwargs = deliver_result_mock.call_args
+            buttons = kwargs.get("buttons")
+            assert buttons, "expected a non-empty buttons spec for a diverted event"
+
+            token = buttons[0][0]["callback_data"].split(":", 2)[2]
+            target = override_callback_state.pop(token)
+
+            assert target is not None, (
+                "override_callback_state has no entry for the token "
+                "buttons_for() actually produced -- the record() block's "
+                "token extraction has desynced from buttons_for()'s "
+                "callback_data format"
+            )
+            assert target["provider"] == event.payload["provider"]
+            assert target["model"] == event.payload["model"]
+            assert target["replacement_provider"] == event.payload["fallback_provider"]
+            assert target["replacement_model"] == event.payload["fallback_model"]
+        finally:
+            override_callback_state.reset()
+
+
 class TestSecretDetectedFormatting:
     """SR-408 regression (2026-04-19) — SECRET_DETECTED must render as a
     compact, human-readable Telegram message, not a generic key:value dump

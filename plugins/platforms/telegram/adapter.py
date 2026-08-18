@@ -6119,6 +6119,182 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
             return
 
+        # --- Model-rate-limit reroute callbacks (rl:action:token) ---
+        # action is one of divert / choose / dismiss (events/override_buttons.py).
+        # ``token`` is an OPAQUE handle, never the model name — it is resolved
+        # to a (provider, model, replacement_provider, replacement_model)
+        # record via events.override_callback_state, which was populated by
+        # events/subscribers/telegram_notifier.py when the buttons were sent.
+        # A tap must NEVER be able to name an arbitrary model through
+        # callback_data; this lookup is what enforces that.
+        if data.startswith("rl:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                action = parts[1]  # divert, choose, dismiss
+                token = parts[2]
+
+                # Only authorized users may act on a reroute prompt.
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                    return
+
+                # Reject an unrecognized action BEFORE the pop() below. The
+                # action is trusted from the callback payload and never
+                # validated elsewhere -- without this, an unknown action
+                # (bad client, future typo, or a probe) would still consume
+                # the token via pop() and silently disarm the legitimate
+                # button, leaving a real "already resolved" answer for the
+                # user's actual next tap.
+                if action not in ("divert", "choose", "dismiss"):
+                    await query.answer(text="⚠️ Unknown action.")
+                    return
+
+                # "Choose model…" is not wired up yet, so it must be a true
+                # NO-OP -- handled BEFORE the pop() below and returning
+                # immediately. Handling it after the pop would consume the
+                # single-use token AND fall through to the
+                # edit_message_text at the end of this branch, which
+                # replaces the alert body and passes reply_markup=None:
+                # the most likely FIRST tap would destroy the alert text
+                # and permanently disarm the only working control in one
+                # go, and the user's follow-up Divert tap would get "This
+                # prompt has already been resolved." Answering here leaves
+                # the token AND the keyboard intact, so Divert still works.
+                if action == "choose":
+                    await query.answer(
+                        text="🔧 Model picker isn't wired up yet — coming soon.",
+                    )
+                    return
+
+                # Pop BEFORE acting — this is what makes a double-tap
+                # idempotent (the second tap finds nothing and answers
+                # "already resolved"), mirroring the sc: branch above.
+                # Also covers an unknown/expired token: never-recorded and
+                # already-consumed both come back None here on purpose.
+                from events import override_callback_state
+                target = override_callback_state.pop(token)
+                if not target:
+                    await query.answer(text="This prompt has already been resolved.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "User")
+                # Set only on a TRANSIENT set_override failure (disk full, a
+                # Windows AV/indexer sharing violation, or the store's
+                # backoff window) -- see the SET_PERSIST_FAILURE_REASON
+                # branch below. It gates both re-arming the token and
+                # skipping the button-retiring edit_message_text: before
+                # the I2 fix (events/model_override.py), set_override only
+                # ever returned False for a PERMANENT rejection (self-
+                # target, blank fallback target), where burning the button
+                # is correct -- retrying can never succeed. I2 widened the
+                # False path to also cover a write that simply didn't reach
+                # disk this time, which retrying COULD fix. Popping the
+                # token unconditionally and always retiring the buttons
+                # (the pre-I2 assumption, still baked into the code below)
+                # would strand the operator: there is no `hermes overrides
+                # set`, only list/clear, so a burned button meant no way to
+                # retry until the next MODEL_RATE_LIMITED alert minted a
+                # fresh one.
+                retry_persist_failure = False
+
+                if action == "dismiss":
+                    label = "❌ Dismissed"
+                elif action == "divert":
+                    if not target["replacement_provider"] or not target["replacement_model"]:
+                        # The record behind this token has no usable
+                        # fallback target -- e.g. a detector emitted
+                        # MODEL_RATE_LIMITED with outcome="diverted" but
+                        # omitted fallback_provider/fallback_model (the
+                        # default rate_limit_signal.record() shape). This
+                        # is a VALIDATION problem with the token's own
+                        # data, not a transient write failure -- a retry
+                        # would hit the exact same blank fields every time,
+                        # so the button must still burn.
+                        # set_override does not itself reject an empty
+                        # target, so calling it here would silently write
+                        # a "/" override that enforcement read #2
+                        # (agent_runtime_helpers.py) then treats as "an
+                        # override exists" for the full 6h TTL -- blocking
+                        # restoration of the primary model while diverting
+                        # to nothing. Refuse before ever calling
+                        # set_override, and reuse the existing
+                        # "show the reason" toast path below.
+                        ok, reason = False, "no fallback target recorded for this alert"
+                    else:
+                        from events.model_override import (
+                            SET_PERSIST_FAILURE_REASON,
+                            set_override,
+                        )
+                        ok, reason = set_override(
+                            provider=target["provider"],
+                            model=target["model"],
+                            replacement_provider=target["replacement_provider"],
+                            replacement_model=target["replacement_model"],
+                            ttl_seconds=6 * 3600,
+                            set_by=f"telegram:{caller_id}",
+                        )
+                        if not ok and reason == SET_PERSIST_FAILURE_REASON:
+                            retry_persist_failure = True
+                    if ok:
+                        label = (
+                            f"✅ Diverted 6h → {target['replacement_provider']}/"
+                            f"{target['replacement_model']}"
+                        )
+                    elif retry_persist_failure:
+                        # Re-arm the token under the SAME string so the
+                        # button on the still-visible message keeps working
+                        # -- the tap only failed to persist, it was never
+                        # invalid. Without this, pop() already consumed the
+                        # token above and the next tap would find nothing
+                        # and answer "already resolved" instead of retrying.
+                        from events import override_callback_state
+                        override_callback_state.record(
+                            token,
+                            provider=target["provider"],
+                            model=target["model"],
+                            replacement_provider=target["replacement_provider"],
+                            replacement_model=target["replacement_model"],
+                        )
+                        label = f"⚠️ Not diverted (temporary — tap Divert again): {reason}"
+                    else:
+                        # A rejected write (self-target, divert-into-a-wall,
+                        # blank target, internal error) must surface its
+                        # reason — a button that silently does nothing is
+                        # the failure mode this whole design exists to
+                        # prevent.
+                        label = f"⚠️ Not diverted: {reason}"
+                else:
+                    label = "Resolved"
+
+                await query.answer(text=label)
+
+                if retry_persist_failure:
+                    # Leave the message and its keyboard exactly as they
+                    # were -- editing it (even just the text, with
+                    # reply_markup=None as every other branch does) would
+                    # retire the only working control before the operator
+                    # gets a chance to tap it again.
+                    return
+
+                # Retire the buttons so a stale message can't be tapped
+                # twice (the token is already consumed either way).
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(f"{label} by {user_display}"),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            return
+
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---
         if data.startswith("cl:"):
             parts = data.split(":", 2)

@@ -405,17 +405,73 @@ class TelegramNotifier(BaseSubscriber):
                 self._flush_batch_key(key)
             self._persist_batch_buffer()
         else:
+            # Model-rate-limit override buttons (2026-08-14 design). Scoped
+            # to MODEL_RATE_LIMITED only — buttons_for() already gates on
+            # detector/outcome internally, but calling it for every event
+            # type on this hot path would be needless work and blur the
+            # intent. Lazily imported (matching this module's existing
+            # local-import convention) so a broken import in
+            # events.override_buttons can't take the whole notifier down at
+            # module load. Wrapped so a runtime failure degrades to
+            # buttons=None (message still delivers, just without buttons)
+            # rather than dropping the alert.
+            buttons = None
+            if event.event_type == EventType.MODEL_RATE_LIMITED:
+                try:
+                    from events.override_buttons import buttons_for
+                    buttons = buttons_for(event)
+                except Exception:
+                    logger.exception(
+                        "TelegramNotifier: buttons_for() failed for event %s "
+                        "— delivering without buttons", event.event_id,
+                    )
+                    buttons = None
+                if buttons:
+                    # Record what the opaque callback token actually points
+                    # at (Task 7 seam). buttons_for() is deliberately
+                    # pure/stateless — see its docstring — so it never
+                    # writes this itself; this is the one place downstream
+                    # of it that has both the token (embedded identically
+                    # in every button on this row) and the event payload
+                    # (provider/model/fallback_provider/fallback_model)
+                    # needed to populate events.override_callback_state.
+                    # plugins/platforms/telegram/adapter.py's callback
+                    # handler resolves a tap through THIS map, never by
+                    # trusting anything Telegram echoes back in
+                    # callback_data — a tap must never be able to name an
+                    # arbitrary model. Wrapped so a failure here degrades
+                    # to "buttons render but no-op on tap" rather than
+                    # dropping the alert.
+                    try:
+                        from events import override_callback_state
+                        token = buttons[0][0]["callback_data"].split(":", 2)[2]
+                        payload = getattr(event, "payload", None) or {}
+                        override_callback_state.record(
+                            token,
+                            provider=payload.get("provider", ""),
+                            model=payload.get("model", ""),
+                            replacement_provider=payload.get("fallback_provider", ""),
+                            replacement_model=payload.get("fallback_model", ""),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "TelegramNotifier: failed to record override "
+                            "callback state for event %s — buttons will "
+                            "no-op on tap", event.event_id,
+                        )
             # Pass event + topic_key so _deliver can emit the
             # NOTIFICATION_DELIVERED / NOTIFICATION_FAILED reverse
             # signal carrying original_event_id + target metadata.
             # Batched flushes call _deliver() without an event so
             # they DO NOT emit per-event reverse signals (Phase 1
             # scope per the design doc — keeps LOW-priority firehose
-            # volume bounded). Spec at
+            # volume bounded), and correspondingly never attach buttons —
+            # a coalesced "Batched (N events)" message has no single event
+            # to attach an override to. Spec at
             # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
             self._deliver(
                 chat_id, thread_id, message,
-                event=event, topic_key=topic_key,
+                event=event, topic_key=topic_key, buttons=buttons,
             )
 
         # Flush any batches older than 5 minutes
@@ -694,6 +750,7 @@ class TelegramNotifier(BaseSubscriber):
         event: Optional[Event] = None,
         topic_key: Optional[str] = None,
         batch_count: Optional[int] = None,
+        buttons: Optional[List[List[Dict[str, str]]]] = None,
     ) -> bool:
         """Send a message to a Telegram chat/thread. Returns True when
         the send succeeded, False when it raised (exceptions are swallowed
@@ -716,6 +773,14 @@ class TelegramNotifier(BaseSubscriber):
         original_event_type="batch_flush" (routing-v3 observability gap,
         2026-07-20: without it a "Batched (N events)" chat message left
         zero ledger rows, so per-topic delivery audits undercounted).
+
+        ``buttons``, when provided, is the serializable spec from
+        ``events.override_buttons.buttons_for`` and is forwarded to
+        ``_deliver_result`` (the production path here, since ``_send_fn``
+        is unset outside tests). It is never passed to ``_send_fn``, so a
+        test double's call signature is unaffected. Defaults to ``None``,
+        in which case this method's behavior is unchanged from before this
+        parameter existed.
         """
         t0 = time.monotonic()
         try:
@@ -732,6 +797,7 @@ class TelegramNotifier(BaseSubscriber):
                     {"deliver": target_str, "id": "event-bus", "name": "event-bus"},
                     message,
                     skip_cron_framing=True,
+                    buttons=buttons,
                 )
             latency_ms = int((time.monotonic() - t0) * 1000)
             if event is not None:

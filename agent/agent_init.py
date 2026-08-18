@@ -276,6 +276,452 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+_MISSING = object()
+
+# Attributes ``_apply_model_override`` mutates. Snapshotted before the first
+# write so a failure part-way through can restore the agent to its wholly
+# pre-override state (mirrors ``swap_model``'s ``_snapshot`` rollback in
+# agent/agent_runtime_helpers.py).
+_OVERRIDE_MUTATED_ATTRS = (
+    "model", "provider", "base_url", "api_mode", "api_key", "client",
+    "_client_kwargs", "_config_context_length",
+    "_use_prompt_caching", "_use_native_cache_layout", "_credential_pool",
+    "_anthropic_api_key", "_anthropic_base_url", "_anthropic_client",
+    "_is_anthropic_oauth", "reasoning_config",
+)
+
+
+def _snapshot_primary_runtime(agent) -> Dict[str, Any]:
+    """Build the ``agent._primary_runtime`` dict from the agent's live state.
+
+    Shared by the init call site (which blesses the post-override state as
+    primary) and by ``_apply_model_override`` (which captures the PRE-override
+    state as ``agent._override_origin["runtime"]`` so enforcement read #2 can
+    put a long-lived agent back on its truly-configured primary once the
+    override expires). One definition, so the two can never drift.
+    """
+    _cc = getattr(agent, "context_compressor", None)
+    rt: Dict[str, Any] = {
+        "model": agent.model,
+        "provider": agent.provider,
+        "base_url": agent.base_url,
+        "api_mode": agent.api_mode,
+        "api_key": getattr(agent, "api_key", ""),
+        "client_kwargs": dict(getattr(agent, "_client_kwargs", {}) or {}),
+        "use_prompt_caching": getattr(agent, "_use_prompt_caching", False),
+        "use_native_cache_layout": getattr(agent, "_use_native_cache_layout", False),
+        # Mirrors switch_model's _primary_runtime shape (agent/agent_
+        # runtime_helpers.py) so restore_primary_runtime's "restore
+        # reasoning_config if it was saved" branch has something to find.
+        # Without this, a model-override swap's re-resolved reasoning_config
+        # (see _apply_model_override below) is never carried by either the
+        # blessed-primary snapshot or the pre-override origin snapshot, so a
+        # revert leaves the REPLACEMENT's reasoning_config active on the
+        # restored PRIMARY -- the same "wrong params sent to the wrong
+        # model" shape as C1, just for reasoning_config instead of cache
+        # policy/compressor/etc.
+        "reasoning_config": (
+            dict(getattr(agent, "reasoning_config", None) or {})
+            if getattr(agent, "reasoning_config", None) else None
+        ),
+        # Context engine state that _try_activate_fallback() overwrites.
+        # Use getattr for model/base_url/api_key/provider since plugin
+        # engines may not have these (they're ContextCompressor-specific).
+        "compressor_model": getattr(_cc, "model", agent.model),
+        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
+        "compressor_api_key": getattr(_cc, "api_key", ""),
+        "compressor_provider": getattr(_cc, "provider", agent.provider),
+        "compressor_context_length": getattr(_cc, "context_length", None),
+        "compressor_threshold_tokens": getattr(_cc, "threshold_tokens", None),
+    }
+    if agent.api_mode == "anthropic_messages":
+        rt.update({
+            "anthropic_api_key": getattr(agent, "_anthropic_api_key", ""),
+            "anthropic_base_url": getattr(agent, "_anthropic_base_url", ""),
+            "is_anthropic_oauth": getattr(agent, "_is_anthropic_oauth", False),
+        })
+    return rt
+
+
+def _apply_model_override(agent) -> None:
+    """Redirect a fresh process onto a Telegram-tap rate-limit reroute.
+
+    Phase 2's central invariant: routing changes if and only if a valid,
+    unexpired override matches the (provider, model) being resolved.
+    Nothing else here may alter routing.
+
+    Must run BEFORE ``agent._primary_runtime`` is snapshotted (see the call
+    site below).  Every cron run is a fresh process — if the override were
+    applied after the snapshot, the snapshot would record the rate-limited
+    primary, and the next turn's ``restore_primary_runtime()`` would undo the
+    reroute right back onto the model that is still 429ing.  If applied
+    before the snapshot, the snapshot captures the replacement as primary and
+    the process never pays the 429 at all.
+
+    Swaps the client too, not just the model/provider strings — leaving
+    ``agent.client`` pointed at the old provider would send the replacement
+    model name to the wrong endpoint. Mirrors the client-construction shape
+    of ``try_activate_fallback`` in ``agent/chat_completion_helpers.py``
+    (resolve via the centralized router, derive api_mode from the resolved
+    base URL/provider).
+
+    It also mirrors that function's (and ``swap_model``'s) per-model derived
+    state: the ``_config_context_length`` reset (#22387), the prompt-cache
+    policy re-evaluation, the context-compressor rebind, the transport-cache
+    clear, and the credential-pool rebind. An earlier revision of this
+    docstring dismissed those five as ``try_activate_fallback``'s
+    "turn-scoped concerns" that a once-at-init swap could skip. That was
+    wrong. Every one of them is INIT-TIME state that was already computed
+    for the PRE-override model by the time this runs, and
+    ``agent._primary_runtime`` is snapshotted immediately afterwards — so a
+    stale value here is blessed as "primary" and re-applied by
+    ``restore_primary_runtime`` on every subsequent turn. It never
+    self-corrects. The sharpest case: an Anthropic-family primary leaves
+    ``_use_prompt_caching``/``_use_native_cache_layout`` True, and
+    ``agent/conversation_loop.py`` then calls
+    ``apply_anthropic_cache_control(..., native_anthropic=True)`` for a
+    chat_completions replacement, injecting ``cache_control`` blocks into
+    every message sent to a non-Anthropic endpoint — a 400 on EVERY call,
+    caused solely by the override, in the one feature whose contract is
+    "never a blocked model call". The compressor is the same story: left
+    unrebound it keeps summarizing through the RATE-LIMITED model, exactly
+    on the long contexts where the 429 hurts most.
+
+    Enforcement read #2 support: on a successful swap this stashes the
+    pre-override runtime on ``agent._override_origin``, keyed by the
+    ORIGINAL (provider, model). ``restore_primary_runtime`` re-checks THAT
+    key — checking the replacement's key, as it did before, can never match
+    by construction, so a gateway agent diverted at init would keep routing
+    to the replacement for the whole process lifetime, defeating the 24h
+    TTL cap. See ``agent/agent_runtime_helpers.py``.
+
+    Fail-open by design: any failure here (bad override record, unresolvable
+    replacement provider, network hiccup) must leave the agent on its
+    configured primary and must never break agent init. Everything that can
+    fail is either computed BEFORE the first attribute is mutated or covered
+    by the rollback below — a half-swapped agent (new model, stale cache
+    policy) is strictly worse than no override at all.
+    """
+    try:
+        from events import model_override
+
+        current_provider = getattr(agent, "provider", "") or ""
+        current_model = getattr(agent, "model", "") or ""
+        override = model_override.get_override(current_provider, current_model)
+        if not override:
+            return
+
+        replacement_provider = str(override.get("replacement_provider") or "").strip()
+        replacement_model = str(override.get("replacement_model") or "").strip()
+        if not replacement_provider or not replacement_model:
+            return
+
+        from agent.auxiliary_client import resolve_provider_client
+
+        new_client, resolved_model = resolve_provider_client(
+            replacement_provider, model=replacement_model, raw_codex=True,
+        )
+        if new_client is None:
+            logger.warning(
+                "Model override %s/%s -> %s/%s could not be resolved to a "
+                "working client; staying on configured primary",
+                current_provider, current_model,
+                replacement_provider, replacement_model,
+            )
+            return
+
+        replacement_model = resolved_model or replacement_model
+        new_base_url = str(getattr(new_client, "base_url", "") or "")
+
+        # Same api_mode derivation shape as try_activate_fallback's
+        # client-construction block, trimmed to the cases the reroute store
+        # actually accepts (see events/model_override.py) -- full parity
+        # with every provider-specific edge case there lives in that
+        # function, not duplicated here.
+        if replacement_provider == "openai-codex":
+            new_api_mode = "codex_responses"
+        elif (
+            replacement_provider == "anthropic"
+            or new_base_url.rstrip("/").lower().endswith("/anthropic")
+        ):
+            new_api_mode = "anthropic_messages"
+        else:
+            new_api_mode = "chat_completions"
+
+        # anthropic_messages dispatch (agent._create_request_anthropic_client,
+        # chat_completion_helpers.py:410-416) reads agent._anthropic_api_key
+        # with no getattr default (run_agent.py:4404-4409). That attribute
+        # only exists when the agent's ORIGINAL api_mode was
+        # anthropic_messages at construction time -- so for the (overwhelmingly
+        # common) case of a chat_completions/codex primary swapping to an
+        # Anthropic replacement, the *next* request after this function
+        # returns would AttributeError unless that native-client state is
+        # built here too. Build it BEFORE any agent attribute is mutated, so
+        # a failure here (bad key, SDK missing, etc.) is caught by the
+        # outer except and leaves the agent completely untouched on its
+        # configured primary -- a half-applied override (api_mode flipped but
+        # no native client) is worse than no override at all.
+        anthropic_native_state = None
+        if new_api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import (
+                build_anthropic_client, resolve_anthropic_token, _is_oauth_token,
+            )
+
+            _new_key = getattr(new_client, "api_key", "") or ""
+            effective_key = (
+                (_new_key or resolve_anthropic_token() or "")
+                if replacement_provider == "anthropic"
+                else _new_key
+            )
+            anthropic_native_state = {
+                "api_key": effective_key,
+                "base_url": new_base_url,
+                "client": build_anthropic_client(effective_key, new_base_url),
+                "is_oauth": (
+                    _is_oauth_token(effective_key)
+                    if replacement_provider == "anthropic"
+                    else False
+                ),
+            }
+
+        # The credential the replacement route will actually use. Needed
+        # both for the client swap below and for the context-length probe.
+        _new_api_key = (
+            anthropic_native_state["api_key"]
+            if anthropic_native_state is not None
+            else getattr(new_client, "api_key", getattr(agent, "api_key", ""))
+        )
+
+        # ── Init-time derived state, recomputed for the REPLACEMENT ──
+        # Computed BEFORE any attribute is mutated (same discipline as the
+        # anthropic_native_state block above) so a failure here is caught by
+        # the outer except with the agent still wholly on its configured
+        # primary.  These five are NOT "turn-scoped concerns" (see the
+        # docstring): they were derived from the pre-override model at init
+        # and the _primary_runtime snapshot taken right after this function
+        # would otherwise bless them as permanent.
+        #
+        # (2) Prompt-cache policy.  THE critical one: an Anthropic-family
+        # primary leaves _use_prompt_caching/_use_native_cache_layout True,
+        # and conversation_loop.py then injects cache_control blocks into
+        # every message sent to a chat_completions replacement -- a 400 on
+        # every single call.  Deliberately NOT wrapped in its own
+        # try/except: if the policy cannot be recomputed the swap must not
+        # happen at all, because applying it with the primary's policy is
+        # the exact defect this guards.
+        new_cache_policy = agent._anthropic_prompt_cache_policy(
+            provider=replacement_provider,
+            base_url=new_base_url,
+            api_mode=new_api_mode,
+            model=replacement_model,
+        )
+
+        # (5) Credential-pool rebind.  Same rationale as
+        # try_activate_fallback (#33163): keeping the primary provider's
+        # pool attached makes downstream 401/429 recovery mutate the wrong
+        # credential set and can overwrite base_url back to the primary
+        # endpoint.  _MISSING = "leave agent._credential_pool alone".
+        new_credential_pool = _MISSING
+        _existing_pool = getattr(agent, "_credential_pool", None)
+        _pool_provider = (getattr(_existing_pool, "provider", "") or "").strip().lower()
+        if _existing_pool is None or (
+            _pool_provider and _pool_provider != replacement_provider
+        ):
+            new_credential_pool = None
+            try:
+                from agent.credential_pool import load_pool
+
+                _replacement_pool = load_pool(replacement_provider)
+                if _replacement_pool and _replacement_pool.has_credentials():
+                    new_credential_pool = _replacement_pool
+            except Exception as _pool_exc:
+                logger.debug(
+                    "Model override -> %s/%s: could not attach credential "
+                    "pool: %s",
+                    replacement_provider, replacement_model, _pool_exc,
+                )
+
+        # (3) Context compressor.  Left unrebound it keeps the OLD model's
+        # model/provider/base_url/api_key, so summarization still calls the
+        # RATE-LIMITED model -- precisely on the long contexts where the 429
+        # hurts most -- and sizes compression to the primary's window.
+        # config_context_length is passed as None on purpose: item (1) below
+        # clears the per-config override so the REPLACEMENT's real window is
+        # resolved instead of the primary's (#22387).
+        _compressor = getattr(agent, "context_compressor", None)
+        new_context_length = None
+        if _compressor is not None:
+            from agent.model_metadata import get_model_context_length
+
+            # api_key may be callable (Entra ID); the resolver expects a
+            # string for live probes -- coerce defensively, same as
+            # try_activate_fallback.
+            _ctx_api_key = _new_api_key if isinstance(_new_api_key, str) else ""
+            new_context_length = get_model_context_length(
+                replacement_model,
+                base_url=new_base_url,
+                api_key=_ctx_api_key,
+                provider=replacement_provider,
+                config_context_length=None,
+                custom_providers=getattr(agent, "_custom_providers", None),
+            )
+
+        # (6) reasoning_config.  Mirrors try_activate_fallback (Closes
+        # #21256, agent/chat_completion_helpers.py) and switch_model
+        # (agent/agent_runtime_helpers.py): the replacement model may carry
+        # a different per-model reasoning_effort override than the primary
+        # (or none), resolved through the shared chokepoint (per-model
+        # override > global reasoning_effort; YAML boolean False =
+        # disabled). Left unresolved, the primary's reasoning_config (e.g.
+        # {"effort": "high"}) keeps flowing into every request built for
+        # the replacement -- a 400 on every call for a replacement that
+        # rejects the parameter, the exact same shape as C1's five, just
+        # for a sixth field the original fix enumeration missed.
+        # _MISSING = "resolution failed or produced nothing to apply -- do
+        # not touch agent.reasoning_config below", matching both
+        # references' "keep whatever reasoning_config was active" fallback.
+        # Deliberately wrapped in try/except (unlike the cache-policy call
+        # above): a config load failure here is not the defect this swap
+        # exists to prevent, and must not block the swap the way a bad
+        # cache policy would.
+        new_reasoning_config = _MISSING
+        try:
+            from hermes_cli.config import load_config as _override_load_config
+            from hermes_constants import (
+                resolve_reasoning_config as _override_resolve_reasoning_config,
+            )
+
+            new_reasoning_config = _override_resolve_reasoning_config(
+                _override_load_config() or {}, replacement_model
+            )
+        except Exception as _reasoning_exc:
+            logger.debug(
+                "Model override -> %s/%s: could not resolve reasoning_config: %s",
+                replacement_provider, replacement_model, _reasoning_exc,
+            )
+
+        # Enforcement read #2 needs the runtime this override is displacing:
+        # once the override expires, restore_primary_runtime() has to put a
+        # long-lived (gateway-cached) agent back on the TRULY configured
+        # primary, and after this function returns nothing else on the agent
+        # remembers what that was.
+        origin_runtime = _snapshot_primary_runtime(agent)
+        origin_config_context_length = getattr(
+            agent, "_config_context_length", None)
+
+        # Rollback snapshot: past this point attributes are mutated, and a
+        # half-swapped agent (new model, primary's cache policy) is strictly
+        # worse than no override.  Mirrors swap_model's _snapshot.
+        _rollback = {
+            name: getattr(agent, name, _MISSING)
+            for name in _OVERRIDE_MUTATED_ATTRS
+        }
+
+        try:
+            # (1) Clear the per-config context_length override so the
+            # replacement model's actual context window is resolved instead
+            # of inheriting the stale value from the primary.  See #22387.
+            agent._config_context_length = None
+            agent.model = replacement_model
+            agent.provider = replacement_provider
+            agent.base_url = new_base_url
+            agent.api_mode = new_api_mode
+            # (4) Transport cache is keyed on the previous endpoint.
+            if hasattr(agent, "_transport_cache"):
+                agent._transport_cache.clear()
+
+            if anthropic_native_state is not None:
+                agent.api_key = anthropic_native_state["api_key"]
+                agent._anthropic_api_key = anthropic_native_state["api_key"]
+                agent._anthropic_base_url = anthropic_native_state["base_url"]
+                agent._anthropic_client = anthropic_native_state["client"]
+                agent._is_anthropic_oauth = anthropic_native_state["is_oauth"]
+                # Mirrors try_activate_fallback's anthropic branch: the OpenAI
+                # client/kwargs are not used on this dispatch path, so null them
+                # out rather than leaving stale primary-provider state around.
+                agent.client = None
+                if hasattr(agent, "_client_kwargs"):
+                    agent._client_kwargs = {}
+            else:
+                agent.api_key = _new_api_key
+                agent.client = new_client
+                if hasattr(agent, "_client_kwargs"):
+                    # Preserve provider-specific default headers baked into the
+                    # resolved client (e.g. Kimi Coding's User-Agent sentinel) --
+                    # dropping them here causes subsequent request-client
+                    # rebuilds to lose them, same rationale as
+                    # try_activate_fallback (chat_completion_helpers.py:1848-1859).
+                    _new_headers = getattr(new_client, "_custom_headers", None)
+                    if not _new_headers:
+                        _new_headers = getattr(new_client, "default_headers", None)
+                    agent._client_kwargs = {
+                        "api_key": getattr(new_client, "api_key", ""),
+                        "base_url": new_base_url,
+                        **({"default_headers": dict(_new_headers)} if _new_headers else {}),
+                    }
+
+            agent._use_prompt_caching, agent._use_native_cache_layout = (
+                new_cache_policy
+            )
+            if new_credential_pool is not _MISSING:
+                agent._credential_pool = new_credential_pool
+            if new_reasoning_config is not _MISSING:
+                agent.reasoning_config = new_reasoning_config
+
+            if _compressor is not None:
+                _compressor.update_model(
+                    model=replacement_model,
+                    context_length=new_context_length,
+                    base_url=new_base_url,
+                    api_key=_new_api_key,  # callable preserved -> call_llm
+                    provider=replacement_provider,
+                    api_mode=new_api_mode,
+                )
+        except Exception:
+            # Roll every mutated field back to the pre-swap snapshot: the
+            # contract is "degrade to the configured primary", never "run
+            # half-swapped".
+            for _name, _value in _rollback.items():
+                if _value is _MISSING:
+                    continue  # attribute did not exist before -- don't fabricate
+                try:
+                    setattr(agent, _name, _value)
+                except Exception:  # noqa: BLE001
+                    pass
+            if _compressor is not None:
+                try:
+                    _compressor.update_model(
+                        model=origin_runtime["compressor_model"],
+                        context_length=origin_runtime["compressor_context_length"],
+                        base_url=origin_runtime["compressor_base_url"],
+                        api_key=origin_runtime["compressor_api_key"],
+                        provider=origin_runtime["compressor_provider"],
+                        api_mode=origin_runtime.get("api_mode", ""),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+
+        agent._override_origin = {
+            "provider": current_provider,
+            "model": current_model,
+            "runtime": origin_runtime,
+            "config_context_length": origin_config_context_length,
+        }
+
+        logger.info(
+            "Model override active: %s/%s -> %s/%s",
+            current_provider, current_model,
+            replacement_provider, replacement_model,
+        )
+    except Exception:
+        logger.warning(
+            "Model override application failed; continuing on configured "
+            "primary",
+            exc_info=True,
+        )
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -2169,36 +2615,20 @@ def init_agent(
     # ``run_conversation``'s preflight) runs it at most once per agent.
     agent._compression_feasibility_checked = False
 
+    # Apply any active Telegram-tap rate-limit reroute BEFORE the primary
+    # runtime is snapshotted below. This is the whole point of Task 3: a
+    # cron run is a fresh process, so if the override lands after the
+    # snapshot, the snapshot records the rate-limited model as primary and
+    # the next turn's restore_primary_runtime() undoes the reroute. Landing
+    # it here means the snapshot captures the replacement as primary and the
+    # process never pays the 429 at all.
+    _apply_model_override(agent)
+
     # Snapshot primary runtime for per-turn restoration.  When fallback
     # activates during a turn, the next turn restores these values so the
     # preferred model gets a fresh attempt each time.  Uses a single dict
     # so new state fields are easy to add without N individual attributes.
-    _cc = agent.context_compressor
-    agent._primary_runtime = {
-        "model": agent.model,
-        "provider": agent.provider,
-        "base_url": agent.base_url,
-        "api_mode": agent.api_mode,
-        "api_key": getattr(agent, "api_key", ""),
-        "client_kwargs": dict(agent._client_kwargs),
-        "use_prompt_caching": agent._use_prompt_caching,
-        "use_native_cache_layout": agent._use_native_cache_layout,
-        # Context engine state that _try_activate_fallback() overwrites.
-        # Use getattr for model/base_url/api_key/provider since plugin
-        # engines may not have these (they're ContextCompressor-specific).
-        "compressor_model": getattr(_cc, "model", agent.model),
-        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
-        "compressor_api_key": getattr(_cc, "api_key", ""),
-        "compressor_provider": getattr(_cc, "provider", agent.provider),
-        "compressor_context_length": _cc.context_length,
-        "compressor_threshold_tokens": _cc.threshold_tokens,
-    }
-    if agent.api_mode == "anthropic_messages":
-        agent._primary_runtime.update({
-            "anthropic_api_key": agent._anthropic_api_key,
-            "anthropic_base_url": agent._anthropic_base_url,
-            "is_anthropic_oauth": agent._is_anthropic_oauth,
-        })
+    agent._primary_runtime = _snapshot_primary_runtime(agent)
 
 
 
