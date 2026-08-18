@@ -125,6 +125,22 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("grok-4.5", 300),
     ("grok-4.6", 300),
     ("grok-4-fast-non-reasoning", 180),
+    # Z.AI GLM-5 series.  GLM-5.3 (released 2026-08-14) always thinks:
+    # there is no off switch — ``thinking: {"type": "disabled"}`` is
+    # silently ignored on the Coding Plan endpoint and rejected with
+    # HTTP 400 (error 1210) on the standard PaaS endpoint.  The Z.AI
+    # Coding endpoint also serves ``glm-5.2`` requests with a
+    # ``glm-5.3`` backend when 5.2 capacity is tight (observed
+    # 2026-08-16+: response ``model`` field returns ``glm-5.3``), so a
+    # user who explicitly selected the toggleable 5.2 can still get a
+    # always-thinking backend.  Measured TTFB on 14k-44k token
+    # contexts: 91-97s before first content token — past the 90s
+    # non-stream default, so the stale detector killed healthy calls
+    # after 3 retries.  240s floor matches the Claude thinking tier
+    # (measured headroom ~2.5x; real answers arrived in 28-33s once
+    # the detector stopped killing them).
+    ("glm-5", 240),
+    ("glm-4.6", 240),
 )
 
 
