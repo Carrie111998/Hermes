@@ -191,13 +191,9 @@ def test_invalid_delivery_mode_is_rejected_before_driver_call():
 
 
 def test_type_text_targets_captured_element_with_snapshot_token():
-    class _TokenSession(_FakeSession):
-        def supports_capability(
-            self, capability: str, tool: Optional[str] = None
-        ) -> bool:
-            return capability == "accessibility.element_tokens" and tool == "type_text"
-
-    session = _TokenSession(input_properties={"type_text": {"element_index"}})
+    session = _FakeSession(
+        input_properties={"type_text": {"element_index", "element_token"}}
+    )
     backend = _make_backend(session)
     backend._snapshot_tokens = {7: "s12345678:7"}
 
