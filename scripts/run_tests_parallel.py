@@ -321,7 +321,7 @@ def _safe_temp_dirname(file: Path, repo_root: Path) -> str:
     except ValueError:
         rel = file
     digest = hashlib.sha1(str(rel).encode("utf-8", "surrogateescape")).hexdigest()
-    return digest[:12]
+    return digest[:8]
 
 
 def _run_one_file(
@@ -1163,7 +1163,11 @@ def main() -> int:
     # Placed under the parent's TMPDIR (or the OS default) so it still
     # lands on whatever disk-backed location the caller configured.
     parent_tmp_base = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
-    runner_tmp_root = parent_tmp_base / f"hermes-run-tests-parallel-{os.getpid()}-{int(time.time())}"
+    # Short on purpose (see _run_one_file_once / _safe_temp_dirname
+    # docstrings): every subprocess nests its own basetemp under this, and
+    # some tests build fixed-length-limited paths (AF_UNIX sockets) directly
+    # under tmp_path, so runner-added path overhead has to stay minimal.
+    runner_tmp_root = parent_tmp_base / f"hrtp{os.getpid()}"
     runner_tmp_root.mkdir(parents=True, exist_ok=True)
     try:
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
