@@ -55,15 +55,24 @@ def render_sessions_export(
     export_format = normalize_export_format(fmt)
     export_only = normalize_export_only(only)
 
+    # Redact structured content BEFORE serialization (#20785 follow-up).
+    # A text pass alone misses credential values nested in structured
+    # messages: once JSONL-serialized, the key is escaped (\"client_secret\")
+    # so the JSON-field regex never fires, and opaque values have no
+    # recognizable prefix. Walking the structure first masks values under
+    # credential-named keys regardless of shape, and force=True keeps this
+    # egress boundary active even when security.redact_secrets is disabled.
+    from agent.redact import redact_structured
+    session_list = redact_structured(session_list)
+
     if export_format == "jsonl":
         rendered = _render_jsonl(session_list, only=export_only)
     else:
         rendered = _render_markdown(session_list, only=export_only)
-    # Never let exported transcripts carry credential values (#20785).
-    # Redaction replaces matches with a plain placeholder, so JSON/MD
-    # structure stays intact.
+    # Belt-and-suspenders text pass over the serialized output so
+    # prose-embedded credentials (URLs, headers, KEY=value) are also masked.
     from agent.redact import redact_sensitive_text
-    return redact_sensitive_text(rendered)
+    return redact_sensitive_text(rendered, force=True)
 
 
 def export_record_count(

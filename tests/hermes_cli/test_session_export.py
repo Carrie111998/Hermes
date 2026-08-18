@@ -95,6 +95,70 @@ def test_export_record_count_switches_unit_for_prompt_only_exports():
     )
 
 
+def test_jsonl_export_redacts_embedded_client_secret_dict_value():
+    """#20785 follow-up: opaque client_secret nested in structured message
+    content must not survive export. The key context alone identifies the
+    value as a secret, even though 'opaque-client-secret-...' has no
+    recognizable prefix and the serialized key is JSON-escaped."""
+    opaque = "opaque-client-secret-abc123XYZ"
+    session = _sample_session()
+    session["messages"].append(
+        {
+            "id": 6,
+            "role": "tool",
+            "tool_name": "google_api",
+            "content": {"client_secret": opaque, "client_id": "cid-123"},
+            "timestamp": 1700000005,
+        }
+    )
+    rendered = render_sessions_export([session], fmt="jsonl")
+    assert opaque not in rendered
+    # JSONL stays parseable after redaction.
+    for line in rendered.strip().splitlines():
+        json.loads(line)
+
+
+def test_jsonl_export_redacts_embedded_client_secret_json_string():
+    """Same leak through a JSON *string* payload (tool output that embeds a
+    credential blob as text)."""
+    opaque = "opaque-client-secret-abc123XYZ"
+    session = _sample_session()
+    session["messages"].append(
+        {
+            "id": 6,
+            "role": "tool",
+            "tool_name": "google_api",
+            "content": json.dumps({"client_secret": opaque}),
+            "timestamp": 1700000005,
+        }
+    )
+    rendered = render_sessions_export([session], fmt="jsonl")
+    assert opaque not in rendered
+    for line in rendered.strip().splitlines():
+        json.loads(line)
+
+
+def test_export_redaction_forced_even_when_global_toggle_disabled(monkeypatch):
+    """Egress boundary must redact regardless of security.redact_secrets."""
+    import agent.redact as redact_mod
+
+    opaque = "GOCSPX-abcdefghij1234567890"
+    monkeypatch.setattr(redact_mod, "_REDACT_ENABLED", False)
+    session = _sample_session()
+    session["messages"].append(
+        {
+            "id": 6,
+            "role": "tool",
+            "tool_name": "google_api",
+            "content": {"client_secret": opaque},
+            "timestamp": 1700000005,
+        }
+    )
+    rendered = render_sessions_export([session], fmt="jsonl")
+    assert opaque not in rendered
+    assert "GOCSPX" not in rendered
+
+
 def test_sessions_export_cli_prompt_only_stdout(monkeypatch, capsys):
     import hermes_cli.main as main_mod
     import hermes_state

@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import mask_secret, redact_cdp_url, redact_structured, redact_sensitive_text, RedactingFormatter
 
 
 @pytest.fixture(autouse=True)
@@ -1051,3 +1051,52 @@ class TestMaskSecretControlStripping:
     def test_all_control_value_returns_empty_fallback(self):
         assert mask_secret("\n\x85\u200b") == ""
         assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"
+
+
+class TestStructuredRedaction:
+    """redact_structured: deep-walk of JSON-like structures for egress
+    boundaries (session exports). Key context alone identifies opaque
+    credential values that no text pattern could match."""
+
+    def test_redacts_opaque_value_under_secret_key(self):
+        out = redact_structured(
+            {"client_secret": "opaque-client-secret-abc123", "client_id": "cid-9"}
+        )
+        assert "opaque-client-secret-abc123" not in str(out)
+        assert out["client_secret"] != "opaque-client-secret-abc123"
+        assert out["client_id"] == "cid-9"  # non-secret key untouched
+
+    def test_redacts_nested_structures(self):
+        out = redact_structured(
+            {
+                "messages": [
+                    {"role": "tool", "content": {"apiKey": "sk-opaque-abc", "text": "hi"}},
+                ]
+            }
+        )
+        assert "sk-opaque-abc" not in str(out)
+        assert out["messages"][0]["content"]["text"] == "hi"
+
+    def test_redacts_json_string_payloads(self):
+        import json as _json
+
+        payload = _json.dumps({"client_secret": "opaque-xyz-789"})
+        out = redact_structured({"content": payload})
+        assert "opaque-xyz-789" not in str(out)
+
+    def test_force_redacts_when_global_toggle_disabled(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        out = redact_structured(
+            {"client_secret": "GOCSPX-abcdefghij1234567890", "note": "hello"}
+        )
+        assert "GOCSPX-abcdefghij1234567890" not in str(out)
+        assert out["note"] == "hello"
+
+    def test_leaves_non_secret_structure_unchanged(self):
+        value = {
+            "id": "sess-1",
+            "title": "Debug auth flow",
+            "message_count": 5,
+            "messages": [{"role": "user", "content": "Why is login broken?"}],
+        }
+        assert redact_structured(value) == value

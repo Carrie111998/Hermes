@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+from typing import Any
 from urllib.parse import unquote_plus
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
@@ -1006,6 +1007,51 @@ def redact_sensitive_text(
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+def redact_structured(value: Any, *, force: bool = True) -> Any:
+    """Deep-redact credential values inside a JSON-like structure.
+
+    Walks dicts/lists/tuples recursively and:
+
+    - runs every string through :func:`redact_sensitive_text` so prefixed
+      credentials (``sk-``, ``GOCSPX-``, …) are masked anywhere they appear;
+    - for a dict entry whose *key* names a credential field (``client_secret``,
+      ``apiKey``, ``token``, ``password``, …), masks the value entirely even
+      when it has no recognizable prefix — the key context alone identifies
+      it as a secret. This is what text-only redaction misses for structured
+      content: once serialized to JSONL the key is quoted (``\\"client_secret\\"``)
+      and the value is opaque, so no pattern fires (issue #20785 follow-up).
+
+    Non-string scalars and empty strings pass through unchanged so structure
+    and JSON types survive (the output stays parseable).
+
+    ``force=True`` is the default because this is an egress boundary: exports
+    must never carry credential values even when ``security.redact_secrets``
+    is disabled globally.
+    """
+    if isinstance(value, str):
+        if not value:
+            return value
+        return redact_sensitive_text(value, force=force)
+    if isinstance(value, dict):
+        out: Dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and _key_has_secret_keyword(key):
+                if isinstance(item, str) and item:
+                    out[key] = _mask_token_nonreusable(item)
+                elif isinstance(item, (dict, list)):
+                    out[key] = redact_structured(item, force=force)
+                else:
+                    out[key] = item
+            else:
+                out[key] = redact_structured(item, force=force)
+        return out
+    if isinstance(value, list):
+        return [redact_structured(item, force=force) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_structured(item, force=force) for item in value)
+    return value
 
 
 # Commands whose stdout is an environment-variable dump (KEY=value lines),
