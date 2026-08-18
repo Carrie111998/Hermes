@@ -644,6 +644,44 @@ class TestSaveAndLoadRoundtrip:
 
         assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == data
 
+    def test_atomic_config_write_keeps_yaml_1_1_bool_words_as_strings(self, tmp_path):
+        """Strings PyYAML would re-type must survive the ruamel write.
+
+        The comment-preserving path dumps through ruamel, which is YAML 1.2:
+        there ``off``/``on``/``yes``/``no`` and sexagesimals like ``1:30`` are
+        ordinary strings, so ruamel emits them UNQUOTED. Every reader in this
+        codebase is PyYAML's ``safe_load``, which is YAML 1.1 and resolves
+        those same plain scalars to ``False``/``True``/``90``.
+
+        Observed 2026-08-18: ``/verbose`` cycling to ``off`` wrote
+        ``tool_progress: off`` and the next read returned boolean ``False``,
+        so the mode silently stopped round-tripping. The nightly gate caught
+        it via tests/gateway/test_verbose_command.py.
+        """
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("agent:\n  # keep me\n  max_turns: 90\n", encoding="utf-8")
+
+        data = {
+            "agent": {"max_turns": 90},
+            "words": {
+                "off": "off", "on": "on", "yes": "yes", "no": "no",
+                "cap_off": "Off", "upper_on": "ON",
+            },
+            "sexagesimal": {"short": "1:30", "long": "12:30:45"},
+            "numeric_strings": {"int_like": "123", "float_like": "1.5"},
+            "real_bools": {"t": True, "f": False},
+            "real_numbers": {"i": 123, "f": 1.5},
+        }
+        atomic_config_write(config_path, data)
+
+        written = config_path.read_text(encoding="utf-8")
+        assert yaml.safe_load(written) == data
+        # The whole point is that this stayed on the comment-preserving path
+        # rather than silently degrading to the plain dump.
+        assert "keep me" in written
+
     def test_atomic_config_write_falls_back_when_roundtrip_cannot_parse(self, tmp_path):
         """A file ruamel refuses must still be writable.
 

@@ -330,6 +330,66 @@ def atomic_yaml_write(
         raise
 
 
+# Lazily-built helpers for the round-trip dumper. Kept module-level so the
+# resolver and the representer subclass are each constructed once, but built
+# on first use so importing utils does not pull in ruamel.
+_PYYAML_RESOLVER: Any = None
+_ROUNDTRIP_REPRESENTER: Any = None
+
+
+def _pyyaml_would_retype(value: str) -> bool:
+    """True when PyYAML would read the *plain* form of ``value`` as a non-string.
+
+    ruamel emits YAML 1.2, in which ``off``/``on``/``yes``/``no`` and
+    sexagesimals like ``1:30`` are ordinary strings — so it writes them
+    unquoted. Every reader in this codebase is PyYAML's ``safe_load``, which
+    is YAML 1.1 and resolves those same plain scalars to ``False``/``True``/
+    ``90``. Asking PyYAML's own resolver is the point: the question is not
+    "is this ambiguous in the abstract" but "will the reader we actually use
+    read back what we just wrote".
+    """
+    global _PYYAML_RESOLVER
+    if _PYYAML_RESOLVER is None:
+        _PYYAML_RESOLVER = yaml.resolver.Resolver()
+    resolved = _PYYAML_RESOLVER.resolve(yaml.nodes.ScalarNode, value, (True, False))
+    return resolved != "tag:yaml.org,2002:str"
+
+
+def _build_roundtrip_representer() -> Any:
+    """Round-trip representer that quotes strings PyYAML would re-type.
+
+    Registered on a dedicated subclass rather than on ruamel's shared
+    ``RoundTripRepresenter``: ``add_representer`` is a classmethod that
+    mutates the class it is called on, so patching the base class would
+    change every other ruamel user in the process.
+    """
+    global _ROUNDTRIP_REPRESENTER
+    if _ROUNDTRIP_REPRESENTER is not None:
+        return _ROUNDTRIP_REPRESENTER
+
+    from ruamel.yaml.representer import RoundTripRepresenter
+
+    class _PyYAMLSafeRoundTripRepresenter(RoundTripRepresenter):
+        pass
+
+    def _represent_str(representer: Any, data: str) -> Any:
+        # Only ever ADD quoting, never remove it. Every value that needs
+        # re-typing protection is a short scalar token, so excluding
+        # newline-bearing strings keeps literal/folded blocks off this path
+        # at no cost in coverage.
+        style = None
+        if data and "\n" not in data and _pyyaml_would_retype(data):
+            style = "'"
+        return representer.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+    # Exact-type registration: ruamel looks up ``type(data)`` first, so the
+    # ScalarString subclasses that carry preserved quote styles keep their
+    # own representers and are unaffected.
+    _PyYAMLSafeRoundTripRepresenter.add_representer(str, _represent_str)
+    _ROUNDTRIP_REPRESENTER = _PyYAMLSafeRoundTripRepresenter
+    return _ROUNDTRIP_REPRESENTER
+
+
 def build_roundtrip_yaml() -> Any:
     """Return the shared ruamel round-trip YAML handle.
 
@@ -340,6 +400,9 @@ def build_roundtrip_yaml() -> Any:
     from ruamel.yaml import YAML
 
     yaml_rt = YAML(typ="rt")
+    # Must be assigned before anything touches ``yaml_rt.representer``, which
+    # instantiates ``Representer`` and caches the instance.
+    yaml_rt.Representer = _build_roundtrip_representer()
     yaml_rt.preserve_quotes = True
     yaml_rt.allow_unicode = True
     yaml_rt.default_flow_style = False
