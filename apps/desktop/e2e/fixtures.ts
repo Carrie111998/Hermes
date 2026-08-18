@@ -365,6 +365,9 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  mockServer?: MockServerOptions
+  /** Populate only this test's isolated HERMES_HOME before backend launch. */
+  prepareSandbox?: (sandbox: Sandbox) => void
 }
 
 /**
@@ -374,10 +377,6 @@ export interface MockBackendOptions {
  *   3. Launch the desktop app
  *   4. Return handles for test interaction
  */
-export interface MockBackendOptions {
-  mockServer?: MockServerOptions
-}
-
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
   // 1. Start mock server
   const mock = await startMockServer(options.mockServer)
@@ -392,6 +391,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
     options.modelContextLength,
   )
   writeEnvFile(sandbox.hermesHome)
+  options.prepareSandbox?.(sandbox)
 
   // 3. Build env + launch
   const env = buildAppEnv(sandbox)

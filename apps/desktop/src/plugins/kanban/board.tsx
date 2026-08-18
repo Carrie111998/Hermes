@@ -1,11 +1,12 @@
 /**
  * The Kanban board page — mounted at `/kanban` (a ROUTES_AREA contribution) in
- * the workspace pane. The desktop port of the dashboard board: one compact
- * header row (count, filter kebab, search, settings, new task — the board
+ * the workspace pane. The desktop port of the dashboard board: a compact
+ * responsive header (count, filter kebab, search, settings, new task — the board
  * SWITCHER lives in the titlebar, see board-switcher.tsx), columns in
- * BOARD_COLUMNS order, drag-to-move (optimistic, workflow-checked),
- * primary-modifier-click multi-select with a floating bulk bar, right-click
- * actions, and the detail drawer. Dispatch nudges ride every write (see api.ts).
+ * BOARD_COLUMNS order with touch-friendly narrow-screen snapping,
+ * drag-to-move (optimistic, workflow-checked),
+ * ⌘-click multi-select with a floating bulk bar, right-click actions, and
+ * the detail drawer. Dispatch nudges ride every write (see api.ts).
  */
 
 import {
@@ -30,7 +31,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   ErrorState,
-  formatModifierToken,
   host,
   Input,
   Loader,
@@ -53,6 +53,7 @@ import {
 import {
   type CSSProperties,
   type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   useEffect,
   useMemo,
@@ -81,6 +82,7 @@ import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
+import { useKanbanViewportGeometry } from './responsive'
 import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
@@ -310,7 +312,7 @@ function Card({
         </ContextMenuItem>
         <ContextMenuItem onSelect={() => onToggleSelect(task.id)}>
           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
-          {selected ? k.deselect : k.select(formatModifierToken('mod'))}
+          {selected ? k.deselect : k.select}
         </ContextMenuItem>
         <ContextMenuSeparator />
         {columns
@@ -337,6 +339,8 @@ function Column({
   collapsed,
   column,
   columns,
+  laneWidth,
+  laneRef,
   onAdd,
   onDelete,
   onDropTask,
@@ -349,6 +353,8 @@ function Column({
   collapsed: boolean
   column: { name: string; tasks: KanbanTask[] }
   columns: string[]
+  laneWidth: number
+  laneRef: (element: HTMLDivElement | HTMLButtonElement | null) => void
   onAdd: (status: string) => void
   onDelete: (id: string) => void
   onDropTask: (id: string, status: string) => void
@@ -424,6 +430,7 @@ function Column({
           wash
         )}
         onClick={onToggle}
+        ref={laneRef}
         type="button"
       >
         <span className="grid h-5 shrink-0 place-items-center">
@@ -442,7 +449,13 @@ function Column({
   return (
     <div
       {...dragHandlers}
-      className={cn('group/col flex h-full w-64 shrink-0 flex-col rounded-lg p-2 transition-colors', wash)}
+      className={cn(
+        'group/col flex h-full w-[calc(100vw-2rem)] max-w-full shrink-0 snap-start snap-always flex-col rounded-lg p-2 transition-colors md:w-64 md:[scroll-snap-align:none]',
+        wash
+      )}
+      data-kanban-lane={column.name}
+      ref={laneRef}
+      style={{ width: laneWidth }}
     >
       <header className="mb-1.5 flex h-5 items-center gap-1.5 px-1">
         <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
@@ -1081,6 +1094,8 @@ function SelectionBar({
 
 export function KanbanBoardPage() {
   const k = useKanban()
+  const [boardRoot, setBoardRoot] = useState<HTMLDivElement | null>(null)
+  const viewport = useKanbanViewportGeometry(boardRoot)
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
   const [archived, setArchived] = useState(false)
@@ -1252,6 +1267,8 @@ export function KanbanBoardPage() {
 
   // Grab-to-scrub the lane strip (shared primitive, same as the dashboard's pan).
   const lanesRef = useRef<HTMLDivElement>(null)
+  const laneElements = useRef(new Map<string, HTMLDivElement | HTMLButtonElement>())
+  const [selectedLane, setSelectedLane] = useState('triage')
   const { grabbing, onMouseDown } = useGrabScroll(lanesRef)
 
   // Lane collapse: auto (empty → rail) unless the user overrode it. The map
@@ -1320,31 +1337,60 @@ export function KanbanBoardPage() {
     $collapsedLanes.set(overrides)
   }
 
+  const revealLane = (name: string) => {
+    const scroller = lanesRef.current
+    const lane = laneElements.current.get(name)
+
+    if (!scroller || !lane) {return}
+
+    setSelectedLane(name)
+    const scrollerRect = scroller.getBoundingClientRect()
+    const laneRect = lane.getBoundingClientRect()
+    const paddingLeft = Number.parseFloat(getComputedStyle(scroller).paddingLeft) || 0
+
+    scroller.scrollTo({
+      behavior: 'auto',
+      left: scroller.scrollLeft + laneRect.left - scrollerRect.left - paddingLeft
+    })
+  }
+
+  const onLaneKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    let next = index
+
+    if (event.key === 'ArrowRight') {next = Math.min(columnNames.length - 1, index + 1)}
+    else if (event.key === 'ArrowLeft') {next = Math.max(0, index - 1)}
+    else if (event.key === 'Home') {next = 0}
+    else if (event.key === 'End') {next = columnNames.length - 1}
+    else {return}
+
+    event.preventDefault()
+    const name = columnNames[next]
+    revealLane(name)
+    document.querySelector<HTMLButtonElement>(`[data-kanban-lane-selector="${name}"]`)?.focus()
+  }
+
   return (
-    <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
+    <div
+      className="relative flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-surface-background)"
+      data-kanban-board-root=""
+      ref={setBoardRoot}
+    >
       {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
       <Contribute area={TITLEBAR_AREAS.center} id="kanban:board-switcher">
         <BoardSwitcher />
       </Contribute>
 
-      <header className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
-        <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
-        <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
-          {total}
-        </span>
-        {board && (
-          <FilterMenu
-            archived={archived}
-            assignee={assignee}
-            board={board}
-            onArchived={setArchived}
-            onAssignee={setAssignee}
-            onTenant={setTenant}
-            tenant={tenant}
-          />
-        )}
-        <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
-        <div className="ml-auto flex items-center gap-1">
+      <header
+        className="grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-4 py-2 md:flex md:flex-wrap"
+        data-kanban-layout={viewport.desktop ? 'desktop' : 'mobile'}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <h1 className="truncate text-sm font-semibold text-foreground">{k.title}</h1>
+          <span className="shrink-0 rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
+            {total}
+          </span>
+        </div>
+        <div className="flex items-center gap-1 md:order-last md:ml-auto">
           <Tip label={k.orchestrationSettings}>
             <Button
               aria-label={k.orchestrationSettings}
@@ -1361,11 +1407,63 @@ export function KanbanBoardPage() {
             {k.newTask}
           </Button>
         </div>
+        <div className="col-span-2 flex min-w-0 items-center gap-2 md:col-auto">
+          {board && (
+            <FilterMenu
+              archived={archived}
+              assignee={assignee}
+              board={board}
+              onArchived={setArchived}
+              onAssignee={setAssignee}
+              onTenant={setTenant}
+              tenant={tenant}
+            />
+          )}
+          <SearchField
+            aria-label={k.filterCards}
+            containerClassName="min-w-0 flex-1 md:flex-none"
+            onChange={setSearch}
+            placeholder={k.filterCards}
+            value={search}
+          />
+        </div>
       </header>
 
       {settingsOpen && <OrchestrationPanel />}
 
       {board && <Intro />}
+
+      {filtered && total > 0 && (
+        <div
+          aria-label={k.title}
+          className="flex shrink-0 overflow-x-auto border-y border-(--ui-stroke-tertiary) px-4 md:hidden"
+          role="tablist"
+        >
+          {filtered.columns.map((col, index) => {
+            const label = columnLabel(k, col.name)
+
+            return (
+              <button
+                aria-label={label}
+                aria-selected={selectedLane === col.name}
+                className={cn(
+                  'grid size-11 shrink-0 place-items-center rounded-none border-r border-(--ui-stroke-tertiary) text-[0.625rem] font-semibold uppercase outline-none first:border-l focus-visible:bg-(--ui-control-active-background)',
+                  selectedLane === col.name && 'bg-(--ui-control-active-background) text-foreground'
+                )}
+                data-kanban-lane-selector={col.name}
+                key={col.name}
+                onClick={() => revealLane(col.name)}
+                onKeyDown={event => onLaneKeyDown(event, index)}
+                role="tab"
+                title={label}
+                type="button"
+              >
+                {label.slice(0, 2)}
+              </button>
+            )
+          })}
+        </div>
+      )}
 
       {errorMessage && !board ? (
         <div className="grid flex-1 place-items-center">
@@ -1388,7 +1486,10 @@ export function KanbanBoardPage() {
         </div>
       ) : (
         <div
-          className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+          className={cn(
+            'flex flex-1 snap-x snap-mandatory gap-2 overflow-x-auto overscroll-x-contain px-4 pt-1 pb-3 md:snap-none',
+            grabbing && 'cursor-grabbing'
+          )}
           onMouseDown={onMouseDown}
           ref={lanesRef}
         >
@@ -1401,6 +1502,11 @@ export function KanbanBoardPage() {
                 column={col}
                 columns={columnNames}
                 key={col.name}
+                laneRef={element => {
+                  if (element) {laneElements.current.set(col.name, element)}
+                  else {laneElements.current.delete(col.name)}
+                }}
+                laneWidth={viewport.laneWidth}
                 onAdd={setAddStatus}
                 onDelete={id => deleteMut.mutate(id)}
                 onDropTask={onMove}
