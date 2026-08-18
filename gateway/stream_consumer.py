@@ -1836,10 +1836,16 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
+            metadata = dict(self.metadata or {})
+            # Mark completed assistant prose explicitly so platform adapters can
+            # distinguish it from mandatory unmarked sends (direct delivery,
+            # recovered finals, clarification, and approval fallbacks). Do not
+            # infer interim intent from a missing ``notify`` marker.
+            metadata["interim_assistant_message"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=metadata,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser

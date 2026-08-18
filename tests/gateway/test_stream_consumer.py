@@ -819,6 +819,7 @@ class TestInterimCommentaryMessages:
             adapter,
             "chat_123",
             StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+            metadata={"thread_id": "thread_7"},
         )
 
         consumer.on_commentary("I'll inspect the repository first.")
@@ -829,6 +830,13 @@ class TestInterimCommentaryMessages:
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         assert sent_texts == ["I'll inspect the repository first.", "Done."]
+        commentary_metadata = adapter.send.call_args_list[0].kwargs["metadata"]
+        assert commentary_metadata == {
+            "thread_id": "thread_7",
+            "interim_assistant_message": True,
+        }
+        final_metadata = adapter.send.call_args_list[1].kwargs["metadata"]
+        assert final_metadata == {"thread_id": "thread_7", "notify": True}
         assert consumer.final_response_sent is True
 
 
