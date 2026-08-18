@@ -48,6 +48,7 @@ class TeacherAgentChatRequest(BaseModel):
 
 class StudentAgentChatRequest(BaseModel):
     request_id: str = "local-student-smoke"
+    request_fingerprint: str = ""
     session_id: str = "gradeos-student-smoke-session"
     message: str
     student: StudentInfo = Field(default_factory=StudentInfo)
@@ -82,6 +83,7 @@ class TeacherAgentChatResponse(BaseModel):
 
 class StudentAgentChatResponse(BaseModel):
     request_id: str
+    request_fingerprint: str = ""
     session_id: str
     session_key: str
     content: str
@@ -506,6 +508,9 @@ async def student_agent_chat(
 
     return StudentAgentChatResponse(
         request_id=request.request_id,
+        # CODEX CHANGE: GradeOS validates this correlation value before it
+        # persists a student-assistant turn; echo the backend-issued value.
+        request_fingerprint=request.request_fingerprint,
         session_id=session_id,
         session_key=session_key,
         content=str(parsed.get("content") or content),
