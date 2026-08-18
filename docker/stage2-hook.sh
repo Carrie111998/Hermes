@@ -442,19 +442,38 @@ seed_one "SOUL.md" "docker/SOUL.md"
 # volume), never overwrite an operator-provided value. Loopback-only: the
 # default bind host is 127.0.0.1 and the Fly service only exposes the
 # dashboard's port, so this listener is never publicly reachable.
-if [ -f "$HERMES_HOME/.env" ] && ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
+#
+# CREATE .env when it is missing rather than requiring it to exist (OOF-285):
+# the first-boot seed above depends on /opt/hermes/.env.example being present
+# in the image, and when it isn't (the .dockerignore excluded it for a long
+# stretch of releases) seed_one is a silent no-op, no .env ever exists, this
+# keygen never ran, the api_server never started, and every scheduled cron
+# fire on the instance was silently lost. The key must not depend on the
+# example-file seed having worked.
+if ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
     if refuse_symlinked_path "append" "$HERMES_HOME/.env"; then
         :
     else
-        _gen_key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        if [ -n "$_gen_key" ]; then
-            # Drop an empty assignment line if the seed left one behind, then
-            # append the generated key.
-            sed -i '/^API_SERVER_KEY=$/d' "$HERMES_HOME/.env" 2>/dev/null || true
-            printf 'API_SERVER_KEY=%s\n' "$_gen_key" >> "$HERMES_HOME/.env"
-            echo "[stage2] Generated API_SERVER_KEY for the loopback gateway api_server"
+        if [ ! -f "$HERMES_HOME/.env" ]; then
+            # Create an empty, owner-only .env so the append below (and any
+            # later runtime save_env_value writes) have a durable target.
+            # The chown/chmod block below re-tightens perms every boot.
+            as_hermes touch "$HERMES_HOME/.env" 2>/dev/null || true
+            chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
         fi
-        unset _gen_key
+        if [ -f "$HERMES_HOME/.env" ]; then
+            _gen_key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+            if [ -n "$_gen_key" ]; then
+                # Drop an empty assignment line if the seed left one behind,
+                # then append the generated key.
+                sed -i '/^API_SERVER_KEY=$/d' "$HERMES_HOME/.env" 2>/dev/null || true
+                printf 'API_SERVER_KEY=%s\n' "$_gen_key" >> "$HERMES_HOME/.env"
+                echo "[stage2] Generated API_SERVER_KEY for the loopback gateway api_server"
+            fi
+            unset _gen_key
+        else
+            echo "[stage2] Warning: could not create $HERMES_HOME/.env — gateway api_server (cron fires) will be unavailable"
+        fi
     fi
 fi
 
