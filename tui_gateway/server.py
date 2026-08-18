@@ -5511,7 +5511,8 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
 def _resolve_default_interaction_mode() -> str:
     """Read agent.interaction_mode from config, default 'build'."""
     try:
-        cfg = _load_cfg()
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
         raw = str((cfg or {}).get("agent", {}).get("interaction_mode", "build")).strip().lower()
         return raw if raw in ("build", "plan") else "build"
     except Exception:

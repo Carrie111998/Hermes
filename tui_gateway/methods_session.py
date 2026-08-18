@@ -156,7 +156,7 @@ def _(rid, params: dict) -> dict:
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
-                "interaction_mode": "build",
+                "interaction_mode": _resolve_default_interaction_mode(),
             },
         },
     )
