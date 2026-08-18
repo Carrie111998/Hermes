@@ -215,3 +215,67 @@ def test_fire_claim_fence_rejects_stale_owner(temp_home):
 
     with fire_claim_fence(job["id"], expected_owner="stale") as owns_claim:
         assert owns_claim is False
+
+
+def test_manual_fire_claim_blocks_sibling_scheduler_for_run_duration(
+    temp_home, monkeypatch
+):
+    """A manual one-shot remains owned across sibling schedulers past 300s."""
+    from datetime import datetime, timedelta, timezone
+
+    import cron.jobs as jobs
+
+    t0 = datetime.now(timezone.utc)
+    run_at = (t0 - timedelta(seconds=5)).isoformat()
+    jobs.save_jobs(
+        [
+            {
+                "id": "manual-cross-process",
+                "name": "Manual",
+                "prompt": "repair",
+                "schedule": {"kind": "once", "run_at": run_at},
+                "next_run_at": run_at,
+                "enabled": True,
+                "state": "scheduled",
+                "repeat": {"times": 1, "completed": 0},
+            }
+        ]
+    )
+
+    # Process A takes the external/manual claim and commits the finite dispatch.
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: t0)
+    claimed = jobs.claim_job_for_fire(
+        "manual-cross-process", return_job=True
+    )
+    assert isinstance(claimed, dict)
+    owner = claimed["fire_claim"]["by"]
+    assert jobs.claim_dispatch("manual-cross-process") is True
+
+    # The live runner renews ownership just before the original five-minute
+    # lease expires.
+    monkeypatch.setattr(
+        jobs, "_hermes_now", lambda: t0 + timedelta(seconds=290)
+    )
+    assert jobs.heartbeat_fire_claim(
+        "manual-cross-process", expected_owner=owner
+    ) is True
+
+    # Process B ticks after the original lease horizon. It must neither return
+    # the same job as due nor delete the finite one-shot record.
+    monkeypatch.setattr(
+        jobs, "_hermes_now", lambda: t0 + timedelta(seconds=301)
+    )
+    assert jobs.get_due_jobs() == []
+    assert jobs.get_job("manual-cross-process") is not None
+    assert jobs.claim_job_for_fire("manual-cross-process") is False
+
+    # The owner can still land a fenced terminal update, retained for audit.
+    assert jobs.mark_job_run(
+        "manual-cross-process",
+        True,
+        expected_fire_owner=owner,
+    ) is True
+    completed = jobs.get_job("manual-cross-process")
+    assert completed is not None
+    assert completed["state"] == "completed"
+    assert completed["last_status"] == "ok"
