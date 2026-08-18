@@ -61,3 +61,52 @@ class TestGatewayConnectionErrorReply:
         assert "rate-limiting" in _gateway_provider_error_reply(
             "rate limited after 3 retries"
         ).lower()
+
+
+class TestQuotaMislabelReply:
+    """Quota exhaustion must not reach chat as an auth failure (#89401).
+
+    The resolution layer wraps the quota AuthError inside a RuntimeError and
+    the caller prefixes "Provider authentication failed:" — which the reply
+    classifier then matched, sending operators to re-authenticate valid
+    credentials. format_resolution_failure_reply distinguishes them at the
+    source; the classifier then routes the quota wording to the rate-limit
+    reply instead of the auth reply."""
+
+    def _quota_runtime_error(self):
+        from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
+
+        inner = AuthError(
+            "Codex provider quota exhausted (429); retry after 116168s. "
+            "Credentials are still valid.",
+            provider="openai-codex",
+            code=CODEX_RATE_LIMITED_CODE,
+            relogin_required=False,
+        )
+        wrapped = RuntimeError(str(inner))
+        wrapped.__cause__ = inner
+        return wrapped
+
+    def test_quota_resolution_failure_is_not_auth(self):
+        from hermes_cli.auth import format_resolution_failure_reply
+
+        reply = format_resolution_failure_reply(self._quota_runtime_error())
+        assert "quota" in reply.lower()
+        assert "credentials are still valid" in reply
+        assert "authentication" not in reply.lower()
+
+    def test_genuine_auth_failure_keeps_auth_reply(self):
+        from hermes_cli.auth import format_resolution_failure_reply
+
+        reply = format_resolution_failure_reply(RuntimeError("invalid api key"))
+        assert "authentication" in reply.lower()
+
+    def test_quota_reply_classifies_as_rate_limit_not_auth(self):
+        # End to end: the quota-worded resolution reply must fall through the
+        # classifier to the rate-limit bucket, never the auth bucket.
+        from hermes_cli.auth import format_resolution_failure_reply
+
+        reply = format_resolution_failure_reply(self._quota_runtime_error())
+        classified = _gateway_provider_error_reply(reply)
+        assert "rate-limiting" in classified.lower()
+        assert "authentication" not in classified.lower()

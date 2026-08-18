@@ -963,6 +963,34 @@ def _parse_retry_after_seconds(headers: Any) -> Optional[int]:
     return None if seconds is None else int(seconds)
 
 
+def format_resolution_failure_reply(exc: Exception) -> str:
+    """User-facing reply for a provider-resolution failure (#89401).
+
+    Resolution failures surface to chat wrapped as "Provider authentication
+    failed: <cause>" — but a quota/rate-limit AuthError is not a credential
+    problem, and #32790's log-side distinction must reach the chat reply too,
+    or operators re-authenticate working credentials. Walks the cause chain
+    because the resolution layer re-raises the AuthError inside a RuntimeError.
+    """
+    seen: set[int] = set()
+    cur: Optional[Exception] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, AuthError) and is_rate_limited_auth_error(cur):
+            window = getattr(cur, "retry_after_seconds", None)
+            suffix = f" — retry after {int(window)}s" if window else ""
+            return (
+                "⏱️ Provider quota exhausted"
+                f"{suffix}. The configured credentials are still valid; "
+                "try again after the quota window reopens."
+            )
+        cur = (
+            getattr(cur, "__cause__", None)
+            or getattr(cur, "__context__", None)
+        )
+    return f"⚠️ Provider authentication failed: {exc}"
+
+
 def format_auth_error(error: Exception) -> str:
     """Map auth failures to concise user-facing guidance."""
     if not isinstance(error, AuthError):

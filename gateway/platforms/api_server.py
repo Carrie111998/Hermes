@@ -6522,9 +6522,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     # /v1/runs has its own branch in its executor.
                     logger.warning("Provider authentication failed for session=%s: %s",
                                    session_id or "", exc)
+                    # Quota exhaustion is not an auth failure (#89401) — the
+                    # reply must not send the operator to re-authenticate
+                    # valid credentials.
+                    from hermes_cli.auth import format_resolution_failure_reply
+
                     return (
                         {
-                            "final_response": f"⚠️ Provider authentication failed: {exc}",
+                            "final_response": format_resolution_failure_reply(exc),
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
@@ -7012,7 +7017,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # failure, instead of falling through to the generic
                 # except-Exception branch below.
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-                error_msg = f"⚠️ Provider authentication failed: {exc}"
+                # Quota exhaustion is not an auth failure (#89401).
+                from hermes_cli.auth import format_resolution_failure_reply
+
+                error_msg = format_resolution_failure_reply(exc)
                 self._set_run_status(
                     run_id,
                     "failed",
