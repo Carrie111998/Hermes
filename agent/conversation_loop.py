@@ -5208,7 +5208,7 @@ def run_conversation(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
-                # Z.AI Coding Plan GLM-5.2 overload 429s classify as
+                # Z.AI Coding Plan overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
                 # is excluded from `is_rate_limited` — the gate for the adaptive
                 # Z.AI backoff below. Detect the overload directly so its
@@ -5220,9 +5220,17 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                _zai_overload_attempts_remain = (
+                    _is_zai_coding_overload
+                    and retry_count < zai_coding_overload_retry_ceiling()
+                )
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (
+                        _is_transport_failure
+                        and retry_count >= 2
+                        and not _zai_overload_attempts_remain
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
