@@ -258,14 +258,23 @@ class TestAbsoluteExpiry:
         _, ttl = _mint(f"printf '%s' '{{\"access_token\":\"t\",\"expiresOn\":\"{deadline}\"}}'", "p")
         assert ttl is not None and 1700 < ttl <= 1800
 
-    def test_expires_in_still_wins_when_both_present(self):
-        """The RFC 6749 field is authoritative where a helper sends both."""
+    def test_shorter_expires_in_wins_when_both_present(self):
+        """The cache must honour the soonest advertised deadline."""
         deadline = self._iso(3600)
         _, ttl = _mint(
             f"printf '%s' '{{\"access_token\":\"t\",\"expires_in\":120,\"expiry\":\"{deadline}\"}}'",
             "p",
         )
         assert ttl == 120.0
+
+    def test_earlier_absolute_expiry_wins_when_both_present(self):
+        """Helpers may keep expires_in at full lifetime while expiry counts down."""
+        deadline = self._iso(90)
+        _, ttl = _mint(
+            f"printf '%s' '{{\"access_token\":\"t\",\"expires_in\":3600,\"expiry\":\"{deadline}\"}}'",
+            "p",
+        )
+        assert ttl is not None and 0 < ttl <= 90
 
     def test_unparseable_expiry_is_not_a_ttl(self):
         """Junk must fall back to refresh-on-401, never to a guessed deadline."""

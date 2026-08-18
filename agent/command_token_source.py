@@ -24,8 +24,9 @@ fresh. It is cached until shortly before expiry, so the command runs about
 once per token lifetime rather than once per request.
 
 Output contract: print ONLY the token on stdout, either bare or as JSON with
-an ``access_token`` field (``expires_in`` is honoured when present) — the
-shape OAuth 2.0 token endpoints and the helpers above already emit.
+an ``access_token`` field. ``expires_in`` and absolute deadlines (``expiry`` /
+``expiresOn``) are honoured when present — the shape OAuth 2.0 token endpoints
+and the helpers above already emit.
 
 Precedence: an explicit ``--api-key`` still wins (the one-off recovery escape
 hatch); otherwise ``key_cmd`` is preferred over a static ``api_key`` /
@@ -115,9 +116,10 @@ def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
                     f"key_cmd for provider {label!r} returned JSON without an "
                     "'access_token' field"
                 )
+            ttl_candidates: list[float] = []
             ttl = payload.get("expires_in")
             if isinstance(ttl, (int, float)) and ttl > 0:
-                return token, float(ttl)
+                ttl_candidates.append(float(ttl))
             # A relative lifetime is the OAuth 2.0 field, but CLI token helpers
             # commonly print an absolute ISO 8601 deadline instead. Treating
             # that as "no TTL advertised" caches the token for the life of the
@@ -130,8 +132,10 @@ def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
                 deadline = _parse_iso_timestamp(payload.get(field))
                 if deadline is not None:
                     remaining = deadline - time.time()
-                    if remaining > 0:
-                        return token, remaining
+                    if remaining > 0 or ttl_candidates:
+                        ttl_candidates.append(max(remaining, 0.0))
+            if ttl_candidates:
+                return token, min(ttl_candidates)
             return token, None
 
     # Bare token. The contract every comparable helper documents is "stdout
@@ -167,7 +171,7 @@ class CommandTokenSource:
             self._token = token
             self._expires_at = (
                 time.monotonic() + max(ttl - _TOKEN_REFRESH_LEEWAY_SECONDS, 5.0)
-                if ttl
+                if ttl is not None
                 # No advertised TTL: bounded cache (see _NO_TTL_REFRESH_SECONDS)
                 # — there is no 401-driven re-mint hook to fall back on.
                 else time.monotonic() + _NO_TTL_REFRESH_SECONDS
