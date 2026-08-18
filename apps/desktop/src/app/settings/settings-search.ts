@@ -192,3 +192,31 @@ export function filterSettingsSearchEntries(entries: SettingsSearchEntry[], quer
     .sort((a, b) => b.score - a.score || a.index - b.index)
     .map(result => result.entry)
 }
+
+/** Serialize a search target to the Settings route's query string. */
+export function settingsSearchTargetQuery(target: SettingsSearchTarget): string {
+  const params = new URLSearchParams()
+  params.set('tab', target.view)
+
+  if (target.providerView) {
+    params.set('pview', target.providerView)
+  }
+
+  if (target.keysView) {
+    params.set('kview', target.keysView)
+  }
+
+  if (target.field) {
+    params.set('field', target.field)
+  }
+
+  if (target.setting) {
+    params.set('setting', target.setting)
+  }
+
+  if (target.key) {
+    params.set('key', target.key)
+  }
+
+  return params.toString()
+}
