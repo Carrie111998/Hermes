@@ -1440,7 +1440,6 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
           )}
           <CommandInput
             className={HUD_TEXT}
-            ref={inputRef}
             onKeyDown={event => {
               // Capture modifiers before cmdk's Enter fires onSelect (which
               // swipes the inviting MouseEvent and hands us nothing).
@@ -1462,6 +1461,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             }}
             onValueChange={setSearch}
             placeholder={placeholder}
+            ref={inputRef}
             right={page === 'pets' ? <PetInlineToggle /> : undefined}
             value={search}
           />

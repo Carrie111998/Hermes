@@ -316,7 +316,6 @@ function PluginRow({ record }: { record: PluginRecord }) {
 
   return (
     <PluginLine
-      id={pluginElementId(record.id)}
       controls={
         <>
           {record.file && (
@@ -343,6 +342,7 @@ function PluginRow({ record }: { record: PluginRecord }) {
           (record.description ?? record.file ?? record.id)
         )
       }
+      id={pluginElementId(record.id)}
       title={
         <>
           <span>{record.name}</span>
