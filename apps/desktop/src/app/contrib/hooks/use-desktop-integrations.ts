@@ -1,9 +1,12 @@
 import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
+import { commandFocusedPreview } from '@/app/chat/right-rail/preview-nav'
 import { openSession } from '@/app/open-session'
 import { resolveDeepLinkAction } from '@/lib/deeplink-routes'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
+import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
+import { startMcpHealthChecker, stopMcpHealthChecker } from '@/store/mcp-health'
 import { respondToApprovalAction } from '@/store/native-notifications'
 import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
@@ -61,11 +64,15 @@ export function useDesktopIntegrations({
   // process's "open updates" menu request.
   useEffect(() => {
     startUpdatePoller()
+    // Background MCP health: HTTP/SSE servers only (never spawns stdio),
+    // notifies on transitions into needs-auth/error with a Sign in action.
+    startMcpHealthChecker()
     const unsubscribe = window.hermesDesktop?.onOpenUpdatesRequested?.(() => openUpdatesWindow())
 
     return () => {
       unsubscribe?.()
       stopUpdatePoller()
+      stopMcpHealthChecker()
     }
   }, [])
 
@@ -189,9 +196,21 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // hermes:// deep links -> composer inserts or plugin install modal.
+  // hermes:// deep links -> a reviewable /blueprint command in the composer,
+  // a plugin install modal, or (hermes://mcp/install) a pending MCP install
+  // awaiting explicit confirmation. Never auto-installs.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
+      if (!payload) {
+        return
+      }
+
+      if (payload.kind === 'mcp' && payload.name === 'install') {
+        requestMcpInstallFromDeepLink(payload.params || {})
+
+        return
+      }
+
       const action = resolveDeepLinkAction(payload)
 
       if (action.type === 'composer-blueprint') {
@@ -236,6 +255,20 @@ export function useDesktopIntegrations({
 
     return () => unsubscribe?.()
   }, [navigate])
+
+  // Native browser gestures (⌘R, a mouse's back/forward buttons, a trackpad
+  // swipe) that landed on the app's own chrome rather than inside a page — main
+  // answers those against the focused guest and never asks. Only ⌘R has an
+  // app-level meaning to fall back to; an unfocused swipe is a no-op.
+  useEffect(() => {
+    const unsubscribe = window.hermesDesktop?.onPreviewNav?.(command => {
+      if (!commandFocusedPreview(command) && command === 'reload') {
+        window.location.reload()
+      }
+    })
+
+    return () => unsubscribe?.()
+  }, [])
 
   // File > Open Folder… — same open-folder-as-project upsert as the ⌘O keybind.
   useEffect(() => {
