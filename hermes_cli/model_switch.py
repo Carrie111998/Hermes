@@ -467,16 +467,64 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
     return merged
 
 
+# Identity of the config the cached aliases were built from. The cache is
+# process-global but its source is profile-local, so it must be keyed or the
+# first profile to resolve an alias pins its definitions — and, since entries
+# carry `api_key`, its credentials — for every later profile in the process.
+# Same shape `load_config()` already keys its own cache on, so a profile
+# switch (HERMES_HOME moves, so the path moves) and a config/key rotation
+# (mtime/size move) both invalidate.
+_DIRECT_ALIAS_IDENTITY: Optional[tuple] = None
+# The exact dict this loader last filled. Callers and tests pre-seed
+# DIRECT_ALIASES by rebinding the module attribute; a cache we did not build
+# is not ours to invalidate, and identity bookkeeping alone cannot tell the
+# difference once the attribute has been swapped.
+_DIRECT_ALIAS_CACHE_DICT: Optional[dict] = None
+
+
+def _direct_alias_source_identity() -> Optional[tuple]:
+    """Identity of the active profile's alias source, or None if unknowable.
+
+    None means "do not reuse the cache" — a source we cannot identify must
+    not be assumed to be the one already loaded.
+    """
+    try:
+        from hermes_constants import get_config_path
+
+        path = get_config_path()
+        try:
+            stat = path.stat()
+        except OSError:
+            # A missing config is still a definite identity for this profile.
+            return (str(path), None, None)
+        return (str(path), stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return None
+
+
 def _ensure_direct_aliases() -> None:
-    """Lazy-load direct aliases on first use.
+    """Load direct aliases for the ACTIVE profile, caching per config identity.
 
     Mutates the existing DIRECT_ALIASES dict in place rather than rebinding
     the module attribute. This keeps `from hermes_cli.model_switch import
     DIRECT_ALIASES` references valid in callers — rebinding would leave them
     pointing at a stale empty dict.
     """
-    if not DIRECT_ALIASES:
-        DIRECT_ALIASES.update(_load_direct_aliases())
+    global _DIRECT_ALIAS_IDENTITY, _DIRECT_ALIAS_CACHE_DICT
+    identity = _direct_alias_source_identity()
+    if DIRECT_ALIASES and (
+        # Not the dict we built — someone pre-seeded it. Leave it alone.
+        DIRECT_ALIASES is not _DIRECT_ALIAS_CACHE_DICT
+        # Ours, and still the same config file at the same signature.
+        or (identity is not None and identity == _DIRECT_ALIAS_IDENTITY)
+    ):
+        return
+    loaded = _load_direct_aliases()
+    # clear()+update() rather than a rebind: callers hold this exact dict.
+    DIRECT_ALIASES.clear()
+    DIRECT_ALIASES.update(loaded)
+    _DIRECT_ALIAS_IDENTITY = identity
+    _DIRECT_ALIAS_CACHE_DICT = DIRECT_ALIASES
 
 
 def direct_alias_api_key(alias: DirectAlias) -> str:
@@ -500,6 +548,25 @@ def direct_alias_api_key(alias: DirectAlias) -> str:
     if raw:
         return raw
     return _scoped_key_env((alias.key_env or "").strip())
+
+
+def direct_alias_runtime_request(alias: DirectAlias) -> tuple[str, Optional[str]]:
+    """Return ``(requested_provider, explicit_api_key)`` for resolving *alias*.
+
+    Single owner of the invariant that a URL-bearing direct alias resolves its
+    credential for the alias HOST, never for its provider label. A label like
+    ``anthropic`` on an unrelated URL would otherwise reach that provider's
+    explicit-runtime branch, keep the foreign URL, and fall back to the live
+    vendor token. Bare ``custom`` is host-gated (#28660), so an authoritative
+    URL still resolves its vendor key and a foreign one resolves none.
+
+    An alias with no base_url keeps its label: there is no foreign host to
+    protect against, and the label is the only routing information there is.
+    """
+    key = direct_alias_api_key(alias) or None
+    if alias.base_url:
+        return "custom", key
+    return (alias.provider or "custom"), key
 
 
 # Hosts where plaintext HTTP is not a downgrade — a local server has no
@@ -1873,19 +1940,12 @@ def switch_model(
                 base_url = _da.base_url
             else:
                 try:
-                    # Resolve as bare `custom` REGARDLESS of the alias's
-                    # provider label. A label like `anthropic` would otherwise
-                    # reach that provider's own resolver, which selects
-                    # ANTHROPIC_API_KEY from the environment while keeping the
-                    # alias's unrelated base_url — handing a built-in
-                    # provider's bearer secret to a third-party host. The bare
-                    # `custom` path is host-gated (#28660), so an authoritative
-                    # URL still resolves its vendor key (api.anthropic.com →
-                    # ANTHROPIC_API_KEY via the host-derived fallback) while a
-                    # non-authoritative one resolves none. An alias that needs
-                    # a specific key states it with api_key/key_env above.
+                    # Shared owner of the label-vs-host invariant; the one-shot
+                    # path resolves through the same helper.
+                    _req, _explicit = direct_alias_runtime_request(_da)
                     _alias_runtime = resolve_runtime_provider(
-                        requested="custom",
+                        requested=_req,
+                        explicit_api_key=_explicit,
                         explicit_base_url=_da.base_url,
                         target_model=new_model,
                     )

@@ -382,17 +382,22 @@ def _run_agent(
             if direct is not None:
                 effective_model = direct.model
                 effective_provider = direct.provider
+                # Resolve the alias through the SAME owner the interactive
+                # `/model` path uses. Passing `direct.provider` alongside a
+                # URL-bearing alias would let a label like `anthropic` reach
+                # that provider's explicit-runtime branch, keep the alias's
+                # unrelated base_url, and fall back to the live vendor token —
+                # a bearer credential crossing an origin boundary. The helper
+                # forces bare `custom` for URL-bearing aliases (host-gated,
+                # #28660) and carries the alias's own key when it declares one.
+                try:
+                    effective_provider, explicit_api_key_from_alias = (
+                        _ms.direct_alias_runtime_request(direct)
+                    )
+                except Exception:
+                    explicit_api_key_from_alias = None
                 if direct.base_url:
                     explicit_base_url_from_alias = direct.base_url.rstrip("/")
-                    # The alias endpoint's own credential. Without it the
-                    # resolver falls back to host-derived/env keys and a
-                    # custom host with a non-derivable key 401s (#83612).
-                    try:
-                        explicit_api_key_from_alias = (
-                            _ms.direct_alias_api_key(direct) or None
-                        )
-                    except Exception:
-                        explicit_api_key_from_alias = None
             else:
                 cfg_provider = ""
                 if isinstance(model_cfg, dict):

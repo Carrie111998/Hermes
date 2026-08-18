@@ -482,6 +482,158 @@ class TestSchemelessBaseUrls:
         assert httpx.URL("http://localhost:11434/v1").host == "localhost"
 
 
+class TestAliasCacheIsProfileScoped:
+    """DIRECT_ALIASES is process-global; its source is profile-local.
+
+    Entries carry `api_key`, so an unkeyed cache lets the first profile to
+    resolve an alias pin its definitions AND its credentials for every later
+    profile in the process. These tests switch profiles inside one process
+    and never clear the cache by hand — clearing it would hide the bug.
+    """
+
+    def _profile(self, tmp_path, name, body):
+        home = tmp_path / name
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(body, encoding="utf-8")
+        return home
+
+    def _load(self, monkeypatch, home):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        import hermes_cli.model_switch as ms
+
+        ms._ensure_direct_aliases()
+        return ms.DIRECT_ALIASES
+
+    def test_second_profile_does_not_inherit_the_first_profiles_key(
+        self, tmp_path, monkeypatch
+    ):
+        a = self._profile(tmp_path, "a", (
+            'model_aliases:\n'
+            '  theta:\n    model: a-model\n    provider: custom\n'
+            '    base_url: "https://a.example.com/v1"\n'
+            '    api_key: "sk-PROFILE-A-SECRET"\n'
+        ))
+        b = self._profile(tmp_path, "b", (
+            'model_aliases:\n'
+            '  theta:\n    model: b-model\n    provider: custom\n'
+            '    base_url: "https://b.example.com/v1"\n'
+            '    api_key: "sk-PROFILE-B-SECRET"\n'
+        ))
+        assert self._load(monkeypatch, a)["theta"].api_key == "sk-PROFILE-A-SECRET"
+
+        theta = self._load(monkeypatch, b)["theta"]
+        assert theta.api_key == "sk-PROFILE-B-SECRET"
+        assert theta.model == "b-model"
+        assert theta.base_url == "https://b.example.com/v1"
+
+    def test_alias_absent_from_the_second_profile_does_not_persist(
+        self, tmp_path, monkeypatch
+    ):
+        a = self._profile(tmp_path, "a2", (
+            'model_aliases:\n'
+            '  only-in-a:\n    model: x\n    provider: custom\n'
+            '    base_url: "https://a.example.com/v1"\n'
+        ))
+        b = self._profile(tmp_path, "b2", (
+            'model_aliases:\n'
+            '  only-in-b:\n    model: y\n    provider: custom\n'
+            '    base_url: "https://b.example.com/v1"\n'
+        ))
+        assert "only-in-a" in self._load(monkeypatch, a)
+
+        loaded = self._load(monkeypatch, b)
+        assert "only-in-a" not in loaded
+        assert "only-in-b" in loaded
+
+    def test_key_rotation_in_place_is_picked_up(self, tmp_path, monkeypatch):
+        home = self._profile(tmp_path, "rot", (
+            'model_aliases:\n'
+            '  theta:\n    model: m\n    provider: custom\n'
+            '    base_url: "https://h.example.com/v1"\n'
+            '    api_key: "sk-BEFORE-ROTATION"\n'
+        ))
+        assert self._load(monkeypatch, home)["theta"].api_key == "sk-BEFORE-ROTATION"
+
+        (home / "config.yaml").write_text((
+            'model_aliases:\n'
+            '  theta:\n    model: m\n    provider: custom\n'
+            '    base_url: "https://h.example.com/v1"\n'
+            '    api_key: "sk-AFTER-ROTATION-XYZ"\n'
+        ), encoding="utf-8")
+        assert self._load(monkeypatch, home)["theta"].api_key == "sk-AFTER-ROTATION-XYZ"
+
+    def test_cache_is_still_mutated_in_place(self, tmp_path, monkeypatch):
+        """Callers hold this exact dict (#16767) — reloading must not rebind."""
+        home = self._profile(tmp_path, "inplace", (
+            'model_aliases:\n'
+            '  theta:\n    model: m\n    provider: custom\n'
+            '    base_url: "https://h.example.com/v1"\n'
+        ))
+        import hermes_cli.model_switch as ms
+
+        before = id(ms.DIRECT_ALIASES)
+        self._load(monkeypatch, home)
+        assert id(ms.DIRECT_ALIASES) == before
+
+
+class TestOneShotUsesTheSameHostInvariant:
+    """`hermes chat -m <alias>` must not trust the alias's provider label.
+
+    These exercise the REAL resolver — the leak lives inside
+    resolve_runtime_provider's provider-specific branches, so stubbing it
+    would test nothing.
+    """
+
+    @pytest.mark.parametrize("provider, env_var", [
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("deepseek", "DEEPSEEK_API_KEY"),
+        ("xai", "XAI_API_KEY"),
+    ])
+    def test_no_key_alias_on_a_foreign_host_gets_no_provider_token(
+        self, monkeypatch, provider, env_var
+    ):
+        secret = f"sk-{provider}-LIVE-TOKEN"
+        monkeypatch.setenv(env_var, secret)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.load_config",
+            lambda *a, **k: {"model": {"default": "m", "provider": "openrouter"}},
+        )
+        from hermes_cli.model_switch import DirectAlias, direct_alias_runtime_request
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        alias = DirectAlias("c", provider, "https://evil.test/v1")
+        requested, explicit_key = direct_alias_runtime_request(alias)
+        runtime = resolve_runtime_provider(
+            requested=requested,
+            explicit_api_key=explicit_key,
+            explicit_base_url=alias.base_url,
+        )
+        assert runtime.get("api_key") != secret
+
+    def test_label_is_kept_when_the_alias_has_no_url(self):
+        """Nothing to protect against without a foreign host, and the label is
+        the only routing information there is."""
+        from hermes_cli.model_switch import DirectAlias, direct_alias_runtime_request
+
+        assert direct_alias_runtime_request(
+            DirectAlias("c", "anthropic", "")
+        ) == ("anthropic", None)
+
+    def test_url_bearing_alias_is_forced_to_custom(self):
+        from hermes_cli.model_switch import DirectAlias, direct_alias_runtime_request
+
+        assert direct_alias_runtime_request(
+            DirectAlias("c", "anthropic", "https://evil.test/v1")
+        ) == ("custom", None)
+
+    def test_declared_key_is_carried_through(self, monkeypatch):
+        from hermes_cli.model_switch import DirectAlias, direct_alias_runtime_request
+
+        assert direct_alias_runtime_request(
+            DirectAlias("c", "anthropic", "https://evil.test/v1", "sk-own")
+        ) == ("custom", "sk-own")
+
+
 class TestBaseUrlOrigin:
     """The origin helper the reuse decision is built on."""
 
