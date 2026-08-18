@@ -1316,6 +1316,57 @@ def _abort_zip_update_if_dirty_tree() -> None:
     print("  Stash or commit your changes, then rerun `hermes update`.")
     print("  To inspect: git status --porcelain")
     _m().sys.exit(1)
+def _state_db_damage_is_fts_only(message: str) -> bool:
+    """True when an integrity-check message blames only the FTS5 index.
+
+    ``PRAGMA integrity_check`` reports FTS5 damage in the shape
+    ``malformed inverted index for FTS5 table main.messages_fts_trigram``
+    (#88252).  That names a *derived* structure: the search index is
+    rebuilt from the canonical ``messages`` rows, so this class of damage
+    costs the user their search index and nothing else.  Real page damage
+    reads very differently (``row N missing from index``, ``wrong # of
+    entries in index``, a bad header), which is why the caller only makes
+    the "your history is intact" claim for this class.
+
+    Deliberately a text test rather than a reuse of
+    ``SessionDB._is_fts_write_corruption_error``: that classifier takes a
+    ``sqlite3.DatabaseError`` raised by a failed *write*, and here there is
+    no exception -- only the string ``verify_sqlite_integrity`` returned.
+    """
+    lowered = message.lower()
+    return "fts5" in lowered or "inverted index" in lowered
+
+
+def _print_state_db_repair_hint(message: str) -> None:
+    """Name a concrete repair command for a state.db the update found corrupt.
+
+    Only reached once restoring from a snapshot turned out to be impossible
+    or to have failed, which is exactly the dead end #88252 reports: the
+    update announces that the database is corrupted, offers nothing, and the
+    user reasonably concludes their history is gone.  Usually it is not --
+    ``hermes sessions repair`` already fixes the dominant class in place,
+    via the FTS5 ``'rebuild'`` command, without touching a single message
+    row.
+
+    That command is also the right pointer for the other classes: it
+    re-probes with its own health check and declines to touch a database
+    that is actually fine, backs up before it changes anything, and
+    escalates least-destructive-first.  So this prints a pointer and never
+    repairs anything itself -- an update is the wrong place to acquire a
+    write lock on a database the user has not asked us to rewrite.
+    """
+    if _state_db_damage_is_fts_only(message):
+        print(
+            "  → This is the FTS5 search index, not your sessions or "
+            "messages — they are intact."
+        )
+        print("    Rebuild the index in place with:  hermes sessions repair")
+    else:
+        print("  → Try:  hermes sessions repair")
+        print(
+            "    It backs up first, refuses to touch a database that is "
+            "actually healthy, and tries the least destructive fix first."
+        )
 
 
 def _read_project_version() -> str | None:
@@ -1741,11 +1792,10 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                 _state_path, check_header=True, run_pragma=True
             )
             if not _state_ok.get("valid"):
+                _state_message = _state_ok.get("message", "unknown error")
+                _state_restored = False
                 print()
-                print(
-                    "⚠ state.db is corrupted after update: "
-                    + _state_ok.get("message", "unknown error")
-                )
+                print("⚠ state.db is corrupted after update: " + _state_message)
                 _snap_root = _quick_snapshot_root(get_hermes_home())
                 if _snap_root.exists():
                     _snap_dirs = sorted(
@@ -1769,6 +1819,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                                         run_pragma=True,
                                     )
                                     if _restored_ok.get("valid"):
+                                        _state_restored = True
                                         print(
                                             "  ✓ Auto-restored from snapshot "
                                             f"{_snap_dir.name}"
@@ -1784,6 +1835,11 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                                         f"  ✗ Auto-restore file copy failed: {_exc}"
                                     )
                                     break
+                if not _state_restored:
+                    # Every branch above either restored the file or ran out
+                    # of options without telling the user what they can do
+                    # next (#88252).  Tell them.
+                    _print_state_db_repair_hint(_state_message)
     except Exception as exc:
         logger.debug(
             "Post-update state.db integrity check (zip path) failed: %s", exc
@@ -6620,11 +6676,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _state_ok.get("message"),
                     )
                 else:
+                    _state_message = _state_ok.get("message", "unknown error")
+                    _state_restored = False
                     print()
-                    print(
-                        "⚠ state.db is corrupted after update: "
-                        + _state_ok.get("message", "unknown error")
-                    )
+                    print("⚠ state.db is corrupted after update: " + _state_message)
                     _pre_snap_id = pre_update_snapshot_id
                     if _pre_snap_id:
                         _snap_state = (
@@ -6647,6 +6702,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                         run_pragma=True,
                                     )
                                     if _restored_ok.get("valid"):
+                                        _state_restored = True
                                         print(
                                             "  ✓ Auto-restored from pre-update "
                                             f"snapshot ({_pre_snap_id})"
@@ -6670,6 +6726,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             )
                     else:
                         print("  ⚠ No pre-update snapshot was taken")
+                    if not _state_restored:
+                        # The reporter's exact dead end (#88252): corruption
+                        # announced, no snapshot to fall back on, and not a
+                        # word about the repair command that already exists.
+                        _print_state_db_repair_hint(_state_message)
                     print()
         except Exception as exc:
             logger.debug("Post-update state.db integrity check failed: %s", exc)
