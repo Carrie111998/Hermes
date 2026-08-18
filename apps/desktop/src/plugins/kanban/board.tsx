@@ -453,7 +453,7 @@ function Column({
     <div
       {...dragHandlers}
       className={cn(
-        'group/col flex h-full w-[calc(100vw-2rem)] max-w-full shrink-0 snap-start flex-col rounded-lg p-2 transition-colors md:w-64 md:[scroll-snap-align:none]',
+        'group/col flex h-full w-[calc(100vw-2.25rem)] max-w-full shrink-0 snap-start snap-always flex-col rounded-none border border-(--ui-stroke-tertiary) p-2 transition-colors md:w-64 md:rounded-lg md:border-0 md:[scroll-snap-align:none]',
         wash
       )}
       data-kanban-lane={column.name}
@@ -1492,12 +1492,15 @@ export function KanbanBoardPage() {
         </div>
       ) : (
         <div
+          aria-label={k.board}
           className={cn(
             'flex flex-1 snap-x snap-mandatory gap-2 overflow-x-auto overscroll-x-contain px-4 pt-1 pb-3 md:snap-none',
             grabbing && 'cursor-grabbing'
           )}
           onMouseDown={onMouseDown}
           ref={lanesRef}
+          role="region"
+          tabIndex={0}
         >
           {filtered.columns.map(col => {
             const auto = boardHasWork && col.tasks.length === 0

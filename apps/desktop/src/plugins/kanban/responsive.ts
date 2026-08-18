@@ -2,7 +2,10 @@ import { useEffect, useState } from 'react'
 
 export const KANBAN_DESKTOP_BREAKPOINT = 768
 export const KANBAN_DRAWER_DESKTOP_WIDTH = 416
-export const KANBAN_HORIZONTAL_GUTTER = 32
+export const KANBAN_MOBILE_INLINE_INSET = 16
+export const KANBAN_LANE_GAP = 8
+export const KANBAN_SCROLL_PEEK = 12
+export const KANBAN_HORIZONTAL_GUTTER = KANBAN_MOBILE_INLINE_INSET + KANBAN_LANE_GAP + KANBAN_SCROLL_PEEK
 
 export interface KanbanViewportGeometry {
   desktop: boolean
