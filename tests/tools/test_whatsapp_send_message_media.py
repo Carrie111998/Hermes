@@ -115,7 +115,11 @@ def test_text_plus_mixed_media_routes_native_types():
                 _resp(200, {"messageId": "m3"}),
             ]
         )
-        with patch("aiohttp.ClientSession", return_value=session_ctx):
+        with patch("aiohttp.ClientSession", return_value=session_ctx), \
+             patch(
+                 "plugins.platforms.whatsapp.adapter._request_authenticated_bridge_health",
+                 new=AsyncMock(return_value={"status": "connected"}),
+             ):
             res = asyncio.run(
                 _standalone_send(
                     _pconfig(),
@@ -141,7 +145,11 @@ def test_missing_captioned_file_falls_back_to_text():
     """If the single captioned file is missing, the caption is delivered as a
     plain /send message rather than being silently lost (W1)."""
     session_ctx, calls = _session_with([_resp(200, {"messageId": "t1"})])
-    with patch("aiohttp.ClientSession", return_value=session_ctx):
+    with patch("aiohttp.ClientSession", return_value=session_ctx), \
+         patch(
+             "plugins.platforms.whatsapp.adapter._request_authenticated_bridge_health",
+             new=AsyncMock(return_value={"status": "connected"}),
+         ):
         res = asyncio.run(
             _standalone_send(
                 _pconfig(),
@@ -175,7 +183,11 @@ def test_standalone_delivery_authenticates_text_caption_fallback_and_media(tmp_p
                 _resp(200, {"messageId": "fallback"}),
             ]
         )
-        with patch("aiohttp.ClientSession", return_value=session_ctx) as client_session:
+        with patch("aiohttp.ClientSession", return_value=session_ctx) as client_session, \
+             patch(
+                 "plugins.platforms.whatsapp.adapter._request_authenticated_bridge_health",
+                 new=AsyncMock(return_value={"status": "connected"}),
+             ) as authenticate:
             text_and_media = asyncio.run(
                 _standalone_send(
                     _pconfig(tmp_path),
@@ -203,6 +215,11 @@ def test_standalone_delivery_authenticates_text_caption_fallback_and_media(tmp_p
         ]
         assert client_session.call_count == 2
         for call in client_session.call_args_list:
+            assert "headers" not in call.kwargs
+        assert authenticate.await_count == 2
+        for call in authenticate.await_args_list:
+            assert call.args[2] == token
+        for call in session_ctx.__aenter__.return_value.post.call_args_list:
             assert call.kwargs["headers"] == {"Authorization": f"Bearer {token}"}
     finally:
         os.unlink(media_path)

@@ -1873,15 +1873,25 @@ async def _standalone_send(
         # a caption is never silently repeated across a multi-file send.
         media_caption = caption if (caption and len(media) == 1) else None
         last_message_id = None
-        async with aiohttp.ClientSession(
-            headers=_bridge_auth_headers(bridge_token)
-        ) as session:
+        bridge_url = f"http://localhost:{bridge_port}"
+        auth_headers = _bridge_auth_headers(bridge_token)
+        async with aiohttp.ClientSession() as session:
+            health = await _request_authenticated_bridge_health(
+                session,
+                bridge_url,
+                bridge_token,
+                aiohttp.ClientTimeout(total=2),
+            )
+            if health is None:
+                return {"error": "WhatsApp bridge failed authentication"}
+
             # 1) Text first (skip the /send call when this chunk is media-only
             #    or when the text is delivered as the media caption instead).
             if text.strip() and not media_caption:
                 async with session.post(
-                    f"http://localhost:{bridge_port}/send",
+                    f"{bridge_url}/send",
                     json={"chatId": normalized_chat_id, "message": text},
+                    headers=auth_headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status != 200:
@@ -1903,8 +1913,9 @@ async def _standalone_send(
                     if media_caption:
                         try:
                             async with session.post(
-                                f"http://localhost:{bridge_port}/send",
+                                f"{bridge_url}/send",
                                 json={"chatId": normalized_chat_id, "message": media_caption},
+                                headers=auth_headers,
                                 timeout=aiohttp.ClientTimeout(total=30),
                             ) as resp:
                                 if resp.status == 200:
@@ -1923,8 +1934,9 @@ async def _standalone_send(
                 if media_caption:
                     payload["caption"] = media_caption
                 async with session.post(
-                    f"http://localhost:{bridge_port}/send-media",
+                    f"{bridge_url}/send-media",
                     json=payload,
+                    headers=auth_headers,
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status != 200:
