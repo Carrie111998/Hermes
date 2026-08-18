@@ -87,3 +87,47 @@ def test_clear_and_list(ov):
     assert clear_override(provider="deepseek", model="deepseek-v4-pro") is True
     assert list_overrides() == []
     assert clear_override(provider="deepseek", model="deepseek-v4-pro") is False
+
+
+def test_target_with_an_open_episode_is_rejected(ov, monkeypatch):
+    from events import model_override
+    monkeypatch.setattr(
+        "events.rate_limit_signal._load_state",
+        lambda: {"openai-codex/gpt-5.6-sol": {"worst_outcome": "diverted"}},
+    )
+    ok, reason = model_override.set_override(
+        provider="deepseek", model="deepseek-v4-pro",
+        replacement_provider="openai-codex", replacement_model="gpt-5.6-sol",
+        ttl_seconds=3600, set_by="test")
+    assert ok is False
+    assert "rate limited" in reason.lower() or "episode" in reason.lower()
+
+
+def test_target_with_no_episode_is_accepted(ov, monkeypatch):
+    from events import model_override
+    monkeypatch.setattr("events.rate_limit_signal._load_state", lambda: {})
+    ok, _ = model_override.set_override(
+        provider="deepseek", model="deepseek-v4-pro",
+        replacement_provider="openai-codex", replacement_model="gpt-5.6-sol",
+        ttl_seconds=3600, set_by="test")
+    assert ok is True
+
+
+def test_unreadable_episode_state_does_not_veto_the_operator(ov, monkeypatch):
+    """Fail-open is INVERTED here vs. everywhere else in this module: the
+    state being read is telemetry, and the action being gated is the
+    operator's deliberate control action. If the episode-state read blows
+    up, the override must still be ACCEPTED -- a telemetry read must never
+    veto an operator's explicit instruction. See the comment in
+    set_override() for the full reasoning."""
+    from events import model_override
+
+    def _boom():
+        raise OSError("boom")
+
+    monkeypatch.setattr("events.rate_limit_signal._load_state", _boom)
+    ok, _ = model_override.set_override(
+        provider="deepseek", model="deepseek-v4-pro",
+        replacement_provider="openai-codex", replacement_model="gpt-5.6-sol",
+        ttl_seconds=3600, set_by="test")
+    assert ok is True

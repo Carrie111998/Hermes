@@ -304,6 +304,49 @@ def set_override(
         ):
             return False, "replacement is the same model as the original — that's a routing loop"
 
+        # Reject a divert-into-a-wall: an override whose replacement target
+        # already has its own open rate-limit episode would make the tap
+        # LOOK like it worked while actually routing traffic onto another
+        # dead model. Spec Sec:Containment.
+        #
+        # Fail-open direction is INVERTED here relative to every other
+        # fail-open in this module (and in rate_limit_signal.py itself).
+        # Everywhere else, "can't read the state" degrades to "act as if
+        # there is no state" because the state IS the thing being acted on.
+        # Here the state being read is telemetry (episode state) and the
+        # action being gated is the OPERATOR's deliberate control action
+        # (a Telegram tap explicitly diverting traffic). A telemetry read
+        # must never veto an explicit operator instruction, so if
+        # _load_state() raises or returns something we can't use, treat it
+        # as "no open episodes" and ALLOW the write -- do not block it.
+        # This looks backwards next to get_override()'s fail-open-to-None,
+        # but the two are gating opposite things: that one fails open
+        # because an unreadable override must never block a live model
+        # call; this one fails open because an unreadable episode log must
+        # never block an operator's explicit fix attempt.
+        try:
+            from events.rate_limit_signal import _episode_key, _load_state
+            episode_state = _load_state()
+            target_key = _episode_key(replacement_provider, replacement_model)
+            target_has_open_episode = bool(
+                isinstance(episode_state, dict) and target_key in episode_state
+            )
+        except Exception:
+            logger.debug(
+                "model_override.set_override: episode-state read failed "
+                "(swallowed, fail-open to allowing the override)",
+                exc_info=True,
+            )
+            target_has_open_episode = False
+
+        if target_has_open_episode:
+            return (
+                False,
+                f"{replacement_provider}/{replacement_model} is itself rate "
+                "limited (open episode) — routing there would divert into "
+                "a wall",
+            )
+
         capped_ttl = min(int(ttl_seconds), MAX_TTL_SECONDS)
         now = _now()
         expires_at = now + timedelta(seconds=capped_ttl)
