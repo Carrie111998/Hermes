@@ -386,6 +386,21 @@ export interface Translations {
       terminalFontReset: string
       translucencyTitle: string
       translucencyDesc: string
+      translucencyGlassDesc: string
+      translucencyModeClear: string
+      translucencyModeGlass: string
+      translucencyFrostTitle: string
+      translucencyFrost: {
+        'under-window': string
+        popover: string
+        titlebar: string
+        header: string
+      }
+      translucencyScopeTitle: string
+      translucencyScope: {
+        window: string
+        sidebar: string
+      }
       backdropTitle: string
       backdropDesc: string
       reactionsTitle: string
@@ -601,21 +616,11 @@ export interface Translations {
       title: string
       envOverride: string
       intro: string
-      allProfiles: string
-      defaultConnection: string
-      profileConnection: (profile: string) => string
-      profileOverridesTitle: string
-      profileOverridesDesc: string
-      overrideEdit: string
-      overrideEditing: string
-      overrideSelectHint: string
       envOverrideTitle: string
       envOverrideDesc: string
       modeTitle: string
       localTitle: string
       localDesc: string
-      inheritTitle: string
-      inheritDesc: string
       remoteTitle: string
       remoteDesc: string
       remoteAuthHint: string
@@ -714,8 +719,6 @@ export interface Translations {
       sshHermesPathTitle: string
       sshHermesPathDesc: string
       sshHermesPathPlaceholder: string
-      sshRemoteProfileTitle: string
-      sshRemoteProfileDesc: string
       sshTestConnection: string
       sshConnect: string
       sshButtonsHint: string
@@ -1238,6 +1241,7 @@ export interface Translations {
     restartGateway: string
     gatewayRestartFailed: string
     updateHermes: string
+    reloadWindow: string
     actionRunning: string
     actionDone: string
     actionFailed: string
@@ -1496,6 +1500,9 @@ export interface Translations {
     creating: string
     createAction: string
     renameTitle: string
+    displayNameTitle: string
+    displayNameDesc: string
+    displayNameLabel: string
     renameDescPrefix: string
     renameDescSuffix: string
     newNameLabel: string
@@ -2456,6 +2463,12 @@ export interface Translations {
       showConsole: string
       hideDevTools: string
       openDevTools: string
+      goBack: string
+      goForward: string
+      reload: string
+      address: string
+      addressPlaceholder: string
+      blankPageBody: string
       finishedRestarting: (message?: string) => string
       failedRestarting: (message: string) => string
       unknownError: string
