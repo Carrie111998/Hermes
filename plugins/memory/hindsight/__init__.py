@@ -57,7 +57,7 @@ _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
 _MIN_CLIENT_VERSION = "0.8.5"
-_DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+_DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request. Override per-profile via timeout key in ~/.hermes/hindsight/config.json
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
@@ -2176,8 +2176,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})
             except Exception as e:
+                msg = f"Failed to store memory: {type(e).__name__}: {e}"
+                if isinstance(e, TimeoutError):
+                    msg += " The server may have completed the operation despite the client timeout. Do not blindly retry — verify the fact was stored via recall before retrying to avoid duplicates. See hindsight-retain-timeout-workaround.md for REST fallback."
                 logger.warning("hindsight_retain failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to store memory: {e}")
+                return tool_error(msg)
 
         elif tool_name == "hindsight_recall":
             query = args.get("query", "")
@@ -2224,7 +2227,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to search memory: {e}")
+                return tool_error(f"Failed to search memory: {type(e).__name__}: {e}")
 
         elif tool_name == "hindsight_reflect":
             query = args.get("query", "")
@@ -2244,7 +2247,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return json.dumps({"result": resp.text or "No relevant memories found."})
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to reflect: {e}")
+                return tool_error(f"Failed to reflect: {type(e).__name__}: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 
