@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { POOL_LOCAL_RUNTIME_MISSING, assertPoolRuntimeInstalled, poolBackendNeedsBootstrap } from './pool-runtime-guard'
+import { assertPoolRuntimeInstalled, POOL_LOCAL_RUNTIME_MISSING, poolBackendNeedsBootstrap } from './pool-runtime-guard'
 
 test('poolBackendNeedsBootstrap detects the unresolved runtime', () => {
   assert.equal(poolBackendNeedsBootstrap({ kind: 'bootstrap-needed' }), true)
