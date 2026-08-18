@@ -78,6 +78,35 @@ def _lineage_rows() -> list[tuple[str, int]]:
         db.close()
 
 
+def _purge_database_rows() -> tuple[list[tuple[object, ...]], ...]:
+    db = SessionDB()
+    try:
+        assert db._conn is not None
+        return (
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT id, archived FROM sessions ORDER BY id"
+                ).fetchall()
+            ],
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT session_id, role, content FROM messages ORDER BY id"
+                ).fetchall()
+            ],
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT scope, session_key, entry_json "
+                    "FROM gateway_routing ORDER BY scope, session_key"
+                ).fetchall()
+            ],
+        )
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize(
     ("arguments", "required_argument"),
     [
@@ -285,6 +314,69 @@ def test_cold_purge_dry_run_is_read_only_and_prints_exact_ids(
         for path in archive_root.rglob("*")
         if path.is_file()
     } == before_files
+
+
+@pytest.mark.parametrize("purge_flag", ["--dry-run", "--yes"])
+def test_cold_purge_refuses_routed_verified_lineage_and_retains_database_rows(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    purge_flag: str,
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "cold-root"
+    store_code, _store_out, store_err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-store",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--yes",
+    )
+    assert store_code == 0
+    assert store_err == ""
+
+    db = SessionDB()
+    try:
+        db.save_gateway_routing_entry(
+            "route-key",
+            '{"session_id":"lineage-root","platform":"test"}',
+            scope="test-routing-scope",
+        )
+    finally:
+        db.close()
+
+    verify_code, _verify_out, verify_err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-verify",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+    )
+    assert verify_code == 0
+    assert verify_err == ""
+    before_rows = _purge_database_rows()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-purge",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        purge_flag,
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "gateway_routing" in out
+    assert "lineage-root" in out
+    assert _purge_database_rows() == before_rows
 
 
 def test_cold_purge_without_yes_refuses_actual_deletion(

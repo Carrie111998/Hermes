@@ -643,10 +643,45 @@ def _id_chunks(ids: tuple[str, ...]) -> list[tuple[str, ...]]:
     ]
 
 
+def _reject_gateway_routing_references(
+    conn: sqlite3.Connection, physical_ids: tuple[str, ...]
+) -> None:
+    """Fail closed on gateway routes that may name a covered session."""
+    covered = set(physical_ids)
+    rows = conn.execute(
+        "SELECT scope, session_key, entry_json FROM gateway_routing"
+    ).fetchall()
+    for row in rows:
+        scope = str(row[0])
+        session_key = str(row[1])
+        try:
+            entry = json.loads(row[2])
+        except Exception as exc:
+            raise ValueError(
+                "cold purge refuses gateway_routing row whose session reference "
+                "cannot be verified: "
+                f"scope={scope!r}, session_key={session_key!r}"
+            ) from exc
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "cold purge refuses gateway_routing row whose session reference "
+                "cannot be verified: "
+                f"scope={scope!r}, session_key={session_key!r}"
+            )
+        session_id = entry.get("session_id")
+        if isinstance(session_id, str) and session_id in covered:
+            raise ValueError(
+                "cold purge refuses gateway_routing soft reference to lineage "
+                f"session {session_id}: scope={scope!r}, "
+                f"session_key={session_key!r}"
+            )
+
+
 def _reject_uncovered_session_references(
     conn: sqlite3.Connection, physical_ids: tuple[str, ...]
 ) -> None:
     """Fail if deleting the covered rows would mutate any unsnapshotted row."""
+    _reject_gateway_routing_references(conn, physical_ids)
     covered = set(physical_ids)
     chunks = _id_chunks(physical_ids)
     for ids in chunks:
@@ -694,6 +729,38 @@ def _reject_uncovered_session_references(
                     )
 
 
+def _validated_purge_plan(
+    conn: sqlite3.Connection, terminal_id: str, archive_root: Path
+) -> tuple[_StorePlan, Path]:
+    plan = _build_store_plan(conn, terminal_id)
+    snapshot_dir = _verify_plan_snapshot(archive_root, plan)
+    _reject_uncovered_session_references(conn, plan.physical_ids)
+    return plan, snapshot_dir
+
+
+def validate_purge_archived_lineage(
+    db: SessionDB, terminal_id: str, archive_root: Path
+) -> VerifiedLineage:
+    """Run the final Purge eligibility gate without deleting any rows."""
+    _require_supported_platform()
+    archive_root = Path(os.path.abspath(os.fspath(archive_root)))
+    conn = _connection(db)
+    with db._lock:
+        conn.execute("SAVEPOINT cold_purge_snapshot")
+        try:
+            plan, snapshot_dir = _validated_purge_plan(
+                conn, terminal_id, archive_root
+            )
+        finally:
+            conn.execute("RELEASE SAVEPOINT cold_purge_snapshot")
+    return VerifiedLineage(
+        plan.terminal_id,
+        plan.physical_ids,
+        plan.source_fingerprint,
+        snapshot_dir,
+    )
+
+
 def purge_archived_lineage(
     db: SessionDB, terminal_id: str, archive_root: Path
 ) -> PurgedLineage:
@@ -707,9 +774,9 @@ def purge_archived_lineage(
     archive_root = Path(os.path.abspath(os.fspath(archive_root)))
 
     def _purge(conn: sqlite3.Connection) -> PurgedLineage:
-        plan = _build_store_plan(conn, terminal_id)
-        snapshot_dir = _verify_plan_snapshot(archive_root, plan)
-        _reject_uncovered_session_references(conn, plan.physical_ids)
+        plan, snapshot_dir = _validated_purge_plan(
+            conn, terminal_id, archive_root
+        )
 
         prompt_hashes = tuple(
             sorted(

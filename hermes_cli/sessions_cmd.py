@@ -981,10 +981,12 @@ def cmd_sessions(args, sessions_parser=None):
 
         archive_root = args.root.expanduser()
         if args.dry_run:
-            from hermes_cli.session_cold_store import verify_archived_lineage
+            from hermes_cli.session_cold_store import (
+                validate_purge_archived_lineage,
+            )
 
             try:
-                verified = verify_archived_lineage(
+                verified = validate_purge_archived_lineage(
                     db, resolved_session_id, archive_root
                 )
             except (OSError, ValueError) as exc:

@@ -168,6 +168,35 @@ def test_purge_rejects_uncovered_child_and_preserves_foreign_key_rows(
         db.close()
 
 
+@pytest.mark.parametrize("entry_json", ["{malformed", "[]"])
+def test_purge_rejects_unverifiable_routing_entries_and_retains_all_rows(
+    tmp_path: Path,
+    entry_json: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="keep me")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        db.save_gateway_routing_entry(
+            "route-key", entry_json, scope="test-routing-scope"
+        )
+
+        with pytest.raises(ValueError, match="gateway_routing.*cannot be verified"):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("terminal") is not None
+        assert db.get_messages("terminal")[0]["content"] == "keep me"
+        assert db.load_gateway_routing_entries(scope="test-routing-scope") == {
+            "route-key": entry_json
+        }
+    finally:
+        db.close()
+
+
 def test_verify_rejects_live_source_change_after_store(tmp_path: Path) -> None:
     """Verify compares the current read-only Store plan with the snapshot."""
     db = SessionDB(db_path=tmp_path / "state.db")
