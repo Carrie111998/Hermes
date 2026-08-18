@@ -1579,7 +1579,7 @@ def _validate_delivery_target(deliver: Any, origin: Optional[Dict[str, Any]]) ->
         raw_parts = [str(part).strip() for part in deliver]
     else:
         raw_parts = str(deliver or "").split(",")
-    targets = [part.lower() for part in raw_parts if part.strip()]
+    targets = [part.strip().lower() for part in raw_parts if part.strip()]
 
     explicit_api_target = any(
         target == "api_server" or target.startswith("api_server:")

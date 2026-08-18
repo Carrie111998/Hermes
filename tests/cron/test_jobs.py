@@ -261,7 +261,18 @@ class TestJobCRUD:
         )
         assert job["deliver"] == "origin"
 
-    @pytest.mark.parametrize("deliver", [None, "origin", "origin,all", "api_server:session-1"])
+    @pytest.mark.parametrize(
+        "deliver",
+        [
+            None,
+            "origin",
+            " origin ",
+            "origin,all",
+            "origin , all",
+            "api_server:session-1",
+            " api_server:session-1 ",
+        ],
+    )
     def test_rejects_api_server_push_delivery(self, tmp_cron_dir, deliver):
         kwargs = {
             "prompt": "Follow up later",
@@ -326,7 +337,8 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
 
-    def test_update_rejects_api_server_origin_delivery(self, tmp_cron_dir):
+    @pytest.mark.parametrize("deliver", ["origin", " origin ", "origin , all"])
+    def test_update_rejects_api_server_origin_delivery(self, tmp_cron_dir, deliver):
         job = create_job(
             prompt="Follow up later",
             schedule="every 1h",
@@ -335,7 +347,7 @@ class TestUpdateJob:
         )
 
         with pytest.raises(ValueError, match="cannot receive scheduled push delivery"):
-            update_job(job["id"], {"deliver": "origin"})
+            update_job(job["id"], {"deliver": deliver})
 
         assert get_job(job["id"])["deliver"] == "local"
 
