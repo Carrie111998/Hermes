@@ -40,7 +40,7 @@ def test_parked_retry_interval_is_clamped_to_safe_floor():
     assert server._parked_retry_interval() == _MIN_PARKED_RETRY_INTERVAL
 
 
-@pytest.mark.parametrize("configured", ["30s", [], float("inf"), 10**400])
+@pytest.mark.parametrize("configured", ["30s", [], float("inf"), 10**400, True, False])
 def test_parked_retry_interval_invalid_value_uses_default(configured, caplog):
     from tools.mcp_tool import MCPServerTask, _PARKED_RETRY_INTERVAL
 

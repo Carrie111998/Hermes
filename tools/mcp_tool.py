@@ -2163,6 +2163,8 @@ class MCPServerTask:
         if configured is None:
             return float(_PARKED_RETRY_INTERVAL)
         try:
+            if isinstance(configured, bool):
+                raise ValueError
             interval = float(configured)
             if not math.isfinite(interval):
                 raise ValueError
