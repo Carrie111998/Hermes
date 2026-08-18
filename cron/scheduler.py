@@ -342,6 +342,19 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+def _failure_delivery_job(job: dict) -> dict:
+    """Use cron.failure_deliver only for failed scheduler-run notifications."""
+    try:
+        failure_deliver = (load_config().get("cron") or {}).get("failure_deliver")
+    except Exception:
+        failure_deliver = None
+    if not isinstance(failure_deliver, str) or not failure_deliver.strip():
+        return job
+    routed_job = dict(job)
+    routed_job["deliver"] = failure_deliver.strip()
+    return routed_job
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -6697,9 +6710,10 @@ def _run_one_job_body(
                 )
 
             if should_deliver:
+                delivery_job = _failure_delivery_job(job) if not success else job
                 unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                    _normalize_deliver_value(delivery_job.get("deliver", "local")) == "origin"
+                    and not _resolve_delivery_targets(delivery_job)
                 )
                 try:
                     with _side_effect_fence() as owns_delivery:
@@ -6707,7 +6721,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            delivery_job,
                             deliver_content,
                             adapters=adapters,
                             loop=loop,

@@ -13,6 +13,7 @@ from cron.scheduler import (
     SILENT_MARKER,
     _build_job_prompt,
     _deliver_result,
+    _failure_delivery_job,
     _merge_mcp_into_per_job_toolsets,
     _resolve_cron_enabled_toolsets,
     _resolve_delivery_target,
@@ -68,6 +69,25 @@ class TestSummarizeCronFailureForDelivery:
         assert "No model was invoked" in summary
         assert "provider timeout" not in summary
         assert "fallback chain" not in summary.lower()
+
+
+class TestFailureDeliveryJob:
+    def test_uses_failure_delivery_without_mutating_normal_job(self):
+        job = {"id": "job-1", "deliver": "origin"}
+        with patch(
+            "cron.scheduler.load_config",
+            return_value={"cron": {"failure_deliver": "discord:alerts"}},
+        ):
+            routed = _failure_delivery_job(job)
+
+        assert routed == {"id": "job-1", "deliver": "discord:alerts"}
+        assert job == {"id": "job-1", "deliver": "origin"}
+
+    @pytest.mark.parametrize("config", [{}, {"cron": {}}, {"cron": {"failure_deliver": "  "}}])
+    def test_keeps_job_delivery_when_failure_route_is_not_configured(self, config):
+        job = {"id": "job-1", "deliver": "origin"}
+        with patch("cron.scheduler.load_config", return_value=config):
+            assert _failure_delivery_job(job) is job
 
 
 class TestPerJobToolsetMcpMerge:
