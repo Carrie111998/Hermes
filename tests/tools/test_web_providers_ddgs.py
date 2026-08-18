@@ -166,6 +166,23 @@ class TestDDGSProviderSearch:
 
         assert prov._run_ddgs_search("q", 2) is expected
 
+    def test_termux_parse_failure_reaches_provider_error(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+
+        monkeypatch.setattr(prov, "is_termux", lambda: True)
+
+        def _raise_parse_failure(query, limit):
+            raise RuntimeError(
+                "DuckDuckGo HTML endpoint returned no parseable results"
+            )
+
+        monkeypatch.setattr(prov, "_run_ddgs_search_bounded", _raise_parse_failure)
+
+        result = prov.DDGSWebSearchProvider().search("q", limit=2)
+
+        assert result["success"] is False
+        assert "no parseable results" in result["error"]
+
     def test_happy_path_normalizes_results(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[
             {"title": "A", "href": "https://a.example.com", "body": "desc A"},

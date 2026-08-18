@@ -5,15 +5,16 @@ The legacy in-tree module ``tools.web_providers.ddgs`` was removed in the
 same commit that moved this code under ``plugins/``; this file is now the
 canonical implementation.
 
-The ``ddgs`` package is an optional dependency. ``is_available()`` reflects
-whether the package is importable; the plugin still registers either way so
-``hermes tools`` can prompt the user to install it.
+The ``ddgs`` package is optional on non-Termux platforms. Termux uses the
+core ``httpx`` dependency against DuckDuckGo's HTML endpoint because the
+``ddgs`` native transport aborts there; the plugin still registers either way
+so ``hermes tools`` can offer the platform-appropriate setup.
 
 Isolation note (#68096): ``ddgs``/``primp`` can block inside native code while
-holding the Python GIL. A ``ThreadPoolExecutor`` + ``future.result(timeout=…)``
-cap (see #52118) cannot fire in that state — the waiter never reacquires the
-GIL — so the whole Hermes process freezes through Ctrl+C/SIGTERM. Each search
-therefore runs in a disposable child process the parent can terminate/kill.
+holding the Python GIL. A thread timeout cannot fire in that state — the
+waiter never reacquires the GIL — so the whole Hermes process freezes through
+Ctrl+C/SIGTERM. Each search therefore runs in a disposable child process that
+the parent polls and can terminate/kill.
 """
 
 from __future__ import annotations
@@ -236,8 +237,8 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
     """Run ``_run_ddgs_search`` in a disposable process with a hard deadline.
 
     The parent never joins the child while it may be inside native code holding
-    *its* GIL — it only polls a communicator thread and, on timeout/interrupt,
-    terminates the child OS process. Raises ``TimeoutError``,
+    *its* GIL — it polls ``communicate()`` with short timeouts and, on
+    timeout/interrupt, terminates the child OS process. Raises ``TimeoutError``,
     ``_SearchInterrupted``, or ``RuntimeError``.
     """
     # Imported lazily so plugin import stays light for ``hermes tools`` probes.
