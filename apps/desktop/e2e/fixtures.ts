@@ -220,7 +220,7 @@ function writeEmptyConfig(hermesHome: string): void {
  *  - HERMES_DESKTOP_APP_NAME → unique-ish per test (avoids single-instance lock)
  *  - XDG_RUNTIME_DIR → ensure Electron has a writable runtime dir on Linux
  */
-export function buildAppEnv(sandbox: Sandbox, extra: Record<string, string> = {}): Record<string, string> {
+export function buildAppEnv(sandbox: Sandbox, extra: Record<string, string | undefined> = {}): Record<string, string> {
   const clean = stripCredentials(process.env)
 
   // XDG_RUNTIME_DIR is needed for Electron on Linux when running in a
@@ -234,7 +234,7 @@ export function buildAppEnv(sandbox: Sandbox, extra: Record<string, string> = {}
     clean.DISPLAY = process.env.DISPLAY
   }
 
-  return {
+  const merged: Record<string, string | undefined> = {
     ...clean,
     HERMES_HOME: sandbox.hermesHome,
     HERMES_DESKTOP_USER_DATA_DIR: sandbox.userDataDir,
@@ -250,6 +250,20 @@ export function buildAppEnv(sandbox: Sandbox, extra: Record<string, string> = {}
     // it loads from the vite URL instead of the local file.
     ...extra,
   }
+
+  // Sanitize after every merge: caller-controlled `extra` must not be able to
+  // select an ambient Kanban board. Match case-insensitively for Windows.
+  for (const key of Object.keys(merged)) {
+    const normalized = key.toUpperCase()
+    if (normalized === 'HERMES_HOME' || normalized.startsWith('HERMES_KANBAN_')) {
+      delete merged[key]
+    }
+  }
+  merged.HERMES_HOME = sandbox.hermesHome
+
+  return Object.fromEntries(
+    Object.entries(merged).filter((entry): entry is [string, string] => Boolean(entry[1])),
+  )
 }
 
 // ─── Electron launch ────────────────────────────────────────────────────
@@ -368,6 +382,8 @@ export interface MockBackendOptions {
   mockServer?: MockServerOptions
   /** Populate only this test's isolated HERMES_HOME before backend launch. */
   prepareSandbox?: (sandbox: Sandbox) => void
+  /** Additional app env; board selectors are always removed fail-closed. */
+  appEnv?: Record<string, string | undefined>
 }
 
 /**
@@ -394,7 +410,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
   options.prepareSandbox?.(sandbox)
 
   // 3. Build env + launch
-  const env = buildAppEnv(sandbox)
+  const env = buildAppEnv(sandbox, options.appEnv)
   const { app, page } = await launchDesktop(env)
 
   return {

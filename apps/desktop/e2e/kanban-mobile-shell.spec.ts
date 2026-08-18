@@ -115,6 +115,13 @@ test.use({ trace: 'off' })
 test.beforeAll(async () => {
   fixture = await setupMockBackend({
     extraConfig: 'plugins:\n  enabled:\n    - kanban',
+    // The actual Electron/backend launch must remain pinned to this fixture's
+    // HERMES_HOME even when a caller supplies ambient board selectors.
+    appEnv: {
+      HERMES_HOME: path.join(REPO_ROOT, '.forbidden-e2e-home'),
+      HERMES_KANBAN_DB: path.join(REPO_ROOT, '.forbidden-e2e-kanban.db'),
+      HERMES_KANBAN_BOARD: 'forbidden-e2e-board',
+    },
     prepareSandbox: sandbox => seedBoard(sandbox.hermesHome)
   })
   await fixture.page.waitForSelector('body')
