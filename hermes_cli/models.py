@@ -1809,6 +1809,7 @@ def fetch_openrouter_models(
         }
 
     curated: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
     silent_default = get_preferred_silent_default_model("openrouter")
     for preferred_id in preferred_ids:
         live_item = live_by_id.get(preferred_id)
@@ -1826,6 +1827,20 @@ def fetch_openrouter_models(
         else:
             desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
         curated.append((preferred_id, desc))
+        seen_ids.add(preferred_id)
+
+    # Surface all remaining free tool-capable models from the live catalog (#89150).
+    # Allows free-tier users to discover all available free models without
+    # dumping the entire 400+ paid catalog.
+    for mid, live_item in live_by_id.items():
+        if mid in seen_ids:
+            continue
+        if not _openrouter_model_is_free(live_item.get("pricing")):
+            continue
+        if not _openrouter_model_supports_tools(live_item):
+            continue
+        curated.append((mid, "free"))
+        seen_ids.add(mid)
 
     if not curated:
         return list(_openrouter_catalog_cache or fallback)
