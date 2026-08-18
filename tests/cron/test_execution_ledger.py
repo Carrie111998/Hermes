@@ -179,7 +179,19 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
-    env["PYTHONPATH"] = str(repo)
+    # PREPEND, never replace. Assigning str(repo) outright drops whatever the
+    # parent inherited -- which is fatal under an interpreter whose third-party
+    # deps reach it only through PYTHONPATH rather than through a venv's own
+    # site-packages. That is exactly the nightly gate's interpreter since
+    # 2026-08-15, when the cron script slot flipped from Store CPython 3.11 to
+    # the uv-managed CPython 3.12: the child lost
+    # agent-src/.venv/Lib/site-packages and died on `import yaml` inside
+    # utils.py, three nights running, while the file passed standalone under the
+    # venv python. The repo path still comes first, so it keeps winning.
+    inherited = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo), *(p for p in inherited if p != str(repo))]
+    )
 
     def _run_child(label: str, code: str) -> subprocess.CompletedProcess:
         """Run a helper interpreter, keeping its output attached to failures.
