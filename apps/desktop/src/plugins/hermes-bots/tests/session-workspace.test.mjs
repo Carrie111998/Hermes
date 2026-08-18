@@ -89,7 +89,9 @@ test('sessions workspace: filtering searches title, preview, and source without 
 test('sessions workspace: opening a stored row uses profile-aware navigation and records selection', async () => {
   const runtime = load({ profile: 'default' })
   await runtime.__sessions.openProfileSession('ops', 'stored-123', 0)
-  assert.deepEqual(plain(runtime.calls), [['openSession', 'stored-123', { profile: 'ops' }]])
+  assert.deepEqual(plain(runtime.calls), [
+    ['openSession', 'stored-123', { keepAllProfilesScope: false, profile: 'ops' }]
+  ])
   assert.equal(runtime.__sessions.$botSelectedSessions.get().ops, 'stored-123')
 })
 

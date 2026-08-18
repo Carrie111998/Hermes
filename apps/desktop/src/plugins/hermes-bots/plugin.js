@@ -2932,7 +2932,7 @@ function createCanonicalChat(name) {
 
     if (sid && typeof host.openSession === 'function') {
       try {
-        await host.openSession(sid, { profile: name })
+        await host.openSession(sid, { keepAllProfilesScope: false, profile: name })
         opened = true
       } catch {
         // The stored row may not exist until the kickoff persists it. Retry
@@ -2947,7 +2947,7 @@ function createCanonicalChat(name) {
         await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
 
         if (!opened && sid && typeof host.openSession === 'function') {
-          await host.openSession(sid, { profile: name })
+          await host.openSession(sid, { keepAllProfilesScope: false, profile: name })
         }
       } catch {
         // The chat already exists. Keep the pin so the next click
@@ -2982,7 +2982,7 @@ async function openBotCanonicalChat(name, pinned, history) {
     const adoptId = history?.id
     if (adoptId && typeof host.openSession === 'function') {
       try {
-        await host.openSession(adoptId, { profile: name })
+        await host.openSession(adoptId, { keepAllProfilesScope: false, profile: name })
         saveBotMeta(name, { chat: adoptId })
         return adoptId
       } catch {
@@ -3015,7 +3015,7 @@ async function openBotCanonicalChat(name, pinned, history) {
     // Transient gateway state (or an older backend): the pin is innocent
     // until proven guilty — try it as-is, and only a rejected open clears.
     try {
-      await host.openSession(pinned, { profile: name })
+      await host.openSession(pinned, { keepAllProfilesScope: false, profile: name })
       return pinned
     } catch {
       saveBotMeta(name, { chat: null })
@@ -3025,7 +3025,7 @@ async function openBotCanonicalChat(name, pinned, history) {
 
   if (preferred) {
     try {
-      await host.openSession(preferred.resolved_id || preferred.id, { profile: name })
+      await host.openSession(preferred.resolved_id || preferred.id, { keepAllProfilesScope: false, profile: name })
       return pinned
     } catch (error) {
       // The precise lookup JUST confirmed this session exists, so a failed
@@ -3042,7 +3042,7 @@ async function openBotCanonicalChat(name, pinned, history) {
   const recoveryId = history?.id
   if (recoveryId && typeof host.openSession === 'function') {
     try {
-      await host.openSession(recoveryId, { profile: name })
+      await host.openSession(recoveryId, { keepAllProfilesScope: false, profile: name })
       saveBotMeta(name, { chat: recoveryId })
       return recoveryId
     } catch {
@@ -7143,7 +7143,7 @@ async function openProfileSession(botName, storedId, gatewayGeneration) {
   if (typeof host.openSession !== 'function') {
     throw new Error('This Hermes Desktop version cannot open stored sessions')
   }
-  await host.openSession(id, { profile })
+  await host.openSession(id, { keepAllProfilesScope: false, profile })
   if (gatewayGeneration !== $sessionsGatewayGeneration.get()) return
   $botSelectedSessions.set({ ...$botSelectedSessions.get(), [profile]: id })
 }
