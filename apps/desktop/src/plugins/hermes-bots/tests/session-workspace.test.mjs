@@ -52,6 +52,7 @@ function load({ profile = 'ops', request, openSession } = {}) {
       openBotSessionsWorkspace,
       openProfileSession,
       filterProfileSessions,
+      sessionSourceLabel,
       $botSessionsWorkspace,
       $botSelectedSessions,
       $sessionsGatewayGeneration,
@@ -82,8 +83,19 @@ test('sessions workspace: filtering searches title, preview, and source without 
     { id: 'docs', title: 'Write docs', preview: 'guide', source: 'desktop' }
   ]
   assert.deepEqual(plain(filterProfileSessions(rows, '').map(row => row.id)), ['named', 'deploy', 'docs'])
+  assert.deepEqual(plain(filterProfileSessions(rows, 'deploy').map(row => row.id)), ['deploy'])
   assert.deepEqual(plain(filterProfileSessions(rows, 'ship').map(row => row.id)), ['deploy'])
   assert.deepEqual(plain(filterProfileSessions(rows, 'DESKTOP').map(row => row.id)), ['docs'])
+  assert.deepEqual(plain(filterProfileSessions(rows, 'bot chat').map(row => row.id)), ['docs'])
+})
+
+test('sessions workspace: source labels distinguish chat surfaces from background work', () => {
+  const { sessionSourceLabel } = load().__sessions
+  assert.equal(sessionSourceLabel('telegram'), 'Telegram')
+  assert.equal(sessionSourceLabel('desktop'), 'Bot Chat')
+  assert.equal(sessionSourceLabel('kanban'), 'Kanban')
+  assert.equal(sessionSourceLabel('tool'), 'Worker')
+  assert.equal(sessionSourceLabel('custom-source'), 'Custom source')
 })
 
 test('sessions workspace: opening a stored row uses profile-aware navigation and records selection', async () => {
@@ -138,13 +150,13 @@ test('source contract: bot rows and Active now activate the owner before canonic
   assert.match(pluginSource, /host\.request\('profiles\.list', \{\}\)/)
   assert.match(pluginSource, /const open = async \(\) => \{[\s\S]*await prepareBotSource\(bot, pinnedChat\)[\s\S]*openBotCanonicalChat\(bot\.name, pinnedChat, previewSession\)/)
   assert.match(pluginSource, /onOpen: bot => \{[\s\S]*await prepareBotSource\(bot, pinnedChat\)[\s\S]*bot\.preferred_session \|\| bot\.last_session/)
-  assert.match(pluginSource, /openBotSessionsWorkspace\(bot\)[\s\S]*children: 'Sessions'/)
+  assert.match(pluginSource, /openBotSessionsWorkspace\(bot\)[\s\S]*children: 'Conversations'/)
 })
 
 test('source contract: workspaces disclose the bounded recent-session inventory', () => {
   assert.match(pluginSource, /queryKey: \[ID, 'profile-sessions', botName, gatewayGeneration\]/)
   assert.match(pluginSource, /enabled: Boolean\(botName\)/)
-  assert.match(pluginSource, /host\.request\('session\.list', \{ profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true \}\)/)
+  assert.match(pluginSource, /host\.request\('session\.list', \{ profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true, include_internal: true \}\)/)
   assert.match(pluginSource, /Showing the \$\{PROFILE_SESSION_LIST_LIMIT\} most recent sessions\./)
   assert.match(pluginSource, /No matching sessions in the \$\{PROFILE_SESSION_LIST_LIMIT\} most recent\./)
   assert.doesNotMatch(pluginSource, /children: 'Activate profile'/)
@@ -154,4 +166,8 @@ test('source contract: workspaces disclose the bounded recent-session inventory'
 test('source contract: session controls expose filter and selection state to assistive technology', () => {
   assert.match(pluginSource, /'aria-label': 'Filter sessions'/)
   assert.match(pluginSource, /'aria-current': active \? 'page' : undefined/)
+  assert.match(pluginSource, /sessionSourceLabel\(session\.source\)/)
+  assert.match(pluginSource, /Browse \$\{displayName\(selectedBot, selectedMeta\)\} conversations/)
+  assert.match(pluginSource, /const selectedBotName = useValue\(\$selectedBot\)/)
+  assert.match(pluginSource, /const selectedBot =\s*\n\s*roster\.find/)
 })

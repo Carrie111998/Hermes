@@ -4579,7 +4579,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
             onSelect: () => openBotSessionsWorkspace(bot),
-            children: 'Sessions'
+            children: 'Conversations'
           }),
           jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: 'Edit Profile' }),
           !bot.remoteSource
@@ -7273,8 +7273,33 @@ function filterProfileSessions(sessions, query) {
   const rows = Array.isArray(sessions) ? sessions : []
   if (!needle) return rows
   return rows.filter(session =>
-    `${session?.title || ''} ${session?.preview || ''} ${session?.source || ''}`.toLowerCase().includes(needle)
+    `${session?.title || ''} ${session?.preview || ''} ${session?.source || ''} ${sessionSourceLabel(session?.source)}`
+      .toLowerCase()
+      .includes(needle)
   )
+}
+
+const SESSION_SOURCE_LABELS = Object.freeze({
+  desktop: 'Bot Chat',
+  telegram: 'Telegram',
+  whatsapp: 'WhatsApp',
+  signal: 'Signal',
+  discord: 'Discord',
+  slack: 'Slack',
+  kanban: 'Kanban',
+  tool: 'Worker',
+  cron: 'Routine',
+  cli: 'CLI',
+  tui: 'Terminal'
+})
+
+function sessionSourceLabel(source) {
+  const normalized = String(source || '').trim().toLowerCase()
+  if (!normalized) return 'Session'
+  if (SESSION_SOURCE_LABELS[normalized]) return SESSION_SOURCE_LABELS[normalized]
+  return normalized
+    .replace(/[-_]+/g, ' ')
+    .replace(/^./, character => character.toUpperCase())
 }
 
 function useProfileSessions(botName, gatewayGeneration) {
@@ -7283,7 +7308,9 @@ function useProfileSessions(botName, gatewayGeneration) {
     enabled: Boolean(botName),
     // include_hidden: this browser exists precisely to see the profile's own
     // (always-hidden) Bot Mode sessions alongside its regular ones.
-    queryFn: () => host.request('session.list', { profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true }),
+    // include_internal is inventory-only: it surfaces Kanban/worker transcripts
+    // without copying messages into Bot Chat or triggering another model run.
+    queryFn: () => host.request('session.list', { profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true, include_internal: true }),
     refetchInterval: 8000,
     staleTime: 4000,
     retry: false
@@ -7312,6 +7339,7 @@ async function openProfileSession(botName, session, gatewayGeneration) {
 }
 
 function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
+  const sourceLabel = sessionSourceLabel(session.source)
   return jsxs('button', {
     type: 'button',
     'aria-current': active ? 'page' : undefined,
@@ -7322,13 +7350,23 @@ function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
       active && 'bg-(--ui-row-active-background)'
     ),
     children: [
-      jsx('span', {
-        className: 'truncate text-[0.8125rem] font-medium',
-        children: session.title || 'Untitled session'
+      jsxs('div', {
+        className: 'flex w-full min-w-0 items-center gap-1.5',
+        children: [
+          jsx('span', {
+            className: 'min-w-0 flex-1 truncate text-[0.8125rem] font-medium',
+            children: session.title || 'Untitled session'
+          }),
+          jsx('span', {
+            className:
+              'shrink-0 rounded-sm border border-(--ui-stroke-secondary) px-1 py-px text-[0.6rem] font-medium text-(--ui-text-tertiary)',
+            children: sourceLabel
+          })
+        ]
       }),
       jsx('div', {
         className: 'truncate text-[0.7rem] text-(--ui-text-tertiary)',
-        children: session.preview || session.source || 'No messages yet'
+        children: session.preview || `${sourceLabel} conversation has no messages yet`
       })
     ]
   })
@@ -7355,7 +7393,7 @@ function ProfileSessionsWorkspace({ bot }) {
       }),
       jsx('div', {
         className: 'min-w-0 flex-1 truncate text-sm font-semibold',
-        children: `${displayName(bot, $botMeta.get()[bot.name])} sessions`
+        children: `${displayName(bot, $botMeta.get()[bot.name])} conversations`
       })
     ]
   })
@@ -8737,6 +8775,7 @@ function BotsPane() {
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
+  const selectedBotName = useValue($selectedBot)
   const [createOpen, setCreateOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState(null)
@@ -8787,6 +8826,12 @@ function BotsPane() {
 
     return activityOf(b) - activityOf(a)
   })
+  const selectedBot =
+    roster.find(bot => bot.name === selectedBotName) ||
+    roster.find(bot => bot.name === activeProfile) ||
+    roster[0] ||
+    null
+  const selectedMeta = selectedBot ? botRosterMeta(selectedBot, allMeta) : null
   const activeSourceRoster = roster.filter(bot => !bot.remoteSource)
   // Hidden bots (right-click → Hide Bot) drop out of the roster list unless
   // the header eye toggle reveals them. Display-only: every other consumer
@@ -8861,6 +8906,19 @@ function BotsPane() {
           jsxs('div', {
             className: 'flex items-center gap-0.5',
             children: [
+              selectedBot
+                ? jsx(Tip, {
+                    label: `Browse ${displayName(selectedBot, selectedMeta)} conversations`,
+                    children: jsx('button', {
+                      type: 'button',
+                      'aria-label': `Browse ${displayName(selectedBot, selectedMeta)} conversations`,
+                      className:
+                        'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                      onClick: () => openBotSessionsWorkspace(selectedBot),
+                      children: jsx(Codicon, { name: 'comment-discussion' })
+                    })
+                  })
+                : null,
               jsx(Tip, {
                 label: activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable',
                 children: jsx('button', {
