@@ -134,6 +134,27 @@ def test_refine_strict_transcript_read_propagates_store_failure():
         store.load_transcript("sess-refine-1", raise_on_error=True)
 
 
+def test_refine_strict_transcript_read_rejects_unavailable_database():
+    store = object.__new__(SessionStore)
+    store._db = None
+
+    with pytest.raises(RuntimeError, match="database is unavailable"):
+        store.load_transcript("sess-refine-1", raise_on_error=True)
+
+
+def test_refine_strict_transcript_read_propagates_tip_lookup_failure():
+    class _FailingTipDB:
+        def get_compression_tip(self, _session_id):
+            raise RuntimeError("tip lookup failed")
+
+    store = object.__new__(SessionStore)
+    store._db = _FailingTipDB()
+    store._transcript_reroutes = {}
+
+    with pytest.raises(RuntimeError, match="tip lookup failed"):
+        store.load_transcript("sess-refine-1", raise_on_error=True)
+
+
 @pytest.mark.asyncio
 async def test_refine_cached_agent_uses_persisted_transcript_when_messages_empty():
     entry = _session_entry()

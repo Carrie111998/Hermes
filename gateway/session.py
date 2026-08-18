@@ -3811,6 +3811,8 @@ class SessionStore:
         transcript from a genuinely empty one.
         """
         if not self._db:
+            if raise_on_error:
+                raise RuntimeError("Session database is unavailable")
             return []
         # Follow the write-side reroute chain (cycle-guarded, same shape as
         # append_to_transcript).
@@ -3826,6 +3828,8 @@ class SessionStore:
             if tip:
                 session_id = tip
         except Exception:
+            if raise_on_error:
+                raise
             pass
         try:
             # repair_alternation: this load feeds LIVE REPLAY. A durable
