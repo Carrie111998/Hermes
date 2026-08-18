@@ -38,11 +38,19 @@ from typing import Any, List, Optional
 _BUTTON_OUTCOMES = frozenset({"diverted", "chain_exhausted", "no_fallback"})
 
 # Longest callback_data prefix is "rl:dismiss:" (11 bytes); Telegram caps
-# callback_data at 64 bytes total. 48 leaves that prefix 5 bytes of slack
+# callback_data at 64 bytes TOTAL. 48 leaves that prefix 5 bytes of slack
 # while comfortably clearing a normal uuid4 event_id (36 chars) untouched --
-# only a pathological event_id (see MINOR 4 in the token comment below) is
-# ever actually truncated.
-_MAX_TOKEN_LEN = 48
+# only a pathological event_id (see the token comment below) is ever
+# actually truncated.
+#
+# The bound is in BYTES, not characters. A character slice looks equivalent
+# and is not: an event_id of multi-byte characters ("🎉" * 5000, which
+# Event.from_dict will happily accept from a stored row) survives a 48-CHAR
+# slice as 192 bytes, producing ~203-byte callback_data. Telegram rejects
+# that with a BadRequest, which re-raises out of _send_telegram and drops the
+# ENTIRE ALERT -- the exact failure this bound exists to prevent, reintroduced
+# by the more natural-looking slice. Verified during review by reproduction.
+_MAX_TOKEN_BYTES = 48
 
 
 def buttons_for(event: Any) -> Optional[List[List[dict]]]:
@@ -75,7 +83,11 @@ def buttons_for(event: Any) -> Optional[List[List[dict]]]:
     # doesn't resolve, that tap just no-ops -- strictly better than losing
     # the message.
     token = getattr(event, "event_id", None) or "unknown"
-    token = str(token)[:_MAX_TOKEN_LEN]
+    # Byte-safe truncation: slice the UTF-8 encoding, then decode with
+    # errors="ignore" so a cut landing mid-codepoint drops that partial
+    # character rather than raising. Never slice the str directly -- see
+    # _MAX_TOKEN_BYTES above for why that silently fails to bound anything.
+    token = str(token).encode("utf-8")[:_MAX_TOKEN_BYTES].decode("utf-8", "ignore")
 
     choose = {"label": "Choose model…", "callback_data": f"rl:choose:{token}"}
     dismiss = {"label": "Dismiss", "callback_data": f"rl:dismiss:{token}"}

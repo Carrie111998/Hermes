@@ -95,3 +95,24 @@ def test_overlong_event_id_does_not_break_the_64_byte_cap():
     for row in spec:
         for b in row:
             assert len(b["callback_data"].encode("utf-8")) <= 64
+
+
+def test_multibyte_event_id_is_bounded_in_BYTES_not_characters():
+    """A character-slice looks equivalent to a byte-slice and is not.
+
+    Reproduced during review: an event_id of multi-byte characters survives a
+    48-CHARACTER slice as 192 bytes, yielding ~203-byte callback_data.
+    Telegram rejects that with a BadRequest which re-raises out of
+    _send_telegram and drops the ENTIRE ALERT -- strictly worse than sending
+    it with no buttons. Pin the byte bound so the natural-looking regression
+    (str[:N]) cannot come back silently.
+    """
+    import dataclasses
+    from events.override_buttons import buttons_for
+    ev = dataclasses.replace(_ev("diverted"), event_id="🎉" * 5000)
+    spec = buttons_for(ev)
+    assert spec, "an over-long id must still produce buttons, not None"
+    for row in spec:
+        for b in row:
+            n = len(b["callback_data"].encode("utf-8"))
+            assert n <= 64, f"callback_data is {n} bytes, over Telegram's 64-byte cap"
