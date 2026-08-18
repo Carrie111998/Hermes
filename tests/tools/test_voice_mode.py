@@ -2000,3 +2000,56 @@ class TestQueuedPlayback:
         assert results["A"] is False, "A barged-in by C"
         assert results["C"] is True, "C (latest) plays through"
         assert results["B"] is False, "B drained after A was interrupted"
+
+    @pytest.mark.macos_only
+    def test_player_exception_does_not_strand_waiter(self, monkeypatch, sample_wav):
+        """Regression: if play_audio_file raises, submit_and_wait must return
+        False instead of blocking on done.wait() forever.
+
+        The bug: _PlaybackQueue._run() called play_audio_file outside any
+        try/except, so a player failure (e.g. TimeoutExpired from
+        proc.wait(timeout=300)) skipped done.set() and the submitting thread
+        hung indefinitely. This test would hang on the old code — the join
+        timeout is the guard.
+        """
+        import tools.voice_mode as vm
+
+        def boom(_path):
+            raise subprocess.TimeoutExpired(cmd=["afplay", sample_wav], timeout=300)
+
+        monkeypatch.setattr(vm, "play_audio_file", boom)
+
+        result: list = []
+        t = threading.Thread(
+            target=lambda: result.append(
+                vm.play_audio_file_queued(sample_wav, key="k-exc")
+            )
+        )
+        t.start()
+        t.join(timeout=5)
+        assert not t.is_alive(), "submit_and_wait blocked forever on player exception"
+        assert result == [False], f"expected False on player failure, got {result}"
+
+    @pytest.mark.macos_only
+    def test_queue_recovers_after_player_exception(self, monkeypatch, sample_wav):
+        """Regression: after a player exception, the queue worker keeps
+        serving later submissions (the except path must `continue`, not let
+        the worker die and leave the queue idle-dead)."""
+        import tools.voice_mode as vm
+
+        calls = {"n": 0}
+
+        def flaky(_path):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise subprocess.TimeoutExpired(cmd=["afplay", sample_wav], timeout=300)
+            return True
+
+        monkeypatch.setattr(vm, "play_audio_file", flaky)
+
+        first = vm.play_audio_file_queued(sample_wav, key="k-recover")
+        second = vm.play_audio_file_queued(sample_wav, key="k-recover")
+
+        assert first is False, "first (exception) submission reports False"
+        assert second is True, "queue keeps working after player exception"
+        assert calls["n"] == 2

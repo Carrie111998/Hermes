@@ -1780,7 +1780,14 @@ class _PlaybackQueue:
                         if self._q.empty():
                             return  # idle -> next submit restarts us
                         continue
-                played = play_audio_file(file_path)
+                try:
+                    played = play_audio_file(file_path)
+                except Exception:
+                    # Player failure (timeout, missing binary, bad file) must
+                    # not strand the submitting caller on done.wait() forever.
+                    result[0] = False
+                    done.set()
+                    continue
                 result[0] = played
                 done.set()
                 if not played:
