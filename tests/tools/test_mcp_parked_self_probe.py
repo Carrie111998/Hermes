@@ -40,6 +40,17 @@ def test_parked_retry_interval_is_clamped_to_safe_floor():
     assert server._parked_retry_interval() == _MIN_PARKED_RETRY_INTERVAL
 
 
+@pytest.mark.parametrize("configured", ["30s", []])
+def test_parked_retry_interval_invalid_value_uses_default(configured, caplog):
+    from tools.mcp_tool import MCPServerTask, _PARKED_RETRY_INTERVAL
+
+    server = MCPServerTask("srv")
+    server._config = {"parked_retry_interval": configured}
+
+    assert server._parked_retry_interval() == _PARKED_RETRY_INTERVAL
+    assert "parked_retry_interval must be a number of seconds" in caplog.text
+
+
 def test_revival_discovery_registers_tools_while_ready_is_cleared(monkeypatch):
     """A managed server revival must publish tools before readiness is reset."""
     from tools import mcp_tool

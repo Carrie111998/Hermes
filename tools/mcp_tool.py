@@ -2162,7 +2162,17 @@ class MCPServerTask:
         configured = self._config.get("parked_retry_interval")
         if configured is None:
             return float(_PARKED_RETRY_INTERVAL)
-        return max(_MIN_PARKED_RETRY_INTERVAL, float(configured))
+        try:
+            interval = float(configured)
+        except (TypeError, ValueError):
+            logger.warning(
+                "MCP config parked_retry_interval must be a number of seconds; "
+                "using default %s instead of %r",
+                _PARKED_RETRY_INTERVAL,
+                configured,
+            )
+            return float(_PARKED_RETRY_INTERVAL)
+        return max(_MIN_PARKED_RETRY_INTERVAL, interval)
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
