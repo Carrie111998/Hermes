@@ -3806,6 +3806,27 @@ const GROUP_TURN_POLL_MS = 2000
 // reached the room (db's Aug 2026 report).
 const GROUP_TURN_HARD_CAP_MS = 20 * 60000
 
+/** One controller per room, SHARED by the composer (pick) and the turn loop
+ *  (stage). A snapshot is WeakMap-bound to the instance that created it, so
+ *  two instances would throw invalid-snapshot; a single instance also makes
+ *  clear() (finalize) safe to call after the whole round, not per member. */
+function getOrCreateRoomController(group) {
+  const existing = roomAttachmentControllers.get(group)
+
+  if (existing) {
+    return existing
+  }
+
+  if (!SdkCreateAttachmentController) {
+    return null
+  }
+
+  const controller = SdkCreateAttachmentController({ contextKey: `${ID}:${group}` })
+  roomAttachmentControllers.set(group, controller)
+
+  return controller
+}
+
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
@@ -3831,9 +3852,7 @@ async function runGroupChatMemberTurn(group, member, prompt, thread) {
   let refs = []
 
   if (snapshot && snapshot.attachments.length) {
-    const controller = roomAttachmentControllers.get(group) || (SdkCreateAttachmentController
-      ? (roomAttachmentControllers.set(group, SdkCreateAttachmentController({ contextKey: `${ID}:${group}` })), roomAttachmentControllers.get(group))
-      : null)
+    const controller = getOrCreateRoomController(group)
 
     if (controller) {
       try {
@@ -3859,13 +3878,6 @@ async function runGroupChatMemberTurn(group, member, prompt, thread) {
         )
       }
     }
-
-    // Consume the key either way: one send, one staging attempt per member.
-    pendingAttachmentSnapshots.delete(attachKey)
-    updateGroupChat(group, r => {
-      delete r.pendingAttachKey
-      return r
-    })
   }
 
   if (refs.length) {
@@ -4112,6 +4124,33 @@ async function runGroupChatRounds(group, members, thread) {
       }
     }
   } finally {
+    // Finalize attachments AFTER the whole round, not per member: the same
+    // send snapshot is staged into EVERY responder's session, so consuming
+    // (or clearing) it at the first member would drop the file for the rest.
+    const room = $groupChats.get()[group] || {}
+    const attachKey = room.pendingAttachKey
+
+    if (attachKey) {
+      const snapshot = pendingAttachmentSnapshots.get(attachKey)
+
+      if (snapshot) {
+        // Remove ONLY the sent items from the controller scope: clears their
+        // chips and stage caches without touching files the user picked for
+        // a next send while this round was running.
+        const controller = getOrCreateRoomController(group)
+
+        for (const item of snapshot.attachments) {
+          controller?.remove(item.id)
+        }
+      }
+
+      pendingAttachmentSnapshots.delete(attachKey)
+      updateGroupChat(group, r => {
+        delete r.pendingAttachKey
+        return r
+      })
+    }
+
     if (isCurrent()) {
       updateGroupChat(group, r => {
         r.running = false
@@ -8171,10 +8210,12 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
   // Attachment capability (AT-01): feature-detected seam. Absent → the
   // attach action is disabled with an explanation; never a raw fallback.
+  // Uses the SAME per-room instance as the turn loop (getOrCreateRoomController)
+  // so snapshots taken here stage validly there (WeakMap-bound per instance).
   const attachmentControllerRef = useRef(null)
 
-  if (SdkCreateAttachmentController && !attachmentControllerRef.current) {
-    attachmentControllerRef.current = SdkCreateAttachmentController({ contextKey: `${ID}:${group}` })
+  if (!attachmentControllerRef.current) {
+    attachmentControllerRef.current = getOrCreateRoomController(group)
   }
 
   const attachmentController = attachmentControllerRef.current
@@ -8272,7 +8313,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
     }
 
     setDraft('')
-    attachmentController?.clear()
+    // NOTE: no clear() here — the turn loop stages this send's snapshot into
+    // EVERY responder's session, and the controller's snapshot is still
+    // current until runGroupChatRounds finalizes it. Clear happens there.
     // Main composer = START A NEW THREAD with the whole group (Slack shape).
     // Full descriptors ride into the turn loop: remote members keep their
     // connection fields so their turns route to their own machines.

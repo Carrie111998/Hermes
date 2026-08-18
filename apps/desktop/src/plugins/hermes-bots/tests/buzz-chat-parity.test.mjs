@@ -13,13 +13,24 @@ import vm from 'node:vm'
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 /** Load the plugin in a vm with scripted host/document so the chat-parity
- *  helpers are reachable and deterministic. */
-function load() {
+ *  helpers are reachable and deterministic. Pass `sdkNamespace` to inject a
+ *  fake SDK (attachment seam) and `turnScript(profile, prompt)` to drive
+ *  member turns (session.create/resume/prompt.submit are simulated). */
+function load(sdkNamespace, turnScript = () => 'ok') {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => values.set(slot, value) }
     values.set(slot, initial)
     return slot
+  }
+  const calls = []
+  const sessions = new Map()
+  const runtimeToStored = new Map()
+  let sessionSequence = 0
+
+  const resolveSession = (profile, target) => {
+    const stored = runtimeToStored.get(target) || (sessions.has(target) ? target : null)
+    return stored ? sessions.get(stored) : null
   }
   const context = {
     atom,
@@ -32,11 +43,50 @@ function load() {
     COMPOSER_AREAS: { middleware: 'middleware' },
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
     host: {
-      request: async () => ({}),
+      request: async (method, params) => {
+        if (method === 'session.create') {
+          sessionSequence += 1
+          const stored = `sid-${params.profile}-${sessionSequence}`
+          const runtime = `rt-${params.profile}-${sessionSequence}`
+          const session = { stored, runtime, profile: params.profile, title: params.title, messages: [] }
+          sessions.set(stored, session)
+          runtimeToStored.set(runtime, stored)
+          return { session_id: runtime, stored_session_id: stored, message_count: 0, messages: [] }
+        }
+        if (method === 'session.resume') {
+          const session = resolveSession(params.profile, params.session_id)
+          if (!session) {
+            throw new Error(`session not found: ${params.session_id}`)
+          }
+          return {
+            session_id: session.runtime,
+            session_key: session.stored,
+            message_count: session.messages.length,
+            messages: [...session.messages],
+            inflight: false,
+            running: false
+          }
+        }
+        if (method === 'prompt.submit') {
+          const session = resolveSession(null, params.session_id)
+          if (!session) {
+            throw new Error(`runtime session not found: ${params.session_id}`)
+          }
+          session.messages.push({ role: 'user', content: params.text })
+          calls.push({ profile: session.profile, prompt: params.text, runtime: session.runtime, stored: session.stored })
+          const reply = turnScript(session.profile, params.text, calls.length, session)
+          session.messages.push({ role: 'assistant', content: reply })
+          return {}
+        }
+        return {}
+      },
       state: { profile: { get: () => 'default', listen: () => undefined }, gateway: { listen: () => undefined } },
       notify: () => undefined,
       notifyError: () => undefined
     }
+  }
+  if (sdkNamespace) {
+    context.sdk = sdkNamespace
   }
   const source = pluginSource
     .replace(/^import\s+\*\s+as\s+sdk\s+from '@hermes\/plugin-sdk'\r?\n/m, '')
@@ -46,7 +96,7 @@ function load() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__cp = { validateChannelName, createChannel, deleteChannel, knownChannels, channelMemberBots, $channels };\n'
+      '\nglobalThis.__cp = { validateChannelName, createChannel, deleteChannel, knownChannels, channelMemberBots, $channels, getOrCreateRoomController, pendingAttachmentSnapshots, roomAttachmentControllers, runGroupChatRounds, updateGroupChat, $groupChats };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -54,7 +104,7 @@ function load() {
     storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
     register: () => undefined
   })
-  return { ...context.__cp, storageWrites }
+  return { ...context.__cp, storageWrites, calls }
 }
 
 // ── CP: copy text chat ───────────────────────────────────────────────────────
@@ -233,4 +283,139 @@ test('AT: mutation-sensitive — removing the seam detection disables the capabi
   // If the seam detection line is removed, the capability-negative test
   // above must turn RED (the attach action would silently vanish).
   assert.match(pluginSource, /SdkCreateAttachmentController/)
+})
+
+// ── AT-RG: executable lifecycle regression (CB-02, @sting/@honey findings) ──
+
+/** Fake SDK attachment controller that MIMICS the real WeakMap snapshot
+ *  contract: stage() rejects snapshots not created by the same instance
+ *  (invalid-snapshot). Tracks stage/remove calls so the test can assert the
+ *  whole-round lifecycle. */
+function fakeSdkWithController() {
+  const instances = []
+  const sdkNamespace = {
+    createAttachmentController: () => {
+      const items = []
+      const snapshots = new WeakMap()
+      const controller = {
+        stageCalls: [],
+        removeCalls: [],
+        $attachments: {
+          get: () => [...items],
+          listen: () => () => undefined
+        },
+        pickFiles: async () => {
+          items.push({ id: 'a1', kind: 'file', label: 'report.pdf', status: 'ready' })
+          return { added: 1, rejected: 0 }
+        },
+        addDropped: () => ({ added: 0, rejected: 0 }),
+        clear: () => {
+          items.length = 0
+        },
+        remove: id => {
+          controller.removeCalls.push(id)
+          const index = items.findIndex(item => item.id === id)
+
+          if (index >= 0) {
+            items.splice(index, 1)
+            return true
+          }
+
+          return false
+        },
+        setContext: () => undefined,
+        snapshot: () => {
+          const snapshot = Object.freeze({
+            attachments: Object.freeze(items.map(item => Object.freeze({ ...item }))),
+            contextKey: 'room'
+          })
+          snapshots.set(snapshot, { attachments: [...items], contextVersion: 0 })
+
+          return snapshot
+        },
+        stage: async (snapshot, target) => {
+          if (!snapshots.has(snapshot)) {
+            const error = new Error('Attachment snapshot was not created by this controller.')
+            error.code = 'invalid-snapshot'
+            throw error
+          }
+
+          controller.stageCalls.push({ sessionId: target.sessionId, routeKey: target.routeKey })
+
+          return {
+            attachments: snapshot.attachments.map(item => ({ id: item.id, kind: item.kind, label: item.label, refText: '@file:ref' })),
+            sessionId: target.sessionId
+          }
+        }
+      }
+      instances.push(controller)
+
+      return controller
+    }
+  }
+
+  return { instances, sdkNamespace }
+}
+
+const ATTACH_MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: '' }]
+
+/** Seed a room with one user message (thread 't1') and an attachment send:
+ *  snapshot parked under a pending key, room.pendingAttachKey set. */
+async function seedAttachmentSend(cp, group = 'Room') {
+  cp.updateGroupChat(group, room => {
+    room.log = [{ from: { kind: 'user', name: 'You' }, text: 'here is the file', at: 1, thread: 't1' }]
+    room.watermarks = { 't1::research': 0, 't1::builder': 0, 't1::ops': 0 }
+    room.epoch = 1
+    return room
+  })
+  const controller = cp.getOrCreateRoomController(group)
+  await controller.pickFiles()
+  const snapshot = controller.snapshot()
+  const attachKey = `${group}\u0000${Date.now()}`
+  cp.pendingAttachmentSnapshots.set(attachKey, snapshot)
+  cp.updateGroupChat(group, room => {
+    room.pendingAttachKey = attachKey
+    return room
+  })
+
+  return { attachKey, controller }
+}
+
+test('AT-RG: one shared controller — snapshot stages for EVERY responder without invalid-snapshot', async () => {
+  const { instances, sdkNamespace } = fakeSdkWithController()
+  const cp = load(sdkNamespace, () => 'got it')
+  // The composer and the turn loop must resolve the SAME instance: a second
+  // instance would make stage() reject the snapshot (WeakMap is per-instance).
+  const first = cp.getOrCreateRoomController('Room')
+  const second = cp.getOrCreateRoomController('Room')
+  assert.equal(first, second, 'one controller per room, shared by composer and turn loop')
+
+  await seedAttachmentSend(cp)
+  await cp.runGroupChatRounds('Room', ATTACH_MEMBERS, 't1')
+
+  const controller = instances[0]
+  // EVERY responder stages the SAME send into its own session — the exact
+  // WeakMap snapshot created by the shared controller must stay valid across
+  // the whole round (no invalid-snapshot, no clear() between members).
+  const profilesStaged = new Set(controller.stageCalls.map(call => call.sessionId.split('-')[1]))
+  assert.equal(profilesStaged.has('research'), true, 'research staged the send')
+  assert.equal(profilesStaged.has('builder'), true, 'builder staged the send')
+  assert.equal(profilesStaged.has('ops'), true, 'ops staged the send')
+  // No staging-failure entry: an invalid-snapshot would have surfaced here.
+  const log = cp.$groupChats.get().Room.log
+  assert.ok(!log.some(entry => /staging failed/i.test(entry.text)), 'no staging failure in the room log')
+})
+
+test('AT-RG: send snapshot survives the whole round and is finalized only after all responders', async () => {
+  const { instances, sdkNamespace } = fakeSdkWithController()
+  const cp = load(sdkNamespace, () => 'got it')
+  const { attachKey } = await seedAttachmentSend(cp)
+
+  await cp.runGroupChatRounds('Room', ATTACH_MEMBERS, 't1')
+
+  // After the round: the key is consumed, the room flag is gone, and the
+  // sent items were removed from the controller scope (chips cleared).
+  assert.equal(cp.pendingAttachmentSnapshots.get(attachKey), undefined, 'snapshot consumed after the round')
+  assert.equal(cp.$groupChats.get().Room.pendingAttachKey, undefined, 'pending flag cleared after the round')
+  assert.equal(instances[0].removeCalls.length, 1, 'sent attachment removed from the controller scope')
 })

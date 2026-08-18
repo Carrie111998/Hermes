@@ -1,7 +1,11 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
+// NOTE: use-prompt-actions pulls the session/store graph (transcribe, prompts,
+// preview-status...) — it is intentionally NOT imported at top level because
+// this factory is exported from the SDK index, and a static import would drag
+// that graph into every SDK consumer (regression: profile-routing.test.ts
+// failed on import). It is loaded lazily inside stageOne().
 import { extractDroppedFiles, isImagePath, partitionDroppedFiles } from '@/app/chat/hooks/use-composer-actions'
-import { uploadComposerAttachment } from '@/app/session/hooks/use-prompt-actions'
 import type { GatewayRequest } from '@/app/session/hooks/use-prompt-actions/utils'
 import { attachmentDisplayText, attachmentId, pathLabel } from '@/lib/chat-runtime'
 import { selectDesktopPaths } from '@/lib/desktop-fs'
@@ -273,6 +277,10 @@ export function createAttachmentController(options: AttachmentControllerOptions 
       let recoveredSessionId: string | undefined
 
       try {
+        // Lazy boundary: a static import here would pull the whole
+        // session/store graph into every SDK consumer (sdk/index.ts exports
+        // this factory). Loaded only when staging actually runs.
+        const { uploadComposerAttachment } = await import('@/app/session/hooks/use-prompt-actions')
         const uploaded = await uploadComposerAttachment(attachment, {
           backendCwd: target.backendCwd,
           remote: target.remote,
