@@ -49,6 +49,7 @@ import os
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error
@@ -345,8 +346,15 @@ def delegate_to_devin(
     # Resolve cwd the same way the terminal tool does — TERMINAL_CWD is
     # force-exported from config.yaml's terminal.cwd by cli.py, so messaging
     # gateway sessions delegate to the user's configured workspace, not the
-    # gateway launch directory.
+    # gateway launch directory. Validate and fall back to os.getcwd() if the
+    # configured directory is relative, deleted, or inaccessible.
     workdir = os.environ.get("TERMINAL_CWD") or os.getcwd()
+    try:
+        workdir = str(Path(workdir).resolve())
+        if not Path(workdir).is_dir():
+            workdir = os.getcwd()
+    except (OSError, ValueError):
+        workdir = os.getcwd()
 
     start = time.monotonic()
     try:
@@ -354,8 +362,11 @@ def delegate_to_devin(
         # group on timeout — Devin spawns child processes (shell, browser,
         # etc.) and subprocess.run only kills the direct child, leaving
         # descendants running. Mirrors tools/code_execution_tool.py's pattern.
+        # stdin=DEVNULL prevents interactive prompts from blocking the
+        # synchronous tool call until timeout expires.
         proc = subprocess.Popen(
             argv,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

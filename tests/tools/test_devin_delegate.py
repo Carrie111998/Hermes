@@ -284,13 +284,31 @@ class TestDelegateToDevin(unittest.TestCase):
 
         def fake_popen(argv, **kw):
             captured["cwd"] = kw.get("cwd")
+            captured["stdin"] = kw.get("stdin")
             return _mock_popen(stdout="ok")
 
         with p1, p2, p3, \
-             patch.dict(os.environ, {"TERMINAL_CWD": "/tmp/test-workspace"}), \
+             patch.dict(os.environ, {"TERMINAL_CWD": "/tmp"}), \
              patch.object(mod.subprocess, "Popen", side_effect=fake_popen):
             delegate_to_devin(goal="do thing")
-        self.assertEqual(captured["cwd"], "/tmp/test-workspace")
+        self.assertTrue(captured["cwd"].endswith("/tmp") or captured["cwd"] == "/tmp")
+        # stdin must be DEVNULL to prevent interactive prompts from blocking
+        self.assertEqual(captured["stdin"], subprocess.DEVNULL)
+
+    def test_falls_back_to_cwd_when_terminal_cwd_invalid(self):
+        """If TERMINAL_CWD points to a non-existent dir, fall back to os.getcwd()."""
+        p1, p2, p3 = self._patch_env()
+        captured = {}
+
+        def fake_popen(argv, **kw):
+            captured["cwd"] = kw.get("cwd")
+            return _mock_popen(stdout="ok")
+
+        with p1, p2, p3, \
+             patch.dict(os.environ, {"TERMINAL_CWD": "/nonexistent/path/xyz"}), \
+             patch.object(mod.subprocess, "Popen", side_effect=fake_popen):
+            delegate_to_devin(goal="do thing")
+        self.assertEqual(captured["cwd"], os.getcwd())
 
 
 class TestSchema(unittest.TestCase):
