@@ -102,6 +102,18 @@ def _purge_database_rows() -> tuple[list[tuple[object, ...]], ...]:
                     "FROM gateway_routing ORDER BY scope, session_key"
                 ).fetchall()
             ],
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT key, value FROM state_meta ORDER BY key"
+                ).fetchall()
+            ],
+            [
+                tuple(row)
+                for row in db._conn.execute(
+                    "SELECT * FROM async_delegations ORDER BY delegation_id"
+                ).fetchall()
+            ],
         )
     finally:
         db.close()
@@ -375,6 +387,114 @@ def test_cold_purge_refuses_routed_verified_lineage_and_retains_database_rows(
     assert code == 1
     assert err == ""
     assert "gateway_routing" in out
+    assert "lineage-root" in out
+    assert _purge_database_rows() == before_rows
+
+
+@pytest.mark.parametrize("purge_flag", ["--dry-run", "--yes"])
+@pytest.mark.parametrize(
+    ("reference_kind", "reference_name"),
+    [
+        pytest.param("state_meta", "goal", id="state-meta-goal"),
+        pytest.param("state_meta", "loop", id="state-meta-loop"),
+        pytest.param("state_meta", "heartbeat", id="state-meta-heartbeat"),
+        pytest.param("async_delegations", "origin_session", id="delegation-origin"),
+        pytest.param(
+            "async_delegations",
+            "parent_session_id",
+            id="delegation-parent",
+        ),
+        pytest.param(
+            "async_delegations",
+            "origin_session_id",
+            id="delegation-origin-session-id",
+        ),
+    ],
+)
+def test_cold_purge_refuses_unsnapshotted_soft_references_without_mutation(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    purge_flag: str,
+    reference_kind: str,
+    reference_name: str,
+) -> None:
+    _seed_archived_lineage()
+    archive_root = session_home.parent / "cold-root"
+    store_code, _store_out, store_err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-store",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--yes",
+    )
+    assert store_code == 0
+    assert store_err == ""
+
+    db = SessionDB()
+    try:
+        assert db._conn is not None
+        columns = {
+            str(row[1])
+            for row in db._conn.execute(
+                "PRAGMA table_info(async_delegations)"
+            ).fetchall()
+        }
+        assert "origin_session_id" in columns
+        if reference_kind == "state_meta":
+            db._conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (f"{reference_name}:lineage-root", '{"keep":"unchanged"}'),
+            )
+        else:
+            reference_values = {
+                "origin_session": "unrelated-origin",
+                "parent_session_id": None,
+                "origin_session_id": "unrelated-api-session",
+            }
+            reference_values[reference_name] = "lineage-root"
+            db._conn.execute(
+                "INSERT INTO async_delegations ("
+                "delegation_id, origin_session, parent_session_id, "
+                "origin_session_id, state, dispatched_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"delegation-{reference_name}",
+                    reference_values["origin_session"],
+                    reference_values["parent_session_id"],
+                    reference_values["origin_session_id"],
+                    "completed",
+                    1.0,
+                    2.0,
+                ),
+            )
+        assert (
+            db._conn.execute("SELECT COUNT(*) FROM gateway_routing").fetchone()[0]
+            == 0
+        )
+    finally:
+        db.close()
+
+    before_rows = _purge_database_rows()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-purge",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        purge_flag,
+    )
+
+    assert code == 1
+    assert err == ""
+    assert reference_kind in out
+    assert reference_name in out
     assert "lineage-root" in out
     assert _purge_database_rows() == before_rows
 

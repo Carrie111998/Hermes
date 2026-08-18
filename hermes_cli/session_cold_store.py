@@ -22,6 +22,12 @@ from hermes_state import SessionDB, resolved_max_export_messages
 
 _ARCHIVE_FORMAT = "hermes-cold-archive-store-spike/v1"
 _MAX_SQLITE_IN_PARAMS = 500
+_STATE_META_SESSION_NAMESPACES = ("goal", "loop", "heartbeat")
+_ASYNC_DELEGATION_SESSION_COLUMNS = (
+    "origin_session",
+    "parent_session_id",
+    "origin_session_id",
+)
 
 
 @dataclass(frozen=True)
@@ -677,11 +683,77 @@ def _reject_gateway_routing_references(
             )
 
 
+def _required_table_columns(
+    conn: sqlite3.Connection, table: str, required: tuple[str, ...]
+) -> None:
+    """Reject stale or damaged soft-reference schemas before purge."""
+    quoted_table = _quoted_identifier(table)
+    rows = conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+    columns = {str(row[1]) for row in rows}
+    missing = [column for column in required if column not in columns]
+    if missing:
+        missing_names = ", ".join(f"{table}.{column}" for column in missing)
+        raise ValueError(
+            "cold purge cannot verify soft references because the session "
+            f"database schema is missing {missing_names}"
+        )
+
+
+def _reject_state_meta_references(
+    conn: sqlite3.Connection, physical_ids: tuple[str, ...]
+) -> None:
+    """Reject goal/loop/heartbeat keys owned by any covered session."""
+    _required_table_columns(conn, "state_meta", ("key",))
+    for namespace in _STATE_META_SESSION_NAMESPACES:
+        for ids in _id_chunks(physical_ids):
+            keys = tuple(f"{namespace}:{session_id}" for session_id in ids)
+            placeholders = ",".join("?" for _ in keys)
+            row = conn.execute(
+                f"SELECT key FROM state_meta WHERE key IN ({placeholders}) LIMIT 1",
+                keys,
+            ).fetchone()
+            if row is None:
+                continue
+            key = str(row[0])
+            session_id = key.split(":", 1)[1]
+            raise ValueError(
+                "cold purge refuses state_meta soft reference to lineage "
+                f"session {session_id}: namespace={namespace!r}, key={key!r}"
+            )
+
+
+def _reject_async_delegation_references(
+    conn: sqlite3.Connection, physical_ids: tuple[str, ...]
+) -> None:
+    """Reject durable delegation rows naming any covered session."""
+    required_columns = ("delegation_id", *_ASYNC_DELEGATION_SESSION_COLUMNS)
+    _required_table_columns(conn, "async_delegations", required_columns)
+    for column in _ASYNC_DELEGATION_SESSION_COLUMNS:
+        quoted_column = _quoted_identifier(column)
+        for ids in _id_chunks(physical_ids):
+            placeholders = ",".join("?" for _ in ids)
+            row = conn.execute(
+                "SELECT delegation_id, "
+                f"{quoted_column} FROM async_delegations "
+                f"WHERE {quoted_column} IN ({placeholders}) LIMIT 1",
+                ids,
+            ).fetchone()
+            if row is None:
+                continue
+            raise ValueError(
+                "cold purge refuses async_delegations soft reference to "
+                f"lineage session {row[1]}: column={column!r}, "
+                f"delegation_id={str(row[0])!r}"
+            )
+
+
 def _reject_uncovered_session_references(
     conn: sqlite3.Connection, physical_ids: tuple[str, ...]
 ) -> None:
     """Fail if deleting the covered rows would mutate any unsnapshotted row."""
     _reject_gateway_routing_references(conn, physical_ids)
+    _reject_state_meta_references(conn, physical_ids)
+    _reject_async_delegation_references(conn, physical_ids)
     covered = set(physical_ids)
     chunks = _id_chunks(physical_ids)
     for ids in chunks:

@@ -13,6 +13,7 @@ from hermes_cli.session_cold_store import (
     plan_archived_lineage,
     purge_archived_lineage,
     store_archived_lineage,
+    validate_purge_archived_lineage,
 )
 from hermes_state import SessionDB
 
@@ -193,6 +194,56 @@ def test_purge_rejects_unverifiable_routing_entries_and_retains_all_rows(
         assert db.load_gateway_routing_entries(scope="test-routing-scope") == {
             "route-key": entry_json
         }
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("operation", ["preflight", "purge"])
+def test_purge_fails_closed_when_optional_delegation_reference_column_is_absent(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="keep me")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+        assert db._conn is not None
+        db._conn.execute(
+            "ALTER TABLE async_delegations DROP COLUMN origin_session_id"
+        )
+        db._conn.commit()
+        before_meta = db._conn.execute(
+            "SELECT key, value FROM state_meta ORDER BY key"
+        ).fetchall()
+        before_delegations = db._conn.execute(
+            "SELECT * FROM async_delegations ORDER BY delegation_id"
+        ).fetchall()
+        assert (
+            db._conn.execute("SELECT COUNT(*) FROM gateway_routing").fetchone()[0]
+            == 0
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"schema is missing async_delegations\.origin_session_id",
+        ):
+            if operation == "preflight":
+                validate_purge_archived_lineage(db, "terminal", archive_root)
+            else:
+                purge_archived_lineage(db, "terminal", archive_root)
+
+        assert db.get_session("terminal") is not None
+        assert db.get_messages("terminal")[0]["content"] == "keep me"
+        assert db._conn.execute(
+            "SELECT key, value FROM state_meta ORDER BY key"
+        ).fetchall() == before_meta
+        assert db._conn.execute(
+            "SELECT * FROM async_delegations ORDER BY delegation_id"
+        ).fetchall() == before_delegations
     finally:
         db.close()
 
