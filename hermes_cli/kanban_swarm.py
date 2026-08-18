@@ -26,6 +26,9 @@ from hermes_cli import kanban_db as kb
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 CONTRACT_PREFIX = "[swarm:contract] "
 MULTI_AGENT_LANE_IDS = ("native_hermes", "claude", "grok", "agy")
+REQUIRED_LANE_ID = "native_hermes"
+EXTERNAL_LANE_IDS = ("claude", "grok", "agy")
+MIN_EXTERNAL_LANES = 2
 DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 120
 DEFAULT_GOAL_MAX_TURNS = 5
 
@@ -183,9 +186,19 @@ def create_swarm(
             raise ValueError("lane-bound swarms require a lane_id for every worker")
         if len(set(lane_ids)) != len(lane_ids):
             raise ValueError("worker lane_id values must be unique")
-        if set(lane_ids) != set(MULTI_AGENT_LANE_IDS):
+        unknown_lanes = set(lane_ids) - set(MULTI_AGENT_LANE_IDS)
+        if unknown_lanes:
             raise ValueError(
-                "lane-bound swarms require exactly native_hermes, claude, grok, agy"
+                "lane-bound swarms only accept lane ids: "
+                + ", ".join(MULTI_AGENT_LANE_IDS)
+            )
+        if REQUIRED_LANE_ID not in lane_ids:
+            raise ValueError(f"lane-bound swarms require the {REQUIRED_LANE_ID} lane")
+        external_present = set(lane_ids) & set(EXTERNAL_LANE_IDS)
+        if len(external_present) < MIN_EXTERNAL_LANES:
+            raise ValueError(
+                f"lane-bound swarms require at least {MIN_EXTERNAL_LANES} of "
+                + ", ".join(EXTERNAL_LANE_IDS)
             )
         if goal_max_turns < 1 or worker_max_runtime_seconds < 1:
             raise ValueError("goal_max_turns and worker_max_runtime_seconds must be positive")

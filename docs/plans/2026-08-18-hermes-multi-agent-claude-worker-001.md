@@ -422,3 +422,40 @@ unexecuted, so this ticket is not complete:
 
 DGX deployment, service restart, relay/timer enablement, and any Telegram
 mutation also remain separate, unexecuted, and unauthorized.
+
+## Amendment (2026-08-18): lane quorum relaxed to native_hermes + 2-of-3 external
+
+The design and implementation above required exactly four lanes
+(`native_hermes`, `claude`, `grok`, `agy`) with a fail-closed verifier that
+blocked on any missing lane. After merge, the user explicitly authorized
+relaxing that requirement: with `claude`, `grok`, and `agy` all runtime-
+available in this environment, a swarm should not be blocked just because one
+external CLI lane is unavailable or fails preflight on a given run.
+
+The amended contract, implemented directly on `origin/main` (no design-review
+round was re-run; this is a scope relaxation authorized by the user in the
+Claude continuation session, not a new independently reviewed ticket):
+
+- `native_hermes` remains a required lane in every lane-bound swarm.
+- At least 2 of the 3 external lanes (`claude`, `grok`, `agy`) must be
+  present; a swarm with 0 or 1 external lane is rejected at construction.
+- Unknown lane ids are still rejected; duplicate lane ids are still rejected.
+- `expected_lane_count` and `verified_lane_count` are unaffected — they were
+  already derived from the actual worker count (3 or 4), not hardcoded to 4 —
+  so the verifier's fail-closed gate-on-completeness behavior is unchanged for
+  whatever lane set a given swarm actually declares.
+- All four lanes remain a fully valid, and still tested, configuration.
+
+This changes `hermes_cli/kanban_swarm.py` (`create_swarm` lane validation) and
+adds four tests to `tests/hermes_cli/test_kanban_swarm.py` covering: 2-of-3
+external construction, missing `native_hermes` rejection, fewer-than-2-external
+rejection, and unknown-lane-id rejection. `optional-skills/devops/kanban-worker/SKILL.md`
+was updated to describe the quorum instead of an exact four-lane requirement.
+
+This amendment does not retroactively change what the original design review
+(gate 2) or the original implementation review (Claude PASS, Grok PASS, AGY
+BLOCKED) approved; those approvals were for the strict four-lane contract.
+The amendment itself has not been independently re-reviewed by a second
+reviewer family, and the disposable end-to-end Telegram test (gate 8) still
+has not been run under either contract. Do not treat this amendment as
+closing any of acceptance gates 3-9.

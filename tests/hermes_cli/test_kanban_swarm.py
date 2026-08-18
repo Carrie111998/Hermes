@@ -155,6 +155,106 @@ def test_lane_bound_swarm_persists_contracts_goal_budget_and_runtime(tmp_path):
         conn.close()
 
 
+def test_lane_bound_swarm_allows_two_of_three_external_lanes(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Ask native Hermes plus two available external agents for one joke.",
+            workers=[
+                SwarmWorkerSpec(
+                    profile=lane, title=f"{lane} joke", body="Return one joke.",
+                    skills=[] if lane == "native_hermes" else ["kanban-worker"], lane_id=lane,
+                )
+                for lane in ("native_hermes", "claude", "grok")
+            ],
+            verifier_assignee="verifier",
+            synthesizer_assignee="synthesizer",
+            tenant="delivery-test",
+        )
+        workers = [kb.get_task(conn, tid) for tid in created.worker_ids]
+        verifier = kb.get_task(conn, created.verifier_id)
+        assert [extract_contract(task.body)["expected_lane_id"] for task in workers] == [
+            "native_hermes", "claude", "grok",
+        ]
+        assert extract_contract(verifier.body)["expected_lane_count"] == 3
+    finally:
+        conn.close()
+
+
+def test_lane_bound_swarm_rejects_missing_native_hermes_lane(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError, match="native_hermes"):
+            create_swarm(
+                conn,
+                goal="Missing the required native_hermes lane.",
+                workers=[
+                    SwarmWorkerSpec(
+                        profile=lane, title=lane, body="Work.",
+                        skills=["kanban-worker"], lane_id=lane,
+                    )
+                    for lane in ("claude", "grok", "agy")
+                ],
+                verifier_assignee="verifier",
+                synthesizer_assignee="synthesizer",
+            )
+    finally:
+        conn.close()
+
+
+def test_lane_bound_swarm_rejects_fewer_than_two_external_lanes(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError, match="at least 2"):
+            create_swarm(
+                conn,
+                goal="Only one external lane is available.",
+                workers=[
+                    SwarmWorkerSpec(
+                        profile="native_hermes", title="native_hermes", body="Work.",
+                        skills=[], lane_id="native_hermes",
+                    ),
+                    SwarmWorkerSpec(
+                        profile="claude", title="claude", body="Work.",
+                        skills=["kanban-worker"], lane_id="claude",
+                    ),
+                ],
+                verifier_assignee="verifier",
+                synthesizer_assignee="synthesizer",
+            )
+    finally:
+        conn.close()
+
+
+def test_lane_bound_swarm_rejects_unknown_lane_id(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError, match="only accept lane ids"):
+            create_swarm(
+                conn,
+                goal="An unrecognized lane id is not a valid worker lane.",
+                workers=[
+                    SwarmWorkerSpec(
+                        profile="native_hermes", title="native_hermes", body="Work.",
+                        skills=[], lane_id="native_hermes",
+                    ),
+                    SwarmWorkerSpec(
+                        profile="claude", title="claude", body="Work.",
+                        skills=["kanban-worker"], lane_id="claude",
+                    ),
+                    SwarmWorkerSpec(
+                        profile="grok", title="grok", body="Work.",
+                        skills=["kanban-worker"], lane_id="mystery",
+                    ),
+                ],
+                verifier_assignee="verifier",
+                synthesizer_assignee="synthesizer",
+            )
+    finally:
+        conn.close()
+
+
 def test_lane_bound_completion_is_fail_closed_and_synth_requires_verifier_gate(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:

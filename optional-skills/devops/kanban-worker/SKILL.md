@@ -9,11 +9,14 @@ Use the existing Kanban completion path (`hermes kanban complete` or the
 `kanban_complete` tool). Keep the human-readable summary useful but concise;
 machine-readable facts belong in completion metadata.
 
-## Four-lane worker contract
+## Multi-lane worker contract
 
 For a lane-bound swarm, the task card names the expected lane and preflight
-skill (empty only for the native_hermes lane). A worker may complete only after its preflight succeeds and must use
-this metadata shape:
+skill (empty only for the native_hermes lane). Every swarm requires the
+`native_hermes` lane plus at least two of the three external lanes
+(`claude`, `grok`, `agy`); a swarm is not blocked by one unavailable external
+lane, but never runs with fewer than two external lanes present. A worker may
+complete only after its preflight succeeds and must use this metadata shape:
 
 ```json
 {
@@ -28,8 +31,9 @@ this metadata shape:
 
 The verifier must use `role="verifier"`, the matching `root_id`,
 `gate="pass"`, and both `expected_lane_count` and `verified_lane_count` equal
-to four. The synthesizer must use `role="synthesizer"`, the matching root,
-`outcome="completed"`, and `result_present=true`.
+to the number of worker lanes actually in the swarm (3 or 4). The synthesizer
+must use `role="synthesizer"`, the matching root, `outcome="completed"`, and
+`result_present=true`.
 
 The human-visible joke or other deliverable belongs in the existing task
 `result` field. Do not copy it into metadata, audit events, dashboard
