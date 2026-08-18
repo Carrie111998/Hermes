@@ -330,12 +330,14 @@ def test_tasks_referencing_script_finds_other_tasks(monkeypatch):
     assert "Hermes_Gateway_OnStart" in referencing
 
 
+@pytest.mark.windows_only
 def test_tasks_referencing_script_none_when_scan_fails(monkeypatch):
     """A failed scan must return None (fail safe), not an empty list."""
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: (1, "", "access denied"))
     assert gateway_windows._tasks_referencing_script(Path("C:/Hermes/gateway-service/Hermes_Gateway.cmd")) is None
 
 
+@pytest.mark.windows_only
 def test_uninstall_keeps_scripts_referenced_by_other_tasks(monkeypatch, tmp_path, capsys):
     """uninstall() must not delete the shared .cmd/.vbs when another task
     (e.g. a manual boot task) still references them."""
@@ -367,6 +369,7 @@ def test_uninstall_keeps_scripts_referenced_by_other_tasks(monkeypatch, tmp_path
     assert "Hermes_Gateway_OnStart" in out
 
 
+@pytest.mark.windows_only
 def test_uninstall_removes_scripts_when_unreferenced(monkeypatch, tmp_path, capsys):
     """uninstall() deletes the .cmd/.vbs when no other task references them."""
     script_path = tmp_path / "Hermes_Gateway_alice.cmd"
