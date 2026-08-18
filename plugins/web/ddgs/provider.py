@@ -1,4 +1,4 @@
-"""DuckDuckGo search — plugin form (via the ``ddgs`` package).
+"""DuckDuckGo search provider with platform-specific transports.
 
 Subclasses the plugin-facing :class:`agent.web_search_provider.WebSearchProvider`.
 The legacy in-tree module ``tools.web_providers.ddgs`` was removed in the
@@ -399,9 +399,9 @@ class DDGSWebSearchProvider(WebSearchProvider):
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a DuckDuckGo search and return normalized results.
 
-        The synchronous ``ddgs`` call runs in a disposable child process with
-        a hard wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung native
-        ``primp`` call cannot freeze the Hermes process (#36776, #68096).
+        The synchronous transport runs in a disposable child process with a
+        hard wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung native
+        call cannot freeze the Hermes process (#36776, #68096).
         """
         if not is_termux():
             try:
@@ -438,7 +438,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
                 "success": False,
                 "error": "DuckDuckGo search interrupted",
             }
-        except Exception as exc:  # noqa: BLE001 — ddgs raises its own exceptions
+        except Exception as exc:  # noqa: BLE001 — transports raise vendor exceptions
             logger.warning("DDGS search error: %s", exc)
             return {"success": False, "error": f"DuckDuckGo search failed: {exc}"}
 

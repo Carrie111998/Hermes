@@ -1121,7 +1121,7 @@ if __name__ == "__main__":
         elif backend == "brave-free":
             print("   Using Brave Search free tier (search only)")
         elif backend == "ddgs":
-            print("   Using DuckDuckGo via ddgs package (search only)")
+            print("   Using DuckDuckGo (search only)")
         elif firecrawl_url_available:
             print(f"   Using self-hosted Firecrawl: {(_gev('FIRECRAWL_API_URL') or '').strip().rstrip('/')}")
         elif firecrawl_key_available:
