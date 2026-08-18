@@ -61,12 +61,15 @@ def _event(*, profile: str | None) -> MessageEvent:
         user_id="user-1",
         profile=profile,
     )
-    # A multiplex source must carry a trusted transport/persistence binding to
-    # be treated as a proven routed message (what the adapter's build_source
-    # stamps in real operation); otherwise the runner's fail-closed gate drops
-    # it as an unbound restored/synthetic source.
-    source._transport_profile = profile or "default"
-    source._persistence_profile = profile or "default"
+    # A multiplex source that is handed to the runner's fail-closed ingress
+    # must carry a trusted transport/persistence binding to be treated as a
+    # proven routed message (what the adapter's build_source stamps in real
+    # operation). Sources with an explicit profile are bound here; a
+    # profile=None source is intentionally left unbound so the adapter can
+    # stamp its own runtime profile.
+    if profile is not None:
+        source._transport_profile = profile
+        source._persistence_profile = profile
     return MessageEvent(
         text="follow up",
         message_type=MessageType.TEXT,
