@@ -78,6 +78,14 @@ def test_flag_off_for_explicit_falsy_values(monkeypatch):
         assert hook._tombstone_enabled() is False, raw
 
 
+def test_unrecognized_flag_values_do_not_enable(monkeypatch):
+    """A default-off safety flag must not be switched ON by a typo. Pins the
+    strict allowlist against a future 'anything not falsy' rewrite."""
+    for raw in ("disabled", "banana", "2", "-1", "on ish"):
+        monkeypatch.setenv(hook.TOMBSTONE_FLAG, raw)
+        assert hook._tombstone_enabled() is False, raw
+
+
 def test_flag_on_for_truthy_values(monkeypatch):
     for raw in ("1", "true", "yes", "on"):
         monkeypatch.setenv(hook.TOMBSTONE_FLAG, raw)
@@ -147,7 +155,10 @@ TOMBSTONE_CACHE = os.path.join(HOME, ".claude", "logs", "memory-tombstones.json"
 TOMBSTONE_MAX_AGE_SEC = 24 * 3600
 CLAUDE_REPO = os.path.join(HOME, ".claude")
 
-_FALSY = {"", "0", "false", "no", "off"}
+# Strict allowlist, NOT "anything that isn't falsy". A default-off safety flag
+# must not be switched ON by a typo: CLAUDE_MEMORY_TOMBSTONE_WARN=disabled has
+# to mean disabled.
+_TRUTHY = {"1", "true", "yes", "on"}
 
 # A memory file is a *.md directly inside a memory root -- no subdirectories,
 # since the roots are flat and a nested path is not a linkable memory.
@@ -155,7 +166,7 @@ _MEMORY_PATH_RE = re.compile(r"/\.claude/projects/[^/]+/memory/[^/]+\.md$")
 
 
 def _tombstone_enabled() -> bool:
-    return (os.environ.get(TOMBSTONE_FLAG) or "").strip().lower() not in _FALSY
+    return (os.environ.get(TOMBSTONE_FLAG) or "").strip().lower() in _TRUTHY
 
 
 def _is_memory_file(file_path: str) -> bool:
@@ -188,7 +199,7 @@ def _new_text(tool_name: str, tool_input: dict) -> str:
 C:/Users/diego/.hermes/agent-src/.venv/Scripts/python.exe -m pytest C:/Users/diego/.claude/hooks/test_memory_index_size_guard_message.py -q
 ```
 
-Expected: PASS — 12 passed (5 pre-existing + 7 new).
+Expected: PASS — 13 passed (5 pre-existing + 8 new).
 
 - [ ] **Step 5: Verify only your paths are staged, then commit**
 
@@ -467,7 +478,7 @@ def _load_tombstones(
 C:/Users/diego/.hermes/agent-src/.venv/Scripts/python.exe -m pytest C:/Users/diego/.claude/hooks/test_memory_index_size_guard_message.py -q
 ```
 
-Expected: PASS — 19 passed.
+Expected: PASS — 20 passed.
 
 - [ ] **Step 5: Verify the real git path works against the live repo**
 
@@ -705,7 +716,7 @@ def _tombstone_message(hits) -> str:
 C:/Users/diego/.hermes/agent-src/.venv/Scripts/python.exe -m pytest C:/Users/diego/.claude/hooks/test_memory_index_size_guard_message.py -q
 ```
 
-Expected: PASS — 28 passed.
+Expected: PASS — 29 passed.
 
 - [ ] **Step 5: Verify only your paths are staged, then commit**
 
@@ -1041,7 +1052,7 @@ Note the BOM literal is written as `"\ufeff"` rather than a raw BOM character, s
 C:/Users/diego/.hermes/agent-src/.venv/Scripts/python.exe -m pytest C:/Users/diego/.claude/hooks/ -q
 ```
 
-Expected: PASS. All 5 original size-guard message tests still green, plus the new tests — 36 in this file — and every other hook suite unchanged.
+Expected: PASS. All 5 original size-guard message tests still green, plus the new tests — 37 in this file — and every other hook suite unchanged.
 
 - [ ] **Step 5: Verify the hook is inert end-to-end under the real interpreter**
 
