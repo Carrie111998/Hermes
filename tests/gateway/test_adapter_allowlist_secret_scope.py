@@ -103,6 +103,44 @@ class TestMatrixYamlAllowlistsSurviveScopedMiss:
         finally:
             ss.reset_secret_scope(token)
 
+    def test_scoped_env_beats_yaml_extra(self, monkeypatch):
+        """Named-profile secret must outrank YAML extra and process env."""
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@default:example.org")
+        monkeypatch.setenv("MATRIX_ALLOWED_ROOMS", "!default:example.org")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope(
+            {
+                "MATRIX_ALLOWED_USERS": "@second:example.org",
+                "MATRIX_ALLOWED_ROOMS": "!second:example.org",
+            }
+        )
+        try:
+            config = PlatformConfig(enabled=True)
+            config.extra = {
+                "homeserver": "https://example.org",
+                "allowed_users": "@operator:example.org",
+                "allowed_rooms": "!private:example.org",
+            }
+            adapter = MatrixAdapter(config)
+            assert adapter._allowed_user_ids == {"@second:example.org"}
+            assert adapter._allowed_rooms == {"!second:example.org"}
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_yaml_extra_beats_unscoped_process_env(self, monkeypatch):
+        """Without a named-profile scope, YAML extra still beats process env."""
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@default:example.org")
+        monkeypatch.setenv("MATRIX_ALLOWED_ROOMS", "!default:example.org")
+        config = PlatformConfig(enabled=True)
+        config.extra = {
+            "homeserver": "https://example.org",
+            "allowed_users": "@operator:example.org",
+            "allowed_rooms": "!private:example.org",
+        }
+        adapter = MatrixAdapter(config)
+        assert adapter._allowed_user_ids == {"@operator:example.org"}
+        assert adapter._allowed_rooms == {"!private:example.org"}
+
     def test_unscoped_startup_still_reads_environ(self, monkeypatch):
         monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@default:example.org")
         assert matrix_secret("MATRIX_ALLOWED_USERS") == "@default:example.org"

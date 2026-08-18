@@ -991,6 +991,32 @@ def _startup_env_secret(name: str) -> str:
         return os.getenv(name, "").strip()
 
 
+def _resolve_allowlist(env_name: str, extra_value):
+    """Resolve a Matrix allowlist: scoped secret > YAML extra > unscoped env.
+
+    A named-profile secret scope is authoritative for that key. YAML
+    ``config.extra`` is next. The process environment is last and only
+    for default-profile / unscoped startup — never as a fallback that
+    lets another profile's bridged ``MATRIX_ALLOWED_*`` leak in.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        if is_multiplex_active():
+            scope = current_secret_scope()
+            if scope is not None:
+                if env_name in scope:
+                    return (scope.get(env_name) or "").strip()
+                if extra_value is not None:
+                    return extra_value
+                return ""
+    except Exception:
+        pass
+    if extra_value is not None:
+        return extra_value
+    return _startup_env_secret(env_name)
+
+
 def matrix_deps_present() -> bool:
     """PASSIVE probe: are the ``platform.matrix`` packages installed?
 
@@ -1274,9 +1300,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 r.strip() for r in str(free_rooms_raw).split(",") if r.strip()
             }
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
-        allowed_rooms_raw = config.extra.get("allowed_rooms")
-        if allowed_rooms_raw is None:
-            allowed_rooms_raw = _startup_env_secret("MATRIX_ALLOWED_ROOMS")
+        # Scoped secret > YAML extra > unscoped process env.
+        allowed_rooms_raw = _resolve_allowlist(
+            "MATRIX_ALLOWED_ROOMS", config.extra.get("allowed_rooms")
+        )
         if isinstance(allowed_rooms_raw, list):
             self._allowed_rooms: Set[str] = {
                 str(r).strip() for r in allowed_rooms_raw if str(r).strip()
@@ -1363,9 +1390,10 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
-        allowed_users_raw = config.extra.get("allowed_users")
-        if allowed_users_raw is None:
-            allowed_users_raw = _startup_env_secret("MATRIX_ALLOWED_USERS")
+        # Scoped secret > YAML extra > unscoped process env.
+        allowed_users_raw = _resolve_allowlist(
+            "MATRIX_ALLOWED_USERS", config.extra.get("allowed_users")
+        )
         if isinstance(allowed_users_raw, list):
             self._allowed_user_ids: Set[str] = {
                 str(u).strip() for u in allowed_users_raw if str(u).strip()
