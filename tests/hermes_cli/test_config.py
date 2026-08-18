@@ -1528,6 +1528,48 @@ class TestSetConfigListValuedGuard:
         cfg = self._set_and_load(tmp_path, monkeypatch, "toolsets", "[hermes-cli, browser]")
         assert cfg["toolsets"] == ["hermes-cli", "browser"]
 
+    def test_list_key_multiline_block_parsed(self, tmp_path, monkeypatch):
+        """Multi-line YAML block style (the style the docs advertise) parses
+        for a list-defaulted key instead of collapsing into one element."""
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "command_allowlist", "- curl\n- git"
+        )
+        assert cfg["command_allowlist"] == ["curl", "git"]
+
+    def test_string_typed_key_keeps_bracket_looking_value(self, tmp_path, monkeypatch):
+        """A known string-typed key given a value starting with '[' keeps the
+        string (e4ea0a0ed): the intent trigger never fires for str defaults."""
+        _default = "x"
+        from hermes_cli import config as _config
+        orig = _config._default_value_for_key
+
+        def _stub(k):
+            return "placeholder" if k == "quick_phrases" else orig(k)
+
+        monkeypatch.setattr(_config, "_default_value_for_key", _stub)
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "quick_phrases", "[[ -f x ]] && echo hi"
+        )
+        assert cfg["quick_phrases"] == "[[ -f x ]] && echo hi"
+
+    def test_intent_only_unparseable_bracket_stored_as_string(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leading-[ on an unknown key that fails to parse falls through to
+        the coercion chain: stored as string with main's warning, not a hard
+        refusal (pre-guard behaviour for open keys)."""
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "open_thing.deep", "[[ broken"
+        )
+        assert cfg["open_thing"]["deep"] == "[[ broken"
+
+    def test_non_string_list_value_passes_through(self, tmp_path, monkeypatch):
+        """Programmatic callers passing a real list hit no string parsing."""
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "toolsets", ["a", "b"]
+        )
+        assert cfg["toolsets"] == ["a", "b"]
+
     def test_list_key_comma_separated_parsed(self, tmp_path, monkeypatch):
         """Comma-separated input for a list-valued key is parsed as a list."""
         cfg = self._set_and_load(tmp_path, monkeypatch, "toolsets", "hermes-cli,browser")

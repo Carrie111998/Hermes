@@ -5248,14 +5248,15 @@ def _looks_structured_value(value: str) -> bool:
 def _parse_list_value(raw: str) -> Optional[list]:
     """Parse a CLI string as a list value.
 
-    Accepts list literals (``'["a", "b"]'`` and YAML flow lists like
-    ``"[a, b]"`` via ``yaml.safe_load``; JSON is a YAML subset),
-    comma-separated values (``"a,b"``), or a single value (``"x"`` becomes
-    ``["x"]``). Returns ``None`` if the input starts with ``[`` but fails
-    to parse as a list (clear intent failure rather than silent fallback).
+    Accepts list literals (``'["a", "b"]'`` and YAML flow/block lists like
+    ``"[a, b]"`` or ``"- curl\\n- git"`` via ``yaml.safe_load``; JSON is a
+    YAML subset), comma-separated values (``"a,b"``), or a single value
+    (``"x"`` becomes ``["x"]``). Returns ``None`` when the input is
+    list-shaped but fails to parse as a list (clear intent failure rather
+    than silent fallback).
     """
     raw = raw.strip()
-    if raw.startswith("["):
+    if raw.startswith("[") or _looks_structured_value(raw):
         try:
             parsed = yaml.safe_load(raw)
             if isinstance(parsed, list):
@@ -5350,32 +5351,41 @@ def set_config_value(key: str, value: str, force: bool = False):
     # defaults (e.g. toolsets) AND from the existing config value (e.g.
     # plugins.enabled, which is absent from DEFAULT_CONFIG but list-valued;
     # _get_nested also resolves list-index paths like custom_providers.0).
-    # Also treat a leading `[` as unconditional list intent (covers first-set
-    # of keys absent from both DEFAULT_CONFIG and the existing config).
+    # A leading `[` is also treated as list intent for keys that are not
+    # string-defaulted (covers first-set of unknown keys), but never for
+    # known string-typed keys: their bracket-looking values (shell
+    # one-liners starting with `[[`, ...) stay strings (e4ea0a0ed).
+    # Non-string values (programmatic callers passing a real list) pass
+    # through untouched.
     _list_default = _default_value_for_key(key)
     _is_list_key = isinstance(_list_default, list) or isinstance(
         _get_nested(user_config, key), list
     )
-    _looks_like_list = isinstance(value, str) and value.strip().startswith("[")
+    _looks_like_list = (
+        isinstance(value, str)
+        and not isinstance(_list_default, str)
+        and value.strip().startswith("[")
+    )
     if _is_list_key or _looks_like_list:
-        _parsed = _parse_list_value(value)
-        if _parsed is None:
-            _expect = (
-                f"'{key}' is a list-valued setting"
-                if _is_list_key
-                else f"the value for '{key}' looks like a list"
-            )
-            print(
-                f"✗ {_expect}. The value could not be\n"
-                f"  parsed as a list. Use JSON array syntax:\n"
-                f"    hermes config set {key} '[\"item1\", \"item2\"]'\n"
-                f"  Or comma-separated:\n"
-                f"    hermes config set {key} 'item1,item2'\n"
-                f"  Or use `hermes config edit` to edit the file directly.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        value = _parsed
+        if isinstance(value, str):
+            _parsed = _parse_list_value(value)
+            if _parsed is not None:
+                value = _parsed
+            elif _is_list_key:
+                # Guaranteed corruption if written as a scalar: refuse.
+                print(
+                    f"✗ '{key}' is a list-valued setting. The value could not be\n"
+                    f"  parsed as a list. Use JSON array syntax:\n"
+                    f"    hermes config set {key} '[\"item1\", \"item2\"]'\n"
+                    f"  Or comma-separated:\n"
+                    f"    hermes config set {key} 'item1,item2'\n"
+                    f"  Or use `hermes config edit` to edit the file directly.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # Intent-only trigger whose literal failed to parse: not
+            # actually a list. Fall through to the coercion chain, which
+            # stores the raw string with a warning (pre-guard behaviour).
 
     # Preserve values for string-typed settings.  In particular, enum members
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
