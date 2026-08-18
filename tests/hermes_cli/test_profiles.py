@@ -925,6 +925,18 @@ class TestWriteProfileMetaDurability:
         assert "🧙" in raw
         assert profiles.read_profile_meta(profile_dir)["description"] == "Code wizard 🧙 ✨"
 
+    def test_read_profile_meta_preserves_namespaced_ui_metadata(self, tmp_path):
+        profile_dir = tmp_path / "hidden-worker"
+        profile_dir.mkdir()
+        (profile_dir / "profile.yaml").write_text(
+            "ui_meta:\n  hermes-bots:\n    hidden: true\n",
+            encoding="utf-8",
+        )
+
+        assert profiles.read_profile_meta(profile_dir)["ui_meta"] == {
+            "hermes-bots": {"hidden": True}
+        }
+
     def test_symlinked_profile_yaml_survives_the_write(self, tmp_path):
         """Guard on the conversion, not a behavior change.
 
@@ -1123,5 +1135,4 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
 

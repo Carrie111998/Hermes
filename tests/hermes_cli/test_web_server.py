@@ -2399,6 +2399,30 @@ class TestNewEndpoints:
 
     # --- Profiles ---
 
+    def test_profiles_list_exposes_source_owned_ui_metadata(self, monkeypatch, tmp_path):
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(
+            profiles_mod,
+            "list_profiles",
+            lambda: [
+                profiles_mod.ProfileInfo(
+                    name="default",
+                    path=tmp_path,
+                    is_default=True,
+                    gateway_running=False,
+                    ui_meta={"hermes-bots": {"hidden": True}},
+                )
+            ],
+        )
+
+        response = self.client.get("/api/profiles")
+
+        assert response.status_code == 200
+        assert response.json()["profiles"][0]["ui_meta"] == {
+            "hermes-bots": {"hidden": True}
+        }
+
 
 
     def test_profiles_create_builder_mcp_auth_is_profile_scoped(

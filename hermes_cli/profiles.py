@@ -657,6 +657,11 @@ class ProfileInfo:
     # surfaces a "review" badge in this case so the user can edit or
     # accept.
     description_auto: bool = False
+    # Namespaced desktop/plugin metadata from profile.yaml. This is already
+    # exposed by gateway `profiles.list`; carrying it in the REST profile
+    # summary lets multi-connection Desktop enumeration honor visibility on
+    # the profile's owning source too.
+    ui_meta: Optional[dict] = None
 
 
 def _read_distribution_meta(profile_dir: Path) -> tuple:
@@ -830,18 +835,20 @@ def read_profile_meta(profile_dir: Path) -> dict:
     """
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False}
+        return {"description": "", "description_auto": False, "ui_meta": {}}
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return {"description": "", "description_auto": False}
+        return {"description": "", "description_auto": False, "ui_meta": {}}
     if not isinstance(data, dict):
-        return {"description": "", "description_auto": False}
+        return {"description": "", "description_auto": False, "ui_meta": {}}
+    ui_meta = data.get("ui_meta")
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
+        "ui_meta": ui_meta if isinstance(ui_meta, dict) else {},
     }
 
 
@@ -911,6 +918,7 @@ def list_profiles() -> List[ProfileInfo]:
             distribution_source=dist_source,
             description=meta.get("description", ""),
             description_auto=meta.get("description_auto", False),
+            ui_meta=meta.get("ui_meta", {}),
         ))
 
     # Named profiles
@@ -953,6 +961,7 @@ def list_profiles() -> List[ProfileInfo]:
                 distribution_source=dist_source,
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
+                ui_meta=meta.get("ui_meta", {}),
             ))
 
     return profiles
