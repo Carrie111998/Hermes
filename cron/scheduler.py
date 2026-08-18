@@ -448,6 +448,14 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))
+    except ValueError:
+        # F7 (P4): a malformed ``platform_toolsets.cron`` value (e.g. a
+        # quoted-JSON list literal that is not parseable) is a CONFIGURATION
+        # ERROR — the resolver already fails closed on it, and swallowing it
+        # into the full-default fallback below would silently WIDEN the
+        # toolset back to everything (fail-open). Re-raise so the job fire
+        # fails loudly instead of running unrestricted.
+        raise
     except Exception as exc:
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",
