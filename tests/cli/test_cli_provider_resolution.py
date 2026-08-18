@@ -260,6 +260,29 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
 
 
 
+def test_runtime_max_output_tokens_becomes_cli_output_cap(monkeypatch):
+    cli = _import_cli()
+
+    def _runtime_resolve(**kwargs):
+        return {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.pokee.ai/v1",
+            "api_key": "test-key",
+            "source": "custom_provider:pokee",
+            "max_output_tokens": 60_000,
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    shell = cli.HermesCLI(model="pokee-isaac", provider="pokee", compact=True, max_turns=1)
+
+    assert shell.max_tokens is None
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.max_tokens == 60_000
+
+
 
 def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     cli = _import_cli()

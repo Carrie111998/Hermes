@@ -1370,7 +1370,7 @@ def _normalize_custom_provider_entry(
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
         "key_cmd",
         "api_mode", "transport", "model", "default_model", "models",
-        "context_length", "rate_limit_delay",
+        "context_length", "rate_limit_delay", "max_output_tokens", "max_tokens",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
@@ -1493,6 +1493,11 @@ def _normalize_custom_provider_entry(
     if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
         normalized["rate_limit_delay"] = rate_limit_delay
 
+    for max_key in ("max_output_tokens", "max_tokens"):
+        max_value = entry.get(max_key)
+        if isinstance(max_value, int) and max_value > 0:
+            normalized[max_key] = max_value
+
     discover_models = entry.get("discover_models")
     if isinstance(discover_models, bool):
         normalized["discover_models"] = discover_models
@@ -1543,6 +1548,8 @@ def _custom_provider_entry_to_provider_config(
         "models",
         "context_length",
         "rate_limit_delay",
+        "max_output_tokens",
+        "max_tokens",
         "discover_models",
         "extra_body",
         "extra_headers",

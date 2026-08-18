@@ -137,6 +137,16 @@ class CLIAgentSetupMixin:
             or resolved_acp_command != self.acp_command
             or resolved_acp_args != self.acp_args
         )
+        max_tokens_changed = False
+        if not getattr(self, "_max_tokens_configured", False):
+            runtime_max_tokens = runtime.get("max_output_tokens")
+            if isinstance(runtime_max_tokens, int) and runtime_max_tokens > 0:
+                if self.max_tokens != runtime_max_tokens:
+                    max_tokens_changed = True
+                self.max_tokens = runtime_max_tokens
+            elif self.max_tokens is not None:
+                max_tokens_changed = True
+                self.max_tokens = None
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
         self.acp_command = resolved_acp_command
@@ -183,8 +193,8 @@ class CLIAgentSetupMixin:
         model_changed = self._normalize_model_for_provider(resolved_provider)
 
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
-        # routing, or the effective model changed.
-        if (credentials_changed or routing_changed or model_changed) and self.agent is not None:
+        # routing, output cap, or the effective model changed.
+        if (credentials_changed or routing_changed or max_tokens_changed or model_changed) and self.agent is not None:
             self.agent = None
             self._active_agent_route_signature = None
 

@@ -1824,6 +1824,50 @@ class TestRetryAfterCap:
         status = self._drive_once(agent, 300)
         assert "Waiting 300.0s" in status
 
+    def test_anthropic_request_spend_limit_does_not_enter_retry_sleep(self, agent):
+        """Anthropic request-cost 429 must fail/fallback without 600s sleep.
+
+        Regression: Anthropic's "would exceed your account's monthly spend
+        limit" 429 can be request-shape-specific. With Retry-After: 600 and no
+        fallback, Hermes used to park the turn in 10-minute retry sleeps and
+        return a generic max-retries failure, making the session look globally
+        billing-blocked even though the credential pool was not poisoned.
+        """
+
+        class _AnthropicSpendLimit(Exception):
+            status_code = 429
+            response = SimpleNamespace(headers={"retry-after": "600"})
+            body = {
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "This request would exceed your account's monthly spend limit. Please try again later.",
+                }
+            }
+
+            def __str__(self):
+                return "Error code: 429 - This request would exceed your account's monthly spend limit."
+
+        def _fake_api_call(api_kwargs):
+            raise _AnthropicSpendLimit()
+
+        agent.provider = "anthropic"
+        agent.base_url = "https://api.anthropic.com"
+        agent.api_mode = "anthropic_messages"
+        agent._fallback_chain = []
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._dump_api_request_debug = lambda *args, **kwargs: None
+
+        with patch("agent.conversation_loop.time.sleep", side_effect=AssertionError("should not sleep")):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["billing_block"] is None
+        assert "did not cache" in result["final_response"]
+        assert "monthly spend limit" in result["final_response"]
+
 
 
 class TestConcurrentToolExecution:
@@ -6566,24 +6610,26 @@ class TestNormalizeCodexDictArguments:
 class TestOAuthFlagAfterCredentialRefresh:
     """_is_anthropic_oauth must update when token type changes during refresh."""
 
-    def test_oauth_flag_updates_api_key_to_oauth(self, agent):
-        """Refreshing from API key to OAuth token must set flag to True."""
+    def test_api_key_refresh_does_not_switch_to_oauth(self, agent):
+        """Static API keys must not be replaced by auto-discovered OAuth tokens."""
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
-        agent._anthropic_api_key = "sk-ant-api-old"
+        agent._anthropic_api_key = "«redacted:sk-…»"
         agent._anthropic_client = MagicMock()
         agent._is_anthropic_oauth = False
 
         with (
             patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value="sk-ant-setup-oauth-token"),
+                  return_value="«redacted:sk-…»") as resolve_token,
             patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
+                  return_value=MagicMock()) as build_client,
         ):
             result = agent._try_refresh_anthropic_client_credentials()
 
-        assert result is True
-        assert agent._is_anthropic_oauth is True
+        assert result is False
+        assert agent._is_anthropic_oauth is False
+        resolve_token.assert_not_called()
+        build_client.assert_not_called()
 
     def test_oauth_flag_updates_oauth_to_api_key(self, agent):
         """Refreshing from OAuth to API key must set flag to False."""

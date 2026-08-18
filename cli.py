@@ -5027,14 +5027,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _moa_provider_override, self.model = _normalize_moa_model(self.model)
         # Read max_tokens from config (env var override: HERMES_MAX_TOKENS)
         _env_mt = os.environ.get("HERMES_MAX_TOKENS")
+        self._max_tokens_configured = False
         if _env_mt:
             try:
                 self.max_tokens = int(_env_mt)
+                self._max_tokens_configured = True
             except (ValueError, TypeError):
                 self.max_tokens = None
         elif isinstance(_model_config, dict):
             _mt = _model_config.get("max_tokens")
             self.max_tokens = _mt if isinstance(_mt, int) else None
+            self._max_tokens_configured = self.max_tokens is not None
         else:
             self.max_tokens = None
         # Auto-detect model from local server if still on default

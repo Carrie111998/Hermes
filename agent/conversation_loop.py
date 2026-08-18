@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.agent_runtime_helpers import _is_anthropic_request_spend_limit
 from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -5204,6 +5205,10 @@ def run_conversation(
                     FailoverReason.billing,
                     FailoverReason.upstream_rate_limit,
                 }
+                is_anthropic_request_spend_limit = _is_anthropic_request_spend_limit(
+                    getattr(agent, "provider", "") or "",
+                    error_context,
+                )
                 _is_transport_failure = classified.reason in {
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
@@ -5275,6 +5280,60 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
+
+                # Anthropic sometimes returns HTTP 429 with
+                # "This request would exceed your account's monthly spend limit"
+                # for one oversized/expensive request shape even when the same
+                # account/key can still serve smaller calls. If no fallback chain
+                # is available, do NOT park the turn in 10-minute Retry-After
+                # sleeps or surface a persistent billing_block: that makes a
+                # recoverable session look globally payment-walled and strands
+                # users until they /stop. The credential-pool guard above already
+                # avoids writing a stale cooldown; this branch makes the no-
+                # fallback path equally bounded and explicitly non-sticky.
+                if is_anthropic_request_spend_limit:
+                    agent._flush_status_buffer()
+                    _summary = agent._summarize_api_error(api_error)
+                    agent._emit_status(
+                        "❌ Anthropic rejected this request as over the monthly "
+                        "spend limit. Hermes did not mark the API key/account "
+                        "exhausted; start a smaller/compacted turn or switch "
+                        "providers."
+                    )
+                    logger.error(
+                        "%sAnthropic request-spend-limit rejection surfaced "
+                        "without retry sleep or billing_block: %s | provider=%s "
+                        "model=%s msgs=%s tokens=~%s",
+                        agent.log_prefix,
+                        _summary,
+                        _provider,
+                        _model,
+                        len(api_messages),
+                        f"{approx_tokens:,}",
+                    )
+                    if api_kwargs is not None:
+                        agent._dump_api_request_debug(
+                            api_kwargs,
+                            reason="anthropic_request_spend_limit_no_retry",
+                            error=api_error,
+                        )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": (
+                            "Anthropic rejected this request as over the monthly "
+                            f"spend limit: {_summary}\n\n"
+                            "Hermes did not cache this as a provider/account "
+                            "billing block. Use /compress, /reset, or switch "
+                            "providers for this oversized turn."
+                        ),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _summary,
+                        "failure_reason": classified.reason.value,
+                        "billing_block": None,
+                    }
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
