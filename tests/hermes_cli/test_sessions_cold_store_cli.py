@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import sys
@@ -109,6 +110,27 @@ def _snapshot_files(archive_root: Path) -> dict[Path, bytes]:
     }
 
 
+def _write_legacy_route(session_home: Path, session_id: str) -> Path:
+    sessions_file = session_home / "sessions" / "sessions.json"
+    sessions_file.parent.mkdir(exist_ok=True)
+    sessions_file.write_text(
+        json.dumps(
+            {
+                "_README": "legacy routing mirror",
+                "agent:main:telegram:dm:123": {
+                    "session_key": "agent:main:telegram:dm:123",
+                    "session_id": session_id,
+                    "created_at": "2026-08-18T00:00:00+00:00",
+                    "updated_at": "2026-08-18T00:00:00+00:00",
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return sessions_file
+
+
 def test_sessions_help_exposes_only_converged_public_cold_archive_command(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -164,6 +186,7 @@ def test_cold_archive_dry_run_is_read_only_and_does_not_require_snapshot(
 ) -> None:
     _seed_archived_lineage()
     archive_root = session_home.parent / "new-cold-root"
+    lock_path = cold_store._cold_archive_lock_path(archive_root)
     before_sessions = _session_rows()
     before_messages = _message_rows()
     db_path = session_home / "state.db"
@@ -201,12 +224,118 @@ def test_cold_archive_dry_run_is_read_only_and_does_not_require_snapshot(
     assert "nothing was written or deleted" in out
     assert opens == [True]
     assert not archive_root.exists()
+    assert not lock_path.exists()
     with sqlite3.connect(db_path) as conn:
         assert int(conn.execute("PRAGMA schema_version").fetchone()[0]) == schema_version
         assert conn.execute(
             "SELECT 1 FROM sqlite_schema "
             "WHERE type = 'index' AND name = 'idx_compression_locks_expires'"
         ).fetchone() is None
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+
+
+def test_cold_archive_lock_contention_fails_before_store_without_mutation(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage(unrelated=True)
+    archive_root = session_home.parent / "cold-root"
+    equivalent_root = archive_root.parent / "unused" / ".." / archive_root.name
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+    before_files = _snapshot_files(archive_root)
+
+    def unexpected_stage(*_args, **_kwargs):
+        raise AssertionError("lock contention must fail before Store/Verify/Purge")
+
+    monkeypatch.setattr(cold_store, "store_archived_lineage", unexpected_stage)
+    monkeypatch.setattr(cold_store, "verify_archived_lineage", unexpected_stage)
+    monkeypatch.setattr(cold_store, "purge_archived_lineage", unexpected_stage)
+
+    with cold_store._exclusive_cold_archive_root_lock(archive_root):
+        code, out, err = _run_cli(
+            monkeypatch,
+            capsys,
+            "sessions",
+            "cold-archive",
+            str(equivalent_root),
+            "--session-id",
+            "lineage-terminal",
+            "--yes",
+        )
+
+    assert code == 1
+    assert err == ""
+    assert "already active for archive root" in out
+    assert _snapshot_files(archive_root) == before_files
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+
+
+def test_cold_archive_dry_run_rejects_legacy_route_without_mutation(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage(unrelated=True)
+    archive_root = session_home.parent / "new-cold-root"
+    sessions_file = _write_legacy_route(session_home, "lineage-root")
+    before_route = sessions_file.read_bytes()
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-archive",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--dry-run",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "could not plan cold archive" in out
+    assert "sessions.json legacy route" in out
+    assert not archive_root.exists()
+    assert sessions_file.read_bytes() == before_route
+    assert _session_rows() == before_sessions
+    assert _message_rows() == before_messages
+
+
+def test_cold_archive_yes_rejects_legacy_route_at_purge_and_retains_state(
+    session_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_archived_lineage(unrelated=True)
+    archive_root = session_home.parent / "cold-root"
+    sessions_file = _write_legacy_route(session_home, "lineage-terminal")
+    before_route = sessions_file.read_bytes()
+    before_sessions = _session_rows()
+    before_messages = _message_rows()
+
+    code, out, err = _run_cli(
+        monkeypatch,
+        capsys,
+        "sessions",
+        "cold-archive",
+        str(archive_root),
+        "--session-id",
+        "lineage-terminal",
+        "--yes",
+    )
+
+    assert code == 1
+    assert err == ""
+    assert "cold archive Purge failed" in out
+    assert "sessions.json legacy route" in out
+    assert any(path.name == "metadata.json" for path in _snapshot_files(archive_root))
+    assert sessions_file.read_bytes() == before_route
     assert _session_rows() == before_sessions
     assert _message_rows() == before_messages
 

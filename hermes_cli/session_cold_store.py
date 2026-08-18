@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import errno
@@ -15,7 +16,7 @@ import secrets
 import shutil
 import sqlite3
 import stat
-from typing import Any
+from typing import Any, Iterator
 
 from hermes_state import SessionDB, resolved_max_export_messages
 
@@ -32,6 +33,17 @@ _COORDINATION_SESSION_REFERENCES = (
     ("compression_locks", "session_id"),
     ("session_turn_leases", "conversation_id"),
 )
+
+
+def _canonical_archive_root(archive_root: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(archive_root)))
+
+
+def _cold_archive_lock_path(archive_root: Path) -> Path:
+    """Return the stable sidecar path for one lexical archive root."""
+    canonical_root = _canonical_archive_root(archive_root)
+    digest = sha256(os.fsencode(canonical_root)).hexdigest()
+    return canonical_root.parent / f".hermes-cold-archive-{digest}.lock"
 
 
 @dataclass(frozen=True)
@@ -327,6 +339,53 @@ def _validate_directory_chain(edges: list[tuple[int, str, int, Path]]) -> None:
     for parent_fd, name, descriptor, path in edges:
         if not _directory_entry_matches(parent_fd, name, descriptor):
             raise _unsafe_archive_parent(path)
+
+
+@contextmanager
+def _exclusive_cold_archive_root_lock(archive_root: Path) -> Iterator[None]:
+    """Hold one non-blocking process lock beside an archive root."""
+    _require_supported_platform()
+    import fcntl
+
+    canonical_root = _canonical_archive_root(archive_root)
+    lock_path = _cold_archive_lock_path(canonical_root)
+    descriptors, edges = _open_snapshot_parent(canonical_root.parent, ())
+    parent_fd = descriptors[-1]
+    lock_fd = -1
+    try:
+        flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            lock_fd = os.open(lock_path.name, flags, 0o600, dir_fd=parent_fd)
+        except OSError as exc:
+            raise ValueError(f"unsafe cold archive lock sidecar: {lock_path}") from exc
+
+        opened = os.fstat(lock_fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"unsafe cold archive lock sidecar: {lock_path}")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"another cold-archive is already active for archive root {canonical_root}"
+            ) from exc
+
+        _validate_directory_chain(edges)
+        try:
+            entry = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(f"unsafe cold archive lock sidecar: {lock_path}") from exc
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_dev != opened.st_dev
+            or entry.st_ino != opened.st_ino
+        ):
+            raise ValueError(f"unsafe cold archive lock sidecar: {lock_path}")
+        yield
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _write_text_fsync_at(directory_fd: int, name: str, text: str) -> None:
@@ -687,6 +746,55 @@ def _reject_gateway_routing_references(
             )
 
 
+def _reject_legacy_routing_references(physical_ids: tuple[str, ...]) -> None:
+    """Fail closed when the legacy sessions.json routes to this lineage."""
+    from hermes_constants import get_hermes_home
+
+    sessions_file = get_hermes_home() / "sessions" / "sessions.json"
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(sessions_file, flags)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError(
+            "cold purge cannot verify sessions.json legacy routes"
+        ) from exc
+
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("cold purge cannot verify sessions.json legacy routes")
+        try:
+            with os.fdopen(
+                descriptor, "r", encoding="utf-8", closefd=False
+            ) as source:
+                routes = json.load(source)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "cold purge cannot verify sessions.json legacy routes"
+            ) from exc
+    finally:
+        os.close(descriptor)
+
+    if not isinstance(routes, dict):
+        raise ValueError("cold purge cannot verify sessions.json legacy routes")
+    covered = set(physical_ids)
+    for session_key, entry in routes.items():
+        if str(session_key).startswith("_"):
+            continue
+        if not isinstance(entry, dict) or not isinstance(entry.get("session_id"), str):
+            raise ValueError(
+                "cold purge cannot verify sessions.json legacy routes: "
+                f"session_key={str(session_key)!r}"
+            )
+        session_id = entry["session_id"]
+        if session_id in covered:
+            raise ValueError(
+                "cold purge refuses sessions.json legacy route to lineage "
+                f"session {session_id}: session_key={str(session_key)!r}"
+            )
+
+
 def _required_table_columns(
     conn: sqlite3.Connection, table: str, required: tuple[str, ...]
 ) -> None:
@@ -835,6 +943,7 @@ def _build_purge_reference_plan(
     """Build the archived source plan and reject every deletion reference."""
     plan = _build_store_plan(conn, terminal_id)
     _reject_uncovered_session_references(conn, plan.physical_ids)
+    _reject_legacy_routing_references(plan.physical_ids)
     return plan
 
 
