@@ -12,22 +12,19 @@ def test_kling_ai_catalog_manifest() -> None:
 
     assert entry.name == "Plugin-Hermes-kling-ai"
     assert entry.transport.type == "http"
-    assert entry.transport.url == "${KLING_AI_MCP_URL}"
+    assert entry.transport.url == "https://kling.ai/mcp"
     assert entry.auth.type == "oauth"
-    assert len(entry.auth.env) == 1
-    assert entry.auth.env[0].name == "KLING_AI_MCP_URL"
-    assert entry.auth.env[0].default == "https://klingai.com/mcp"
-    assert entry.auth.env[0].secret is False
+    assert entry.auth.env == []
     assert entry.suggest is not None
     assert entry.suggest.keywords == ["kling", "kling ai", "klingai", "可灵", "可灵ai"]
     assert entry.suggest.hosts == ["klingai.com", "kling.ai"]
-    assert "https://kling.ai/mcp" in entry.post_install
+    assert "KLING_AI_MCP_URL" not in MANIFEST.read_text(encoding="utf-8")
 
 
 def test_kling_ai_catalog_builds_one_oauth_server() -> None:
     entry = _parse_manifest(MANIFEST)
 
     assert _build_server_config(entry, {}) == {
-        "url": "${KLING_AI_MCP_URL}",
+        "url": "https://kling.ai/mcp",
         "auth": "oauth",
     }

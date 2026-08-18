@@ -41,7 +41,6 @@ def test_kling_ai_skill_contract_and_structure() -> None:
     assert positions == sorted(positions)
     for phrase in (
         "Plugin-Hermes-kling-ai",
-        "https://klingai.com/mcp",
         "https://kling.ai/mcp",
         "credit-consuming",
         "at most once",
@@ -50,6 +49,8 @@ def test_kling_ai_skill_contract_and_structure() -> None:
         "text fallback",
     ):
         assert phrase in text
+
+    assert "https://klingai.com/mcp" not in text
 
     assert (SKILL_DIR / "references" / "tool-workflows.md").is_file()
     assert (SKILL_DIR / "references" / "troubleshooting.md").is_file()

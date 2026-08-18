@@ -5,16 +5,10 @@ source: https://kling.ai/
 
 transport:
   type: http
-  url: "${KLING_AI_MCP_URL}"
+  url: "https://kling.ai/mcp"
 
 auth:
   type: oauth
-  env:
-    - name: KLING_AI_MCP_URL
-      prompt: "Kling MCP endpoint: China https://klingai.com/mcp or Global https://kling.ai/mcp"
-      default: "https://klingai.com/mcp"
-      required: true
-      secret: false
 
 suggest:
   keywords:
@@ -28,10 +22,6 @@ suggest:
     - kling.ai
 
 post_install: |
-  Use exactly one regional endpoint in a Hermes profile:
-  - China: https://klingai.com/mcp
-  - Global: https://kling.ai/mcp
-
   Complete browser OAuth when Hermes connects for the first time.
   Install the companion Skill with:
     hermes skills install official/creative/kling-ai

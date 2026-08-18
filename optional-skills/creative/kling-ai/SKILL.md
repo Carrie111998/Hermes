@@ -28,9 +28,9 @@ Do not use this Skill for unrelated media providers or for editing media locally
 ## Prerequisites
 
 - Hermes Agent has one MCP server named `Plugin-Hermes-kling-ai`.
-- Exactly one regional endpoint is active: China `https://klingai.com/mcp` or Global `https://kling.ai/mcp`.
+- The server points to the Kling AI Global endpoint `https://kling.ai/mcp`.
 - The server uses Hermes-native OAuth. Never request an API key or expose credentials, cookies, authorization headers, private account fields, or signed URLs in logs.
-- For the repository package, preserve `X-Kling-Integration: Plugin-Hermes` and `supports_parallel_tool_calls: false` from the selected regional YAML. The official MCP catalog schema cannot currently encode these two optional fields.
+- For the repository package, preserve `X-Kling-Integration: Plugin-Hermes` and `supports_parallel_tool_calls: false` from `mcp.config.yaml`. The official MCP catalog schema cannot currently encode these two optional fields.
 
 Hermes owns OAuth dynamic registration and uses its native client identity. The integration header is telemetry-only and must not affect authorization, billing, or rollout.
 
@@ -71,7 +71,7 @@ Use these defaults only when the user did not specify alternatives and the live 
 
 ## Pitfalls
 
-- **Both regions enabled:** OAuth/account state and submission ownership become ambiguous. Disconnect and reauthorize before switching regions.
+- **Legacy endpoint:** remove an older non-Global connection before adding the Global endpoint, then complete OAuth again.
 - **Blind retries:** a lost response does not prove the credit-consuming request failed. Query existing tasks first.
 - **Stale schema assumptions:** refresh the live schema and revise only unsupported fields.
 - **Parallel generation calls:** keep parallel tool calls disabled because submissions and reads may share account/task state.
