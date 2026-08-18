@@ -264,6 +264,16 @@ def _is_ephemeral_scaffolding(msg: Any) -> bool:
 
 _MAX_TOOL_WORKERS = 8
 
+# Wording of the periodic refresh emitted while a cross-process session turn
+# lease is held elsewhere (``_on_session_turn_lease_wait``). The refresh only
+# makes sense on surfaces that can update the initial wait notice in place;
+# gateway/run.py derives its no-in-place-update suppression matcher from this
+# constant (#89166) — never re-inline the wording at either site.
+SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE = (
+    "⏳ Still waiting for the other Hermes process on "
+    "this session ({elapsed_seconds}s)..."
+)
+
 # Intrinsic marker stamped on a message dict once it has been written to the
 # SQLite session store.  Used by ``_flush_messages_to_session_db`` to decide
 # what is already durable.  An object-identity (``id(msg)``) dedup set cannot be
@@ -8484,8 +8494,9 @@ class AIAgent:
                         )
                     else:
                         self._emit_status(
-                            "⏳ Still waiting for the other Hermes process on "
-                            f"this session ({int(elapsed)}s)..."
+                            SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE.format(
+                                elapsed_seconds=int(elapsed)
+                            )
                         )
 
                 if not _turn_db.acquire_session_turn_lease(

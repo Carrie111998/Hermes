@@ -874,6 +874,45 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
+_SESSION_TURN_LEASE_REFRESH_RE = None
+
+
+def _session_turn_lease_refresh_re():
+    """Compile-once matcher for run_agent's periodic lease-wait refresh.
+
+    Derived from the SAME template constant the emit site formats
+    (SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE, #89166) — never
+    re-inlined wording, same convention as _COMPRESSION_PROGRESS_STATUS_RE
+    (#69550). The import stays lazy because gateway/run.py never imports
+    run_agent at module scope.
+    """
+    global _SESSION_TURN_LEASE_REFRESH_RE
+    if _SESSION_TURN_LEASE_REFRESH_RE is None:
+        from run_agent import SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE
+
+        _SESSION_TURN_LEASE_REFRESH_RE = re.compile(
+            _status_template_to_regex(SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE),
+            re.IGNORECASE,
+        )
+    return _SESSION_TURN_LEASE_REFRESH_RE
+
+
+def _should_suppress_lease_wait_refresh(adapter, message: str) -> bool:
+    """True when a periodic turn-lease wait refresh would flood this adapter.
+
+    The periodic refresh exists to update the initial "Another Hermes process
+    is using this session..." notice in place. On adapters without
+    ``send_or_update_status`` (WeCom, Weixin, QQ, Signal, ... — all
+    SUPPORTS_MESSAGE_EDITING = False) ``_send_or_update_status_coro`` falls
+    back to a plain send, so every ~15s refresh lands as another standalone
+    chat message (#89166). Suppress the refresh there; the initial notice and
+    the lease-timeout warning use different wording and are always delivered.
+    """
+    if callable(getattr(adapter, "send_or_update_status", None)):
+        return False
+    return bool(_session_turn_lease_refresh_re().search(str(message or "")))
+
+
 def _resolve_progress_thread_id(
     platform: Any,
     source_thread_id: Any,
@@ -5153,6 +5192,15 @@ class TurnRunner:
                 ctx.source.platform.value if ctx.source.platform else "unknown",
                 event_type,
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+            )
+            return
+        if _should_suppress_lease_wait_refresh(
+            ctx._status_adapter, prepared_message
+        ):
+            logger.debug(
+                "suppressed periodic lease-wait refresh for %s: adapter has "
+                "no in-place status updates",
+                ctx.source.platform.value if ctx.source.platform else "unknown",
             )
             return
         _fut = safe_schedule_threadsafe(
