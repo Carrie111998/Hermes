@@ -1598,6 +1598,7 @@ def _skill_write_lock():
 
 
 def _pending_fs_identity(info: os.stat_result) -> tuple:
+    """Bind replay identity to ctime so mtime-restored writes still diverge."""
     return (
         info.st_dev,
         info.st_ino,
