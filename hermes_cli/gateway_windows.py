@@ -270,19 +270,25 @@ def _launch_elevated_install(
     start_now: bool | None = None,
     start_on_login: bool | None = None,
     at_boot: bool = False,
+    password: str | None = None,
 ) -> bool:
-    """Launch an elevated gateway install via UAC and return True on handoff."""
+    """Launch an elevated gateway install via UAC and return True on handoff.
+
+    ``password`` (boot-task account password, already prompted for in the
+    parent) is passed to the elevated child via an environment variable, not
+    the command line, so it does not show up in process listings / ETW.
+    """
     old_start_now = os.environ.get("HERMES_GATEWAY_INSTALL_START_NOW")
     old_start_on_login = os.environ.get("HERMES_GATEWAY_INSTALL_START_ON_LOGIN")
-    old_at_boot = os.environ.get("HERMES_GATEWAY_INSTALL_AT_BOOT")
+    old_password = os.environ.get("HERMES_GATEWAY_INSTALL_PASSWORD")
     old_handoff = os.environ.get("HERMES_GATEWAY_ELEVATED_HANDOFF")
     try:
         if start_now is not None:
             os.environ["HERMES_GATEWAY_INSTALL_START_NOW"] = "1" if start_now else "0"
         if start_on_login is not None:
             os.environ["HERMES_GATEWAY_INSTALL_START_ON_LOGIN"] = "1" if start_on_login else "0"
-        if at_boot:
-            os.environ["HERMES_GATEWAY_INSTALL_AT_BOOT"] = "1"
+        if password is not None:
+            os.environ["HERMES_GATEWAY_INSTALL_PASSWORD"] = password
         os.environ["HERMES_GATEWAY_ELEVATED_HANDOFF"] = "1"
         extra_args = ["--elevated-handoff"]
         if force:
@@ -298,7 +304,7 @@ def _launch_elevated_install(
         for key, old in (
             ("HERMES_GATEWAY_INSTALL_START_NOW", old_start_now),
             ("HERMES_GATEWAY_INSTALL_START_ON_LOGIN", old_start_on_login),
-            ("HERMES_GATEWAY_INSTALL_AT_BOOT", old_at_boot),
+            ("HERMES_GATEWAY_INSTALL_PASSWORD", old_password),
             ("HERMES_GATEWAY_ELEVATED_HANDOFF", old_handoff),
         ):
             if old is None:
@@ -741,7 +747,12 @@ def _install_scheduled_task(
         # the password via /RP. /IT is meaningless for a boot task.
         variants = []
         if user:
-            password = _prompt_task_password(user)
+            # Elevated handoff passes the password via env (never the
+            # command line, which is visible to process inspection/ETW);
+            # a direct (non-elevated) run prompts here.
+            password = os.environ.get("HERMES_GATEWAY_INSTALL_PASSWORD")
+            if password is None:
+                password = _prompt_task_password(user)
             if password is None:
                 return (False, "Scheduled Task creation cancelled: no password provided for boot task.")
             variants.append([*base, "/RU", user, "/RP", password])
@@ -1159,6 +1170,20 @@ def install(
     task_name = get_task_name()
     script_path = _write_task_script()
 
+    # Boot tasks need the account password stored in Task Scheduler. Prompt
+    # for it in the parent (visible console) BEFORE any UAC handoff so the
+    # elevated child never has to prompt, and pass it via env (not argv).
+    boot_password: str | None = None
+    if at_boot:
+        user = _resolve_task_user()
+        if not user:
+            print("✗ Could not resolve the Windows user for the boot task.")
+            return
+        boot_password = _prompt_task_password(user)
+        if boot_password is None:
+            print("✗ Boot-task install cancelled: no password provided.")
+            return
+
     # On machines where the current user's scheduled-task ACL is locked down,
     # schtasks /Create or /Change can sit for the timeout before returning
     # Access Denied. We already collected all intent questions above, so avoid
@@ -1170,7 +1195,11 @@ def install(
         print("  UAC is Windows' admin approval prompt; it is needed to create/update the Scheduled Task.")
         if prompt_yes_no("  Open the UAC prompt now?", False):
             if _launch_elevated_install(
-                force=force, start_now=start_now, start_on_login=start_on_login, at_boot=at_boot
+                force=force,
+                start_now=start_now,
+                start_on_login=start_on_login,
+                at_boot=at_boot,
+                password=boot_password,
             ):
                 print("✓ Launched elevated Hermes gateway install prompt.")
                 if start_now:
@@ -1216,7 +1245,11 @@ def install(
         print("  UAC is Windows' admin approval prompt; it is needed to create/update the Scheduled Task.")
         if prompt_yes_no("  Open the UAC prompt now?", False):
             if _launch_elevated_install(
-                force=force, start_now=start_now, start_on_login=start_on_login, at_boot=at_boot
+                force=force,
+                start_now=start_now,
+                start_on_login=start_on_login,
+                at_boot=at_boot,
+                password=boot_password,
             ):
                 print("✓ Launched elevated Hermes gateway install prompt.")
                 if start_now:
@@ -1389,8 +1422,9 @@ def query_task_status() -> dict[str, str]:
 def _task_has_boot_trigger(task_name: str) -> bool:
     """True when the registered task uses a BootTrigger (installed --at-boot).
 
-    Parses ``schtasks /Query /V /FO LIST`` output; the schedule-type line is
-    localized, so we match on the trigger XML instead, which is stable.
+    Queries ``schtasks /Query /TN <name> /XML`` and matches on the trigger
+    XML, which is stable across locales (unlike the localized schedule-type
+    text in ``/V /FO LIST`` output).
     """
     code, out, _err = _exec_schtasks(["/Query", "/TN", task_name, "/XML"])
     if code != 0:
