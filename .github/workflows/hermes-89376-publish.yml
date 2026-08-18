@@ -23,7 +23,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL https://raw.githubusercontent.com/huklaa/pc-runner/main/scripts/hermes-89376-apply.py -o "$RUNNER_TEMP/hermes-89376-apply.py"
+          git show origin/main:scripts/hermes-89376-apply.py > "$RUNNER_TEMP/hermes-89376-apply.py"
           python "$RUNNER_TEMP/hermes-89376-apply.py"
           git diff --check
           python -m compileall -q cron/jobs.py cron/scheduler.py tests/cron/test_provider_retry_backoff.py
