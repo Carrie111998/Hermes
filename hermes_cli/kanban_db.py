@@ -8849,7 +8849,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def _worker_final_output(task_id: str) -> str:
+def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     """Best-effort read of a quiet-mode kanban worker's last printed text.
 
     ``hermes chat -q`` prints nothing but the final response (banner,
@@ -8861,9 +8861,15 @@ def _worker_final_output(task_id: str) -> str:
     couldn't comply — see #88603, where that text was discarded in
     favor of a canned diagnostic on every reap. Returns "" (never
     raises) on a missing/unreadable log or an empty tail.
+
+    ``board`` must be threaded through from the caller's dispatch tick
+    (see ``detect_crashed_workers``) — without it the log path falls back
+    to ambient current-board resolution, which is wrong for every board
+    other than whichever one happens to be "current" for the dispatching
+    thread.
     """
     try:
-        raw = read_worker_log(task_id, tail_bytes=2000)
+        raw = read_worker_log(task_id, tail_bytes=2000, board=board)
     except Exception:
         return ""
     if not raw:
@@ -8877,8 +8883,16 @@ def _worker_final_output(task_id: str) -> str:
     return "\n".join(lines).strip()[:400]
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
+
+    ``board`` pins the worker-log lookup used to surface a crashed
+    worker's own final output (see ``_worker_final_output``) to the
+    board this tick is actually running for. When omitted, falls back to
+    ambient current-board resolution — only correct for single-board
+    callers.
 
     Appends a ``crashed`` event and restores the task's source phase.
     Different from ``release_stale_claims``: this checks liveness
@@ -8976,7 +8990,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # instruction and said so should have that surface on the
                 # board instead of being silently replaced by the canned
                 # message above on every retry.
-                worker_output = _worker_final_output(row["id"])
+                worker_output = _worker_final_output(row["id"], board=board)
                 if worker_output:
                     error_text += f" Worker's last output: {worker_output!r}"
                     event_payload["worker_output"] = worker_output
@@ -9988,7 +10002,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
