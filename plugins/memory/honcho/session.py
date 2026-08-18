@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import queue
 import re
 import logging
+import platform as _platform
 import threading
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -24,6 +27,120 @@ logger = logging.getLogger(__name__)
 _ASYNC_SHUTDOWN = object()
 _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _rfc3339(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_machine_identity(context: dict[str, Any]) -> str:
+    """Resolve a portable machine identity without confusing workspace with host."""
+    for key in ("machine_id", "runtime_machine_id"):
+        value = context.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    try:
+        value = _platform.node().strip()
+    except Exception:
+        value = ""
+    return value or "unknown-machine"
+
+
+_SECRET_SHAPED_RE = re.compile(
+    r"(?i)(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{10,}\.|"
+    r"\b(?:api[_-]?key|token|password|secret)\s*[:=]|\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,})"
+)
+_SAFE_CREDENTIAL_REFERENCE_SUFFIXES = (
+    "_path",
+    "_ref",
+    "_reference",
+    "_name",
+    "_id",
+    "_status",
+    "_count",
+    "_policy",
+    "_enabled",
+)
+
+
+def _normalize_metadata_key(key: str) -> str:
+    """Normalize snake/kebab/camel/Pascal/acronym keys for sensitivity checks."""
+    value = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _is_sensitive_metadata_key(key: str) -> bool:
+    normalized = _normalize_metadata_key(key)
+    if normalized.endswith(_SAFE_CREDENTIAL_REFERENCE_SUFFIXES):
+        return False
+    parts = normalized.split("_")
+    compact = "".join(parts)
+    if any(part in {"password", "passwd", "secret", "token", "authorization"} for part in parts):
+        return True
+    if any(
+        marker in compact
+        for marker in (
+            "apikey",
+            "privatekey",
+            "clientsecret",
+            "accesstoken",
+            "refreshtoken",
+            "authtoken",
+            "password",
+            "authorization",
+        )
+    ):
+        return True
+    return any(
+        parts[index : index + 2] in (["api", "key"], ["private", "key"])
+        for index in range(max(0, len(parts) - 1))
+    )
+
+
+def _redact_metadata_value(value: Any) -> Any:
+    """Force-redact every string in metadata, failing closed on suspicious data."""
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            raw_key = str(key)
+            safe_key = str(_redact_metadata_value(raw_key))
+            result[safe_key] = (
+                "«redacted-metadata»"
+                if _is_sensitive_metadata_key(raw_key)
+                else _redact_metadata_value(item)
+            )
+        return result
+    if isinstance(value, list):
+        return [_redact_metadata_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_metadata_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if not isinstance(value, str):
+        # Config-file values are JSON-native, but hand-constructed configs and
+        # runtime extensions can supply arbitrary objects. Do not let their
+        # repr leak local paths, credentials, or fail SDK serialization.
+        return "«redacted-metadata»"
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(
+            value,
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        return "«redacted-metadata»"
+    if redacted == value and _SECRET_SHAPED_RE.search(value):
+        return "«redacted-metadata»"
+    return redacted
 
 
 class HonchoAuthError(RuntimeError):
@@ -85,20 +202,22 @@ class HonchoSession:
     assistant_peer_id: str  # Honcho peer ID for the assistant
     honcho_session_id: str  # Honcho session ID
     messages: list[dict[str, Any]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utc_now)
+    updated_at: datetime = field(default_factory=_utc_now)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the local cache."""
+        created_at = kwargs.pop("created_at", None) or _utc_now()
         msg = {
             "role": role,
             "content": content,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": _rfc3339(created_at),
+            "created_at": created_at,
             **kwargs,
         }
         self.messages.append(msg)
-        self.updated_at = datetime.now()
+        self.updated_at = _utc_now()
 
     def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
         """Get message history for LLM context."""
@@ -112,7 +231,7 @@ class HonchoSession:
     def clear(self) -> None:
         """Clear all messages in the session."""
         self.messages = []
-        self.updated_at = datetime.now()
+        self.updated_at = _utc_now()
 
 
 class HonchoSessionManager:
@@ -130,6 +249,8 @@ class HonchoSessionManager:
         config: Any | None = None,
         runtime_user_peer_name: str | None = None,
         runtime_user_peer_name_alt: str | None = None,
+        provenance_context: dict[str, Any] | None = None,
+        source_session_id: str | None = None,
     ):
         """
         Initialize the session manager.
@@ -147,6 +268,10 @@ class HonchoSessionManager:
         self._config = config
         self._runtime_user_peer_name = runtime_user_peer_name
         self._runtime_user_peer_name_alt = runtime_user_peer_name_alt
+        self._provenance_context = dict(provenance_context or {})
+        self._source_session_id = str(source_session_id or "").strip()
+        configured_metadata = getattr(config, "message_metadata", {}) if config else {}
+        self._message_metadata = copy.deepcopy(configured_metadata) if isinstance(configured_metadata, dict) else {}
         self._cache: dict[str, HonchoSession] = {}
         self._cache_lock = threading.RLock()
         self._peers_cache: dict[str, Any] = {}
@@ -205,6 +330,110 @@ class HonchoSessionManager:
         self._async_thread_lock = threading.Lock()
         if write_frequency == "async":
             self._async_queue = queue.Queue()
+
+    @staticmethod
+    def new_source_record_id() -> str:
+        """Return a stable identity shared by all chunks of one role-side turn."""
+        return str(uuid.uuid4())
+
+    def _build_message_metadata(
+        self,
+        session: HonchoSession,
+        role: str,
+        *,
+        created_at: datetime,
+        source_record_id: str,
+        source_session_id: str | None,
+        chunk_index: int,
+        chunk_count: int,
+    ) -> dict[str, Any]:
+        context = self._provenance_context
+        extensions = copy.deepcopy(self._message_metadata.get("extensions", {}))
+        if not isinstance(extensions, dict):
+            extensions = {}
+        static_hermes = extensions.get("hermes")
+        hermes_extension = dict(static_hermes) if isinstance(static_hermes, dict) else {}
+        hermes_extension.update({
+            "platform": str(context.get("platform") or "cli"),
+            "agent_context": str(context.get("agent_context") or "primary"),
+            "agent_identity": str(context.get("agent_identity") or "default"),
+            "agent_workspace": str(context.get("agent_workspace") or "hermes"),
+            "user_id": context.get("user_id"),
+            "user_id_alt": context.get("user_id_alt"),
+            "user_name": context.get("user_name"),
+            "chat_id": context.get("chat_id"),
+            "chat_name": context.get("chat_name"),
+            "chat_type": context.get("chat_type"),
+            "thread_id": context.get("thread_id"),
+            "gateway_session_key": context.get("gateway_session_key"),
+            "session_title": context.get("session_title"),
+            "honcho_session_id": session.honcho_session_id,
+            "chunk_index": chunk_index,
+            "chunk_count": chunk_count,
+        })
+        extensions["hermes"] = hermes_extension
+
+        profile = str(context.get("agent_identity") or "default")
+        agent_context = str(context.get("agent_context") or "primary")
+        metadata = copy.deepcopy(self._message_metadata)
+        metadata.update({
+            "schema": metadata.get("schema") or "hermes.provenance/v1",
+            "event_id": str(uuid.uuid4()),
+            "record_kind": "source_event",
+            "source_kind": "user_statement" if role == "user" else "assistant_statement",
+            "human_peer": session.user_peer_id,
+            "ai_peer": session.assistant_peer_id,
+            "interface": str(context.get("platform") or "cli"),
+            "machine": _resolve_machine_identity(context),
+            "runtime": f"hermes:{profile}:{agent_context}",
+            "session_id": str(source_session_id or self._source_session_id or session.key),
+            "channel_id": context.get("chat_id"),
+            "source_record_id": source_record_id,
+            "observed_at": _rfc3339(created_at),
+            "effective_at": metadata.get("effective_at"),
+            # Authority is an identity-bearing runtime field, not a static
+            # default: a shared metadata template must never attribute an
+            # assistant statement to the human (or vice versa).
+            "authority": session.user_peer_id if role == "user" else session.assistant_peer_id,
+            "evidence_refs": metadata.get("evidence_refs") if isinstance(metadata.get("evidence_refs"), list) else [],
+            "confidence": metadata.get("confidence"),
+            "verification_state": metadata.get("verification_state") or "unverified",
+            "review_state": metadata.get("review_state") or "captured",
+            "sensitivity": metadata.get("sensitivity") or "private",
+            "retention_class": metadata.get("retention_class") or "semantic",
+            "derived_from": metadata.get("derived_from") if isinstance(metadata.get("derived_from"), list) else [],
+            "supersedes": metadata.get("supersedes") if isinstance(metadata.get("supersedes"), list) else [],
+            "superseded_by": metadata.get("superseded_by") if isinstance(metadata.get("superseded_by"), list) else [],
+            "deletion_request_id": metadata.get("deletion_request_id"),
+            "deleted_at": metadata.get("deleted_at"),
+            "target_artifacts": metadata.get("target_artifacts") if isinstance(metadata.get("target_artifacts"), list) else [],
+            "extensions": extensions,
+        })
+        return _redact_metadata_value(metadata)
+
+    def add_source_message(
+        self,
+        session: HonchoSession,
+        role: str,
+        content: str,
+        *,
+        source_record_id: str | None = None,
+        source_session_id: str | None = None,
+        chunk_index: int = 0,
+        chunk_count: int = 1,
+    ) -> None:
+        """Capture one source-message chunk with stable idempotency metadata."""
+        created_at = _utc_now()
+        metadata = self._build_message_metadata(
+            session,
+            role,
+            created_at=created_at,
+            source_record_id=source_record_id or self.new_source_record_id(),
+            source_session_id=source_session_id,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
+        )
+        session.add_message(role, content, metadata=metadata, created_at=created_at)
 
     @property
     def honcho(self) -> Honcho:
@@ -641,6 +870,8 @@ class HonchoSessionManager:
                 "role": role,
                 "content": msg.content,
                 "timestamp": msg.created_at.isoformat() if msg.created_at else "",
+                "created_at": msg.created_at,
+                "metadata": copy.deepcopy(getattr(msg, "metadata", None) or {}),
                 "_synced": True,
             })
 
@@ -666,6 +897,24 @@ class HonchoSessionManager:
         if not new_messages:
             return True
 
+        # Backward-compatible guard for callers that populated the local cache
+        # directly. Assign once before the first attempt so retries keep IDs.
+        for message in new_messages:
+            if not isinstance(message.get("metadata"), dict) or not message["metadata"].get("event_id"):
+                created_at = message.get("created_at")
+                if not isinstance(created_at, datetime):
+                    created_at = _utc_now()
+                    message["created_at"] = created_at
+                message["metadata"] = self._build_message_metadata(
+                    session,
+                    message["role"],
+                    created_at=created_at,
+                    source_record_id=self.new_source_record_id(),
+                    source_session_id=None,
+                    chunk_index=0,
+                    chunk_count=1,
+                )
+
         # Resolved inside the operation so a retry after a client rebuild gets fresh objects.
         def _sync_messages() -> int:
             user_peer = self._get_or_create_peer(session.user_peer_id)
@@ -676,7 +925,11 @@ class HonchoSessionManager:
                     session.honcho_session_id, user_peer, assistant_peer
                 )
             honcho_messages = [
-                (user_peer if m["role"] == "user" else assistant_peer).message(m["content"])
+                (user_peer if m["role"] == "user" else assistant_peer).message(
+                    m["content"],
+                    metadata=_redact_metadata_value(m.get("metadata") or {}),
+                    created_at=m.get("created_at"),
+                )
                 for m in new_messages
             ]
             honcho_session.add_messages(honcho_messages)

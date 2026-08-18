@@ -512,6 +512,8 @@ class HonchoMemoryProvider(MemoryProvider):
             context_tokens=cfg.context_tokens,
             runtime_user_peer_name=kwargs.get("user_id") or None,
             runtime_user_peer_name_alt=kwargs.get("user_id_alt") or None,
+            provenance_context=kwargs,
+            source_session_id=session_id,
         )
 
         self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
@@ -1444,11 +1446,31 @@ class HonchoMemoryProvider(MemoryProvider):
             try:
                 session = self._manager.get_or_create(self._session_key)
                 if clean_user_content:
-                    for chunk in self._chunk_message(clean_user_content, msg_limit):
-                        session.add_message("user", chunk)
+                    chunks = self._chunk_message(clean_user_content, msg_limit)
+                    source_record_id = self._manager.new_source_record_id()
+                    for index, chunk in enumerate(chunks):
+                        self._manager.add_source_message(
+                            session,
+                            "user",
+                            chunk,
+                            source_record_id=source_record_id,
+                            source_session_id=session_id or None,
+                            chunk_index=index,
+                            chunk_count=len(chunks),
+                        )
                 if clean_assistant_content:
-                    for chunk in self._chunk_message(clean_assistant_content, msg_limit):
-                        session.add_message("assistant", chunk)
+                    chunks = self._chunk_message(clean_assistant_content, msg_limit)
+                    source_record_id = self._manager.new_source_record_id()
+                    for index, chunk in enumerate(chunks):
+                        self._manager.add_source_message(
+                            session,
+                            "assistant",
+                            chunk,
+                            source_record_id=source_record_id,
+                            source_session_id=session_id or None,
+                            chunk_index=index,
+                            chunk_count=len(chunks),
+                        )
                 # Route through save() so writeFrequency is honored —
                 # _flush_session() directly bypassed "session"/N batching
                 # and flushed every turn regardless of config.
