@@ -9,6 +9,7 @@ const PDF_EXTENSIONS = new Set(['.pdf'])
 // Mirrors `_FS_DATA_URL_MAX_BYTES` in the backend filesystem endpoint.
 const REMOTE_HTML_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
 const REMOTE_HTML_PREVIEW_MAX_BASE64_BYTES = Math.ceil(REMOTE_HTML_PREVIEW_MAX_BYTES / 3) * 4
+const WORKSPACE_RELOAD_HOSTS = new Set(['localhost', '0.0.0.0', '::1'])
 
 const LANGUAGE_BY_EXT: Record<string, string> = {
   '.c': 'c',
@@ -78,6 +79,57 @@ function pathToFileUrl(path: string) {
   }
 
   return `file://${encoded.startsWith('/') ? encoded : `/${encoded}`}`
+}
+
+// Dev servers the workspace live-reload should keep working for: loopback,
+// private LAN, and link-local addresses. A file edit can plausibly affect what
+// these serve; a public origin (x.com etc.) can never depend on workspace files.
+function isLocalOrPrivateIpv4(hostname: string): boolean {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname)
+
+  if (!match) {
+    return false
+  }
+
+  const octets = match.slice(1).map(Number)
+
+  if (octets.some(octet => octet > 255)) {
+    return false
+  }
+
+  const [a, b] = octets
+
+  return (
+    a === 127 || // loopback 127.0.0.0/8
+    a === 10 || // private 10.0.0.0/8
+    (a === 172 && b >= 16 && b <= 31) || // private 172.16.0.0/12
+    (a === 192 && b === 168) || // private 192.168.0.0/16
+    (a === 169 && b === 254) // link-local 169.254.0.0/16
+  )
+}
+
+export function isWorkspaceLiveReloadUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return false
+    }
+
+    const hostname = url.hostname
+      .toLowerCase()
+      .replace(/^\[|\]$/g, '')
+      .replace(/\.$/, '')
+
+    return (
+      WORKSPACE_RELOAD_HOSTS.has(hostname) ||
+      hostname.endsWith('.localhost') ||
+      hostname.endsWith('.local') ||
+      isLocalOrPrivateIpv4(hostname)
+    )
+  } catch {
+    return false
+  }
 }
 
 export function validatedRemoteHtmlDataUrl(value: string): string | null {

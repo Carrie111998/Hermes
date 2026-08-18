@@ -9,12 +9,46 @@ vi.mock('@/lib/desktop-fs', () => ({
 }))
 
 import {
+  isWorkspaceLiveReloadUrl,
   localPreviewTarget,
   normalizeOrLocalPreviewTarget,
   openPreviewTargetInBrowser,
   remoteHtmlPreviewDocument,
   validatedRemoteHtmlDataUrl
 } from './local-preview'
+
+describe('workspace live reload URLs', () => {
+  it.each([
+    'http://localhost:5173',
+    'https://127.0.0.1:8443/app',
+    'http://127.26.5.4:3000', // any 127/8 loopback, not just 127.0.0.1
+    'http://0.0.0.0:3000',
+    'http://[::1]:4173',
+    'http://demo.local:8080',
+    'http://app.localhost:3000',
+    'http://LOCALHOST.:5173', // case + trailing dot normalization
+    'http://10.0.0.8:3000', // private LAN dev server
+    'http://172.16.1.20:5173',
+    'http://172.31.255.255:8080',
+    'http://192.168.1.100:3000',
+    'http://169.254.1.1:9000' // link-local
+  ])('accepts local development origin %s', url => {
+    expect(isWorkspaceLiveReloadUrl(url)).toBe(true)
+  })
+
+  it.each([
+    'https://x.com',
+    'https://localhost.example.com',
+    'https://demo.local.example.com',
+    'http://user@evil.test:3000', // userinfo must not smuggle a public host
+    'http://172.32.0.1:3000', // just outside 172.16/12
+    'http://11.0.0.1:3000', // just outside 10/8
+    'http://256.1.1.1', // not a valid IPv4 octet
+    'not a URL'
+  ])('rejects external or malformed origin %s', url => {
+    expect(isWorkspaceLiveReloadUrl(url)).toBe(false)
+  })
+})
 
 const remoteTarget = {
   kind: 'file' as const,
