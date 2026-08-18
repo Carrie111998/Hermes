@@ -733,7 +733,11 @@ def fetch_models_dev(
 
 
 def lookup_models_dev_context(
-    provider: str, model: str, *, allow_network: bool = False
+    provider: str,
+    model: str,
+    *,
+    base_url: str = "",
+    allow_network: bool = False,
 ) -> Optional[int]:
     """Look up context_length for a provider+model combo in models.dev.
 
@@ -748,6 +752,9 @@ def lookup_models_dev_context(
     ``allow_network`` defaults to False — context-length lookup is a
     hot path (called during every conversation turn) and must never block
     on the network. Pass True only from explicit refresh flows.
+
+    ``base_url`` selects route-specific provider catalogs when one Hermes
+    provider identity fronts multiple products, such as Z.AI Coding Plan.
     """
     # Explicit config override — checked before catalog so it always wins.
     override_ctx = _override_context_window(provider, model)
@@ -758,6 +765,15 @@ def lookup_models_dev_context(
     if not mdev_provider_id:
         return _default_override_context(provider)
 
+    provider_ids = [mdev_provider_id]
+    if (
+        mdev_provider_id == "zai"
+        and "/api/coding/" in str(base_url or "").lower()
+    ):
+        # Z.AI publishes Coding Plan-only models in a separate models.dev
+        # catalog even though Hermes uses one provider identity for both APIs.
+        provider_ids.insert(0, "zai-coding-plan")
+
     # NOTE: keep the zero-argument call on the allow_network path. Dozens
     # of test sites monkeypatch fetch_models_dev with zero-arg lambdas;
     # passing the kwarg unconditionally breaks them all (TypeError).
@@ -766,50 +782,45 @@ def lookup_models_dev_context(
         if allow_network
         else fetch_models_dev(allow_network=False)
     )
-    provider_data = data.get(mdev_provider_id)
-    if not isinstance(provider_data, dict):
-        return _default_override_context(provider)
-
-    models = provider_data.get("models", {})
-    if not isinstance(models, dict):
-        return _default_override_context(provider)
-
-    # Exact match
-    entry = models.get(model)
-    if entry:
-        ctx = _extract_context(entry)
-        if ctx:
-            return ctx
-
-    # Case-insensitive match
     model_lower = model.lower()
-    for mid, mdata in models.items():
-        if mid.lower() == model_lower:
-            ctx = _extract_context(mdata)
-            if ctx:
-                return ctx
+    for provider_id in provider_ids:
+        provider_data = data.get(provider_id)
+        if not isinstance(provider_data, dict):
+            continue
+        models = provider_data.get("models", {})
+        if not isinstance(models, dict):
+            continue
 
-    # Suffix-aware fallback: some providers (e.g. ollama-cloud) store
-    # model IDs with :cloud / -cloud suffixes in models.dev while the
-    # live API returns bare names.  Without this, kimi-k2.6 misses the
-    # kimi-k2.6:cloud entry and falls through to stale OpenRouter metadata
-    # reporting 32768 — tripping the 64k minimum-context guard.
-    # The suffix-stripping in fetch_ollama_cloud_models() handles the
-    # model-picker UX; this handles the context-length lookup path.
-    for suffix in (":cloud", "-cloud"):
-        suffixed_key = model + suffix
-        entry = models.get(suffixed_key)
+        # Exact match
+        entry = models.get(model)
         if entry:
             ctx = _extract_context(entry)
             if ctx:
                 return ctx
-        # Also try case-insensitive
-        suffixed_lower = model_lower + suffix
+
+        # Case-insensitive match
         for mid, mdata in models.items():
-            if mid.lower() == suffixed_lower:
+            if mid.lower() == model_lower:
                 ctx = _extract_context(mdata)
                 if ctx:
                     return ctx
+
+        # Suffix-aware fallback: some providers (e.g. ollama-cloud) store
+        # model IDs with :cloud / -cloud suffixes in models.dev while the
+        # live API returns bare names.
+        for suffix in (":cloud", "-cloud"):
+            suffixed_key = model + suffix
+            entry = models.get(suffixed_key)
+            if entry:
+                ctx = _extract_context(entry)
+                if ctx:
+                    return ctx
+            suffixed_lower = model_lower + suffix
+            for mid, mdata in models.items():
+                if mid.lower() == suffixed_lower:
+                    ctx = _extract_context(mdata)
+                    if ctx:
+                        return ctx
 
     # Catalog miss — a _default override may fill the gap (#84482).
     return _default_override_context(provider)

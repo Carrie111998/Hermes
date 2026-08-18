@@ -134,6 +134,28 @@ class TestLookupModelsDevContext:
         mock_fetch.return_value = SAMPLE_REGISTRY
         assert lookup_models_dev_context("anthropic", "claude-opus-4-6") == 1000000
 
+    @patch("agent.models_dev.fetch_models_dev")
+    def test_zai_coding_route_uses_coding_plan_catalog(self, mock_fetch):
+        mock_fetch.return_value = {
+            "zai": {"models": {}},
+            "zai-coding-plan": {
+                "models": {
+                    "glm-5.3": {"limit": {"context": 1_000_000}},
+                },
+            },
+        }
+
+        assert lookup_models_dev_context(
+            "zai",
+            "glm-5.3",
+            base_url="https://api.z.ai/api/coding/paas/v4",
+        ) == 1_000_000
+        assert lookup_models_dev_context(
+            "zai",
+            "glm-5.3",
+            base_url="https://api.z.ai/api/paas/v4",
+        ) is None
+
 
 
 
