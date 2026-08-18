@@ -15,7 +15,7 @@ import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
+def isolated_kanban_home(monkeypatch, restore_purged_modules):
     """Spin up a fresh HERMES_HOME with a clean kanban DB, then remove it.
 
     The cross-test isolation this fixture provides never depended on keeping
@@ -26,7 +26,10 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     try:
         monkeypatch.setenv("HERMES_HOME", test_home)
-        # Force-reimport so the fresh HERMES_HOME is picked up.
+        # Force-reimport so the fresh HERMES_HOME is picked up.  The
+        # ``restore_purged_modules`` fixture puts them back afterwards — see its
+        # docstring in conftest.py for why leaving them evicted silently
+        # de-fangs every later ``monkeypatch.setattr("hermes_cli...", ...)``.
         for mod in list(sys.modules.keys()):
             if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
                 del sys.modules[mod]
