@@ -1801,12 +1801,14 @@ export const ja = defineLocale({
       menuAppearance: '外観',
       noColor: '色なし',
       menuAddFolder: 'フォルダを追加',
+      menuOpenAgent: 'プロジェクト Agent を開く',
       menuSetActive: 'アクティブに設定',
       menuDelete: '削除',
       reveal: 'フォルダで表示',
       copyPath: 'パスをコピー',
       removeFromSidebar: 'サイドバーから削除',
       createFailed: 'プロジェクトを作成できませんでした',
+      agentOpenFailed: 'プロジェクト Agent を開けませんでした',
       staleBackend:
         'プロジェクトを作成するには Hermes バックエンドを更新してください。バックエンドがこのデスクトップアプリより古いです（設定 → 更新 → バックエンド）。',
       deleteConfirm:

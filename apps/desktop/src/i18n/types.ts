@@ -1762,6 +1762,7 @@ export interface Translations {
       menuAppearance: string
       noColor: string
       menuAddFolder: string
+      menuOpenAgent: string
       menuSetActive: string
       menuDelete: string
       moveToProject: string
@@ -1773,6 +1774,7 @@ export interface Translations {
       copyPath: string
       removeFromSidebar: string
       createFailed: string
+      agentOpenFailed: string
       staleBackend: string
       deleteConfirm: string
       startWork: string

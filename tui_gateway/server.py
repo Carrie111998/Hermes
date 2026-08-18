@@ -271,6 +271,7 @@ _LONG_HANDLERS = frozenset(
         "projects.discover_repos",
         "projects.record_repos",
         "projects.for_cwd",
+        "projects.agent.open",
         "projects.tree",
         "projects.project_sessions",
         # Setup readiness RPCs are polled by the Desktop frontend on connect
@@ -1042,6 +1043,11 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     """
     if not session or session.get("_finalized"):
         return False
+    # A project agent is intentionally resident across window disconnects. Its
+    # durable project binding is the return address; the next open reattaches a
+    # live transport without rebuilding the agent or its cached prompt prefix.
+    if session.get("project_agent_id"):
+        return False
     if session.get("running"):
         return False
     return session.get("transport") is _detached_ws_transport
@@ -1233,6 +1239,8 @@ def _transport_is_dead(transport) -> bool:
 
 
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
+    if session.get("project_agent_id"):
+        return False
     if session.get("running") or _session_pending_kind(sid):
         return False
     if _session_has_active_delegations(sid, session):
@@ -12576,6 +12584,132 @@ def _(rid, params, pdb, conn) -> dict:
 def _(rid, params, pdb, conn) -> dict:
     pdb.set_active(conn, _require_project(pdb, conn, params).id if params.get("id") else None)
     return _ok(rid, {"active_id": pdb.get_active_id(conn)})
+
+
+_project_agent_open_lock = threading.Lock()
+
+
+def _mark_project_agent(payload: dict, project_id: str, *, reused: bool) -> dict:
+    """Mark the live record + response as a project's resident conversation."""
+    sid = str(payload.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is not None:
+        session["project_agent_id"] = project_id
+    stored = str(
+        payload.get("stored_session_id")
+        or payload.get("session_key")
+        or (session or {}).get("session_key")
+        or ""
+    )
+    payload.update(
+        {
+            "project_agent": True,
+            "project_id": project_id,
+            "resident_reused": reused,
+            "stored_session_id": stored,
+        }
+    )
+    return payload
+
+
+@_projects_method("projects.agent.open")
+def _(rid, params, pdb, conn) -> dict:
+    """Open the one long-lived conversation assigned to a Project.
+
+    The project→session binding survives gateway restarts in projects.db. While
+    the gateway stays alive, repeated opens return the exact same in-memory
+    AIAgent, preserving its conversation object and prompt-cache prefix instead
+    of rebuilding on every project switch.
+    """
+    project = _require_project(pdb, conn, params)
+    cwd = project.primary_path or next(
+        (folder.path for folder in project.folders if folder.is_primary),
+        project.folders[0].path if project.folders else None,
+    )
+    if not cwd:
+        raise ValueError("project needs a folder before opening its agent")
+
+    try:
+        cols = int(params.get("cols", 80))
+    except (TypeError, ValueError):
+        cols = 80
+    transport = current_transport() or _stdio_transport
+    source = str(params.get("source") or "desktop").strip() or "desktop"
+
+    # Serialize the read/recover/create sequence so concurrent windows cannot
+    # mint two agents before either has written the one-row binding.
+    with _project_agent_open_lock:
+        stored = pdb.get_agent_session_id(conn, project.id)
+        if stored:
+            live = _find_live_session_by_key(stored)
+            if live is not None:
+                live_sid, live_session = live
+                live_session["project_agent_id"] = project.id
+                payload = _live_session_payload(
+                    live_sid,
+                    live_session,
+                    cols=cols,
+                    touch=True,
+                    transport=transport,
+                    omit_messages=is_truthy_value(params.get("omit_messages", False)),
+                )
+                payload["resumed"] = stored
+                return _ok(
+                    rid,
+                    _mark_project_agent(payload, project.id, reused=True),
+                )
+
+            resume = _methods["session.resume"](
+                rid,
+                {
+                    "session_id": stored,
+                    "cols": cols,
+                    "source": source,
+                    "profile": params.get("profile"),
+                    "omit_messages": params.get("omit_messages", False),
+                    "defer_history": params.get("defer_history", False),
+                },
+            )
+            if "error" not in resume:
+                return _ok(
+                    rid,
+                    _mark_project_agent(resume["result"], project.id, reused=True),
+                )
+            # The mapped session was deleted or became unreadable. Recover by
+            # replacing only the binding; any surviving transcript stays intact.
+            pdb.clear_agent_session_id(conn, project.id)
+
+        created = _methods["session.create"](
+            rid,
+            {
+                "cols": cols,
+                "cwd": cwd,
+                "source": source,
+                "profile": params.get("profile"),
+                "title": f"{project.name} · Project Agent",
+                "close_on_disconnect": False,
+            },
+        )
+        if "error" in created:
+            return created
+        payload = _mark_project_agent(created["result"], project.id, reused=False)
+        session = _sessions.get(payload["session_id"])
+        if session is None:
+            return _err(rid, _E_PROJECTS, "project agent session was not registered")
+
+        # Unlike an ordinary abandoned draft, a project agent has explicit
+        # durable intent from the moment it is opened. Persist the empty row now
+        # so the binding remains resumable after a gateway restart.
+        _ensure_session_db_row(session)
+        stored = str(session.get("session_key") or "")
+        with _session_db(session) as session_db:
+            if not stored or session_db is None or not session_db.get_session(stored):
+                return _err(rid, _E_PROJECTS, "project agent session could not be persisted")
+            session_db.set_session_title(stored, f"{project.name} · Project Agent")
+        session["pending_title"] = None
+        pdb.set_agent_session_id(conn, project.id, stored)
+        payload["stored_session_id"] = stored
+        return _ok(rid, payload)
 
 
 @_projects_method("projects.for_cwd")

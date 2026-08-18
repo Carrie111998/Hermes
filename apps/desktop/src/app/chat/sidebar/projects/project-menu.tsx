@@ -26,6 +26,7 @@ import {
   copyPath,
   deleteProject,
   openProjectAddFolder,
+  openProjectAgent,
   openProjectRename,
   revealPath,
   setActiveProject,
@@ -79,6 +80,12 @@ function useProjectActions({
   const identityItems: ActionItemSpec[] = project.isAuto
     ? []
     : [
+        {
+          icon: 'hubot',
+          key: 'open-agent',
+          label: p.menuOpenAgent,
+          onSelect: () => void openProjectAgent(project.id)
+        },
         { icon: 'edit', key: 'rename', label: p.menuRename, onSelect: () => openProjectRename(target) },
         {
           icon: 'new-folder',

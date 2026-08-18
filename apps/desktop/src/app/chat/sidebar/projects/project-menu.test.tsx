@@ -33,6 +33,7 @@ vi.mock('@/i18n', () => ({
           menuAddFolder: 'Add folder',
           menuAppearance: 'Appearance',
           menuDelete: 'Delete',
+          menuOpenAgent: 'Open project agent',
           menuRename: 'Rename',
           menuSetActive: 'Set active',
           noColor: 'No color',
@@ -61,11 +62,15 @@ vi.mock('@/store/projects', () => ({
   copyPath: vi.fn(),
   deleteProject: vi.fn(),
   openProjectAddFolder: vi.fn(),
+  openProjectAgent: vi.fn(),
   openProjectRename: vi.fn(),
   revealPath: vi.fn(),
   setActiveProject: vi.fn(),
   setProjectAppearance: vi.fn().mockResolvedValue(false)
 }))
+
+const projectStore = await import('@/store/projects')
+const openProjectAgent = vi.mocked(projectStore.openProjectAgent)
 
 const project = {
   color: null,
@@ -93,6 +98,15 @@ describe('ProjectMenu', () => {
 
     const button = screen.getByRole('button', { name: 'Actions' })
     expect(tipTrigger(button)).toBeNull()
+  })
+
+  it('opens the durable project agent from the actions menu', async () => {
+    render(<ProjectMenu isActive={false} project={project} />)
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Open project agent' }))
+
+    expect(openProjectAgent).toHaveBeenCalledWith('p1')
   })
 
   // When anchorRef is absent, PopoverAnchor wraps the dropdown trigger so the
