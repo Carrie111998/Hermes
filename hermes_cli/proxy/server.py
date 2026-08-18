@@ -121,6 +121,14 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 code="path_not_allowed",
             )
 
+        allowed_methods = getattr(adapter, "allowed_methods", None)
+        if allowed_methods is not None and request.method not in allowed_methods:
+            return _json_error(
+                405,
+                "This proxy does not forward that HTTP method for the requested path.",
+                code="method_not_allowed",
+            )
+
         try:
             cred = adapter.get_credential()
         except Exception as exc:

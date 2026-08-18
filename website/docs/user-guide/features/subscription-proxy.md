@@ -72,8 +72,7 @@ automatically when the bearer approaches expiry.
 hermes proxy providers
 ```
 
-Currently shipped: `nous` (Nous Portal) and `xai` (xAI / Grok). More
-OAuth providers can be added by implementing the `UpstreamAdapter`
+Currently shipped: `nous` (Nous Portal), `openai-codex` (OpenAI Codex), and `xai` (xAI / Grok). More OAuth providers can be added by implementing the `UpstreamAdapter`
 interface in `hermes_cli/proxy/adapters/`.
 
 ## Check status
@@ -93,6 +92,26 @@ If you see `not logged in`, run `hermes portal`. If you see
 happens if you signed out from the Portal web UI) — just re-run
 `hermes portal`.
 
+## OpenAI Codex broker
+
+Authenticate Hermes once, then start the Codex upstream explicitly:
+
+```bash
+hermes auth add openai-codex
+hermes proxy start --provider openai-codex
+```
+
+The Codex adapter permits only `POST /v1/responses`. It resolves and refreshes
+Hermes-managed OAuth credentials only inside the Hermes process, then forwards
+the Responses request upstream. A client receives the response stream but never
+receives a Hermes access token, refresh token, or credential-store value.
+
+For a local DeepSeek Harness client, use the default proxy endpoint:
+
+```text
+http://127.0.0.1:8645/v1/responses
+```
+
 ## Allowed paths
 
 The proxy only forwards paths the upstream actually serves. For Nous
@@ -108,6 +127,12 @@ Portal:
 Other paths (`/v1/images/generations`, `/v1/audio/speech`, etc.) return
 404 with a clear error pointing at the allowed paths. This keeps stray
 clients from leaking weird requests to the upstream.
+
+For the OpenAI Codex adapter, the only permitted path is:
+
+| Path | Purpose |
+|------|---------|
+| `/v1/responses` | Codex Responses API (streaming + non-streaming) |
 
 ## Configuring OpenViking to use Portal
 

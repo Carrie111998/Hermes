@@ -116,12 +116,13 @@ def cmd_proxy(args: Any) -> int:
     if sub in {"providers", "list"}:
         return cmd_proxy_list_providers(args)
     # No subcommand → print short help.
+    available = "|".join(sorted(ADAPTERS)) or "provider"
     print(
         "hermes proxy — local OpenAI-compatible proxy that attaches your\n"
         "OAuth-authenticated provider credentials to outbound requests.\n"
         "\n"
         "Subcommands:\n"
-        "  hermes proxy start [--provider nous|xai] [--host 127.0.0.1] [--port 8645]\n"
+        f"  hermes proxy start [--provider {available}] [--host 127.0.0.1] [--port 8645]\n"
         "      Run the proxy in the foreground.\n"
         "  hermes proxy status\n"
         "      Show which upstream adapters are ready.\n"

@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +15,9 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+from hermes_cli.proxy.adapters.openai_codex import OpenAICodexAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+from hermes_cli.proxy.cli import cmd_proxy
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +29,102 @@ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Codex adapter
+# ---------------------------------------------------------------------------
+
+
+def test_codex_adapter_is_registered_for_proxy_use():
+    assert ADAPTERS["openai-codex"] is OpenAICodexAdapter
+    adapter = get_adapter("openai-codex")
+    assert isinstance(adapter, OpenAICodexAdapter)
+    assert adapter.allowed_paths == frozenset({"/responses"})
+    assert adapter.allowed_methods == frozenset({"POST"})
+
+
+def test_codex_proxy_is_discoverable_from_cli_help(capsys):
+    assert cmd_proxy(SimpleNamespace(proxy_command=None)) == 0
+    assert "openai-codex" in capsys.readouterr().err
+
+
+def test_codex_adapter_forwards_responses_via_hermes_runtime_auth(monkeypatch):
+    """The proxy may resolve Hermes auth, but returns only a live upstream bearer."""
+    adapter = OpenAICodexAdapter()
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.get_provider_auth_state",
+        lambda provider: {
+            "tokens": {"access_token": "placeholder-access", "refresh_token": "placeholder-refresh"}
+        }
+        if provider == "openai-codex" else None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        lambda **kwargs: {
+            "api_key": "opaque-test-bearer",
+            "base_url": "https://example.invalid/codex",
+        },
+    )
+
+    assert adapter.is_authenticated()
+    assert adapter.allowed_paths == frozenset({"/responses"})
+    credential = adapter.get_credential()
+    assert credential.base_url == "https://example.invalid/codex"
+    assert credential.bearer == "opaque-test-bearer"
+
+
+def test_codex_adapter_detects_pool_only_hermes_credentials(monkeypatch):
+    class Pool:
+        def has_credentials(self):
+            return True
+
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.load_pool",
+        lambda provider: Pool() if provider == "openai-codex" else None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.get_provider_auth_state",
+        lambda provider: None,
+    )
+
+    assert OpenAICodexAdapter().is_authenticated()
+
+
+def test_codex_adapter_forces_a_hermes_refresh_after_upstream_401(monkeypatch):
+    adapter = OpenAICodexAdapter()
+    calls: list[bool] = []
+
+    def resolve(**kwargs):
+        calls.append(bool(kwargs.get("force_refresh")))
+        return {
+            "api_key": "after-refresh" if kwargs.get("force_refresh") else "before-refresh",
+            "base_url": "https://example.invalid/codex",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        resolve,
+    )
+
+    failed = adapter.get_credential()
+    retried = adapter.get_retry_credential(failed_credential=failed, status_code=401)
+    assert retried is not None
+    assert retried.bearer == "after-refresh"
+    assert calls == [False, True]
+
+
+def test_codex_adapter_returns_value_free_auth_errors(monkeypatch):
+    """Broker clients must never receive an upstream-auth failure body."""
+    adapter = OpenAICodexAdapter()
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("untrusted upstream detail")),
+    )
+
+    with pytest.raises(RuntimeError, match="OpenAI Codex authentication is unavailable") as raised:
+        adapter.get_credential()
+    assert "untrusted upstream detail" not in str(raised.value)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +412,7 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
 
     app = web.Application()
     app.router.add_route("*", "/v1/chat/completions", echo)
+    app.router.add_route("*", "/v1/responses", echo)
     app.router.add_route("*", "/v1/embeddings", echo)
     app.router.add_route("*", "/v1/sse", sse)
     return app
@@ -358,6 +458,44 @@ def test_server_strips_client_auth_header():
                     await resp.read()
             assert captured["requests"][0]["auth"] == "Bearer ours"
             assert "SHOULD_NOT_LEAK" not in captured["requests"][0]["auth"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_codex_proxy_forwards_responses_without_exposing_hermes_auth(monkeypatch):
+    """A local client gets a response while only the proxy sees the upstream bearer."""
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        monkeypatch.setattr(
+            "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+            lambda **kwargs: {
+                "api_key": "opaque-hermes-bearer",
+                "base_url": f"{upstream_base}/v1",
+            },
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(OpenAICodexAdapter()))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={"model": "test", "input": "hello"},
+                    headers={"Authorization": "Bearer local-client-placeholder"},
+                ) as response:
+                    assert response.status == 200
+                    await response.read()
+                async with session.get(f"{proxy_base}/v1/responses") as response:
+                    assert response.status == 405
+                    await response.read()
+            assert captured["requests"] == [{
+                "method": "POST",
+                "path": "/v1/responses",
+                "auth": "Bearer opaque-hermes-bearer",
+                "body": '{"model": "test", "input": "hello"}',
+            }]
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
