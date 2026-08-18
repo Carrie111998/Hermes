@@ -1207,42 +1207,218 @@ function ringToPath(pts) {
   return d + 'Z'
 }
 
-/** Grok-style pose. thinking/working lean and sway. idle is a small sine. */
-function facePose(mood, t) {
-  if (mood === 'work') {
-    return {
-      turn: -11 + Math.sin(t * 0.48) * 8,
-      tilt: Math.sin(t * 0.42) * 8 + Math.sin(t * 1.1) * 1.6,
-      roll: Math.sin(t * 0.75) * 4.2,
-      gazeX: Math.sin(t * 0.55) * 3.6,
-      gazeY: -1.6 + Math.sin(t * 0.38) * 2,
-      blink: t % 1.45 > 1.26,
-      d0: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6)),
-      d1: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6 - 0.7)),
-      d2: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6 - 1.4))
-    }
-  }
+/** Moods a face can hold. Anything else paints as idle. */
+const FACE_MOODS = ['idle', 'work', 'happy', 'sad', 'sleepy', 'shy', 'surprised', 'sick']
 
-  return {
+/** Per-face time offset so a roster of faces doesn't blink and glance in
+ *  lockstep. Seeded from the bot name, so a bot keeps its own rhythm. */
+function facePhase(name) {
+  return sigilRng(String(name || 'agent'))() * 20
+}
+
+/** Deterministic 0..1 noise for an integer slot, so blink and glance
+ *  schedules are irregular but replayable (pure function of time). */
+function slotNoise(n, salt = 0) {
+  let h = Math.imul((n | 0) ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(salt + 1, 0xc2b2ae35)
+  h = Math.imul(h ^ (h >>> 15), 0x27d4eb2d)
+  h ^= h >>> 13
+  return (h >>> 0) / 4294967296
+}
+
+/**
+ * Blink as a vertical squash, 0 (open) .. 1 (shut). Each `period`-second slot
+ * holds one blink at a random offset, sometimes a quick double, and the
+ * squash follows a sine so the lid closes and opens instead of cutting.
+ */
+function blinkSquash(t, period = 3.4, dur = 0.16) {
+  const slot = Math.floor(t / period)
+  const local = t - slot * period
+  const at = slotNoise(slot) * (period - dur * 2.6)
+  const shut = u => (u >= 0 && u < 1 ? Math.sin(u * Math.PI) : 0)
+  let s = shut((local - at) / dur)
+  if (slotNoise(slot, 7) < 0.18) {
+    s = Math.max(s, shut((local - at - dur * 1.7) / dur))
+  }
+  return s
+}
+
+/** Slow wandering gaze with a saccade every few seconds: the "someone is home"
+ *  signal. Returns [x, y] in pupil-offset units. */
+function idleGaze(t) {
+  const driftX = Math.sin(t * 0.31) * 0.6 + Math.sin(t * 0.77 + 1.3) * 0.35
+  const driftY = Math.sin(t * 0.23 + 0.6) * 0.3
+  // Every ~6s (jittered) look somewhere for a beat, then come back.
+  const period = 6.1
+  const slot = Math.floor(t / period)
+  const local = t - slot * period
+  const at = 1 + slotNoise(slot, 3) * 3
+  const hold = 0.9 + slotNoise(slot, 4) * 0.8
+  const u = (local - at) / hold
+  const env = u >= 0 && u < 1 ? Math.sin(u * Math.PI) ** 0.6 : 0
+  const dirX = (slotNoise(slot, 5) - 0.5) * 5.2
+  const dirY = (slotNoise(slot, 6) - 0.5) * 1.6
+  return [driftX + env * dirX, driftY + env * dirY]
+}
+
+/**
+ * Pose for a mood at time t. Head channels (turn/tilt/roll) drive the body
+ * projection and slide the eyes across it, the rest drive the eyes:
+ *   gazeX/gazeY  pupil offset            sx/sy   pupil scale (squint, wide)
+ *   cant         pupil rotation, mirrored L/R (+ inner corners up = pleading,
+ *                - inner corners down = focused / cross)
+ *   lid          0..1 upper-lid coverage (sleepy, drowsy, unwell)
+ *   cheek        0..1 lower-lid rise: leaves an upward crescent (happy squint)
+ *   blink        0..1 vertical squash     bob     body y bounce
+ *   d0..d2       thinking dots (work only)
+ * Every channel is numeric so paintMathFace can ease between moods instead
+ * of snapping.
+ */
+function facePose(mood, t) {
+  const [gx, gy] = idleGaze(t)
+  const base = {
     turn: Math.sin(t * 0.5) * 1.5,
     tilt: Math.sin(t * 0.27),
     roll: Math.sin(t * 0.85) * 1.2,
-    gazeX: 0,
-    gazeY: 0,
-    blink: t % 3.2 > 3.02,
+    gazeX: gx,
+    gazeY: gy,
+    sx: 1,
+    sy: 1,
+    cant: 0,
+    lid: 0,
+    cheek: 0,
+    bob: 0,
+    blink: blinkSquash(t),
     d0: 0,
     d1: 0,
     d2: 0
   }
+
+  switch (mood) {
+    case 'work':
+      return {
+        ...base,
+        turn: -11 + Math.sin(t * 0.48) * 8,
+        tilt: Math.sin(t * 0.42) * 8 + Math.sin(t * 1.1) * 1.6,
+        roll: Math.sin(t * 0.75) * 4.2,
+        gazeX: Math.sin(t * 0.55) * 3.6,
+        gazeY: -1.6 + Math.sin(t * 0.38) * 2,
+        sy: 1.13,
+        cant: -5,
+        blink: blinkSquash(t, 1.6, 0.13),
+        d0: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6)),
+        d1: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6 - 0.7)),
+        d2: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6 - 1.4))
+      }
+    case 'happy':
+      // Squinted-up eyes and a light bounce: something arrived for you.
+      return {
+        ...base,
+        roll: Math.sin(t * 2.1) * 3,
+        gazeX: gx * 0.4,
+        gazeY: -0.5,
+        sx: 1.15,
+        sy: 1.05,
+        cheek: 0.62,
+        bob: -Math.abs(Math.sin(t * 2.2)) * 0.9,
+        blink: 0
+      }
+    case 'sad':
+      return {
+        ...base,
+        roll: 4 + Math.sin(t * 0.6) * 0.8,
+        gazeX: gx * 0.5,
+        gazeY: 1.3,
+        sy: 0.85,
+        cant: 14,
+        lid: 0.22,
+        blink: blinkSquash(t, 4.4, 0.24)
+      }
+    case 'sleepy':
+      return {
+        ...base,
+        turn: Math.sin(t * 0.3) * 2,
+        roll: Math.sin(t * 0.6) * 2.5,
+        gazeX: gx * 0.3,
+        gazeY: 0.6,
+        sx: 1.05,
+        lid: 0.48 + Math.sin(t * 0.9) * 0.06,
+        bob: Math.sin(t * 0.9) * 0.4,
+        blink: blinkSquash(t, 5.2, 0.55)
+      }
+    case 'shy':
+      // Looks away and down, eyes a touch smaller.
+      return {
+        ...base,
+        turn: -20,
+        roll: -5,
+        gazeX: -2.6 + gx * 0.3,
+        gazeY: 1.4,
+        sx: 0.85,
+        sy: 0.85,
+        blink: blinkSquash(t, 2.6, 0.16)
+      }
+    case 'surprised':
+      return {
+        ...base,
+        turn: 0,
+        roll: 0,
+        gazeX: 0,
+        gazeY: -0.6,
+        sx: 1.28,
+        sy: 1.38,
+        bob: -0.6,
+        blink: blinkSquash(t, 5.5, 0.12)
+      }
+    case 'sick':
+      // Woozy: slow sway, heavy lids, pleading cant.
+      return {
+        ...base,
+        turn: Math.sin(t * 1.7) * 5,
+        tilt: Math.sin(t * 0.7) * 3,
+        roll: Math.sin(t * 0.9) * 3.5,
+        gazeX: Math.sin(t * 1.3) * 0.8,
+        gazeY: 1,
+        sx: 0.9,
+        sy: 0.8,
+        cant: 8,
+        lid: 0.4,
+        blink: blinkSquash(t, 3.8, 0.3)
+      }
+    default:
+      return base
+  }
+}
+
+const EASED_CHANNELS = ['gazeX', 'gazeY', 'sx', 'sy', 'cant', 'lid', 'cheek', 'bob']
+// blink is deliberately not eased: it is already a sine and should stay crisp.
+const facePoseMemo = typeof WeakMap === 'function' ? new WeakMap() : null
+
+/** Ease the eye channels toward the target so a mood switch morphs instead of
+ *  snapping. Head channels stay live (they are already sines). ~300ms at 15fps. */
+function easeFacePose(svg, target) {
+  if (!facePoseMemo) {
+    return target
+  }
+  const prev = facePoseMemo.get(svg)
+  if (!prev) {
+    facePoseMemo.set(svg, { ...target })
+    return target
+  }
+  const next = { ...target }
+  for (const k of EASED_CHANNELS) {
+    next[k] = prev[k] + (target[k] - prev[k]) * 0.28
+  }
+  facePoseMemo.set(svg, next)
+  return next
 }
 
 function paintMathFace(svg, t) {
-  const mood = svg.getAttribute('data-hb-mood') || 'idle'
+  const moodAttr = svg.getAttribute('data-hb-mood') || 'idle'
+  const mood = FACE_MOODS.includes(moodAttr) ? moodAttr : 'idle'
   const shape = svg.getAttribute('data-hb-shape') || 'circle'
-  const pose = facePose(mood, t)
+  const phase = Number(svg.getAttribute('data-hb-phase')) || 0
+  const pose = easeFacePose(svg, facePose(mood, t + phase))
   const body = svg.querySelector('[data-hb-body]')
-  const open = svg.querySelector('[data-hb-open]')
-  const shut = svg.querySelector('[data-hb-shut]')
   const el = svg.querySelector('[data-hb-el]')
   const er = svg.querySelector('[data-hb-er]')
   const dots = svg.querySelectorAll('[data-hb-dot]')
@@ -1256,43 +1432,106 @@ function paintMathFace(svg, t) {
     }
   }
 
+  // The eyes sit on the head, not on the screen: a turn slides the pair
+  // sideways and narrows the eye on the far side, which is what reads as
+  // volume at 34px. The cloud keeps its eyes still (its body is a fixed path).
+  const turnRad = shape === 'cloud' ? 0 : (pose.turn * Math.PI) / 180
+  const slide = Math.sin(turnRad) * 4.2
+  const spread = 4.6 * (0.72 + 0.28 * Math.cos(turnRad))
   const eyeY = (shape === 'cloud' ? 22 : 17.2) + pose.gazeY
-  const eyeL = 15.4 + pose.gazeX
-  const eyeR = 24.6 + pose.gazeX
+  const eyeL = 20 - spread + slide + pose.gazeX
+  const eyeR = 20 + spread + slide + pose.gazeX
+  // Blink is a vertical squash of the pupil down to a sliver, then back.
+  const blinkScale = 1 - 0.92 * pose.blink
+  const rxL = 2.2 * pose.sx * (1 + 0.28 * Math.sin(turnRad))
+  const rxR = 2.2 * pose.sx * (1 - 0.28 * Math.sin(turnRad))
+  const ry = 2.3 * pose.sy
+  const ryDrawn = ry * blinkScale
+  const cant = pose.cant.toFixed(2)
 
   if (el) {
-    el.setAttribute('cx', eyeL)
-    el.setAttribute('cy', eyeY)
+    el.setAttribute('cx', eyeL.toFixed(2))
+    el.setAttribute('cy', eyeY.toFixed(2))
+    el.setAttribute('rx', rxL.toFixed(2))
+    el.setAttribute('ry', ryDrawn.toFixed(2))
+    el.setAttribute('transform', `rotate(${cant} ${eyeL.toFixed(2)} ${eyeY.toFixed(2)})`)
   }
 
   if (er) {
-    er.setAttribute('cx', eyeR)
-    er.setAttribute('cy', eyeY)
+    er.setAttribute('cx', eyeR.toFixed(2))
+    er.setAttribute('cy', eyeY.toFixed(2))
+    er.setAttribute('rx', rxR.toFixed(2))
+    er.setAttribute('ry', ryDrawn.toFixed(2))
+    er.setAttribute('transform', `rotate(${-cant} ${eyeR.toFixed(2)} ${eyeY.toFixed(2)})`)
   }
 
   // Catchlights ride the pupils (upper-left offset) — without this they
   // stay at the circle-face position and drift outside e.g. the cloud's
-  // lower-set eyes.
+  // lower-set eyes. They fade as the eye squints, blinks or the lid drops so
+  // a happy squint doesn't keep a full sparkle floating above the slit.
   const hl = svg.querySelector('[data-hb-hl-l]')
   const hr = svg.querySelector('[data-hb-hl-r]')
+  const hlOpacity =
+    Math.max(0, Math.min(1, (pose.sy * blinkScale - 0.45) * 2.2)) * (1 - pose.lid) * (1 - pose.cheek * 0.5)
 
   if (hl) {
-    hl.setAttribute('cx', eyeL - 0.6)
-    hl.setAttribute('cy', eyeY - 0.7)
+    hl.setAttribute('cx', (eyeL - 0.6).toFixed(2))
+    hl.setAttribute('cy', (eyeY - 0.7 * pose.sy * blinkScale).toFixed(2))
+    hl.setAttribute('opacity', hlOpacity.toFixed(2))
   }
 
   if (hr) {
-    hr.setAttribute('cx', eyeR - 0.6)
-    hr.setAttribute('cy', eyeY - 0.7)
+    hr.setAttribute('cx', (eyeR - 0.6).toFixed(2))
+    hr.setAttribute('cy', (eyeY - 0.7 * pose.sy * blinkScale).toFixed(2))
+    hr.setAttribute('opacity', hlOpacity.toFixed(2))
   }
 
-  if (open) {
-    open.setAttribute('opacity', pose.blink ? '0' : '1')
+  // Upper lids: body-colored, pupil-sized ellipses that slide down over the
+  // pupils. Kept pupil-sized and hidden at lid 0 so they never leak past a
+  // tight body outline (the cloud hugs its eyes closely).
+  const lidL = svg.querySelector('[data-hb-lid-l]')
+  const lidR = svg.querySelector('[data-hb-lid-r]')
+  const lidCy = (eyeY - 2 * ry - 0.4 + pose.lid * (2 * ry + 0.8)).toFixed(2)
+  const lidRy = (ry + 0.4).toFixed(2)
+  const lidOpacity = pose.lid > 0.04 ? '1' : '0'
+
+  if (lidL) {
+    lidL.setAttribute('cx', eyeL.toFixed(2))
+    lidL.setAttribute('cy', lidCy)
+    lidL.setAttribute('rx', (rxL + 0.8).toFixed(2))
+    lidL.setAttribute('ry', lidRy)
+    lidL.setAttribute('opacity', lidOpacity)
   }
 
-  if (shut) {
-    shut.setAttribute('d', `M${eyeL - 2.6} ${eyeY} L${eyeL + 2.6} ${eyeY} M${eyeR - 2.6} ${eyeY} L${eyeR + 2.6} ${eyeY}`)
-    shut.setAttribute('opacity', pose.blink ? '1' : '0')
+  if (lidR) {
+    lidR.setAttribute('cx', eyeR.toFixed(2))
+    lidR.setAttribute('cy', lidCy)
+    lidR.setAttribute('rx', (rxR + 0.8).toFixed(2))
+    lidR.setAttribute('ry', lidRy)
+    lidR.setAttribute('opacity', lidOpacity)
+  }
+
+  // Lower lids ("cheeks"): same trick from below. A raised cheek leaves the
+  // top of the pupil as an upward crescent, which is the happy squint.
+  const cheekL = svg.querySelector('[data-hb-cheek-l]')
+  const cheekR = svg.querySelector('[data-hb-cheek-r]')
+  const cheekCy = (eyeY + 2 * ry + 0.4 - pose.cheek * (2 * ry + 0.8)).toFixed(2)
+  const cheekOpacity = pose.cheek > 0.04 ? '1' : '0'
+
+  if (cheekL) {
+    cheekL.setAttribute('cx', eyeL.toFixed(2))
+    cheekL.setAttribute('cy', cheekCy)
+    cheekL.setAttribute('rx', (rxL + 0.8).toFixed(2))
+    cheekL.setAttribute('ry', lidRy)
+    cheekL.setAttribute('opacity', cheekOpacity)
+  }
+
+  if (cheekR) {
+    cheekR.setAttribute('cx', eyeR.toFixed(2))
+    cheekR.setAttribute('cy', cheekCy)
+    cheekR.setAttribute('rx', (rxR + 0.8).toFixed(2))
+    cheekR.setAttribute('ry', lidRy)
+    cheekR.setAttribute('opacity', cheekOpacity)
   }
 
   dots.forEach((dot, i) => {
@@ -1300,7 +1539,7 @@ function paintMathFace(svg, t) {
     dot.setAttribute('opacity', String(o))
   })
 
-  svg.style.transform = `rotate(${pose.tilt}deg)`
+  svg.style.transform = `translateY(${pose.bob.toFixed(2)}px) rotate(${pose.tilt}deg)`
   svg.style.transformOrigin = '50% 70%'
 }
 
@@ -1556,7 +1795,8 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
     })
   }
 
-  const working = mood === 'work'
+  const faceMood = FACE_MOODS.includes(mood) ? mood : 'idle'
+  const working = faceMood === 'work'
   const eyeFill = isDarkColor(color) ? 'rgba(232,220,195,0.95)' : 'rgba(0,0,0,0.85)'
   // Catchlight contrast follows the pupil, not the body: dark pupils get the
   // white sparkle, light (cream) pupils on dark bodies get a dark one — a
@@ -1564,17 +1804,19 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
   // maroon/ink/oxblood avatars.
   const hlFill = isDarkColor(color) ? 'rgba(0,0,0,0.6)' : 'rgba(255,255,255,0.85)'
   const ring = sampleFaceRing(shape)
-  const rest = facePose(working ? 'work' : 'idle', 0)
+  const rest = facePose(faceMood, 0)
   // Shape-aware initial eye line — the cloud body sits lower, so its eyes
   // (and their catchlights) start at the cloud position instead of jumping
   // there on the first clock paint.
   const eyeY0 = shape === 'cloud' ? 22 : 17.2
+  const ry0 = 2.3 * rest.sy
 
   return jsxs('svg', {
     'data-bot-face': name,
     'data-hb-math': '1',
-    'data-hb-mood': working ? 'work' : 'idle',
+    'data-hb-mood': faceMood,
     'data-hb-shape': shape || 'circle',
+    'data-hb-phase': facePhase(name).toFixed(2),
     viewBox: '0 0 40 44',
     width: size,
     height: size,
@@ -1589,22 +1831,20 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
         fill: color
       }),
       jsxs('g', {
-        'data-hb-open': '1',
+        'data-hb-eyes': '1',
         children: [
-          jsx('ellipse', { 'data-hb-el': '1', cx: 15.4, cy: eyeY0, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
-          jsx('ellipse', { 'data-hb-er': '1', cx: 24.6, cy: eyeY0, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
+          jsx('ellipse', { 'data-hb-el': '1', cx: 15.4, cy: eyeY0, rx: 2.2 * rest.sx, ry: ry0, fill: eyeFill }),
+          jsx('ellipse', { 'data-hb-er': '1', cx: 24.6, cy: eyeY0, rx: 2.2 * rest.sx, ry: ry0, fill: eyeFill }),
           jsx('circle', { 'data-hb-hl-l': '1', cx: 14.8, cy: eyeY0 - 0.7, r: 0.65, fill: hlFill }),
-          jsx('circle', { 'data-hb-hl-r': '1', cx: 24, cy: eyeY0 - 0.7, r: 0.65, fill: hlFill })
+          jsx('circle', { 'data-hb-hl-r': '1', cx: 24, cy: eyeY0 - 0.7, r: 0.65, fill: hlFill }),
+          // Upper lids: body-colored, parked above the eye until a mood
+          // lowers them (sleepy / sad / sick). Blink is a squash of the
+          // pupils themselves, so there is no separate shut-eye line.
+          jsx('ellipse', { 'data-hb-lid-l': '1', cx: 15.4, cy: eyeY0 - 2 * ry0 - 0.4, rx: 3, ry: ry0 + 0.4, fill: color, opacity: 0 }),
+          jsx('ellipse', { 'data-hb-lid-r': '1', cx: 24.6, cy: eyeY0 - 2 * ry0 - 0.4, rx: 3, ry: ry0 + 0.4, fill: color, opacity: 0 }),
+          jsx('ellipse', { 'data-hb-cheek-l': '1', cx: 15.4, cy: eyeY0 + 2 * ry0 + 0.4, rx: 3, ry: ry0 + 0.4, fill: color, opacity: 0 }),
+          jsx('ellipse', { 'data-hb-cheek-r': '1', cx: 24.6, cy: eyeY0 + 2 * ry0 + 0.4, rx: 3, ry: ry0 + 0.4, fill: color, opacity: 0 })
         ]
-      }),
-      jsx('path', {
-        'data-hb-shut': '1',
-        d: `M12.8 ${eyeY0} L18 ${eyeY0} M22 ${eyeY0} L27.2 ${eyeY0}`,
-        stroke: eyeFill,
-        strokeWidth: 2,
-        strokeLinecap: 'round',
-        fill: 'none',
-        opacity: 0
       }),
       working
         ? jsxs('g', {
@@ -4664,15 +4904,32 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const gatewayState = useValue(host.state.gateway)
+  // Turn-busy for the focused chat. `host.state.gateway` is the SOCKET state
+  // ('idle' | 'connecting' | 'open' | 'closed' | 'error') and is never 'busy'.
+  const turnBusy = useValue(host.state.busy)
   const activeNow = Boolean(last?.last_active && Date.now() / 1000 - last.last_active < ACTIVE_WINDOW_S)
-  // Work pose only when this bot is actually doing something: the active
-  // profile while the gateway is busy, or a bot that wrote within the
-  // liveness window. Not every bot whenever the gateway is busy.
-  const botMood = (isGatewayHome && gatewayState === 'busy') || activeNow ? 'work' : 'idle'
   // Subscribe on every render. A source switch turns the same keyed row from
   // thin to rich; conditionally calling useValue here breaks React hook order.
   const unreadByName = useValue($botUnread)
   const unread = !bot.remoteSource && Boolean(unreadByName[bot.name])
+  // Work pose only when this bot is actually doing something: the active
+  // profile mid-turn, or a bot that wrote within the liveness window. Not
+  // every bot whenever the gateway is busy. Beyond that the face reads the
+  // room: local gateway down -> sick, connecting -> sleepy, a message waiting
+  // -> happy, hidden -> shy, otherwise idle.
+  const localSocket = !bot.remoteSource
+  const botMood =
+    localSocket && (gatewayState === 'error' || gatewayState === 'closed')
+      ? 'sick'
+      : localSocket && gatewayState === 'connecting'
+        ? 'sleepy'
+        : (isActive && turnBusy) || activeNow
+          ? 'work'
+          : unread
+            ? 'happy'
+            : meta?.hidden
+              ? 'shy'
+              : 'idle'
   // WHO sent the last message (bot-to-bot DM vs human) — the full stored
   // history lives in the Sessions workspace (context menu), not inline.
   // Preview identity must match click identity (#88200): when the backend

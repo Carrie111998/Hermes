@@ -61,7 +61,7 @@ Remote-creation notes:
 Every Bot gets a face:
 
 - **Blob faces** (default) — a deterministic soft-body face drawn from the Bot's name: same name, same face, forever. While you type a name in New Agent the face follows it live; hit **Randomize** to re-roll, **Lock face** to keep the one you like even if the name changes, or pin one of the six silhouettes (round, organic, boxy, nub, cloud, sun) while everything else still comes from the name.
-- **Geometric faces** — the classic 7 shapes × 10 colors, with blinking eyes that scan while the Bot works.
+- **Geometric faces** — the classic 7 shapes × 10 colors, with eyes that blink, look around, and change with the Bot's state: a message you have not read makes it happy, a working Bot turns and thinks, a hidden Bot looks shy, and a Bot whose gateway is down looks unwell.
 - **An uploaded image** — any picture you like.
 - **An AI-generated portrait** — when an image backend is configured, generated in place (this rides the standard `image.generate` RPC and works over both local and remote gateways).
 - **A pixel pet** — a companion from the [petdex gallery](./features/pets.md) that bounces beside the avatar while the Bot is busy. Run `hermes pets` in a terminal to explore the gallery.

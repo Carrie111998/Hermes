@@ -66,7 +66,7 @@ function renderBotRow(input = 'alpha') {
     useEffect: () => undefined,
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {
-      state: { gateway: atom('open'), profile: atom('default') },
+      state: { busy: atom(false), gateway: atom('open'), profile: atom('default') },
       ensureAgent: async (connectionId, profile) => {
         ensured.push([connectionId, profile])
         liveConnectionId = connectionId
@@ -193,7 +193,7 @@ test('behavior: remote default does not open this-device chat when the source di
     useEffect: () => undefined,
     useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
     host: {
-      state: { gateway: atom('open'), profile: atom('default') },
+      state: { busy: atom(false), gateway: atom('open'), profile: atom('default') },
       ensureAgent: async (connectionId, profile) => ensured.push([connectionId, profile]),
       activeConnectionId: () => 'local',
       warmAgent: () => undefined,
