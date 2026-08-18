@@ -128,11 +128,26 @@ _aux_probe_state = threading.local()
 class _AuxProbeClientStub:
     """Non-functional placeholder returned while `aux_probe_mode` is active."""
 
-    __slots__ = ("api_key", "base_url")
+    # `close` and the wrapper-introspection attributes are REAL members, not
+    # __getattr__ fall-throughs. Teardown and cache-eviction code legitimately
+    # probes these with getattr(obj, name, default) / hasattr, which is a
+    # protocol that requires AttributeError — and this class raises
+    # RuntimeError by design. Without real members, a stub reaching any
+    # best-effort cleanup path turns it into a hard failure instead of a
+    # no-op (#compression abort: "used as a real client (attribute 'close')").
+    # Exposing them here keeps the loud failure for genuine client USE
+    # (.chat, .messages, …) while making the stub inert to inspection.
+    __slots__ = ("api_key", "base_url", "_real_client", "_client")
 
     def __init__(self, api_key: str = "", base_url: str = "") -> None:
         self.api_key = api_key
         self.base_url = base_url
+        self._real_client = None
+        self._client = None
+
+    def close(self) -> None:
+        """No-op: a stub owns no transport, so there is nothing to release."""
+        return None
 
     def __getattr__(self, name: str) -> Any:
         # Loud failure if a probe stub ever leaks into a runtime call path
@@ -7802,6 +7817,17 @@ def _get_cached_client(
         task=task,
     )
     if client is not None:
+        if isinstance(client, _AuxProbeClientStub):
+            # Availability probe: never publish a stub into the shared cache.
+            # This is the SAME invariant _store_cached_client enforces, but
+            # this function writes `_client_cache` directly (below), so the
+            # guard has to be restated here or the invariant has a hole: a
+            # check_fn probing under aux_probe_mode() would seed the cache
+            # with a stub, and the next REAL consumer (context compression,
+            # title generation, vision) would get it on a cache hit and blow
+            # up with "used as a real client". Probes are cheap to redo; a
+            # poisoned cache entry persists for the life of the process.
+            return client, model or default_model
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
