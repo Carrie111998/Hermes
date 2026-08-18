@@ -35,7 +35,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -74,22 +74,6 @@ _lock = threading.RLock()
 _entries: Dict[str, _ClarifyEntry] = {}
 # session_key → list[clarify_id]  (FIFO; for text-fallback intercept and session cleanup)
 _session_index: Dict[str, List[str]] = {}
-# Octo delivers the same ordinary message over realtime transport and Bot
-# events. Keep only messages that actually resolved clarify; failed claims are
-# never retained, so the realtime path can continue as an ordinary turn.
-_consumed_message_ids: Dict[str, float] = {}
-_CONSUMED_MESSAGE_TTL_SECONDS = 24 * 60 * 60
-
-
-def _prune_consumed_messages(now: float) -> None:
-    cutoff = now - _CONSUMED_MESSAGE_TTL_SECONDS
-    expired = [
-        message_id
-        for message_id, consumed_at in _consumed_message_ids.items()
-        if consumed_at < cutoff
-    ]
-    for message_id in expired:
-        _consumed_message_ids.pop(message_id, None)
 
 
 def source_identity(source: Any) -> Tuple[str, ...]:
@@ -250,6 +234,21 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
         entry.state = "answered"
         entry.event.set()
         return True
+
+def resolve_gateway_clarify_entry(
+    entry: _ClarifyEntry,
+    response: str,
+) -> bool:
+    """Resolve only when ``entry`` is still the exact registered occurrence."""
+    with _lock:
+        if _entries.get(entry.clarify_id) is not entry or entry.state != "pending":
+            return False
+        entry.response = str(response) if response is not None else ""
+        entry.state = "answered"
+        entry.event.set()
+        return True
+
+
 
 def get_pending_for_session(
     session_key: str,
@@ -413,61 +412,6 @@ def resolve_text_response_for_session(
     return resolve_gateway_clarify(entry.clarify_id, coerced)
 
 
-def resolve_message_text_for_session(
-    session_key: str,
-    response: str,
-    message_id: str,
-    *,
-    source_identity: Optional[Tuple[str, ...]] = None,
-) -> Literal["consumed", "duplicate", "not_resolved"]:
-    """Atomically resolve clarify and retain one cross-transport consumption result."""
-    if not isinstance(message_id, str) or not message_id:
-        return "not_resolved"
-    with _lock:
-        now = time.monotonic()
-        _prune_consumed_messages(now)
-        if message_id in _consumed_message_ids:
-            return "duplicate"
-        ids = _session_index.get(session_key) or []
-        entry = next(
-            (
-                candidate
-                for clarify_id in ids
-                if (candidate := _entries.get(clarify_id)) is not None
-                and candidate.state == "pending"
-                and (
-                    source_identity is None
-                    or candidate.source_identity is None
-                    or _source_identity_matches(
-                        candidate.source_identity,
-                        source_identity,
-                        shared_multi_user_session=candidate.shared_multi_user_session,
-                    )
-                )
-            ),
-            None,
-        )
-        if entry is None:
-            return "not_resolved"
-        coerced = _coerce_text_response(entry, response)
-        if coerced is None or entry.state != "pending":
-            return "not_resolved"
-        entry.response = coerced
-        entry.state = "answered"
-        _consumed_message_ids[message_id] = now
-        entry.event.set()
-        return "consumed"
-
-
-def is_clarify_message_consumed(message_id: str) -> bool:
-    """Return whether this Octo message already answered clarify in this process."""
-    if not isinstance(message_id, str) or not message_id:
-        return False
-    with _lock:
-        _prune_consumed_messages(time.monotonic())
-        return message_id in _consumed_message_ids
-
-
 def mark_awaiting_text(clarify_id: str) -> bool:
     """Flip an entry into text-capture mode (user picked the 'Other' button).
 
@@ -476,6 +420,15 @@ def mark_awaiting_text(clarify_id: str) -> bool:
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None or entry.state != "pending":
+            return False
+        entry.awaiting_text = True
+        return True
+
+
+def mark_awaiting_text_entry(entry: _ClarifyEntry) -> bool:
+    """Flip only the exact still-pending clarify occurrence into text mode."""
+    with _lock:
+        if _entries.get(entry.clarify_id) is not entry or entry.state != "pending":
             return False
         entry.awaiting_text = True
         return True

@@ -64,7 +64,6 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
-        getattr(cm, "_consumed_message_ids").clear()
         cm._notify_cbs.clear()
 
 

@@ -19,7 +19,6 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
-        cm._consumed_message_ids.clear()
         cm._notify_cbs.clear()
 
 
@@ -52,6 +51,17 @@ class TestClarifyPrimitive:
         assert cm.resolve_gateway_clarify("id-race", "A") is True
         assert cm.resolve_gateway_clarify("id-race", "") is False
         assert entry.response == "A"
+
+    def test_mark_awaiting_text_entry_rejects_same_id_replacement(self):
+        """An old card cannot switch a replacement occurrence into text mode."""
+        from tools import clarify_gateway as cm
+
+        original = cm.register("same-id", "sk", "Original", ["A"])
+        cm.clear_session("sk")
+        replacement = cm.register("same-id", "sk", "Replacement", ["B"])
+
+        assert cm.mark_awaiting_text_entry(original) is False
+        assert replacement.awaiting_text is False
 
     def test_open_ended_auto_awaits_text(self):
         """Clarify with no choices is in text-capture mode immediately."""
@@ -556,48 +566,3 @@ class TestNativeChoiceFreeText:
         assert json.loads(cm.wait_for_response("custom-multi", timeout=1)) == [
             "later, after lunch"
         ]
-
-
-class TestClarifyMessageConsumption:
-    """Realtime and Bot-event delivery share one message-id decision."""
-
-    def setup_method(self):
-        _clear_clarify_state()
-
-    def test_message_id_is_consumed_once_across_delivery_paths(self):
-        from tools import clarify_gateway as cm
-
-        cm.register("dedup", "sk", "Pick", ["A", "B"])
-
-        assert cm.resolve_message_text_for_session("sk", "custom", "message-1") == "consumed"
-        assert cm.resolve_message_text_for_session("sk", "custom", "message-1") == "duplicate"
-        assert cm.is_clarify_message_consumed("message-1") is True
-        assert cm.wait_for_response("dedup", timeout=1) == "custom"
-
-    def test_failed_message_resolution_does_not_consume_message_id(self):
-        from tools import clarify_gateway as cm
-
-        assert cm.resolve_message_text_for_session("missing", "custom", "message-2") == "not_resolved"
-        assert cm.is_clarify_message_consumed("message-2") is False
-
-    def test_message_claim_and_answer_are_atomic_against_competing_answer(self):
-        from tools import clarify_gateway as cm
-
-        cm.register("race-message", "sk", "Pick", ["A", "B"])
-        outcomes = []
-        barrier = threading.Barrier(3)
-
-        def resolve(message_id, answer):
-            barrier.wait()
-            outcomes.append(cm.resolve_message_text_for_session("sk", answer, message_id))
-
-        first = threading.Thread(target=resolve, args=("message-a", "A"))
-        second = threading.Thread(target=resolve, args=("message-b", "B"))
-        first.start()
-        second.start()
-        barrier.wait()
-        first.join(timeout=5)
-        second.join(timeout=5)
-
-        assert sorted(outcomes) == ["consumed", "not_resolved"]
-        assert sum(cm.is_clarify_message_consumed(mid) for mid in ("message-a", "message-b")) == 1

@@ -16381,16 +16381,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _pending_clarify = None
         if (
             allow_gateway_control
-            and _clarify_mod is not None
-            and _clarify_mod.is_clarify_message_consumed(event.message_id or "")
-        ):
-            logger.info(
-                "Gateway suppressed duplicate clarify message delivery (message_id=%s)",
-                event.message_id,
-            )
-            return ""
-        if (
-            allow_gateway_control
             and _pending_clarify is not None
             and _clarify_mod is not None
         ):
@@ -16413,13 +16403,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _clarify_cmd
             )
             if _raw_clarify_reply and not _clarify_command_known:
-                _resolved = _clarify_mod.resolve_message_text_for_session(
+                _resolved = _clarify_mod.resolve_text_response_for_session(
                     _quick_key,
                     _raw_clarify_reply,
-                    event.message_id or "",
                     source_identity=_clarify_identity,
                 )
-                if _resolved in {"consumed", "duplicate"}:
+                if _resolved:
                     logger.info(
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
