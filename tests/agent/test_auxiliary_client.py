@@ -2670,6 +2670,9 @@ class TestAuxiliaryPoolRotationRetry:
             def has_credentials(self):
                 return True
 
+            def entry_id_for_api_key(self, api_key):
+                return "opencode-a" if api_key == "opencode-key-a" else None
+
             def mark_exhausted_and_rotate(self, **kwargs):
                 return SimpleNamespace(id="opencode-b")
 
@@ -2704,9 +2707,117 @@ class TestAuxiliaryPoolRotationRetry:
             )
 
         assert response.choices[0].message.content == "rotated-moa-reference"
+        assert mock_cached.call_args_list[1].args[0] == "opencode-go"
         assert mock_cached.call_args_list[1].kwargs["api_key"] is None
+        assert fresh_client.api_key == "opencode-key-b"
         assert fresh_client.chat.completions.create.call_count == 1
         mock_fallback.assert_not_called()
+
+    def test_call_llm_preserves_explicit_key_not_owned_by_pool(self):
+        quota_err = Exception("GoUsageLimitError: usage limit reached")
+        quota_err.status_code = 429
+
+        stale_client = MagicMock()
+        stale_client.api_key = "user-pinned-key"
+        stale_client.base_url = "https://opencode.ai/zen/go/v1"
+        stale_client.chat.completions.create.side_effect = quota_err
+
+        retry_client = MagicMock()
+        retry_client.api_key = "user-pinned-key"
+        retry_client.base_url = "https://opencode.ai/zen/go/v1"
+        retry_client.chat.completions.create.return_value = _DummyResponse("pinned-key-retry")
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def entry_id_for_api_key(self, api_key):
+                return None
+
+            def mark_exhausted_and_rotate(self, **kwargs):
+                return SimpleNamespace(id="opencode-pool-b")
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "opencode-go",
+                    "deepseek-v4-flash",
+                    "https://opencode.ai/zen/go/v1",
+                    "user-pinned-key",
+                    "chat_completions",
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                side_effect=[
+                    (stale_client, "deepseek-v4-flash"),
+                    (retry_client, "deepseek-v4-flash"),
+                ],
+            ) as mock_cached,
+            patch("agent.auxiliary_client.load_pool", return_value=_Pool()),
+        ):
+            response = call_llm(
+                task="moa_reference",
+                provider="opencode-go",
+                model="deepseek-v4-flash",
+                base_url="https://opencode.ai/zen/go/v1",
+                api_key="user-pinned-key",
+                messages=[{"role": "user", "content": "advise"}],
+            )
+
+        assert response.choices[0].message.content == "pinned-key-retry"
+        assert mock_cached.call_args_list[1].kwargs["api_key"] == "user-pinned-key"
+
+    def test_call_llm_does_not_rebuild_when_pool_has_no_replacement(self):
+        quota_err = Exception("GoUsageLimitError: usage limit reached")
+        quota_err.status_code = 429
+
+        stale_client = MagicMock()
+        stale_client.api_key = "opencode-key-a"
+        stale_client.base_url = "https://opencode.ai/zen/go/v1"
+        stale_client.chat.completions.create.side_effect = quota_err
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def entry_id_for_api_key(self, api_key):
+                return "opencode-a" if api_key == "opencode-key-a" else None
+
+            def mark_exhausted_and_rotate(self, **kwargs):
+                return None
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "opencode-go",
+                    "deepseek-v4-flash",
+                    "https://opencode.ai/zen/go/v1",
+                    "opencode-key-a",
+                    "chat_completions",
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(stale_client, "deepseek-v4-flash"),
+            ) as mock_cached,
+            patch("agent.auxiliary_client.load_pool", return_value=_Pool()),
+            patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")),
+            patch("agent.auxiliary_client._try_main_agent_model_fallback", return_value=(None, None, "")),
+        ):
+            with pytest.raises(Exception, match="GoUsageLimitError"):
+                call_llm(
+                    task="moa_reference",
+                    provider="opencode-go",
+                    model="deepseek-v4-flash",
+                    base_url="https://opencode.ai/zen/go/v1",
+                    api_key="opencode-key-a",
+                    messages=[{"role": "user", "content": "advise"}],
+                )
+
+        assert mock_cached.call_count == 1
 
     @pytest.mark.asyncio
     async def test_async_call_llm_rebuilds_without_exhausted_explicit_key(self):
@@ -2728,6 +2839,7 @@ class TestAuxiliaryPoolRotationRetry:
 
         pool = MagicMock()
         pool.has_credentials.return_value = True
+        pool.entry_id_for_api_key.return_value = "opencode-a"
         pool.mark_exhausted_and_rotate.return_value = SimpleNamespace(id="opencode-b")
 
         with (
@@ -2760,7 +2872,9 @@ class TestAuxiliaryPoolRotationRetry:
             )
 
         assert response.choices[0].message.content == "rotated-async-reference"
+        assert mock_cached.call_args_list[1].args[0] == "opencode-go"
         assert mock_cached.call_args_list[1].kwargs["api_key"] is None
+        assert fresh_client.api_key == "opencode-key-b"
         assert fresh_create.await_count == 1
 
 
