@@ -4315,6 +4315,26 @@ def _is_unsupported_temperature_error(exc: Exception) -> bool:
     return _is_unsupported_parameter_error(exc, "temperature")
 
 
+def _is_zai_vision_param_error(err_str: str, base_url) -> bool:
+    """Detect ZAI's undocumented error code 1210 for a multimodal ``max_tokens`` call.
+
+    ZAI vision models (glm-4v-flash etc.) return error code 1210 ("API
+    调用参数有误") when ``max_tokens`` is passed on multimodal calls. The
+    error message does NOT contain "max_tokens" so the generic
+    unsupported-parameter retry never fires — this is the only signal.
+
+    Hostname match (not substring) on the client's own ``base_url``: a
+    proxied endpoint whose path merely contains the text "bigmodel" must
+    not misfire on an unrelated provider's error text (same class as
+    #74312 / the ZAI/Kimi host-anchoring fix already applied to
+    ``_to_openai_base_url()``).
+    """
+    if "1210" not in (err_str or ""):
+        return False
+    url = str(base_url or "")
+    return base_url_host_matches(url, "open.bigmodel.cn") or base_url_host_matches(url, "api.z.ai")
+
+
 def _is_model_not_found_error(exc: Exception) -> bool:
     """Detect "the requested model doesn't exist" errors (404 / invalid model).
 
@@ -9489,15 +9509,7 @@ def _call_llm_impl(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
-        # ZAI vision models (glm-4v-flash etc.) return error code 1210
-        # ("API 调用参数有误") when max_tokens is passed on multimodal
-        # calls.  The error message does NOT contain "max_tokens" so the
-        # generic retry below never fires.  Detect the ZAI-specific error
-        # and strip max_tokens before retrying.
-        _is_zai_param_error = (
-            "1210" in err_str
-            and "bigmodel" in str(getattr(client, "base_url", ""))
-        )
+        _is_zai_param_error = _is_zai_vision_param_error(err_str, getattr(client, "base_url", ""))
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
@@ -10201,15 +10213,7 @@ async def _async_call_llm_impl(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
-        # ZAI vision models (glm-4v-flash etc.) return error code 1210
-        # ("API 调用参数有误") when max_tokens is passed on multimodal
-        # calls.  The error message does NOT contain "max_tokens" so the
-        # generic retry below never fires.  Detect the ZAI-specific error
-        # and strip max_tokens before retrying.
-        _is_zai_param_error = (
-            "1210" in err_str
-            and "bigmodel" in str(getattr(client, "base_url", ""))
-        )
+        _is_zai_param_error = _is_zai_vision_param_error(err_str, getattr(client, "base_url", ""))
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
