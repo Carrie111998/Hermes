@@ -143,6 +143,97 @@ class TestDetectDangerousRm:
                 assert "delete" in desc.lower(), command
 
 
+class TestDetectDangerousSingleFileHomeDelete:
+    """A single, non-recursive `rm` of one file under $HOME previously fell
+    through both existing rm rules entirely: "delete in root path" only
+    fires on a literal leading "/" (already folded away for home paths by
+    the time patterns run), and every recursive-delete rule requires
+    -r/-R/--recursive. `rm ~/Documents/important_file.txt` matched neither
+    and was silently treated as safe."""
+
+    def test_single_file_delete_under_home_is_dangerous(self):
+        for command in (
+            "rm ~/Documents/important_file.txt",
+            "rm -f ~/foo.txt",
+            "rm $HOME/foo.txt",
+            "rm ${HOME}/foo.txt",
+        ):
+            is_dangerous, key, desc = detect_dangerous_command(command)
+            assert is_dangerous is True, command
+            assert key is not None, command
+            assert desc == "single-file delete under home directory", command
+
+    def test_raw_absolute_home_path_is_folded_and_flagged(self, monkeypatch):
+        # Absolute paths under $HOME are folded to ~/... by
+        # _rewrite_resolved_user_home before any pattern in DANGEROUS_PATTERNS
+        # ever runs, so the new rule must catch the raw absolute spelling too
+        # even though it only matches the folded ~/$HOME forms directly.
+        home = os.path.expanduser("~")
+        command = f"rm {home}/some/nested/file.txt"
+        is_dangerous, key, desc = detect_dangerous_command(command)
+        assert is_dangerous is True, command
+        assert desc == "single-file delete under home directory", command
+
+    def test_bare_home_root_not_matched_by_new_rule(self):
+        # `rm ~` (no path component after the slash) is the whole-home-wipe
+        # hardline rule's territory, not this one -- and it isn't even a
+        # valid non-recursive rm of a directory, so it should not be flagged
+        # as a "single file" delete by the new rule.
+        is_dangerous, key, desc = detect_dangerous_command("rm ~")
+        assert is_dangerous is False
+        assert key is None
+
+    def test_recursive_home_delete_still_classified_as_recursive_not_single_file(self):
+        # When a recursive flag is present (leading or permuted after the
+        # operand), the existing recursive-delete rules must still win so the
+        # reported description reflects the real risk -- the new rule must
+        # not shadow them.
+        for command in ("rm -rf ~/foo.txt", "rm -rf ~", "rm ~/foo.txt -r"):
+            is_dangerous, key, desc = detect_dangerous_command(command)
+            assert is_dangerous is True, command
+            assert "recursive" in desc.lower(), command
+
+    def test_verification_cleanup_exemption_still_applies_under_home(self):
+        # The legitimate-cleanup exemption (_is_verification_artifact_cleanup)
+        # is checked in detect_dangerous_command BEFORE any DANGEROUS_PATTERNS
+        # match, so it must still short-circuit the new home rule even when
+        # the temp dir itself happens to resolve under $HOME.
+        home = os.path.expanduser("~")
+        fake_temp = os.path.join(home, "tmp-verify-area")
+        with mock_patch("tempfile.gettempdir", return_value=fake_temp):
+            assert detect_dangerous_command(
+                f"rm -f {fake_temp}/hermes-verify-example.py"
+            ) == (False, None, None)
+            assert detect_dangerous_command(
+                f"rm -f {fake_temp}/hermes-ad-hoc-example.py"
+            ) == (False, None, None)
+
+    def test_existing_root_path_catchall_unaffected(self):
+        # "delete in root path" -- unrelated to $HOME, must be unaffected by
+        # the new rule's addition.
+        is_dangerous, key, desc = detect_dangerous_command("rm -rf /")
+        assert is_dangerous is True
+        assert desc == "delete in root path"
+
+    def test_existing_whole_home_recursive_hardline_unaffected(self):
+        # "recursive delete of home directory" is a HARDLINE rule (never
+        # bypassable, even under yolo) -- confirm it still fires correctly
+        # and is unaffected by the new (bypassable, DANGEROUS_PATTERNS-level)
+        # single-file rule living in a different detection list.
+        for command in ("rm -rf ~", "rm -rf $HOME", "rm -rf ${HOME}/"):
+            is_hardline, desc = detect_hardline_command(command)
+            assert is_hardline is True, command
+            assert desc == "recursive delete of home directory", command
+
+    def test_safe_delete_outside_home_not_flagged(self):
+        # Sanity check that the new rule hasn't been over-broadened: a
+        # relative-path delete with no home reference at all must stay safe.
+        is_dangerous, key, desc = detect_dangerous_command("rm somefile.txt")
+        assert is_dangerous is False
+        assert key is None
+        assert desc is None
+
+
 class TestWindowsShellDestructiveCommands:
     def test_windows_destructive_requires_approval(self):
         cases = [
