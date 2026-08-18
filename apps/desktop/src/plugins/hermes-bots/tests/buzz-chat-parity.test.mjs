@@ -96,7 +96,7 @@ function load(sdkNamespace, turnScript = () => 'ok') {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__cp = { validateChannelName, createChannel, deleteChannel, knownChannels, channelMemberBots, $channels, getOrCreateRoomController, pendingAttachmentSnapshots, roomAttachmentControllers, runGroupChatRounds, updateGroupChat, $groupChats };\n'
+      '\nglobalThis.__cp = { validateChannelName, createChannel, deleteChannel, knownChannels, channelMemberBots, $channels, getOrCreateRoomController, pendingAttachmentSnapshots, roomAttachmentControllers, runGroupChatRounds, updateGroupChat, $groupChats, sendToGroupChat };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -390,8 +390,8 @@ test('AT-RG: one shared controller — snapshot stages for EVERY responder witho
   const second = cp.getOrCreateRoomController('Room')
   assert.equal(first, second, 'one controller per room, shared by composer and turn loop')
 
-  await seedAttachmentSend(cp)
-  await cp.runGroupChatRounds('Room', ATTACH_MEMBERS, 't1')
+  const { attachKey } = await seedAttachmentSend(cp)
+  await cp.runGroupChatRounds('Room', ATTACH_MEMBERS, 't1', attachKey)
 
   const controller = instances[0]
   // EVERY responder stages the SAME send into its own session — the exact
@@ -411,11 +411,48 @@ test('AT-RG: send snapshot survives the whole round and is finalized only after 
   const cp = load(sdkNamespace, () => 'got it')
   const { attachKey } = await seedAttachmentSend(cp)
 
-  await cp.runGroupChatRounds('Room', ATTACH_MEMBERS, 't1')
+  await cp.runGroupChatRounds('Room', ATTACH_MEMBERS, 't1', attachKey)
 
   // After the round: the key is consumed, the room flag is gone, and the
   // sent items were removed from the controller scope (chips cleared).
   assert.equal(cp.pendingAttachmentSnapshots.get(attachKey), undefined, 'snapshot consumed after the round')
   assert.equal(cp.$groupChats.get().Room.pendingAttachKey, undefined, 'pending flag cleared after the round')
   assert.equal(instances[0].removeCalls.length, 1, 'sent attachment removed from the controller scope')
+})
+
+test('AT-RG: attachment-only send drives the room (no text, staged files still start a round)', async () => {
+  const { instances, sdkNamespace } = fakeSdkWithController()
+  const cp = load(sdkNamespace, () => 'got it')
+  const { attachKey } = await seedAttachmentSend(cp)
+
+  // The composer's attachment-only path: no text, but the send is bound to
+  // the snapshot key — the room must still round-robin (file delivery).
+  // sendToGroupChat must NOT reject a text-less send when files are staged.
+  const thread = cp.sendToGroupChat('Room', ATTACH_MEMBERS, '', null, attachKey)
+  assert.ok(thread, 'attachment-only send starts a round (not rejected)')
+  assert.equal(cp.$groupChats.get().Room.running, true, 'room marked running for the attachment-only send')
+  // The snapshot stays parked for the (async) drive — it was not dropped.
+  assert.equal(cp.pendingAttachmentSnapshots.get(attachKey) === undefined, false, 'snapshot parked for the round')
+})
+
+test('AT-RG: a newer send while a round runs is NOT consumed by the older round', async () => {
+  const { instances, sdkNamespace } = fakeSdkWithController()
+  const cp = load(sdkNamespace, () => 'got it')
+  const first = await seedAttachmentSend(cp)
+  // Second send: park a NEW snapshot under a different key while the first
+  // round is still live (the old round must not delete the new key).
+  await cp.getOrCreateRoomController('Room').pickFiles()
+  const secondSnapshot = cp.getOrCreateRoomController('Room').snapshot()
+  const secondKey = 'Room\u0000second'
+  cp.pendingAttachmentSnapshots.set(secondKey, secondSnapshot)
+  cp.updateGroupChat('Room', room => {
+    room.pendingAttachKey = secondKey
+    return room
+  })
+
+  // The older round finalizes ONLY its own key.
+  await cp.runGroupChatRounds('Room', ATTACH_MEMBERS, 't1', first.attachKey)
+
+  assert.equal(cp.pendingAttachmentSnapshots.get(first.attachKey), undefined, 'old round consumed its own key')
+  assert.equal(cp.pendingAttachmentSnapshots.get(secondKey), secondSnapshot, 'newer send snapshot survives the older round')
 })

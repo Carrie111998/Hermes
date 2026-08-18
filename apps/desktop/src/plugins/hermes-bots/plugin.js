@@ -3834,7 +3834,7 @@ function getOrCreateRoomController(group) {
  *  so slow models aren't cut off mid-run. A turn that still times out
  *  records a stranded marker so the finished reply can be harvested into
  *  the room at the member's next turn instead of being lost. */
-async function runGroupChatMemberTurn(group, member, prompt, thread) {
+async function runGroupChatMemberTurn(group, member, prompt, thread, attachKey = null) {
   const { runtime, stored } = await ensureGroupChatSession(group, member)
 
   if (!runtime) {
@@ -3843,11 +3843,10 @@ async function runGroupChatMemberTurn(group, member, prompt, thread) {
 
   // CB-02: stage this send's attachments into THIS member's own session and
   // route (never a hard-coded local target). The snapshot is immutable and
-  // keyed by send; a newer send replaces the key, so stale completions are
-  // ignored. Failure preserves the draft (already in the room log) and
-  // reports honestly — an unknown outcome is never retried.
-  const room = $groupChats.get()[group] || {}
-  const attachKey = room.pendingAttachKey
+  // keyed by the round that owns this send — a newer send parks a DIFFERENT
+  // key, so stale completions are never picked up here. Failure preserves
+  // the draft (already in the room log) and reports honestly — an unknown
+  // outcome is never retried.
   const snapshot = attachKey ? pendingAttachmentSnapshots.get(attachKey) : null
   let refs = []
 
@@ -4034,7 +4033,7 @@ async function harvestStrandedGroupReply(group, member) {
  *  next member boundary, bails, and the newest send's own loop takes over.
  *  Watermarks are per thread+member (`${thread}::${memberKey}`), so parallel
  *  topics never eat each other's deltas. */
-async function runGroupChatRounds(group, members, thread) {
+async function runGroupChatRounds(group, members, thread, roundAttachKey = null) {
   const startEpoch = ($groupChats.get()[group] || {}).epoch || 0
   const isCurrent = () => (($groupChats.get()[group] || {}).epoch || 0) === startEpoch
   let posted = 0
@@ -4091,7 +4090,7 @@ async function runGroupChatRounds(group, members, thread) {
         let reply = null
 
         try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread)
+          reply = await runGroupChatMemberTurn(group, member, prompt, thread, roundAttachKey)
         } catch {
           reply = null // a failed turn is a pass, never a room error
         }
@@ -4127,11 +4126,11 @@ async function runGroupChatRounds(group, members, thread) {
     // Finalize attachments AFTER the whole round, not per member: the same
     // send snapshot is staged into EVERY responder's session, so consuming
     // (or clearing) it at the first member would drop the file for the rest.
-    const room = $groupChats.get()[group] || {}
-    const attachKey = room.pendingAttachKey
-
-    if (attachKey) {
-      const snapshot = pendingAttachmentSnapshots.get(attachKey)
+    // The key is the one THIS round was bound to — never the room's current
+    // pendingAttachKey, which may belong to a NEWER send that arrived while
+    // this round was running.
+    if (roundAttachKey) {
+      const snapshot = pendingAttachmentSnapshots.get(roundAttachKey)
 
       if (snapshot) {
         // Remove ONLY the sent items from the controller scope: clears their
@@ -4144,11 +4143,15 @@ async function runGroupChatRounds(group, members, thread) {
         }
       }
 
-      pendingAttachmentSnapshots.delete(attachKey)
-      updateGroupChat(group, r => {
-        delete r.pendingAttachKey
-        return r
-      })
+      // Consume only this round's key. A newer send's key (if any) survives.
+      pendingAttachmentSnapshots.delete(roundAttachKey)
+
+      if (($groupChats.get()[group] || {}).pendingAttachKey === roundAttachKey) {
+        updateGroupChat(group, r => {
+          delete r.pendingAttachKey
+          return r
+        })
+      }
     }
 
     if (isCurrent()) {
@@ -4163,20 +4166,29 @@ async function runGroupChatRounds(group, members, thread) {
 
 /** User send into a group room. `thread` continues that thread (its reply
  *  box); omitted/null mints a NEW thread — the main composer's Slack shape.
- *  Appends, bumps the room epoch (supersedes any running loop at its next
- *  member boundary), and starts the turn drive for the target thread.
- *  Returns the thread id the message landed in. */
-function sendToGroupChat(group, members, text, thread) {
+ *  `attachKey` binds this send's attachment snapshot to the round it starts
+ *  (attachment-only sends are valid: a send with no text but staged files
+ *  must still drive the room). Appends, bumps the room epoch (supersedes any
+ *  running loop at its next member boundary), and starts the turn drive for
+ *  the target thread. Returns the thread id the message landed in. */
+function sendToGroupChat(group, members, text, thread, attachKey = null) {
   const trimmed = String(text || '').trim()
 
-  if (!trimmed || !members.length) {
+  if (!trimmed && !attachKey) {
+    return null
+  }
+
+  if (!members.length) {
     return null
   }
 
   const target = thread || mintGroupThreadId()
 
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
-  appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target)
+
+  if (trimmed) {
+    appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target)
+  }
 
   const wasRunning = ($groupChats.get()[group] || {}).running === true
 
@@ -4186,24 +4198,21 @@ function sendToGroupChat(group, members, text, thread) {
     return room
   })
 
-  if (!wasRunning) {
-    void runGroupChatRounds(group, members, target).catch(() => {
+  const startRounds = () => {
+    void runGroupChatRounds(group, members, target, attachKey).catch(() => {
       updateGroupChat(group, r => {
         r.running = false
         return r
       })
     })
+  }
+
+  if (!wasRunning) {
+    startRounds()
   } else {
     // A loop is live; it bails at its next boundary. Chain the fresh loop
     // after a short settle so exactly one drive owns the room.
-    setTimeout(() => {
-      void runGroupChatRounds(group, members, target).catch(() => {
-        updateGroupChat(group, r => {
-          r.running = false
-          return r
-        })
-      })
-    }, 250)
+    setTimeout(startRounds, 250)
   }
 
   return target
@@ -8319,7 +8328,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
     // Main composer = START A NEW THREAD with the whole group (Slack shape).
     // Full descriptors ride into the turn loop: remote members keep their
     // connection fields so their turns route to their own machines.
-    const minted = sendToGroupChat(group, memberDescriptors(), text)
+    const minted = sendToGroupChat(group, memberDescriptors(), text, null, attachKey)
 
     if (minted) {
       setOpenThreads(prev => ({ ...prev, [minted]: true }))
