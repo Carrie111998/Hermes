@@ -1,7 +1,7 @@
 """Tests for the DuckDuckGo (ddgs) web search provider.
 
 Covers:
-- DDGSWebSearchProvider.is_available() — reflects package importability
+- DDGSWebSearchProvider.is_available() — reflects active transport availability
 - DDGSWebSearchProvider.search() — happy path, missing package, runtime error
 - Result normalization (title, url, description, position)
 - Process-isolated timeout / interrupt / GIL-hold / reap (#68096)
