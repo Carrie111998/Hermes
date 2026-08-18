@@ -87,8 +87,13 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     """
     killpg = getattr(os, "killpg", None)
     if killpg is not None:
+        # start_new_session=True makes the child the process-group leader,
+        # so its pgid is reliably proc.pid. Using proc.pid directly (instead
+        # of os.getpgid(proc.pid)) avoids a ProcessLookupError if the direct
+        # child has already exited while descendants still hold the pipe open
+        # — which is exactly the case when communicate(timeout=...) timed out.
         try:
-            os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+            os.killpg(proc.pid, 9)  # SIGKILL
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()
@@ -353,7 +358,7 @@ def delegate_to_devin(
         workdir = str(Path(workdir).resolve())
         if not Path(workdir).is_dir():
             workdir = os.getcwd()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         workdir = os.getcwd()
 
     start = time.monotonic()
@@ -383,6 +388,19 @@ def delegate_to_devin(
             except Exception:
                 stdout, stderr = "", ""
             duration = time.monotonic() - start
+            # Tailor the error hint: if the model supplied a timeout override,
+            # raising the config default won't help — the model chose this cap.
+            if timeout is not None:
+                timeout_hint = (
+                    "The model supplied a shorter timeout override; ask it to "
+                    "retry without the timeout parameter or raise "
+                    "delegation.devin.timeout_seconds in config.yaml."
+                )
+            else:
+                timeout_hint = (
+                    "Raise delegation.devin.timeout_seconds if the task needs "
+                    "more time."
+                )
             return json.dumps(
                 {"results": [{
                     "task_index": 0,
@@ -390,8 +408,7 @@ def delegate_to_devin(
                     "summary": "",
                     "error": (
                         f"Devin did not finish within {timeout_seconds:.0f}s. "
-                        "Raise delegation.devin.timeout_seconds if the task needs "
-                        "more time."
+                        f"{timeout_hint}"
                     ),
                     "duration_seconds": round(duration, 3),
                     "model": resolved_model,

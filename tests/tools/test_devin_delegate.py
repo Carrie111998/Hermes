@@ -228,6 +228,22 @@ class TestDelegateToDevin(unittest.TestCase):
         self.assertEqual(entry["status"], "timeout")
         self.assertEqual(entry["exit_reason"], "timeout")
         self.assertIn("60s", entry["error"])
+        # No model override → hint points to config
+        self.assertIn("timeout_seconds", entry["error"])
+
+    def test_timeout_with_model_override_shows_override_hint(self):
+        """When the model supplied a timeout override, the error hint should
+        mention the override, not just the config knob."""
+        p1, p2, p3 = self._patch_env(cfg={"enabled": True, "timeout_seconds": 1800})
+        proc = _mock_popen()
+        proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["devin"], timeout=120)
+        with p1, p2, p3, \
+             patch.object(mod.subprocess, "Popen", return_value=proc), \
+             patch.object(mod, "_kill_process_group", lambda p: None):
+            result = json.loads(delegate_to_devin(goal="do thing", timeout=120))
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "timeout")
+        self.assertIn("override", entry["error"].lower())
 
     def test_truncation_flag_when_stdout_exceeds_limit(self):
         p1, p2, p3 = self._patch_env(cfg={"enabled": True, "max_result_chars": 256})
