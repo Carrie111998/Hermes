@@ -6145,6 +6145,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return
 
+                # Reject an unrecognized action BEFORE the pop() below. The
+                # action is trusted from the callback payload and never
+                # validated elsewhere -- without this, an unknown action
+                # (bad client, future typo, or a probe) would still consume
+                # the token via pop() and silently disarm the legitimate
+                # button, leaving a real "already resolved" answer for the
+                # user's actual next tap.
+                if action not in ("divert", "choose", "dismiss"):
+                    await query.answer(text="⚠️ Unknown action.")
+                    return
+
                 # Pop BEFORE acting — this is what makes a double-tap
                 # idempotent (the second tap finds nothing and answers
                 # "already resolved"), mirroring the sc: branch above.
@@ -6166,15 +6177,32 @@ class TelegramAdapter(BasePlatformAdapter):
                     # doing nothing. No override is written.
                     label = "🔧 Model picker isn't wired up yet — coming soon."
                 elif action == "divert":
-                    from events.model_override import set_override
-                    ok, reason = set_override(
-                        provider=target["provider"],
-                        model=target["model"],
-                        replacement_provider=target["replacement_provider"],
-                        replacement_model=target["replacement_model"],
-                        ttl_seconds=6 * 3600,
-                        set_by=f"telegram:{caller_id}",
-                    )
+                    if not target["replacement_provider"] or not target["replacement_model"]:
+                        # The record behind this token has no usable
+                        # fallback target -- e.g. a detector emitted
+                        # MODEL_RATE_LIMITED with outcome="diverted" but
+                        # omitted fallback_provider/fallback_model (the
+                        # default rate_limit_signal.record() shape).
+                        # set_override does not itself reject an empty
+                        # target, so calling it here would silently write
+                        # a "/" override that enforcement read #2
+                        # (agent_runtime_helpers.py) then treats as "an
+                        # override exists" for the full 6h TTL -- blocking
+                        # restoration of the primary model while diverting
+                        # to nothing. Refuse before ever calling
+                        # set_override, and reuse the existing
+                        # "show the reason" toast path below.
+                        ok, reason = False, "no fallback target recorded for this alert"
+                    else:
+                        from events.model_override import set_override
+                        ok, reason = set_override(
+                            provider=target["provider"],
+                            model=target["model"],
+                            replacement_provider=target["replacement_provider"],
+                            replacement_model=target["replacement_model"],
+                            ttl_seconds=6 * 3600,
+                            set_by=f"telegram:{caller_id}",
+                        )
                     if ok:
                         label = (
                             f"✅ Diverted 6h → {target['replacement_provider']}/"

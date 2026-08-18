@@ -55,10 +55,16 @@ def record(
 ) -> None:
     """Remember what a callback token refers to.
 
-    Called once, when the buttons are sent. Overwrites any prior entry for
-    the same token -- harmless: ``buttons_for()`` derives the token from
-    the event_id, so a re-alert on the same rate-limit episode reuses the
-    identical token and should point at whatever the latest fallback is.
+    Called once, when the buttons are sent. This does overwrite any prior
+    entry for the same token, but that branch is not something a re-alert
+    on the same rate-limit episode ever exercises: ``buttons_for()``
+    derives the token from ``event.event_id``, and ``Event.create`` assigns
+    a fresh ``uuid4`` per event, so every MODEL_RATE_LIMITED alert --
+    including a re-alert on the same episode -- gets its own unique token
+    and its own entry here. Two records would only ever collide on the
+    same token if something reused an event_id, which nothing does today;
+    the overwrite is a harmless default for that hypothetical, not a
+    mechanism anything currently relies on.
     """
     _state[str(token)] = {
         "provider": provider or "",

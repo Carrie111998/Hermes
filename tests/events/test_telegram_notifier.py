@@ -692,6 +692,58 @@ class TestModelRateLimitedButtons:
         _args, kwargs = deliver_result_mock.call_args
         assert kwargs.get("buttons") is None
 
+    def test_record_call_uses_the_actual_buttons_for_token_and_payload(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Task 7 review Important-2: the record() block at
+        telegram_notifier.py:429-461 had zero test coverage. Every other
+        test in this suite seeds events.override_callback_state via a
+        hardcoded token through a local ``_record_target()`` helper that
+        never calls buttons_for() -- so a mis-parse of
+        ``buttons[0][0]["callback_data"].split(":", 2)[2]``, or the
+        ``if buttons:`` guard shifting, would leave every real button
+        answering "This prompt has already been resolved." in production
+        with no test failing.
+
+        This drives a REAL event through handle(), reads the token out of
+        buttons_for()'s ACTUAL output (never recomputed), and asserts
+        events.override_callback_state.pop() returns a target matching
+        the event's own payload -- pinning both the parse and the
+        no-desync property between the two.
+        """
+        from events import override_callback_state
+
+        override_callback_state.reset()
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = self._diverted_event()
+
+        try:
+            with patch("cron.scheduler._deliver_result") as deliver_result_mock:
+                notifier.handle(event)
+
+            deliver_result_mock.assert_called_once()
+            _args, kwargs = deliver_result_mock.call_args
+            buttons = kwargs.get("buttons")
+            assert buttons, "expected a non-empty buttons spec for a diverted event"
+
+            token = buttons[0][0]["callback_data"].split(":", 2)[2]
+            target = override_callback_state.pop(token)
+
+            assert target is not None, (
+                "override_callback_state has no entry for the token "
+                "buttons_for() actually produced -- the record() block's "
+                "token extraction has desynced from buttons_for()'s "
+                "callback_data format"
+            )
+            assert target["provider"] == event.payload["provider"]
+            assert target["model"] == event.payload["model"]
+            assert target["replacement_provider"] == event.payload["fallback_provider"]
+            assert target["replacement_model"] == event.payload["fallback_model"]
+        finally:
+            override_callback_state.reset()
+
 
 class TestSecretDetectedFormatting:
     """SR-408 regression (2026-04-19) — SECRET_DETECTED must render as a

@@ -270,6 +270,137 @@ class TestRateLimitRejectedWrite:
         assert edit_kwargs["reply_markup"] is None
 
 
+class TestRateLimitBlankTargetRejection:
+    """Review Important-1 regression guard: a recorded target with a blank
+    replacement (e.g. a runtime detector that emitted outcome="diverted"
+    without fallback_provider/fallback_model) must never reach
+    set_override -- writing a "/" override would pass enforcement read #1
+    (agent_init.py, which rejects a blank replacement) but still trip
+    enforcement read #2 (agent_runtime_helpers.py's bare `if override:
+    return False`), blocking restoration of the primary model for the
+    full 6h TTL while diverting to nothing."""
+
+    @pytest.mark.asyncio
+    async def test_blank_replacement_provider_is_refused_and_writes_nothing(self):
+        from events.model_override import get_override, list_overrides
+
+        adapter = _make_adapter()
+        _record_target(
+            "tok-blank", provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="", replacement_model="",
+        )
+        query = _make_query("rl:divert:tok-blank")
+        update = _make_update(query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert get_override("deepseek", "deepseek-v4-pro") is None
+        assert list_overrides() == [], (
+            "a blank-target token must never produce ANY override record"
+        )
+
+        query.answer.assert_called_once()
+        toast = query.answer.call_args[1]["text"]
+        assert "not diverted" in toast.lower()
+
+        # The toast must not lie by rendering "Diverted 6h -> /".
+        assert "diverted 6h" not in toast.lower()
+
+        # Buttons are still retired -- the token was consumed either way.
+        query.edit_message_text.assert_called_once()
+        assert query.edit_message_text.call_args[1]["reply_markup"] is None
+
+    @pytest.mark.asyncio
+    async def test_blank_replacement_model_only_is_also_refused(self):
+        from events.model_override import get_override
+
+        adapter = _make_adapter()
+        _record_target(
+            "tok-blank-model", provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex", replacement_model="",
+        )
+        query = _make_query("rl:divert:tok-blank-model")
+        update = _make_update(query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert get_override("deepseek", "deepseek-v4-pro") is None
+        toast = query.answer.call_args[1]["text"]
+        assert "not diverted" in toast.lower()
+
+
+class TestRateLimitUnknownAction:
+    """Review Minor-5 regression guard: an unrecognized action must be
+    rejected BEFORE the token is popped, so it cannot silently consume
+    (disarm) a legitimate button."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_does_not_consume_the_token(self):
+        from events import override_callback_state
+        from events.model_override import get_override
+
+        adapter = _make_adapter()
+        _record_target("tok-unknown-action")
+        query = _make_query("rl:bogus:tok-unknown-action")
+        update = _make_update(query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert get_override("deepseek", "deepseek-v4-pro") is None
+        query.edit_message_text.assert_not_called()
+        query.answer.assert_called_once()
+
+        # The real button for this token must still be tappable -- an
+        # unknown action must not have disarmed it.
+        assert override_callback_state.pop("tok-unknown-action") is not None
+
+
+class TestRateLimitPayloadCannotNameAModel:
+    """Missing-security-test: constraint 3 ("a tap can never name a
+    model") currently holds structurally -- the handler never reads a
+    fourth field from callback_data. Pin that so a future refactor that
+    starts trusting one gets caught."""
+
+    @pytest.mark.asyncio
+    async def test_extra_colon_fields_cannot_inject_a_model(self):
+        from events.model_override import get_override, list_overrides
+
+        adapter = _make_adapter()
+        _record_target(
+            "tok-inject", provider="deepseek", model="deepseek-v4-pro",
+            replacement_provider="openai-codex", replacement_model="gpt-5.6-sol",
+        )
+        # A payload that tries to smuggle a target through extra fields
+        # after the token. split(":", 2) folds everything past the second
+        # colon into a single opaque "token" string -- there is no fourth
+        # field the handler ever reads.
+        query = _make_query("rl:divert:tok-inject:evilprovider:evilmodel")
+        update = _make_update(query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        # Whatever happened (token mismatch -> no-op, or a match -> the
+        # recorded target), the attacker-supplied strings must never
+        # appear in any written override.
+        for rec in list_overrides():
+            assert rec.get("replacement_provider") != "evilprovider"
+            assert rec.get("replacement_model") != "evilmodel"
+        assert get_override("evilprovider", "evilmodel") is None
+        assert get_override("deepseek", "evilmodel") is None
+
+        # And the legitimately recorded target, if it was written at all,
+        # must be exactly the recorded one -- never the payload-supplied
+        # strings.
+        rec = get_override("deepseek", "deepseek-v4-pro")
+        if rec is not None:
+            assert rec["replacement_provider"] == "openai-codex"
+            assert rec["replacement_model"] == "gpt-5.6-sol"
+
+
 class TestRateLimitChooseAndDismiss:
     @pytest.mark.asyncio
     async def test_choose_does_not_write_an_override(self):
