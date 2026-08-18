@@ -367,7 +367,7 @@ DELEGATE_TO_DEVIN_SCHEMA = {
                 ),
             },
             "timeout": {
-                "type": "integer",
+                "type": "number",
                 "description": (
                     "Optional wall-clock cap in seconds (min 60, default "
                     "1800). If Devin does not finish in time it is killed and "
