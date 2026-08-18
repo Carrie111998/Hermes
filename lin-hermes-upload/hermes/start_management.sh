@@ -10,7 +10,7 @@ PROJECT_ROOT=$(pwd)
 
 # Keep the Dashboard as a supervised child of the Management Gateway. Starting
 # the gateway without a ready Dashboard produces misleading edge 502 responses.
-uv run --project "$PROJECT_ROOT" hermes dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build 2>&1 &
+uv run --project "$PROJECT_ROOT" --no-sync hermes dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build 2>&1 &
 dashboard_pid=$!
 cleanup() {
     kill "$dashboard_pid" 2>/dev/null || true
