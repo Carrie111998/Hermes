@@ -72,6 +72,11 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Devin CLI delegate backend — peer to delegate_task, but shells out to the
+    # local `devin` binary instead of spawning an in-process AIAgent. Opt-in:
+    # gated by check_fn (delegation.devin.enabled + devin on $PATH), so it has
+    # zero schema footprint unless Devin is configured.
+    "delegate_to_devin",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -298,7 +303,7 @@ TOOLSETS = {
     
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
-        "tools": ["delegate_task"],
+        "tools": ["delegate_task", "delegate_to_devin"],
         "includes": []
     },
 
