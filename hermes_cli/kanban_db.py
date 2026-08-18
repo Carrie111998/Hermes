@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -4107,6 +4108,94 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _open_nofollow(
+    path: str | os.PathLike[str],
+    *,
+    dir_fd: Optional[int] = None,
+    directory: bool = False,
+) -> int:
+    """Open one filesystem entry and prove the opened inode is not a link.
+
+    ``O_NOFOLLOW`` closes the final-component race on POSIX.  The lstat/fstat
+    identity check is retained as a portable second line of defence (and the
+    fallback on platforms without ``O_NOFOLLOW``).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, dir_fd=dir_fd)
+    try:
+        path_stat = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        opened_stat = os.fstat(fd)
+        expected = stat.S_ISDIR if directory else stat.S_ISREG
+        if (
+            not expected(path_stat.st_mode)
+            or not expected(opened_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+        ):
+            raise OSError("filesystem entry changed or is not the required regular type")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _mkdir_open_nofollow(parent_fd: int, name: str) -> int:
+    """Create/open one child directory without following links, durably."""
+    created = False
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        created = True
+    except FileExistsError:
+        pass
+    child_fd = _open_nofollow(name, dir_fd=parent_fd, directory=True)
+    if created and os.name != "nt":
+        # Persist the newly-created directory entry in its parent before a DB
+        # row is allowed to refer to anything below it.
+        os.fsync(parent_fd)
+    return child_fd
+
+
+def _ensure_directory_tree_nofollow(path: Path) -> tuple[Path, int]:
+    """Create an absolute directory tree with durable, no-follow components."""
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and stat.S_ISLNK(existing.st_mode):
+        raise OSError(f"refusing symlinked custody root: {path}")
+
+    resolved = path.resolve(strict=False)
+    if os.name == "nt":
+        resolved.mkdir(parents=True, exist_ok=True)
+        return resolved, _open_nofollow(resolved, directory=True)
+
+    if not resolved.is_absolute():
+        raise OSError(f"custody root must be absolute: {resolved}")
+    current_fd = _open_nofollow(resolved.anchor, directory=True)
+    try:
+        for component in resolved.parts[1:]:
+            next_fd = _mkdir_open_nofollow(current_fd, component)
+            os.close(current_fd)
+            current_fd = next_fd
+        return resolved, current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _sha256_fd(fd: int) -> str:
+    """Return SHA-256 for an already-open regular-file descriptor."""
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
 def _safe_attachment_name(raw: str) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
@@ -5548,8 +5637,29 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        preallocated_run_id: Optional[int] = None
+        if _current_run_id(conn, task_id) is None and (
+            summary or metadata or result or prior_status == "review"
+        ):
+            # Completion artifacts must carry run lineage even when a human
+            # completes an unclaimed ready/review task. Allocate the synthetic
+            # terminal run before capture, then backfill its final handoff once
+            # artifact metadata has been rewritten to durable custody paths.
+            preallocated_run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="completed",
+                summary=None,
+                metadata=None,
+            )
+        closing_run_id = _current_run_id(conn, task_id) or preallocated_run_id
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            _persist_scratch_completion_artifacts(
+                conn,
+                task_id,
+                metadata,
+                source_run_id=closing_run_id,
+            )
             for staged_artifact in metadata.pop("_staged_artifacts", []):
                 _insert_completion_attachment(
                     conn,
@@ -5564,12 +5674,33 @@ def complete_task(
                     capture_key=staged_artifact["capture_key"],
                     created_at=now,
                 )
-        run_id = _end_run(
-            conn, task_id,
-            outcome="completed", status="done",
-            summary=summary if summary is not None else result,
-            metadata=metadata,
-        )
+        if preallocated_run_id is None:
+            run_id = _end_run(
+                conn, task_id,
+                outcome="completed", status="done",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
+            )
+        else:
+            run_id = preallocated_run_id
+            synth_summary = summary if summary is not None else result
+            synth_metadata = metadata
+            if prior_status == "review" and not synth_summary and not synth_metadata:
+                synth_summary = "Review approved without additional evidence."
+                synth_metadata = {
+                    "source_status": "review",
+                    "approval": "manual",
+                }
+            conn.execute(
+                "UPDATE task_runs SET summary = ?, metadata = ? WHERE id = ?",
+                (
+                    synth_summary,
+                    json.dumps(synth_metadata, ensure_ascii=False)
+                    if synth_metadata
+                    else None,
+                    run_id,
+                ),
+            )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
@@ -5724,6 +5855,8 @@ def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
+    *,
+    source_run_id: Optional[int] = None,
 ) -> None:
     """Capture scratch deliverables into content-addressed durable custody.
 
@@ -5749,140 +5882,275 @@ def _persist_scratch_completion_artifacts(
     if not is_managed:
         return
 
+    workspace_root = Path(os.path.abspath(workspace))
+    attachment_root = attachments_root(board=board)
+    workspace_fd: Optional[int] = None
+    attachment_root_fd: Optional[int] = None
     try:
-        workspace_root = workspace.resolve()
-    except OSError:
-        return
+        workspace_fd = _open_nofollow(workspace_root, directory=True)
+        attachment_root, attachment_root_fd = _ensure_directory_tree_nofollow(
+            attachment_root
+        )
+    except OSError as exc:
+        if workspace_fd is not None:
+            os.close(workspace_fd)
+        if attachment_root_fd is not None:
+            os.close(attachment_root_fd)
+        raise ArtifactPreservationError(
+            f"could not establish no-follow artifact roots: {exc}"
+        ) from exc
 
-    attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
     staged_records: list[dict[str, Any]] = []
-    created_paths: set[Path] = set()
     changed = False
-    source_run_id = _current_run_id(conn, task_id)
+    managed: list[tuple[str, Path, str, str]] = []
+    seen_sources: set[str] = set()
+    role_sources: dict[str, str] = {}
 
-    def _discard_copies() -> None:
-        for copied in created_paths:
+    try:
+        # Admission is deterministic before any bytes are copied. Distinct
+        # scratch paths with the same hydrate-time basename are rejected now,
+        # not after a parent has completed and lost its workspace.
+        for item in raw_artifacts:
+            artifact = str(item).strip() if isinstance(item, str) else ""
+            if not artifact:
+                continue
+            source_path = Path(os.path.abspath(Path(artifact).expanduser()))
             try:
-                copied.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
-        src = Path(artifact).expanduser()
-        if src.is_symlink():
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact is symlinked: {artifact}"
-            )
-        try:
-            resolved_src = src.resolve()
-        except OSError:
-            persisted.append(artifact)
-            continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        if not src.is_file():
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable, symlinked, or not a regular file: {artifact}"
-            )
-
-        before = resolved_src.stat()
-        size = before.st_size
-        if size > KANBAN_ATTACHMENT_MAX_BYTES:
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
-
-        temporary: Optional[Path] = None
-        try:
-            staging_dir = attachment_dir / ".staging"
-            staging_dir.mkdir(parents=True, exist_ok=True)
-            temporary = staging_dir / f"{secrets.token_hex(16)}.tmp"
-            digest = hashlib.sha256()
-            with resolved_src.open("rb") as source_file, temporary.open("xb") as destination_file:
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
-                    digest.update(chunk)
-                destination_file.flush()
-                os.fsync(destination_file.fileno())
-            after = resolved_src.stat()
-            if (
-                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                or copied != after.st_size
-            ):
+                relative = source_path.relative_to(workspace_root)
+            except ValueError:
+                persisted.append(artifact)
+                continue
+            if not relative.parts:
                 raise ArtifactPreservationError(
-                    f"declared scratch artifact changed during capture: {artifact}"
+                    f"declared scratch artifact is not a file path: {artifact}"
                 )
-            artifact_sha256 = digest.hexdigest()
-            filename = _safe_attachment_name(resolved_src.name)
-            dest_dir = attachment_dir / "sha256" / artifact_sha256[:2] / artifact_sha256
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / filename
-            if dest.exists():
-                if not dest.is_file() or dest.stat().st_size != copied or _sha256_file(dest) != artifact_sha256:
-                    raise ArtifactPreservationError(
-                        f"content-addressed custody conflict for {artifact}"
-                    )
-                temporary.unlink(missing_ok=True)
-            else:
-                os.replace(temporary, dest)
-                created_paths.add(dest)
-        except Exception as exc:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
-            raise ArtifactPreservationError(
-                f"could not preserve declared scratch artifact {artifact}: {exc}"
-            ) from exc
+            source_role = relative.as_posix()
+            if source_role in seen_sources:
+                continue
+            filename = _safe_attachment_name(relative.name)
+            prior_source = role_sources.get(filename)
+            if prior_source is not None and prior_source != source_role:
+                raise ArtifactPreservationError(
+                    "declared scratch artifacts have ambiguous hydrate-time "
+                    f"name {filename!r}: {prior_source!r} and {source_role!r}"
+                )
+            seen_sources.add(source_role)
+            role_sources[filename] = source_role
+            managed.append((artifact, relative, filename, source_role))
 
-        persisted.append(str(dest.resolve()))
-        capture_key = hashlib.sha256(
-            json.dumps(
-                {
-                    "task_id": task_id,
-                    "source_run_id": source_run_id,
-                    "artifact_role": filename,
-                    "sha256": artifact_sha256,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        staged_records.append(
-            {
-                "filename": filename,
-                "stored_path": str(dest.resolve()),
-                "source_path": str(resolved_src),
-                "source_run_id": source_run_id,
-                "artifact_role": filename,
-                "size": copied,
-                "sha256": artifact_sha256,
-                "capture_key": capture_key,
-            }
-        )
-        changed = True
+        if _safe_attachment_name(task_id) != task_id:
+            raise ArtifactPreservationError(f"unsafe task id for artifact custody: {task_id}")
+        task_fd = _mkdir_open_nofollow(attachment_root_fd, task_id)
+        staging_fd: Optional[int] = None
+        sha_root_fd: Optional[int] = None
+        try:
+            staging_fd = _mkdir_open_nofollow(task_fd, ".staging")
+            sha_root_fd = _mkdir_open_nofollow(task_fd, "sha256")
+        finally:
+            os.close(task_fd)
+
+        try:
+            # A process crash before DB commit may leave a staged temporary.
+            # Completion is serialized by SQLite's write transaction, so all
+            # task-local staging entries here are stale and can be reconciled.
+            staging_changed = False
+            for stale_name in os.listdir(staging_fd):
+                stale_stat = os.stat(
+                    stale_name,
+                    dir_fd=staging_fd,
+                    follow_symlinks=False,
+                )
+                if not (stat.S_ISREG(stale_stat.st_mode) or stat.S_ISLNK(stale_stat.st_mode)):
+                    raise ArtifactPreservationError(
+                        f"unexpected entry in artifact staging directory: {stale_name}"
+                    )
+                os.unlink(stale_name, dir_fd=staging_fd)
+                staging_changed = True
+            if staging_changed and os.name != "nt":
+                os.fsync(staging_fd)
+
+            for artifact, relative, filename, artifact_role in managed:
+                source_parent_fd = os.dup(workspace_fd)
+                source_fd: Optional[int] = None
+                temp_name: Optional[str] = None
+                prefix_fd: Optional[int] = None
+                digest_fd: Optional[int] = None
+                try:
+                    for component in relative.parts[:-1]:
+                        next_fd = _open_nofollow(
+                            component,
+                            dir_fd=source_parent_fd,
+                            directory=True,
+                        )
+                        os.close(source_parent_fd)
+                        source_parent_fd = next_fd
+                    source_fd = _open_nofollow(
+                        relative.name,
+                        dir_fd=source_parent_fd,
+                        directory=False,
+                    )
+                    before = os.fstat(source_fd)
+                    if before.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                        raise ArtifactPreservationError(
+                            f"declared scratch artifact exceeds the "
+                            f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                        )
+
+                    temp_name = f"{secrets.token_hex(16)}.tmp"
+                    temp_flags = (
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    temp_fd = os.open(
+                        temp_name,
+                        temp_flags,
+                        0o600,
+                        dir_fd=staging_fd,
+                    )
+                    digest = hashlib.sha256()
+                    copied = 0
+                    with os.fdopen(temp_fd, "wb", closefd=True) as destination_file:
+                        while chunk := os.read(source_fd, 1024 * 1024):
+                            copied += len(chunk)
+                            if copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                                raise ArtifactPreservationError(
+                                    f"declared scratch artifact grew beyond the size limit: {artifact}"
+                                )
+                            destination_file.write(chunk)
+                            digest.update(chunk)
+                        destination_file.flush()
+                        os.fsync(destination_file.fileno())
+                    after = os.fstat(source_fd)
+                    entry_after = os.stat(
+                        relative.name,
+                        dir_fd=source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    identity_fields = (
+                        "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"
+                    )
+                    if (
+                        tuple(getattr(before, field) for field in identity_fields)
+                        != tuple(getattr(after, field) for field in identity_fields)
+                        or not stat.S_ISREG(entry_after.st_mode)
+                        or (entry_after.st_dev, entry_after.st_ino)
+                        != (before.st_dev, before.st_ino)
+                        or copied != after.st_size
+                    ):
+                        raise ArtifactPreservationError(
+                            f"declared scratch artifact changed during capture: {artifact}"
+                        )
+
+                    artifact_sha256 = digest.hexdigest()
+                    prefix_fd = _mkdir_open_nofollow(
+                        sha_root_fd,
+                        artifact_sha256[:2],
+                    )
+                    digest_fd = _mkdir_open_nofollow(prefix_fd, artifact_sha256)
+                    try:
+                        existing_fd = _open_nofollow(
+                            filename,
+                            dir_fd=digest_fd,
+                            directory=False,
+                        )
+                    except FileNotFoundError:
+                        os.replace(
+                            temp_name,
+                            filename,
+                            src_dir_fd=staging_fd,
+                            dst_dir_fd=digest_fd,
+                        )
+                        temp_name = None
+                        if os.name != "nt":
+                            os.fsync(staging_fd)
+                            os.fsync(digest_fd)
+                    else:
+                        try:
+                            existing = os.fstat(existing_fd)
+                            if (
+                                existing.st_size != copied
+                                or _sha256_fd(existing_fd) != artifact_sha256
+                            ):
+                                raise ArtifactPreservationError(
+                                    f"content-addressed custody conflict for {artifact}"
+                                )
+                        finally:
+                            os.close(existing_fd)
+                        os.unlink(temp_name, dir_fd=staging_fd)
+                        temp_name = None
+                        if os.name != "nt":
+                            os.fsync(staging_fd)
+
+                    stored_path = (
+                        attachment_root.resolve()
+                        / task_id
+                        / "sha256"
+                        / artifact_sha256[:2]
+                        / artifact_sha256
+                        / filename
+                    )
+                    persisted.append(str(stored_path))
+                    capture_key = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "task_id": task_id,
+                                "source_run_id": source_run_id,
+                                "artifact_role": artifact_role,
+                                "source_path": str(workspace_root / relative),
+                                "sha256": artifact_sha256,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    staged_records.append(
+                        {
+                            "filename": filename,
+                            "stored_path": str(stored_path),
+                            "source_path": str(workspace_root / relative),
+                            "source_run_id": source_run_id,
+                            "artifact_role": artifact_role,
+                            "size": copied,
+                            "sha256": artifact_sha256,
+                            "capture_key": capture_key,
+                        }
+                    )
+                    changed = True
+                except Exception as exc:
+                    if isinstance(exc, ArtifactPreservationError):
+                        raise
+                    raise ArtifactPreservationError(
+                        f"could not preserve declared scratch artifact {artifact}: {exc}"
+                    ) from exc
+                finally:
+                    if temp_name is not None:
+                        try:
+                            os.unlink(temp_name, dir_fd=staging_fd)
+                            if os.name != "nt":
+                                os.fsync(staging_fd)
+                        except OSError:
+                            pass
+                    if source_fd is not None:
+                        os.close(source_fd)
+                    os.close(source_parent_fd)
+                    if digest_fd is not None:
+                        os.close(digest_fd)
+                    if prefix_fd is not None:
+                        os.close(prefix_fd)
+        finally:
+            if staging_fd is not None:
+                os.close(staging_fd)
+            if sha_root_fd is not None:
+                os.close(sha_root_fd)
+    finally:
+        if workspace_fd is not None:
+            os.close(workspace_fd)
+        if attachment_root_fd is not None:
+            os.close(attachment_root_fd)
 
     if changed:
         metadata["artifacts"] = persisted

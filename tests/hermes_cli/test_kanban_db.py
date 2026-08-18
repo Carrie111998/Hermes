@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -612,7 +614,14 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     with kb.connect() as conn:
         attachments = kb.list_attachments(conn, t)
     assert [
-        (a.filename, a.stored_path, a.sha256, a.source_path, a.artifact_role)
+        (
+            a.filename,
+            a.stored_path,
+            a.sha256,
+            a.source_path,
+            a.artifact_role,
+            a.source_run_id,
+        )
         for a in attachments
     ] == [
         (
@@ -621,6 +630,7 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
             expected_digest,
             str(artifact.resolve()),
             "chart.png",
+            run.id,
         )
     ]
 
@@ -637,7 +647,10 @@ def test_complete_task_rejects_symlinked_scratch_artifact_without_cleanup(kanban
         declared = workspace / "declared.txt"
         declared.symlink_to(ambient)
 
-        with pytest.raises(kb.ArtifactPreservationError, match="symlinked"):
+        with pytest.raises(
+            kb.ArtifactPreservationError,
+            match="symlink|symbolic links",
+        ):
             kb.complete_task(
                 conn,
                 task_id,
@@ -648,6 +661,198 @@ def test_complete_task_rejects_symlinked_scratch_artifact_without_cleanup(kanban
         assert kb.get_task(conn, task_id).status != "done"
         assert kb.list_attachments(conn, task_id) == []
     assert workspace.exists(), "rejected capture must preserve scratch for repair"
+
+
+def test_complete_task_rejects_symlinked_source_directory_component(kanban_home):
+    ambient_dir = kanban_home / "ambient-dir"
+    ambient_dir.mkdir()
+    (ambient_dir / "report.txt").write_text("ambient")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reject linked parent")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        (workspace / "linked").symlink_to(ambient_dir, target_is_directory=True)
+        declared = workspace / "linked" / "report.txt"
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="unsafe",
+                metadata={"artifacts": [str(declared)]},
+            )
+
+        assert kb.get_task(conn, task_id).status != "done"
+        assert kb.list_attachments(conn, task_id) == []
+    assert workspace.exists()
+
+
+def test_complete_task_detects_source_entry_swap_after_open(kanban_home, monkeypatch):
+    """An opened safe inode cannot be swapped for an ambient symlink mid-copy."""
+    ambient = kanban_home / "ambient-swap.txt"
+    ambient.write_text("ambient")
+    original_read = kb.os.read
+    swapped = False
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="detect swap")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        declared = workspace / "report.txt"
+        declared.write_text("declared")
+
+        def swapping_read(fd, size):
+            nonlocal swapped
+            chunk = original_read(fd, size)
+            if not swapped and chunk:
+                declared.unlink()
+                declared.symlink_to(ambient)
+                swapped = True
+            return chunk
+
+        monkeypatch.setattr(kb.os, "read", swapping_read)
+        with pytest.raises(kb.ArtifactPreservationError, match="changed during capture"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="race",
+                metadata={"artifacts": [str(declared)]},
+            )
+
+        assert swapped
+        assert kb.get_task(conn, task_id).status != "done"
+        assert kb.list_attachments(conn, task_id) == []
+    assert ambient.read_text() == "ambient"
+    assert workspace.exists()
+
+
+def test_complete_task_rejects_symlinked_custody_destination(kanban_home):
+    payload = b"candidate"
+    digest = hashlib.sha256(payload).hexdigest()
+    ambient = kanban_home / "ambient-destination.txt"
+    ambient.write_text("do-not-overwrite")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="protect custody")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        declared = workspace / "candidate.txt"
+        declared.write_bytes(payload)
+        destination_dir = (
+            kb.task_attachments_dir(task_id)
+            / "sha256"
+            / digest[:2]
+            / digest
+        )
+        destination_dir.mkdir(parents=True)
+        (destination_dir / declared.name).symlink_to(ambient)
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="unsafe custody",
+                metadata={"artifacts": [str(declared)]},
+            )
+
+        assert kb.get_task(conn, task_id).status != "done"
+        assert kb.list_attachments(conn, task_id) == []
+    assert ambient.read_text() == "do-not-overwrite"
+    assert workspace.exists()
+
+
+def test_complete_task_fsyncs_custody_directories_before_commit(kanban_home, monkeypatch):
+    fsynced_modes: list[int] = []
+    original_fsync = kb.os.fsync
+
+    def recording_fsync(fd):
+        fsynced_modes.append(kb.os.fstat(fd).st_mode)
+        return original_fsync(fd)
+
+    monkeypatch.setattr(kb.os, "fsync", recording_fsync)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="durable custody")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "durable.txt"
+        artifact.write_text("durable")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={"artifacts": [str(artifact)]},
+        )
+
+    assert any(stat.S_ISREG(mode) for mode in fsynced_modes)
+    assert sum(stat.S_ISDIR(mode) for mode in fsynced_modes) >= 4
+
+
+def test_complete_task_reuses_sealed_blob_after_db_rollback(kanban_home, monkeypatch):
+    """A crash-equivalent DB failure leaves scratch retryable and blob reusable."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="retry capture")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "retry.txt"
+        artifact.write_text("retryable")
+        original_insert = kb._insert_completion_attachment
+
+        def fail_insert(*args, **kwargs):
+            raise sqlite3.OperationalError("injected before DB commit")
+
+        monkeypatch.setattr(kb, "_insert_completion_attachment", fail_insert)
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="first attempt",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, task_id).status != "done"
+        assert workspace.exists()
+        sealed = [
+            path
+            for path in kb.task_attachments_dir(task_id).rglob("retry.txt")
+            if ".staging" not in path.parts
+        ]
+        assert len(sealed) == 1
+        monkeypatch.setattr(kb, "_insert_completion_attachment", original_insert)
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="retry succeeded",
+            metadata={"artifacts": [str(artifact)]},
+        )
+        attachments = kb.list_attachments(conn, task_id)
+
+    assert len(attachments) == 1
+    assert Path(attachments[0].stored_path) == sealed[0]
+    assert not workspace.exists()
+
+
+def test_complete_task_rejects_ambiguous_same_basename_before_cleanup(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reject ambiguous outputs")
+        workspace = kb.resolve_workspace(kb.get_task(conn, task_id))
+        kb.set_workspace_path(conn, task_id, workspace)
+        first = workspace / "one" / "report.html"
+        second = workspace / "two" / "report.html"
+        first.parent.mkdir()
+        second.parent.mkdir()
+        first.write_text("one")
+        second.write_text("two")
+
+        with pytest.raises(kb.ArtifactPreservationError, match="ambiguous"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="ambiguous",
+                metadata={"artifacts": [str(first), str(second)]},
+            )
+
+        assert kb.get_task(conn, task_id).status != "done"
+        assert kb.list_attachments(conn, task_id) == []
+    assert workspace.exists()
 
 
 
