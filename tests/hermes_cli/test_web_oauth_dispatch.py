@@ -562,9 +562,11 @@ def test_claude_code_disconnect_command_is_native_powershell_on_windows():
     command = web_server._oauth_provider_disconnect_command(provider)
 
     assert command is not None
+    assert "Test-Path" in command
     assert "Remove-Item" in command
     assert "-Force" in command
-    assert "-ErrorAction SilentlyContinue" in command
+    assert "-ErrorAction Stop" in command
+    assert "SilentlyContinue" not in command
     assert "rm -f" not in command
 
 
@@ -628,15 +630,18 @@ def test_anthropic_disconnect_surfaces_auth_store_failure(tmp_path, monkeypatch)
         lambda: tmp_path / "missing-oauth.json",
     )
 
+    sensitive_detail = f"auth store is read-only: {tmp_path}"
+
     def fail_clear(_provider):
-        raise OSError("auth store is read-only")
+        raise OSError(sensitive_detail)
 
     monkeypatch.setattr(auth_mod, "clear_provider_auth", fail_clear)
 
     resp = client.delete("/api/providers/oauth/anthropic", headers=HEADERS)
 
     assert resp.status_code == 500, resp.text
-    assert "auth store is read-only" in resp.text
+    assert "Failed to remove stored credentials for Anthropic API Key" in resp.text
+    assert sensitive_detail not in resp.text
 
 
 def test_xai_dashboard_poller_seeds_single_entry_and_clears_suppression(tmp_path, monkeypatch):

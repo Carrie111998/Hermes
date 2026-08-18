@@ -9948,8 +9948,9 @@ def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str
         rm_file = "rm -f ~/.claude/.credentials.json"
         if sys.platform == "win32":
             return (
+                'if (Test-Path -LiteralPath "$HOME/.claude/.credentials.json") { '
                 'Remove-Item -LiteralPath "$HOME/.claude/.credentials.json" '
-                "-Force -ErrorAction SilentlyContinue"
+                "-Force -ErrorAction Stop }"
             )
         if sys.platform == "darwin":
             return f'security delete-generic-password -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
@@ -10114,14 +10115,20 @@ async def disconnect_oauth_provider(
                         cleared = True
                 except Exception as e:
                     _log.exception("disconnect %s OAuth file failed", provider_id)
-                    raise HTTPException(status_code=500, detail=str(e))
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to remove stored credentials for {provider['name']}.",
+                    )
                 # Also clear the credential pool entry if present.
                 try:
                     from hermes_cli.auth import clear_provider_auth
                     cleared = clear_provider_auth("anthropic") or cleared
                 except Exception as e:
                     _log.exception("disconnect %s auth store failed", provider_id)
-                    raise HTTPException(status_code=500, detail=str(e))
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to remove stored credentials for {provider['name']}.",
+                    )
                 if not cleared:
                     raise HTTPException(
                         status_code=409,
@@ -10146,7 +10153,10 @@ async def disconnect_oauth_provider(
                 raise
             except Exception as e:
                 _log.exception("disconnect %s failed", provider_id)
-                raise HTTPException(status_code=500, detail=str(e))
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to remove stored credentials for {provider['name']}.",
+                )
 
     return await asyncio.to_thread(_run)
 
