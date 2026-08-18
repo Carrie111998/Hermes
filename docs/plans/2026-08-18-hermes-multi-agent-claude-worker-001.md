@@ -1,6 +1,6 @@
 ---
 title: "HERMES-MULTI-AGENT-CLAUDE-WORKER-001 ticket design"
-status: IMPLEMENTATION_IN_PROGRESS_AFTER_DESIGN_REVIEW_PASS_2_OF_3
+status: CI_BLOCKED_BASELINE_GATEWAY_REGRESSION
 date: 2026-08-18
 type: ticket-design
 ticket: HERMES-MULTI-AGENT-CLAUDE-WORKER-001
@@ -338,5 +338,21 @@ reconciliation item found during the review was corrected before this record:
 and `agy` require a non-empty preflight-confirmed skill.
 
 Post-reconciliation evidence: the focused swarm suite passed 6/6 using an
-isolated test base directory, and `git diff --check` passed. No commit, push,
-merge, CI, deployment, restart, or Telegram mutation has occurred yet.
+isolated test base directory, and `git diff --check` passed. The implementation
+was committed as `af3034993fae20b6d6a552cd014fa0646cbf7af2` and pushed to PR
+#48. No merge, deployment, restart, or Telegram mutation has occurred for this
+commit.
+
+## CI blocker record
+
+GitHub run `32102234859` failed in Python tests slice 3/8. The failures are
+three existing gateway fresh-final tests in
+`tests/gateway/test_stream_consumer_fresh_final.py`; the failed job rerun
+reproduced them. PR #48 changes no gateway files or gateway tests. Other
+required checks passed, but the aggregate required check is failed, so the
+ticket is blocked at CI and must not advance to merge or deployment.
+
+GitHub Issues are disabled for this repository and no issue number exists. A
+gateway correction requires a separately authorized repo-local plan or another
+explicitly approved ticket path; it must not be folded into PR #48 by
+assumption.

@@ -1,100 +1,142 @@
 # Project Handover - hermes-agent
 
-**Plan key:** hermes-agent  
-**Last verified:** 2026-08-18 (Asia/Taipei)
-**Handover owner/session:** Codex  
-**Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
+Plan key: `hermes-agent`
+Last verified: 2026-08-18 (Asia/Taipei)
+Authoritative roadmap: `docs/ROADMAP-HERMES-DGX.md`
 
 ## 1. Project identity and boundary
 
-- **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
-- **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Merged runtime code baseline:** `dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea` (PR #45, HERMES-MULTI-AGENT-ORCHESTRATION-001; prior Telegram delivery baseline remains separately recorded).
-- **DGX runtime:** host `140.96.58.171`, hostname `55-0940189-03`, user service `hermes-gateway.service`.
-- **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
-- **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
+- Repository: `https://github.com/cwliao/hermes-agent`
+- Verified `origin/main`: `2b5eb8437a0bdae0529e7f4af5b8771b5f339997`.
+- Primary checkout: `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`,
+  HEAD `c192e863d8dc9df98c2bd9d066ce49bc4f9cb3e8`.
+- The primary checkout is intentionally dirty. Preserve all existing changes
+  and untracked files; do not reset, clean, overwrite, stage, or commit it.
+- Active isolated worktree: this worktree, branch
+  `ticket/hermes-multi-agent-claude-worker-001`, HEAD
+  `af3034993fae20b6d6a552cd014fa0646cbf7af2`.
+- PR #48 is open against `main`; its required CI is currently unstable.
+- DGX is reached only from WSL Ubuntu. Verify hostname `55-0940189-03`, user
+  `cwliao`, and `hermes-gateway.service` before any remote mutation.
 
-The DGX live source checkout is deployment input only. The active service uses an immutable release snapshot selected by a systemd user drop-in. The primary laptop checkout is not authoritative for runtime state.
+This handover covers the four-lane Kanban worker correction ticket. It does
+not claim that the current PR is merged, deployed, restarted, or Telegram
+user-visible.
 
-The local audit checkout is `D:/PROJECT/Hermes`, branch `ticket/hermes-auth-001`, HEAD `c192e863d8dc9df98c2bd9d066ce49bc4f9cb3e8`; it remains dirty with pre-existing changes and untracked files. They were preserved and were not staged, reset, or cleaned.
+## 2. Current goal and roadmap
 
-## 2. Goal and roadmap
+The current goal is to finish the correction ticket's CI and review gates for
+the four explicit lanes: native Hermes, Claude, Grok, and AGY. The intended
+test is a disposable, metadata-only joke-brainstorm goal created through the
+existing Kanban graph, with all four worker lanes, a fail-closed verifier, a
+Hermes synthesizer, and a separately verified Telegram user-visible response.
 
-- **Current goal:** preserve the merged ARCH-002/ARCH-003/ARCH-004 contracts, keep Telegram service/inbound/outbound/user-visible gates separate, and operate the merged multi-agent orchestration summary path with explicit worker-runtime boundaries.
-- **Completed and deployed:** ARCH-002, PR #29, merge `3e9fd48dc28b7df186c780992351ef01febaa070`; ARCH-003, PR #30, merge `e8cdfd1e65191b68423afd7e12248d3c6e728e00`; and ARCH-004, PR #33, merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`. Each has separate review, CI, immutable-release, rollback, and post-deploy evidence.
-- **Completed and deployed:** HERMES-MULTI-AGENT-ORCHESTRATION-001, PR #45, merge `dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea`; official Grok/AGY skills are installed with source parity, the metadata-only summary timer is enabled, and the gateway is running the matching immutable release.
-- **Telegram runtime:** the gateway recovered from a transient startup timeout through its bounded retry path. The latest authorized test produced a correlated inbound accepted audit, correlated outbound delivered audit records, and direct user confirmation of the visible response.
-- **Deferred/blocked:** HERMES-MONITORING-001 remains BLOCKED. Telegram user-visible delivery is not claimed from service or polling health.
-- **Next gate:** user-owned Grok OAuth remains open; the corrected AGY CLI smoke passed with exit code 0. The summary timer's `hermes send` success is outbound evidence only. Direct Telegram user-visible receipt for the new summary and a real worker-produced `token_usage` metadata record remain separate verification gates.
+Completed for this ticket:
 
-## 3. Verified runtime and deployment state
+- Design packet reached the required two-of-three review quorum.
+- Implementation commit: `af3034993fae20b6d6a552cd014fa0646cbf7af2`.
+- Claude: `PASS`; Grok: `PASS`; AGY: `BLOCKED` because the DGX CLI required an
+  interactive TTY. AGY is not counted and was not duplicated.
+- Focused swarm suite: 6 passed.
+- Branch pushed and PR #48 opened.
 
-- **DGX host identity:** `cwliao@55-0940189-03`.
-- **Active release:** `v2026.8.18-hermes-multi-agent-orchestration-dashboard-dd7a0164`.
-- **Release marker:** `HERMES_RELEASE_SHA=dd7a0164f45c235b6cbc5b5ef4995b6bbec036ea`.
-- **Effective service:** user `hermes-gateway.service`, `ActiveState=active`, `SubState=running`, MainPID `2943801`, `NRestarts=0`, `ExecMainStatus=0` after the authorized Dashboard-artifact deployment restart and bounded stability check.
-- **Effective WorkingDirectory/PYTHONPATH:** the Dashboard-artifact release above; both resolved to that immutable release.
-- **Effective drop-in:** `43-hermes-multi-agent-orchestration-dashboard-dd7a0164.conf`.
-- **Rollback:** ARCH-003 release `v2026.8.17-hermes-arch-003-e8cdfd1e`, ARCH-002 release `v2026.8.16-hermes-arch-002-3e9fd48dc2`, and prior Telegram releases/drop-ins remain available.
-- **Deployment manifest:** ARCH-004 rollback metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-arch-004-e2f94e26`; the prior ARCH-003 drop-in remains intact.
-- **Deployment manifest:** this deployment's prior-release metadata is preserved under `/home/cwliao/.hermes/deploy-backups/hermes-multi-agent-orchestration-dashboard-dd7a0164`; the previous multi-agent and Telegram release/drop-ins remain intact.
+Current blocker:
 
-- **Summary timer:** `hermes-kanban-summary.timer` is `enabled/active`; its ten-minute cadence and metadata-only oneshot service are installed from the matching release. The first run returned `success`/`sent`, which proves an outbound `hermes send` attempt only; no new user-visible Telegram receipt is claimed.
-- **Worker skills:** official `grok` and `antigravity-cli` skill directories are enabled and byte-identical to their optional sources. DGX `grok` `1.0.5` and `agy` `1.1.13` executables are present; the corrected bounded AGY smoke passed with exit code 0. Grok OAuth remains user-owned and not logged in (`auth-present=false`).
-- **Dashboard gate:** the built-in Dashboard artifact is present in the active release. A bounded authenticated loopback probe returned HTTP 200 for the root, status, Kanban board, and Kanban stats endpoints and confirmed ephemeral session-token injection. The board was empty, so this does not prove a real completed worker run or `token_usage` metadata rendering.
+- CI run `32102234859` fails in Python tests slice 3/8, in existing gateway
+  fresh-final tests under `tests/gateway/test_stream_consumer_fresh_final.py`.
+- The failed job was rerun and reproduced the same three failures.
+- PR #48 changes no gateway files or gateway tests; the aggregate required
+  check remains failed and PR #48 must not be merged on this state.
+- GitHub Issues are disabled, so a gateway follow-up needs a separately
+  authorized repo-local plan or another explicitly approved ticket path.
 
-The correction deployment retained its rollback manifest under the corresponding
-deployment-backups entry. The temporary staging directory was removed after
-the release marker, process cwd, and rollback metadata were verified. Relay
-remains disabled.
+Do not fix the gateway regression inside PR #48 without a new, explicitly
+authorized scope. Do not merge, deploy, restart DGX, enable relay/timer, or
+run the Telegram test for `af303...` while CI is blocked.
 
-### Telegram evidence boundary
+## 3. Verified implementation state
 
-- At restart, the service recorded transient Telegram connect timeouts and queued bounded retry.
-- At `17:18:22`, the gateway logged `Connected to Telegram (polling mode)`.
-- From `17:18:33` onward, the gateway recorded repeated `telegram_polling_progress` with `result_class=empty`; no post-recovery degraded event was observed in the bounded log window.
-- Read-only token-protected `getMe` and `getWebhookInfo` probes returned HTTP 200; `pending_update_count=0), no webhook URL was present.
-- This proves current inbound polling progress, not user-visible response/delivery. Do not expose message content or credentials.
+PR #48 changes only these existing surfaces:
+
+- `hermes_cli/kanban.py`
+- `hermes_cli/kanban_db.py`
+- `hermes_cli/kanban_swarm.py`
+- `optional-skills/devops/kanban-worker/SKILL.md`
+- `tests/hermes_cli/test_kanban_swarm.py`
+- `tools/kanban_tools.py`
+- the ticket design under `docs/plans/`
+
+The implementation provides four explicit lane identities, expected
+lane/preflight-skill binding, bounded goal and worker runtime settings,
+parser-safe worker construction, required worker completion metadata, a
+fail-closed verifier, and a synthesizer result boundary in the existing task
+`result` field. Dashboard and Telegram correlation is metadata-only and uses
+opaque IDs and status fields.
+
+The focused swarm test passed 6/6 and `git diff --check` passed. CI is the
+authoritative repository gate and is not replaced by local tests.
+
+The last separately verified DGX runtime was the pre-PR release identified by
+`HERMES_RELEASE_SHA=20aadf71cb4ead7db7d9590310465e90c937558b`, with the user
+service active/running, zero restarts, and rollback evidence retained. This
+does not prove that `af303...` is deployed. Relay remains disabled by default.
 
 ## 4. Ticket and gate state
 
-### ARCH-002
+Active ticket plan: `docs/plans/2026-08-18-hermes-multi-agent-claude-worker-001.md`.
 
-- **Status:** `MERGED_DEPLOYED`.
-- **PR/commit:** PR #29, head `d705c977...`, merge `3e9fd48d...`.
-- **Implementation evidence:** focused runtime-state and gateway integration tests `24 passed`.
-- **Review evidence:** identical metadata-only v3 packet SHA-256 `6d55a0944efd858ab63d5af809f81e6c5fab09d1c02c2f293fd11fae4ed213c1`; authenticated DGX AGY PASS and Claude Opus 4.8 PASS, correction set none.
-- **CI evidence:** latest-head CI run `31937692260` / #127 completed successfully, including required checks.
-- **Deployment evidence:** immutable release and effective service state are recorded above. Telegram delivery remains separate.
+The gates remain separate: source identity, ticket design, implementation,
+tests, Claude/Grok/AGY review, reconciliation, CI, commit, push, merge, DGX
+deployment, runtime health, inbound polling, outbound delivery, and Telegram
+user-visible delivery.
 
-### Other ticket state
+Current state: implementation committed and pushed, review quorum PASS,
+focused tests PASS, CI BLOCKED by reproduced baseline gateway failures, and
+all later gates unsatisfied for `af303...`.
 
-- **HERMES-TELEGRAM-TRANSPORT-001:** merged/deployed; current runtime recovered from the observed transient startup timeout, but user-visible delivery remains separate.
-- **HERMES-TELEGRAM-INBOUND-001:** merged/deployed; qualifying empty polling progress is currently observed.
-- **HERMES-AUTH-001 / AUTH-002:** merged/deployed separately; do not conflate them with ARCH-003.
-- **HERMES-CALENDAR-GUARD-001:** merged/deployed; actual DGX guard naming/effective unit remains a separate documentation hygiene concern.
-- **HERMES-MONITORING-001:** BLOCKED; do not infer readiness from gateway health.
-- **ARCH-003:** `MERGED_DEPLOYED`; PR #30, implementation commit `9b777c0b1`, merge `e8cdfd1e...`; focused Windows dependency test `29 passed`; canonical runner ARCH-003 tests `24 passed` with its gateway integration collection limited by the borrowed KLIB venv missing PyYAML; authenticated AGY and fresh authenticated WSL Claude implementation reviews both `PASS`; CI run `31981532693` passed after retrying an unrelated pre-existing stream-consumer slice; immutable release and runtime health verified on DGX.
-- **ARCH-004:** `MERGED_DEPLOYED`; PR #33, implementation commit `650a34808`, merge `e2f94e26b0a8b1db71c00e1607bca8f89f02aaea`; focused runtime-state tests `32 passed`, compileall PASS; required CI checks PASS in run `31990198398`; Claude and active DGX `.hermes` AGY implementation reviews both `PASS` with no correction set; immutable release and user-service health verified above.
-- **HERMES-TELEGRAM-DELIVERY-VERIFICATION-001:** `PASS`; PR #43, implementation commit `2ee79107b`, merge `3bf3f210`; required CI run `32075681273` passed; Claude and AGY reviewed the identical metadata-only packet and returned `PASS`; the latest release is active with rollback metadata. The one authorized test produced one inbound accepted record, four same-correlation outbound delivered records with one platform message id, no failed outbound record, and direct user-visible confirmation. No retry was issued.
+## 5. Safe continuation procedure
 
-### Repository inventory
+1. Read this file, `docs/ROADMAP-HERMES-DGX.md`, and the active ticket plan.
+2. Verify repository root, remote, branch, HEAD, worktree, and authenticated
+   GitHub `origin/main` in the exact command context.
+3. Preserve `D:/PROJECT/Hermes`; use an isolated worktree for every change.
+4. Treat the CI failure as a separate gateway follow-up. Do not expand PR #48
+   unless the user explicitly authorizes that scope.
+5. Use one authenticated reviewer per family; never duplicate Claude, Grok, or
+   AGY across platforms. Reconcile any non-quorum finding.
+6. Before DGX mutation, verify hostname, user, effective unit, release SHA,
+   and rollback evidence.
+7. Keep reports metadata-only: no message bodies, prompts, joke text, tokens,
+   credentials, or sensitive absolute paths.
 
-- GitHub Issues are disabled for `cwliao/hermes-agent`; repo-local `docs/plans`, this handover, and the roadmap are the ticket source of truth.
-- The only open PR is PR #21, `docs: open HERMES-UPDATE-001 DGX upstream update plan`; its required checks PASS, but it remains an open planning/documentation PR and is not the ARCH-004 runtime deployment.
-- Merged/deployed lanes: HERMES-UPDATE-001 runtime work, HERMES-TELEGRAM-TRANSPORT-001, HERMES-TELEGRAM-INBOUND-001, HERMES-AUTH-001, HERMES-AUTH-002, HERMES-CALENDAR-GUARD-001, ARCH-002, ARCH-003, and ARCH-004.
-- Blocked/separate gates: HERMES-MONITORING-001 remains BLOCKED; Telegram user-visible delivery is the next independent verification gate.
+## Copyable Claude continuation prompt
 
-### Gate rule
+```text
+You are taking over the hermes-agent repository. Use the repo as the source of truth.
+Read docs/HANDOVER.md, docs/ROADMAP-HERMES-DGX.md, and
+docs/plans/2026-08-18-hermes-multi-agent-claude-worker-001.md before acting.
 
-Ticket design, implementation, tests, independent review, reconciliation, CI, merge, deployment, service health, inbound polling, outbound delivery, and rollback are separate gates. A pass at one gate cannot be reported as a pass at another.
+Verify repository root, remote, branch, HEAD, worktree, and authenticated
+origin/main. The primary checkout D:/PROJECT/Hermes is intentionally dirty;
+do not reset, clean, overwrite, stage, or commit it. Work only in an isolated
+worktree.
 
-## 5. Safe continuation instructions
+The current implementation is commit af3034993fae20b6d6a552cd014fa0646cbf7af2
+on PR #48. Claude and Grok returned PASS on the same metadata-only packet;
+AGY was blocked by a required interactive TTY and is not counted. The focused
+swarm suite passed 6 tests.
 
-1. Read this handover, `docs/ROADMAP-HERMES-DGX.md`, and the active ticket plan before acting.
-2. Verify repository root, remote, branch, HEAD, GitHub main code baseline, DGX hostname, service, release marker, and rollback release.
-3. Preserve the primary dirty worktree and DGX live source checkout; do not reset, clean, or overwrite either.
-4. Keep reviewer packets metadata-only; never send source, secrets, tokens, absolute paths, message bodies, or generated evidence text.
-5. ARCH-004 is merged and deployed with separate implementation, review, CI, merge, release, rollback, and runtime evidence; do not repeat its implementation lane.
-6. Keep ARCH-002, ARCH-003, and Telegram delivery evidence separate.
-7. Telegram delivery verification is complete; do not retry the conversation merely to manufacture more evidence. HERMES-MONITORING-001 remains a separate blocked ticket, and any new work requires a new ticket and authorization.
+CI run 32102234859 is blocked: Python tests slice 3/8 fails three existing
+gateway fresh-final tests in tests/gateway/test_stream_consumer_fresh_final.py;
+the failed job rerun reproduced them. PR #48 contains no gateway files or
+gateway tests. Do not fix that gateway issue inside PR #48 unless the user
+explicitly authorizes a separate scope. GitHub Issues are disabled, so a
+follow-up needs an authorized repo-local plan or another approved ticket path.
+
+Do not merge, deploy, restart DGX, enable relay/timer, or run Telegram testing
+for af303 while CI is blocked. Keep design, implementation, tests, review,
+CI, commit, push, merge, deployment, runtime health, inbound polling,
+outbound delivery, and Telegram user-visible delivery as separate gates.
+Before ending, update the repo handover only with facts verified in this
+session, and keep evidence metadata-only.
+```
