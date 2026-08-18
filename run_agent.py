@@ -2967,6 +2967,19 @@ class AIAgent:
         r"(?<![/:\w.`])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*[\w.\-]+\.[\w]+",
     )
 
+    # ``MEDIA:<path>`` tags are re-parsed from response text by the gateway
+    # media extractor (``MEDIA_TAG_CLEANUP_RE`` / ``MEDIA_EXTENSIONLESS_TAG_RE``
+    # in gateway/platforms/base.py, both case-insensitive).  In this footer a
+    # tag can only ever be untrusted error text, so the colon is rewritten
+    # into a visible escape no downstream parser recognises — the tag stays
+    # legible as data but can never execute as an attachment directive.
+    _FOOTER_MEDIA_TAG_RE = re.compile(r"MEDIA:", re.IGNORECASE)
+
+    # Delivery-behaviour toggles matched verbatim at the dispatch sites
+    # (gateway/run.py) and stripped by ``extract_media``.  Escaped underscores
+    # break the exact match while Markdown still renders the original text.
+    _FOOTER_MEDIA_DIRECTIVES = ("[[audio_as_voice]]", "[[as_document]]")
+
     @classmethod
     def _neutralize_footer_paths(cls, text: str) -> str:
         """Wrap bare file paths in backticks so they aren't auto-delivered.
@@ -2986,9 +2999,21 @@ class AIAgent:
 
     @staticmethod
     def _sanitize_file_mutation_warning_fragment(value: Any, max_len: int) -> str:
-        """Render untrusted footer text as bounded, single-line Markdown."""
+        """Render untrusted footer text as bounded, single-line Markdown.
+
+        Delivery directives (``MEDIA:`` tags, ``[[audio_as_voice]]`` /
+        ``[[as_document]]`` toggles) are rewritten into visible,
+        non-executable forms — the response pipeline re-parses those from
+        assistant text, so untrusted error previews must never carry a
+        live one.
+        """
 
         text = str(value)
+        text = AIAgent._FOOTER_MEDIA_TAG_RE.sub(
+            lambda m: m.group(0)[:-1] + r"\x3a", text
+        )
+        for directive in AIAgent._FOOTER_MEDIA_DIRECTIVES:
+            text = text.replace(directive, directive.replace("_", r"\_"))
 
         def _escape(char: str) -> str:
             if char == "`":
@@ -3013,8 +3038,8 @@ class AIAgent:
             return "".join(escaped)
 
         separator = "…"
-        head_budget = (max_len - len(separator)) // 2
-        tail_budget = max_len - len(separator) - head_budget
+        head_budget = max(0, (max_len - len(separator)) // 2)
+        tail_budget = max(0, max_len - len(separator) - head_budget)
 
         head_tokens = escaped or [_escape(char) for char in text[:head_budget]]
         tail_tokens = escaped or [_escape(char) for char in text[-tail_budget:]]
