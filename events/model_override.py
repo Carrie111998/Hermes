@@ -261,6 +261,29 @@ def _save_store(store: Dict[str, Any]) -> bool:
         return False
 
 
+def _emit_audit(payload: Dict[str, Any], bus: Any) -> None:
+    """Emit MODEL_OVERRIDE_SET. Best-effort: never raises, never blocks the
+    override write it documents -- mirrors events/rate_limit_signal.py's
+    ``_emit`` (lazy bus import/construction, blanket try/except degrading to
+    a debug log). Spec §Containment: "each write emits an event, so
+    audit.jsonl records who diverted what, when."
+    """
+    try:
+        from events.schema import EventType, Priority
+        active_bus = bus
+        if active_bus is None:
+            from events.bus import EventBus
+            active_bus = EventBus()
+        active_bus.emit(
+            event_type=EventType.MODEL_OVERRIDE_SET,
+            source="model_override",
+            payload=payload,
+            priority=Priority.NORMAL,
+        )
+    except Exception:
+        logger.debug("model_override: audit emit failed (swallowed)", exc_info=True)
+
+
 def get_override(provider: str, model: str) -> Optional[Dict[str, Any]]:
     """Return the active override record for (provider, model), or None.
 
@@ -287,6 +310,7 @@ def set_override(
     replacement_model: str,
     ttl_seconds: int,
     set_by: str,
+    bus: Any = None,
 ) -> Tuple[bool, str]:
     """Record an override routing (provider, model) to a replacement.
 
@@ -297,6 +321,11 @@ def set_override(
     ttl_seconds is capped (not rejected) at MAX_TTL_SECONDS: no permanent
     override is expressible through this API. A self-target (replacement ==
     original) is rejected outright -- it would be a routing loop.
+
+    Emits MODEL_OVERRIDE_SET on success only -- a rejected write (self-
+    target, divert-into-a-wall) leaves nothing behind, so it must not leave
+    an audit trail either. ``bus`` is test-injectable, mirroring
+    events/rate_limit_signal.py.
     """
     try:
         if _override_key(provider, model) == _override_key(
@@ -381,24 +410,64 @@ def set_override(
         # A non-positive ttl_seconds writes a record whose expires_at is
         # already <= now; _reap_expired() drops it on the very next load, so
         # get_override() correctly reports "no override" for it.
+        _emit_audit(
+            {
+                "provider": provider,
+                "model": model,
+                "replacement_provider": replacement_provider,
+                "replacement_model": replacement_model,
+                "expires_at": record["expires_at"],
+                "set_by": set_by,
+                "action": "set",
+            },
+            bus,
+        )
         return True, "ok"
     except Exception:
         logger.debug("model_override.set_override failed (swallowed)", exc_info=True)
         return False, "internal error setting override"
 
 
-def clear_override(*, provider: str, model: str) -> bool:
-    """Remove an active override. Returns True only if something was removed."""
+def clear_override(*, provider: str, model: str, bus: Any = None) -> bool:
+    """Remove an active override. Returns True only if something was removed.
+
+    Emits MODEL_OVERRIDE_SET only when a record was actually removed -- a
+    no-op clear (nothing to remove) leaves nothing behind, so it must not
+    leave an audit trail either. ``bus`` is test-injectable, mirroring
+    events/rate_limit_signal.py.
+    """
     try:
         key = _override_key(provider, model)
         store = dict(_load_store())
-        if key not in store:
+        removed = store.get(key)
+        if removed is None:
             return False
         del store[key]
 
         saved = _save_store(store) if _store_reliable() else False
         if not saved:
             _publish_unsaved(store)
+
+        payload = {
+            "provider": provider,
+            "model": model,
+            "replacement_provider": (
+                removed.get("replacement_provider", "")
+                if isinstance(removed, dict) else ""
+            ),
+            "replacement_model": (
+                removed.get("replacement_model", "")
+                if isinstance(removed, dict) else ""
+            ),
+            "expires_at": (
+                removed.get("expires_at", "") if isinstance(removed, dict) else ""
+            ),
+            "set_by": (
+                removed.get("set_by", "") if isinstance(removed, dict) else ""
+            ),
+            "action": "cleared",
+        }
+        _emit_audit(payload, bus)
         return True
     except Exception:
         logger.debug("model_override.clear_override failed (swallowed)", exc_info=True)

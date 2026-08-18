@@ -131,3 +131,128 @@ def test_unreadable_episode_state_does_not_veto_the_operator(ov, monkeypatch):
         replacement_provider="openai-codex", replacement_model="gpt-5.6-sol",
         ttl_seconds=3600, set_by="test")
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Task 5: MODEL_OVERRIDE_SET audit event -- every override write leaves a
+# trail (spec Sec:Containment: "each write emits an event, so audit.jsonl
+# records who diverted what, when"). Mirrors the injectable-bus pattern
+# proven in tests/events/test_rate_limit_signal.py::_FakeBus.
+# ---------------------------------------------------------------------------
+
+class _FakeBus:
+    def __init__(self):
+        self.emitted = []
+
+    def emit(self, *, event_type, source, payload, priority=None, **kw):
+        self.emitted.append((event_type, source, payload, priority))
+        return "evt-id"
+
+
+class _ExplodingBus:
+    def emit(self, *args, **kwargs):
+        raise RuntimeError("bus is down")
+
+
+def test_set_override_emits_audit_event_on_success(ov):
+    from events.model_override import set_override
+    from events.schema import EventType
+    bus = _FakeBus()
+    ok, _ = set_override(provider="deepseek", model="deepseek-v4-pro",
+                         replacement_provider="openai-codex",
+                         replacement_model="gpt-5.6-sol",
+                         ttl_seconds=3600, set_by="telegram:diego",
+                         bus=bus)
+    assert ok is True
+    assert len(bus.emitted) == 1
+    et, source, payload, _ = bus.emitted[0]
+    assert et is EventType.MODEL_OVERRIDE_SET
+    assert payload["provider"] == "deepseek"
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["replacement_provider"] == "openai-codex"
+    assert payload["replacement_model"] == "gpt-5.6-sol"
+    assert payload["set_by"] == "telegram:diego"
+    assert payload["action"] == "set"
+    assert "expires_at" in payload
+
+
+def test_set_override_does_not_emit_on_rejected_self_target(ov):
+    """A rejected write (self-target routing loop) must not emit -- only a
+    write that actually lands leaves a trail."""
+    from events.model_override import set_override
+    bus = _FakeBus()
+    ok, _ = set_override(provider="deepseek", model="deepseek-v4-pro",
+                         replacement_provider="deepseek",
+                         replacement_model="deepseek-v4-pro",
+                         ttl_seconds=3600, set_by="test", bus=bus)
+    assert ok is False
+    assert bus.emitted == []
+
+
+def test_set_override_does_not_emit_on_rejected_open_episode(ov, monkeypatch):
+    """A rejected write (divert-into-a-wall) must not emit either."""
+    from events import model_override
+    monkeypatch.setattr(
+        "events.rate_limit_signal._load_state",
+        lambda: {"openai-codex/gpt-5.6-sol": {"worst_outcome": "diverted"}},
+    )
+    bus = _FakeBus()
+    ok, _ = model_override.set_override(
+        provider="deepseek", model="deepseek-v4-pro",
+        replacement_provider="openai-codex", replacement_model="gpt-5.6-sol",
+        ttl_seconds=3600, set_by="test", bus=bus)
+    assert ok is False
+    assert bus.emitted == []
+
+
+def test_clear_override_emits_audit_event_when_something_removed(ov):
+    from events.model_override import set_override, clear_override
+    from events.schema import EventType
+    set_override(provider="deepseek", model="deepseek-v4-pro",
+                 replacement_provider="openai-codex",
+                 replacement_model="gpt-5.6-sol",
+                 ttl_seconds=3600, set_by="test")
+    bus = _FakeBus()
+    assert clear_override(provider="deepseek", model="deepseek-v4-pro",
+                          bus=bus) is True
+    assert len(bus.emitted) == 1
+    et, source, payload, _ = bus.emitted[0]
+    assert et is EventType.MODEL_OVERRIDE_SET
+    assert payload["provider"] == "deepseek"
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["action"] == "cleared"
+
+
+def test_clear_override_does_not_emit_when_nothing_removed(ov):
+    """clear_override on a key with no active override must not emit --
+    nothing was actually diverted or un-diverted."""
+    from events.model_override import clear_override
+    bus = _FakeBus()
+    assert clear_override(provider="deepseek", model="deepseek-v4-pro",
+                          bus=bus) is False
+    assert bus.emitted == []
+
+
+def test_set_override_still_succeeds_when_bus_explodes(ov):
+    """Fail-open: emission must never break the override write."""
+    from events.model_override import set_override, get_override
+    ok, _ = set_override(provider="deepseek", model="deepseek-v4-pro",
+                         replacement_provider="openai-codex",
+                         replacement_model="gpt-5.6-sol",
+                         ttl_seconds=3600, set_by="test",
+                         bus=_ExplodingBus())
+    assert ok is True
+    rec = get_override("deepseek", "deepseek-v4-pro")
+    assert rec["replacement_model"] == "gpt-5.6-sol"
+
+
+def test_clear_override_still_succeeds_when_bus_explodes(ov):
+    """Fail-open: emission must never break the clear."""
+    from events.model_override import set_override, clear_override, get_override
+    set_override(provider="deepseek", model="deepseek-v4-pro",
+                 replacement_provider="openai-codex",
+                 replacement_model="gpt-5.6-sol",
+                 ttl_seconds=3600, set_by="test")
+    assert clear_override(provider="deepseek", model="deepseek-v4-pro",
+                          bus=_ExplodingBus()) is True
+    assert get_override("deepseek", "deepseek-v4-pro") is None
