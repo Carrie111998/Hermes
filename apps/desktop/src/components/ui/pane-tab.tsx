@@ -42,6 +42,12 @@ const TAB_IDLE =
 const TAB_SELECTED =
   '[background-image:linear-gradient(color-mix(in_srgb,var(--ui-accent)_14%,transparent),color-mix(in_srgb,var(--ui-accent)_14%,transparent))] text-foreground'
 
+function targetsPaneTabClose(target: EventTarget | null): boolean {
+  const element = target as Element | null
+
+  return typeof element?.closest === 'function' && Boolean(element.closest('[data-pane-tab-close]'))
+}
+
 interface PaneTabProps extends React.ComponentProps<'div'> {
   active?: boolean
   dirty?: boolean
@@ -84,6 +90,7 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
 ) {
   // Vertical rails only. Horizontal tabs draw no bottom border — the strip owns
   // that rule, and a per-tab border stacked a second translucent line over it.
+  const closeLabel = translateNow('common.close')
   const edge = vertical ? (side === 'right' ? 'border-l' : 'border-r') : undefined
   const middle = middleClickHandlers(onClose)
 
@@ -106,7 +113,7 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
         // Sites whose tab activates on the label's own onClick (the preview
         // rail) fire it AFTER our pointerdown close — swallow that stray click
         // in the capture phase so it can't re-select the just-closed tab.
-        if (onClose && isMetaClose(event)) {
+        if (onClose && isMetaClose(event) && !targetsPaneTabClose(event.target)) {
           event.preventDefault()
           event.stopPropagation()
         }
@@ -142,32 +149,44 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
     >
       {children}
       {onClose && !vertical && (
-        <button
-          aria-label="Close tab"
-          className={cn(
-            'grid size-4 shrink-0 place-items-center self-center rounded-sm text-(--ui-text-tertiary) transition-opacity',
-            // Always reserve the slot; visible on hover. The dirty dot
-            // (below) yields to the X on hover so the two never overlap.
-            // Opacity transitions keep the layout stable (no width shift
-            // when the X appears).
-            'mr-1.5 opacity-0 group-hover/tab:opacity-100',
-            'hover:bg-(--ui-control-hover-background) hover:text-foreground'
+        <span className="relative mr-1.5 grid size-4 shrink-0 place-items-center self-center">
+          {dirty && (
+            <span
+              aria-hidden
+              className="pointer-events-none absolute inset-0 grid place-items-center transition-opacity group-hover/tab:opacity-0 group-focus-within/tab:opacity-0"
+              data-pane-tab-dirty
+            >
+              <span className="size-2 rounded-full bg-amber-500 shadow-[0_0_0_2px_var(--tab-bg),0_1px_2px_rgba(0,0,0,0.45)] dark:bg-amber-400" />
+            </span>
           )}
-          onClick={event => {
-            event.preventDefault()
-            event.stopPropagation()
-            onClose()
-          }}
-          onPointerDown={event => {
-            // Claim the press so the tab's drag/activate pointerdown handler
-            // can't fire — the X is a leaf action, never a drag start.
-            event.preventDefault()
-            event.stopPropagation()
-          }}
-          type="button"
-        >
-          <Codicon name="close" size="0.625rem" />
-        </button>
+          <button
+            aria-label={closeLabel}
+            className={cn(
+              'absolute inset-0 grid place-items-center rounded-sm text-(--ui-text-tertiary) opacity-0 transition-opacity outline-none',
+              // The slot stays reserved so hover/focus never shifts the tab.
+              // Keyboard focus must reveal the action too: global app styles
+              // suppress native outlines, so carry the shared focus ring here.
+              'group-hover/tab:opacity-100 group-focus-within/tab:opacity-100 focus-visible:opacity-100',
+              'hover:bg-(--ui-control-hover-background) hover:text-foreground focus-visible:ring-[0.1875rem] focus-visible:ring-ring/50'
+            )}
+            data-pane-tab-close
+            onClick={event => {
+              event.preventDefault()
+              event.stopPropagation()
+              onClose()
+            }}
+            onPointerDown={event => {
+              // Claim the press so the tab's drag/activate pointerdown handler
+              // can't fire — the X is a leaf action, never a drag start.
+              event.preventDefault()
+              event.stopPropagation()
+            }}
+            title={closeLabel}
+            type="button"
+          >
+            <Codicon name="close" size="0.625rem" />
+          </button>
+        </span>
       )}
       {dirty && !(onClose && !vertical) && (
         <span
@@ -176,6 +195,7 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
             'pointer-events-none absolute grid size-4 place-items-center',
             vertical ? 'bottom-1.5 left-1/2 -translate-x-1/2' : 'right-1.5 top-1/2 -translate-y-1/2'
           )}
+          data-pane-tab-dirty
         >
           <span className="size-2 rounded-full bg-amber-500 shadow-[0_0_0_2px_var(--tab-bg),0_1px_2px_rgba(0,0,0,0.45)] dark:bg-amber-400" />
         </span>

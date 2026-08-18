@@ -102,7 +102,28 @@ describe('PaneTab hover close button', () => {
       </PaneTab>
     )
 
-    expect(screen.getByRole('button', { name: 'Close tab' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Close' })).toBeTruthy()
+  })
+
+  it('reveals the close button for keyboard focus as well as pointer hover', () => {
+    const onClose = vi.fn()
+    render(
+      <PaneTab onClose={onClose}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    expect(screen.getByRole('button', { name: 'Close' }).className).toContain('focus-visible:opacity-100')
+  })
+
+  it('retains the dirty marker on a closeable tab', () => {
+    const { container } = render(
+      <PaneTab dirty onClose={vi.fn()}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    expect(container.querySelector('[data-pane-tab-dirty]')).not.toBeNull()
   })
 
   it('clicking the close button calls onClose and stops propagation', () => {
@@ -114,12 +135,42 @@ describe('PaneTab hover close button', () => {
       </PaneTab>
     )
 
-    const closeBtn = screen.getByRole('button', { name: 'Close tab' })
+    const closeBtn = screen.getByRole('button', { name: 'Close' })
     fireEvent.pointerDown(closeBtn)
     fireEvent.click(closeBtn)
     expect(onClose).toHaveBeenCalledTimes(1)
     // The tab's own pointerdown handler must NOT fire — the X is a leaf action.
     expect(onTabPointerDown).not.toHaveBeenCalled()
+  })
+
+  it('keeps the established meta-click close gesture over the close button', () => {
+    const onClose = vi.fn()
+    render(
+      <PaneTab onClose={onClose}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    const closeBtn = screen.getByRole('button', { name: 'Close' })
+    fireEvent.pointerDown(closeBtn, { button: 0, metaKey: true })
+    fireEvent.click(closeBtn, { button: 0, metaKey: true })
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('is focusable and closes from a keyboard-style activation click', () => {
+    const onClose = vi.fn()
+    render(
+      <PaneTab onClose={onClose}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    const closeBtn = screen.getByRole('button', { name: 'Close' })
+    closeBtn.focus()
+    expect(closeBtn.ownerDocument.activeElement).toBe(closeBtn)
+
+    fireEvent.click(closeBtn, { detail: 0 })
+    expect(onClose).toHaveBeenCalledTimes(1)
   })
 
   it('does not render a close button on vertical tabs', () => {
@@ -130,7 +181,7 @@ describe('PaneTab hover close button', () => {
       </PaneTab>
     )
 
-    expect(screen.queryByRole('button', { name: 'Close tab' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Close' })).toBeNull()
   })
 
   it('does not render a close button without onClose', () => {
@@ -140,6 +191,6 @@ describe('PaneTab hover close button', () => {
       </PaneTab>
     )
 
-    expect(screen.queryByRole('button', { name: 'Close tab' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Close' })).toBeNull()
   })
 })
