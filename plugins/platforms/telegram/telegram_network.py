@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import socket
+import sys
 from typing import Iterable, Optional
 
 import httpx
@@ -42,6 +44,67 @@ _DOH_PROVIDERS: list[dict] = [
 # endpoints in the 149.154.160.0/20 block (same seed used by OpenClaw).
 _SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]
 
+# Adapter used to inject HTTPX limits of 512 connections. That defeats the
+# CLOSE_WAIT leak cap in TelegramFallbackTransport and eventually makes
+# getaddrinfo fail with errno 8 on macOS.
+_MAX_TRANSPORT_CONNECTIONS = 16
+_MAX_TRANSPORT_KEEPALIVE = 8
+
+
+def prefer_ipv4() -> bool:
+    """Return True when Telegram should skip hostname DNS (IPv6) first.
+
+    Default on macOS is IPv4-first: local AAAA lookups here fail with errno 8
+    and poison the pool. Set HERMES_TELEGRAM_PREFER_IPV4=0 to restore the
+    historical hostname-first order.
+    """
+    raw = os.environ.get("HERMES_TELEGRAM_PREFER_IPV4", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return sys.platform == "darwin"
+
+
+def _clamp_transport_limits(limits: httpx.Limits | None) -> httpx.Limits:
+    if limits is None:
+        return TelegramFallbackTransport._POOL_LIMITS
+    max_conn = int(getattr(limits, "max_connections", None) or _MAX_TRANSPORT_CONNECTIONS)
+    max_keep = int(getattr(limits, "max_keepalive_connections", None) or _MAX_TRANSPORT_KEEPALIVE)
+    expiry = float(getattr(limits, "keepalive_expiry", 2.0) or 2.0)
+    return httpx.Limits(
+        max_connections=min(max_conn, _MAX_TRANSPORT_CONNECTIONS),
+        max_keepalive_connections=min(max_keep, _MAX_TRANSPORT_KEEPALIVE),
+        keepalive_expiry=min(expiry, 2.0) if expiry > 0 else 2.0,
+    )
+
+
+def _build_attempt_order(sticky_ip: Optional[str], fallback_ips: Iterable[str]) -> list[Optional[str]]:
+    """Build connect order for one Telegram request.
+
+    Default (historical): sticky → primary DNS → other IPv4 fallbacks.
+    HERMES_TELEGRAM_PREFER_IPV4=1: sticky → IPv4 fallbacks → primary DNS last.
+    The IPv4-first order avoids macOS errno 8 / flaky IPv6 AAAA lookups that
+    poison the whole pool before fallback IPs are tried.
+    """
+    ips = [ip for ip in fallback_ips if ip]
+    if prefer_ipv4():
+        order: list[Optional[str]] = []
+        if sticky_ip:
+            order.append(sticky_ip)
+        for ip in ips:
+            if ip != sticky_ip:
+                order.append(ip)
+        order.append(None)
+        return order
+    order = [sticky_ip] if sticky_ip else [None]
+    if sticky_ip:
+        order.append(None)
+    for ip in ips:
+        if ip != sticky_ip:
+            order.append(ip)
+    return order
+
 
 def _resolve_proxy_url(target_hosts=None) -> str | None:
     # Delegate to shared implementation (env vars + macOS system proxy detection)
@@ -68,7 +131,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
-        transport_kwargs.setdefault("limits", self._POOL_LIMITS)
+        transport_kwargs["limits"] = _clamp_transport_limits(transport_kwargs.get("limits"))
         self._transport_kwargs = transport_kwargs
         self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
         self._primary_lock = asyncio.Lock()
@@ -121,12 +184,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             return await self._primary.handle_async_request(request)
 
         sticky_ip = self._sticky_ip
-        attempt_order: list[Optional[str]] = [sticky_ip] if sticky_ip else [None]
-        if sticky_ip:
-            attempt_order.append(None)  # retry primary DNS after sticky failure
-        for ip in self._fallback_ips:
-            if ip != sticky_ip:
-                attempt_order.append(ip)
+        attempt_order = _build_attempt_order(sticky_ip, self._fallback_ips)
 
         last_error: Exception | None = None
         for ip in attempt_order:
@@ -320,4 +378,16 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
 
 
 def _is_retryable_connect_error(exc: Exception) -> bool:
-    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+    # Retry on any transient transport/timeout error that may self-heal across
+    # a single long-poll cycle — including network resets after a TCP handshake
+    # and read stalls on a flaky link. Telegram long-polls are expected to block
+    # for up to the configured timeout, so a ReadTimeout must be retried rather
+    # than treated as a permanent API failure.
+    return isinstance(exc, (
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpx.NetworkError,
+        httpx.ReadTimeout,
+        httpx.PoolTimeout,
+        httpx.WriteTimeout,
+    ))

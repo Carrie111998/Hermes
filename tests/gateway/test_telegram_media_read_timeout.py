@@ -133,3 +133,35 @@ async def test_send_image_upload_fallback_uses_media_read_timeout(adapter, monke
     upload = calls[1]
     assert isinstance(upload["photo"], (bytes, bytearray))
     assert upload["read_timeout"] == tg._MEDIA_SEND_READ_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_media_downloader_passes_long_read_timeout(adapter):
+    """_download_telegram_media_bytes uses the long media download timeout.
+
+    Without this, ``file_obj.download_as_bytearray()`` falls back to PTB's
+    20s default and fails on slow/flaky links that need >20s to fetch a voice
+    note from Telegram's CDN.
+    """
+    get_file_calls = []
+    download_calls = []
+
+    class _File:
+        file_path = "voice/file.oga"
+
+        async def download_as_bytearray(self, *, read_timeout=None, write_timeout=None, connect_timeout=None, pool_timeout=None):
+            download_calls.append(read_timeout)
+            return bytearray(b"fake-ogg-voice")
+
+    class _Voice:
+        file_id = "abc123"
+
+        async def get_file(self, *, read_timeout=None, connect_timeout=None, write_timeout=None, pool_timeout=None):
+            get_file_calls.append(read_timeout)
+            return _File()
+
+    data = await adapter._download_telegram_media_bytes(_Voice())
+
+    assert data == b"fake-ogg-voice"
+    assert get_file_calls == [tg._MEDIA_DOWNLOAD_TIMEOUT]
+    assert download_calls == [tg._MEDIA_DOWNLOAD_TIMEOUT]

@@ -123,6 +123,9 @@ async def test_failed_primary_pool_is_discarded_and_closed(monkeypatch):
         "http_proxy", "all_proxy", "TELEGRAM_PROXY", "NO_PROXY", "no_proxy",
     ):
         monkeypatch.delenv(key, raising=False)
+    # Force hostname-first order so the primary pool is attempted, fails, and
+    # is replaced — the scenario this regression test is exercising.
+    monkeypatch.setenv("HERMES_TELEGRAM_PREFER_IPV4", "0")
 
     behavior = {"api.telegram.org": "timeout", "149.154.167.220": "ok"}
     instances = []
@@ -146,9 +149,13 @@ async def test_failed_primary_pool_is_discarded_and_closed(monkeypatch):
 
 
 def test_caller_limits_win_over_pool_default(monkeypatch):
-    """A caller-supplied ``limits`` kwarg must win over the ``_POOL_LIMITS``
-    ``setdefault`` default, for both the primary and lazily-built fallback
-    pools (#71593)."""
+    """A caller-supplied ``limits`` kwarg wins over the ``_POOL_LIMITS``
+    default and is forwarded to both primary and fallback pools (#71593).
+
+    Both keepalive and connection counts are clamped by the transport to
+    prevent CLOSE_WAIT fd leaks, but the forwarded limits are NOT the class
+    default pool limits.
+    """
     import asyncio
 
     kwargs_log: list = []
@@ -167,13 +174,16 @@ def test_caller_limits_win_over_pool_default(monkeypatch):
     transport = tnet.TelegramFallbackTransport(
         ["149.154.167.220"], limits=custom_limits
     )
-    # Primary built in __init__ with the caller's limits (not the default).
-    assert kwargs_log[0]["limits"] is custom_limits
+    # Primary built in __init__ with the caller's limits clamped to the cap.
+    assert kwargs_log[0]["limits"].max_connections == tnet._MAX_TRANSPORT_CONNECTIONS
 
-    # Lazily-built fallback pool must also carry the caller's limits.
+    # Lazily-built fallback pool must also carry the same clamped limits.
     asyncio.run(transport._get_fallback("149.154.167.220"))
     assert len(kwargs_log) == 2
-    assert all(kw["limits"] is custom_limits for kw in kwargs_log)
+    for kw in kwargs_log:
+        assert kw["limits"].max_connections == tnet._MAX_TRANSPORT_CONNECTIONS
+        assert kw["limits"].max_keepalive_connections == tnet._MAX_TRANSPORT_KEEPALIVE
+        assert kw["limits"].keepalive_expiry == 2.0
     # And the caller's limits are NOT the class default.
     assert custom_limits is not tnet.TelegramFallbackTransport._POOL_LIMITS
 

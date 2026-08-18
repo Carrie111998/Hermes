@@ -164,7 +164,7 @@ def test_proxy_branch_general_pool_has_tight_keepalive(monkeypatch):
 
 
 def test_fallback_branch_forwards_tuned_limits_to_inner_transports(monkeypatch):
-    monkeypatch.delenv("HERMES_TELEGRAM_HTTP_POOL_SIZE", raising=False)
+    monkeypatch.setenv("HERMES_TELEGRAM_HTTP_POOL_SIZE", "512")
     monkeypatch.delenv("HERMES_GATEWAY_HTTPX_KEEPALIVE_EXPIRY", raising=False)
 
     instances = _drive_connect(
@@ -181,7 +181,7 @@ def test_fallback_branch_forwards_tuned_limits_to_inner_transports(monkeypatch):
         assert isinstance(limits, httpx.Limits)
         assert limits.keepalive_expiry is not None
         assert limits.keepalive_expiry < 5.0
-        assert limits.max_connections == 512
+        assert limits.max_connections == 16
 
     for instance in instances:
         asyncio.run(instance.kwargs["httpx_kwargs"]["transport"].aclose())

@@ -83,6 +83,32 @@ class TestTelegramAuthClassification:
         assert _telegram_classifier()(RuntimeError("InvalidToken Forbidden")) is False
 
 
+def _telegram_network_classifier():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    return TelegramAdapter._looks_like_network_error
+
+
+class TestTelegramNetworkErrorClassification:
+    """Raw httpx transport errors must be treated as transient network errors."""
+
+    def test_httpx_connect_error_is_network_error(self):
+        import httpx
+        assert _telegram_network_classifier()(httpx.ConnectError("dropped")) is True
+
+    def test_httpx_read_timeout_is_network_error(self):
+        import httpx
+        assert _telegram_network_classifier()(httpx.ReadTimeout("read timeout")) is True
+
+    def test_httpx_pool_timeout_is_network_error(self):
+        import httpx
+        assert _telegram_network_classifier()(httpx.PoolTimeout("pool full")) is True
+
+    def test_badrequest_is_not_network_error(self):
+        import httpx
+        assert _telegram_network_classifier()(httpx.HTTPStatusError("400", request=MagicMock(), response=MagicMock())) is False
+
+
 # ── Discord: connect exception classification ──────────────────────────
 
 

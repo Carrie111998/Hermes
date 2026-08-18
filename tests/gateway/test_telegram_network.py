@@ -118,6 +118,7 @@ class TestFallbackTransport:
 
     @pytest.mark.asyncio
     async def test_falls_back_on_connect_timeout_and_becomes_sticky(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TELEGRAM_PREFER_IPV4", "0")
         calls = []
         behavior = {"api.telegram.org": "timeout", "149.154.167.220": "ok"}
         monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
@@ -143,6 +144,7 @@ class TestFallbackTransport:
     @pytest.mark.asyncio
     async def test_sticky_ip_tried_first_but_falls_through_if_stale(self, monkeypatch):
         """If the sticky IP stops working, the transport retries others."""
+        monkeypatch.setenv("HERMES_TELEGRAM_PREFER_IPV4", "0")
         calls = []
         behavior = {
             "api.telegram.org": "timeout",
@@ -243,6 +245,10 @@ class TestFallbackTransportInit:
         AsyncHTTPTransport instances (#58790).  httpx ignores the
         client-level limits kwarg when a custom transport is
         supplied, so the limits must be forwarded via transport_kwargs.
+
+        Limits that exceed the transport's internal cap are clamped so a
+        single poisoned pool cannot exhaust the process file-descriptor limit
+        (#63311).
         """
         seen_kwargs = []
 
@@ -273,8 +279,10 @@ class TestFallbackTransportInit:
         assert len(seen_kwargs) == 2
         for kw in seen_kwargs:
             assert "limits" in kw
-            # Caller-supplied limits must win over the setdefault default.
-            assert kw["limits"] is custom_limits
+            # Oversized limits are clamped so a poisoned pool cannot exhaust fds.
+            assert kw["limits"].max_connections == tnet._MAX_TRANSPORT_CONNECTIONS
+            assert kw["limits"].max_keepalive_connections == tnet._MAX_TRANSPORT_KEEPALIVE
+            assert kw["limits"].keepalive_expiry == 2.0
 
 
 class TestFallbackTransportClose:
@@ -488,4 +496,51 @@ class TestDiscoverFallbackIps:
 
         assert ips == ["149.154.167.220"]
         assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
+
+
+class TestRetryableErrors:
+    """_is_retryable_connect_error must classify transient transport errors as retryable."""
+
+    @pytest.mark.parametrize("exc", [
+        httpx.ConnectTimeout("timed out"),
+        httpx.ConnectError("connect error"),
+        httpx.NetworkError("network reset"),
+        httpx.ReadTimeout("read timeout"),
+        httpx.PoolTimeout("pool timeout"),
+        httpx.WriteTimeout("write timeout"),
+    ])
+    def test_transport_errors_are_retryable(self, exc):
+        assert tnet._is_retryable_connect_error(exc) is True
+
+    def test_protocol_errors_are_not_retryable(self):
+        # A real API-level 4xx should not be silently retried; it should reach
+        # the caller where PTB can translate it into a BadRequest etc.
+        class _FakeProtocolError(Exception):
+            pass
+
+        assert tnet._is_retryable_connect_error(_FakeProtocolError("nope")) is False
+
+
+class TestPreferIpv4Order:
+    def test_default_tries_primary_dns_before_fallback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TELEGRAM_PREFER_IPV4", "0")
+        assert tnet._build_attempt_order(None, ["149.154.167.220"]) == [None, "149.154.167.220"]
+
+    def test_prefer_ipv4_tries_fallback_before_dns(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TELEGRAM_PREFER_IPV4", "1")
+        assert tnet._build_attempt_order(None, ["149.154.167.220"]) == ["149.154.167.220", None]
+
+    @pytest.mark.asyncio
+    async def test_prefer_ipv4_skips_broken_hostname_dns(self, monkeypatch):
+        calls = []
+        behavior = {"api.telegram.org": "connect_error", "149.154.167.220": "ok"}
+        monkeypatch.setenv("HERMES_TELEGRAM_PREFER_IPV4", "1")
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+        resp = await transport.handle_async_request(_telegram_request())
+
+        assert resp.status_code == 200
+        assert calls[0]["url_host"] == "149.154.167.220"
+        assert transport._sticky_ip == "149.154.167.220"
 
