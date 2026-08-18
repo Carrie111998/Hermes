@@ -14,6 +14,7 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms import weixin
 from gateway.platforms.weixin import ContextTokenStore, WeixinAdapter
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from tools.send_message_tool import _parse_target_ref, _send_to_platform
 
 
@@ -269,6 +270,160 @@ class TestWeixinChunkDelivery:
         # rest of the current chunk and follow-up sends fail fast.
         assert send_message_mock.await_count == 2
         assert sleep_mock.await_count == 1
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_final_response_priority_drops_transient_progress_before_send(
+        self, send_message_mock
+    ):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "final_response_priority": True,
+                },
+            )
+        )
+        adapter._send_session = object()
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        send_message_mock.return_value = {}
+
+        result = asyncio.run(
+            adapter.send(
+                "wxid_test123",
+                "tool progress",
+                metadata={"transient_progress": True},
+            )
+        )
+
+        assert result.success is True
+        assert send_message_mock.await_count == 0
+        assert result.raw_response == {
+            "suppressed": True,
+            "reason": "transient_progress",
+        }
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_final_response_priority_keeps_final_delivery(self, send_message_mock):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "final_response_priority": True,
+                },
+            )
+        )
+        adapter._send_session = object()
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        send_message_mock.return_value = {}
+
+        result = asyncio.run(adapter.send("wxid_test123", "final answer"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 1
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_suppressed_stream_commentary_does_not_claim_final_delivery(
+        self, send_message_mock
+    ):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "final_response_priority": True,
+                },
+            )
+        )
+        adapter._send_session = object()
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        send_message_mock.return_value = {}
+
+        async def scenario():
+            consumer = GatewayStreamConsumer(
+                adapter,
+                "wxid_test123",
+                StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+                metadata={"thread_id": "topic-1"},
+                commentary_metadata={
+                    "thread_id": "topic-1",
+                    "transient_progress": True,
+                },
+            )
+            consumer.on_commentary("same as final")
+            consumer.finish()
+            await consumer.run()
+
+            assert consumer.has_delivered_text("same as final") is False
+
+            final_result = await adapter.send(
+                "wxid_test123",
+                "same as final",
+                metadata={"thread_id": "topic-1"},
+            )
+            assert final_result.success is True
+
+        asyncio.run(scenario())
+
+        assert send_message_mock.await_count == 1
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            {},
+            {"transient_progress": False},
+            {"transient_progress": 1},
+            {"transient_progress": "true"},
+            ["not-a-metadata-dict"],
+        ],
+    )
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_final_response_priority_only_suppresses_exact_boolean_true(
+        self, send_message_mock, metadata
+    ):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "final_response_priority": True,
+                },
+            )
+        )
+        adapter._send_session = object()
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        send_message_mock.return_value = {}
+
+        result = asyncio.run(
+            adapter.send("wxid_test123", "must be delivered", metadata=metadata)
+        )
+
+        assert result.success is True
+        assert send_message_mock.await_count == 1
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_transient_progress_is_sent_when_priority_mode_disabled(
+        self, send_message_mock
+    ):
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = {}
+
+        result = asyncio.run(
+            adapter.send(
+                "wxid_test123",
+                "tool progress",
+                metadata={"transient_progress": True},
+            )
+        )
+
+        assert result.success is True
+        assert send_message_mock.await_count == 1
 
 
 class TestWeixinOutboundMedia:

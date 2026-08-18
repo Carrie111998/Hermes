@@ -103,6 +103,7 @@ The adapter will restore saved credentials, connect to the iLink API, and begin 
 - **Context token persistence** — disk-backed reply continuity across restarts
 - **Markdown formatting** — preserves Markdown, including headers, tables, and code blocks, so WeChat clients that support Markdown can render it natively
 - **Smart message chunking** — messages stay as a single bubble when under the limit; only oversized payloads split at logical boundaries
+- **Optional final-response priority** — suppresses tool progress, interim commentary, background-review notifications, and long-running heartbeats before iLink delivery while preserving final replies and lifecycle/actionable messages
 - **Typing indicators** — shows "typing…" status in the WeChat client while the agent processes
 - **SSRF protection** — outbound media URLs are validated before download
 - **Message deduplication** — 5-minute sliding window prevents double-processing
@@ -123,6 +124,7 @@ Set these in `config.yaml` under `platforms.weixin.extra`:
 | `allow_from` | `[]` | User IDs allowed for DMs (when dm_policy=allowlist) |
 | `group_allow_from` | `[]` | Group IDs allowed (when group_policy=allowlist) |
 | `split_multiline_messages` | `false` | When `true`, split multi-line replies into multiple chat messages (legacy behavior). When `false`, keep multi-line replies as one message unless they exceed the length limit. |
+| `final_response_priority` | `false` | When `true`, drop only outbound messages marked by the gateway as `transient_progress` before calling iLink: tool progress, interim commentary (including the streaming-consumer path), background-review notifications, and long-running heartbeats. Final replies, lifecycle statuses, and actionable warning/approval/clarify messages remain deliverable. Useful when iLink send quotas are tight or a shared Desktop/Weixin session emits frequent progress. |
 | `text_batch_delay_seconds` | `3.0` | Quiet period (seconds) before a buffered burst of rapid text messages is flushed as one combined request. iLink delivers messages individually, so this debounce avoids one agent invocation per fragment. Set `0` to dispatch each message immediately. |
 | `text_batch_split_delay_seconds` | `5.0` | Extended flush delay used when the latest fragment is near the split threshold (long messages iLink may have chunked). |
 

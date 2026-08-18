@@ -25,6 +25,22 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     }
 
 
+def test_legacy_positional_on_new_message_callback_is_preserved():
+    callback = MagicMock()
+    metadata = {"thread_id": "topic-1"}
+
+    consumer = GatewayStreamConsumer(
+        MagicMock(),
+        "chat-1",
+        StreamConsumerConfig(),
+        metadata,
+        callback,
+    )
+
+    assert consumer._on_new_message is callback
+    assert consumer.commentary_metadata is metadata
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 
@@ -830,6 +846,43 @@ class TestInterimCommentaryMessages:
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         assert sent_texts == ["I'll inspect the repository first.", "Done."]
         assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_commentary_metadata_is_transient_but_final_metadata_is_not(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=True, message_id="msg_2"),
+        ])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+            metadata={"thread_id": "topic-1"},
+            commentary_metadata={
+                "thread_id": "topic-1",
+                "transient_progress": True,
+            },
+        )
+
+        consumer.on_commentary("I'll inspect the repository first.")
+        consumer.on_delta("Done.")
+        consumer.finish()
+
+        await consumer.run()
+
+        commentary_call, final_call = adapter.send.call_args_list
+        assert commentary_call.kwargs["metadata"] == {
+            "thread_id": "topic-1",
+            "transient_progress": True,
+        }
+        assert final_call.kwargs["metadata"] == {
+            "thread_id": "topic-1",
+            "notify": True,
+        }
 
 
 class TestCancelledConsumerSetsFlags:

@@ -103,6 +103,7 @@ hermes gateway
 - **上下文 token 持久化** — 基于磁盘的回复连续性，重启后仍可保持
 - **Markdown 格式化** — 保留 Markdown 格式（包括标题、表格和代码块），支持 Markdown 的微信客户端可原生渲染
 - **智能消息分块** — 未超出长度限制时保持单条消息气泡；仅超长内容在逻辑边界处拆分
+- **可选的最终回复优先** — 在调用 iLink 前抑制工具进度、中间说明、后台审查通知和长任务心跳，同时保留最终回复、生命周期状态和需要操作的消息
 - **正在输入提示** — 代理处理消息时在微信客户端显示"正在输入…"状态
 - **SSRF 防护** — 下载前验证外发媒体 URL
 - **消息去重** — 5 分钟滑动窗口防止重复处理
@@ -123,6 +124,7 @@ hermes gateway
 | `allow_from` | `[]` | 允许发送私信的用户 ID（当 dm_policy=allowlist 时生效） |
 | `group_allow_from` | `[]` | 允许的群组 ID（当 group_policy=allowlist 时生效） |
 | `split_multiline_messages` | `false` | 为 `true` 时，将多行回复拆分为多条消息（旧版行为）；为 `false` 时，多行回复保持为单条消息，除非超出长度限制。 |
+| `final_response_priority` | `false` | 为 `true` 时，仅在调用 iLink 前丢弃被网关标记为 `transient_progress` 的出站消息：工具进度、中间说明（包括 streaming consumer 路径）、后台审查通知和长任务心跳。最终回复、生命周期状态以及可操作的警告/审批/澄清消息仍会正常投递。适用于 iLink 发送额度紧张，或 Desktop/Weixin 共享会话频繁产生进度消息的场景。 |
 
 ## 访问策略
 

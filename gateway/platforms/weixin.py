@@ -1242,6 +1242,10 @@ class WeixinAdapter(BasePlatformAdapter):
             or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
             default=False,
         )
+        self._final_response_priority = _coerce_bool(
+            extra.get("final_response_priority"),
+            default=False,
+        )
 
         # Text debounce batching (mirrors Telegram adapter pattern).
         # iLink delivers messages individually, so rapid multi-message
@@ -1913,6 +1917,26 @@ class WeixinAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if (
+            self._final_response_priority
+            and isinstance(metadata, dict)
+            and metadata.get("transient_progress") is True
+        ):
+            logger.debug(
+                "[%s] final-response priority suppressed transient progress for %s",
+                self.name,
+                _safe_id(chat_id),
+            )
+            # ``success=True`` acknowledges an intentional no-op so generic
+            # progress callers do not retry it.  The machine-readable flag is
+            # the delivery-ledger contract: no platform message was created.
+            return SendResult(
+                success=True,
+                raw_response={
+                    "suppressed": True,
+                    "reason": "transient_progress",
+                },
+            )
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)

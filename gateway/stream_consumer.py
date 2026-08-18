@@ -199,11 +199,15 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        commentary_metadata: Optional[dict] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
+        self.commentary_metadata = (
+            commentary_metadata if commentary_metadata is not None else metadata
+        )
         # Fired whenever a fresh content bubble is created on the platform
         # (first-send of a new message, commentary, overflow chunk, or
         # fallback continuation). The gateway uses this to linearize the
@@ -1839,14 +1843,22 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self.commentary_metadata,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
             # tool..."), not the final response. Setting already_sent would cause
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
-            if result.success:
+            raw_response = getattr(result, "raw_response", None)
+            # Some transports intentionally acknowledge a suppressed progress
+            # send as success to prevent retries.  That is not delivery: never
+            # let it enter the commentary ledger used to suppress final replies.
+            suppressed = (
+                isinstance(raw_response, dict)
+                and raw_response.get("suppressed") is True
+            )
+            if result.success and not suppressed:
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
@@ -1855,7 +1867,7 @@ class GatewayStreamConsumer:
                 # an interim "preview" actually carried the final response, vs.
                 # unrelated commentary delivered during a session split (#14238).
                 self._delivered_commentary_texts.append(text)
-            return result.success
+            return bool(result.success and not suppressed)
         except Exception as e:
             logger.error("Commentary send error: %s", e)
             return False
