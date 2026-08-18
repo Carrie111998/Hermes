@@ -205,7 +205,7 @@ import { cursorPointInWindow } from './hud-cursor'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
-import { imageContextMenuItems } from './image-context-menu'
+import { imageContextMenuItems, resolveComposerAttachmentRemove } from './image-context-menu'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
@@ -6395,91 +6395,105 @@ function installZoomShortcuts(window) {
 
 function installContextMenu(window) {
   window.webContents.on('context-menu', (_event, params) => {
-    const template = []
-    const hasSelection = Boolean(params.selectionText?.trim())
-    const hasLink = Boolean(params.linkURL)
-    const isEditable = Boolean(params.isEditable)
+    void popupWindowContextMenu(window, params)
+  })
+}
+
+async function popupWindowContextMenu(window, params) {
+  if (!window || window.isDestroyed()) {
+    return
+  }
+
+  const template = []
+  const hasSelection = Boolean(params.selectionText?.trim())
+  const hasLink = Boolean(params.linkURL)
+  const isEditable = Boolean(params.isEditable)
+  const removeAttachment = await resolveComposerAttachmentRemove(window.webContents, params, () => window.isDestroyed())
+
+  if (window.isDestroyed()) {
+    return
+  }
+
+  template.push(
+    ...imageContextMenuItems(params, {
+      copyImageAt: (x, y) => window.webContents.copyImageAt(x, y),
+      openImage: openExternalUrl,
+      copyImageAddress: url => clipboard.writeText(url),
+      removeAttachment,
+      saveImage: url => {
+        void saveImageFromUrl(url).catch(error => rememberLog(`Save image failed: ${error.message}`))
+      }
+    })
+  )
+
+  if (hasLink) {
+    if (template.length) {
+      template.push({ type: 'separator' })
+    }
 
     template.push(
-      ...imageContextMenuItems(params, {
-        copyImageAt: (x, y) => window.webContents.copyImageAt(x, y),
-        openImage: openExternalUrl,
-        copyImageAddress: url => clipboard.writeText(url),
-        saveImage: url => {
-          void saveImageFromUrl(url).catch(error => rememberLog(`Save image failed: ${error.message}`))
-        }
-      })
+      {
+        label: 'Open Link',
+        click: () => openExternalUrl(params.linkURL)
+      },
+      {
+        label: 'Copy Link',
+        click: () => clipboard.writeText(params.linkURL)
+      }
     )
+  }
 
-    if (hasLink) {
-      if (template.length) {
-        template.push({ type: 'separator' })
-      }
+  // Spell-check suggestions for the misspelled word under the caret.
+  // Chromium surfaces them on `params.dictionarySuggestions`; we offer the
+  // top 5 plus a "Add to dictionary" affordance.
+  const suggestions = Array.isArray(params.dictionarySuggestions) ? params.dictionarySuggestions : []
 
-      template.push(
-        {
-          label: 'Open Link',
-          click: () => openExternalUrl(params.linkURL)
-        },
-        {
-          label: 'Copy Link',
-          click: () => clipboard.writeText(params.linkURL)
-        }
-      )
+  if (isEditable && params.misspelledWord && suggestions.length > 0) {
+    if (template.length) {
+      template.push({ type: 'separator' })
     }
 
-    // Spell-check suggestions for the misspelled word under the caret.
-    // Chromium surfaces them on `params.dictionarySuggestions`; we offer the
-    // top 5 plus a "Add to dictionary" affordance.
-    const suggestions = Array.isArray(params.dictionarySuggestions) ? params.dictionarySuggestions : []
-
-    if (isEditable && params.misspelledWord && suggestions.length > 0) {
-      if (template.length) {
-        template.push({ type: 'separator' })
-      }
-
-      for (const suggestion of suggestions.slice(0, 5)) {
-        template.push({
-          label: suggestion,
-          click: () => window.webContents.replaceMisspelling(suggestion)
-        })
-      }
-
-      template.push({ type: 'separator' })
+    for (const suggestion of suggestions.slice(0, 5)) {
       template.push({
-        label: 'Add to dictionary',
-        click: () => window.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord)
+        label: suggestion,
+        click: () => window.webContents.replaceMisspelling(suggestion)
       })
     }
 
-    if (hasSelection || isEditable) {
-      if (template.length) {
-        template.push({ type: 'separator' })
-      }
+    template.push({ type: 'separator' })
+    template.push({
+      label: 'Add to dictionary',
+      click: () => window.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord)
+    })
+  }
 
-      if (isEditable) {
-        template.push(
-          { role: 'cut', enabled: params.editFlags.canCut },
-          { role: 'copy', enabled: params.editFlags.canCopy },
-          { role: 'paste', enabled: params.editFlags.canPaste },
-          { type: 'separator' },
-          { role: 'selectAll', enabled: params.editFlags.canSelectAll }
-        )
-      } else {
-        template.push({ role: 'copy', enabled: params.editFlags.canCopy })
-      }
+  if (hasSelection || isEditable) {
+    if (template.length) {
+      template.push({ type: 'separator' })
     }
 
-    // Bare right-click on non-editable, non-selected, non-media content (a pane
-    // body, the sidebar, chrome): the renderer's own context menus own those
-    // surfaces, and anywhere without one shows nothing — not a lone, useless
-    // "Select All" from the native fallback.
-    if (!template.length) {
-      return
+    if (isEditable) {
+      template.push(
+        { role: 'cut', enabled: params.editFlags.canCut },
+        { role: 'copy', enabled: params.editFlags.canCopy },
+        { role: 'paste', enabled: params.editFlags.canPaste },
+        { type: 'separator' },
+        { role: 'selectAll', enabled: params.editFlags.canSelectAll }
+      )
+    } else {
+      template.push({ role: 'copy', enabled: params.editFlags.canCopy })
     }
+  }
 
-    Menu.buildFromTemplate(template).popup({ window })
-  })
+  // Bare right-click on non-editable, non-selected, non-media content (a pane
+  // body, the sidebar, chrome): the renderer's own context menus own those
+  // surfaces, and anywhere without one shows nothing — not a lone, useless
+  // "Select All" from the native fallback.
+  if (!template.length) {
+    return
+  }
+
+  Menu.buildFromTemplate(template).popup({ window })
 }
 
 // Microphone and camera capture. The voice composer drives mic access and
