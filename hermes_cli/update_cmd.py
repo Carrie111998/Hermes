@@ -4717,6 +4717,37 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # to the target. When the target is "main" this is the historical
         # "always update against main" behavior; for any other target it's
         # the same thing — get HEAD onto the requested branch first, then
+        # If this is a fork on a custom feature branch (e.g. feat/*), rebase on upstream/main
+        # instead of forcing checkout to origin/main and breaking local commits.
+        if _m()._is_fork(_m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)) and current_branch != branch:
+            if _m()._has_upstream_remote(git_cmd, _m().PROJECT_ROOT):
+                print(f"  🔱 Fork detected on branch '{current_branch}' — updating via upstream rebase...")
+                auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+                fetch_res = subprocess.run(
+                    git_cmd + ["fetch", "upstream", "main"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                rebase_res = subprocess.run(
+                    git_cmd + ["rebase", "upstream/main"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                if rebase_res.returncode == 0:
+                    print(f"  ✓ Successfully rebased '{current_branch}' onto upstream/main.")
+                    if auto_stash_ref is not None:
+                        _m()._restore_stashed_changes(git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=False)
+                    _m()._invalidate_update_cache()
+                    return 0
+                else:
+                    subprocess.run(git_cmd + ["rebase", "--abort"], cwd=_m().PROJECT_ROOT, capture_output=True)
+                    print(f"  ⚠ Rebase hit conflicts and was aborted. Please rebase manually: git rebase upstream/main")
+                    if auto_stash_ref is not None:
+                        _m()._restore_stashed_changes(git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=False)
+                    return 1
+
         # fast-forward.
         if current_branch != branch:
             label = (
