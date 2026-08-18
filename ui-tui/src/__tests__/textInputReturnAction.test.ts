@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { INITIAL_STATE, parseMultipleKeypresses } from '../../packages/hermes-ink/src/ink/parse-keypress.js'
+
 const originalPlatform = process.platform
 
 async function importTextInput(platform: NodeJS.Platform) {
@@ -18,10 +20,21 @@ const key = (overrides: Record<string, unknown> = {}) =>
   ({ ctrl: false, meta: false, return: true, shift: false, super: false, ...overrides }) as any
 
 describe('isCtrlJNewline', () => {
-  it('recognizes the normalized Ctrl+J event emitted by extended-key protocols', async () => {
+  it.each([
+    ['Kitty CSI-u', '\x1b[106;5u'],
+    ['modifyOtherKeys', '\x1b[27;5;106~']
+  ])('recognizes Ctrl+J parsed from %s', async (_label, sequence) => {
     const { isCtrlJNewline } = await importTextInput('linux')
+    const [[parsed]] = parseMultipleKeypresses(INITIAL_STATE, sequence)
 
-    expect(isCtrlJNewline('j', key({ ctrl: true, return: false }))).toBe(true)
+    expect(parsed).toMatchObject({ ctrl: true, name: 'j' })
+    expect(parsed.kind).toBe('key')
+
+    if (parsed.kind !== 'key') {
+      throw new Error('expected a parsed key event')
+    }
+
+    expect(isCtrlJNewline(parsed.name ?? '', parsed)).toBe(true)
   })
 
   it('does not consume plain J or chords with additional modifiers', async () => {
@@ -106,6 +119,19 @@ describe('shouldInsertNewlineOnReturn', () => {
 
   it('accepts a bare LF as a multiline fallback under tmux on non-macOS', async () => {
     const prev = { ...process.env }
+
+    for (const k of [
+      'SSH_CONNECTION',
+      'SSH_CLIENT',
+      'SSH_TTY',
+      'WT_SESSION',
+      'GHOSTTY_RESOURCES_DIR',
+      'GHOSTTY_BIN_DIR',
+      'WSL_DISTRO_NAME'
+    ]) {
+      delete process.env[k]
+    }
+
     process.env.TMUX = '/tmp/tmux-1000/default,1234,0'
 
     try {
