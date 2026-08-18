@@ -46,3 +46,6 @@ export const hermesConfigCacheWriter = (profile?: ProfileScope) =>
 
 export const invalidateHermesConfig = (profile?: ProfileScope) =>
   queryClient.invalidateQueries({ queryKey: hermesConfigKey(profile) })
+
+export const resetHermesConfigCache = () =>
+  queryClient.removeQueries({ queryKey: HERMES_CONFIG_KEY })

@@ -16,8 +16,10 @@ from pydantic import BaseModel, SecretStr, field_validator
 # --- from web_server.py (originally lines 1273-1372) ---
 
 class ConfigUpdate(BaseModel):
-    config: dict
+    config: Optional[dict] = None
+    patch: Optional[dict] = None
     profile: Optional[str] = None
+    expected_revision: Optional[str] = None
 
 
 class EnvVarUpdate(BaseModel):

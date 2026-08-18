@@ -90,12 +90,20 @@ export function getHermesConfigSchema(profile?: null | string): Promise<ConfigSc
   })
 }
 
-export function saveHermesConfig(config: HermesConfigRecord, profile?: null | string): Promise<{ ok: boolean }> {
-  return hermesApi<{ ok: boolean }>({
+export function saveHermesConfig(
+  config: HermesConfigRecord,
+  profile?: null | string
+): Promise<{ ok: boolean; _revision?: string }> {
+  // The revision travelling with the draft is the CAS token: sending it lets
+  // the backend reject the save with 409 when the remote config moved since
+  // this draft was loaded, instead of silently clobbering it.
+  const expectedRevision = (config as Record<string, unknown>)._revision as string | undefined
+
+  return hermesApi<{ ok: boolean; _revision?: string }>({
     ...profileScoped(profile),
     path: '/api/config',
     method: 'PUT',
-    body: { config }
+    body: expectedRevision ? { config, expected_revision: expectedRevision } : { config }
   })
 }
 

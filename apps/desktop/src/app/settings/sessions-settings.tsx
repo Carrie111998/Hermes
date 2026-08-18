@@ -239,7 +239,11 @@ function AutoArchiveSetting() {
       setConfig(updated)
 
       try {
-        await saveHermesConfig(updated)
+        const result = await saveHermesConfig(updated)
+
+        if (result._revision) {
+          setConfig({ ...updated, _revision: result._revision })
+        }
       } catch (err) {
         notifyError(err, s.autoArchiveFailed)
       }

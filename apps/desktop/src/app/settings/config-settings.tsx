@@ -119,16 +119,24 @@ function ConfigSettingsInner({
   const savedDiscoverySignatureRef = useRef<string | undefined>(undefined)
   const [saveVersion, setSaveVersion] = useState(0)
 
-  // Seed the local draft once, the first time the shared record lands.
-  // Background refetches thereafter must not clobber in-progress edits.
+  // Seed the local draft, and re-sync if a fresh revision lands while no
+  // uncommitted edits are in progress (e.g. background refetch after remote gateway connection).
   const configSeeded = useRef(false)
+  const lastLoadedRevision = useRef<string | undefined>(undefined)
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (loadedConfig && !configSeeded.current) {
-      configSeeded.current = true
-      savedDiscoverySignatureRef.current = repoDiscoveryPolicySignature(repoDiscoveryPolicyFromConfig(loadedConfig))
-      setConfig(loadedConfig)
+    if (loadedConfig) {
+      const rev = (loadedConfig as Record<string, unknown>)._revision as string | undefined
+      if (
+        !configSeeded.current ||
+        (saveVersionRef.current === 0 && rev && rev !== lastLoadedRevision.current)
+      ) {
+        configSeeded.current = true
+        lastLoadedRevision.current = rev
+        savedDiscoverySignatureRef.current = repoDiscoveryPolicySignature(repoDiscoveryPolicyFromConfig(loadedConfig))
+        setConfig(loadedConfig)
+      }
     }
   }, [loadedConfig])
 
@@ -138,6 +146,7 @@ function ConfigSettingsInner({
   // the pending debounced autosave is cancelled by its effect cleanup.
   useOnProfileSwitch(() => {
     configSeeded.current = false
+    lastLoadedRevision.current = undefined
     savedDiscoverySignatureRef.current = undefined
     setConfig(null)
     saveVersionRef.current = 0
@@ -184,9 +193,19 @@ function ConfigSettingsInner({
             throw new Error(c.autosaveFailed)
           }
 
+          // Carry the server's new revision forward: without this every save
+          // after the first still sends the pre-save revision (this draft
+          // never re-fetches), so it false-409s against its own prior write.
+          const saved = result._revision ? { ...config, _revision: result._revision } : config
+
+          if (saveVersionRef.current === v) {
+            lastLoadedRevision.current = result._revision ?? lastLoadedRevision.current
+            setConfig(saved)
+          }
+
           // Mirror the saved record into the shared cache so MCP/model surfaces
           // reflect the edit without their own refetch.
-          writeConfigCache(config)
+          writeConfigCache(saved)
 
           if (saveVersionRef.current === v) {
             // The repo-discovery scan reads the ACTIVE profile's workspace
@@ -211,8 +230,11 @@ function ConfigSettingsInner({
     }, 550)
 
     return () => window.clearTimeout(t)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- copy is stable; avoid re-scheduling autosave on locale change
-  }, [config, onConfigSaved, saveVersion])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- config intentionally excluded: applyConfig
+    // always bumps saveVersion in the same tick, so config is already fresh whenever this effect
+    // re-runs for a real edit. Keeping config out of the deps also means the post-save
+    // revision-carry-forward setConfig() above doesn't re-trigger this effect and loop.
+  }, [onConfigSaved, saveVersion])
 
   const applyConfig = (next: HermesConfigRecord) => {
     saveVersionRef.current += 1
