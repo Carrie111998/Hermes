@@ -35,6 +35,7 @@ import { hermesConfigCacheWriter, invalidateHermesConfig, useHermesConfigRecord 
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
 import { CONTROL_TEXT } from './constants'
+import { DelegationRoutesSettings } from './delegation-routes-settings'
 import { getNested, setNested } from './helpers'
 import { ListRow, Pill, SectionHeading } from './primitives'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
@@ -910,6 +911,8 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
           </div>
         )}
       </section>
+
+      <DelegationRoutesSettings />
 
       <section>
         <div className="mb-2.5 flex items-center justify-between">

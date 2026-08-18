@@ -23,6 +23,7 @@ import type {
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
   DebugShareResponse,
+  DelegationRoutesConfig,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   HermesConfig,
@@ -1026,6 +1027,18 @@ export function saveHermesConfig(config: HermesConfigRecord, profile?: null | st
     path: '/api/config',
     method: 'PUT',
     body: { config }
+  })
+}
+
+export function saveDelegationRoutes(
+  routes: DelegationRoutesConfig,
+  profile?: null | string
+): Promise<{ ok: boolean; routes: DelegationRoutesConfig }> {
+  return window.hermesDesktop.api<{ ok: boolean; routes: DelegationRoutesConfig }>({
+    ...profileScoped(profile),
+    path: '/api/config/delegation-routes',
+    method: 'PUT',
+    body: { routes }
   })
 }
 
