@@ -493,7 +493,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     "qwen3-coder-plus": 1000000,  # 1M context
     "qwen3-coder": 262144,        # 256K context
     "qwen3-max": 262144,          # 256K context (qwen3-max-2026-01-23 snapshot, Coding Plan)
-    "qwen": 131072,
+    # NOTE: A generic "qwen" catch-all was removed in #88931. Longest-substring
+    # matching made it a foot-gun: a custom model like ``qwen36-35b`` (no
+    # explicit catalog entry) silently inherited 131072 and short-circuited
+    # the user-configured override path. The specific ``qwen3.*`` entries
+    # above cover every currently-named Qwen model; new family additions
+    # should be appended here, NOT as a generic catch-all.
     # MiniMax — M3 is 1M context (max output 512K); M2.x series is 204,800.
     # Keys use substring matching (longest-first), so "minimax-m3" wins over
     # the generic "minimax" catch-all for the M3 slug on every surface
