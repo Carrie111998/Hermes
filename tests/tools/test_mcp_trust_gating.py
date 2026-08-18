@@ -73,7 +73,10 @@ def fake_session():
 def _clean_trust_state():
     """Isolate the module-level trust metadata between tests."""
     with patch.dict(mcp_tool._server_trust_levels, {}, clear=True), \
-         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True):
+         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True), \
+         patch.dict(mcp_tool._lazy_server_configs, {}, clear=True), \
+         patch.dict(mcp_tool._lazy_server_fingerprints, {}, clear=True), \
+         patch.dict(mcp_tool._lazy_server_tool_names, {}, clear=True):
         yield
 
 
@@ -377,3 +380,45 @@ class TestProfileScopedTrust:
         with patch("tools.approval.request_elicitation_consent") as consent:
             handler({"repo": "x"})
         consent.assert_not_called()
+
+    def test_lazy_config_isolation_across_profiles(self, monkeypatch):
+        """F5/P4: the lazy (schema-cache) server config carries the
+        command/credentials/trust used for the first-use connect. It is
+        keyed by (profile home, server name) — profile B must NOT see or
+        consume profile A's lazy config for a same-named server, or B's
+        first call would spawn/connect using A's command/credentials."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+
+        # Profile A registers the lazy entry for 'srv' (schema-cache path).
+        key_a = mcp_tool._mcp_scope_key("srv")
+        assert key_a == ("profile-A", "srv")
+        mcp_tool._lazy_server_configs[key_a] = {
+            "command": "node",
+            "args": ["/a/server.js"],
+            "env": {"API_KEY": "profile-A-secret"},
+        }
+        mcp_tool._lazy_server_fingerprints[key_a] = "fp-a"
+        mcp_tool._lazy_server_tool_names[key_a] = ["srv_util"]
+
+        # Profile B, same server name: its scope key differs, so the lazy
+        # config, fingerprint and tool-name entries are all absent.
+        homes["current"] = "profile-B"
+        key_b = mcp_tool._mcp_scope_key("srv")
+        assert key_b == ("profile-B", "srv")
+        assert key_b not in mcp_tool._lazy_server_configs, (
+            "profile B must not inherit profile A's lazy config (F5)"
+        )
+        assert mcp_tool._lazy_server_configs.get(key_b) is None
+        assert mcp_tool._lazy_server_fingerprints.get(key_b) is None
+        assert mcp_tool._lazy_server_tool_names.get(key_b) is None
+
+        # The is_lazy check (first-use connect trigger) is scoped too.
+        assert mcp_tool._mcp_scope_key("srv") not in mcp_tool._lazy_server_configs
+
+        # Profile A's entry remains intact under its own scope.
+        homes["current"] = "profile-A"
+        assert mcp_tool._lazy_server_configs[key_a]["env"]["API_KEY"] == (
+            "profile-A-secret"
+        )
+        assert mcp_tool._lazy_server_tool_names[key_a] == ["srv_util"]

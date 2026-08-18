@@ -4216,11 +4216,15 @@ _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 # Lazy MCP startup (#56832): servers whose tools were registered from the
-# on-disk schema cache without spawning/connecting. Keyed by server name;
-# entries are popped once a real connection is established on first use.
-_lazy_server_configs: Dict[str, dict] = {}
-_lazy_server_fingerprints: Dict[str, str] = {}
-_lazy_server_tool_names: Dict[str, List[str]] = {}
+# on-disk schema cache without spawning/connecting. Keyed by the SAME
+# (profile home, server name) scope key as trust/ownership (F5/P4): the
+# lazy config carries the command/credentials/trust for the first-use
+# connect, so a second profile with a same-named server must never consume
+# the first profile's config. Entries are popped once a real connection is
+# established on first use.
+_lazy_server_configs: Dict[tuple, dict] = {}
+_lazy_server_fingerprints: Dict[tuple, str] = {}
+_lazy_server_tool_names: Dict[tuple, List[str]] = {}
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -5725,7 +5729,7 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
                 server_name, _server_home.get(server_name, "?"),
             )
             return False
-        config = _lazy_server_configs.get(server_name)
+        config = _lazy_server_configs.get(_mcp_scope_key(server_name))
         if not config:
             return False
         if _connect_cooldown_active(server_name):
@@ -5758,9 +5762,10 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     with _lock:
         _server_connecting.discard(server_name)
         _clear_connect_failure(server_name)
-        _lazy_server_configs.pop(server_name, None)
-        stale_fingerprint = _lazy_server_fingerprints.pop(server_name, None)
-        cached_names = _lazy_server_tool_names.pop(server_name, None) or []
+        _scope_key = _mcp_scope_key(server_name)
+        _lazy_server_configs.pop(_scope_key, None)
+        stale_fingerprint = _lazy_server_fingerprints.pop(_scope_key, None)
+        cached_names = _lazy_server_tool_names.pop(_scope_key, None) or []
         server = _servers.get(server_name)
         live_names = set(
             getattr(server, "_registered_tool_names", []) or []
@@ -5793,7 +5798,7 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     """
     with _lock:
         server = _servers.get(server_name)
-        is_lazy = server_name in _lazy_server_configs
+        is_lazy = _mcp_scope_key(server_name) in _lazy_server_configs
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
         with _lock:
@@ -6337,8 +6342,10 @@ def _make_check_fn(server_name: str):
             ):
                 return True
             # Lazy (schema-cache registered) servers are available: the
-            # first real call spawns/connects them (#56832).
-            return server_name in _lazy_server_configs
+            # first real call spawns/connects them (#56832). Scoped by
+            # (profile home, server name) so a same-named server in another
+            # profile does not appear available here (F5).
+            return _mcp_scope_key(server_name) in _lazy_server_configs
 
     return _check
 
@@ -6806,11 +6813,13 @@ def _existing_tool_names() -> List[str]:
             schema = _convert_mcp_schema(server.name, mcp_tool)
             names.append(schema["name"])
     # Lazy servers registered from the schema cache have no MCPServerTask
-    # yet — their tools live in the registry only (#56832).
+    # yet — their tools live in the registry only (#56832). Keys are
+    # (profile home, server name) scope keys (F5); filter by the server
+    # name part.
     with _lock:
         lazy_names = [
             n
-            for sname, tool_names in _lazy_server_tool_names.items()
+            for (_scope_home, sname), tool_names in _lazy_server_tool_names.items()
             if sname not in _servers
             for n in tool_names
         ]
@@ -7216,9 +7225,10 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     if registered_names:
         registry.register_toolset_alias(name, toolset_name)
         with _lock:
-            _lazy_server_configs[name] = dict(config)
-            _lazy_server_fingerprints[name] = fingerprint
-            _lazy_server_tool_names[name] = list(registered_names)
+            _scope_key = _mcp_scope_key(name)
+            _lazy_server_configs[_scope_key] = dict(config)
+            _lazy_server_fingerprints[_scope_key] = fingerprint
+            _lazy_server_tool_names[_scope_key] = list(registered_names)
         logger.info(
             "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
             name, len(registered_names),
@@ -7329,7 +7339,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             and k not in connecting
             # Servers already lazily registered from the schema cache are
             # not re-registered; they connect on first tool use (#56832).
-            and k not in _lazy_server_configs
+            # Scoped by (profile home, server name): a same-named server
+            # lazily registered under ANOTHER home is a different server
+            # and must be registered here (F5).
+            and _mcp_scope_key(k) not in _lazy_server_configs
             and _parse_boolish(v.get("enabled", True), default=True)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
