@@ -673,6 +673,17 @@ _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
 # degrades, with the loop stalled far under the watchdog's probe window.
 _DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
 
+# How long a *write* caller (save_goal) waits for the inflight bootstrap
+# before degrading to a dropped write. Reads keep the tight loop window —
+# a slow load merely reports "no goal yet" — but a dropped save is silent
+# data loss: /goal already answered "Goal set" from in-memory state while
+# the row never lands (#89175). A cold-disk fresh-DB init (schema + FTS
+# DDL) can take seconds on slow runners, so the write path waits once for
+# durability. Still bounded far below the loop-liveness watchdog (10s
+# probe timeout, 3 strikes) so a wedged init degrades instead of
+# crash-looping the gateway.
+_DB_BOOTSTRAP_WRITE_WAIT_S = 5.0
+
 
 def _bootstrap_session_db(home: str, done: threading.Event) -> None:
     """Construct SessionDB off-loop and populate the cache (worker thread)."""
@@ -690,7 +701,7 @@ def _bootstrap_session_db(home: str, done: threading.Event) -> None:
     done.set()
 
 
-def _get_session_db() -> Optional[Any]:
+def _get_session_db(loop_wait_s: Optional[float] = None) -> Optional[Any]:
     """Return a SessionDB instance for the current HERMES_HOME.
 
     SessionDB has no built-in singleton, but opening a new connection per
@@ -707,6 +718,10 @@ def _get_session_db() -> Optional[Any]:
     loop we kick a one-shot background bootstrap and return None; every
     caller already degrades gracefully on None, and a later call returns the
     cached instance.
+
+    ``loop_wait_s`` overrides the loop-thread grace window for durability
+    callers (save_goal): a dropped write is silent data loss, so it waits
+    the longer one-shot write window instead (#89175).
     """
     try:
         from hermes_constants import get_hermes_home
@@ -750,7 +765,9 @@ def _get_session_db() -> Optional[Any]:
         # loop-thread call instead of silently dropping it. A contended init
         # (the crash-loop scenario) exceeds the window and we degrade to
         # None — a bounded stall far below the watchdog's probe timeout.
-        done.wait(_DB_BOOTSTRAP_LOOP_WAIT_S)
+        done.wait(
+            _DB_BOOTSTRAP_LOOP_WAIT_S if loop_wait_s is None else loop_wait_s
+        )
         return _DB_CACHE.get(home)
 
     try:
@@ -797,13 +814,21 @@ def save_goal(session_id: str, state: GoalState) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
-    db = _get_session_db()
+    db = _get_session_db(loop_wait_s=_DB_BOOTSTRAP_WRITE_WAIT_S)
     if db is None:
+        # A dropped save is silent data loss: /goal already answered
+        # "Goal set" from in-memory state while the row never lands, so
+        # surface the drop instead of swallowing it at DEBUG (#89175).
+        logger.warning(
+            "GoalManager: goal write for %s dropped — session DB still "
+            "unavailable after the bootstrap write wait",
+            session_id,
+        )
         return
     try:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
-        logger.debug("GoalManager: set_meta failed: %s", exc)
+        logger.warning("GoalManager: set_meta failed: %s", exc)
 
 
 def clear_goal(session_id: str) -> None:

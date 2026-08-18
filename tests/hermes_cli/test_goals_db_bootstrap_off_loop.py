@@ -136,3 +136,99 @@ def test_slow_construction_does_not_block_the_loop(monkeypatch):
     assert elapsed is not None and elapsed < 1.0, (
         f"loop-thread call blocked for {elapsed:.2f}s — watchdog territory"
     )
+
+
+class _SlowThenReadyDB:
+    """Stands in for a cold-disk SessionDB: init (schema + FTS DDL) is slow
+    but healthy — finishes well past the 0.25s read window, well inside the
+    write window. Records set_meta writes."""
+
+    writes: dict = {}
+
+    def __init__(self):
+        time.sleep(0.6)
+
+    def get_meta(self, key):
+        return self.writes.get(key)
+
+    def set_meta(self, key, value):
+        self.writes[key] = value
+
+
+def test_save_goal_waits_out_slow_bootstrap(monkeypatch):
+    """A slow-but-healthy cold init must not drop the first /goal write
+    (#89175): save_goal waits the one-shot write window for durability, so
+    the row lands even when init exceeds the read grace window."""
+    import hermes_state
+
+    _SlowThenReadyDB.writes = {}
+    monkeypatch.setattr(hermes_state, "SessionDB", _SlowThenReadyDB)
+    persisted = []
+
+    async def main():
+        state = goals.GoalState(goal="ship it", max_turns=7)
+        goals.save_goal("sess-89175", state)
+
+    asyncio.run(main())
+    db = next(iter(goals._DB_CACHE.values()), None)
+    assert db is not None, "background bootstrap never populated the cache"
+    persisted = db.writes.get("goal:sess-89175")
+    assert persisted, (
+        "first /goal write was dropped: bootstrap exceeded the wait window"
+    )
+    assert '"ship it"' in persisted
+
+
+def test_load_goal_keeps_tight_loop_window(monkeypatch):
+    """Reads keep the 0.25s grace window: a slow init degrades load_goal to
+    None quickly instead of stalling the loop thread (#89175)."""
+    import hermes_state
+
+    _SlowThenReadyDB.writes = {}
+    monkeypatch.setattr(hermes_state, "SessionDB", _SlowThenReadyDB)
+    elapsed = None
+    result = "UNSET"
+
+    async def main():
+        nonlocal elapsed, result
+        t0 = time.monotonic()
+        result = goals.load_goal("sess-89175")
+        elapsed = time.monotonic() - t0
+
+    asyncio.run(main())
+    assert result is None, "slow init must not fabricate a goal for reads"
+    assert elapsed is not None and elapsed < 0.5, (
+        f"read path blocked for {elapsed:.2f}s — reads must keep the tight window"
+    )
+
+
+def test_save_goal_drop_warns_after_write_wait(monkeypatch, caplog):
+    """When even the write window expires (wedged init), the dropped write
+    is surfaced at WARNING instead of vanishing below DEBUG (#89175)."""
+    import hermes_state
+
+    class _NeverReadyDB:
+        def __init__(self):
+            time.sleep(30.0)  # wedged far past any wait
+
+        def get_meta(self, key):
+            return None
+
+    monkeypatch.setattr(hermes_state, "SessionDB", _NeverReadyDB)
+    monkeypatch.setattr(goals, "_DB_BOOTSTRAP_WRITE_WAIT_S", 0.15)
+    wrote = []
+
+    async def main():
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.goals"):
+            state = goals.GoalState(goal="later", max_turns=3)
+            t0 = time.monotonic()
+            goals.save_goal("sess-wedged", state)
+            wrote.append(time.monotonic() - t0)
+
+    asyncio.run(main())
+    assert wrote and wrote[0] < 1.0, "write wait must stay bounded"
+    assert any(
+        "dropped" in rec.message for rec in caplog.records
+    ), "dropped goal write must log at WARNING"
