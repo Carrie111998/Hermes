@@ -164,7 +164,9 @@ def test_purge_rejects_uncovered_child_and_preserves_foreign_key_rows(
 
         assert db.get_session("root") is not None
         assert db.get_session("terminal") is not None
-        assert db.get_session("branch")["parent_session_id"] == "root"
+        branch = db.get_session("branch")
+        assert branch is not None
+        assert branch["parent_session_id"] == "root"
     finally:
         db.close()
 
