@@ -20,6 +20,9 @@ import { Input } from '@/components/ui/input'
 import { PaneStripGlyph } from '@/components/ui/pane-tab'
 import { useI18n } from '@/i18n'
 
+import { type ViewportMode } from './preview-viewport'
+import { PreviewViewportControl } from './preview-viewport-control'
+
 interface PreviewBrowserBarProps {
   canGoBack: boolean
   canGoForward: boolean
@@ -32,9 +35,11 @@ interface PreviewBrowserBarProps {
   onReload: () => void
   onToggleConsole: () => void
   onToggleDevTools: () => void
+  onViewportChange: (next: ViewportMode) => void
   /** The page's CURRENT address (it moves as the user navigates), not the
    *  target the tab was opened with. */
   url: string
+  viewport: ViewportMode
 }
 
 /**
@@ -94,7 +99,9 @@ export function PreviewBrowserBar({
   onReload,
   onToggleConsole,
   onToggleDevTools,
-  url
+  onViewportChange,
+  url,
+  viewport
 }: PreviewBrowserBarProps) {
   const { t } = useI18n()
   const copy = t.preview.web
@@ -161,6 +168,7 @@ export function PreviewBrowserBar({
         spellCheck={false}
         value={draft ?? url}
       />
+      <PreviewViewportControl mode={viewport} onModeChange={onViewportChange} />
       <PaneStripGlyph
         active={consoleOpen}
         icon={<Codicon name="terminal" size="0.8125rem" />}
