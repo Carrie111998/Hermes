@@ -42,6 +42,13 @@ DEFAULT_CONFIG = {
         # behavior everywhere.
         "terminal_continue": True,
     },
+    "resume": {
+        # When true (default), resuming a session (--resume, -c, /resume)
+        # restores the model that was active in that session unless an
+        # explicit --model flag was passed on the CLI. When false, resume
+        # leaves the current config.yaml default model active.
+        "restore_model": True,
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
