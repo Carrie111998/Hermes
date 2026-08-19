@@ -16,6 +16,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
@@ -878,6 +879,12 @@ class SessionBridgeStore:
         self._hermes_profile_db_paths = (
             hermes_profile_db_paths or self._discover_hermes_profile_db_paths
         )
+        # Reused read-only handles on the other profiles' databases, keyed by
+        # resolved path -> (database, file identity, opened_at).
+        self._profile_db_cache: dict[
+            str, tuple[SessionDB, tuple[int, int], float]
+        ] = {}
+        self._profile_db_lock = threading.Lock()
 
     def enqueue_claude_visibility_job(
         self,
@@ -3177,27 +3184,86 @@ class SessionBridgeStore:
             if entry.is_dir() and (entry / "state.db").is_file()
         )
 
+    # How long a cached profile handle may live before it is reopened. The
+    # handle is only closed and rebuilt on the next use, which hands any
+    # offline maintenance a periodic window to swap that profile's database
+    # file underneath us (Windows refuses os.replace while a reader holds it).
+    _PROFILE_DB_MAX_AGE_S = 30.0
+
+    def _acquire_profile_database(self, path: Path, key: str) -> SessionDB | None:
+        """Return a read-only handle for *path*, reusing an open one.
+
+        Opening a SessionDB is not cheap: the first statement on a fresh
+        connection makes SQLite parse the entire schema, and this ran for
+        every profile on every call. Measured 2026-08-18: 18 profile
+        databases, one of them 1.7 GB, re-opened and closed on each of seven
+        call sites -- ~51% of the bridge's wall time landed in this path.
+
+        A handle is discarded when the file's identity changes (a VACUUM swap
+        replaces the file, so the old handle would serve stale bytes) or when
+        it exceeds ``_PROFILE_DB_MAX_AGE_S``.
+        """
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        identity = (int(stat.st_dev), int(stat.st_ino))
+        now = time.monotonic()
+        with self._profile_db_lock:
+            cached = self._profile_db_cache.get(key)
+            if cached is not None:
+                database, cached_identity, opened_at = cached
+                if (
+                    cached_identity == identity
+                    and (now - opened_at) < self._PROFILE_DB_MAX_AGE_S
+                ):
+                    return database
+                # Retire by DROPPING the reference, never by closing it here:
+                # a sibling worker thread may be mid-query on this handle, and
+                # closing it under them raises ProgrammingError. Refcounting
+                # closes the connection once the last user lets go.
+                self._profile_db_cache.pop(key, None)
+            try:
+                database = SessionDB(path, read_only=True)
+            except Exception:
+                return None
+            self._install_profile_read_compatibility(database)
+            self._profile_db_cache[key] = (database, identity, now)
+            return database
+
+    def close_profile_databases(self) -> None:
+        """Release every cached cross-profile handle. Never raises."""
+        with self._profile_db_lock:
+            entries = list(self._profile_db_cache.values())
+            self._profile_db_cache.clear()
+        for database, _identity, _opened_at in entries:
+            try:
+                database.close()
+            except Exception:
+                pass
+
     @contextmanager
     def _native_hermes_databases(self):
         databases: list[tuple[str, SessionDB, bool]] = [("default", self.db, False)]
         seen = {str(self.db.db_path.resolve()).casefold()}
-        try:
-            for profile, raw_path in self._hermes_profile_db_paths():
-                if not isinstance(profile, str) or not profile.strip():
-                    raise ValueError("Hermes profile name must be nonempty")
-                path = Path(raw_path)
-                key = str(path.resolve()).casefold()
-                if key in seen or not path.is_file():
-                    continue
-                seen.add(key)
-                database = SessionDB(path, read_only=True)
-                self._install_profile_read_compatibility(database)
-                databases.append((profile.strip(), database, True))
-            yield databases
-        finally:
-            for _profile, database, owned in databases:
-                if owned:
-                    database.close()
+        for profile, raw_path in self._hermes_profile_db_paths():
+            if not isinstance(profile, str) or not profile.strip():
+                raise ValueError("Hermes profile name must be nonempty")
+            path = Path(raw_path)
+            key = str(path.resolve()).casefold()
+            if key in seen or not path.is_file():
+                continue
+            seen.add(key)
+            database = self._acquire_profile_database(path, key)
+            if database is None:
+                continue
+            # The third element is a PROVENANCE marker -- "a foreign profile
+            # database, not our own" -- which consumers branch on (e.g.
+            # _list_profile_sidebar_sources skips `not owned`). It is not a
+            # lifetime flag: the cache owns these handles now and this context
+            # manager deliberately no longer closes them.
+            databases.append((profile.strip(), database, True))
+        yield databases
 
     @staticmethod
     def _install_profile_read_compatibility(database: SessionDB) -> None:

@@ -1247,6 +1247,66 @@ async def test_restart_mid_import_resumes_without_duplicate_catalog_rows(
         restarted_db.close()
 
 
+def test_profile_databases_are_opened_once_not_per_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-profile reads must reuse their SessionDB handles.
+
+    _native_hermes_databases constructed a fresh read-only SessionDB for
+    EVERY Hermes profile on EVERY call, then closed them all again. The
+    first statement on a fresh connection forces SQLite to parse the whole
+    schema, so the cost is per-open, not per-row.
+
+    Live bridge 2026-08-18: 18 profile databases (one of them 1.7 GB), and
+    seven call sites drive this -- list_sidebar_candidates alone runs it on
+    every sidebar refresh. py-spy attributed ~51% of process wall time to
+    _list_profile_sidebar_sources + list_sidebar_candidates +
+    _fts_table_probe, the last of which is inside SessionDB.__init__.
+    """
+    from session_bridge import store as store_module
+
+    root = tmp_path / "state.db"
+    root_db = SessionDB(db_path=root)
+    profiles = tmp_path / "profiles"
+    for name in ("alpha", "beta"):
+        profile_dir = profiles / name
+        profile_dir.mkdir(parents=True)
+        SessionDB(db_path=profile_dir / "state.db").close()
+
+    opens: list[str] = []
+    real_cls = store_module.SessionDB
+
+    class _CountingSessionDB(real_cls):  # type: ignore[misc,valid-type]
+        def __init__(self, db_path=None, read_only=False):
+            opens.append(str(db_path))
+            super().__init__(db_path, read_only=read_only)
+
+    monkeypatch.setattr(store_module, "SessionDB", _CountingSessionDB)
+
+    try:
+        store = SessionBridgeStore(root_db, clock=lambda: 1_000.0)
+        with store._native_hermes_databases() as first:
+            first_names = {name for name, _db, _owned in first}
+        after_first = len(opens)
+        with store._native_hermes_databases() as second:
+            second_names = {name for name, _db, _owned in second}
+        after_second = len(opens)
+    finally:
+        closer = getattr(store, "close_profile_databases", None)
+        if callable(closer):
+            closer()
+        root_db.close()
+
+    assert {"alpha", "beta"} <= first_names, "fixture must expose both profiles"
+    assert first_names == second_names, "the same profiles must be visible again"
+    assert after_first >= 2, f"fixture must open the profiles at least once ({opens})"
+    assert after_second == after_first, (
+        f"second call re-opened {after_second - after_first} profile database(s) "
+        f"that were already open ({opens[after_first:]}); handles must be reused"
+    )
+
+
 @pytest.mark.asyncio
 async def test_scan_stats_each_transcript_at_most_once(
     tmp_path: Path,
