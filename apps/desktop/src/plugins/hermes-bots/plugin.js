@@ -7446,13 +7446,19 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   })
 }
 
+/** Which bot the Routines tile should scope to. $selectedBot already tracks
+ *  the live gateway profile (see the host.state.profile listener that keeps
+ *  it in sync) plus roster clicks, so it is current the instant a bot is
+ *  clicked; the raw gateway profile is only a fallback before any selection
+ *  has landed. */
+function resolveRoutinesBot(selected, gatewayProfile) {
+  return (selected || gatewayProfile || 'default').trim() || 'default'
+}
+
 function RoutinesPane() {
   const selected = useValue($selectedBot)
   const gatewayProfile = useValue(host.state.profile)
-  // The tile maps to the bot you're chatting with: the live gateway profile
-  // is the truth once a chat opens; $selectedBot covers the gap between a
-  // roster click and the profile swap landing.
-  const bot = (gatewayProfile || selected || 'default').trim() || 'default'
+  const bot = resolveRoutinesBot(selected, gatewayProfile)
   const meta = useValue($botMeta)[bot]
   const { shape, color, image } = botAppearance(bot, meta)
   const { data, error, isLoading, refetch } = useRoutines(bot)
