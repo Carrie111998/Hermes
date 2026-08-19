@@ -558,6 +558,24 @@ def register(ctx):
     ctx.state.set("cursor", {"page": cursor["page"] + 1})
 ```
 
+State is cloned by `hermes profile create --clone-all` unless the plugin
+declares that its entire namespace is bound to the current profile's identity.
+Declare that policy before writing credentials or other identity-bound state:
+
+```python
+def register(ctx):
+    ctx.state.declare_identity_bound()
+    ctx.state.set("credential_binding", provision_for_this_profile())
+```
+
+The declaration is a durable marker in that plugin's profile-local data
+directory, so clone creation can enforce it without importing plugin code. A
+declared namespace is absent from a `--clone-all` destination; undeclared
+namespaces retain the default full-copy behavior. If Hermes cannot verify a
+marker because of a filesystem error, it fails open and copies the namespace
+instead of risking data loss. Fresh profiles and ordinary `--clone` copies do
+not copy plugin state, as before.
+
 State is profile-scoped, atomically replaced, safe across concurrent writers,
 and limited to 10 MiB per plugin. Portable packages share the same directory as
 their `PLUGIN_DATA`; native plugins receive a collision-resistant,

@@ -34,6 +34,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli.plugin_state_policy import namespace_declares_identity_bound_state
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
 def _clone_all_copytree_ignore(source_dir: Path):
     """Exclude infrastructure artifacts when cloning a profile via --clone-all.
 
-    Three categories:
+    Four categories:
       1. Root-level entries in ``_CLONE_ALL_HISTORY_EXCLUDE_ROOT`` — session
          history, backups, and snapshots that belong to the SOURCE profile
          and should never carry into a fresh clone.  Applies to any source.
@@ -161,6 +162,9 @@ def _clone_all_copytree_ignore(source_dir: Path):
       3. Universal exclusions at any depth — Python bytecode caches that
          are stale or regenerable (``__pycache__``, ``*.pyc``, ``*.pyo``)
          and runtime sockets / temp files (``*.sock``, ``*.tmp``).
+      4. Immediate namespaces under ``plugin-data/`` whose owning plugin has
+         durably declared its state identity-bound through ``PluginState``.
+         Marker probe failures fail open so uncertain state is copied.
 
     The export-side ignore (``_default_export_ignore``) uses the same
     two-tier pattern with the broader ``_DEFAULT_EXPORT_EXCLUDE_ROOT`` set
@@ -169,9 +173,20 @@ def _clone_all_copytree_ignore(source_dir: Path):
     """
     source_resolved = source_dir.resolve()
     is_default_source = source_resolved == _get_default_hermes_home().resolve()
+    plugin_data_resolved = source_resolved / "plugin-data"
 
     def _ignore(directory: str, names: List[str]) -> List[str]:
         ignored: list[str] = []
+        try:
+            directory_resolved = Path(directory).resolve()
+            at_root = directory_resolved == source_resolved
+            at_plugin_data_root = directory_resolved == plugin_data_resolved
+        except (OSError, ValueError):
+            # ``resolve()`` can fail on unusual FS layouts (broken symlinks,
+            # missing parents). Fail open — better to over-copy than silently
+            # drop user data.
+            at_root = False
+            at_plugin_data_root = False
         for entry in names:
             # Universal exclusions at any depth.
             if (
@@ -180,13 +195,6 @@ def _clone_all_copytree_ignore(source_dir: Path):
             ):
                 ignored.append(entry)
                 continue
-            try:
-                at_root = Path(directory).resolve() == source_resolved
-            except (OSError, ValueError):
-                # ``resolve()`` can fail on unusual FS layouts (broken
-                # symlinks, missing parents).  Fail open — better to
-                # over-copy than silently drop user data.
-                at_root = False
             if at_root:
                 # History artifacts: excluded for ANY source profile.
                 if entry in _CLONE_ALL_HISTORY_EXCLUDE_ROOT:
@@ -195,6 +203,11 @@ def _clone_all_copytree_ignore(source_dir: Path):
                 # Infrastructure: only the default profile contains these.
                 if is_default_source and entry in _CLONE_ALL_DEFAULT_EXCLUDE_ROOT:
                     ignored.append(entry)
+                    continue
+            if at_plugin_data_root and namespace_declares_identity_bound_state(
+                Path(directory) / entry
+            ):
+                ignored.append(entry)
         return ignored
 
     return _ignore
