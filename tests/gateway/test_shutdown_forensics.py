@@ -8,6 +8,8 @@ import signal
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import mock_open, patch
 
 import pytest
 
@@ -133,6 +135,33 @@ class TestParseSystemdDuration:
 # ---------------------------------------------------------------------------
 
 class TestCheckSystemdTimingAlignment:
+
+    def test_system_slice_queries_system_manager_before_user_default(self, monkeypatch):
+        """A system service must not read a synthetic user-manager timeout."""
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        calls = []
+
+        def fake_run(command, **_kwargs):
+            calls.append(command)
+            if "--user" in command:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout="TimeoutStopUSec=3min 30s\nLoadState=loaded\n",
+            )
+
+        cgroup = "0::/system.slice/hermes-gateway.service\n"
+        with patch("builtins.open", mock_open(read_data=cgroup)), \
+             patch("subprocess.run", side_effect=fake_run):
+            result = sf.check_systemd_timing_alignment(180.0)
+
+        assert result is not None
+        assert result["timeout_stop_sec"] == 210.0
+        assert result["mismatch"] is False
+        assert "--user" not in calls[0]
 
     def test_returns_none_when_unit_undeterminable(self, monkeypatch):
         monkeypatch.setenv("INVOCATION_ID", "abc")

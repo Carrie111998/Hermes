@@ -342,12 +342,14 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
 
     # Try to identify our unit name and ask systemctl for its config.
     unit_name: Optional[str] = None
+    under_user_manager = False
     try:
         # /proc/self/cgroup gives us "0::/user.slice/.../hermes-gateway.service"
         with open("/proc/self/cgroup", encoding="utf-8") as fh:
             for line in fh:
                 # systemd cgroup line ends with the unit name
                 if ".service" in line:
+                    under_user_manager = "user.slice" in line
                     parts = line.strip().split("/")
                     for p in reversed(parts):
                         if p.endswith(".service"):
@@ -360,22 +362,31 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
     if not unit_name:
         return None
 
-    # Query systemctl for TimeoutStopUSec.  Use --user OR system depending
-    # on which manager actually owns the unit.  Try user first since
-    # that's the common case for hermes.
+    # Query the manager that owns our cgroup first.  ``systemctl --user show``
+    # returns synthetic defaults even when the unit is not found, so blindly
+    # preferring the user manager can turn a healthy 210s system unit into a
+    # false 90s mismatch warning.
     timeout_us: Optional[int] = None
-    for flag in (["--user"], []):
+    manager_flags = (["--user"], []) if under_user_manager else ([], ["--user"])
+    for flag in manager_flags:
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                [
+                    "systemctl", *flag, "show", unit_name,
+                    "--property=LoadState", "--property=TimeoutStopUSec",
+                ],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode != 0:
             continue
-        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        load_state: Optional[str] = None
+        # Output includes ``LoadState=loaded`` plus
+        # "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000".
         for line in result.stdout.splitlines():
+            if line.startswith("LoadState="):
+                load_state = line.split("=", 1)[1].strip()
             if line.startswith("TimeoutStopUSec="):
                 value = line.split("=", 1)[1].strip()
                 # Try numeric microseconds first
@@ -383,8 +394,9 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
                     timeout_us = int(value)
                 else:
                     timeout_us = _parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    break
+        if load_state != "loaded":
+            timeout_us = None
+            continue
         if timeout_us is not None:
             break
 
