@@ -2508,6 +2508,31 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
+def _record_fallback_on_session(agent) -> None:
+    """Flag the live session row as fallback-served. Best effort.
+
+    A fallback swap is a recovery path: it must never be aborted by a
+    bookkeeping write, hence the blanket except. When the session row does not
+    exist yet (it is created lazily on the first turn, which can be the very
+    turn that fell back), the UPDATE is a no-op and ``_ensure_db_session``
+    re-applies the flag right after it inserts the row.
+    """
+    try:
+        db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None)
+        if db is None or not session_id:
+            return
+        db.record_session_fallback(
+            session_id,
+            requested_model=getattr(agent, "origin_requested_model", "") or None,
+            requested_provider=(
+                getattr(agent, "origin_requested_provider", "") or None
+            ),
+        )
+    except Exception:
+        logger.debug("Could not record fallback on the session row", exc_info=True)
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -2958,6 +2983,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         notice = (
             f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
             f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
+        )
+        # Persist the swap on the session row. The buffered/pending notices
+        # below are terminal-only and are swallowed whole by quiet one-shot and
+        # gateway surfaces (suppress_status_output short-circuits _vprint even
+        # for force=True), so without this write a silent fallback leaves no
+        # trace anywhere: the row ends up naming the served model as if it had
+        # been the one requested.
+        _record_fallback_on_session(agent)
+        # The buffered line above is dropped on successful recovery, but a
+        # provider/model switch is a durable state change operators must see
+        # even when the fallback succeeds.  Record a one-shot notice that the
+        # success path surfaces exactly once via _emit_pending_fallback_notice
+        # (see run_agent.py); it is discarded on terminal failure since the
+        # buffered line is flushed instead.  See fallback-observability fix.
+        agent._pending_fallback_notice = (
+            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+            f"→ {fb_model} via {fb_provider}"
         )
         # The buffered switch is surfaced on terminal failure. A successful
         # fallback clears retry chatter, so retain every switch as a durable
