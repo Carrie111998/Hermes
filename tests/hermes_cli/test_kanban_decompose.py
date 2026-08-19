@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -161,3 +162,202 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_same_lineage_constraint_refuses_before_llm(kanban_home):
+    """A durable operator constraint gates the real entrypoint before inference."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="keep this task whole", triage=True)
+        kb.set_decomposition_constraint(
+            conn,
+            tid,
+            constraint=kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+            reason="operator approved no decomposition",
+        )
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+
+    assert outcome.ok is False
+    assert "SAME-LINEAGE" in outcome.reason
+    call_llm.assert_not_called()
+
+
+def test_manual_author_spoof_cannot_bypass_and_refusal_audit_is_idempotent(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="whole", triage=True)
+        kb.set_decomposition_constraint(
+            conn, tid, constraint=kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+            reason="keep lineage",
+        )
+
+    for author in ("operator", "root", "auto-decomposer"):
+        assert not decomp.decompose_task(tid, author=author).ok
+
+    with kb.connect_closing() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'decomposition_refused'", (tid,),
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_direct_manual_graph_write_cannot_bypass_constraint(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="whole", triage=True)
+        kb.set_decomposition_constraint(
+            conn, tid, constraint=kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+            reason="keep lineage",
+        )
+        with pytest.raises(RuntimeError, match="SAME-LINEAGE"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="operator",
+                children=[{"title": "bypass", "parents": []}],
+                author="operator",
+            )
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+@pytest.mark.parametrize("payload", [None, "not-json", '{"version":1}'])
+def test_malformed_typed_constraint_events_fail_closed_before_llm(kanban_home, payload):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="whole", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', ?, 1)", (tid, payload),
+            )
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid)
+    assert not outcome.ok
+    assert "malformed or ambiguous" in outcome.reason
+    call_llm.assert_not_called()
+
+
+def test_ambiguous_typed_constraints_fail_closed(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="whole", triage=True)
+        payload = jsonlib.dumps({
+            "version": 1,
+            "constraint": kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+            "reason": "duplicate",
+        })
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', ?, 1)", (tid, payload),
+            )
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', ?, 2)", (tid, payload),
+            )
+    assert not decomp.decompose_task(tid).ok
+
+
+@pytest.mark.parametrize("fanout", [False, True])
+def test_policy_cursor_change_invalidates_respec_and_fanout_writes(
+    kanban_home, fanout
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="race", triage=True)
+    payload = ({
+        "fanout": True,
+        "tasks": [{"title": "child", "body": "x", "assignee": "orchestrator", "parents": []}],
+    } if fanout else {"fanout": False, "title": "changed", "body": "changed"})
+
+    def race_policy(*args, **kwargs):
+        with kb.connect_closing() as conn:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                    "VALUES (?, 'decomposition_constraint_set', ?, 1)",
+                    (tid, jsonlib.dumps({
+                        "version": 1,
+                        "constraint": kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+                        "reason": "arrived during inference",
+                    })),
+                )
+        return _fake_aux_response(jsonlib.dumps(payload))
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=race_policy):
+            outcome = decomp.decompose_task(tid)
+    finally:
+        for p in patches:
+            p.stop()
+    assert not outcome.ok
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_decomposition_reservations WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
+
+
+def test_reserve_vs_constraint_set_has_exactly_one_winner(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="linearize", triage=True)
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def reserve():
+        with kb.connect_closing() as conn:
+            barrier.wait()
+            outcomes.append(("reserve", kb.reserve_decomposition(conn, tid)))
+
+    def constrain():
+        with kb.connect_closing() as conn:
+            barrier.wait()
+            try:
+                kb.set_decomposition_constraint(
+                    conn, tid,
+                    constraint=kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+                    reason="race",
+                )
+            except RuntimeError:
+                outcomes.append(("constraint", False))
+            else:
+                outcomes.append(("constraint", True))
+
+    threads = [threading.Thread(target=reserve), threading.Thread(target=constrain)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    reserve_result = next(value for kind, value in outcomes if kind == "reserve")
+    constraint_result = next(value for kind, value in outcomes if kind == "constraint")
+    assert int(reserve_result.ok) + int(constraint_result) == 1
+
+
+def test_crash_reservation_fails_closed_until_bounded_audited_recovery(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="crashed decomposer", triage=True)
+        reservation = kb.reserve_decomposition(conn, tid)
+        assert reservation.ok
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_decomposition_reservations SET reserved_at = 1 "
+                "WHERE task_id = ?", (tid,),
+            )
+
+    blocked = decomp.decompose_task(tid)
+    assert not blocked.ok
+    assert "already reserved" in blocked.reason
+
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="between"):
+            kb.recover_stale_decomposition_reservation(
+                conn, tid, older_than_seconds=0, reason="unsafe",
+            )
+        assert kb.recover_stale_decomposition_reservation(
+            conn, tid, older_than_seconds=60, reason="operator verified crash",
+        )
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'decomposition_reservation_recovered'", (tid,),
+        ).fetchone()
+        assert jsonlib.loads(event["payload"])["reason"] == "operator verified crash"

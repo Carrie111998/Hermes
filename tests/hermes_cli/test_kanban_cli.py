@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_decompose as decomp
 
 
 @pytest.fixture
@@ -68,6 +69,35 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert f"Task {child_id}: child task" in output
     assert f"parents:   {parent_id}" in output
     assert "Cannot operate on a closed database" not in output
+
+
+def test_constraint_cli_sets_supersedes_and_rejects_delegated_producers(
+    kanban_home, monkeypatch
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="operator guarded", triage=True)
+
+    set_output = kc.run_slash(
+        f"constraint set {tid} same-lineage --reason 'approved guard'"
+    )
+    assert "SAME-LINEAGE" in set_output
+    assert not decomp.decompose_task(tid, author="operator").ok
+
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    delegated_set = kc.run_slash(
+        f"constraint set {tid} same-lineage --reason spoof"
+    )
+    delegated_remove = kc.run_slash(
+        f"constraint supersede {tid} same-lineage --reason spoof"
+    )
+    assert "delegate_task child contexts cannot mutate" in delegated_set
+    assert "delegate_task child contexts cannot mutate" in delegated_remove
+
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
+    removed = kc.run_slash(
+        f"constraint supersede {tid} same-lineage --reason 'operator release'"
+    )
+    assert "superseded" in removed.lower()
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
@@ -177,5 +207,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
-
