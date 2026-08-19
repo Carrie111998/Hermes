@@ -156,6 +156,14 @@ DEFAULT_CONFIG = {
         # api_modes — fixes the Gemini/Claude "stops after stating intent" case),
         # false (never), or a list of model-name substrings to match.
         "intent_ack_continuation": "auto",
+        # Optional additive literal phrases for intent-ack detection. These let
+        # users teach the runtime model- or language-specific wording without
+        # replacing the built-in English vocabulary.
+        "intent_ack_vocabulary": {
+            "future_ack_markers": [],
+            "action_markers": [],
+            "workspace_markers": [],
+        },
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
         # after a stub instead of finishing the artifact, (2) fabricating

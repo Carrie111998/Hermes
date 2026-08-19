@@ -1911,6 +1911,11 @@ def init_agent(
     # model-name substrings.  Resolved against the active api_mode/model in the
     # conversation loop's intent-ack block.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
+    # Additive literal phrases for models that announce actions in vocabulary
+    # the built-in English detector does not know (including other languages).
+    # Validation stays at the detector boundary so malformed user config safely
+    # contributes no markers instead of breaking agent initialization.
+    agent._intent_ack_vocabulary = _agent_section.get("intent_ack_vocabulary", {})
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance

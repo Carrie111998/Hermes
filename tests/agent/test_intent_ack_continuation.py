@@ -25,12 +25,14 @@ def _agent(
     mode: Union[str, bool, list] = "auto",
     api_mode="chat_completions",
     model="anthropic/claude-sonnet-4",
+    vocabulary=None,
 ):
     # _strip_think_blocks is a no-op for these plain-text fixtures.
     return SimpleNamespace(
         _intent_ack_continuation=mode,
         api_mode=api_mode,
         model=model,
+        _intent_ack_vocabulary=vocabulary or {},
         _strip_think_blocks=lambda c: c,
     )
 
@@ -113,6 +115,48 @@ def test_all_path_drops_workspace_requirement():
     msgs = [{"role": "user", "content": REPRO_USER}]
     assert looks_like_codex_intermediate_ack(
         a, REPRO_USER, REPRO_ACK, msgs, require_workspace=False
+    )
+
+
+def test_custom_multilingual_vocabulary_extends_detector():
+    vocabulary = {
+        "future_ack_markers": ["我来", "让我"],
+        "action_markers": ["查一下", "看看"],
+    }
+    a = _agent(True, "chat_completions", vocabulary=vocabulary)
+    user = "数据库现在是什么状态？"
+    msgs = [{"role": "user", "content": user}]
+
+    assert looks_like_codex_intermediate_ack(
+        a, user, "我来查一下数据库。", msgs, require_workspace=False
+    )
+    assert looks_like_codex_intermediate_ack(
+        a, user, "让我看看配置。", msgs, require_workspace=False
+    )
+
+
+def test_custom_workspace_marker_respects_codex_scope():
+    vocabulary = {
+        "future_ack_markers": ["我来"],
+        "action_markers": ["检查"],
+        "workspace_markers": ["代码库"],
+    }
+    a = _agent("auto", "codex_responses", vocabulary=vocabulary)
+    user = "检查代码库"
+    msgs = [{"role": "user", "content": user}]
+
+    assert looks_like_codex_intermediate_ack(
+        a, user, "我来检查。", msgs, require_workspace=True
+    )
+
+
+def test_malformed_custom_vocabulary_is_ignored():
+    a = _agent(True, "chat_completions", vocabulary={"future_ack_markers": "我来"})
+    user = "检查数据库"
+    msgs = [{"role": "user", "content": user}]
+
+    assert not looks_like_codex_intermediate_ack(
+        a, user, "我来检查数据库。", msgs, require_workspace=False
     )
 
 
