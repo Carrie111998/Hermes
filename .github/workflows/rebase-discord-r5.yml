@@ -1,0 +1,86 @@
+name: Rebase Discord R5 onto current main
+
+on:
+  push:
+    branches: [fix/dc-standalone-send]
+    paths: [.github/workflows/rebase-discord-r5.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebuild R5 from current upstream main
+        env:
+          OLD_HEAD: c4c92ffcb6411bfc1699065e14fd5fa808b82911
+        run: |
+          set -euo pipefail
+          git config user.name "Andrex Ibiza, MBA"
+          git config user.email "andrexibiza@gmail.com"
+          git fetch https://github.com/NousResearch/hermes-agent.git main
+          UPSTREAM_SHA="$(git rev-parse FETCH_HEAD)"
+          git reset --hard "$UPSTREAM_SHA"
+
+          git checkout "$OLD_HEAD" -- \
+            contributors/emails/andrexibiza@gmail.com \
+            contributors/emails/discord-fixer@users.noreply.github.com \
+            tests/plugins/discord/test_discord_standalone_sanitize_repair.py \
+            tests/plugins/discord/test_discord_standalone_send_seam.py
+
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          adapter_path = Path("plugins/platforms/discord/adapter.py")
+          module_path = Path("plugins/platforms/discord/standalone_send.py")
+          adapter = adapter_path.read_text()
+          old_module = subprocess.check_output(
+              ["git", "show", "c4c92ffcb6411bfc1699065e14fd5fa808b82911:plugins/platforms/discord/standalone_send.py"],
+              text=True,
+          )
+
+          marker = "# ── Standalone (out-of-process) sender ────────────────────────────────────────"
+          end_marker = "# ── Plugin entry point ────────────────────────────────────────────────────────"
+          start = adapter.index(marker)
+          end = adapter.index(end_marker, start)
+          current_block = adapter[start:end].rstrip() + "\n"
+
+          old_marker = old_module.index(marker)
+          preamble = old_module[:old_marker]
+          module_path.write_text(preamble + current_block)
+
+          import_anchor = "from agent.display import ToolPreview\n"
+          import_block = '''from plugins.platforms.discord.standalone_send import (\n    _DISCORD_CHANNEL_TYPE_PROBE_CACHE,\n    _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,\n    _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,\n    _remember_channel_is_forum,\n    _probe_is_forum_cached,\n    _derive_forum_thread_name,\n    _standalone_sanitize_error,\n    _standalone_close_response,\n    _standalone_read_response_bytes_limited,\n    _standalone_response_encoding,\n    _standalone_read_text_limited,\n    _standalone_read_json_limited,\n    _standalone_send,\n)\n'''
+          if import_block not in adapter:
+              adapter = adapter.replace(import_anchor, import_anchor + import_block, 1)
+          start = adapter.index(marker)
+          end = adapter.index(end_marker, start)
+          adapter = adapter[:start] + adapter[end:]
+          adapter_path.write_text(adapter)
+          PY
+
+          python -m py_compile plugins/platforms/discord/adapter.py plugins/platforms/discord/standalone_send.py
+          python -m pytest -q \
+            tests/plugins/discord/test_discord_standalone_send_seam.py \
+            tests/plugins/discord/test_discord_standalone_sanitize_repair.py
+          git diff --check
+
+          rm -f .github/workflows/rebase-discord-r5.yml
+          git add -- \
+            contributors/emails/andrexibiza@gmail.com \
+            contributors/emails/discord-fixer@users.noreply.github.com \
+            plugins/platforms/discord/adapter.py \
+            plugins/platforms/discord/standalone_send.py \
+            tests/plugins/discord/test_discord_standalone_sanitize_repair.py \
+            tests/plugins/discord/test_discord_standalone_send_seam.py
+          git commit -s -m "refactor(discord): rebase standalone sender shard onto current main" \
+            -m "Re-extract the standalone REST sender from the exact current upstream adapter rather than carrying the stale historical adapter blob. Preserve the existing R5 seam, tests, contributor provenance, and register() contract." \
+            -m "Part of #78647" -m "Part of #78634" -m "Part of #79564" -m "Part of #79772"
+          git push --force-with-lease origin HEAD:fix/dc-standalone-send
