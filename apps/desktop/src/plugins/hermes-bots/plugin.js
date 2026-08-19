@@ -4144,6 +4144,35 @@ const GROUP_TURN_POLL_MS = 2000
 // reached the room (db's Aug 2026 report).
 const GROUP_TURN_HARD_CAP_MS = 20 * 60000
 
+/** Derive the room activity chip for the member on turn from its live
+ *  session state (session.resume payload): phase + a short preview of the
+ *  work, so the room shows what the bot is doing instead of a generic
+ *  thinking line. Returns null when the session is not visibly busy —
+ *  same check the poll loop uses (inflight || running), so a retained
+ *  failed turn (inflight + running=false) still yields a chip. */
+function roomActivityFromState(state) {
+  const inflight = state?.inflight && typeof state.inflight === 'object' ? state.inflight : null
+  if (!state?.running && !inflight) {
+    return null
+  }
+
+  const text = (inflight?.assistant || inflight?.user || '').replace(/\s+/g, ' ').trim()
+  const phase = inflight?.error
+    ? 'failed'
+    : state?.status === 'waiting'
+      ? 'awaiting approval'
+      : inflight?.streaming || text
+        ? 'writing'
+        : 'thinking'
+
+  return { phase, since: state?.turn_started_at || null, preview: text.slice(0, 80) }
+}
+
+function formatGroupActivitySeconds(total) {
+  const s = Math.max(0, Math.floor(total))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
@@ -4272,9 +4301,18 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
       return null
     }
 
-    // Still visibly working: extend the deadline (never past the hard cap).
+    // Still visibly working: extend the deadline (never past the hard cap)
+    // and refresh the room's activity chip for the member on turn.
     if (busy) {
       deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+      const activity = roomActivityFromState(state)
+
+      updateGroupChat(group, r => {
+        // Keep the local turn anchor when the server sends none (older
+        // gateways), so the chip's timer never jumps backwards.
+        r.turnMeta = { ...activity, since: activity.since || r.turnMeta?.since || Date.now() / 1000 }
+        return r
+      })
     }
   }
 
@@ -4441,10 +4479,12 @@ async function runGroupChatRounds(group, members, thread) {
         const deltaImages = delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
 
         // Surface WHO is on turn (runtime-only, like running/epoch) so the
-        // room shows "Radar is thinking…" instead of a generic working line —
-        // long model turns otherwise read as the room being stuck.
+        // room can show that member's live activity instead of a generic
+        // working line — long model turns otherwise read as the room
+        // being stuck.
         updateGroupChat(group, r => {
           r.turn = member.name
+          r.turnMeta = null
           return r
         })
 
@@ -4490,6 +4530,7 @@ async function runGroupChatRounds(group, members, thread) {
       updateGroupChat(group, r => {
         r.running = false
         r.turn = null
+        r.turnMeta = null
         return r
       })
     }
@@ -9251,12 +9292,24 @@ function GroupChatWorkspace({ group, members, onBack }) {
                     children: 'Say something — every bot in this group hears the room.'
                   }, 'empty')
                 ]),
-            room.running
-              ? jsx('div', {
-                  className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: room.turn
-                    ? `${groupSpeakerLabel(room.turn)} is thinking…`
-                    : 'The room is working…'
+            room.running && room.turn
+              ? jsxs('span', {
+                  title: room.turnMeta?.preview ? `“${room.turnMeta.preview}”` : undefined,
+                  className: 'flex max-w-full flex-wrap items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[0.65rem] text-(--ui-text-quaternary)',
+                  children: [
+                    jsx('span', { className: 'font-medium text-(--ui-text-secondary)', children: groupSpeakerLabel(room.turn) }),
+                    jsx(
+                      'span',
+                      { className: `italic ${(room.turnMeta?.phase || 'working') === 'failed' ? 'text-(--ui-danger,#ef4444)' : ''}`, children: room.turnMeta?.phase || 'working' },
+                      `phase:${room.turn}`
+                    ),
+                    room.turnMeta?.since
+                      ? jsx('span', { children: formatGroupActivitySeconds(Date.now() / 1000 - room.turnMeta.since) }, `since:${room.turn}`)
+                      : null,
+                    room.turnMeta?.preview
+                      ? jsx('span', { className: 'max-w-44 truncate', children: room.turnMeta.preview }, `preview:${room.turn}`)
+                      : null
+                  ]
                 }, 'working')
               : null
           ]

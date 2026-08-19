@@ -104,7 +104,7 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, roomActivityFromState, openGroupChat, closeGroupChatMainTab, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -676,10 +676,32 @@ test('source contract: long visible turns extend the deadline up to a hard cap',
   assert.match(pluginSource, /deadline = Math\.min\(started \+ GROUP_TURN_HARD_CAP_MS/)
 })
 
-test('source contract: the working line names the member on turn', () => {
-  assert.match(pluginSource, /is thinking…/)
+test('source contract: the working strip names the member on turn with phase + preview', () => {
+  assert.match(pluginSource, /function roomActivityFromState\(/)
+  assert.match(pluginSource, /r\.turnMeta = \{ \.\.\.activity, since:/)
   assert.match(pluginSource, /r\.turn = member\.name/)
   assert.match(pluginSource, /r\.turn = null/)
+})
+
+test('activity derivation: phase tracks the live session state', () => {
+  const gc = load(() => '(pass)')
+  const { roomActivityFromState } = gc
+
+  assert.equal(roomActivityFromState({ running: false, inflight: null }), null, 'idle session has no chip')
+  assert.equal(roomActivityFromState(null), null, 'missing state has no chip')
+
+  const planning = roomActivityFromState({ running: true, status: 'working', inflight: { assistant: '', streaming: false }, turn_started_at: 100 })
+  assert.equal(planning.phase, 'thinking', 'no tokens yet is thinking')
+
+  const writing = roomActivityFromState({ running: true, status: 'working', inflight: { assistant: 'fixing the adapter registry now', streaming: true } })
+  assert.equal(writing.phase, 'writing', 'streaming text is writing')
+  assert.match(writing.preview, /fixing the adapter registry/)
+
+  const waiting = roomActivityFromState({ running: true, status: 'waiting', inflight: null })
+  assert.equal(waiting.phase, 'awaiting approval', 'pending approval surfaces as waiting')
+
+  const failed = roomActivityFromState({ running: false, inflight: { assistant: 'partial', error: 'turn failed' } })
+  assert.equal(failed.phase, 'failed', 'a retained failed turn still shows a chip')
 })
 
 test('source contract: creating a group with a taken name mints a fresh room, never reopens the old log', () => {
