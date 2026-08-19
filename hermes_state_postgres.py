@@ -1717,8 +1717,17 @@ class _PostgresConnection:
         """The underlying psycopg connection (for advisory-lock SQL etc.).
 
         Calls ``_ensure_live`` first so callers that bypass the adapter
-        (advisory-lock SQL, migration paths) also get a live connection.
+        (advisory-lock SQL, migration paths) also get a live connection —
+        EXCEPT inside an open transaction, where a replacement connection
+        cannot carry the in-flight ``BEGIN`` or its transaction-scoped
+        advisory locks. Handing one out there would let a caller issue
+        statements that self-commit on an ``autocommit=True`` connection,
+        outside the transaction the caller believes it is in. Fail closed
+        instead, matching ``_call_with_retry``.
         """
+        if self._in_transaction:
+            self._ensure_live_in_transaction()
+            return self._conn
         self._ensure_live()
         return self._conn
 

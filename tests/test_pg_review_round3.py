@@ -452,3 +452,61 @@ class TestProfileEnvDsnIsHonoured:
             "configured in the documented shape (backend in YAML, DSN in .env) "
             "is unreadable by any cross-profile reader"
         )
+
+
+class TestRawPropertyRespectsTransaction:
+    """The `raw` property is a fifth reconnect path into the same hazard.
+
+    `_call_with_retry` was hardened, but `raw` called `_ensure_live()`
+    unconditionally. Callers that bypass the adapter — advisory-lock SQL,
+    migration paths — would receive a REPLACEMENT connection while the caller
+    believed it was inside a transaction. That replacement is
+    `autocommit=True`, so statements issued on it self-commit outside the
+    caller's BEGIN and without its transaction-scoped advisory locks.
+
+    Found by live failure injection: closing the client handle mid-transaction
+    and asserting the post-close row never becomes durable. The earlier
+    `pg_terminate_backend` variant could not find it — the server rejects the
+    statement either way, so it passed with the protection removed.
+    """
+
+    def _make_conn(self):
+        from hermes_state_postgres import _PostgresConnection
+
+        raw = _ClosedConn()
+        return _PostgresConnection(raw, dsn="postgresql://example/db")
+
+    def test_raw_does_not_reconnect_inside_a_transaction(self, monkeypatch):
+        import hermes_state_postgres as hsp
+
+        conn = self._make_conn()
+        conn._in_transaction = True
+
+        def _boom(self):
+            raise AssertionError(
+                "raw reconnected inside an open transaction; the replacement "
+                "is autocommit, so any statement issued on it self-commits "
+                "outside the caller's BEGIN"
+            )
+
+        monkeypatch.setattr(hsp._PostgresConnection, "_reconnect", _boom)
+
+        with pytest.raises(RuntimeError, match="lost inside an open transaction"):
+            _ = conn.raw
+
+    def test_raw_still_repairs_an_idle_dead_handle(self, monkeypatch):
+        """Outside a transaction, `raw` must keep its healing behaviour."""
+        import hermes_state_postgres as hsp
+
+        conn = self._make_conn()
+        conn._in_transaction = False
+
+        healthy = _ClosedConn()
+        healthy.closed = 0
+
+        def _swap(self):
+            self._conn = healthy
+
+        monkeypatch.setattr(hsp._PostgresConnection, "_reconnect", _swap)
+
+        assert conn.raw is healthy
