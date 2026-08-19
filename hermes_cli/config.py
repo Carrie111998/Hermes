@@ -3803,6 +3803,12 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body",
+        # Per-provider output cap. runtime_provider._lift_max_output_tokens
+        # reads these off a custom_providers entry, but they were missing
+        # here, so the normalizer dropped them before the lifter ran: the
+        # setting silently did nothing and every startup logged
+        # "unknown config keys ignored: max_output_tokens".
+        "max_output_tokens", "max_tokens",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -3900,6 +3906,15 @@ def _normalize_custom_provider_entry(
     extra_body = entry.get("extra_body")
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
+
+    # Per-provider output cap. runtime_provider._lift_max_output_tokens reads
+    # these off the entry, but normalization rebuilds entries field-by-field
+    # and dropped them, so the setting silently did nothing.
+    for _cap_key in ("max_output_tokens", "max_tokens"):
+        _cap = entry.get(_cap_key)
+        if isinstance(_cap, int) and _cap > 0:
+            normalized["max_output_tokens"] = _cap
+            break
 
     return normalized
 
