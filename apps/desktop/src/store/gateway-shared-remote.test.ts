@@ -41,6 +41,7 @@ const {
   $gateway,
   closeSecondaryGateways,
   configureGatewayRegistry,
+  ensureActiveGatewayOpen,
   ensureGatewayForProfile,
   setPrimaryGateway
 } = await import('./gateway')
@@ -142,5 +143,44 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     expect($gateway.get()).not.toBe(primary)
     expect(gatewayMocks.setConnection).toHaveBeenCalledOnce()
     expect(gatewayMocks.setConnection).toHaveBeenCalledWith(connection)
+  })
+
+  it('republishes the active descriptor when a reconnect reopens the socket', async () => {
+    // Companion to the decline test above, and the reason this file still
+    // imports ensureActiveGatewayOpen. Declining an activation whose socket
+    // never opened is only half the contract: once a pooled profile IS
+    // active, a socket that drops and is reopened must re-publish its
+    // descriptor, or session state keeps pointing at a connection that is no
+    // longer the live one. Nothing else in src/store covers that publish --
+    // deleting it from reconnectSecondary leaves the whole directory green.
+    const connection = {
+      authMode: 'token',
+      baseUrl: 'https://worker.invalid',
+      mode: 'remote',
+      profile: 'worker',
+      token: 'fake-test-token',
+      wsUrl: 'wss://worker.invalid/api/ws?token=fake-test-token'
+    }
+
+    const primary = makePrimary()
+
+    setPrimaryGateway(primary as never, 'default')
+    installDesktop({ getConnection: vi.fn(async () => connection) })
+    gatewayMocks.connect.mockResolvedValue(undefined)
+
+    expect(await ensureGatewayForProfile('worker')).toBe(true)
+    expect(gatewayMocks.setConnection).toHaveBeenCalledOnce()
+
+    // Drop the live socket the way a transport failure would, without
+    // disturbing wantOpen/retained -- ensureActiveGatewayOpen is the path
+    // that notices and redials.
+    const active = $gateway.get() as unknown as { connectionState: string }
+
+    active.connectionState = 'closed'
+
+    await ensureActiveGatewayOpen()
+
+    expect(gatewayMocks.setConnection).toHaveBeenCalledTimes(2)
+    expect(gatewayMocks.setConnection).toHaveBeenLastCalledWith(connection)
   })
 })
