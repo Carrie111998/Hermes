@@ -1,13 +1,18 @@
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
 from agent.session_events import (
     SessionEventRecorder,
     configure_agent_event_recorder,
+    digest_trace_file,
     emit_agent_event,
+    resolve_hermes_trace_binary,
+    summarize_trace_file,
     start_agent_turn_trace,
     start_agent_step_trace,
+    verify_trace_file,
 )
 
 
@@ -118,3 +123,208 @@ def test_turn_and_step_helpers_attach_stable_coordinates(tmp_path: Path):
     ]
     assert events[0]["data"]["turn_id"] == "turn-a"
     assert events[1]["data"]["previous_tools"] == [{"name": "read_file"}]
+
+
+def test_trace_utility_helpers_call_hermes_trace_with_safe_argv(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    assert verify_trace_file(trace, binary="hermes-trace", runner=runner) is True
+    assert calls == [
+        (
+            ["hermes-trace", "verify", str(trace)],
+            {"check": False, "capture_output": True, "text": True, "timeout": 30.0},
+        )
+    ]
+
+
+def test_resolve_hermes_trace_binary_prefers_repo_release(tmp_path: Path):
+    binary_name = "hermes-trace.exe"
+    release_binary = tmp_path / "crates" / "hermes-trace" / "target" / "release" / binary_name
+    release_binary.parent.mkdir(parents=True)
+    release_binary.write_text("", encoding="utf-8")
+    start = tmp_path / "agent" / "session_events.py"
+
+    assert resolve_hermes_trace_binary(start=start, binary_name=binary_name) == str(release_binary)
+
+
+def test_resolve_hermes_trace_binary_uses_environment_override(tmp_path: Path):
+    env_binary = tmp_path / "custom" / "hermes-trace"
+    release_binary = tmp_path / "crates" / "hermes-trace" / "target" / "release" / "hermes-trace"
+    release_binary.parent.mkdir(parents=True)
+    release_binary.write_text("", encoding="utf-8")
+
+    assert resolve_hermes_trace_binary(
+        start=tmp_path,
+        binary_name="hermes-trace",
+        environ={"HERMES_TRACE_BINARY": str(env_binary)},
+    ) == str(env_binary)
+
+
+def test_resolve_hermes_trace_binary_explicit_binary_wins_over_environment(tmp_path: Path):
+    explicit = tmp_path / "explicit" / "hermes-trace"
+    env_binary = tmp_path / "env" / "hermes-trace"
+
+    assert resolve_hermes_trace_binary(
+        binary=explicit,
+        environ={"HERMES_TRACE_BINARY": str(env_binary)},
+    ) == str(explicit)
+
+
+def test_resolve_hermes_trace_binary_falls_back_to_path_name(tmp_path: Path):
+    assert (
+        resolve_hermes_trace_binary(start=tmp_path, binary_name="hermes-trace")
+        == "hermes-trace"
+    )
+
+
+def test_resolve_hermes_trace_binary_uses_explicit_path_lookup(tmp_path: Path):
+    path_binary = tmp_path / "bin" / "hermes-trace"
+
+    assert (
+        resolve_hermes_trace_binary(
+            start=tmp_path,
+            binary_name="hermes-trace",
+            path_lookup=lambda name: str(path_binary) if name == "hermes-trace" else None,
+        )
+        == str(path_binary)
+    )
+
+
+def test_trace_summary_and_digest_helpers_parse_cli_output(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+
+    def runner(args, **kwargs):
+        if args[1] == "summary":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"turns":1,"steps":2,"tool_calls":3,"tool_errors":4,'
+                    '"input_tokens":5,"output_tokens":6}\n'
+                ),
+                stderr="",
+            )
+        if args[1] == "digest":
+            return SimpleNamespace(returncode=0, stdout="a" * 64 + "\n", stderr="")
+        raise AssertionError(args)
+
+    assert summarize_trace_file(trace, runner=runner) == {
+        "turns": 1,
+        "steps": 2,
+        "tool_calls": 3,
+        "tool_errors": 4,
+        "input_tokens": 5,
+        "output_tokens": 6,
+    }
+    assert digest_trace_file(trace, runner=runner) == "a" * 64
+
+
+def test_summarize_trace_file_rejects_non_integer_summary_values(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+
+    def runner(args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"turns":true,"steps":"2","tool_calls":3,"tool_errors":4,'
+                '"input_tokens":5,"output_tokens":6}\n'
+            ),
+            stderr="",
+        )
+
+    try:
+        summarize_trace_file(trace, runner=runner)
+    except ValueError as exc:
+        assert "turns" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_summarize_trace_file_rejects_negative_summary_values(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+
+    def runner(args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"turns":1,"steps":2,"tool_calls":3,"tool_errors":4,'
+                '"input_tokens":-1,"output_tokens":6}\n'
+            ),
+            stderr="",
+        )
+
+    try:
+        summarize_trace_file(trace, runner=runner)
+    except ValueError as exc:
+        assert "input_tokens" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_summarize_trace_file_rejects_missing_summary_fields(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+
+    def runner(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout='{"turns":1}\n', stderr="")
+
+    try:
+        summarize_trace_file(trace, runner=runner)
+    except ValueError as exc:
+        assert "steps" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_trace_utility_helpers_raise_on_cli_failure(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+
+    def runner(args, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="bad trace\n")
+
+    try:
+        verify_trace_file(trace, runner=runner)
+    except RuntimeError as exc:
+        assert "bad trace" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_trace_utility_helpers_reject_non_positive_timeout_before_subprocess(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+
+    def runner(args, **kwargs):
+        raise AssertionError("runner should not be called")
+
+    try:
+        verify_trace_file(trace, timeout=0, runner=runner)
+    except ValueError as exc:
+        assert "timeout" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_trace_utility_helpers_reject_non_finite_timeout_before_subprocess(tmp_path: Path):
+    trace = tmp_path / "session.jsonl"
+    trace.write_text("", encoding="utf-8")
+
+    def runner(args, **kwargs):
+        raise AssertionError("runner should not be called")
+
+    for timeout in (math.nan, math.inf, "nan", "inf"):
+        try:
+            verify_trace_file(trace, timeout=timeout, runner=runner)
+        except ValueError as exc:
+            assert "timeout" in str(exc)
+        else:
+            raise AssertionError(f"expected ValueError for timeout={timeout!r}")

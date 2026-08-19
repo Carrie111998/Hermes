@@ -1,11 +1,11 @@
-use hermes_trace::{project_reader, write_project_file, EventWriter, TraceEvent};
+use hermes_trace::{digest_reader, verify_reader, write_project_file, EventWriter, TraceEvent};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "usage: hermes-trace <verify|project|snapshot|append> <trace.jsonl>\nappend reads one JSON event from stdin"
+    "usage: hermes-trace <verify|summary|project|snapshot|digest|append> <trace.jsonl>\nappend reads one JSON event from stdin"
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,8 +17,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     match command.as_str() {
         "verify" => {
-            project_reader(BufReader::new(File::open(path)?))?;
+            verify_reader(BufReader::new(File::open(path)?))?;
             println!("ok");
+        }
+        "summary" => {
+            let summary = verify_reader(BufReader::new(File::open(path)?))?;
+            serde_json::to_writer(io::stdout().lock(), &summary)?;
+            println!();
         }
         "project" => {
             write_project_file(path, BufWriter::new(io::stdout().lock()), false)?;
@@ -27,6 +32,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "snapshot" => {
             write_project_file(path, BufWriter::new(io::stdout().lock()), true)?;
             println!();
+        }
+        "digest" => {
+            println!("{}", digest_reader(BufReader::new(File::open(path)?))?);
         }
         "append" => {
             let event: TraceEvent = serde_json::from_reader(io::stdin().lock())?;

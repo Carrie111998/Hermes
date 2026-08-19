@@ -9,8 +9,11 @@ export, which remains a training-data format.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -31,6 +34,42 @@ _SENSITIVE_KEYS = frozenset(
 )
 _locks_guard = threading.Lock()
 _path_locks: dict[Path, threading.Lock] = {}
+_TRACE_COMMANDS = frozenset({"verify", "summary", "digest"})
+_TRACE_SUMMARY_KEYS = (
+    "turns",
+    "steps",
+    "tool_calls",
+    "tool_errors",
+    "input_tokens",
+    "output_tokens",
+)
+
+
+def resolve_hermes_trace_binary(
+    *,
+    start: str | Path | None = None,
+    binary: str | Path | None = None,
+    binary_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    path_lookup: Callable[[str], str | None] = shutil.which,
+) -> str:
+    """Resolve a local hermes-trace build, falling back to PATH lookup."""
+    if binary is not None:
+        return str(binary)
+    env_binary = str((os.environ if environ is None else environ).get("HERMES_TRACE_BINARY", "")).strip()
+    if env_binary:
+        return env_binary
+    name = binary_name or ("hermes-trace.exe" if os.name == "nt" else "hermes-trace")
+    anchor = Path(start) if start is not None else Path(__file__)
+    if anchor.suffix:
+        anchor = anchor.parent
+    for root in (anchor, *anchor.parents):
+        crate = root / "crates" / "hermes-trace" / "target"
+        for profile in ("release", "debug"):
+            candidate = crate / profile / name
+            if candidate.is_file():
+                return str(candidate)
+    return path_lookup(name) or name
 
 
 def _path_lock(path: Path) -> threading.Lock:
@@ -172,14 +211,18 @@ def start_agent_turn_trace(
     enabled: bool | None = None,
     home: str | Path | None = None,
 ) -> bool:
-    """Configure tracing and emit the immutable start record for one turn."""
-    if configure_agent_event_recorder(agent, enabled=enabled, home=home) is None:
-        return False
+    """Emit turn start and report whether every requested durable sink succeeded."""
+    trace_requested = enabled is True or (
+        enabled is None
+        and os.environ.get("HERMES_TRACE_EVENTS", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    recorder = configure_agent_event_recorder(agent, enabled=enabled, home=home)
     agent._trajectory_turn_number = int(
         getattr(agent, "_trajectory_turn_number", 0) or 0
     ) + 1
     agent._trajectory_step_number = None
-    return emit_agent_event(
+    delivered = emit_agent_event(
         agent,
         "turn/start",
         {
@@ -189,6 +232,7 @@ def start_agent_turn_trace(
             "provider": getattr(agent, "provider", None),
         },
     )
+    return delivered and (not trace_requested or recorder is not None)
 
 
 def start_agent_step_trace(
@@ -207,20 +251,126 @@ def start_agent_step_trace(
 
 
 def emit_agent_event(agent: Any, event_type: str, data: Mapping[str, Any] | None) -> bool:
-    """Emit through an agent's optional recorder without affecting its turn."""
+    """Emit to memory providers and the optional trace without affecting the turn."""
+    safe_data = redact_trace_data(data or {})
+    memory_delivered: bool | None = None
+    memory_manager = getattr(agent, "_memory_manager", None)
+    notify = getattr(memory_manager, "on_session_event_all", None)
+    if callable(notify):
+        try:
+            memory_delivered = notify(
+                event_type,
+                safe_data,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                turn=getattr(agent, "_trajectory_turn_number", None),
+                step=getattr(agent, "_trajectory_step_number", None),
+            ) is True
+        except Exception:
+            memory_delivered = False
     recorder = getattr(agent, "_session_event_recorder", None)
     if recorder is None:
-        return False
+        return memory_delivered is True
     try:
         recorder.append(
             event_type,
-            data,
+            safe_data,
             turn=getattr(agent, "_trajectory_turn_number", None),
             step=getattr(agent, "_trajectory_step_number", None),
         )
-        return True
+        return memory_delivered is not False
     except Exception:
         # Observability is fail-open: a trace disk or serialization failure must
         # never alter the conversation loop, tool execution, or persistence.
         agent._session_event_recorder = None
         return False
+
+
+def _run_hermes_trace_command(
+    command: str,
+    trace_path: str | Path,
+    *,
+    binary: str | Path | None = None,
+    timeout: float = 30.0,
+    runner: Callable[..., Any] = subprocess.run,
+) -> str:
+    if command not in _TRACE_COMMANDS:
+        raise ValueError(f"unsupported hermes-trace command: {command}")
+    timeout_seconds = float(timeout)
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout must be a finite positive number")
+    resolved_binary = resolve_hermes_trace_binary(binary=binary)
+    completed = runner(
+        [resolved_binary, command, str(Path(trace_path))],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "hermes-trace failed").strip()
+        raise RuntimeError(f"hermes-trace {command} failed: {message}")
+    return str(completed.stdout).strip()
+
+
+def verify_trace_file(
+    trace_path: str | Path,
+    *,
+    binary: str | Path | None = None,
+    timeout: float = 30.0,
+    runner: Callable[..., Any] = subprocess.run,
+) -> bool:
+    _run_hermes_trace_command(
+        "verify",
+        trace_path,
+        binary=binary,
+        timeout=timeout,
+        runner=runner,
+    )
+    return True
+
+
+def summarize_trace_file(
+    trace_path: str | Path,
+    *,
+    binary: str | Path | None = None,
+    timeout: float = 30.0,
+    runner: Callable[..., Any] = subprocess.run,
+) -> dict[str, int]:
+    output = _run_hermes_trace_command(
+        "summary",
+        trace_path,
+        binary=binary,
+        timeout=timeout,
+        runner=runner,
+    )
+    summary = json.loads(output)
+    if not isinstance(summary, Mapping):
+        raise ValueError("hermes-trace summary output must be a JSON object")
+    validated: dict[str, int] = {}
+    for key in _TRACE_SUMMARY_KEYS:
+        if key not in summary:
+            raise ValueError(f"hermes-trace summary field {key!r} is required")
+        value = summary[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"hermes-trace summary field {key!r} must be a non-negative integer")
+        validated[key] = value
+    return validated
+
+
+def digest_trace_file(
+    trace_path: str | Path,
+    *,
+    binary: str | Path | None = None,
+    timeout: float = 30.0,
+    runner: Callable[..., Any] = subprocess.run,
+) -> str:
+    digest = _run_hermes_trace_command(
+        "digest",
+        trace_path,
+        binary=binary,
+        timeout=timeout,
+        runner=runner,
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("hermes-trace digest output must be 64 lowercase hex characters")
+    return digest

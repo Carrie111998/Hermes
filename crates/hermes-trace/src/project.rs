@@ -1,6 +1,7 @@
 use crate::{TraceError, TraceEvent};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -119,6 +120,10 @@ pub fn project_reader(reader: impl BufRead) -> Result<Projection, TraceError> {
     Ok(Projection { summary, records })
 }
 
+pub fn verify_reader(reader: impl BufRead) -> Result<ProjectionSummary, TraceError> {
+    scan_reader(reader, |_| Ok(()))
+}
+
 pub fn snapshot_reader(reader: impl BufRead) -> Result<Snapshot, TraceError> {
     let projection = project_reader(reader)?;
     Ok(Snapshot {
@@ -137,13 +142,32 @@ pub fn snapshot_reader(reader: impl BufRead) -> Result<Snapshot, TraceError> {
     })
 }
 
+pub fn digest_reader(reader: impl BufRead) -> Result<String, TraceError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hermes-trace-snapshot-v1\n");
+    scan_reader(reader, |event| {
+        let record = SnapshotRecord {
+            seq: event.seq,
+            event_type: event.event_type,
+            turn: event.turn,
+            step: event.step,
+            data: event.data,
+        };
+        let encoded = serde_json::to_vec(&record)?;
+        hasher.update(encoded);
+        hasher.update(b"\n");
+        Ok(())
+    })?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 pub fn write_project_file(
     path: impl AsRef<Path>,
     mut writer: impl Write,
     normalized: bool,
 ) -> Result<(), TraceError> {
     let path = path.as_ref();
-    let summary = scan_reader(BufReader::new(File::open(path)?), |_| Ok(()))?;
+    let summary = verify_reader(BufReader::new(File::open(path)?))?;
 
     writer.write_all(b"{\"summary\":")?;
     serde_json::to_writer(&mut writer, &summary)?;
