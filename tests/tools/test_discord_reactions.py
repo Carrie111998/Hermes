@@ -27,6 +27,22 @@ def test_custom_emoji_accepted():
     assert validate_emoji("hermes:123456789012345678") == "hermes:123456789012345678"
 
 
+def test_keycap_emoji_accepted():
+    # Keycap sequences embed an ASCII digit (or `#`/`*`) plus U+FE0F/U+20E3;
+    # they are valid Discord reactions and must not trip the ASCII-alnum gate
+    # or the `#` forbid.
+    assert validate_emoji("1\ufe0f\u20e3") == "1\ufe0f\u20e3"  # 1️⃣
+    assert validate_emoji("#\ufe0f\u20e3") == "#\ufe0f\u20e3"  # #️⃣
+    assert validate_emoji("*\ufe0f\u20e3") == "*\ufe0f\u20e3"  # *️⃣
+
+
+def test_custom_emoji_leading_zero_snowflake_rejected():
+    # Discord snowflake ids are positive integers; a leading-zero id is not a
+    # real reaction target and would 404 at the API, so reject it up front.
+    with pytest.raises(ReactionError):
+        validate_emoji("hermes:000000000000000")
+
+
 def test_emoji_whitespace_rejected():
     with pytest.raises(ReactionError):
         validate_emoji("  ok")
@@ -95,6 +111,14 @@ def test_list_reactions_query_and_clamp():
     assert r["query"] == {"limit": "10"}
     r2 = list_reactions_request("111", "222", "\U0001f44d", limit=9999)
     assert int(r2["query"]["limit"]) == MAX_REACTION_PAGE
+
+
+def test_list_reactions_non_integer_limit_rejected():
+    # Non-numeric limit must surface as ReactionError, not a bare ValueError.
+    with pytest.raises(ReactionError):
+        list_reactions_request("111", "222", "\U0001f44d", limit="many")
+    with pytest.raises(ReactionError):
+        list_reactions_request("111", "222", "\U0001f44d", limit=None)
 
 
 def test_invalid_snowflake_rejected():

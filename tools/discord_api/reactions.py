@@ -36,7 +36,11 @@ __all__ = [
 # Discord's GET reaction listing default/max (REST v10 resources/emoji.mdx).
 MAX_REACTION_PAGE = 100
 
-_CUSTOM_EMOJI_RE = re.compile(r"^[A-Za-z0-9_]{2,32}:[0-9]{15,20}$")
+_CUSTOM_EMOJI_RE = re.compile(r"^[A-Za-z0-9_]{2,32}:[1-9][0-9]{14,19}$")
+# Discord keycap emoji: "0️⃣".."9️⃣", "#️⃣", "*️⃣" (combining enclose keycap).
+# Matched before the ASCII-alnum gate so `#`/digits inside a keycap are not
+# mistaken for smuggling or plain text.
+_KEYCAP_EMOJI_RE = re.compile(r"^[0-9#*]\ufe0f?\u20e3$")
 # Reject forms that could smuggle a ping or whitespace into a URL.
 _FORBIDDEN = re.compile(r"[\s/@#]|@everyone|@here")
 
@@ -58,10 +62,13 @@ def validate_emoji(emoji: str) -> str:
     stripped = emoji.strip()
     if stripped != emoji:
         raise ReactionError("emoji must not have surrounding whitespace")
+    # Custom guild emoji and Discord keycaps are exact, closed forms: a match
+    # cannot carry a whitespace/ping-smuggling payload, so they are accepted
+    # before the general forbid + unicode gates.
+    if _CUSTOM_EMOJI_RE.match(emoji) or _KEYCAP_EMOJI_RE.match(emoji):
+        return emoji
     if _FORBIDDEN.search(emoji):
         raise ReactionError(f"emoji {emoji!r} contains forbidden characters")
-    if _CUSTOM_EMOJI_RE.match(emoji):
-        return emoji
     # Unicode emoji cluster: no plain-ASCII letters/digits (which would be a
     # mistaken word or a malformed custom emoji), and at least one symbol
     # codepoint (So/Sm/Sc/Sk) among combining/ZWJ/emoji-modifier codepoints.
@@ -144,11 +151,17 @@ def list_reactions_request(
 ) -> dict:
     """Build the GET that lists users who reacted with ``emoji``.
 
-    ``limit`` is clamped to the Discord max of 100.
+    ``limit`` is clamped to the Discord max of 100. A non-integer value
+    raises :class:`ReactionError` like every other invalid input in this
+    module, rather than leaking a bare ``ValueError``.
     """
     base = _base_path(channel_id, message_id)
     enc = encode_emoji_path(emoji)
-    n = max(1, min(int(limit), MAX_REACTION_PAGE))
+    try:
+        n = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ReactionError(f"limit must be an integer, got {limit!r}") from exc
+    n = max(1, min(n, MAX_REACTION_PAGE))
     return {
         "method": "GET",
         "path": f"{base}/reactions/{enc}",
