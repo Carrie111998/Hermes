@@ -168,6 +168,26 @@ class TestCreateJob:
                 assert data["retry_create"] is False
                 assert "private callback URL and token" not in data["error"]
 
+    @pytest.mark.asyncio
+    async def test_create_job_reports_validation_error_as_bad_request(self, adapter):
+        app = _create_app(adapter)
+        message = (
+            "API-server sessions use HTTP request/response and cannot receive "
+            "scheduled push delivery. Set deliver='local' to save output only."
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", side_effect=ValueError(message)
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                })
+
+                assert resp.status == 400
+                assert (await resp.json())["error"] == message
+
 
     @pytest.mark.asyncio
     async def test_create_job_prompt_too_long(self, adapter):
@@ -213,6 +233,24 @@ class TestGetJob:
 # ---------------------------------------------------------------------------
 
 class TestUpdateJob:
+
+    @pytest.mark.asyncio
+    async def test_update_job_reports_validation_error_as_bad_request(self, adapter):
+        app = _create_app(adapter)
+        message = (
+            "API-server sessions use HTTP request/response and cannot receive "
+            "scheduled push delivery. Set deliver='local' to save output only."
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", side_effect=ValueError(message)
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}", json={"deliver": "origin"}
+                )
+
+                assert resp.status == 400
+                assert (await resp.json())["error"] == message
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
