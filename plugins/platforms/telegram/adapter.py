@@ -750,6 +750,24 @@ class TelegramAdapter(BasePlatformAdapter):
         # declines drafts so transport=auto uses edit-in-place + rich finalize
         # instead of MDV2 drafts that jump to sendRichMessage at the end.
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
+        # Opt-in conversational splitting (#4445): deliver blank-line-separated
+        # paragraphs as separate Telegram bubbles instead of one long message.
+        # Mirrors the WhatsApp adapter's split_outgoing_* extra keys.
+        self._split_outgoing_on_blank_lines: bool = self._coerce_bool_extra(
+            "split_outgoing_on_blank_lines", False
+        )
+        self._split_outgoing_delay_seconds: float = self._coerce_float_extra(
+            "split_outgoing_delay_seconds", 0.6, min_value=0.0
+        )
+        _split_extra = getattr(config, "extra", None) or {}
+        try:
+            self._split_outgoing_max_parts = int(
+                _split_extra.get("split_outgoing_max_parts", 4)
+            )
+        except (TypeError, ValueError):
+            self._split_outgoing_max_parts = 4
+        if self._split_outgoing_max_parts < 1:
+            self._split_outgoing_max_parts = 4
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -5117,6 +5135,46 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    def _outgoing_message_parts(self, formatted: str) -> List[str]:
+        """Split on blank lines outside triple-backtick fenced code blocks."""
+        if not getattr(self, "_split_outgoing_on_blank_lines", False):
+            return [formatted]
+
+        parts: List[str] = []
+        current: List[str] = []
+        in_fence = False
+
+        for line in formatted.split("\n"):
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+
+            if indent <= 3 and re.match(r"```(?!`)", stripped):
+                if in_fence:
+                    if re.fullmatch(r"[ \t]{0,3}```[ \t]*", line):
+                        in_fence = False
+                else:
+                    in_fence = True
+
+            if not line.strip() and not in_fence:
+                part = "\n".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                continue
+
+            current.append(line)
+
+        final_part = "\n".join(current).strip()
+        if final_part:
+            parts.append(final_part)
+        if len(parts) <= 1:
+            return [formatted]
+
+        max_parts = getattr(self, "_split_outgoing_max_parts", 4)
+        if max_parts > 0 and len(parts) > max_parts:
+            return parts[: max_parts - 1] + ["\n\n".join(parts[max_parts - 1 :])]
+        return parts
+
     async def send(
         self,
         chat_id: str,
@@ -5159,11 +5217,14 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
+            # Format, optionally split into conversational bubbles, then apply
+            # the existing length chunking to every part.
             formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
+            chunks = []
+            for part in self._outgoing_message_parts(formatted):
+                chunks.extend(self.truncate_message(
+                    part, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                ))
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
@@ -5388,6 +5449,16 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
+
+                # Pace multi-bubble delivery when conversational splitting is
+                # enabled; the legacy multi-chunk path stays delay-free.
+                if (
+                    i < len(chunks) - 1
+                    and getattr(self, "_split_outgoing_on_blank_lines", False)
+                ):
+                    await asyncio.sleep(
+                        getattr(self, "_split_outgoing_delay_seconds", 0.6)
+                    )
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
