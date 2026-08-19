@@ -24,11 +24,11 @@ async def test_enrich_message_with_vision_uses_concise_prompt():
 
     assert "A cat on a chair." in result
     assert "What is happening here?" in result
-    assert (
-        "Concisely describe this image in 2-4 sentences"
-        in mock_vision.await_args.kwargs["user_prompt"]
-    )
-    assert "Skip decorative details." in mock_vision.await_args.kwargs["user_prompt"]
+    prompt = mock_vision.await_args.kwargs["user_prompt"]
+    assert "What is happening here?" in prompt
+    assert "gateway_auto_enrichment" in prompt
+    assert "2-4 sentences" in prompt
+    assert "untrusted visual data" in prompt
     # No output cap is forwarded: per the max-tokens-knob policy the aux
     # client decides token handling; conciseness comes from the prompt.
     assert "max_tokens" not in mock_vision.await_args.kwargs

@@ -24302,7 +24302,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Auto-analyze user-attached images with the vision tool and prepend
         the descriptions to the message text.
 
-        Each image is analyzed with a general-purpose prompt.  The resulting
+        Each image is analyzed against the user's actual task.  The resulting
         description *and* the local cache path are injected so the model can:
           1. Immediately understand what the user sent (no extra tool call).
           2. Re-examine the image with vision_analyze if it needs more detail.
@@ -24314,15 +24314,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns:
             The enriched message string with vision descriptions prepended.
         """
-        from tools.vision_tools import vision_analyze_tool
         from agent.memory_manager import sanitize_context
+        from agent.vision_prompt import build_vision_prompt
+        from tools.vision_tools import vision_analyze_tool
 
-        analysis_prompt = (
-            "Concisely describe this image in 2-4 sentences "
-            "(~200 Chinese characters or ~150 English words). "
-            "Cover the main subject, key visible text/data/code, and overall context. "
-            "If it is a chart, diagram, or scientific figure, include the important "
-            "labels, legend, and key values. Skip decorative details."
+        analysis_prompt = build_vision_prompt(
+            user_text,
+            surface="gateway_auto_enrichment",
+            concise=True,
         )
 
         enriched_parts = []
