@@ -1819,6 +1819,17 @@ def _build_child_agent(
             )
             child_session_db = None
 
+        # Ensure session is registered in SessionDB so TUI can resume/switch to it
+        if child_session_db is not None and session_id:
+            try:
+                child_session_db.ensure_session(
+                    session_id=session_id,
+                    title=f"Subagent ({session_id})",
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                )
+            except Exception:
+                pass
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():

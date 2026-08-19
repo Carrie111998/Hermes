@@ -6994,7 +6994,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
-                    if snapshot.get("cwd_label"):
+                    if width >= 90 and snapshot.get("cwd_label"):
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", snapshot["cwd_label"]))
                     frags.append(("class:status-bar", " "))
@@ -7067,7 +7067,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
-                    if snapshot.get("cwd_label"):
+                    if width >= 90 and snapshot.get("cwd_label"):
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", snapshot["cwd_label"]))
                     frags.append(("class:status-bar", " "))
