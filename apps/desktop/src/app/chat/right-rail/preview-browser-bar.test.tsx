@@ -15,7 +15,9 @@ const baseProps = {
   onReload: vi.fn(),
   onToggleConsole: vi.fn(),
   onToggleDevTools: vi.fn(),
-  url: 'https://example.com'
+  onViewportChange: vi.fn(),
+  url: 'https://example.com',
+  viewport: { kind: 'free' as const }
 }
 
 function address(rendered: ReturnType<typeof render>) {
@@ -79,6 +81,7 @@ describe('PreviewBrowserBar', () => {
     expect(rendered.getByRole('button', { name: 'Reload page' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Show preview console' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Open preview DevTools' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Preview viewport' })).toBeTruthy()
     expect(address(rendered)).toBeTruthy()
   })
 

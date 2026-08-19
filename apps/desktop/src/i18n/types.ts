@@ -2506,6 +2506,14 @@ export interface Translations {
       reload: string
       address: string
       addressPlaceholder: string
+      viewport: string
+      viewportFree: string
+      viewportDesktop: string
+      viewportLaptop: string
+      viewportMobile: string
+      viewportWidth: string
+      viewportHeight: string
+      viewportApply: string
       blankPageBody: string
       finishedRestarting: (message?: string) => string
       failedRestarting: (message: string) => string

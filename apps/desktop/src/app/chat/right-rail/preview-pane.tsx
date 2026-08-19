@@ -29,6 +29,7 @@ import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
+import { loadViewportMode, modeSize, saveViewportMode, scaleFor, type ViewportMode } from './preview-viewport'
 
 type PreviewWebview = HTMLElement & {
   canGoBack?: () => boolean
@@ -184,6 +185,10 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
+  const [viewport, setViewport] = useState<ViewportMode>(() => loadViewportMode())
+  const [hostSize, setHostSize] = useState({ width: 0, height: 0 })
+  const guestSize = modeSize(viewport)
+  const guestScale = guestSize ? scaleFor(hostSize, guestSize) : 1
 
   // Artifacts have no URL to load — they render from the registry, never in a
   // webview.
@@ -390,6 +395,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     }
   }, [])
 
+  const handleViewportChange = useCallback((next: ViewportMode) => {
+    setViewport(next)
+    saveViewportMode(next)
+  }, [])
+
   // Gestures that land on the app's chrome (⌘R from the address bar, a mouse
   // button over the frame). A gesture made INSIDE the page is answered by main
   // against the focused guest — this renderer can't see into a webview.
@@ -400,6 +410,24 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
     return registerPreviewNav(tabId, { back: goBack, forward: goForward, reload: reloadPreview })
   }, [goBack, goForward, isRemoteHtml, isWebPreview, reloadPreview, tabId])
+
+  useEffect(() => {
+    const host = previewContentRef.current
+
+    if (!host || typeof ResizeObserver === 'undefined') {
+      return
+    }
+
+    const apply = () => {
+      setHostSize({ width: host.clientWidth, height: host.clientHeight })
+    }
+
+    apply()
+    const observer = new ResizeObserver(apply)
+    observer.observe(host)
+
+    return () => observer.disconnect()
+  }, [])
 
   // Publish the PAGE reader for this tab (the read_preview tool): extract the
   // rendered page's title + visible text from the webview. innerText (not
@@ -806,7 +834,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             onReload={reloadPreview}
             onToggleConsole={() => consoleState.setOpen(open => !open)}
             onToggleDevTools={toggleDevTools}
+            onViewportChange={handleViewportChange}
             url={currentUrl}
+            viewport={viewport}
           />
         )}
 
@@ -817,9 +847,20 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           <div
             className={cn(
               'absolute inset-0 flex bg-transparent',
+              guestSize && 'items-start justify-center overflow-hidden',
               (isRemoteHtml || !isWebPreview || loadError) && 'pointer-events-none opacity-0'
             )}
             ref={hostRef}
+            style={
+              guestSize
+                ? {
+                    width: guestSize.width,
+                    height: guestSize.height,
+                    transform: `scale(${guestScale})`,
+                    transformOrigin: 'top center'
+                  }
+                : undefined
+            }
           />
           {isRemoteHtml && (
             <iframe
