@@ -3644,7 +3644,7 @@ class MCPServerTask:
                 self.name,
             )
             self._tools = []
-            self._register_discovered_tools_if_needed()
+            await self._register_discovered_tools_if_needed()
             return
         async with self._rpc_lock:
             self._list_cache_meta = {}
@@ -3652,9 +3652,9 @@ class MCPServerTask:
                 self.session.list_tools, "tools", self.name,
                 cache_meta_out=self._list_cache_meta,
             )
-        self._register_discovered_tools_if_needed()
+        await self._register_discovered_tools_if_needed()
 
-    def _register_discovered_tools_if_needed(self) -> None:
+    async def _register_discovered_tools_if_needed(self) -> None:
         """Re-register tools after an owned server reconnects if needed.
 
         Initial registration is performed by ``_discover_and_register_server``
@@ -3666,8 +3666,27 @@ class MCPServerTask:
         A server retained after a recoverable initial failure is likewise
         registry-owned before its first successful session, so ownership also
         authorizes its first publication.
+
+        When ``_registered_tool_names`` is already set (quick reconnect
+        after prior registration), the freshly discovered ``self._tools``
+        list is compared against the currently registered names.  If the
+        tool sets differ, the update is delegated to ``_refresh_tools()``
+        which handles diff, deregistration, ownership checks, and logging.
+        This avoids stale tools after a quick reconnect that does not
+        exhaust the retry budget (no parking).
         """
         if self._registered_tool_names:
+            # Quick reconnect: tools were already registered but we just
+            # rediscovered them.  If the set changed, delegate to the
+            # canonical _refresh_tools() which handles diff, deregistration,
+            # ownership checks, and pagination.
+            new_names = {
+                mcp_prefixed_tool_name(self.name, t.name)
+                for t in self._tools
+            }
+            if set(self._registered_tool_names) == new_names:
+                return
+            await self._refresh_tools()
             return
         if not self._ready.is_set():
             with _lock:
