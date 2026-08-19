@@ -37,6 +37,7 @@ import {
   $panesFlipped,
   $pinnedSessionIds,
   $sidebarAgentsGrouped,
+  $sidebarArchivedOpen,
   $sidebarCronOpen,
   $sidebarMessagingOpenIds,
   $sidebarPinsOpen,
@@ -51,6 +52,7 @@ import {
   SESSION_SEARCH_FOCUS_EVENT,
   setPinnedSessionOrder,
   setSidebarAgentsGrouped,
+  setSidebarArchivedOpen,
   setSidebarCronOpen,
   setSidebarPinsOpen,
   setSidebarProjectOrderIds,
@@ -66,6 +68,7 @@ import {
 import { $newChatProfile, $profiles, $profileScope, ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
 import {
   $activeProjectId,
+  $archivedProjects,
   $projects,
   $projectScope,
   $projectTree,
@@ -80,6 +83,7 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  restoreProject,
   scanAndRecordRepos
 } from '@/store/projects'
 import { openRouteTile } from '@/store/route-tiles'
@@ -290,6 +294,8 @@ export function ChatSidebar({
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const pinsOpen = useStore($sidebarPinsOpen)
   const agentsOpen = useStore($sidebarRecentsOpen)
+  const archivedOpen = useStore($sidebarArchivedOpen)
+  const archivedProjectTree = useStore($archivedProjects)
   const cronOpen = useStore($sidebarCronOpen)
   // The sidebar highlight tracks the FOCUSED session — the interacted tile's
   // tab, else the main selection — so it stays 1:1 with whatever tab is active.
@@ -611,18 +617,20 @@ export function ChatSidebar({
     }
 
     const sorted = sortProjectsForOverview(
-      filterVisibleProjects(projectTree, dismissedAutoProjects).map(project =>
-        excludeProjectSessions(
-          {
-            ...project,
-            // Home is synthetic, so its name is ours to translate — every other
-            // label is a repo basename or a name the user typed.
-            label: project.isNoProject ? s.projects.home : project.label,
-            repos: orderRepos(project.repos)
-          },
-          isPinnedSession
-        )
-      ),
+      filterVisibleProjects(projectTree, dismissedAutoProjects)
+        .filter(project => !project.archived)
+        .map(project =>
+          excludeProjectSessions(
+            {
+              ...project,
+              // Home is synthetic, so its name is ours to translate — every other
+              // label is a repo basename or a name the user typed.
+              label: project.isNoProject ? s.projects.home : project.label,
+              repos: orderRepos(project.repos)
+            },
+            isPinnedSession
+          )
+        ),
       activeProjectId
     )
 
@@ -640,6 +648,15 @@ export function ChatSidebar({
     isPinnedSession,
     s
   ])
+
+  // Archived (hidden) explicit projects — rendered as a collapsible section at
+  // the bottom of the overview so they can be restored without the CLI. Served
+  // by the backend alongside `projects.tree` (the tree itself only lists
+  // active projects, and session grouping must never claim an archived one).
+  const archivedProjects = useMemo<SidebarProjectTree[]>(
+    () => (showAllProfiles ? [] : archivedProjectTree.map(project => ({ ...project, repos: orderRepos(project.repos) }))),
+    [archivedProjectTree, orderRepos, showAllProfiles]
+  )
 
   // The overview only renders in grouped mode; the model stays live regardless
   // so scoping is consistent across views.
@@ -1435,6 +1452,10 @@ export function ChatSidebar({
                 projectBackRow={
                   inProject ? <ProjectBackRow label={s.projects.back} onClick={exitProjectScope} /> : undefined
                 }
+                projectArchived={archivedProjects}
+                archivedOpen={archivedOpen}
+                onRestoreProject={restoreProject}
+                onToggleArchived={() => setSidebarArchivedOpen(!archivedOpen)}
                 projectContent={inProject ? enteredProjectContent : undefined}
                 projectOverview={projectOverview}
                 projectOverviewPreviews={overviewPreviews}

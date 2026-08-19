@@ -1564,6 +1564,9 @@ export interface Translations {
       noColor: string
       menuAddFolder: string
       menuSetActive: string
+      menuArchive: string
+      archivedSection: string
+      restoreProject: string
       menuDelete: string
       reveal: string
       copyPath: string

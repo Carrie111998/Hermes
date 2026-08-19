@@ -171,6 +171,9 @@ export const $dismissedWorktreeIds = persistentAtom(
 )
 export const $sidebarPinsOpen = atom(true)
 export const $sidebarRecentsOpen = atom(true)
+// Archived projects hide in a collapsible section at the bottom of the
+// overview; collapsed by default so a fully-archived sidebar stays clean.
+export const $sidebarArchivedOpen = atom(false)
 // Cron-job sessions live in their own section below recents, collapsed by
 // default (it only renders at all when cron sessions exist) so the
 // scheduler's `[IMPORTANT: …]` first-message previews don't spam recents.
@@ -333,6 +336,10 @@ export function setSidebarPinsOpen(open: boolean) {
 
 export function setSidebarRecentsOpen(open: boolean) {
   $sidebarRecentsOpen.set(open)
+}
+
+export function setSidebarArchivedOpen(open: boolean) {
+  $sidebarArchivedOpen.set(open)
 }
 
 export function setSidebarCronOpen(open: boolean) {

@@ -11074,13 +11074,15 @@ def _project_tree_row(r: dict) -> dict:
 
 def _project_tree_inputs(
     db, session_limit: int, *, include_discovered: bool
-) -> tuple[list[dict], list[dict], list[dict], str | None]:
-    """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
+) -> tuple[list[dict], list[dict], list[dict], str | None, list[dict]]:
+    """Gather (sessions, projects, discovered_repos, active_id, archived_projects).
 
     ``include_discovered`` is the zero-session-repo overview tier; the entered
     view (drill-in) skips it entirely — it only needs the project it's showing,
     which already has sessions — avoiding the distinct-cwd scan + git probes on
     that per-turn path. One projects.db connection serves both reads.
+    ``archived_projects`` are the hidden (archived=1) explicit projects, served
+    so the desktop can render its restore section without a second RPC.
     """
     rows = db.list_sessions_rich(
         limit=session_limit,
@@ -11109,6 +11111,7 @@ def _project_tree_inputs(
                 preserve_unversioned=_repo_discovery_policy_is_default(policy),
             )
         projects = [p.to_dict() for p in pdb.list_projects(conn)]
+        archived_projects = [p.to_dict() for p in pdb.list_projects(conn, include_archived=True) if p.archived]
         active_id = pdb.get_active_id(conn)
         # backfill stays off the hot tree path — grouping uses the live resolver.
         discovered = (
@@ -11122,7 +11125,7 @@ def _project_tree_inputs(
             else []
         )
 
-    return sessions, projects, discovered, active_id
+    return sessions, projects, discovered, active_id, archived_projects
 
 
 # Per-build memo for `_dir_exists_cached`. Cleared at the top of every
@@ -11148,12 +11151,15 @@ def _dir_exists_cached(path: str) -> bool:
 
 def _build_project_tree(
     db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool
-) -> tuple[dict, str | None]:
-    """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
+) -> tuple[dict, str | None, list[dict]]:
+    """Gather inputs and run the one authoritative builder.
+
+    Returns (tree, active_id, archived_projects).
+    """
     from tui_gateway import project_tree
 
     _DIR_EXISTS_CACHE.clear()
-    sessions, projects, discovered, active_id = _project_tree_inputs(
+    sessions, projects, discovered, active_id, archived_projects = _project_tree_inputs(
         db, session_limit, include_discovered=include_discovered
     )
     tree = project_tree.build_tree(
@@ -11167,7 +11173,7 @@ def _build_project_tree(
         is_junk_cwd=_is_session_cwd_junk,
         exists=_dir_exists_cached,
     )
-    return tree, active_id
+    return tree, active_id, archived_projects
 
 
 # ── Methods: tools & system ──────────────────────────────────────────

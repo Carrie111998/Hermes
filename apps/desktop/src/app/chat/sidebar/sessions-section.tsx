@@ -3,6 +3,7 @@ import type * as React from 'react'
 import { useMemo } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
+import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { HermesGitWorktree } from '@/global'
@@ -16,6 +17,7 @@ import { sessionPinId } from '@/store/session'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import {
+  ArchivedProjectRow,
   EnteredProjectContent,
   ProjectOverviewRow,
   type SidebarProjectTree,
@@ -137,6 +139,12 @@ interface SidebarSessionsSectionProps {
   onReorderSessions?: (ids: string[]) => void
   // Drag-to-reorder for the project overview list (top-level projects).
   onReorderProjects?: (ids: string[]) => void
+  // Archived (hidden) projects, rendered below the overview as a collapsible
+  // section so they can be restored without leaving the app.
+  projectArchived?: SidebarProjectTree[]
+  onRestoreProject?: (id: string) => void
+  archivedOpen?: boolean
+  onToggleArchived?: () => void
   // Rendered atop the entered-project body (a "back to overview" row).
   projectBackRow?: React.ReactNode
   dndSensors?: ReturnType<typeof useSensors>
@@ -187,12 +195,17 @@ export function SidebarSessionsSection({
   sortable = false,
   onReorderSessions,
   onReorderProjects,
+  projectArchived,
+  onRestoreProject,
+  archivedOpen = false,
+  onToggleArchived,
   projectBackRow,
   dndSensors,
   showProfileTags = false,
   dateGrouped = false
 }: SidebarSessionsSectionProps) {
   const { t } = useI18n()
+  const s = t.sidebar
   const dividerLabels = t.sidebar.dateDivider
   const sectionOpen = collapsible ? open : true
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
@@ -403,6 +416,32 @@ export function SidebarSessionsSection({
   // to avoid a double scroll container.
   const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-y-visible')
 
+  // Archived projects live at the bottom of the overview in their own
+  // collapsible section (collapsed by default), so hiding a project never
+  // strands its restore affordance off-screen or in the CLI.
+  const archivedSection =
+    projectArchived && projectArchived.length > 0 && onRestoreProject && onToggleArchived ? (
+      <div className="mt-1 border-t border-(--ui-border-subtle) pt-1">
+        <SidebarSectionHeader
+          collapsible
+          icon={<Codicon name="archive" size="0.75rem" />}
+          label={s.projects.archivedSection}
+          meta={
+            <span className="text-[0.6875rem] text-(--ui-text-quaternary)">{projectArchived.length}</span>
+          }
+          onToggle={onToggleArchived}
+          open={archivedOpen}
+        />
+        {archivedOpen && (
+          <div className="flex flex-col gap-px">
+            {projectArchived.map(project => (
+              <ArchivedProjectRow key={project.id} onRestore={onRestoreProject} project={project} />
+            ))}
+          </div>
+        )}
+      </div>
+    ) : null
+
   return (
     <SidebarGroup className={rootClassName}>
       <SidebarSectionHeader
@@ -417,6 +456,7 @@ export function SidebarSessionsSection({
       {sectionOpen && (
         <SidebarGroupContent className={resolvedContentClassName}>
           {inner}
+          {archivedSection}
           {footer}
         </SidebarGroupContent>
       )}

@@ -33,6 +33,10 @@ export const $activeProjectId = atom<null | string>(null)
 // source of project membership — the desktop no longer derives it.
 export const $projectTree = atom<SidebarProjectTree[]>([])
 export const $projectTreeLoading = atom(false)
+// Archived (hidden) explicit projects served alongside the tree — the sidebar's
+// collapsible restore section. Empty on backends without the archived_projects
+// field (the desktop then offers no restore affordance, only CLI `hermes project restore`).
+export const $archivedProjects = atom<SidebarProjectTree[]>([])
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -378,6 +382,9 @@ export async function refreshProjects(): Promise<void> {
 
 interface ProjectTreePayload {
   projects: SidebarProjectTree[]
+  // Archived (hidden) explicit projects, rendered as the sidebar's restore
+  // section. Missing on older backends — the desktop then shows no restore UI.
+  archived_projects?: ProjectInfo[]
   active_id: null | string
   scoped_session_ids: string[]
 }
@@ -402,6 +409,7 @@ async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
 
     const scoped = new Set(res.scoped_session_ids ?? [])
     $projectTree.set(res.projects ?? [])
+    $archivedProjects.set((res.archived_projects ?? []).map(archivedToTreeNode))
     $activeProjectId.set(res.active_id ?? null)
     const tombstones = $removedSessionIds.get()
 
@@ -688,6 +696,13 @@ function projectInfoToTreeNode(project: ProjectInfo): SidebarProjectTree {
   }
 }
 
+// Map an archived ProjectInfo onto a minimal overview tree node — the same
+// stub as projectInfoToTreeNode, flagged archived so the sidebar's restore
+// section renders it (and session grouping never claims it).
+function archivedToTreeNode(project: ProjectInfo): SidebarProjectTree {
+  return { ...projectInfoToTreeNode(project), archived: true }
+}
+
 export async function createProject(input: CreateProjectInput): Promise<ProjectInfo | null> {
   if ($projectsRpcAvailable.get() === false) {
     throw projectsStaleBackendError()
@@ -902,6 +917,45 @@ export async function deleteProject(id: string): Promise<void> {
   })
   void refreshProjectTree()
 }
+
+// Archive (hide from every project surface) or restore a project. Optimistic,
+// like delete: the cached list/tree flip instantly, the `projects.archive` RPC
+// reconciles in the background, and a failed write rolls the whole cache back.
+// Archiving never touches files or sessions — the project record (and its
+// folders) just stops being listed, and restore brings it back as-is.
+export async function archiveProject(id: string, restore = false): Promise<void> {
+  const snap = snapshotProjects()
+
+  const setArchived = (archived: boolean) => {
+    $projects.set($projects.get().map(project => (project.id === id ? { ...project, archived } : project)))
+    $projectTree.set($projectTree.get().map(node => (node.id === id ? { ...node, archived } : node)))
+
+    const current = $archivedProjects.get()
+
+    if (archived) {
+      const info = $projects.get().find(project => project.id === id)
+
+      if (info && !current.some(node => node.id === id)) {
+        $archivedProjects.set([...current, archivedToTreeNode(info)])
+      }
+    } else {
+      $archivedProjects.set(current.filter(node => node.id !== id))
+    }
+  }
+
+  setArchived(!restore)
+
+  if (!restore && snap.active === id) {
+    $activeProjectId.set(null)
+  }
+
+  await persistOrRollback(snap, async () => {
+    applyPayload(await gatewayRequest<ProjectsPayload>('projects.archive', { id, restore }))
+  })
+  void refreshProjectTree()
+}
+
+export const restoreProject = (id: string): Promise<void> => archiveProject(id, true)
 
 export async function setActiveProject(id: null | string): Promise<void> {
   const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id })

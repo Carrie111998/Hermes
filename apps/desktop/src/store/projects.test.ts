@@ -5,16 +5,20 @@ import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/proje
 import { $sidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import { applyConfiguredDefaultProjectDir } from '@/store/session'
+import type { ProjectInfo } from '@/types/hermes'
 
 import {
   $activeProjectId,
+  $archivedProjects,
   $projectScope,
+  $projects,
   $projectsRpcAvailable,
   $projectTree,
   $removedSessionIds,
   $sessionMutationsInFlight,
   $worktreeRefreshToken,
   ALL_PROJECTS,
+  archiveProject,
   beginSessionMutation,
   createProject,
   endSessionMutation,
@@ -27,6 +31,7 @@ import {
   refreshProjectTree,
   refreshWorktrees,
   resolveNewSessionCwd,
+  restoreProject,
   scanAndRecordRepos,
   tombstoneSessions
 } from './projects'
@@ -483,5 +488,84 @@ describe('tombstone pruning', () => {
     await refreshProjectTree()
 
     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+  })
+})
+
+describe('archiveProject', () => {
+  const info = (over: Partial<ProjectInfo> = {}): ProjectInfo => ({
+    id: 'p_1',
+    slug: 'project-1',
+    name: 'Project 1',
+    description: null,
+    icon: null,
+    color: null,
+    board_slug: null,
+    primary_path: '/work/project-1',
+    archived: false,
+    created_at: 0,
+    folders: [{ path: '/work/project-1', label: null, is_primary: true, added_at: 0 }],
+    ...over
+  })
+
+  const treeNode = (over: Partial<SidebarProjectTree> = {}): SidebarProjectTree => ({
+    id: 'p_1',
+    label: 'Project 1',
+    path: '/work/project-1',
+    repos: [],
+    sessionCount: 0,
+    ...over
+  })
+
+  const openGatewayResponding = () => {
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn((method: string, params?: { restore?: boolean }) => {
+        if (method === 'projects.tree') {
+          return Promise.resolve({ projects: [], active_id: null, scoped_session_ids: [] })
+        }
+
+        return Promise.resolve({ active_id: null, projects: [info({ archived: !params?.restore })] })
+      })
+    }
+
+    activeGateway.mockImplementation(() => gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    return gateway
+  }
+
+  beforeEach(() => {
+    $projects.set([])
+    $projectTree.set([])
+    $archivedProjects.set([])
+    $activeProjectId.set(null)
+  })
+
+  it('archives optimistically: tree node flips, active pointer drops, restore list gains it', async () => {
+    $projects.set([info()])
+    $projectTree.set([treeNode()])
+    $activeProjectId.set('p_1')
+    openGatewayResponding()
+
+    await archiveProject('p_1')
+
+    expect($projects.get()[0].archived).toBe(true)
+    expect($projectTree.get()[0].archived).toBe(true)
+    expect($activeProjectId.get()).toBeNull()
+    expect($archivedProjects.get().map(project => project.id)).toEqual(['p_1'])
+  })
+
+  it('restore removes the project from the archived list and unflags it', async () => {
+    $projects.set([info({ archived: true })])
+    $projectTree.set([treeNode({ archived: true })])
+    $archivedProjects.set([treeNode({ archived: true })])
+    $activeProjectId.set(null)
+    openGatewayResponding()
+
+    await restoreProject('p_1')
+
+    expect($projects.get()[0].archived).toBe(false)
+    expect($projectTree.get()[0].archived).toBe(false)
+    expect($archivedProjects.get().map(project => project.id)).toEqual([])
   })
 })

@@ -62,6 +62,45 @@ export function ProjectBackRow({ label, onClick }: { label: string; onClick: () 
   )
 }
 
+// A row in the archived-projects section: the project's identity (icon + name)
+// plus a restore action. Not clickable to enter — an archived project has no
+// live workspace until it's restored, so the row only offers that single step.
+export function ArchivedProjectRow({
+  project,
+  onRestore
+}: {
+  project: SidebarProjectTree
+  onRestore: (id: string) => void
+}) {
+  const { t } = useI18n()
+  const s = t.sidebar
+
+  return (
+    <SidebarRowShell
+      actions={
+        <Tip label={s.projects.restoreProject}>
+          <button
+            aria-label={s.projects.restoreProject}
+            className="flex items-center gap-1 rounded px-1 py-0.5 text-xs text-(--ui-text-tertiary) opacity-0 transition group-hover/workspace:opacity-100 hover:bg-(--ui-control-hover-background) hover:text-foreground"
+            onClick={() => onRestore(project.id)}
+            type="button"
+          >
+            <Codicon name="archive" size="0.8125rem" />
+            <span>{s.projects.restoreProject}</span>
+          </button>
+        </Tip>
+      }
+      className="group/workspace opacity-60 hover:opacity-100"
+    >
+      <SidebarRowCluster className="min-w-0 flex-1">
+        <SidebarRowLead>{projectIcon(project)}</SidebarRowLead>
+        <SidebarRowLabel className="truncate text-xs text-(--ui-text-tertiary)">{project.label}</SidebarRowLabel>
+        <span className="flex-1" />
+      </SidebarRowCluster>
+    </SidebarRowShell>
+  )
+}
+
 interface ProjectOverviewRowProps {
   project: SidebarProjectTree
   onEnter?: (id: string) => void

@@ -7,7 +7,7 @@ export {
   sortProjectsForOverview,
   useRepoWorktreeMap
 } from './model'
-export { ProjectBackRow, ProjectOverviewRow } from './overview-row'
+export { ArchivedProjectRow, ProjectBackRow, ProjectOverviewRow } from './overview-row'
 export { ProjectMenu } from './project-menu'
 export { SidebarWorkspaceGroup } from './workspace-group'
 export {
