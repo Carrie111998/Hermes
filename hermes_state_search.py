@@ -132,7 +132,6 @@ class _LineageResolutionState:
         "memo_hits",
         "bound_hit",
         "candidates_inspected",
-        "accepted_roots",
     )
 
     def __init__(self, budget: int = _LINEAGE_WORK_BUDGET) -> None:
@@ -142,7 +141,6 @@ class _LineageResolutionState:
         self.memo_hits = 0
         self.bound_hit = False
         self.candidates_inspected = 0
-        self.accepted_roots = 0
 
     def _memoize_unresolved(self, path: List[str], node: str) -> None:
         """Mark *path* plus *node* as proven unresolved (zero later lookups)."""
@@ -2730,7 +2728,6 @@ class SessionSearchMixin:
                         continue
                     # First displayable hit of this owner in rank order.
                     seen_roots.add(root)
-                    state.accepted_roots = len(seen_roots)
                     winner = dict(candidate)
                     winner["lineage_root_id"] = root
                     winners.append(winner)

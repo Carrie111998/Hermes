@@ -171,16 +171,12 @@ def _resolve_lineage(db, session_id: str) -> Optional[str]:
     resolver used by winner selection.  Returns ``None`` when the outcome is
     unresolved / budget-exhausted — never a fabricated root (#68): a resource
     limit is not evidence, so a B-limited resolution must not pretend the
-    session is its own root.  The old generic-parent walk is kept only as a
-    compatibility fallback for small test doubles / older DB objects.
+    session is its own root.
     """
     if not session_id:
         return session_id
-    resolver = getattr(db, "resolve_compression_lineage", None)
-    if resolver is None:
-        return _resolve_to_parent(db, session_id)[0]
     try:
-        return resolver(session_id)
+        return db.resolve_compression_lineage(session_id)
     except Exception:
         logging.debug(
             "compression lineage resolution failed for %s",
@@ -828,33 +824,24 @@ def _discover(
     _truncated = bool(winner_stats.get("lineage_bound_hit"))
 
     if not winner_rows and not title_result:
+        _empty_payload = {
+            "success": True,
+            "mode": "discover",
+            "query": query,
+            "detail": detail,
+            "results": [],
+            "count": 0,
+            "truncated": _truncated,
+        }
         if _truncated:
             # The lineage safety work bound stopped the scan before any
             # winner: this is an incomplete result, never "no matches".
-            _empty_payload = {
-                "success": True,
-                "mode": "discover",
-                "query": query,
-                "detail": detail,
-                "results": [],
-                "count": 0,
-                "truncated": True,
-                "warning": (
-                    "Session search stopped at the lineage safety work bound; "
-                    "results are a safe ranked prefix and may be incomplete."
-                ),
-            }
+            _empty_payload["warning"] = (
+                "Session search stopped at the lineage safety work bound; "
+                "results are a safe ranked prefix and may be incomplete."
+            )
         else:
-            _empty_payload = {
-                "success": True,
-                "mode": "discover",
-                "query": query,
-                "detail": detail,
-                "results": [],
-                "count": 0,
-                "truncated": False,
-                "message": "No matching sessions found.",
-            }
+            _empty_payload["message"] = "No matching sessions found."
         _annotate_rebuild_status(db, _empty_payload)
         return json.dumps(_empty_payload, ensure_ascii=False)
 
