@@ -20,10 +20,12 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import types
 
 import pytest
 
+import tests.conftest as _conftest
 from tests.conftest import PROJECT_ROOT
 
 # A guaranteed-foreign PID: PID 1 (init).  Owned by root, not us, and
@@ -386,6 +388,65 @@ def test_git_dash_c_stash_targeting_project_root_blocked(tmp_path):
         subprocess.run(
             ["git", "-C", str(PROJECT_ROOT), "stash", "push"], cwd=tmp_path
         )
+
+
+# ─────────────── import-time layer (no fixture required) ───────────────
+#
+# _live_system_guard is function-scoped, so it is inactive during collection,
+# during session/module-scoped fixture setup+teardown, and after the last
+# test. The import-time wrappers installed by conftest cover those windows.
+
+
+def test_import_time_git_guard_is_installed_without_any_fixture():
+    """Importing conftest alone must install the wrappers.
+
+    Checked in a FRESH interpreter on purpose: inside a running test the
+    autouse fixture has layered its own wrappers on top, so inspecting
+    subprocess.run here would only prove the fixture ran. A clean process
+    that merely imports conftest is exactly the collection-time situation
+    this layer exists to cover.
+    """
+    probe = (
+        "import sys; sys.path.insert(0, %r);"
+        "import tests.conftest, subprocess, os;"
+        "print(getattr(subprocess.run, '_git_guarded', False),"
+        "      getattr(subprocess.Popen, '_git_guarded', False),"
+        "      getattr(os.system, '_git_guarded', False))"
+    ) % str(PROJECT_ROOT)
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["True", "True", "True"], result.stdout
+
+
+def test_import_time_predicate_flags_destructive_git():
+    """The shared predicate — the one consulted in the fixture-less
+    collection window — classifies correctly."""
+    flag = _conftest._destructive_git_against_project_root
+    assert flag(["git", "stash", "push"], {"cwd": PROJECT_ROOT})
+    assert flag(["git", "reset", "--hard"], {"cwd": PROJECT_ROOT})
+    assert flag(["bash", "-c", "git reset --hard"], {"cwd": PROJECT_ROOT})
+    assert flag(["git", "-C", str(PROJECT_ROOT), "checkout", "main"], {})
+
+
+def test_import_time_predicate_allows_safe_calls(tmp_path):
+    flag = _conftest._destructive_git_against_project_root
+    assert not flag(["git", "stash", "list"], {"cwd": PROJECT_ROOT})
+    assert not flag(["git", "status"], {"cwd": PROJECT_ROOT})
+    assert not flag(["git", "reset", "--hard"], {"cwd": tmp_path})
+    assert not flag(["echo", "git reset --hard"], {"cwd": PROJECT_ROOT})
+
+
+def test_os_system_destructive_git_blocked(monkeypatch):
+    # Either layer may catch it first (the fixture wraps on top of the
+    # import-time wrapper); both refuse, which is all that matters here.
+    monkeypatch.chdir(PROJECT_ROOT)
+    with pytest.raises(RuntimeError, match="guard"):
+        os.system("git reset --hard")
 
 
 # ──────────────────── pass-through cases (must NOT raise) ──────

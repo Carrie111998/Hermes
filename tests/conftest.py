@@ -989,6 +989,196 @@ def _ensure_current_event_loop(request):
 # delivery is harmless.
 
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
+
+
+# ── Import-time destructive-git guard (#git-mutation, 2026-08-12) ──────────
+#
+# ``_live_system_guard`` below is a FUNCTION-SCOPED autouse fixture, so it is
+# only active while a test function is running. It cannot see:
+#   • module-level code executing during COLLECTION (import of a test module)
+#   • session/module-scoped fixture setup and teardown
+#   • anything running after the last test's teardown
+#
+# A real `git stash push` against PROJECT_ROOT from any of those windows would
+# sweep away uncommitted work exactly as the 2026-08-11 / 2026-08-12 incidents
+# did. The wrappers below are installed once, at import time, and stay for the
+# whole process — so the destructive-git check has no blind spot. The fixture
+# delegates to the same predicate, so the two can never drift apart.
+
+_DESTRUCTIVE_GIT_VERBS = (
+    "checkout", "reset", "clean", "switch", "stash", "restore",
+)
+#: ``git stash list``/``show`` only READ — blocking them buys no safety.
+_READONLY_STASH_SUBCOMMANDS = ("list", "show")
+#: Wrappers that can hide a git call in a later argument.
+_GIT_WRAPPER_COMMANDS = frozenset(
+    {"bash", "sh", "zsh", "dash", "env", "sudo", "setsid", "nohup", "time",
+     "xargs", "script", "stdbuf"}
+)
+
+#: Set by ``_live_system_guard`` for tests carrying
+#: ``@pytest.mark.live_system_guard_bypass`` so the import-time layer honors
+#: the same opt-out the fixture does.
+_GIT_GUARD_BYPASS = False
+
+
+def _git_guard_tokens(cmd):
+    """Flatten any command form into a flat token list.
+
+    A list argv is JOINED and then re-split, deliberately: for
+    ``["bash", "-c", "git reset --hard"]`` the dangerous git call lives
+    *inside* a single argv element, so scanning the raw list elements would
+    never see a ``git`` token. Joining first flattens that nesting. (Losing
+    this step let a real `git reset --hard` through during development.)
+    """
+    import shlex
+    if isinstance(cmd, (list, tuple)):
+        text = " ".join(
+            c.decode(errors="replace") if isinstance(c, bytes) else str(c)
+            for c in cmd
+        )
+    elif isinstance(cmd, bytes):
+        text = cmd.decode(errors="replace")
+    elif isinstance(cmd, str):
+        text = cmd
+    else:
+        text = str(cmd)
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def _destructive_git_against_project_root(cmd, kwargs) -> bool:
+    """True for a real ``git checkout/reset/clean/switch/stash/restore``
+    aimed at PROJECT_ROOT — this repo's own checkout."""
+    if _GIT_GUARD_BYPASS:
+        return False
+    tokens = _git_guard_tokens(cmd)
+    if not tokens:
+        return False
+
+    def _base(tok):
+        return tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+    # A bare `git ...` argv only needs argv[0]; wrappers need a full scan.
+    scan = tokens if _base(tokens[0]) in _GIT_WRAPPER_COMMANDS else tokens[:1]
+    if not any(_base(t) == "git" for t in scan):
+        return False
+
+    matched = next((t for t in tokens if t in _DESTRUCTIVE_GIT_VERBS), None)
+    if matched is None:
+        return False
+    if matched == "stash":
+        after = tokens[tokens.index("stash") + 1:]
+        sub = next((t for t in after if not t.startswith("-")), "push")
+        if sub in _READONLY_STASH_SUBCOMMANDS:
+            return False
+
+    cwd = (kwargs or {}).get("cwd")
+    try:
+        target_dir = Path(cwd).resolve() if cwd else Path.cwd()
+    except Exception:
+        return False
+
+    # `-C <path>` / --git-dir / --work-tree retarget regardless of cwd.
+    override = None
+    for i, tok in enumerate(tokens):
+        if tok == "-C" and i + 1 < len(tokens):
+            override = tokens[i + 1]
+        elif tok.startswith("--git-dir=") or tok.startswith("--work-tree="):
+            override = tok.split("=", 1)[1]
+        elif tok in ("--git-dir", "--work-tree") and i + 1 < len(tokens):
+            override = tokens[i + 1]
+    if override is not None:
+        try:
+            cand = Path(override)
+            target_dir = (
+                cand if cand.is_absolute() else target_dir / cand
+            ).resolve()
+            if target_dir.name == ".git":
+                target_dir = target_dir.parent
+        except Exception:
+            return False
+
+    try:
+        target_dir.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return False
+    return True
+
+
+def _git_guard_raise(where, cmd):
+    raise RuntimeError(
+        f"tests/conftest.py import-time git guard: blocked {where}({cmd!r}) "
+        f"— a real destructive git command "
+        f"(checkout/reset/clean/switch/stash/restore) aimed at PROJECT_ROOT "
+        f"({PROJECT_ROOT}), this repo's own checkout. Running it for real "
+        "discards uncommitted work (this happened on 2026-08-11 and "
+        "2026-08-12: `hermes update`'s autostash reached the live repo from "
+        "inside a test). Mock the subprocess call, or pass an isolated cwd "
+        "(e.g. tmp_path). Use @pytest.mark.live_system_guard_bypass only if "
+        "a real git mutation of PROJECT_ROOT is genuinely intended."
+    )
+
+
+def _install_import_time_git_guard():
+    import os as _os
+    import subprocess as _sp
+
+    for _name in ("run", "call", "check_call", "check_output"):
+        _real = getattr(_sp, _name, None)
+        if _real is None or getattr(_real, "_git_guarded", False):
+            continue
+
+        def _make(real, name):
+            def _guarded(cmd, *a, **kw):
+                if _destructive_git_against_project_root(cmd, kw):
+                    _git_guard_raise(f"subprocess.{name}", cmd)
+                return real(cmd, *a, **kw)
+            _guarded.__name__ = f"_git_guarded_{name}"
+            _guarded._git_guarded = True
+            return _guarded
+
+        setattr(_sp, _name, _make(_real, _name))
+
+    # Popen is a CLASS — subclass it so `subprocess.Popen | None` annotations
+    # and isinstance checks keep working.
+    if not getattr(_sp.Popen, "_git_guarded", False):
+        _RealPopen = _sp.Popen
+
+        class _GitGuardedPopen(_RealPopen):  # type: ignore[misc, valid-type]
+            _git_guarded = True
+
+            def __init__(self, cmd, *a, **kw):
+                if _destructive_git_against_project_root(cmd, kw):
+                    _git_guard_raise("subprocess.Popen", cmd)
+                super().__init__(cmd, *a, **kw)
+
+        _GitGuardedPopen.__name__ = "Popen"
+        _GitGuardedPopen.__qualname__ = "Popen"
+        _sp.Popen = _GitGuardedPopen
+
+    for _name in ("system", "popen"):
+        _real = getattr(_os, _name, None)
+        if _real is None or getattr(_real, "_git_guarded", False):
+            continue
+
+        def _make_os(real, name):
+            def _guarded(cmd, *a, **kw):
+                # os.system/os.popen have no cwd kwarg — they inherit the
+                # process cwd, which the predicate resolves itself.
+                if _destructive_git_against_project_root(cmd, {}):
+                    _git_guard_raise(f"os.{name}", cmd)
+                return real(cmd, *a, **kw)
+            _guarded.__name__ = f"_git_guarded_os_{name}"
+            _guarded._git_guarded = True
+            return _guarded
+
+        setattr(_os, _name, _make_os(_real, _name))
+
+
+_install_import_time_git_guard()
 _REQUIRES_WAL_MARK = "requires_wal"
 
 
@@ -1299,7 +1489,16 @@ def _live_system_guard(request, monkeypatch):
     targeting hermes/python patterns are also blocked.
     """
     if request.node.get_closest_marker(_LIVE_SYSTEM_GUARD_BYPASS_MARK):
-        yield
+        # The import-time git guard is process-wide and outlives this fixture,
+        # so the opt-out has to reach it too — otherwise a bypassed test would
+        # still be blocked by the outer layer.
+        global _GIT_GUARD_BYPASS
+        _previous = _GIT_GUARD_BYPASS
+        _GIT_GUARD_BYPASS = True
+        try:
+            yield
+        finally:
+            _GIT_GUARD_BYPASS = _previous
         return
 
     import os as _os
@@ -1481,87 +1680,14 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
-    _DESTRUCTIVE_GIT_VERBS = (
-        "checkout", "reset", "clean", "switch", "stash", "restore",
-    )
-    #: ``git stash list``/``show`` only READ. The mutating forms
-    #: (push/save/pop/apply/drop/clear) are the ones that sweep the working
-    #: tree — and `stash push` is what actually caused the 2026-08-11 and
-    #: 2026-08-12 incidents, via `hermes update`'s autostash.
-    _READONLY_STASH_SUBCOMMANDS = ("list", "show")
-
     def _is_destructive_git_against_project_root(cmd, kwargs) -> bool:
-        """True for a real (unmocked) ``git checkout``/``reset``/``clean``/
-        ``switch`` whose cwd resolves inside PROJECT_ROOT — this repo's own
-        live checkout.
+        """Delegates to the module-level predicate installed at import time.
 
-        A test that forgets to mock ``subprocess.run`` for one of these
-        verbs silently flips the developer's actual branch or discards
-        real uncommitted work (confirmed data loss, 2026-08-11 — see
-        Operations.md's isolated-clone-first rule). ``hermes update``
-        already has its own dedicated check above; this covers the raw
-        git-command case directly, which a test can reach without ever
-        going through ``hermes update`` at all.
+        Kept as a thin wrapper so the fixture and the import-time guard can
+        never diverge: one definition of "destructive git against
+        PROJECT_ROOT", used by both layers.
         """
-        cmd_str = _cmd_to_string(cmd)
-        try:
-            tokens = _shlex.split(cmd_str)
-        except ValueError:
-            tokens = cmd_str.split()
-        if not tokens:
-            return False
-        head0 = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        # Wrapper executables (bash -c "git reset --hard", sudo git ..., etc.)
-        # need full-token scanning; a bare "git ..." argv only needs argv[0].
-        git_tokens = tokens if head0 in _WRAPPER_COMMANDS else tokens[:1]
-        if not any(
-            t.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] == "git" for t in git_tokens
-        ):
-            return False
-        matched = next((t for t in tokens if t in _DESTRUCTIVE_GIT_VERBS), None)
-        if matched is None:
-            return False
-        if matched == "stash":
-            after = tokens[tokens.index("stash") + 1:]
-            # Bare `git stash` == `git stash push`, hence the default.
-            sub = next((t for t in after if not t.startswith("-")), "push")
-            if sub in _READONLY_STASH_SUBCOMMANDS:
-                return False
-        cwd = (kwargs or {}).get("cwd")
-        try:
-            resolved_cwd = Path(cwd).resolve() if cwd else Path.cwd()
-        except Exception:
-            return False
-
-        # `git -C <path> checkout ...` (and --git-dir/--work-tree) retarget the
-        # command at <path> REGARDLESS of cwd, so a cwd-only check sails right
-        # past them. hermes_cli/mcp_catalog.py really does build
-        # `git -C <dest> checkout <ref>`, so this is a live shape, not
-        # hypothetical. Resolve the override relative to cwd and judge THAT.
-        target = None
-        for i, tok in enumerate(tokens):
-            if tok == "-C" and i + 1 < len(tokens):
-                target = tokens[i + 1]
-            elif tok.startswith("--git-dir=") or tok.startswith("--work-tree="):
-                target = tok.split("=", 1)[1]
-            elif tok in ("--git-dir", "--work-tree") and i + 1 < len(tokens):
-                target = tokens[i + 1]
-        if target is not None:
-            try:
-                candidate = Path(target)
-                resolved_cwd = (
-                    candidate if candidate.is_absolute() else resolved_cwd / candidate
-                ).resolve()
-                # A .git directory means the WORK TREE is its parent.
-                if resolved_cwd.name == ".git":
-                    resolved_cwd = resolved_cwd.parent
-            except Exception:
-                return False
-        try:
-            resolved_cwd.relative_to(PROJECT_ROOT)
-        except ValueError:
-            return False
-        return True
+        return _destructive_git_against_project_root(cmd, kwargs)
 
     def _check_subprocess_cmd(name, cmd, kwargs=None):
         if _is_destructive_git_against_project_root(cmd, kwargs):
