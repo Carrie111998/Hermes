@@ -2775,6 +2775,8 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     provider = None
     base_url = None
     api_key = None
+    requested_provider = None
+    user_providers = None
     custom_providers = None
     configured_model = None
     configured_provider = None
@@ -2799,8 +2801,10 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
             try:
                 from hermes_cli.config import get_compatible_custom_providers
 
+                user_providers = data.get("providers")
                 custom_providers = get_compatible_custom_providers(data)
             except Exception:
+                user_providers = data.get("providers")
                 custom_providers = data.get("custom_providers")
     except Exception:
         pass
@@ -2808,6 +2812,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     try:
         runtime = _resolve_runtime_agent_kwargs()
         provider = runtime.get("provider") or provider
+        requested_provider = runtime.get("requested_provider") or configured_provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
     except Exception:
@@ -2828,6 +2833,18 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
                 config_context_length = None
         except Exception:
             config_context_length = None
+
+    if config_context_length is None and user_providers:
+        try:
+            from hermes_cli.config import get_named_provider_context_length
+
+            config_context_length = get_named_provider_context_length(
+                model=resolved_model,
+                provider=requested_provider or configured_provider or provider or "",
+                user_providers=user_providers,
+            )
+        except Exception:
+            pass
 
     if config_context_length is None and custom_providers and base_url:
         try:
@@ -18222,7 +18239,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _msg_config_ctx = None
                     except Exception:
                         _msg_config_ctx = None
-                if _msg_custom_providers and _msg_base_url:
+                if _msg_config_ctx is None and isinstance(_msg_cfg, dict):
+                    try:
+                        from hermes_cli.config import get_named_provider_context_length
+
+                        _msg_config_ctx = get_named_provider_context_length(
+                            model=_msg_model,
+                            provider=(
+                                _msg_runtime.get("requested_provider")
+                                or _msg_model_cfg.get("provider")
+                                or _msg_runtime.get("provider")
+                                or ""
+                            ),
+                            user_providers=_msg_cfg.get("providers"),
+                        )
+                    except Exception:
+                        pass
+                if (
+                    _msg_config_ctx is None
+                    and _msg_custom_providers
+                    and _msg_base_url
+                ):
                     try:
                         from hermes_cli.config import get_custom_provider_context_length
 
@@ -19002,6 +19039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_configured_provider = None
             _hyg_configured_base_url = None
             _hyg_data = {}
+            _hyg_runtime = {}
             try:
                 _hyg_data = _load_gateway_config()
                 if _hyg_data:
@@ -19101,9 +19139,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         _hyg_config_context_length = None
 
-                # Check custom_providers per-model context_length
+                # Check selected named-provider metadata before the legacy
+                # endpoint-scoped custom_providers fallback.
                 # (same fallback as run_agent.py lines 1171-1189).
                 # Must run after runtime resolution so _hyg_base_url is set.
+                if _hyg_config_context_length is None:
+                    try:
+                        from hermes_cli.config import (
+                            get_named_provider_context_length as _gw_gnpcl,
+                        )
+
+                        _hyg_config_context_length = _gw_gnpcl(
+                            model=_hyg_model,
+                            provider=(
+                                _hyg_runtime.get("requested_provider")
+                                or _hyg_configured_provider
+                                or _hyg_provider
+                                or ""
+                            ),
+                            user_providers=_hyg_data.get("providers"),
+                        )
+                    except Exception:
+                        pass
                 if _hyg_config_context_length is None and _hyg_base_url:
                     try:
                         try:

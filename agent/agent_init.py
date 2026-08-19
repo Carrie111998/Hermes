@@ -2470,9 +2470,30 @@ def init_agent(
     # Store for reuse by _check_compression_model_feasibility (auxiliary
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
+    agent._user_providers = (
+        _agent_cfg.get("providers")
+        if isinstance(_agent_cfg.get("providers"), dict)
+        else {}
+    )
     _merge_custom_provider_extra_body(agent, _custom_providers)
 
-    # Check custom_providers per-model context_length
+    # Prefer exact metadata from the selected named provider. Provider identity
+    # keeps shared endpoints from borrowing another route's model metadata.
+    if _config_context_length is None and agent._user_providers:
+        try:
+            from hermes_cli.config import get_named_provider_context_length
+
+            _named_ctx_resolved = get_named_provider_context_length(
+                model=agent.model,
+                provider=agent.requested_provider,
+                user_providers=agent._user_providers,
+            )
+            if _named_ctx_resolved:
+                _config_context_length = int(_named_ctx_resolved)
+        except Exception:
+            pass
+
+    # Check legacy custom_providers per-model context_length.
     if _config_context_length is None and _custom_providers:
         try:
             from hermes_cli.config import get_custom_provider_context_length

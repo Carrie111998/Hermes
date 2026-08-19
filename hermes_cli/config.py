@@ -1863,6 +1863,61 @@ def get_custom_provider_context_length(
     return None
 
 
+def get_named_provider_context_length(
+    model: str,
+    provider: str,
+    user_providers: Optional[Dict[str, Any]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Return exact per-model metadata for the selected ``providers:`` entry.
+
+    Provider and model keys match case-insensitively but otherwise exactly.
+    The provider identity is required so entries sharing an endpoint cannot
+    borrow each other's metadata.
+    """
+    model_id = str(model or "").strip()
+    provider_id = str(provider or "").strip()
+    if not model_id or not provider_id:
+        return None
+    if user_providers is None:
+        if config is None:
+            try:
+                config = load_config_readonly()
+            except Exception:
+                return None
+        user_providers = config.get("providers") if isinstance(config, dict) else None
+    if not isinstance(user_providers, dict):
+        return None
+
+    provider_cfg = None
+    provider_key = provider_id.casefold()
+    for key, candidate in user_providers.items():
+        if str(key).strip().casefold() == provider_key and isinstance(candidate, dict):
+            provider_cfg = candidate
+            break
+    if provider_cfg is None or not is_provider_enabled(provider_cfg):
+        return None
+
+    models = provider_cfg.get("models")
+    if not isinstance(models, dict):
+        return None
+    model_key = model_id.casefold()
+    for configured_model, metadata in models.items():
+        if str(configured_model).strip().casefold() != model_key:
+            continue
+        if not isinstance(metadata, dict):
+            return None
+        raw_ctx = metadata.get("context_length")
+        if raw_ctx is None:
+            return None
+        try:
+            context_length = int(raw_ctx)
+        except (TypeError, ValueError):
+            return None
+        return context_length if context_length > 0 else None
+    return None
+
+
 def get_custom_provider_model_capability(
     model: str,
     base_url: str,

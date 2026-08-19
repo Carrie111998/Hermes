@@ -1929,6 +1929,7 @@ class GatewaySlashCommandsMixin:
                                 _self,
                                 session_key=_session_key,
                                 source=event.source,
+                                user_providers=user_provs,
                                 custom_providers=custom_provs,
                                 load_gateway_config=_load_gateway_config,
                             )
@@ -2116,6 +2117,7 @@ class GatewaySlashCommandsMixin:
                             base_url=result.base_url or current_base_url or "",
                             api_key=result.api_key or current_api_key or "",
                             model_info=mi,
+                            user_providers=user_provs,
                             custom_providers=custom_provs,
                             config_context_length=_sw_config_ctx,
                             configured_model=(
@@ -2239,6 +2241,7 @@ class GatewaySlashCommandsMixin:
                 self,
                 session_key=session_key,
                 source=source,
+                user_providers=user_provs,
                 custom_providers=custom_provs,
                 load_gateway_config=_load_gateway_config,
             )
@@ -2443,6 +2446,7 @@ class GatewaySlashCommandsMixin:
                 base_url=result.base_url or current_base_url or "",
                 api_key=result.api_key or current_api_key or "",
                 model_info=mi,
+                user_providers=user_provs,
                 custom_providers=custom_provs,
                 config_context_length=_sw2_config_ctx,
                 configured_model=(
