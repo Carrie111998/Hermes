@@ -792,19 +792,27 @@ class TelegramNotifier(BaseSubscriber):
         in which case this method's behavior is unchanged from before this
         parameter existed.
         """
-        # Rendered-text observability (2026-08-19). The bytes handed to
-        # Telegram existed NOWHERE on disk: audit.jsonl carries the event
-        # PAYLOAD, RepeatGuard keeps only a sha of the normalized text and
-        # dies with the process, no message_id is persisted, and
-        # TelegramMirror was retired 2026-04-28. So the UNKNOWN AGENT_NOTE
-        # header (fixed in bdc736bd37) rendered wrong on EVERY delivery
-        # while 759 tests, an 83/83 coverage gate and three clean delivery
-        # receipts all passed -- nothing observed the formatter output.
+        # Formatter observability (2026-08-19). The rendered message
+        # existed NOWHERE on disk: audit.jsonl carries the event PAYLOAD,
+        # RepeatGuard keeps only a sha of the normalized text and dies with
+        # the process, no message_id is persisted, and TelegramMirror was
+        # retired 2026-04-28. So the UNKNOWN AGENT_NOTE header (fixed in
+        # bdc736bd37) rendered wrong on EVERY delivery while 759 tests, an
+        # 83/83 coverage gate and three clean delivery receipts all passed.
         # This is the single choke point for both the _send_fn (test) and
-        # _deliver_result (production) paths. repr() keeps a multi-line
-        # message to ONE greppable line and shows the exact glyphs.
+        # _deliver_result (production) paths.
+        #
+        # HEADER LINE ONLY, deliberately. The header carries everything the
+        # formatter decides -- priority dot, verdict label, icon, type,
+        # source, timestamp -- which is the whole surface this exists to
+        # watch. The body is CALLER CONTENT and may be sensitive, so it
+        # must not be written to a log file. body_chars is a length, never
+        # content, and is enough to catch truncation. Do not widen this
+        # back to the full message.
+        header = message.splitlines()[0] if message else ""
         logger.info(
-            "TelegramNotifier sending to %s/%s: %r", chat_id, thread_id, message
+            "TelegramNotifier sending to %s/%s: %r (+%d body chars)",
+            chat_id, thread_id, header, len(message) - len(header),
         )
         t0 = time.monotonic()
         try:
