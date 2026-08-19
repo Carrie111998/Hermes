@@ -215,7 +215,9 @@ class TestCjkDegradation:
             "SELECT 1 FROM sqlite_master WHERE name = 'sessions_fts_cjk'"
         ).fetchone()
         assert tbl is None
-        assert db._sessions_fts_available is True
+        # Unicode-lane availability is implicit via the rebuild-gap check: a
+        # fresh empty DB has no pending rebuild, so the lane serves.
+        assert db._session_fts_rebuild_gap(db._conn) is None
 
     def test_incapable_host_writes_still_work(self, db):
         db._execute_write(

@@ -6,6 +6,7 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent.skill_commands import (
@@ -592,6 +593,54 @@ _FTS_SESSION_TRIGRAM_TRIGGERS = (
 # until a capable host resets and rebuilds. Distinct from the Unicode and
 # CJK-session markers.
 FTS_SESSION_TRIGRAM_STALE_KEY = "fts_session_trigram_stale"
+
+
+@dataclass(frozen=True)
+class _SessionFtsLane:
+    """Identity and ensure-settings of one session-metadata FTS lane.
+
+    ``marker_prefix`` names the lane's OWN H/P marker pair (so no lane can
+    falsely certify another), ``fts_table`` is the external-content table the
+    chunk backfill inserts into, ``src_from`` is the row source (``sessions``
+    or the compact trigram VIEW), and ``available_attr`` names the
+    search-serving flag to flip once the backfill completes (None for the
+    Unicode lane, whose availability is implicit via the rebuild-gap check).
+    ``stale_key`` / ``table_sql`` / ``trigger_sql`` drive the optional-lane
+    schema ensure (split table/trigger DDL so a stale optional index can
+    exist while unsafe triggers remain absent; ``trigger_sql`` None means the
+    table SQL already includes the triggers).
+    """
+
+    marker_prefix: str
+    fts_table: str
+    src_from: str
+    available_attr: Optional[str] = None
+    stale_key: Optional[str] = None
+    table_sql: Optional[str] = None
+    trigger_sql: Optional[str] = None
+
+
+_FTS_SESSION_LANES = (
+    _SessionFtsLane("fts_session_rebuild", "sessions_fts", "sessions"),
+    _SessionFtsLane(
+        "fts_session_cjk_rebuild",
+        "sessions_fts_cjk",
+        "sessions",
+        available_attr="_sessions_cjk_available",
+        stale_key=FTS_SESSION_CJK_STALE_KEY,
+        table_sql=SESSIONS_FTS_CJK_TABLE_SQL,
+        trigger_sql=SESSIONS_FTS_CJK_TRIGGER_SQL,
+    ),
+    _SessionFtsLane(
+        "fts_session_trigram_rebuild",
+        "sessions_fts_trigram",
+        "sessions_fts_trigram_src",
+        available_attr="_sessions_trigram_available",
+        stale_key=FTS_SESSION_TRIGRAM_STALE_KEY,
+        table_sql=SESSIONS_FTS_TRIGRAM_SQL,
+        trigger_sql=None,
+    ),
+)
 
 
 SCHEMA_SQL = """

@@ -3429,11 +3429,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                # Session Unicode metadata FTS availability; flipped by
-                # _ensure_sessions_fts_schema during _init_schema. The CJK
-                # lane is flipped by _ensure_sessions_fts_cjk_schema / the
-                # CJK rebuild finish.
-                self._sessions_fts_available = False
+                # Session metadata FTS availability; the Unicode lane's
+                # availability is implicit via the rebuild-gap check, the
+                # optional CJK/trigram lanes are flipped by their ensure /
+                # rebuild-finish paths during _init_schema.
                 self._sessions_cjk_available = False
                 self._sessions_trigram_available = False
                 self._init_schema()

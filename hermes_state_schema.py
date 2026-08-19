@@ -17,25 +17,22 @@ from hermes_constants import get_hermes_home
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
-    FTS_STALE_KEY,
+    FTS_SESSION_CJK_STALE_KEY,
     FTS_SQL,
+    FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
-    _FTS_CJK_TRIGGERS,
-    _FTS_TRIGGERS,
-    FTS_SESSION_CJK_STALE_KEY,
-    FTS_SESSION_TRIGRAM_STALE_KEY,
     SESSION_INDEX_SQL_STATEMENTS,
     SESSION_TABLE_REBUILD_SQL,
-    SESSIONS_FTS_CJK_TABLE_SQL,
-    SESSIONS_FTS_CJK_TRIGGER_SQL,
     SESSIONS_FTS_SQL,
-    SESSIONS_FTS_TRIGRAM_SQL,
+    _FTS_CJK_TRIGGERS,
     _FTS_SESSION_CJK_TRIGGERS,
+    _FTS_SESSION_LANES,
+    _FTS_TRIGGERS,
     _ephemeral_child_sql,
 )
 
@@ -1474,9 +1471,8 @@ class SessionSchemaMixin:
                 "WHERE key = 'fts_session_rebuild_high_water' LIMIT 1"
             ).fetchone()
             if row is None:
-                self._seed_session_fts_rebuild_markers(cursor)
+                self._seed_session_fts_rebuild_markers(cursor, _FTS_SESSION_LANES[0])
         ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
-        self._sessions_fts_available = bool(ok)
         return ok
 
     def _ensure_sessions_fts_cjk_schema(self, cursor) -> None:
@@ -1536,112 +1532,64 @@ class SessionSchemaMixin:
             self._sessions_cjk_available = False
             return
 
-        try:
-            cursor.executescript(SESSIONS_FTS_CJK_TABLE_SQL)
-            if not cjk_present:
-                cursor.execute(
-                    "DELETE FROM state_meta WHERE key = ?",
-                    (FTS_SESSION_CJK_STALE_KEY,),
-                )
-                n_sessions = cursor.execute(
-                    "SELECT COUNT(*) FROM sessions"
-                ).fetchone()[0]
-                if n_sessions > 0:
-                    hw = cursor.execute(
-                        "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
-                    ).fetchone()[0]
-                    for k, v in (
-                        ("fts_session_cjk_rebuild_high_water", str(hw)),
-                        ("fts_session_cjk_rebuild_progress", "0"),
-                    ):
-                        cursor.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (k, v),
-                        )
-            stale = cursor.execute(
-                "SELECT 1 FROM state_meta WHERE key = ?",
-                (FTS_SESSION_CJK_STALE_KEY,),
-            ).fetchone()
-            if stale:
-                # A tokenizer-less process dropped the triggers at some
-                # unknown point - the index has a gap of unknown extent. Do
-                # NOT reinstall triggers (an external-content 'delete' for an
-                # unindexed rowid corrupts the index); the next
-                # optimize-storage run rebuilds from scratch.
-                self._sessions_cjk_available = False
-                return
-            cursor.executescript(SESSIONS_FTS_CJK_TRIGGER_SQL)
-            backfill_pending = cursor.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_session_cjk_rebuild_high_water' LIMIT 1"
-            ).fetchone()
-            self._sessions_cjk_available = not backfill_pending
-        except sqlite3.OperationalError:
-            # Includes "no such tokenizer: cjk_unicode61" if the extension
-            # loaded but registration failed - degrade to Unicode/trigram.
-            logger.warning(
-                "sessions_fts_cjk ensure failed; CJK session search stays on "
-                "Unicode/trigram/LIKE", exc_info=True,
-            )
-            self._sessions_cjk_available = False
+        self._ensure_session_optional_lane(cursor, _FTS_SESSION_LANES[1])
 
-    def _ensure_sessions_fts_trigram_schema(self, cursor) -> None:
-        """Create / repair / self-heal the optional trigram session metadata
-        index over the compact derived VIEW (mirrors the CJK-session ensure).
-
-        Sets ``self._sessions_trigram_available``. Never raises; a host whose
-        SQLite build lacks the trigram tokenizer degrades to Unicode/CJK/LIKE
+    def _ensure_session_optional_lane(self, cursor, lane) -> None:
+        """Create / repair / self-heal one OPTIONAL session-metadata lane
+        (CJK / trigram) on a tokenizer-capable host. Sets the lane's
+        search-serving availability flag; never raises - a host whose SQLite
+        build lacks the lane's tokenizer degrades to Unicode/trigram/LIKE
         routing.
+
+        Fresh-create over a populated DB seeds the lane's own H/P markers so
+        the id-gated triggers keep NEW rows indexed while old rows await the
+        resumable backfill; a stale breadcrumb (capability loss of unknown
+        extent) is never served until a capable host rebuilds.
         """
-        trig_present = bool(cursor.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'sessions_fts_trigram'"
+        present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (lane.fts_table,),
         ).fetchone())
         try:
-            cursor.executescript(SESSIONS_FTS_TRIGRAM_SQL)
-            if not trig_present:
+            cursor.executescript(lane.table_sql)
+            if not present:
                 cursor.execute(
-                    "DELETE FROM state_meta WHERE key = ?",
-                    (FTS_SESSION_TRIGRAM_STALE_KEY,),
+                    "DELETE FROM state_meta WHERE key = ?", (lane.stale_key,)
                 )
                 n_sessions = cursor.execute(
                     "SELECT COUNT(*) FROM sessions"
                 ).fetchone()[0]
                 if n_sessions > 0:
-                    hw = cursor.execute(
-                        "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
-                    ).fetchone()[0]
-                    for k, v in (
-                        ("fts_session_trigram_rebuild_high_water", str(hw)),
-                        ("fts_session_trigram_rebuild_progress", "0"),
-                    ):
-                        cursor.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (k, v),
-                        )
+                    self._seed_session_fts_rebuild_markers(cursor, lane)
             stale = cursor.execute(
-                "SELECT 1 FROM state_meta WHERE key = ?",
-                (FTS_SESSION_TRIGRAM_STALE_KEY,),
+                "SELECT 1 FROM state_meta WHERE key = ?", (lane.stale_key,)
             ).fetchone()
             if stale:
                 # Capability loss of unknown extent - do not serve until a
-                # capable host resets and rebuilds the index.
-                self._sessions_trigram_available = False
+                # capable host resets and rebuilds the index. Split DDL keeps
+                # the unsafe triggers absent (an external-content 'delete'
+                # for an unindexed rowid corrupts the index).
+                setattr(self, lane.available_attr, False)
                 return
-            backfill_pending = cursor.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_session_trigram_rebuild_high_water' LIMIT 1"
+            if lane.trigger_sql:
+                cursor.executescript(lane.trigger_sql)
+            pending = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (f"{lane.marker_prefix}_high_water",),
             ).fetchone()
-            self._sessions_trigram_available = not backfill_pending
+            setattr(self, lane.available_attr, not bool(pending))
         except sqlite3.OperationalError:
-            # Includes "no such tokenizer: trigram".
+            # Includes "no such tokenizer: ..." if the tokenizer is missing.
             logger.warning(
-                "sessions_fts_trigram ensure failed; trigram session search "
-                "stays on Unicode/CJK/LIKE", exc_info=True,
+                "%s ensure failed; %s session search stays on Unicode/trigram/LIKE",
+                lane.marker_prefix, lane.marker_prefix, exc_info=True,
             )
-            self._sessions_trigram_available = False
+            setattr(self, lane.available_attr, False)
+
+    def _ensure_sessions_fts_trigram_schema(self, cursor) -> None:
+        """Create / repair / self-heal the optional trigram session metadata
+        index over the compact derived VIEW (mirrors the CJK-session ensure)."""
+        self._ensure_session_optional_lane(cursor, _FTS_SESSION_LANES[2])
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor
