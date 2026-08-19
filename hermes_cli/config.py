@@ -3019,6 +3019,12 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
 # introduced after the first is fixed, is still surfaced.
 _PROVIDERS_STRING_WARNED: set = set()
 
+# Sentinel for "``json.loads`` raised", kept distinct from a successful decode
+# to ``None``: ``json.loads("null")`` legitimately returns ``None``, so a bare
+# ``None`` can't tell "not valid JSON at all" apart from "valid JSON of the
+# wrong shape" — and the malformed-payload warning names which one it is.
+_JSON_DECODE_FAILED = object()
+
 
 def _normalize_providers_string(config: Dict[str, Any]) -> Dict[str, Any]:
     """Decode a JSON-string-typed ``providers`` value into a dict.
@@ -3053,17 +3059,22 @@ def _normalize_providers_string(config: Dict[str, Any]) -> Dict[str, Any]:
     try:
         decoded = json.loads(raw)
     except (ValueError, TypeError):
-        decoded = None
+        decoded = _JSON_DECODE_FAILED
     if isinstance(decoded, dict):
         config["providers"] = decoded
     else:
         if raw not in _PROVIDERS_STRING_WARNED:
             _PROVIDERS_STRING_WARNED.add(raw)
+            shape = (
+                "a string that is not valid JSON"
+                if decoded is _JSON_DECODE_FAILED
+                else "valid JSON that is not an object"
+            )
             logger.warning(
                 "Ignoring malformed 'providers' config: expected a mapping but "
-                "got a %s-typed value; treating it as empty. Custom providers "
-                "and per-model overrides will not resolve until this is fixed.",
-                "JSON string decoding to non-dict" if decoded is not None else "string",
+                "got %s; treating it as empty. Custom providers and per-model "
+                "overrides will not resolve until this is fixed.",
+                shape,
             )
         config["providers"] = {}
     return config

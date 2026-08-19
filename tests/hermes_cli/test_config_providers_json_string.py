@@ -79,6 +79,33 @@ class TestNormalizeProvidersString:
             _normalize_providers_string({"providers": "[1, 2, 3]"})
         assert sum("malformed 'providers'" in r.message for r in caplog.records) == 2
 
+    def test_warning_names_which_kind_of_malformed(self, caplog):
+        # The two malformed branches describe different problems and must not
+        # share wording: a non-JSON scalar vs. valid JSON of the wrong shape.
+        config_mod._PROVIDERS_STRING_WARNED.clear()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            _normalize_providers_string({"providers": "{not json"})
+        assert "not valid JSON" in caplog.records[-1].getMessage()
+
+        caplog.clear()
+        config_mod._PROVIDERS_STRING_WARNED.clear()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            _normalize_providers_string({"providers": "[1, 2, 3]"})
+        assert "valid JSON that is not an object" in caplog.records[-1].getMessage()
+
+    def test_json_null_is_labeled_valid_json_not_undecodable(self, caplog):
+        # ``json.loads("null")`` decodes to None: it parsed fine, it's just the
+        # wrong shape. It must not be mislabeled as un-decodable JSON.
+        config_mod._PROVIDERS_STRING_WARNED.clear()
+        out = _normalize_providers_string({"providers": "null"})
+        assert out["providers"] == {}
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+            config_mod._PROVIDERS_STRING_WARNED.clear()
+            _normalize_providers_string({"providers": "null"})
+        msg = caplog.records[-1].getMessage()
+        assert "valid JSON that is not an object" in msg
+        assert "not valid JSON" not in msg
+
 
 class TestLoadConfigDecodesProvidersString:
     def test_load_config_decodes_and_vision_override_resolves(self, tmp_path):
