@@ -430,6 +430,21 @@ def test_merge_interrupted_history_matrix():
     assert {"role": "user", "content": "OTHER"} not in merged
     assert {"role": "assistant", "content": "obsolete"} not in merged
 
+    # Divergent prefix with the current user buried before a stale assistant.
+    buried = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "OTHER"},
+        {"role": "user", "content": "retry me"},
+        {"role": "assistant", "content": "partial stale"},
+    ]
+    merged = server._merge_interrupted_api_history(
+        live, buried, turn_start_history=turn_start, current_prompt="retry me"
+    )
+    assert merged[:3] == live
+    assert merged[-1]["content"] == "retry me"
+    assert {"role": "assistant", "content": "partial stale"} not in merged
+
     # Transformed current-turn user (context-reference / HUD note wrap).
     wrapped = [
         {"role": "user", "content": "a"},

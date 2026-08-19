@@ -7942,8 +7942,11 @@ def _merge_interrupted_api_history(
         shared_turn = _common_history_prefix_len(turn_start, returned)
         if shared_turn == len(turn_start):
             return _append_turn_local_tail(live, turn_start, returned[shared_turn:])
-        last = returned[shared_turn:][-1] if shared_turn < len(returned) else None
-        if last is not None and _is_current_turn_user_row(last, current_prompt):
+        last = None
+        for msg in returned[shared_turn:]:
+            if _is_current_turn_user_row(msg, current_prompt):
+                last = msg
+        if last is not None:
             if live and _message_fingerprint(live[-1]) == _message_fingerprint(last):
                 return live
             return [*live, last]
