@@ -31,7 +31,11 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
+import {
+  collectLiveStragglerPids,
+  stopBackendChild as stopBackendChildImpl,
+  stopBackendTreesForUpdate
+} from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
@@ -3386,19 +3390,15 @@ async function releaseBackendLock(updateRoot, tag) {
     // A supervised backend can respawn between kill and check (grandchildren,
     // pool entries registered mid-teardown). Re-collect and re-kill each pass
     // instead of trusting the initial sweep.
-    const stragglers = []
-
-    const currentHermesProcess = backendConnectionState.getProcess()
-
-    if (currentHermesProcess && Number.isInteger(currentHermesProcess.pid)) {
-      stragglers.push(currentHermesProcess.pid)
-    }
-
-    for (const entry of backendPool.values()) {
-      if (entry.process && Number.isInteger(entry.process.pid)) {
-        stragglers.push(entry.process.pid)
-      }
-    }
+    // LIVE roots only. This loop re-collects every pass, so once pass 1 has
+    // killed a child, a pid-only filter would keep re-issuing taskkill against
+    // its number on every later pass -- and Windows recycles pids fast enough
+    // that the number can already belong to a system process, which bugchecks
+    // the machine rather than failing quietly (#89614).
+    const stragglers = collectLiveStragglerPids(
+      backendConnectionState.getProcess(),
+      Array.from(backendPool.values(), entry => entry.process)
+    )
 
     for (const pid of stragglers) {
       forceKillProcessTree(pid)
@@ -9511,8 +9511,10 @@ function resetBootProgressForReconnect() {
   )
 }
 
+// No deps: teardown signals through the retained handle only. It deliberately
+// no longer receives forceKillProcessTree -- a pid is not authority (#89614).
 function stopBackendChild(child) {
-  stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
+  stopBackendChildImpl(child)
 }
 
 // Soft gateway-mode apply: tear down the primary without resetting boot UI or

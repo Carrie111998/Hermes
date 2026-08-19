@@ -37,114 +37,106 @@ test('hiddenWindowsChildOptions defaults isWindows from process.platform when om
   assert.equal(Boolean(result.windowsHide), expectedHide)
 })
 
-function makeChild(overrides: Partial<{ pid: number | null; killed: boolean }> = {}) {
+function makeChild(
+  overrides: Partial<{
+    exitCode: number | null
+    killed: boolean
+    pid: number | null
+    signalCode: string | null
+  }> = {}
+) {
   const calls: string[] = []
 
   return {
     calls,
     child: {
+      // A LIVE handle carries both lifecycle fields as null. `isLiveProcessRoot`
+      // is fail-closed (#89614), so a fixture that omits them is a stale record
+      // rather than a live one -- that case is pinned in
+      // backend-stale-pid.test.ts, deliberately not here.
+      exitCode: 'exitCode' in overrides ? (overrides.exitCode as number | null) : null,
       kill: (signal: string) => {
         calls.push(signal)
       },
       killed: overrides.killed ?? false,
-      pid: 'pid' in overrides ? overrides.pid : 1234
+      pid: 'pid' in overrides ? overrides.pid : 1234,
+      signalCode: 'signalCode' in overrides ? (overrides.signalCode as string | null) : null
     }
   }
 }
 
-test('stopBackendChild tree-kills on Windows when the child has a pid', () => {
-  const { child, calls } = makeChild({ pid: 4242 })
-  const treeKillCalls: number[] = []
-
-  stopBackendChild(child, {
-    forceKillProcessTree: (pid: number) => treeKillCalls.push(pid),
-    isWindows: true
-  })
-
-  assert.deepEqual(treeKillCalls, [4242])
-  assert.deepEqual(calls, [], 'SIGTERM must not be sent when the Windows tree-kill path is taken')
-})
-
-test('stopBackendChild group-SIGTERMs on POSIX (negative pgid) when the child has a pid', () => {
-  const { child, calls } = makeChild({ pid: 4242 })
-  const treeKillCalls: number[] = []
-  const groupKills: Array<[number, string]> = []
-
-  stopBackendChild(child, {
-    forceKillProcessTree: (pid: number) => treeKillCalls.push(pid),
-    isWindows: false,
-    killGroup: (pgid, signal) => groupKills.push([pgid, signal])
-  })
-
-  assert.deepEqual(groupKills, [[-4242, 'SIGTERM']], 'must signal the whole process group')
-  assert.deepEqual(calls, [], 'direct child.kill must not run when the group send succeeds')
-  assert.deepEqual(treeKillCalls, [], 'tree-kill must not run off Windows')
-})
-
-test('stopBackendChild falls back to direct SIGTERM on POSIX when the group send throws', () => {
+test('stopBackendChild signals through the retained handle and never tree-kills by pid', () => {
+  // INVERTED on purpose (#89614). This used to assert taskkill /T /F against
+  // child.pid. A pid is not authority: the OS can reap the child and reassign
+  // the number, and taskkill would then kill whoever inherited it.
   const { child, calls } = makeChild({ pid: 4242 })
 
-  stopBackendChild(child, {
-    forceKillProcessTree: () => {},
-    isWindows: false,
-    killGroup: () => {
-      throw new Error('ESRCH: no such process group')
-    }
-  })
+  stopBackendChild(child)
 
-  assert.deepEqual(calls, ['SIGTERM'], 'must fall back to signalling the direct child')
+  assert.deepEqual(calls, ['SIGTERM'], 'the retained handle must be the only mutator')
 })
 
-test('stopBackendChild falls back to SIGTERM on Windows when the pid is not an integer', () => {
-  const { child, calls } = makeChild({ pid: null })
-  const treeKillCalls: number[] = []
+test('stopBackendChild issues no pid-based syscall of any kind', () => {
+  // Also inverted. The POSIX branch used process.kill(-pid, ...), which is
+  // pid-based too -- a recycled number means signalling an unrelated process
+  // GROUP. Quieter than a Windows bugcheck, same defect.
+  //
+  // With dependency injection gone, process.kill is the only remaining way to
+  // smuggle a pid mutator back into this path, so watch it directly.
+  const { child, calls } = makeChild({ pid: 4242 })
+  const pidKills: Array<[number, unknown]> = []
+  const realKill = process.kill
 
-  stopBackendChild(child, {
-    forceKillProcessTree: (pid: number) => treeKillCalls.push(pid),
-    isWindows: true
-  })
+  process.kill = ((pid: number, signal?: unknown) => {
+    pidKills.push([pid, signal])
+  }) as typeof process.kill
 
+  try {
+    stopBackendChild(child)
+  } finally {
+    process.kill = realKill
+  }
+
+  assert.deepEqual(pidKills, [], 'no process.kill by pid or pgid may be issued')
   assert.deepEqual(calls, ['SIGTERM'])
-  assert.deepEqual(treeKillCalls, [])
+})
+
+test('stopBackendChild still signals a child whose pid never materialised', () => {
+  const { child, calls } = makeChild({ pid: null })
+
+  stopBackendChild(child)
+
+  assert.deepEqual(calls, ['SIGTERM'], 'a failed spawn is still worth signalling through the handle')
 })
 
 test('stopBackendChild is a no-op for an already-killed child', () => {
   const { child, calls } = makeChild({ killed: true })
-  const treeKillCalls: number[] = []
 
-  stopBackendChild(child, {
-    forceKillProcessTree: (pid: number) => treeKillCalls.push(pid),
-    isWindows: true
-  })
+  stopBackendChild(child)
 
   assert.deepEqual(calls, [])
-  assert.deepEqual(treeKillCalls, [])
 })
 
 test('stopBackendChild is a no-op for a null/undefined child', () => {
-  const treeKillCalls: number[] = []
-
   assert.doesNotThrow(() => {
-    stopBackendChild(null, { forceKillProcessTree: (pid: number) => treeKillCalls.push(pid), isWindows: true })
-    stopBackendChild(undefined, { forceKillProcessTree: (pid: number) => treeKillCalls.push(pid), isWindows: true })
+    stopBackendChild(null)
+    stopBackendChild(undefined)
   })
-  assert.deepEqual(treeKillCalls, [])
 })
 
 test('stopBackendChild swallows errors thrown by the kill strategy', () => {
   const child = {
+    exitCode: null,
     kill: () => {
       throw new Error('ESRCH: no such process')
     },
     killed: false,
-    pid: 99
+    pid: 99,
+    signalCode: null
   }
 
   assert.doesNotThrow(() => {
-    stopBackendChild(child, {
-      forceKillProcessTree: () => {},
-      isWindows: false
-    })
+    stopBackendChild(child)
   })
 })
 
