@@ -2855,21 +2855,18 @@ ensure_browser() {
         return 1
     fi
 
-    # agent-browser itself is intentionally NOT installed here (#43564 /
-    # PR #44772 review): it resolves lazily via `npx agent-browser` instead,
-    # which every consumer (tools/browser_tool.py, `hermes update`'s npx
-    # cache warm) already goes through. Eagerly npm-installing a second,
-    # separately version-pinned copy here -- only reachable via this
-    # explicit --ensure browser fallback in the first place -- was redundant
-    # complexity and an extra credential/supply-chain surface for a path
-    # npx already covers.
-    log_info "Installing camofox browser server..."
+    # Keep agent-browser in Hermes' managed Node prefix instead of relying on
+    # an npx cache. The cache-only design made a CLI-backed consumer disappear
+    # after a dependency refresh, while a global Homebrew link was left
+    # dangling (issue #48521). Do not put Camofox on this default path: it is
+    # an optional backend with its own setup flow.
+    log_info "Installing agent-browser..."
     local log_file
     log_file="$(mktemp)"
     # Time-boxed (#39219): a stalled npm registry fetch here would otherwise
     # hang the installer with no progress, same class as the desktop build.
-    if ! run_with_timeout "$NODE_DEPS_TIMEOUT" "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent --ignore-scripts \
-        "@askjo/camofox-browser@^1.5.2" \
+    if ! run_with_timeout "$NODE_DEPS_TIMEOUT" "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent \
+        "agent-browser@^0.26.0" \
         >"$log_file" 2>&1; then
         log_error "npm install failed or timed out:"
         cat "$log_file" >&2

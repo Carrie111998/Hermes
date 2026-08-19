@@ -977,24 +977,20 @@ class TestNodeRuntimeNpmResolution:
 class TestUpdateNodeDependencies:
     """Unit tests for _update_node_dependencies — issue #43564.
 
-    Root package.json has no dependencies of its own: agent-browser
-    resolves at runtime via npx (tools/browser_tool.py), and @streamdown/math
-    moved to apps/desktop/package.json since it's a desktop-only import.
-    With nothing root-only left to protect, a single workspace-scoped
-    install (ui-tui, web) is safe — apps/desktop is simply never named, so
-    its ~200 MB Electron devDependency is never resolved. Skipping is
-    governed by _npm_lockfile_changed (content hash over the lockfile +
-    every workspace package.json), tested separately in
+    Root package.json has no browser runtime dependency of its own. The
+    agent-browser CLI is installed in Hermes' managed Node prefix by the
+    dependency reconciler, while this function refreshes the ui-tui and web
+    workspaces. Skipping is governed by _npm_lockfile_changed (content hash
+    over the lockfile + every workspace package.json), tested separately in
     TestNpmLockfileChanged.
     Uses a tmp_path root so tests never touch real node_modules.
     """
 
     @pytest.fixture(autouse=True)
-    def _stub_npx_warmup(self):
-        """The npx cache warm-up is covered by its own dedicated test below;
-        stub it out everywhere else so it doesn't add a spurious npm/npx
-        call to the workspace-install assertions in this class."""
-        with patch("tools.browser_tool.warm_agent_browser_npx_cache", return_value=True):
+    def _stub_managed_browser_repair(self):
+        """The managed browser repair has its own dependency tests; keep
+        workspace-install assertions deterministic and offline here."""
+        with patch("hermes_cli.dep_ensure.ensure_dependency", return_value=True):
             yield
 
     def _npm_calls(self, mock_run):
@@ -1168,11 +1164,11 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.Popen")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_warms_npx_agent_browser_cache_regardless_of_install_result(
+    def test_repairs_managed_agent_browser_regardless_of_install_result(
         self, _which, mock_popen, tmp_path, monkeypatch
     ):
-        """The npx warm-up must fire even when the workspace install fails —
-        it's independent of ui-tui/web dependency state (#43564)."""
+        """Managed browser repair is attempted even when workspace npm work
+        fails — the two dependency surfaces must not mask one another."""
         from hermes_cli import main as hm
 
         (tmp_path / "package.json").write_text("{}")
@@ -1181,12 +1177,10 @@ class TestUpdateNodeDependencies:
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
 
-        with patch(
-            "tools.browser_tool.warm_agent_browser_npx_cache", return_value=True
-        ) as mock_warm:
+        with patch("hermes_cli.dep_ensure.ensure_dependency", return_value=False) as ensure:
             hm._update_node_dependencies()
 
-        mock_warm.assert_called_once()
+        ensure.assert_called_once_with("browser", interactive=False)
 
     @patch("subprocess.run")
     @patch("shutil.which", return_value=None)

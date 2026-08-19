@@ -2562,24 +2562,28 @@ def _update_node_dependencies() -> list[str]:
     # shared Hermes root rather than rerunning npm once per named profile.
     shared_hermes_root = get_default_hermes_root()
 
-    # Best-effort: warm npx's cache for agent-browser (#43564). Runs before
-    # the lockfile-unchanged early return below since that's the common
-    # `hermes update` case. Synchronous and can block ~11s on a true cold
-    # cache (~0.4s once warm) — print first so that doesn't look like a hang.
-    print("→ Warming npx cache for agent-browser...")
+    # Keep agent-browser installed in Hermes' managed Node prefix. A missing
+    # managed CLI is a real update failure, not a reason to silently rely on
+    # npx and report success to CLI-backed consumers.
+    print("→ Ensuring managed agent-browser...")
+    failures: list[str] = []
     try:
-        from tools.browser_tool import warm_agent_browser_npx_cache
-        warm_agent_browser_npx_cache()
+        from . import dep_ensure
+        if not dep_ensure.ensure_dependency("browser", interactive=False):
+            print("  ⚠ Could not install managed agent-browser")
+            failures.append("managed agent-browser")
     except Exception:
-        pass
+        logger.debug("managed agent-browser install failed", exc_info=True)
+        print("  ⚠ Could not install managed agent-browser")
+        failures.append("managed agent-browser")
 
     if not _m()._npm_lockfile_changed(shared_hermes_root):
         logger.info("npm lockfile unchanged, skipping npm install")
-        return []
+        return failures
 
     # Root package.json has no dependencies of its own (agent-browser and
-    # @streamdown/math were moved out — see #43564): agent-browser resolves
-    # at runtime via `npx agent-browser` (tools/browser_tool.py), and
+    # @streamdown/math were moved out — see #43564). The browser CLI is
+    # installed separately in Hermes' managed Node prefix, while
     # @streamdown/math is a desktop-only import now declared in
     # apps/desktop/package.json. That means a plain workspace-scoped install
     # can never prune anything root-only, so we only need to name the
@@ -2627,15 +2631,15 @@ def _update_node_dependencies() -> list[str]:
     if result.returncode == 0:
         _record_npm_lockfile_hash(shared_hermes_root)
         print("  ✓ ui-tui, web workspaces installed (desktop skipped)")
-        failures: list[str] = []
+        workspace_failures: list[str] = []
     else:
         print("  ⚠ npm install failed")
         stderr = (result.stderr or "").strip() if result.stderr else ""
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
-        failures = _partial_update_failure("ui-tui, web workspaces")
+        workspace_failures = _partial_update_failure("ui-tui, web workspaces")
 
-    return failures
+    return failures + workspace_failures
 
 def _log_only_write(text: str) -> None:
     """Write ``text`` to ``~/.hermes/logs/update.log`` only, never the terminal.

@@ -31,11 +31,12 @@ _DEP_CHECKS = {
     # not on PATH, so which() would report Node missing on an install that has
     # a managed one and trigger a redundant re-install.
     "node": lambda: find_node_executable("node") is not None,
+    # The browser CLI is a required managed Hermes dependency. npx remains a
+    # runtime fallback in browser_tool.py, but must not make setup/update report
+    # success while the Hermes-owned executable is missing.
     "browser": lambda: (
         agent_browser_runnable(shutil.which("agent-browser"))
-        or _has_system_browser()
         or _has_hermes_agent_browser()
-        or _has_npx_agent_browser()
     ),
     "ripgrep": lambda: shutil.which("rg") is not None,
     "ffmpeg": lambda: shutil.which("ffmpeg") is not None,
@@ -83,14 +84,15 @@ def _has_hermes_agent_browser() -> bool:
     from hermes_constants import get_hermes_home
     home = get_hermes_home()
     if _IS_WINDOWS:
-        # npm -g --prefix puts .cmd shims directly in the prefix dir on Windows
-        return (home / "node" / "agent-browser.cmd").is_file()
-    # install.sh installs globally into $HERMES_HOME/node/bin/ via npm -g --prefix
-    # Also check legacy node_modules/.bin/ path for git-clone installs.
-    return (
-        (home / "node" / "bin" / "agent-browser").is_file()
-        or (home / "node_modules" / ".bin" / "agent-browser").is_file()
-    )
+        candidates = [home / "node" / "agent-browser.cmd"]
+    else:
+        # install.sh installs globally into $HERMES_HOME/node/bin/ via npm -g
+        # --prefix. Keep the legacy checkout path for older git installs.
+        candidates = [
+            home / "node" / "bin" / "agent-browser",
+            home / "node_modules" / ".bin" / "agent-browser",
+        ]
+    return any(agent_browser_runnable(str(candidate)) for candidate in candidates)
 
 
 def _find_install_script(

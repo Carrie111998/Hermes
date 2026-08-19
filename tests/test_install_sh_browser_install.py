@@ -206,42 +206,31 @@ def _extract_function_body(source: str, name: str) -> str:
     return m.group(0)
 
 
-def test_ensure_browser_no_longer_npm_installs_agent_browser() -> None:
-    """agent-browser resolves lazily via npx everywhere else in the system
-    (tools/browser_tool.py::_find_agent_browser); this was the last place
-    that still eagerly npm-installed a second, separately version-pinned
-    copy of it. Removed: agent-browser acquisition now happens only via
-    `hermes update`'s npx cache warm or an actual browser-tool call's lazy
-    npx resolution (PR #44772 review)."""
+def test_ensure_browser_installs_managed_agent_browser() -> None:
+    """agent-browser is a durable Hermes-managed CLI, not only an npx cache."""
     body = _extract_function_body(INSTALL_SH.read_text(), "ensure_browser")
 
-    assert "agent-browser@" not in body
+    assert "agent-browser@^0.26.0" in body
+    assert "Installing agent-browser..." in body
     assert "Installing Chromium via agent-browser install" not in body
-    # camofox is unrelated to this change and must still be installed here.
-    assert "@askjo/camofox-browser@^1.5.2" in body
-    # System-browser detection is still cheap/valuable without agent-browser.
     assert "find_system_browser" in body
     assert "configure_browser_env_from_system_browser" in body
 
 
-def test_ensure_browser_still_ignore_scripts_and_timeout_guarded() -> None:
-    """The removal of agent-browser must not have also dropped the
-    supply-chain and hang-protection hardening that still applies to the
-    remaining camofox install."""
+def test_ensure_browser_installs_native_agent_browser_and_timeout_guarded() -> None:
+    """The managed install runs agent-browser's native postinstall."""
     body = _extract_function_body(INSTALL_SH.read_text(), "ensure_browser")
 
-    assert "--ignore-scripts" in body
+    assert "agent-browser@^0.26.0" in body
+    assert "--ignore-scripts" not in body
     assert "run_with_timeout" in body
 
 
-def test_ensure_browser_no_longer_references_agent_browser_binary_path() -> None:
-    """No dangling reference to a local agent-browser binary path should
-    remain now that this function never installs it — a leftover reference
-    would be dead code pointing at a binary that no longer gets placed
-    there by this function."""
+def test_ensure_browser_keeps_agent_browser_in_hermes_prefix() -> None:
+    """The npm prefix is Hermes-owned, so workspace refreshes cannot prune it."""
     body = _extract_function_body(INSTALL_SH.read_text(), "ensure_browser")
 
-    assert "$HERMES_HOME/node/bin/agent-browser" not in body
+    assert '"$HERMES_HOME/node"' in body
 
 
 

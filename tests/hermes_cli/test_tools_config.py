@@ -350,13 +350,9 @@ def test_numeric_mcp_server_name_does_not_crash_sorted():
 class TestAgentBrowserPostSetup:
     """_run_post_setup('agent_browser'/'browserbase') — #43564.
 
-    agent-browser is no longer a root package.json dependency (there's no
-    local `npm install` step anymore); it resolves at runtime via
-    tools.browser_tool._find_agent_browser (PATH -> Homebrew/Hermes-managed
-    node -> local .bin -> npx). This class exercises the Chromium-install
-    branch of _run_post_setup, which now delegates to that same resolution
-    cascade instead of hand-rolling its own node_modules/.bin/agent-browser
-    (and Windows .cmd-shim) lookup.
+    agent-browser is a Hermes-managed browser dependency. The post-setup hook
+    repairs that managed install before exercising the Chromium-install branch.
+    These tests stub the repair step so they stay focused on Chromium behavior.
     """
 
     @pytest.fixture(autouse=True)
@@ -366,7 +362,10 @@ class TestAgentBrowserPostSetup:
         Chromium-branch tests never bootstrap uv / hit the network, and so
         their print/subprocess assertions stay scoped to the agent-browser
         logic under test."""
-        with patch("hermes_cli.tools_config._ensure_browser_use_cli") as stub:
+        with (
+            patch("hermes_cli.tools_config._ensure_browser_use_cli") as stub,
+            patch("hermes_cli.dep_ensure.ensure_dependency", return_value=True),
+        ):
             yield stub
 
     def test_warns_when_neither_npx_nor_agent_browser_on_path(self):

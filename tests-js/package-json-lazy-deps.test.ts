@@ -11,17 +11,11 @@
  *
  * The contract:
  *
- * - ``agent-browser`` is NOT a root dependency. It used to be eager (see
- *   #27055, which reasoned its postinstall was small enough to keep eager
- *   unlike Camofox's) but #43564 found that keeping ANY dependency in root
- *   ``package.json`` — however small its postinstall — entangles it with
- *   the ui-tui/web workspace install and risks it being pruned. It now
- *   resolves at runtime via ``npx agent-browser`` (see
- *   ``tools/browser_tool.py::_find_agent_browser``), which sidesteps the
- *   workspace graph entirely. ``hermes update`` and ``hermes doctor --fix``
- *   both fire-and-forget ``warm_agent_browser_npx_cache()`` to keep npx's
- *   own cache warm, preserving the "available before any session starts"
- *   property #27055 cared about without re-entangling the dependency.
+ * - ``agent-browser`` is NOT a root dependency. Keeping it out of the
+ *   workspace graph avoids the #43564 pruning failure, but it is no longer
+ *   npx-only: the Hermes installer and dependency reconciler install it in
+ *   the managed Node prefix. Browser tools retain npx as a last-resort
+ *   runtime fallback, and ``hermes doctor`` reports that degraded state.
  *
  * - ``@streamdown/math`` is NOT a root dependency either. It's imported only
  *   by desktop's own TS code (``apps/desktop/src/...``), so it belongs in
@@ -70,16 +64,13 @@ test('camofox is not in root dependencies (must stay opt-in)', () => {
   )
 })
 
-test('agent-browser is not in root dependencies (resolves via npx, #43564)', () => {
+test('agent-browser stays out of root dependencies (managed prefix, #43564)', () => {
   const deps = (rootPackageJson().dependencies ?? {}) as Record<string, string>
   assert.ok(
     !('agent-browser' in deps),
-    'agent-browser must not be a root package.json dependency — it ' +
-      'resolves lazily via `npx agent-browser` instead (see ' +
-      'tools/browser_tool.py::_find_agent_browser and ' +
-      'warm_agent_browser_npx_cache). Putting it back in root ' +
-      'dependencies re-entangles it with the ui-tui/web workspace ' +
-      'install graph and reintroduces #43564.'
+    'agent-browser must stay out of the root package.json workspace graph. ' +
+      'Hermes installs it separately in the managed Node prefix; browser ' +
+      'tools retain npx only as a last-resort fallback.'
   )
 })
 
@@ -138,10 +129,8 @@ test('root lockfile has no agent-browser entry (#43564)', () => {
   const text = fs.readFileSync(ROOT_LOCK, 'utf-8')
   assert.ok(
     !text.includes('"node_modules/agent-browser"'),
-    'package-lock.json still has a node_modules/agent-browser entry. ' +
-      'It must resolve lazily via `npx agent-browser` instead — ' +
-      'regenerate the lockfile after removing the dep: ' +
-      '`rm package-lock.json && npm install --package-lock-only ' +
-      '--ignore-scripts --no-fund --no-audit`.'
+    'package-lock.json must keep agent-browser out of the workspace graph. ' +
+      'The durable install lives in the Hermes managed Node prefix; ' +
+      'regenerate the lockfile only if the root package graph changes.'
   )
 })

@@ -2141,12 +2141,10 @@ def run_doctor(args):
     # Node.js + agent-browser (for browser automation tools)
     if _safe_which("node"):
         check_ok("Node.js")
-        # agent-browser is no longer a root package.json dependency (#43564)
-        # — it resolves lazily via npx (or a global/Hermes-managed install)
-        # at first use. Mirror tools.browser_tool._find_agent_browser's own
-        # resolution cascade here so doctor can't diverge from what browser
-        # tools will actually find; validate=False keeps this a cheap
-        # existence check with no subprocess spawn or install side effects.
+        # agent-browser stays outside the root workspace graph (#43564), but
+        # the Hermes installer owns a durable managed CLI. Mirror the browser
+        # resolver here so doctor can distinguish that contract from the npx
+        # fallback; validate=False keeps this a cheap existence check.
         agent_browser_ok = False
         try:
             from tools.browser_tool import _find_agent_browser, _is_npx_agent_browser_sentinel
@@ -2155,18 +2153,25 @@ def run_doctor(args):
             _resolved_ab = None
 
         if _resolved_ab and _is_npx_agent_browser_sentinel(_resolved_ab):
-            check_ok("agent-browser", "(resolves via npx on first use)")
-            agent_browser_ok = True
+            managed_install_failed = False
             if should_fix:
-                # Doctor can't tell from here whether npx's cache already
-                # has agent-browser warm — just fire the same warm-up
-                # `hermes update` does, so a session's first browser call
-                # doesn't pay the registry fetch either way.
-                from tools.browser_tool import warm_agent_browser_npx_cache
-                if warm_agent_browser_npx_cache():
-                    check_info("  Warmed npx cache for agent-browser")
+                # A warm npx cache is only a fallback. Repair the durable
+                # Hermes-managed CLI during doctor --fix as well.
+                from . import dep_ensure
+                if dep_ensure.ensure_dependency("browser", interactive=False):
+                    _resolved_ab = _find_agent_browser(validate=False)
                 else:
-                    check_info("  Could not warm npx cache (offline or npx unavailable)")
+                    managed_install_failed = True
+            if managed_install_failed:
+                check_warn("agent-browser managed install failed")
+            elif _resolved_ab and _is_npx_agent_browser_sentinel(_resolved_ab):
+                check_warn("agent-browser only available via npx", "(managed CLI missing)")
+                agent_browser_ok = False
+            elif _resolved_ab and agent_browser_runnable(_resolved_ab):
+                check_ok("agent-browser", "(browser automation)")
+                agent_browser_ok = True
+            else:
+                check_warn("agent-browser managed install failed")
         elif _resolved_ab and agent_browser_runnable(_resolved_ab):
             check_ok("agent-browser", "(browser automation)")
             agent_browser_ok = True
@@ -2176,7 +2181,7 @@ def run_doctor(args):
             # `hermes update` wiped node_modules (issue #48521).
             check_warn(
                 "agent-browser found but not runnable",
-                f"(broken symlink at {_resolved_ab}? run: npx agent-browser --version)",
+                f"(broken symlink at {_resolved_ab}? run: hermes doctor --fix)",
             )
         elif _is_termux():
             check_info("agent-browser is not installed (expected in the tested Termux path)")

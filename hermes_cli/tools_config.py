@@ -1808,10 +1808,16 @@ def _run_post_setup(post_setup_key: str):
         # CLI when it's runnable — install it here too, not only on the
         # explicit "Browser Use" picker row.
         _ensure_browser_use_cli()
-        # agent-browser is no longer a root package.json dependency (#43564)
-        # — it resolves lazily via npx (or a global/Hermes-managed install)
-        # instead of a local `npm install`, so there's no node_modules/
-        # population step here anymore.
+        # agent-browser is a required Hermes-managed CLI. npx remains a
+        # runtime fallback, but setup must repair the durable executable.
+        try:
+            from . import dep_ensure
+            if not dep_ensure.ensure_dependency("browser", interactive=False):
+                _print_warning("    Could not install managed agent-browser CLI")
+                return
+        except Exception as exc:  # pragma: no cover — defensive
+            _print_warning(f"    Could not install managed agent-browser CLI: {exc}")
+            return
         try:
             # Import lazily so the tools_config UI doesn't pull in the full
             # browser_tool module at import time.

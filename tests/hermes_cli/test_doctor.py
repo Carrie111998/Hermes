@@ -730,72 +730,58 @@ def _doctor_env_for_agent_browser(monkeypatch, tmp_path):
 
 
 def test_run_doctor_reports_agent_browser_resolves_via_npx(monkeypatch, tmp_path):
-    """When agent-browser has no local/global install, _find_agent_browser
-    falls through to 'npx agent-browser' — doctor must report that as OK
-    (#43564: agent-browser is no longer a root package.json dependency, so
-    this is the expected common case now, not a warning)."""
+    """A npx-only resolution is reported as a degraded managed install."""
     _doctor_env_for_agent_browser(monkeypatch, tmp_path)
 
     import tools.browser_tool as bt
     monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kw: "npx agent-browser")
-    warm_calls = []
-    monkeypatch.setattr(
-        bt, "warm_agent_browser_npx_cache", lambda *a, **kw: warm_calls.append(1) or True
-    )
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         doctor_mod.run_doctor(Namespace(fix=False))
     out = buf.getvalue()
 
-    assert "agent-browser" in out
-    assert "resolves via npx on first use" in out
-    assert "agent-browser not installed" not in out
-    # --fix was not requested: the warm-up must not fire on a plain check.
-    assert not warm_calls
+    assert "agent-browser only available via npx" in out
+    assert "managed CLI missing" in out
 
 
-def test_run_doctor_fix_warms_npx_cache_when_agent_browser_resolves_via_npx(
-    monkeypatch, tmp_path
-):
-    """`hermes doctor --fix` must actually call warm_agent_browser_npx_cache()
-    when agent-browser resolves via npx, and report success."""
+def test_run_doctor_fix_repairs_managed_agent_browser(monkeypatch, tmp_path):
+    """`hermes doctor --fix` repairs npx-only resolution into the managed CLI."""
     _doctor_env_for_agent_browser(monkeypatch, tmp_path)
 
     import tools.browser_tool as bt
-    monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kw: "npx agent-browser")
-    warm_calls = []
-    monkeypatch.setattr(
-        bt, "warm_agent_browser_npx_cache", lambda *a, **kw: warm_calls.append(1) or True
-    )
+    from hermes_cli import dep_ensure
+
+    resolved = iter(["npx agent-browser", "/tmp/hermes-agent-browser"])
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kw: next(resolved))
+    monkeypatch.setattr(dep_ensure, "ensure_dependency", lambda *a, **kw: True)
+    monkeypatch.setattr(doctor_mod, "agent_browser_runnable", lambda path: path == "/tmp/hermes-agent-browser")
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         doctor_mod.run_doctor(Namespace(fix=True))
     out = buf.getvalue()
 
-    assert warm_calls, "warm_agent_browser_npx_cache() must be called under --fix"
-    assert "Warmed npx cache for agent-browser" in out
-    assert "Could not warm npx cache" not in out
+    assert "✓ agent-browser (browser automation)" in out
+    assert "managed install failed" not in out
 
 
-def test_run_doctor_fix_reports_when_npx_warmup_fails(monkeypatch, tmp_path):
-    """If warm_agent_browser_npx_cache() fails (offline, npx missing from
-    PATH at call time, etc.), doctor must say so instead of silently
-    claiming success — and must not count it as a fix."""
+def test_run_doctor_fix_reports_when_managed_agent_browser_install_fails(monkeypatch, tmp_path):
+    """A failed managed repair must remain visible instead of claiming success."""
     _doctor_env_for_agent_browser(monkeypatch, tmp_path)
 
     import tools.browser_tool as bt
+    from hermes_cli import dep_ensure
     monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kw: "npx agent-browser")
-    monkeypatch.setattr(bt, "warm_agent_browser_npx_cache", lambda *a, **kw: False)
+    monkeypatch.setattr(dep_ensure, "ensure_dependency", lambda *a, **kw: False)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         doctor_mod.run_doctor(Namespace(fix=True))
     out = buf.getvalue()
 
-    assert "Could not warm npx cache (offline or npx unavailable)" in out
-    assert "Warmed npx cache for agent-browser" not in out
+    assert "agent-browser managed install failed" in out
+    assert "only available via npx" not in out
 
 
 def test_run_doctor_kimi_cn_env_is_detected_and_probe_is_null_safe(monkeypatch, tmp_path):

@@ -660,15 +660,11 @@ function Install-AgentBrowser {
         throw "npm not found"
     }
 
-    # agent-browser itself is intentionally NOT installed here (#43564 /
-    # PR #44772 review): it resolves lazily via `npx agent-browser` instead,
-    # which every consumer (tools/browser_tool.py, `hermes update`'s npx
-    # cache warm) already goes through. Eagerly npm-installing a second,
-    # separately version-pinned copy here -- only reachable via this
-    # explicit -Ensure browser fallback in the first place -- was redundant
-    # complexity and an extra credential/supply-chain surface for a path
-    # npx already covers.
-    Write-Info "Installing camofox browser server..."
+    # Keep agent-browser in Hermes' managed Node prefix instead of relying on
+    # an npx cache. The cache-only design made a CLI-backed consumer disappear
+    # after a dependency refresh, while a global link was left dangling
+    # (issue #48521). Camofox remains an optional backend with its own setup.
+    Write-Info "Installing agent-browser..."
     $prefixDir = Join-Path $HermesHome "node"
     if (-not (Test-Path $prefixDir)) {
         New-Item -ItemType Directory -Path $prefixDir -Force | Out-Null
@@ -676,7 +672,8 @@ function Install-AgentBrowser {
     $npmLog = [System.IO.Path]::GetTempFileName()
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    & $npm install -g --prefix $prefixDir --silent --ignore-scripts "@askjo/camofox-browser@^1.5.2" 2>&1 | Tee-Object -FilePath $npmLog | Out-Null
+    & $npm install -g --prefix $prefixDir --silent `
+        "agent-browser@^0.26.0" 2>&1 | Tee-Object -FilePath $npmLog | Out-Null
     $npmExit = $LASTEXITCODE
     $ErrorActionPreference = $prevEAP
     if ($npmExit -ne 0) {
