@@ -57,10 +57,6 @@ FROM debian:13.4
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Store Playwright browsers outside the volume mount so the build-time
-# install survives the /opt/data volume overlay at runtime.
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
-
 # Install system dependencies in one layer, clear APT cache.
 # tini was previously PID 1 to reap orphaned zombie processes (MCP stdio
 # subprocesses, git, bun, etc.) that would otherwise accumulate when hermes
@@ -197,10 +193,6 @@ COPY apps/shared/ apps/shared/
 ENV npm_config_install_links=false
 
 RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
-    for i in 1 2 3; do \
-        npx playwright install --with-deps chromium --only-shell && break || \
-        { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
-    done && \
     npm cache clean --force
 
 # ---------- Photon iMessage sidecar deps (baked, NS-606) ----------
