@@ -2228,9 +2228,19 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
+
+    Reads the on-disk .env (like doctor.collect_deprecated_env_vars) rather
+    than os.environ: the config bridge (TERMINAL_CONFIG_ENV_MAP) injects
+    terminal.cwd → TERMINAL_CWD into the process env, which used to
+    false-positive here whenever terminal.cwd was still the default
+    "." / "auto" — the bridge value is not a deprecated .env entry.
     """
-    messaging_cwd = os.environ.get("MESSAGING_CWD")
-    terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+    try:
+        env_map = load_env()
+    except Exception:
+        env_map = {}
+    messaging_cwd = env_map.get("MESSAGING_CWD")
+    terminal_cwd_env = env_map.get("TERMINAL_CWD")
 
     if config is None:
         try:
