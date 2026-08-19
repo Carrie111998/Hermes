@@ -1892,6 +1892,16 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    try:
+        from hermes_cli.kanban_supervisor import note_delegate_spawn
+
+        note_delegate_spawn(
+            subagent_id=subagent_id,
+            owner_profile=getattr(parent_agent, "profile", None),
+            goal=goal,
+        )
+    except Exception:
+        logger.debug("note_delegate_spawn failed", exc_info=True)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.
@@ -3336,6 +3346,18 @@ def _finalize_child_results(
                 )
             except Exception:
                 logger.debug("subagent_stop hook invocation failed", exc_info=True)
+            try:
+                from hermes_cli.kanban_supervisor import note_delegate_stop
+
+                child_sid = getattr(child, "_subagent_id", None) if child else None
+                if child_sid:
+                    note_delegate_stop(
+                        subagent_id=child_sid,
+                        status=str(entry.get("status") or "done"),
+                        summary=entry.get("summary"),
+                    )
+            except Exception:
+                logger.debug("note_delegate_stop failed", exc_info=True)
 
         if children_cost_total > 0.0:
             try:

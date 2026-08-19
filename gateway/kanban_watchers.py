@@ -217,7 +217,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "starvation")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -596,6 +596,18 @@ class GatewayKanbanWatchersMixin:
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
                             )
+                        elif kind == "starvation":
+                            reason = ""
+                            count = None
+                            if ev.payload:
+                                if ev.payload.get("reason"):
+                                    reason = f": {str(ev.payload['reason'])[:120]}"
+                                count = ev.payload.get("count")
+                            cc = f" ({count}x)" if count else ""
+                            msg = (
+                                f"🚨 {board_tag}{tag}Kanban {sub['task_id']} starved"
+                                f"{cc}{reason} — supervisor is acting; this is not done"
+                            )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -759,7 +771,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "starvation")
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -844,6 +856,26 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], fails,
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
+                                try:
+                                    from hermes_cli.kanban_supervisor import record_wake_failure
+                                    from hermes_cli import kanban_db as _kb_wf
+
+                                    _wf_conn = _kb_wf.connect(board=board_slug)
+                                    try:
+                                        record_wake_failure(
+                                            _wf_conn,
+                                            task_id=sub["task_id"],
+                                            platform=platform_str,
+                                            chat_id=sub["chat_id"],
+                                            error=str(_wk_err),
+                                        )
+                                    finally:
+                                        _wf_conn.close()
+                                except Exception:
+                                    logger.debug(
+                                        "kanban notifier: wake_failed event not recorded",
+                                        exc_info=True,
+                                    )
                                 if fails >= MAX_SEND_FAILURES:
                                     logger.warning(
                                         "kanban notifier: dropping subscription "

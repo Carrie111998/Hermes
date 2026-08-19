@@ -9645,6 +9645,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked",
+    "block_loop_detected", "review_requested", "starvation",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -9786,6 +9787,14 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         except (TypeError, ValueError):
             pass
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+    if kind == "starvation":
+        reason = f": {str(payload.get('reason'))[:120]}" if payload.get("reason") else ""
+        count = payload.get("count")
+        cc = f" ({count}x)" if count else ""
+        return (
+            f"🚨 {board_tag}{tag}Kanban {task_id} starved{cc}{reason} "
+            "— supervisor is acting; this is not done"
+        )
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None
@@ -9841,11 +9850,13 @@ def _collect_kanban_notifications(session: dict) -> list:
         # writable unless it has a subscription owned by this exact session;
         # subscriptions for gateways or other sessions are not actionable here.
         try:
-            if _kb.count_notify_subs(
-                board=slug,
-                platform="tui",
-                chat_id=session_key,
-            ) == 0:
+            tui_n = _kb.count_notify_subs(
+                board=slug, platform="tui", chat_id=session_key,
+            )
+            webui_n = _kb.count_notify_subs(
+                board=slug, platform="webui", chat_id=session_key,
+            )
+            if tui_n == 0 and webui_n == 0:
                 continue
         except Exception:
             # Preserve delivery if the read-only probe cannot inspect a
@@ -9861,7 +9872,8 @@ def _collect_kanban_notifications(session: dict) -> list:
             except Exception:
                 continue
             for sub in subs:
-                if (sub.get("platform") or "").lower() != "tui":
+                plat = (sub.get("platform") or "").lower()
+                if plat not in {"tui", "webui"}:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue

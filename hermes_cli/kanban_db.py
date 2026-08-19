@@ -1524,6 +1524,62 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- LS-2776: durable objective ledger + starvation state. Also created by
+-- ``_ensure_supervisor_tables`` so legacy boards pick them up on open.
+CREATE TABLE IF NOT EXISTS kanban_objectives (
+    id TEXT PRIMARY KEY,
+    root_task_id TEXT NOT NULL,
+    delegator_profile TEXT,
+    origin_platform TEXT,
+    origin_chat_id TEXT,
+    origin_thread_id TEXT,
+    origin_session_key TEXT,
+    remoko_request_id TEXT,
+    remoko_external_id TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_objectives_root ON kanban_objectives(root_task_id);
+CREATE INDEX IF NOT EXISTS idx_objectives_status ON kanban_objectives(status);
+
+CREATE TABLE IF NOT EXISTS kanban_objective_units (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    owner_profile TEXT,
+    last_progress_at INTEGER,
+    terminal_predicate TEXT,
+    next_gate TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    proof TEXT,
+    UNIQUE(objective_id, kind, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_objective_units_obj ON kanban_objective_units(objective_id);
+CREATE INDEX IF NOT EXISTS idx_objective_units_ref ON kanban_objective_units(kind, ref);
+
+CREATE TABLE IF NOT EXISTS kanban_respawn_guard_state (
+    task_id TEXT PRIMARY KEY,
+    last_reason TEXT,
+    consecutive_count INTEGER NOT NULL DEFAULT 0,
+    first_guard_at INTEGER,
+    last_guard_at INTEGER,
+    last_starvation_at INTEGER,
+    last_starvation_reason TEXT,
+    exemption TEXT,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_supervisor_events (
+    event_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    task_id TEXT,
+    objective_id TEXT,
+    payload TEXT,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -2835,6 +2891,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _ensure_supervisor_tables(conn)
+
+
+def _ensure_supervisor_tables(conn: sqlite3.Connection) -> None:
+    """Create LS-2776 ledger tables on legacy boards (idempotent)."""
+    try:
+        from hermes_cli.kanban_supervisor import ensure_supervisor_tables
+    except Exception:
+        return
+    ensure_supervisor_tables(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -3555,6 +3621,17 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            try:
+                from hermes_cli.kanban_supervisor import note_kanban_child
+
+                note_kanban_child(
+                    conn,
+                    task_id,
+                    parents=parents,
+                    owner_profile=assignee,
+                )
+            except Exception:
+                _log.debug("note_kanban_child failed for %s", task_id, exc_info=True)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -4725,6 +4802,12 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        try:
+            from hermes_cli.kanban_supervisor import clear_respawn_guard_streak
+
+            clear_respawn_guard_streak(conn, task_id)
+        except Exception:
+            pass
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4824,6 +4907,12 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
+        try:
+            from hermes_cli.kanban_supervisor import clear_respawn_guard_streak
+
+            clear_respawn_guard_streak(conn, task_id)
+        except Exception:
+            pass
         return get_task(conn, task_id)
 
 
@@ -5589,6 +5678,16 @@ def complete_task(
             run_id=run_id,
             summary=(summary if summary is not None else result),
         )
+    try:
+        from hermes_cli.kanban_supervisor import note_kanban_terminal, supervise_once
+
+        note_kanban_terminal(
+            conn, task_id, status="done",
+            proof={"summary": summary or result},
+        )
+        supervise_once(conn)
+    except Exception:
+        _log.debug("supervisor complete hook failed for %s", task_id, exc_info=True)
     return True
 
 
@@ -7561,6 +7660,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_supervisor_rows(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -7584,8 +7684,23 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_supervisor_rows(conn, task_id)
     recompute_ready(conn)
     return True
+
+
+def _delete_supervisor_rows(conn: sqlite3.Connection, task_id: str) -> None:
+    """Best-effort cascade for LS-2776 ledger rows. Missing tables are fine."""
+    for sql in (
+        "DELETE FROM kanban_respawn_guard_state WHERE task_id = ?",
+        "DELETE FROM kanban_supervisor_events WHERE task_id = ?",
+        "DELETE FROM kanban_objective_units WHERE kind = 'kanban' AND ref = ?",
+        "DELETE FROM kanban_objectives WHERE root_task_id = ?",
+    ):
+        try:
+            conn.execute(sql, (task_id,))
+        except sqlite3.OperationalError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -9525,16 +9640,50 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    # 4. GitHub PR URL in a comment after a real prior run. A never-run
+    #    card that merely *mentions* a PR is a first spawn, not a respawn.
+    #    Review-lane already returned above. Body-only PR URLs are not
+    #    scanned (comments only).
+    try:
+        from hermes_cli.kanban_supervisor import has_active_pr_exemption
+    except Exception:
+        has_active_pr_exemption = None  # type: ignore[assignment]
+    if has_active_pr_exemption is not None and has_active_pr_exemption(conn, task_id):
+        return None
 
-    return None
+    first_run = conn.execute(
+        "SELECT started_at FROM task_runs WHERE task_id = ? "
+        "ORDER BY started_at ASC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if first_run is None:
+        return None
+
+    first_started = int(first_run["started_at"] or 0)
+    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_at: Optional[int] = None
+    for c in conn.execute(
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
+        (task_id, max(first_started, pr_cutoff)),
+    ).fetchall():
+        if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
+            continue
+        ts = int(c["created_at"] or 0)
+        if ts >= first_started:
+            latest_pr_at = ts if latest_pr_at is None else max(latest_pr_at, ts)
+    if latest_pr_at is None:
+        return None
+    requeued_after = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND created_at > ? "
+        "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+        "LIMIT 1",
+        (task_id, latest_pr_at),
+    ).fetchone()
+    if requeued_after:
+        return None
+    return "active_pr"
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -10214,6 +10363,18 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+                    try:
+                        from hermes_cli.kanban_supervisor import record_respawn_guard
+
+                        record_respawn_guard(
+                            conn, row["id"], guard_reason,
+                            append_event=_append_event,
+                        )
+                    except Exception:
+                        _log.debug(
+                            "record_respawn_guard failed for %s",
+                            row["id"], exc_info=True,
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -10345,6 +10506,18 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+                    try:
+                        from hermes_cli.kanban_supervisor import record_respawn_guard
+
+                        record_respawn_guard(
+                            conn, row["id"], guard_reason,
+                            append_event=_append_event,
+                        )
+                    except Exception:
+                        _log.debug(
+                            "record_respawn_guard failed for %s",
+                            row["id"], exc_info=True,
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -10415,6 +10588,13 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+    if not dry_run:
+        try:
+            from hermes_cli.kanban_supervisor import supervise_once
+
+            supervise_once(conn)
+        except Exception:
+            _log.debug("supervise_once failed", exc_info=True)
     return result
 
 
@@ -10763,6 +10943,20 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    try:
+        from hermes_cli.kanban_supervisor import (
+            ensure_supervisor_tables,
+            get_objective_for_root,
+            _root_task_id,
+        )
+
+        with connect_closing(board=board) as _sconn:
+            ensure_supervisor_tables(_sconn)
+            _obj = get_objective_for_root(_sconn, _root_task_id(_sconn, task.id))
+            if _obj:
+                env["HERMES_OBJECTIVE_ID"] = str(_obj["id"])
+    except Exception:
+        pass
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -11437,7 +11631,9 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    # allow_nested: create_task / note_kanban_child compose this under an
+    # outer write_txn. A nested RuntimeError would swallow origin delivery.
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs

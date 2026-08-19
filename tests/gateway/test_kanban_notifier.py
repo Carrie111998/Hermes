@@ -622,3 +622,39 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_delivers_starvation_ping(tmp_path, monkeypatch):
+    """A starvation event must reach the origin subscriber (LS-2776)."""
+    db_path = tmp_path / "starvation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="guarded forever", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn, tid, "starvation",
+            {"reason": "active_pr", "count": 3, "first_guard_at": 1},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "starvation must produce a notification"
+    text = adapter.sent[0]["text"]
+    assert "starved" in text.lower() or "STARV" in text.upper() or "🚨" in text
+    assert tid in text
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["starvation"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []

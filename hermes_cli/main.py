@@ -1820,6 +1820,29 @@ def _create_titled_session(title: str) -> Optional[str]:
                 pass
 
 
+def _maybe_track_bot_chat(title: str, session_id: str) -> None:
+    """Best-effort ledger upsert when a named Bot Chat handoff starts."""
+    if (title or "").strip() != "Bot Chat" or not session_id:
+        return
+    try:
+        from hermes_cli.kanban_supervisor import note_bot_chat_handoff
+
+        note_bot_chat_handoff(session_id=session_id, title=title)
+    except Exception:
+        logger.debug("bot chat handoff ledger upsert failed", exc_info=True)
+
+
+def _maybe_complete_bot_chat(title: object, session_id: object) -> None:
+    if (str(title or "")).strip() != "Bot Chat" or not session_id:
+        return
+    try:
+        from hermes_cli.kanban_supervisor import note_bot_chat_complete
+
+        note_bot_chat_complete(session_id=str(session_id))
+    except Exception:
+        logger.debug("bot chat complete ledger update failed", exc_info=True)
+
+
 def _resolve_continue_arg(args, *, use_tui: bool) -> None:
     """Resolve ``-c/--continue`` into ``args.resume``.
 
@@ -1839,6 +1862,7 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
             resolved = _resolve_session_by_name_or_id(continue_val)
             if resolved:
                 args.resume = resolved
+                _maybe_track_bot_chat(continue_val, resolved)
             elif getattr(args, "create_if_missing", False):
                 # --create-if-missing: no session matches the title — create a
                 # new session with that title and proceed. This is the
@@ -1848,6 +1872,7 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                 new_sid = _create_titled_session(continue_val)
                 if new_sid:
                     args.resume = new_sid
+                    _maybe_track_bot_chat(continue_val, new_sid)
                 else:
                     print(
                         f"No session found matching '{continue_val}' and "
@@ -3207,6 +3232,11 @@ def cmd_chat(args):
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
+    finally:
+        _maybe_complete_bot_chat(
+            getattr(args, "continue_last", None),
+            getattr(args, "resume", None),
+        )
 
 
 def cmd_gateway(args):

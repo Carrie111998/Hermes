@@ -445,8 +445,23 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
             conn, review_id, summary="PR ready",
             expected_run_id=claimed.current_run_id,
         )
-        # Ready-lane task with the same fresh PR comment.
+        # Ready-lane task with a prior run AND a fresh PR comment — respawn.
         ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
+        ready_claimed = kb.claim_task(conn, ready_id)
+        assert ready_claimed is not None
+        now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='released', outcome='reclaimed', "
+                "ended_at=? WHERE task_id=? AND ended_at IS NULL",
+                (now, ready_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+                "WHERE id=?",
+                (ready_id,),
+            )
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
 
         assert kb.check_respawn_guard(conn, ready_id) == "active_pr"

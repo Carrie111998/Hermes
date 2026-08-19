@@ -1134,3 +1134,48 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_create_child_subscribes_parent_origin_not_stale_webui(worker_env, monkeypatch):
+    """LS-2776: worker-created children notify the objective origin, not the
+    current (possibly stale) WebUI chat id."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_supervisor as sup
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        sup.ensure_objective(
+            conn,
+            worker_env,
+            origin=sup.SessionOrigin(
+                platform="webui",
+                chat_id="73c58f750cba",
+                session_key="73c58f750cba",
+                profile="default",
+            ),
+        )
+        kb.add_notify_sub(
+            conn, task_id=worker_env, platform="webui",
+            chat_id="73c58f750cba", delivery_mode="notify+wake",
+            delivery_metadata={"session_key": "73c58f750cba"},
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "7779276c4c10")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "7779276c4c10")
+
+    out = kt._handle_create({
+        "title": "child of origin",
+        "assignee": "cole",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    child = d["task_id"]
+    subs = _sub_index(_list_subs_for_task(child))
+    chats = {s["chat_id"] for s in subs}
+    assert "73c58f750cba" in chats
+    assert "7779276c4c10" not in chats

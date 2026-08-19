@@ -1532,37 +1532,44 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     chat_id = ""
     try:
         from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if not platform or not chat_id:
-            # TUI / desktop fallback: platform/chat_id ContextVars are
-            # cleared for TUI sessions, but the parent process exports
-            # HERMES_SESSION_KEY into the subprocess env. Treat that
-            # as a "tui" subscription so the TUI notification poller
-            # (tui_gateway/server.py) can pick it up.
-            #
-            # HERMES_SESSION_ID is intentionally NOT a fallback here:
-            # it is set by ACP / the agent subprocess for telemetry
-            # regardless of whether the parent is a TUI or a CLI, so
-            # treating it as a notification target would auto-subscribe
-            # every CLI invocation, which is exactly the over-eager
-            # behaviour that got #19718 reverted upstream. The TUI
-            # poller keys on HERMES_SESSION_KEY.
+        from hermes_cli.kanban_supervisor import resolve_notify_origin
+
+        inherited = None
+        try:
+            inherited = resolve_notify_origin(conn, task_id)
+        except Exception:
+            inherited = None
+        worker_parent = os.environ.get("HERMES_KANBAN_TASK") or ""
+        if inherited and inherited.usable and worker_parent:
+            platform = inherited.platform
+            chat_id = inherited.notify_chat_id()
+            thread_id = inherited.thread_id or None
+            session_key = inherited.session_key
+        else:
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
             session_key = (
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+            if not platform or not chat_id:
+                if not session_key:
+                    return False
+                platform = "tui"
+                chat_id = session_key
+            elif platform.lower() in {"webui", "tui", "api_server"} and session_key:
+                # Exact-origin: the live session key is the wake target.
+                # A stale CHAT_ID ContextVar must not steal delivery.
+                chat_id = session_key
+            thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        if not platform or not chat_id:
+            return False
         is_gateway_session = platform != "tui"
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        delivery_mode = "notify+wake" if is_gateway_session else None
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
+        delivery_mode = "notify+wake" if is_gateway_session else None
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
@@ -1576,6 +1583,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         delivery_metadata: dict[str, Any] = {}
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
+        if session_key:
+            delivery_metadata["session_key"] = session_key
         if chat_type:
             delivery_metadata["chat_type"] = chat_type
         if (
