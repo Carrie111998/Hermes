@@ -355,3 +355,49 @@ class TestKbRpcNotMirrored:
         )
         assert watcher.scan() == 0
         assert len(bus.query(event_type=EventType.MAILBOX_MESSAGE)) == 0
+
+
+class TestSubmitResultIsMirrored:
+    """SUBMIT_RESULT is the applier's ONLY report of a real submission
+    (tmp_ready_sweep_cron.py:811,834) and it was missing from
+    MIRRORED_MESSAGE_TYPES, so it never reached the bus at all. A
+    MailboxTranslator branch for it would be dead code without this: the
+    translator only ever sees message types the watcher mirrors.
+    """
+
+    def test_submit_result_is_in_the_mirrored_set(self):
+        from events.producers.mailbox_watcher import MIRRORED_MESSAGE_TYPES
+        assert "SUBMIT_RESULT" in MIRRORED_MESSAGE_TYPES
+
+    def test_submit_confirm_stays_mirrored_for_audit(self):
+        """The translator no longer emits a domain event for SUBMIT_CONFIRM
+        (it is Diego's authorization, not an outcome). Dropping that branch
+        is only safe while the raw message still reaches the bus as
+        `mailbox_message`, so removing it from this set would take the
+        authorization off the bus entirely, not just out of the domain lane.
+        """
+        from events.producers.mailbox_watcher import MIRRORED_MESSAGE_TYPES
+        assert "SUBMIT_CONFIRM" in MIRRORED_MESSAGE_TYPES
+
+    def test_a_submit_result_file_reaches_the_bus(self, bus, mailbox_root):
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        _write_message(mailbox_root / "main" / "inbox", "SUBMIT_RESULT",
+                       "applier", {"job_id": "j1", "status": "submitted",
+                                   "confirmation_id": "CONF-1"})
+        assert watcher.scan() == 1
+        mirrored = bus.query(event_type=EventType.MAILBOX_MESSAGE)
+        assert [e.payload["message_type"] for e in mirrored] == ["SUBMIT_RESULT"]
+        bus.close()
+
+    def test_summarize_names_the_outcome_not_the_message_type(self, tmp_path):
+        """Without a case, _summarize falls through to the bare type string
+        and Scribe Daily renders a line that says only "SUBMIT_RESULT"."""
+        bus = EventBus(db_path=tmp_path / "db.sqlite")
+        try:
+            w = MailboxWatcher(bus, mailbox_root=tmp_path / "mailbox")
+            summary = w._summarize({"type": "SUBMIT_RESULT", "payload": {
+                "company": "Acme", "title": "VP", "status": "submitted"}})
+            assert "submitted" in summary
+            assert "Acme / VP" in summary
+        finally:
+            bus.close()

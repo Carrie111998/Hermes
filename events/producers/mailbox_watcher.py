@@ -43,6 +43,12 @@ MIRRORED_MESSAGE_TYPES = {
     "TAILOR_REQUEST", "TAILOR_COMPLETE", "TAILOR_REVISION",
     "TAILOR_MODULE_REQUEST", "TAILOR_MODULE_COMPLETE",
     "SUBMIT_REQUEST", "DRY_RUN_COMPLETE", "SUBMIT_CONFIRM", "BLOCKED_QUESTION",
+    # SUBMIT_RESULT added 2026-08-19: it is the applier's ONLY report of a real
+    # submission (profiles/applier/workspace/tmp_ready_sweep_cron.py:811,834),
+    # and omitting it here kept it off the bus entirely — so the only
+    # `application_submitted` event ever recorded was a synthetic drill, and a
+    # MailboxTranslator branch for it would have been dead code.
+    "SUBMIT_RESULT",
     "PIPELINE_UPDATE", "STATUS_REQUEST", "STATUS_RESPONSE", "FOLLOWUP_ALERT",
     "NOTIFICATION", "HIGH_SCORE_ALERT",
     "VIP_DISCOVERY", "VIP_PROMOTE", "VIP_SCAN_REQUEST",
@@ -277,6 +283,14 @@ class MailboxWatcher:
             company = payload.get("company", "?")
             title = payload.get("title", "?")
             return f"{msg_type.lower().replace('_', ' ')}: {company} / {title}"
+        if msg_type == "SUBMIT_RESULT":
+            # Both outcomes share the message type; the status is the whole
+            # point of the line, so lead with it rather than falling through
+            # to the bare "SUBMIT_RESULT".
+            status = payload.get("status", "?")
+            company = payload.get("company", "?")
+            title = payload.get("title", "?")
+            return f"submit result ({status}): {company} / {title}"
         if msg_type == "BLOCKED_QUESTION":
             # Coerce to str: some producers send a structured/dict question,
             # and dict[:200] raises TypeError (see NOTIFICATION/ERROR below).
