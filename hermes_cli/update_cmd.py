@@ -4644,9 +4644,128 @@ def _rebuild_desktop_after_update(
     return True
 
 
+# Windows console-script shims that run the managed-runtime interpreter
+# with the shim file itself as the script (see
+# ``_maybe_reexec_windows_update_from_shim``).
+_WINDOWS_SHIM_NAMES = frozenset(
+    {"hermes.exe", "hermes-acp.exe", "hermes-agent.exe", "hermes-gateway.exe"}
+)
+# Marker preventing re-exec loops (the re-exec'd child must not re-spawn).
+_REEXEC_ENV = "HERMES_UPDATE_REEXEC"
+
+
+def _current_windows_shim_path() -> Path | None:
+    """Return the venv console-shim path this process was launched from, if any.
+
+    ``venv\\Scripts\\hermes.exe`` is a PE launcher that runs the
+    managed-runtime interpreter with the shim itself as a script/zipapp.
+    Depending on the launch path, ``sys.argv[0]`` is the shim path, the
+    shim's ``__main__.py`` (runpy/``-m`` module launches put the
+    ``__main__`` file path there), or the module spec origin. Check all
+    three so every variant is recognised. The runtime interpreter keeps the
+    shim open for the whole process lifetime without ``FILE_SHARE_DELETE``,
+    so any ``hermes ...`` command locks its own shim while it runs.
+    """
+    candidates: list[Path] = []
+    try:
+        if sys.argv:
+            candidates.append(Path(sys.argv[0]))
+    except Exception:
+        pass
+    try:
+        import __main__  # noqa: PLC0415
+
+        main_file = getattr(__main__, "__file__", None)
+        if main_file:
+            candidates.append(Path(main_file))
+        spec = getattr(__main__, "__spec__", None)
+        origin = getattr(spec, "origin", None) if spec is not None else None
+        if origin:
+            candidates.append(Path(origin))
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        name = resolved.name.lower()
+        if name in _WINDOWS_SHIM_NAMES:
+            return resolved
+        if name == "__main__.py" and resolved.parent.name.lower() in _WINDOWS_SHIM_NAMES:
+            return resolved.parent
+    return None
+
+
+def _running_from_windows_shim() -> bool:
+    """Return True when this process was launched through a venv console shim."""
+    if sys.platform != "win32":
+        return False
+    return _current_windows_shim_path() is not None
+
+
+def _maybe_reexec_windows_update_from_shim() -> bool:
+    """Re-exec ``hermes update`` via the venv interpreter when launched from a shim.
+
+    On Windows an update invoked as ``hermes update`` runs inside the
+    managed-runtime interpreter, which holds ``venv\\Scripts\\hermes.exe``
+    open (zipapp/script, no ``FILE_SHARE_DELETE``) until it exits. uv then
+    cannot remove the shim during ``pip install -e .`` (``os error 32``)
+    and the pre-install quarantine rename is denied as well — the update
+    fails on every attempt, regardless of Desktop/gateway/AV state.
+
+    Spawn ``venv\\Scripts\\python.exe -m hermes_cli.main <argv>`` with
+    inherited stdio and return True; the caller then finishes so this
+    process exits and the shim handle is released. The re-exec'd child
+    maps no shim and can replace ``hermes.exe`` freely.
+
+    Exit-code trade-off: the process the user/shell waited on exits
+    immediately (status of the spawn, not of the update). The update
+    reports its own result in its output, and in ``--gateway`` mode the
+    updater writes the true exit code to ``.update_exit_code`` itself
+    before the gateway restart, so the gateway watcher still sees it.
+    """
+    if os.environ.get(_REEXEC_ENV) == "1":
+        return False
+    if not _running_from_windows_shim():
+        return False
+    scripts_dir = _m()._venv_scripts_dir()
+    if scripts_dir is None:
+        return False
+    python_exe = scripts_dir / "python.exe"
+    if not python_exe.is_file():
+        return False
+    env = dict(os.environ)
+    env[_REEXEC_ENV] = "1"
+    cmd = [str(python_exe), "-m", "hermes_cli.main", *sys.argv[1:]]
+    logger.info(
+        "Re-execing Windows update via %s (shim self-lock workaround)", python_exe
+    )
+    try:
+        subprocess.Popen(cmd, env=env)
+    except Exception as exc:  # pragma: no cover - spawn failure path
+        logger.warning(
+            "Re-exec update via %s failed (%s); continuing in-process — "
+            "the Windows shim lock may break dependency sync.",
+            python_exe,
+            exc,
+        )
+        return False
+    return True
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    # Windows: when this process was launched through a venv console shim
+    # (venv\Scripts\hermes.exe), the managed-runtime interpreter keeps the
+    # shim open as its script file for the whole run — WITHOUT
+    # FILE_SHARE_DELETE. An in-process update would then fail to replace
+    # hermes.exe no matter what (uv: os error 32; quarantine rename:
+    # denied). Re-exec via the venv interpreter, which maps no shim.
+    if _maybe_reexec_windows_update_from_shim():
+        return
+
     # A managed-runtime refresh can replace site-packages before the normal
     # ``.[all]`` install runs. Snapshot while the old environment can still
     # prove which optional backends the user had activated.

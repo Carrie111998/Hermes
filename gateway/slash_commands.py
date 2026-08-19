@@ -5975,11 +5975,21 @@ class GatewaySlashCommandsMixin:
                         f.write(str(rc))
                     """
                 ).strip()
+                # Spawn the updater via the venv interpreter directly
+                # (`python.exe -m hermes_cli.main update --gateway`) instead
+                # of the `hermes` shim: on Windows the shim runs the
+                # managed-runtime interpreter with hermes.exe itself as its
+                # script/zipapp, which holds the shim open without
+                # FILE_SHARE_DELETE for the whole update — uv then cannot
+                # replace hermes.exe (os error 32) and the update fails
+                # every time. A module invocation maps no shim, so the
+                # entry-point shims can be rewritten freely.
                 subprocess.Popen(
                     [
                         sys.executable, "-c", helper,
                         str(output_path), str(exit_code_path),
-                        *hermes_cmd, "update", "--gateway",
+                        sys.executable, "-m", "hermes_cli.main",
+                        "update", "--gateway",
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
