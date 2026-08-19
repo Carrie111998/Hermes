@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import os
 import sqlite3
 import subprocess
@@ -16,6 +17,97 @@ import pytest
 
 import hermes_state
 from hermes_cli import kanban_db as kb
+
+
+def test_dispatch_once_scopes_each_explicit_board_over_stale_global_selection(
+    kanban_home, monkeypatch, tmp_path
+):
+    """Alternating board ticks must not share ambient policy identity."""
+    boards = {"yibbles", "passive-income-engine"}
+    for slug in boards:
+        (kanban_home / "kanban" / "boards" / slug).mkdir(parents=True, exist_ok=True)
+    (kanban_home / "kanban" / "current").write_text(
+        "passive-income-engine\n", encoding="utf-8"
+    )
+
+    observed: list[tuple[str, bool]] = []
+
+    def fake_locked(conn, **kwargs):
+        observed.append((kb.get_current_board(), kwargs["reconcile_orphans"]))
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "_dispatch_once_locked", fake_locked)
+    monkeypatch.setattr(kb, "board_exists", lambda slug: slug in boards)
+    monkeypatch.setattr(
+        kb, "kanban_db_path", lambda board=None: tmp_path / f"{board}.db"
+    )
+    monkeypatch.setattr(
+        kb, "_dispatch_tick_lock", lambda path: contextlib.nullcontext(True)
+    )
+    monkeypatch.setattr(kb, "_maybe_checkpoint_wal", lambda conn, path: None)
+    monkeypatch.setattr(kb, "_fire_dispatch_tick_hook", lambda *args, **kwargs: None)
+
+    with sqlite3.connect(":memory:") as conn:
+        kb.dispatch_once(conn, board="yibbles", reconcile_orphans=False)
+        kb.dispatch_once(conn, board="passive-income-engine")
+        kb.dispatch_once(conn, board="yibbles", reconcile_orphans=False)
+
+    assert observed == [
+        ("yibbles", False),
+        ("passive-income-engine", True),
+        ("yibbles", False),
+    ]
+    assert kb.get_current_board() == "passive-income-engine"
+
+
+def test_dispatch_once_preserves_fail_soft_malformed_board_handling(monkeypatch):
+    """Policy scoping must not preempt the existing invalid-path fallback."""
+    observed: list[str] = []
+
+    def fake_locked(conn, **kwargs):
+        observed.append(kwargs["board"])
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "_dispatch_once_locked", fake_locked)
+    monkeypatch.setattr(
+        kb, "kanban_db_path", lambda board=None: (_ for _ in ()).throw(ValueError("bad board"))
+    )
+    monkeypatch.setattr(kb, "_fire_dispatch_tick_hook", lambda *args, **kwargs: None)
+
+    with sqlite3.connect(":memory:") as conn:
+        kb.dispatch_once(conn, board="not a valid board")
+
+    assert observed == ["not a valid board"]
+
+
+def test_dispatch_once_real_claim_hooks_keep_alternating_board_identity(
+    kanban_home, monkeypatch
+):
+    """Real claims must report the explicit board despite stale environment."""
+    from hermes_cli import profiles
+
+    for slug in ("yibbles", "passive-income-engine"):
+        kb.create_board(slug)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "passive-income-engine")
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
+
+    claimed_boards: list[str] = []
+
+    def capture_hook(name, task_id, **kwargs):
+        if name == "kanban_task_claimed":
+            claimed_boards.append(kwargs["board"])
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", capture_hook)
+    monkeypatch.setattr(kb, "_fire_dispatch_tick_hook", lambda *args, **kwargs: None)
+
+    for index, slug in enumerate(("yibbles", "passive-income-engine", "yibbles")):
+        with kb.connect(board=slug) as conn:
+            kb.create_task(conn, title=f"claim-{index}", assignee="worker")
+            kb.dispatch_once(conn, board=slug, spawn_fn=lambda *args: 1000 + index)
+
+    assert claimed_boards == ["yibbles", "passive-income-engine", "yibbles"]
+    assert kb.get_current_board() == "passive-income-engine"
 
 
 @pytest.fixture
