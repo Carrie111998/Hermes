@@ -27,6 +27,7 @@
  * these into the IPC layer and owns file I/O + secret encryption.
  */
 
+import { isAuthRejectionError, isReauthRequiredError } from './backend-health'
 import {
   hostLabelFromBaseUrl,
   modeIsRemoteLike,
@@ -320,12 +321,24 @@ export interface ConnectionAgents {
   profiles: null | string[]
   /** Present when profiles is null: why enumeration was skipped. */
   error?: string
+  /** The source rejected its OAuth session and needs an interactive sign-in. */
+  authRequired?: boolean
   /** Stable backend identity from the connection's /api/status (`install_id`).
    * Two connections reporting the same id are the SAME physical install
    * registered under two addresses (hostname + Tailscale IP), so the roster
    * collapses their rows. Absent on older backends → no collapse (fully
    * backward compatible). */
   installId?: string
+}
+
+/**
+ * A roster probe may meet an already-tagged boot failure or a fresh 401/403
+ * from an established descriptor whose session expired after it was cached.
+ * Only OAuth sources have a sign-in recovery path; token sources keep their
+ * ordinary unreachable/error state so the UI does not offer the wrong fix.
+ */
+export function connectionAgentAuthRequired(connection: RegistryConnection, error: unknown): boolean {
+  return connection.authMode === 'oauth' && (isReauthRequiredError(error) || isAuthRejectionError(error))
 }
 
 export interface RosterAgent {

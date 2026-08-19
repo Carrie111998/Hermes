@@ -55,6 +55,7 @@ function renderBotRow(input = 'alpha') {
     displayName: bot => bot.name,
     duplicateBot: async () => `${name}-copy`,
     haptic: () => undefined,
+    notifyRemoteBot: () => undefined,
     // #49 session-aware-row helpers referenced inside BotRow.
     previewKind: () => ({ fromBot: false, sender: null }),
     generatedSessionTitle: () => null,
@@ -184,6 +185,7 @@ test('behavior: remote default does not open this-device chat when the source di
     displayName: bot => bot.connectionLabel || bot.name,
     duplicateBot: async () => 'copy',
     haptic: () => undefined,
+    notifyRemoteBot: () => undefined,
     previewKind: () => ({ fromBot: false, sender: null }),
     generatedSessionTitle: () => null,
     openBotCanonicalChat: async (...args) => {

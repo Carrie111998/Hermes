@@ -15,6 +15,7 @@ import {
   backendScopeKey,
   backendScopePrefix,
   buildAgentRoster,
+  connectionAgentAuthRequired,
   connectionDialFieldsChanged,
   connectionIdForLabel,
   labelKey,
@@ -269,6 +270,17 @@ test('rememberSshEnumeration: live list wins, cache then seed default', () => {
     profiles: null,
     error: 'connect-on-demand'
   })
+})
+
+test('connectionAgentAuthRequired only marks rejected OAuth sessions', () => {
+  const oauth = { id: 'studio', kind: 'remote' as const, label: 'Studio', authMode: 'oauth' as const }
+  const token = { id: 'studio-token', kind: 'remote' as const, label: 'Studio token', authMode: 'token' as const }
+  const tagged = Object.assign(new Error('session expired'), { isReauthRequired: true })
+
+  assert.equal(connectionAgentAuthRequired(oauth, new Error('401: no_cookie')), true)
+  assert.equal(connectionAgentAuthRequired(oauth, tagged), true)
+  assert.equal(connectionAgentAuthRequired(token, new Error('401: invalid token')), false)
+  assert.equal(connectionAgentAuthRequired(oauth, new Error('Timed out connecting')), false)
 })
 
 test('shouldRetrySshInventory: first try, cooldown, then retry; cache never retries', () => {

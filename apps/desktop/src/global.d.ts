@@ -880,6 +880,8 @@ export interface DesktopAgentRoster {
     label: string
     kind: DesktopConnectionKind
     reachable: boolean
+    /** The OAuth session was rejected and needs an interactive sign-in. */
+    authRequired?: boolean
     error?: string
     // Stable backend identity (/api/status install_id) when known.
     installId?: string

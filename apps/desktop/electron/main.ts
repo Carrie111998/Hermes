@@ -98,6 +98,7 @@ import {
   backendScopeKey,
   backendScopePrefix,
   buildAgentRoster,
+  connectionAgentAuthRequired,
   connectionDialFieldsChanged,
   mergeConnectionInput,
   migrateV1ToRegistry,
@@ -12585,7 +12586,13 @@ async function probeSshProfileInventory(connection) {
 async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRegistry()) {
   return Promise.all(
     registry.connections.map(async connection => {
-      let raw: { connection: typeof connection; error?: string; installId?: string; profiles: null | string[] }
+      let raw: {
+        connection: typeof connection
+        authRequired?: boolean
+        error?: string
+        installId?: string
+        profiles: null | string[]
+      }
 
       try {
         // SSH roster listing must never spawn a dashboard. A stale
@@ -12636,7 +12643,12 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           raw = { connection, profiles, ...(installId ? { installId } : {}) }
         }
       } catch (error: any) {
-        raw = { connection, profiles: null, error: String(error?.message || error) }
+        raw = {
+          connection,
+          profiles: null,
+          error: String(error?.message || error),
+          ...(connectionAgentAuthRequired(connection, error) ? { authRequired: true } : {})
+        }
       }
 
       if (raw.profiles && raw.profiles.length > 0) {
@@ -12645,7 +12657,12 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
 
       const remembered = rememberSshEnumeration(raw, sshRosterCache.get(connection.id), connection.kind)
 
-      return { connection, ...remembered, ...(raw.installId ? { installId: raw.installId } : {}) }
+      return {
+        connection,
+        ...remembered,
+        ...(raw.authRequired ? { authRequired: true } : {}),
+        ...(raw.installId ? { installId: raw.installId } : {})
+      }
     })
   )
 }
@@ -12662,11 +12679,12 @@ ipcMain.handle('hermes:agents:roster', async () => {
     // instead of appending duplicates (remote-only desktops doubled every
     // bot otherwise; see #88344).
     primaryConnectionId: registry.primary,
-    sources: enumerations.map(({ connection, error, installId, profiles }) => ({
+    sources: enumerations.map(({ connection, authRequired, error, installId, profiles }) => ({
       connectionId: connection.id,
       label: connection.label,
       kind: connection.kind,
       reachable: profiles !== null,
+      ...(authRequired ? { authRequired: true } : {}),
       ...(installId ? { installId } : {}),
       ...(error ? { error } : {})
     }))
