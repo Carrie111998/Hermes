@@ -16604,6 +16604,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             manipulate user input from a keybinding handler.
         """
 
+    def _get_subagents_bar_fragments(self):
+        """Render responsive subagent pill bar underneath the input composer."""
+        try:
+            from tools.async_delegation import list_async_delegations
+            active_dels = list_async_delegations()
+            running = []
+            for d in active_dels:
+                if d.get("status") in ("running", "stalling", "finalizing"):
+                    tasks = d.get("tasks", [])
+                    for t in tasks:
+                        t_name = t.get("agent") or t.get("name")
+                        if t_name and t_name not in running:
+                            running.append(t_name)
+                    if not tasks and d.get("agent"):
+                        running.append(d["agent"])
+            if not running:
+                return []
+            
+            width = self._get_tui_terminal_width()
+            frags = [("class:subagent-bar-label", " Subagents: ")]
+            for name in running:
+                pill = f" [ 🤖 {name} ● Working ] "
+                frags.append(("class:subagent-pill", pill))
+                frags.append(("", " "))
+            
+            total_w = sum(self._status_bar_display_width(t) for _, t in frags)
+            if total_w > width:
+                # Responsive collapse on narrow terminals
+                return [("class:subagent-pill", f" 🤖 {len(running)} working ")]
+            return frags
+        except Exception:
+            return []
+
     def _build_tui_layout_children(
         self,
         *,
@@ -16648,6 +16681,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 image_bar,
                 input_area,
                 input_rule_bot,
+                getattr(self, "_subagents_bar_widget", None),
                 voice_status_bar,
                 completions_menu,
             ] if item is not None
@@ -18852,6 +18886,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             filter=Condition(lambda: cli_ref._voice_mode),
         )
 
+        # Subagents action bar underneath input area (visible only when subagents are active)
+        def _get_subagents_bar():
+            return cli_ref._get_subagents_bar_fragments()
+
+        subagents_bar = ConditionalContainer(
+            Window(
+                FormattedTextControl(_get_subagents_bar),
+                height=1,
+                wrap_lines=False,
+            ),
+            filter=Condition(lambda: bool(cli_ref._get_subagents_bar_fragments())),
+        )
+
         status_bar = ConditionalContainer(
             Window(
                 content=FormattedTextControl(lambda: cli_ref._get_status_bar_fragments()),
@@ -18895,6 +18942,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 and bool(len(cli_ref._prompt_stash))
             ),
         )
+
+        self._subagents_bar_widget = subagents_bar
 
         # Allow wrapper CLIs to register extra keybindings.
         self._register_extra_tui_keybindings(kb, input_area=input_area)
@@ -18949,6 +18998,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'status-bar-plan': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-build': 'bg:#1a1a2e #8FBC8F',
             'status-bar-session-title': 'bg:#FFD700 #1a1a2e bold',
+            'subagent-bar-label': '#888888 italic',
+            'subagent-pill': 'bg:#2a2a4e #87CEEB bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges
