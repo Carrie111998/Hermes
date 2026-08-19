@@ -9622,7 +9622,17 @@ function BotsPane() {
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
-  if (groupChatName && groupChatMembers.length) {
+  // The group room lives in the MAIN chat window (host.openWorkspace, newer
+  // desktops) — that is its one true surface. The Bots pane must KEEP its
+  // roster and only highlight the active group row (GroupRow's `active`
+  // already does this). Rendering the room here too double-books the group:
+  // it seizes the Bots pane AND the main window, hiding the bot list behind a
+  // duplicate room. Only fall back to the in-panel room on desktops whose SDK
+  // predates host.openWorkspace (which openGroupChat already feature-detected
+  // and skipped). See issue #89788.
+  const inPanelRoomFallback = typeof host.openWorkspace !== 'function'
+
+  if (groupChatName && groupChatMembers.length && inPanelRoomFallback) {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
   }
 

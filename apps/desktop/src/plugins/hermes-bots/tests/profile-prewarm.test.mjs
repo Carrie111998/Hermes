@@ -107,6 +107,23 @@ test('regression: rendering BotsPane does not prewarm the entire roster', () => 
   assert.doesNotMatch(botsPaneSource, /host\.warmProfile/)
 })
 
+test('fix #89788: Bots pane keeps its roster when the group opens in the main window', () => {
+  const botsPaneSource = sourceBetween('function BotsPane(', '// ── plugin')
+
+  // The in-panel room must be gated on the absence of the main-window door:
+  // on desktops with host.openWorkspace the group room already lives in the
+  // main chat window, so the Bots pane must NOT replace its roster with a
+  // duplicate room (that double-books the group and hides the bot list).
+  assert.match(botsPaneSource, /inPanelRoomFallback = typeof host\.openWorkspace !== 'function'/)
+  assert.match(botsPaneSource, /groupChatName && groupChatMembers\.length && inPanelRoomFallback/)
+  // The roster (the bot list) is rendered through this branch when the door
+  // exists, so the group selection only highlights its row, not the room.
+  assert.doesNotMatch(
+    botsPaneSource,
+    /if \(groupChatName && groupChatMembers\.length\) \{\s*return jsx\(GroupChatWorkspace/
+  )
+})
+
 test('regression: source transitions keep BotRow hook order stable', () => {
   const botRowSource = sourceBetween('function BotRow(', '// ── model picker')
 
