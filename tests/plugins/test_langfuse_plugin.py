@@ -982,6 +982,96 @@ class TestUploadRedaction:
         ):
             assert mod._redact_secrets(prose) == prose, f"false positive on: {prose!r}"
 
+    @pytest.mark.parametrize("header,credential", [
+        ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+        ("Authorization: Digest abcdef0123456789abcdef0123456789", "abcdef0123456789abcdef0123456789"),
+        ("Authorization: Token abcdef0123456789abcdef0123456789", "abcdef0123456789abcdef0123456789"),
+        ("authorization: bearer abcdef0123456789abcdef0123456789", "abcdef0123456789abcdef0123456789"),
+        ("Proxy-Authorization: Basic cHJveHl1c2VyOnByb3h5cGFzcw==", "cHJveHl1c2VyOnByb3h5cGFzcw=="),
+    ])
+    def test_authorization_header_any_scheme_fully_redacted(self, header, credential):
+        # Regression for the plugin-local Authorization regex (`\S+` stops at
+        # the scheme word) that redacted only the scheme and left the actual
+        # credential bytes -- Basic/Digest/Token/Proxy -- in the clear. Each
+        # case here is the single-opaque-token shape _AUTH_HEADER_RE targets;
+        # RFC 7616 Digest's multi-field `key="value", ...` list is a separate,
+        # out-of-scope shape (no single credential token to mask).
+        mod = self._fresh_plugin()
+        redacted = mod._redact_secrets(header)
+        assert credential not in redacted, f"credential leaked from: {header!r} -> {redacted!r}"
+        assert credential[:8] not in redacted, f"partial reveal from: {header!r} -> {redacted!r}"
+
+    def test_structured_dict_sensitive_keys_fully_redacted_regardless_of_shape(self):
+        # Regression: once a payload is parsed into a dict, _safe_value walked
+        # bare scalar values with no key context, so opaque secrets that don't
+        # match any shape pattern (a plain password, a raw client secret)
+        # reached Langfuse untouched. Key-aware redaction catches these via
+        # the key name alone.
+        mod = self._fresh_plugin()
+        payload = {
+            "password": "hunter2",
+            "client_secret": "not-a-recognized-shape-at-all",
+            "authorization": "some opaque bearer-less value",
+            "access_token": "opaque-token-no-vendor-prefix",
+            "username": "alice",
+            "note": "this mentions a password in prose but is not one",
+        }
+        safe = mod._safe_value(payload)
+        assert safe["password"] == "[REDACTED]"
+        assert safe["client_secret"] == "[REDACTED]"
+        assert safe["authorization"] == "[REDACTED]"
+        assert safe["access_token"] == "[REDACTED]"
+        assert safe["username"] == "alice"
+        assert safe["note"] == payload["note"]
+
+    def test_structured_false_positives_not_redacted(self):
+        # Same word-boundary false-positive class as the deleted local regex
+        # (monkey/hockey/donkey embed "key") -- key-aware redaction must use
+        # the shared word-boundary matcher, not a bare substring check.
+        mod = self._fresh_plugin()
+        payload = {"monkey": "banana", "hockey": "score", "donkey": "kong"}
+        safe = mod._safe_value(payload)
+        assert safe == payload
+
+    def test_structured_usage_metadata_not_redacted(self):
+        # A tool result embedding an LLM API's usage block ({"usage": {...}})
+        # is common and not secret -- key-aware redaction must not treat
+        # "total_tokens" as a "tokens" secret via plural matching.
+        mod = self._fresh_plugin()
+        payload = {"usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70}}
+        safe = mod._safe_value(payload)
+        assert safe == payload
+
+    def test_url_userinfo_and_query_credentials_redacted_public_params_kept(self):
+        mod = self._fresh_plugin()
+        redacted = mod._redact_secrets(
+            "https://user:s3cr3tpass@api.example.com/v1/x?api_key=abcdef123456&region=us-east-1"
+        )
+        assert "s3cr3tpass" not in redacted
+        assert "abcdef123456" not in redacted
+        assert "region=us-east-1" in redacted
+
+    def test_base_url_credentials_redacted_in_generation_metadata(self):
+        mod = self._fresh_plugin()
+        redacted = mod._redact_metadata_url("https://proxyuser:proxysecret@llm-gateway.internal:8443/v1")
+        assert "proxysecret" not in redacted
+
+    def test_redaction_failure_omits_content_never_returns_raw(self, monkeypatch):
+        # Fail-CLOSED regression: both sanitizer passes used to swallow every
+        # exception and return the raw, unredacted value. A sanitizer failure
+        # at a third-party export boundary must never transmit the original.
+        mod = self._fresh_plugin()
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated redaction failure")
+
+        import agent.redact
+        monkeypatch.setattr(agent.redact, "redact_sensitive_text", _boom)
+        secret = "sk-abcdefghijklmnopqrstuvwxyz012345"
+        result = mod._redact_secrets(f"here is {secret}")
+        assert secret not in result
+        assert result == mod._REDACTION_FAILED
+
 
 # ---------------------------------------------------------------------------
 # Model attribution: wire truth over stale agent attribute
