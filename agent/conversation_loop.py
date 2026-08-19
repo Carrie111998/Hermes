@@ -1322,6 +1322,9 @@ def _content_policy_blocked_result(
     *,
     final_response: str,
     error_detail: str,
+    failure_reason: str = "content_policy_blocked",
+    status_code: Optional[int] = None,
+    error_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the terminal turn result for a content-policy block.
 
@@ -1338,6 +1341,9 @@ def _content_policy_blocked_result(
         "completed": False,
         "failed": True,
         "error": f"content_policy_blocked: {error_detail}",
+        "failure_reason": failure_reason,
+        "status_code": status_code,
+        "error_type": error_type,
     }
 
 
@@ -6111,6 +6117,9 @@ def run_conversation(
                             api_call_count,
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
+                            failure_reason=classified.reason.value,
+                            status_code=status_code,
+                            error_type=type(api_error).__name__,
                         )
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as
@@ -6133,6 +6142,9 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        "failure_reason": classified.reason.value,
+                        "status_code": status_code,
+                        "error_type": type(api_error).__name__,
                     }
 
                 if retry_count >= max_retries:
