@@ -397,6 +397,41 @@ class TestStreamingFallback:
         # The flag should be set so the main retry loop switches to non-streaming
         assert agent._disable_streaming is True
 
+    def test_reset_streaming_disable_for_new_turn_clears_flag(self):
+        """#25723: new user turns must re-attempt streaming so a single
+        false-positive fallback can't strand the whole session on
+        non-streaming behind a proxy that kills silent connections."""
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._disable_streaming = True
+        agent._reset_streaming_disable_for_new_turn()
+        assert agent._disable_streaming is False
+
+    def test_reset_streaming_disable_noop_when_unset(self):
+        """#25723: the reset must be safe to call when the flag was never
+        set, so we don't pay a log line for every healthy turn."""
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        assert not getattr(agent, "_disable_streaming", False)
+        agent._reset_streaming_disable_for_new_turn()
+        assert not getattr(agent, "_disable_streaming", False)
+
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
