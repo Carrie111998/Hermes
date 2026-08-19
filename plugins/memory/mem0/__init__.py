@@ -91,6 +91,91 @@ def _close_cached_backends() -> None:
             pass
 
 
+def _normalize_backend_config(cfg: dict) -> dict:
+    """Return a copy of ``cfg`` with path-like fields canonicalized for caching.
+
+    The OSS cache key is derived from this config, so semantically identical
+    configs that differ only in spelling (``~`` vs the expanded home dir,
+    redundant ``./`` segments, trailing slashes, case) must hash to the same
+    key — otherwise the same Qdrant local-path folder could be handed to two
+    distinct OSSBackend instances, recreating the very "already accessed by
+    another instance" failure this cache exists to prevent.
+    """
+    import copy
+
+    out = copy.deepcopy(cfg)
+    vs = out.get("vector_store")
+    if isinstance(vs, dict):
+        vs_cfg = vs.get("config")
+        if isinstance(vs_cfg, dict) and vs_cfg.get("path"):
+            vs_cfg["path"] = os.path.abspath(os.path.expanduser(str(vs_cfg["path"])))
+        elif isinstance(vs_cfg, dict) and vs_cfg.get("host"):
+            vs_cfg["host"] = str(vs_cfg["host"]).rstrip("/").lower()
+    for key in ("llm", "embedder"):
+        block = out.get(key)
+        if isinstance(block, dict) and isinstance(block.get("config"), dict):
+            cfg_block = block["config"]
+            for k in ("api_base", "base_url"):
+                if cfg_block.get(k):
+                    cfg_block[k] = str(cfg_block[k]).rstrip("/").lower()
+    return out
+
+
+def _cache_key_for(mode: str, oss_config: dict | None, host: str | None, api_key: str | None) -> tuple:
+    """Build a normalized cache key that reflects the backend's actual identity.
+
+    Includes the API key (or a hash) so a key rotation mid-process — or two
+    sessions using different keys against the same host — never reuse a
+    backend constructed with a stale credential.
+    """
+    if mode == "oss":
+        norm = _normalize_backend_config(oss_config or {})
+        return ("oss", json.dumps(norm, sort_keys=True, default=str))
+    if host:
+        key_suffix = api_key[-8:] if api_key else "<none>"
+        return ("host", host.rstrip("/").lower(), key_suffix)
+    return ("platform", "<none>")
+
+
+# Per-key locks guard access to shared cached backends so a non-thread-safe
+# QdrantClient is never used concurrently by tool calls and mirror threads.
+# The key is the same normalized tuple as the cache, so one lock per backend.
+_BACKEND_LOCKS: dict[tuple, threading.Lock] = {}
+_BACKEND_LOCKS_GUARD = threading.Lock()
+
+
+def _backend_lock_for(key: tuple) -> threading.Lock:
+    """Return the per-backend lock for ``key``, creating it on first use."""
+    with _BACKEND_LOCKS_GUARD:
+        lock = _BACKEND_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _BACKEND_LOCKS[key] = lock
+        return lock
+
+
+class _BackendGuard:
+    """Context manager that serializes access to a shared cached backend.
+
+    Takes the per-key lock for the duration of a call so concurrent tool
+    calls and mirror daemon threads touching the same QdrantClient don't
+    interleave. Construction itself happens outside the process-wide cache
+    lock via double-checked locking, so a slow QdrantClient init never
+    serializes all providers.
+    """
+
+    def __init__(self, key: tuple):
+        self._lock = _backend_lock_for(key)
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
+
+
 def _is_client_error(exc: Exception) -> bool:
     """True for user-caused errors (bad ID, not found) that should NOT trip circuit breaker."""
     etype = type(exc).__name__
@@ -229,6 +314,7 @@ class Mem0MemoryProvider(MemoryProvider):
     def __init__(self):
         self._config = None
         self._backend = None
+        self._backend_key = None  # normalized cache key for the active backend
         self._mode = "platform"
         self._api_key = ""
         self._host = ""
@@ -310,30 +396,41 @@ class Mem0MemoryProvider(MemoryProvider):
             if self._mode == "oss":
                 from ._backend import OSSBackend
                 cfg = self._config.get("oss", {})
-                cache_key = ("oss", json.dumps(cfg, sort_keys=True, default=str))
+                key = _cache_key_for("oss", cfg, None, None)
+                # Double-checked locking: read the cache without the write
+                # lock, construct OUTSIDE the process-wide cache lock (a slow
+                # QdrantClient init must not serialize all providers), then
+                # re-check before inserting so a racing constructor wins only
+                # once.
+                cached = _BACKEND_CACHE.get(key)
+                if cached is not None:
+                    return cached, key
                 with _BACKEND_CACHE_LOCK:
-                    cached = _BACKEND_CACHE.get(cache_key)
+                    cached = _BACKEND_CACHE.get(key)
                     if cached is not None:
-                        return cached
+                        return cached, key
                     backend = OSSBackend(cfg)
-                    _BACKEND_CACHE[cache_key] = backend
-                    return backend
+                    _BACKEND_CACHE[key] = backend
+                    return backend, key
             if self._host:
-                cache_key = ("host", self._host)
+                key = _cache_key_for("host", None, self._host, self._api_key)
+                cached = _BACKEND_CACHE.get(key)
+                if cached is not None:
+                    return cached, key
                 with _BACKEND_CACHE_LOCK:
-                    cached = _BACKEND_CACHE.get(cache_key)
+                    cached = _BACKEND_CACHE.get(key)
                     if cached is not None:
-                        return cached
+                        return cached, key
                     from ._backend import SelfHostedBackend
                     backend = SelfHostedBackend(self._api_key, self._host)
-                    _BACKEND_CACHE[cache_key] = backend
-                    return backend
+                    _BACKEND_CACHE[key] = backend
+                    return backend, key
             from ._backend import PlatformBackend
-            return PlatformBackend(self._api_key)
+            return PlatformBackend(self._api_key), ("platform", "<none>")
         except Exception as e:
             logger.error("Mem0 backend failed to initialize (%s mode): %s", self._mode, e)
             self._init_error = str(e)
-            return None
+            return None, None
 
     def _is_breaker_open(self) -> bool:
         """Return True if the circuit breaker is tripped (too many failures)."""
@@ -576,19 +673,23 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._backend is None or self._is_breaker_open():
             return
         backend = self._backend
+        guard_key = self._backend_key or ("platform", "<none>")
 
         def _write():
             try:
                 meta = dict(metadata or {})
                 meta.setdefault("write_origin", "builtin_memory_mirror")
                 meta["target"] = target
-                backend.add(
-                    [{"role": "user", "content": content}],
-                    user_id=self._user_id,
-                    agent_id=self._agent_id,
-                    infer=False,
-                    metadata=meta,
-                )
+                # Use the same per-backend guard as tool calls so the mirror
+                # thread never races a tool call on the shared QdrantClient.
+                with _BackendGuard(guard_key):
+                    backend.add(
+                        [{"role": "user", "content": content}],
+                        user_id=self._user_id,
+                        agent_id=self._agent_id,
+                        infer=False,
+                        metadata=meta,
+                    )
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -607,14 +708,28 @@ class Mem0MemoryProvider(MemoryProvider):
         e.g. another process held the Qdrant local-path lock at the time.
         That condition is transient: once the lock is released the backend
         can initialize fine. Retrying on each call (guarded by the circuit
-        breaker) lets the provider recover without a process restart,
-        instead of being permanently wedged until the host restarts.
+        breaker, plus a short backoff) lets the provider recover without a
+        process restart, instead of being permanently wedged until the host
+        restarts. The backoff prevents hammering a still-held lock when the
+        transient condition persists.
         """
         if self._backend is not None or self._is_breaker_open():
             return self._backend
-        self._backend = self._create_backend()
+        now = time.monotonic()
+        if now < getattr(self, "_retry_after", 0.0):
+            return None
+        result = self._create_backend()
+        if isinstance(result, tuple):
+            self._backend, self._backend_key = result
+        else:
+            self._backend = result
+            self._backend_key = None
         if self._backend is not None:
             self._init_error = None
+            self._retry_after = 0.0
+        else:
+            # Backoff: retry again after a short delay instead of on every call.
+            self._retry_after = now + 1.0
         return self._backend
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -635,6 +750,10 @@ class Mem0MemoryProvider(MemoryProvider):
                 msg += f" Check that your {vs.get('provider', 'vector store')} is running."
             return json.dumps({"error": msg})
 
+        # Serialize access to the shared cached backend so concurrent tool
+        # calls (and mirror threads) never interleave on the same QdrantClient.
+        guard_key = self._backend_key or ("platform", "<none>")
+
         if tool_name == "mem0_search":
             query = args.get("query", "")
             if not query:
@@ -646,7 +765,8 @@ class Mem0MemoryProvider(MemoryProvider):
                     rerank = rerank_raw.lower() not in ("false", "0", "no")
                 else:
                     rerank = bool(rerank_raw)
-                results = self._backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank)
+                with _BackendGuard(guard_key):
+                    results = self._backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank)
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
@@ -663,13 +783,14 @@ class Mem0MemoryProvider(MemoryProvider):
             if not content:
                 return tool_error("Missing required parameter: content")
             try:
-                result = self._backend.add(
-                    [{"role": "user", "content": content}],
-                    user_id=self._user_id,
-                    agent_id=self._agent_id,
-                    infer=False,
-                    metadata=self._write_metadata(),
-                )
+                with _BackendGuard(guard_key):
+                    result = self._backend.add(
+                        [{"role": "user", "content": content}],
+                        user_id=self._user_id,
+                        agent_id=self._agent_id,
+                        infer=False,
+                        metadata=self._write_metadata(),
+                    )
                 self._record_success()
                 event_id = result.get("event_id") if isinstance(result, dict) else None
                 # Cloud add is async (server-side extraction); OSS and self-hosted store synchronously.
@@ -687,7 +808,8 @@ class Mem0MemoryProvider(MemoryProvider):
             if not text:
                 return tool_error("Missing required parameter: text")
             try:
-                result = self._backend.update(memory_id, text)
+                with _BackendGuard(guard_key):
+                    result = self._backend.update(memory_id, text)
                 self._record_success()
                 return json.dumps(result)
             except Exception as e:
@@ -701,7 +823,8 @@ class Mem0MemoryProvider(MemoryProvider):
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
             try:
-                result = self._backend.delete(memory_id)
+                with _BackendGuard(guard_key):
+                    result = self._backend.delete(memory_id)
                 self._record_success()
                 return json.dumps(result)
             except Exception as e:

@@ -165,7 +165,7 @@ def test_ensure_backend_recovers_after_transient_failure(monkeypatch):
     prov._agent_id = "hermes"
 
     # First initialize fails (lock held elsewhere at startup).
-    backend = prov._create_backend()
+    backend = prov._create_backend()[0]
     assert backend is None, "startup init must fail while the lock is held"
     assert prov._backend is None
 
