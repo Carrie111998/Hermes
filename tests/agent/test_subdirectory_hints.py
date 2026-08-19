@@ -234,6 +234,59 @@ class TestSubdirectoryHintTracker:
             for call in mock_realpath.call_args_list
         )
 
+    def test_progressive_discovery_rechecks_ancestor_above_working_dir(
+        self, tmp_path
+    ):
+        """A denied parent of working_dir blocks every later hint discovery."""
+        denied_ancestor = tmp_path / "private1"
+        working_dir = denied_ancestor / "src"
+        subdir = working_dir / "pkg"
+        subdir.mkdir(parents=True)
+        hint = subdir / "AGENTS.md"
+        hint.write_text("SHOULD_NOT_LOAD")
+        target = subdir / "module.py"
+        target.write_text("data")
+        original_resolve = Path.resolve
+        original_read_text = Path.read_text
+        from agent import deny_policy
+
+        def in_denied_subtree(path_obj):
+            return path_obj == denied_ancestor or denied_ancestor in path_obj.parents
+
+        def guarded_resolve(path_obj, *args, **kwargs):
+            if in_denied_subtree(path_obj):
+                raise AssertionError("progressive discovery resolved inside denied ancestor")
+            return original_resolve(path_obj, *args, **kwargs)
+
+        def guarded_read_text(path_obj, *args, **kwargs):
+            if in_denied_subtree(path_obj):
+                raise AssertionError("progressive discovery read inside denied ancestor")
+            return original_read_text(path_obj, *args, **kwargs)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "private?")],
+            ),
+            patch(
+                "agent.deny_policy.os.path.realpath",
+                wraps=deny_policy.os.path.realpath,
+            ) as mock_realpath,
+            patch.object(Path, "resolve", autospec=True, side_effect=guarded_resolve),
+            patch.object(Path, "read_text", autospec=True, side_effect=guarded_read_text),
+        ):
+            tracker = SubdirectoryHintTracker(working_dir=str(working_dir))
+            result = tracker.check_tool_call(
+                "read_file",
+                {"path": str(target)},
+            )
+
+        assert result is None
+        assert not any(
+            in_denied_subtree(Path(call.args[0]))
+            for call in mock_realpath.call_args_list
+        )
+
     def test_progressive_discovery_preflights_denied_ancestor_before_metadata(
         self,
         tmp_path,
