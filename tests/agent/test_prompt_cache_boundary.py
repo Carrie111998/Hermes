@@ -331,7 +331,7 @@ class TestCronBuilder:
             return [_build_job_prompt(job) for job in jobs]
 
     @staticmethod
-    def _skill_view(name: str) -> str:
+    def _skill_view(name: str, **_kwargs) -> str:
         import json
 
         if name == "missing":

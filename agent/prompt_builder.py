@@ -2304,6 +2304,7 @@ def _truncate_content(
 def load_soul_md(
     context_length: Optional[int] = None,
     home_override: "Path | None" = None,
+    activation_metadata: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
@@ -2328,7 +2329,15 @@ def load_soul_md(
     if not soul_path.exists():
         return None
     try:
-        content = soul_path.read_text(encoding="utf-8").strip()
+        raw_content = soul_path.read_bytes()
+        # Match text-mode universal-newline handling while retaining the exact
+        # source bytes for activation attestation.
+        content = (
+            raw_content.decode("utf-8")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .strip()
+        )
         if not content:
             return None
         content = _scan_context_content(content, "SOUL.md")
@@ -2336,6 +2345,13 @@ def load_soul_md(
             content, "SOUL.md", context_length=context_length,
             read_path=str(soul_path),
         )
+        if activation_metadata is not None:
+            from hermes_cli.activation_receipts import digest_bytes, digest_text
+
+            activation_metadata.update(
+                raw_digest=digest_bytes(raw_content),
+                effective_digest=digest_text(content),
+            )
         return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)

@@ -213,6 +213,10 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Closed post-construction attestation. The single ``receipt`` mapping
+    # contains identifiers and SHA-256 digests only — never prompt, history,
+    # filesystem paths, credentials, or runtime handles.
+    "on_activation_receipt",
     # Successful skill lifecycle facts. The local skill name is available to
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",
@@ -381,13 +385,15 @@ VALID_HOOKS: Set[str] = {
     "pre_command",
 }
 
-# Hooks whose return value carries a directive that the shell-hook response
-# parser (``agent/shell_hooks._parse_response``) has no channel for.
+# Hooks that are intentionally unavailable to shell hooks. Most carry a
+# directive the shell response parser has no channel for. Activation receipts
+# are excluded because their bounded observer contract must not grant command
+# execution; Python observers and signed outbound webhooks remain available.
 # ``VALID_HOOKS`` doubles as the shell-hook config allow-list, so without
-# this exclusion a shell hook could register for one of these events and
-# have its output silently ignored — registration is refused loudly instead.
-# Support for a shell response shape can lift an event out of this set.
+# this exclusion a shell hook could register for these events. Registration is
+# refused loudly instead.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "on_activation_receipt",
     "transform_api_error_classification",
 }
 

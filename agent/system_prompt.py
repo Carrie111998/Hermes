@@ -336,7 +336,11 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+def build_system_prompt_parts(
+    agent: Any,
+    system_message: Optional[str] = None,
+    activation_metadata: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
     Returns a dict with three keys:
@@ -377,11 +381,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _soul_activation: Dict[str, str] = {}
     if agent.load_soul_identity or not agent.skip_context_files:
         # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
         # ambient resolution on a thread that lost the HERMES_HOME ContextVar
         # reads the launch profile's SOUL.md instead (#50233).
-        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
+        _soul_content = _r.load_soul_md(
+            _ctx_len,
+            home_override=_agent_home(agent),
+            activation_metadata=(
+                _soul_activation if activation_metadata is not None else None
+            ),
+        )
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -879,6 +890,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
+    if _soul_loaded and _soul_activation and activation_metadata is not None:
+        agent_home = _agent_home(agent) or get_hermes_home()
+        activation_metadata.update(
+            profile_id=_profile_name_for_home(agent_home),
+            session_id=str(getattr(agent, "session_id", None) or ""),
+            activation_mode=(
+                "cache_rebuild"
+                if getattr(agent, "_activation_receipt_rebuild_pending", False)
+                else "session_start"
+            ),
+            raw_digest=_soul_activation.get("raw_digest", ""),
+            effective_digest=_soul_activation.get("effective_digest", ""),
+        )
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
@@ -903,7 +928,12 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     rebuilt (on compaction/restore) the unchanged stable scaffold ahead of
     the change stays in the reused prefix.
     """
-    parts = build_system_prompt_parts(agent, system_message=system_message)
+    activation_metadata: Dict[str, str] = {}
+    parts = build_system_prompt_parts(
+        agent,
+        system_message=system_message,
+        activation_metadata=activation_metadata,
+    )
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
 
@@ -911,6 +941,22 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     # channel so gateway/CLI users see them in chat instead of only in logs.
     for warning in drain_truncation_warnings():
         agent._emit_status(warning)
+
+    # The complete model-bound system prompt now exists. The observer sees
+    # only validated identifiers and source/effective digests.
+    if activation_metadata:
+        from hermes_cli.activation_receipts import emit_activation_receipt
+
+        emit_activation_receipt(
+            profile_id=activation_metadata.get("profile_id", ""),
+            session_id=activation_metadata.get("session_id", ""),
+            component_type="soul",
+            component_name="SOUL.md",
+            activation_mode=activation_metadata.get("activation_mode", ""),
+            raw_digest=activation_metadata.get("raw_digest", ""),
+            effective_digest=activation_metadata.get("effective_digest", ""),
+        )
+        agent._activation_receipt_rebuild_pending = False
 
     return joined
 
@@ -923,6 +969,7 @@ def invalidate_system_prompt(agent: Any) -> None:
     """
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
+    agent._activation_receipt_rebuild_pending = True
     if agent._memory_store:
         agent._memory_store.load_from_disk()
 

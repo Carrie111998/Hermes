@@ -276,8 +276,21 @@ class TestSkillViewQualifiedName:
         )
 
         assert result["success"] is True
-        [loaded] = [event for _, event in events if event["action"] == "loaded"]
+        [loaded] = [
+            event
+            for name, event in events
+            if name == "on_skill_lifecycle" and event["action"] == "loaded"
+        ]
         assert loaded["provenance"] == "installed"
+        [activation] = [
+            event["receipt"]
+            for name, event in events
+            if name == "on_activation_receipt"
+        ]
+        assert activation["component_type"] == "skill"
+        assert activation["component_name"] == "superpowers:writing-plans"
+        assert activation["activation_mode"] == "skill_view"
+        assert activation["session_id"] == "session-1"
 
     def test_invalid_namespace_returns_error(self, tmp_path):
         from tools.skills_tool import skill_view

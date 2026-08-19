@@ -236,14 +236,23 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
         normalized = normalize_skill_lookup_name(raw_identifier)
 
+        activation_metadata: Dict[str, str] = {}
         loaded_skill = json.loads(
-            skill_view(normalized, task_id=task_id, preprocess=False)
+            skill_view(
+                normalized,
+                task_id=task_id,
+                preprocess=False,
+                activation_metadata=activation_metadata,
+            )
         )
     except Exception:
         return None
 
     if not loaded_skill.get("success"):
         return None
+
+    if activation_metadata.get("raw_digest"):
+        loaded_skill["_activation_raw_digest"] = activation_metadata["raw_digest"]
 
     skill_name = str(loaded_skill.get("name") or normalized)
     skill_path = str(loaded_skill.get("path") or "")
@@ -307,6 +316,7 @@ def _build_skill_message(
     loaded_skill: dict[str, Any],
     skill_dir: Path | None,
     activation_note: str,
+    activation_mode: str,
     user_instruction: str = "",
     runtime_note: str = "",
     session_id: str | None = None,
@@ -326,7 +336,8 @@ def _build_skill_message(
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
         content = _expand_inline_shell(content, skill_dir, timeout)
 
-    parts = [activation_note, "", content.strip()]
+    effective_content = content.strip()
+    parts = [activation_note, "", effective_content]
 
     # ── Inject the absolute skill directory so the agent can reference
     #    bundled scripts without an extra skill_view() round-trip. ──
@@ -413,6 +424,25 @@ def _build_skill_message(
     message = "\n".join(parts)
     if stable_prefix is not None and message.startswith(stable_prefix) and len(message) > len(stable_prefix):
         register_stable_prefix(stable_prefix)
+
+    raw_digest = str(loaded_skill.get("_activation_raw_digest") or "")
+    skill_name = str(loaded_skill.get("name") or "")
+    if raw_digest and skill_name and session_id:
+        from hermes_cli.activation_receipts import (
+            current_profile_id,
+            digest_text,
+            emit_activation_receipt,
+        )
+
+        emit_activation_receipt(
+            profile_id=current_profile_id(),
+            session_id=str(session_id),
+            component_type="skill",
+            component_name=skill_name,
+            activation_mode=activation_mode,
+            raw_digest=raw_digest,
+            effective_digest=digest_text(effective_content),
+        )
     return message
 
 
@@ -668,6 +698,7 @@ def build_skill_invocation_message(
         loaded_skill,
         skill_dir,
         activation_note,
+        "slash",
         user_instruction=user_instruction,
         runtime_note=runtime_note,
         session_id=task_id,
@@ -778,6 +809,7 @@ def build_stacked_skill_invocation_message(
                 loaded_skill,
                 skill_dir,
                 activation_note,
+                "slash",
                 session_id=task_id,
             )
         )
@@ -865,6 +897,7 @@ def build_preloaded_skills_prompt(
                 loaded_skill,
                 skill_dir,
                 activation_note,
+                "preload",
                 session_id=task_id,
             )
         )

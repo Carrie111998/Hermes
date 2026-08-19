@@ -458,6 +458,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_session_end` | Observer | Canonically at each turn finalization; CLI/TUI exits have additional reduced legacy shapes. Return ignored. | Canonical: `session_id`, `task_id`, `turn_id`, `completed`, `failed`, `interrupted`, `turn_exit_reason`, `model`, `platform`; exit paths may add `reason`/`api_request_id` and omit fields. | IDs, model/platform, and outcome; canonical payload has no message body. |
 | `on_session_finalize` | Observer | CLI/TUI/gateway teardown through `finalize_session`; gateway shutdown or expiry may finalize without a reset. Return ignored. | Surface-dependent `session_id`, `platform`, optionally `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
 | `on_session_reset` | Observer | CLI/TUI session boundary and gateway after the replacement session exists; return ignored. | CLI: `session_id`, `platform`, `reason`; TUI: `session_id`, `platform`; gateway: those plus `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
+| `on_activation_receipt` | Observer | After model-bound SOUL or full skill content is constructed; return ignored. A rebuilt SOUL emits again after prompt-cache invalidation. | `receipt` with the closed schema documented below. | Profile/session/component identifiers, activation mode, and SHA-256 digests only; no content, paths, credentials, history, or runtime handles. Python plugins and outbound webhooks only; shell hooks are refused. |
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
@@ -1539,6 +1540,30 @@ Fires after a provider response has been normalized successfully. This is observ
 #### `api_request_error`
 
 Fires for a failed provider attempt with status/retry timing, an `error` object, and sanitized `request`. This is observer-only. Error messages may still contain provider or user data.
+
+### `on_activation_receipt`
+
+Fires only after Hermes has constructed model-bound SOUL or full main-skill content. Discovery, failed loads, supporting-file views, and unchanged `skill_view` dedup responses do not fire it. Prompt-cache invalidation marks the next successfully rebuilt SOUL receipt as `cache_rebuild`; receipt IDs are new even when the source and effective digests are unchanged.
+
+The callback receives one `receipt` mapping with exactly these fields:
+
+```json
+{
+  "schema_version": 1,
+  "receipt_id": "activation:<random-id>",
+  "profile_id": "work",
+  "session_id": "<session-id>",
+  "component_type": "soul | skill",
+  "component_name": "SOUL.md | <skill-name>",
+  "activation_mode": "session_start | cache_rebuild | slash | preload | bundle | auto | cron | skill_view",
+  "raw_digest": "sha256:<64 lowercase hex characters>",
+  "effective_digest": "sha256:<64 lowercase hex characters>"
+}
+```
+
+`raw_digest` covers the exact source-file bytes. `effective_digest` covers the exact effective component text inserted into the constructed prompt or tool result after Hermes scanning, truncation, template expansion, inline expansion, and provenance/banner processing that applies on that path. Hermes-generated activation scaffolding is not part of the component digest.
+
+This is a closed attestation observer, not a request hook or control surface. It exposes no prompt or skill text, conversation/history, filesystem path or file-reading handle, credential, tool/command capability, or runtime lifecycle handle. Return values are ignored and observer failures do not alter prompt construction. Shell hooks are deliberately unsupported so subscribing does not introduce command authority; Python plugins and outbound webhooks can subscribe.
 
 ### `on_skill_lifecycle`
 

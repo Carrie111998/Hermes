@@ -885,6 +885,7 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    activation_metadata: Optional[Dict[str, str]] = None,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -907,7 +908,12 @@ def _serve_plugin_skill(
         # UTF-8 with replacement keeps skill_view deterministic across
         # platforms — falling back to the machine locale (cp1252/GBK) would
         # make the same skill render differently per host (see PR #51701).
-        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
+        raw_content = skill_md.read_bytes()
+        content = (
+            raw_content.decode("utf-8-sig", errors="replace")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
     except Exception as e:
         return json.dumps(
             {"success": False, "error": f"Failed to read skill '{namespace}:{bare}': {e}"},
@@ -1037,11 +1043,17 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
+    effective_content = f"{banner}{rendered_content}" if banner else rendered_content
+    if activation_metadata is not None:
+        from hermes_cli.activation_receipts import digest_bytes
+
+        activation_metadata["raw_digest"] = digest_bytes(raw_content)
+
     return json.dumps(
         {
             "success": True,
             "name": f"{namespace}:{bare}",
-            "content": f"{banner}{rendered_content}" if banner else rendered_content,
+            "content": effective_content,
             "description": description,
             "linked_files": _plugin_skill_linked_files(skill_md.parent),
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
@@ -1074,6 +1086,7 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    activation_metadata: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1188,6 +1201,7 @@ def skill_view(
                     file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
+                    activation_metadata=activation_metadata,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1430,7 +1444,12 @@ def skill_view(
 
         # Read the file once — reused for platform check and main content below
         try:
-            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
+            raw_content = skill_md.read_bytes()
+            content = (
+                raw_content.decode("utf-8-sig", errors="replace")
+                .replace("\r\n", "\n")
+                .replace("\r", "\n")
+            )
         except Exception as e:
             return json.dumps(
                 {
@@ -1911,6 +1930,11 @@ def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
+        if activation_metadata is not None:
+            from hermes_cli.activation_receipts import digest_bytes
+
+            activation_metadata["raw_digest"] = digest_bytes(raw_content)
+
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:
@@ -2137,8 +2161,12 @@ def _skill_view_with_bump(args, **kw):
     stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
     if stub is not None:
         return stub
+    activation_metadata: Dict[str, str] = {}
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=task_id
+        name,
+        file_path=args.get("file_path"),
+        task_id=task_id,
+        activation_metadata=activation_metadata,
     )
     try:
         parsed = json.loads(result)
@@ -2148,16 +2176,36 @@ def _skill_view_with_bump(args, **kw):
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
             if resolved:
-                from tools.skill_usage import bump_use, bump_view
-                bump_view(str(resolved))
-                # A skill_view tool call is the agent actively loading the skill
-                # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(
-                    str(resolved),
-                    task_id=kw.get("task_id"),
-                    session_id=kw.get("session_id"),
-                )
+                if not args.get("file_path") and activation_metadata.get("raw_digest"):
+                    from hermes_cli.activation_receipts import (
+                        current_profile_id,
+                        digest_text,
+                        emit_activation_receipt,
+                    )
+
+                    emit_activation_receipt(
+                        profile_id=current_profile_id(),
+                        session_id=str(kw.get("session_id") or task_id or ""),
+                        component_type="skill",
+                        component_name=str(resolved),
+                        activation_mode="skill_view",
+                        raw_digest=activation_metadata["raw_digest"],
+                        effective_digest=digest_text(str(parsed.get("content") or "")),
+                    )
+                try:
+                    from tools.skill_usage import bump_use, bump_view
+
+                    bump_view(str(resolved))
+                    # A skill_view tool call is the agent actively loading the skill
+                    # to act on it — that counts as use, not just a browse/view.
+                    # Curator's stale timer keys off last_used_at (see agent/curator.py).
+                    bump_use(
+                        str(resolved),
+                        task_id=kw.get("task_id"),
+                        session_id=kw.get("session_id"),
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
     return result

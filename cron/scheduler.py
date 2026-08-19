@@ -3968,8 +3968,14 @@ def _build_job_prompt(
             skipped.append(skill_name)
             continue
 
+        activation_metadata: dict[str, str] = {}
         try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
+            loaded = json.loads(
+                skill_view(
+                    normalize_skill_lookup_name(skill_name),
+                    activation_metadata=activation_metadata,
+                )
+            )
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
@@ -3996,6 +4002,22 @@ def _build_job_prompt(
                 content,
             ]
         )
+        if activation_metadata.get("raw_digest"):
+            from hermes_cli.activation_receipts import (
+                current_profile_id,
+                digest_text,
+                emit_activation_receipt,
+            )
+
+            emit_activation_receipt(
+                profile_id=current_profile_id(),
+                session_id=str(job.get("id") or ""),
+                component_type="skill",
+                component_name=str(loaded.get("name") or skill_name),
+                activation_mode="cron",
+                raw_digest=activation_metadata["raw_digest"],
+                effective_digest=digest_text(content),
+            )
 
     if skipped:
         notice = (

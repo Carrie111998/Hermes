@@ -333,6 +333,7 @@ def build_bundle_invocation_message(
                 loaded_skill,
                 skill_dir,
                 activation_note,
+                "bundle",
                 session_id=task_id,
             )
         )
