@@ -46,6 +46,7 @@ import {
   type PetChangeMeta,
   setChangeEventsAvailable
 } from '@/store/live-sync'
+import { liveToolComplete, liveToolStart, liveTurnAppendText, liveTurnEnd, liveTurnStart } from '@/store/live-turn'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notify, notifyError } from '@/store/notifications'
@@ -789,7 +790,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         flushQueuedDeltas(sessionId)
+        // NOTE: subagents are cleared on the user's submit (the real turn
+        // boundary), NOT here — message.start also fires per assistant round and
+        // for synthetic re-entries (async-delegation completion / notifications),
+        // which must accumulate into the same turn, not wipe it.
         pruneFinishedSessionSubagents(sessionId)
+        liveTurnStart(sessionId)
         setSessionCompacting(sessionId, false)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
@@ -851,7 +857,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
       } else if (event.type === 'message.delta') {
         if (sessionId) {
-          appendAssistantDelta(sessionId, coerceGatewayText(payload?.text), occurredAt)
+          const text = coerceGatewayText(payload?.text)
+          appendAssistantDelta(sessionId, text, occurredAt)
+          liveTurnAppendText(sessionId, text)
         }
       } else if (event.type === 'message.interim') {
         // The agent emitted interim assistant commentary (text alongside tool
@@ -1006,6 +1014,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             : undefined
 
         completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure, occurredAt)
+        liveTurnEnd(sessionId)
 
         // Structured billing wall forwarded by the gateway (out of credits /
         // payment required) — cache it + raise a billing-specific toast.
@@ -1079,6 +1088,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         flushQueuedDeltas(sessionId)
         upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type, occurredAt)
 
+        if (event.type === 'tool.start') {
+          const toolId = String(payload?.tool_id ?? payload?.tool_call_id ?? payload?.id ?? payload?.name ?? '')
+
+          if (toolId) {
+            liveToolStart(sessionId, toolId, String(payload?.name ?? 'tool'))
+          }
+        }
+
         if (isActiveEvent) {
           setPetActivity({ reasoning: false, toolRunning: true })
         }
@@ -1086,6 +1103,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type, occurredAt)
+
+          const toolId = String(payload?.tool_id ?? payload?.tool_call_id ?? payload?.id ?? payload?.name ?? '')
+
+          if (toolId) {
+            liveToolComplete(sessionId, toolId, payload?.error ? 'error' : 'ok')
+          }
 
           if (isActiveEvent) {
             setPetActivity({ toolRunning: false })
