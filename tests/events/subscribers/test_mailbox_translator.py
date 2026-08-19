@@ -109,14 +109,6 @@ def test_batch_summary_real_protocol_field_results(bus):
     assert high[0]["company"] == "Beta"
 
 
-def test_submit_confirm_emits_application_submitted(bus):
-    _mailbox_event(bus, "SUBMIT_CONFIRM",
-                   {"company": "Acme", "title": "Director", "submission_id": "s1"})
-    _translate(bus)
-    events = _recent_domain_events(bus)
-    assert any(et == EventType.APPLICATION_SUBMITTED for et, _ in events)
-
-
 def test_blocked_question_emits_application_blocked(bus):
     _mailbox_event(bus, "BLOCKED_QUESTION",
                    {"company": "Acme", "title": "Director", "question": "Eligible?"})
@@ -1212,3 +1204,65 @@ class TestSubmitResultIsTranslated:
         row = next(e for e in bus.query()
                    if e.event_type == EventType.APPLICATION_SUBMITTED)
         assert row.job_id == "8de4877d"
+
+
+class TestSubmitConfirmIsNotAnOutcome:
+    """SUBMIT_CONFIRM is Diego's AUTHORIZATION, not an accomplished submission.
+
+    "Dry-run -> Jaum review -> SUBMIT_CONFIRM -> actual submit"
+    (curator/orchestrator.py:151) places it strictly BEFORE the applier acts,
+    and protocol.md:49 gives its whole payload as `{job_id, approved: true}`.
+    Mapping it to APPLICATION_SUBMITTED -- a _SUCCESS_EVENT_TYPE
+    (events/outcomes.py:89) -- booked the job as a completed success the
+    instant Diego said yes. The damage is durable, not cosmetic:
+    memory_writer.py:186 appends "Application submitted for <title> at
+    <company>" to that job's GBrain timeline, which is append-only, and
+    digest_composer.py:371 counts it in the daily "Applier: N submitted" line.
+
+    Since a4e6ade172 the truthful producer of that event type is SUBMIT_RESULT
+    with `status == "submitted"`, so keeping this branch made one authorized
+    application emit APPLICATION_SUBMITTED TWICE -- once falsely at the
+    go-ahead, once truthfully at the report.
+
+    Removed rather than repointed at an "authorization received" event type:
+    Diego AUTHORS SUBMIT_CONFIRM (SOUL.md:58; he clicks Approve --
+    profiles/applier/workspace/WORKFLOW.md:73), so such an event would page
+    him about his own click. Nothing is lost -- the message still reaches the
+    bus as `mailbox_message` for audit, with its own `_summarize` case
+    (mailbox_watcher.py:282), and the dispatch route that wakes the applier is
+    a separate table (jobflow_dispatch/contracts.py:55).
+    """
+
+    def test_submit_confirm_emits_no_domain_event(self, bus, pipeline_state):
+        """The real payload the protocol defines."""
+        _mailbox_event(bus, "SUBMIT_CONFIRM",
+                       {"job_id": "8de4877d", "approved": True})
+        _translate(bus)
+        assert _recent_domain_events(bus) == []
+
+    def test_a_confirm_naming_the_job_is_still_not_a_submission(self, bus):
+        """The removed branch keyed on exactly these fields, so a producer
+        that started sending them must not resurrect the false success."""
+        _mailbox_event(bus, "SUBMIT_CONFIRM", {
+            "company": "Acme", "title": "Director", "job_key": "8de4877d",
+            "submission_id": "s1"})
+        _translate(bus)
+        assert _recent_domain_events(bus) == []
+
+    def test_one_authorized_application_emits_one_submitted_event(
+        self, bus, pipeline_state
+    ):
+        """The whole authorized lane: Diego confirms, the applier reports.
+        Two producers for one _SUCCESS_EVENT_TYPE double-counted the digest
+        and wrote the GBrain timeline entry twice."""
+        _mailbox_event(bus, "SUBMIT_CONFIRM",
+                       {"job_id": "8de4877d", "approved": True})
+        _mailbox_event(bus, "SUBMIT_RESULT", {
+            "job_id": "8de4877d", "status": "submitted",
+            "confirmation_id": "CONF-123"})
+        _translate(bus)
+        submitted = [p for et, p in _recent_domain_events(bus)
+                     if et == EventType.APPLICATION_SUBMITTED]
+        assert len(submitted) == 1
+        assert submitted[0]["submission_id"] == "CONF-123"
+        assert submitted[0]["company"] == "Tala"

@@ -369,6 +369,16 @@ class TestSubmitResultIsMirrored:
         from events.producers.mailbox_watcher import MIRRORED_MESSAGE_TYPES
         assert "SUBMIT_RESULT" in MIRRORED_MESSAGE_TYPES
 
+    def test_submit_confirm_stays_mirrored_for_audit(self):
+        """The translator no longer emits a domain event for SUBMIT_CONFIRM
+        (it is Diego's authorization, not an outcome). Dropping that branch
+        is only safe while the raw message still reaches the bus as
+        `mailbox_message`, so removing it from this set would take the
+        authorization off the bus entirely, not just out of the domain lane.
+        """
+        from events.producers.mailbox_watcher import MIRRORED_MESSAGE_TYPES
+        assert "SUBMIT_CONFIRM" in MIRRORED_MESSAGE_TYPES
+
     def test_a_submit_result_file_reaches_the_bus(self, bus, mailbox_root):
         watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
         _write_message(mailbox_root / "main" / "inbox", "SUBMIT_RESULT",
