@@ -6,25 +6,13 @@ import type { ProfileInfo } from '@/types/hermes'
 
 // Keep profile.ts's side-effecting imports inert: the gateway socket layer and
 // the REST query client must not run for real in a unit test.
-// Returns true: both prepare seams hand back a thunk reporting whether the
-// activation was ACCEPTED, and a caller publishes its companion state only on
-// true. A bare vi.fn() returns undefined, which now reads as "superseded" and
-// would silently suppress every publication these tests assert on.
-const activateGateway = vi.fn(() => true)
 const ensureGatewayForProfile = vi.fn(async () => undefined)
-const prepareGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => activateGateway)
-const prepareGatewayForProfile = vi.fn(async (_profile: string) => activateGateway)
+const ensureGatewayForAgent = vi.fn(async () => true)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
-vi.mock('@/store/gateway', () => ({
-  $gateway,
-  ensureGatewayForProfile,
-  openGatewayForProfile,
-  prepareGatewayForAgent,
-  prepareGatewayForProfile
-}))
+vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForAgent, ensureGatewayForProfile, openGatewayForProfile }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   setApiRequestProfile: vi.fn()
@@ -72,10 +60,9 @@ const getConnectionFor = vi.fn<
 beforeEach(() => {
   getConnection.mockReset()
   getConnectionFor.mockReset()
-  activateGateway.mockClear()
+  ensureGatewayForAgent.mockReset()
+  ensureGatewayForAgent.mockResolvedValue(true)
   ensureGatewayForProfile.mockClear()
-  prepareGatewayForAgent.mockClear()
-  prepareGatewayForProfile.mockClear()
   openGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
@@ -100,8 +87,12 @@ describe('profile rail routing on a registered gateway', () => {
 
     selectProfile('research')
 
-    await vi.waitFor(() => expect(prepareGatewayForAgent).toHaveBeenCalledWith('local', 'research'))
-    expect(prepareGatewayForProfile).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('local', 'research'))
+    await vi.waitFor(() => {
+      expect($connection.get()?.connectionId).toBe('local')
+      expect($connection.get()?.profile).toBe('research')
+    })
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
 
   it('keeps unscoped legacy windows on the legacy profile route', async () => {
@@ -109,8 +100,8 @@ describe('profile rail routing on a registered gateway', () => {
 
     selectProfile('research')
 
-    await vi.waitFor(() => expect(prepareGatewayForProfile).toHaveBeenCalledWith('research'))
-    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('research'))
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
 
   it('does not promote an inferred non-local legacy descriptor into a registry route', async () => {
@@ -119,8 +110,8 @@ describe('profile rail routing on a registered gateway', () => {
 
     selectProfile('research')
 
-    await vi.waitFor(() => expect(prepareGatewayForProfile).toHaveBeenCalledWith('research'))
-    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('research'))
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
 
   it('starts a profile session on the active registered gateway', async () => {
@@ -131,15 +122,15 @@ describe('profile rail routing on a registered gateway', () => {
 
     newSessionInProfile('research')
 
-    await vi.waitFor(() => expect(prepareGatewayForAgent).toHaveBeenCalledWith('homelab', 'research'))
-    expect(prepareGatewayForProfile).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(ensureGatewayForAgent).toHaveBeenCalledWith('homelab', 'research'))
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
 
   it('contains a registered gateway activation rejection', async () => {
     const error = new Error('gateway unavailable')
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     $connection.set(remoteConn({ connectionId: 'homelab', registryScoped: true }))
-    prepareGatewayForAgent.mockRejectedValueOnce(error)
+    ensureGatewayForAgent.mockRejectedValueOnce(error)
 
     try {
       selectProfile('research')
@@ -163,8 +154,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
 
     await ensureGatewayProfile('vps-remote')
 
-    expect(prepareGatewayForProfile).toHaveBeenCalledWith('vps-remote')
-    expect(activateGateway).toHaveBeenCalledTimes(1)
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('vps-remote')
     expect(getConnection).toHaveBeenCalledWith('vps-remote')
     expect($connection.get()?.mode).toBe('remote')
     expect($connection.get()?.profile).toBe('vps-remote')
@@ -181,49 +171,13 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect($connection.get()?.mode).toBe('local')
   })
 
-  it('fails as a unit when the descriptor fetch fails — no mixed state', async () => {
-    // Previously the gateway was activated and $activeGatewayProfile set even
-    // when the descriptor lookup failed, leaving $gateway on the new backend
-    // while $connection kept describing the old one for the rest of the
-    // session. Now nothing is published: every atom still consistently
-    // describes the previous profile and the user can retry.
+  it('leaves the prior connection intact when the descriptor fetch fails', async () => {
     getConnection.mockRejectedValue(new Error('backend unreachable'))
 
     await ensureGatewayProfile('vps-remote')
 
-    expect(activateGateway).not.toHaveBeenCalled()
-    expect($activeGatewayProfile.get()).toBe('default')
+    // Best-effort: boot/reconnect resyncs later; we must not null it out here.
     expect($connection.get()?.mode).toBe('local')
-  })
-
-  it('never publishes the new gateway before its connection descriptor', async () => {
-    // The exact mixed-state window from the follow-up review: a slow
-    // descriptor fetch must not leave $gateway/$activeGatewayProfile on the
-    // remote backend while $connection still says local. All three flip
-    // together only once the descriptor is in hand.
-    let resolveDescriptor: (conn: HermesConnection) => void = () => undefined
-    getConnection.mockReturnValue(
-      new Promise<HermesConnection>(resolve => {
-        resolveDescriptor = resolve
-      })
-    )
-
-    const switching = ensureGatewayProfile('vps-remote')
-    // Let the socket-open half of the switch settle; the descriptor is still
-    // deliberately pending.
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(activateGateway).not.toHaveBeenCalled()
-    expect($activeGatewayProfile.get()).toBe('default')
-    expect($connection.get()?.mode).toBe('local')
-
-    resolveDescriptor(remoteConn())
-    await switching
-
-    expect(activateGateway).toHaveBeenCalledTimes(1)
-    expect($activeGatewayProfile.get()).toBe('vps-remote')
-    expect($connection.get()?.mode).toBe('remote')
   })
 
   it('does not churn $connection when the target is already the active profile', async () => {
@@ -233,7 +187,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     await ensureGatewayProfile('vps-remote')
 
     expect(getConnection).not.toHaveBeenCalled()
-    expect(prepareGatewayForProfile).not.toHaveBeenCalled()
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
     expect($connection.get()?.mode).toBe('remote')
   })
 })
