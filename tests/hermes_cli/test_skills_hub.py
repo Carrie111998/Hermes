@@ -70,6 +70,18 @@ def _capture(source_filter: str = "all") -> str:
     return sink.getvalue()
 
 
+def test_skills_reset_slash_help_distinguishes_plain_reset_from_restore():
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    handle_skills_slash("/skills reset", console=console)
+
+    output = sink.getvalue()
+    assert "matches bundled" in output
+    assert "differs from bundled" in output
+    assert "--restore" in output
+
+
 def _capture_check(monkeypatch, results, name=None) -> str:
     import tools.skills_hub as hub
 

@@ -64,3 +64,18 @@ def test_mcp_and_acp_accept_hooks_flag():
     # acp takes --accept-hooks at top level
     ns = parser.parse_args(["acp", "--accept-hooks"])
     assert ns.accept_hooks is True
+
+
+def test_skills_reset_help_distinguishes_plain_reset_from_restore(capsys):
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_skills_parser(sub, cmd_skills=_h("skills"))
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["skills", "reset", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "byte-identical" in output
+    assert "genuinely differs" in output
+    assert "--restore" in output
