@@ -86,6 +86,81 @@ def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
         assert cli_main._detect_venv_python_processes() == []
 
 
+# ---------------------------------------------------------------------------
+# Lazy cwd resolution (#89659)
+# ---------------------------------------------------------------------------
+
+
+def _lazy_proc(pid: int, exe: str, name: str, cmdline: list[str], cwd: str | None):
+    """A process whose cwd is readable ONLY via proc.cwd(), never via info.
+
+    Mirrors the post-#89659 contract: `cwd` is not in the process_iter attrs
+    list, so anything that still reads it out of `info` sees nothing.
+    """
+    proc = MagicMock()
+    proc.info = {"pid": pid, "exe": exe, "name": name, "cmdline": cmdline}
+    if cwd is None:
+        proc.cwd.side_effect = PermissionError("access denied")
+    else:
+        proc.cwd.return_value = cwd
+    return proc
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_does_not_request_cwd_for_every_process(_winp, tmp_path):
+    """The expensive `cwd` field must not be pulled for the whole process table.
+
+    On Windows psutil reads cwd from the target's PEB — a handle open plus a
+    remote memory read per process. Paying that for every process is what made
+    the scan exceed the Desktop preflight's timeout and abort valid updates.
+    """
+    requested: list[list[str]] = []
+
+    def _iter(attrs):
+        requested.append(list(attrs))
+        return iter([])
+
+    fake_psutil = types.SimpleNamespace(
+        process_iter=_iter, Process=lambda *a, **k: MagicMock(parents=lambda: [])
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        cli_main._detect_venv_python_processes()
+
+    assert requested, "process_iter was never called"
+    assert "cwd" not in requested[0]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_still_matches_by_cwd_lazily(_winp, tmp_path):
+    """Dropping the eager field must not lose the cwd-based fallback match.
+
+    A base-interpreter trampoline running `-m hermes_cli.main` from inside the
+    install root is a real venv holder even though neither its exe nor its
+    cmdline names the venv — cwd is the only signal that identifies it.
+    """
+    outside_py = str(tmp_path / "other" / "python.exe")
+    holder = _lazy_proc(
+        4242, outside_py, "python.exe", ["python.exe", "-m", "hermes_cli.main", "serve"], str(tmp_path)
+    )
+    # Same shape, but its cwd is unreadable — must not be reported as a holder.
+    denied = _lazy_proc(
+        4243, outside_py, "python.exe", ["python.exe", "-m", "hermes_cli.main", "serve"], None
+    )
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter([holder, denied]),
+        Process=lambda *a, **k: MagicMock(parents=lambda: []),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [pid for pid, _name, _cmd in matches] == [4242]
+    holder.cwd.assert_called()
+
+
 
 
 # ---------------------------------------------------------------------------

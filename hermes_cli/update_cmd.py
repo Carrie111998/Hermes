@@ -3354,6 +3354,24 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         return False, "; ".join(missing[:4])
     return True, ""
 
+def _proc_cwd_prefix(proc: object) -> str:
+    """Return *proc*'s working directory, lowered and ``os.sep``-terminated.
+
+    Returns ``""`` when the directory cannot be read — a zombie, a process
+    owned by another user, or a system process psutil is denied access to.
+    That is not an error: an unreadable cwd simply cannot match this install's
+    root, which is the same answer the eager ``process_iter(["cwd"])`` field
+    produced for those processes.
+    """
+    try:
+        cwd = proc.cwd()  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+    if not isinstance(cwd, str) or not cwd:
+        return ""
+    return cwd.lower().rstrip(os.sep) + os.sep
+
+
 def _detect_venv_python_processes(
     *, exclude_pids: set[int] | None = None
 ) -> list[tuple[int, str, str]]:
@@ -3400,7 +3418,14 @@ def _detect_venv_python_processes(
 
     matches: list[tuple[int, str, str]] = []
     try:
-        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+        # `cwd` is deliberately NOT requested here. On Windows psutil reads it
+        # out of the target process's PEB, which costs a handle open + remote
+        # memory read for every process on the box — the dominant cost of this
+        # scan (~19s on a loaded machine, tripping the Desktop preflight's
+        # timeout and aborting valid updates, #89659). Only the narrow
+        # `hermes_cli.main` fallback below consults it, so it is fetched lazily
+        # per candidate instead of eagerly for the whole process table.
+        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline"])
     except Exception:
         return []
     for proc in proc_iter:
@@ -3418,7 +3443,6 @@ def _detect_venv_python_processes(
             exe_norm = str(exe).lower()
         cmdline_raw = " ".join(info.get("cmdline") or [])
         cmdline_low = cmdline_raw.lower()
-        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
 
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
@@ -3431,7 +3455,7 @@ def _detect_venv_python_processes(
         if not is_holder and venv_prefix in cmdline_low:
             is_holder = True
         if not is_holder and "hermes_cli.main" in cmdline_low:
-            if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
+            if root_prefix in cmdline_low or _proc_cwd_prefix(proc).startswith(root_prefix):
                 is_holder = True
         if not is_holder:
             continue

@@ -295,6 +295,27 @@ describe('scanVenvBlockers', () => {
     assert.equal(typeof c.timeout, 'number')
     assert.ok(c.timeout > 0)
   })
+
+  it('allows a slow scan enough headroom to finish (#89659)', async () => {
+    // The scan is a one-shot psutil enumeration that legitimately takes ~19s
+    // on a loaded Windows box. A ceiling at or below that SIGTERMs the probe
+    // mid-scan, which the caller reads as `probe-failure` and turns into a
+    // hard update abort — on every attempt, unrecoverably, because the
+    // updater's `git reset --hard` reverts any local patch.
+    const calls: any[] = []
+
+    const spy = (async (_cmd: string, _args: string[], opts: any) => {
+      calls.push(opts.timeout)
+
+      return { stdout: okJson, stderr: '' }
+    }) as any
+
+    await scanVenvBlockers('/update/root', spy, stubVenv)
+    assert.ok(
+      calls[0] >= 60_000,
+      `scan timeout ${calls[0]}ms is too tight for a slow process enumeration`
+    )
+  })
 })
 
 describe('stopSafeVenvBlockers', () => {

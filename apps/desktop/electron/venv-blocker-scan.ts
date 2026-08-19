@@ -45,7 +45,13 @@ export type ScanOutcome =
 // Constants
 // ---------------------------------------------------------------------------
 
-const SCAN_TIMEOUT_MS = 15000
+// A one-shot process enumeration, not a poll: the only thing this ceiling has
+// to catch is a genuinely wedged scan. 15s was below the honest cost on loaded
+// Windows boxes (Defender real-time scanning, large process tables), so the
+// probe was SIGTERM'd mid-scan and every update aborted with
+// `venv-probe-failed` (#89659). 60s still fails fast on a stuck scan while
+// leaving headroom for slow machines.
+const SCAN_TIMEOUT_MS = 60000
 const SCAN_MODULE = 'hermes_cli._scan_venv_blockers'
 
 // ---------------------------------------------------------------------------
@@ -204,8 +210,8 @@ export function parseVenvBlockerScanOutput(raw: string): ScanOutcome {
 
 /**
  * Run the venv-blocker scan subprocess.  Async so the Electron main-process
- * event loop is never blocked by the psutil process scan (up to 15s on a
- * loaded Windows box).  Accepts optional overrides for testing (dependency
+ * event loop is never blocked by the psutil process scan (tens of seconds on
+ * a loaded Windows box).  Accepts optional overrides for testing (dependency
  * injection).
  */
 export async function scanVenvBlockers(
