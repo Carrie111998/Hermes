@@ -712,7 +712,22 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
-    
+
+    # "once at <YYYY-MM-DD HH:MM>" — round-trip from display string (#89560)
+    _once_at_match = re.match(
+        r'^once\s+at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)',
+        schedule_lower,
+    )
+    if _once_at_match:
+        schedule = _once_at_match.group(1)  # fall through to ISO parser below
+        original = schedule
+
+    # "once in <duration>" — round-trip from display string (#89560)
+    _once_in_match = re.match(r'^once\s+in\s+(.+)$', schedule_lower)
+    if _once_in_match:
+        schedule = _once_in_match.group(1).strip()  # fall through to duration parser below
+        original = schedule
+
     # "every X" pattern → recurring interval
     if schedule_lower.startswith("every "):
         duration_str = schedule[6:].strip()
