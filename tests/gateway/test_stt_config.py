@@ -64,9 +64,13 @@ async def test_enrich_message_with_transcription_returns_tuple_for_empty_content
             ["/tmp/voice.ogg"],
         )
 
-    # The redundant placeholder is stripped, leaving only the transcript prefix.
+    # The redundant placeholder is stripped, leaving the transcript plus a
+    # durable pointer to the original audio. Downstream media workflows need
+    # the source asset even when automatic STT succeeds.
     assert "hello from a captionless voice note" in result
     assert "(The user sent a message with no text content)" not in result
+    assert "saved at:" in result
+    assert "/tmp/voice.ogg" in result
     # Crucially, the transcripts are still surfaced so callers can echo them.
     assert transcripts == ["hello from a captionless voice note"]
 
