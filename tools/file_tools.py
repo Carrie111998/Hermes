@@ -2126,6 +2126,11 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
             return None
         read_mtime = task_data.get("read_timestamps", {}).get(resolved)
     if read_mtime is None:
+        if os.path.isfile(resolved):
+            return (
+                f"Notice: {filepath} has not been inspected with `read_file` during this session. "
+                "Always verify existing line content before applying changes."
+            )
         return None  # File was never read — nothing to compare against
     try:
         current_mtime = os.path.getmtime(resolved)

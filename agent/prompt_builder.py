@@ -375,6 +375,10 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm",
 # in the cached system prompt — token cost is paid once at install and
 # then amortised across all sessions via prefix caching.  Keep it tight.
 TASK_COMPLETION_GUIDANCE = (
+    "# Inspect before mutating (explore first)\n"
+    "NEVER write, edit, or patch a file without inspecting it first. Always call `read_file` or "
+    "`search_files` to verify exact file contents, line numbers, and existing context before invoking "
+    "`write_file` or `patch`. Do not guess imports, signatures, or existing logic.\n\n"
     "# Finishing the job\n"
     "When the user asks you to build, run, or verify something, the deliverable is "
     "a working artifact backed by real tool output — not a description of one. "
