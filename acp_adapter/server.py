@@ -1165,13 +1165,30 @@ class HermesACPAgent(acp.Agent):
             )
             return
 
+        state.acp_mcp_server_names = list(
+            dict.fromkeys(server.name for server in mcp_servers if server.name)
+        )
+        self._restore_session_mcp_tool_surface(state)
+
+    def _restore_session_mcp_tool_surface(self, state: SessionState) -> None:
+        """Re-enable ACP-supplied MCP tools after constructing a session agent.
+
+        MCP registration is process-global, while each AIAgent snapshots its
+        enabled toolsets and schemas. Model switches replace the AIAgent, so
+        the per-session ACP toolsets must be applied to the replacement before
+        the next prompt. Only server names are retained; credentials and
+        command arguments are never copied into session persistence.
+        """
+        if not state.acp_mcp_server_names:
+            return
+
         try:
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None),
-                mcp_server_names=[server.name for server in mcp_servers],
+                mcp_server_names=state.acp_mcp_server_names,
             )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
@@ -1183,14 +1200,20 @@ class HermesACPAgent(acp.Agent):
             state.agent.valid_tool_names = {
                 tool["function"]["name"] for tool in state.agent.tools or []
             }
-            inject_memory_provider_tools(state.agent)
+            # A decision-only evaluation may expose only its explicitly
+            # supplied constrained MCP. Native memory/context injectors are
+            # part of the ordinary Hermes surface and must not be reintroduced.
+            if state.tool_profile != ACP_TOOL_PROFILE_DECISION_ONLY:
+                inject_memory_provider_tools(state.agent)
             invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
             if callable(invalidate):
                 invalidate()
             logger.info(
-                "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
+                "Session %s: refreshed ACP tool surface profile=%s toolsets=%s tools=%s",
                 state.session_id,
-                len(state.agent.tools or []),
+                state.tool_profile or "default",
+                enabled_toolsets,
+                sorted(state.agent.valid_tool_names),
             )
         except Exception:
             logger.warning(
@@ -1226,6 +1249,12 @@ class HermesACPAgent(acp.Agent):
         No-op when discovery already finished, when the join times out, when the
         registry was unchanged, or when the session was closed while waiting.
         """
+        # The constrained server is registered synchronously above. The global
+        # configured-server discovery path may also re-inject native
+        # memory/context tools, so it is never applicable to decision sessions.
+        if state.tool_profile == ACP_TOOL_PROFILE_DECISION_ONLY:
+            return
+
         try:
             from hermes_cli.mcp_startup import mcp_discovery_in_flight
         except Exception:
@@ -2354,6 +2383,7 @@ class HermesACPAgent(acp.Agent):
             requested_provider=target_provider,
             tool_profile=state.tool_profile,
         )
+        self._restore_session_mcp_tool_surface(state)
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
@@ -2607,6 +2637,7 @@ class HermesACPAgent(acp.Agent):
                 api_mode=current_api_mode,
                 tool_profile=state.tool_profile,
             )
+            self._restore_session_mcp_tool_surface(state)
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",

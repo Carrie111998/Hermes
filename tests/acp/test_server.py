@@ -757,6 +757,65 @@ class TestRegisterSessionMcpServers:
         assert state.agent.enabled_toolsets == ["mcp-buzz-dev-mcp"]
         assert "hermes-acp" not in state.agent.enabled_toolsets
 
+    @pytest.mark.parametrize("switch_path", ["slash", "protocol"])
+    @pytest.mark.asyncio
+    async def test_decision_only_model_switch_restores_explicit_mcp_only(
+        self, agent, mock_manager, switch_path
+    ):
+        state = mock_manager.create_session(
+            cwd="/tmp", tool_profile=ACP_TOOL_PROFILE_DECISION_ONLY
+        )
+        state.acp_mcp_server_names = ["buzz-dev-mcp"]
+        state.agent.provider = "openai-codex"
+        state.agent.model = "old-model"
+
+        replacement = MagicMock(name="ReplacementDecisionAgent")
+        replacement.enabled_toolsets = []
+        replacement.disabled_toolsets = None
+        replacement.tools = []
+        replacement.valid_tool_names = set()
+        replacement.provider = "openai-codex"
+        replacement.model = "new-model"
+        replacement.base_url = None
+        replacement.api_mode = "codex_app_server"
+
+        decision_tools = [
+            {"function": {"name": "jobs_accept"}},
+            {"function": {"name": "jobs_reject"}},
+        ]
+        with patch.object(
+            mock_manager, "_make_agent", return_value=replacement
+        ) as make_agent, patch.object(
+            agent,
+            "_resolve_model_selection",
+            return_value=("openai-codex", "new-model"),
+        ), patch(
+            "model_tools.get_tool_definitions", return_value=decision_tools
+        ) as get_defs, patch(
+            "agent.memory_manager.inject_memory_provider_tools"
+        ) as inject_memory:
+            if switch_path == "slash":
+                response = agent._cmd_model("new-model", state)
+                assert response.startswith("Model switched to: new-model")
+            else:
+                response = await agent.set_session_model(
+                    "new-model", state.session_id
+                )
+                assert isinstance(response, SetSessionModelResponse)
+
+        assert make_agent.call_args.kwargs["tool_profile"] == (
+            ACP_TOOL_PROFILE_DECISION_ONLY
+        )
+        get_defs.assert_called_once_with(
+            enabled_toolsets=["mcp-buzz-dev-mcp"],
+            disabled_toolsets=None,
+            quiet_mode=True,
+        )
+        inject_memory.assert_not_called()
+        assert replacement.enabled_toolsets == ["mcp-buzz-dev-mcp"]
+        assert replacement.valid_tool_names == {"jobs_accept", "jobs_reject"}
+        assert "hermes-acp" not in replacement.enabled_toolsets
+
     @pytest.mark.asyncio
     async def test_register_failure_logs_warning(self, agent, mock_manager):
         """If register_mcp_servers raises, warning is logged but no crash."""

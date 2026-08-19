@@ -133,6 +133,8 @@ class TestCreateSession:
             def __init__(self, **kwargs):
                 self.enabled_toolsets = kwargs["enabled_toolsets"]
                 self.kwargs = kwargs
+                self.tools = [{"function": {"name": "native_memory_write"}}]
+                self.valid_tool_names = {"native_memory_write"}
 
         monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
         monkeypatch.setattr(
@@ -163,6 +165,9 @@ class TestCreateSession:
         if tool_profile == ACP_TOOL_PROFILE_DECISION_ONLY:
             assert "hermes-acp" not in state.agent.enabled_toolsets
             assert "mcp-configured" not in state.agent.enabled_toolsets
+            assert state.agent.tools == []
+            assert state.agent.valid_tool_names == set()
+            assert state.agent._skip_mcp_refresh is True
 
     def test_decision_only_profile_survives_persisted_restore(self, monkeypatch, tmp_path):
         created_toolsets = []

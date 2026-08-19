@@ -180,6 +180,11 @@ class SessionState:
     # ACP client-requested capability reduction. This is persisted so a
     # restored evaluation session cannot silently regain the default tools.
     tool_profile: str | None = None
+    # Names of MCP servers supplied by the ACP client for this live session.
+    # The registry itself is process-global; retaining only names is sufficient
+    # to restore the permitted toolsets after an in-session agent rebuild
+    # without persisting command arguments or environment secrets.
+    acp_mcp_server_names: List[str] = field(default_factory=list)
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -712,6 +717,14 @@ class SessionManager:
             logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
         agent = AIAgent(**kwargs)
+        if tool_profile == ACP_TOOL_PROFILE_DECISION_ONLY:
+            # AIAgent appends memory/context-engine schemas after registry
+            # filtering. Remove those native additions as well: the ACP server
+            # will add only the explicitly supplied constrained decision MCP.
+            agent.tools = []
+            agent.valid_tool_names = set()
+            agent._context_engine_tool_names = set()
+            agent._skip_mcp_refresh = True
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.
