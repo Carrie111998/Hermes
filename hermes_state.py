@@ -13820,11 +13820,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         max_tool_calls: Optional[int] = None,
         include_pinned: bool = False,
     ) -> Tuple[str, list]:
-        """Build attribute filters for bulk prune/archive selection.
+        """Build the shared WHERE clause for bulk prune/archive selection.
 
-        All filters AND together. Session lifecycle eligibility is added by the
-        caller: destructive prune and filtered export require an ended session,
-        while reversible archive may include unended sessions.
+        All filters AND together. Only ended sessions are ever candidates
+        (``ended_at IS NOT NULL``) so a live session is never selected.
         ``archived`` is a tri-state: ``None`` = both, ``True`` = only
         archived rows, ``False`` = only unarchived rows.
 
@@ -13839,7 +13838,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The clause references the ``s`` table alias — callers must select
         ``FROM sessions s``.
         """
-        clauses = []
+        clauses = ["s.ended_at IS NOT NULL"]
         params: list = []
         if last_active_before is not None:
             clauses.append(
@@ -13970,6 +13969,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
+        if include_unended:
+            ended_guard = "s.ended_at IS NOT NULL"
+            if not where.startswith(ended_guard):
+                raise RuntimeError(
+                    "prune filter lost its ended-session safety guard"
+                )
+            where = (
+                "(s.ended_at IS NOT NULL OR s.ended_at IS NULL)"
+                + where[len(ended_guard):]
+            )
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 f"""SELECT s.id, s.source, s.title, s.model, s.started_at,
@@ -14029,6 +14038,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params
             )
             return int(cursor.fetchone()[0])
+
     def list_prune_candidates(
         self,
         older_than_days: Optional[float] = None,
@@ -14062,6 +14072,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_unended=True,
             **filters,
         )
+
     def archive_sessions(
         self,
         older_than_days: Optional[float] = None,

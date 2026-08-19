@@ -12,6 +12,9 @@ def test_sessions_archive_dry_run_matches_unended_title(monkeypatch, capsys, tmp
     db = session_db_cls(db_path)
     db.create_session("open", source="cli")
     db.set_session_title("open", "Purple Elephant Test")
+    db.create_session("pinned-open", source="cli")
+    db.set_session_title("pinned-open", "Purple Elephant Pinned")
+    db.set_session_pinned("pinned-open", True)
     db.close()
 
     monkeypatch.setattr(hermes_state, "SessionDB", lambda: session_db_cls(db_path))
@@ -49,7 +52,9 @@ def test_sessions_archive_dry_run_matches_unended_title(monkeypatch, capsys, tmp
     output = capsys.readouterr().out
     assert "1 session(s) match" in output
     assert "1 unended, 0 ended" in output
+    assert "1 pinned session" in output
     assert "open" in output
+    assert "pinned-open" not in output
     assert "Dry run" in output
 
 
