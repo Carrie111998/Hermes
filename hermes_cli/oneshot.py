@@ -447,6 +447,10 @@ def _run_agent(
             platform="cli",
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
+            provider_request_overrides=dict(runtime.get("request_overrides") or {}),
+            acp_command=runtime.get("command"),
+            acp_args=list(runtime.get("args") or []),
+            max_tokens=runtime.get("max_output_tokens"),
             fallback_model=_fb or None,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:

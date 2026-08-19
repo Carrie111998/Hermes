@@ -25,9 +25,30 @@ pinning); same family of resolved-vs-requested identity loss.
 
 import json
 import types
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
+import pytest
+from run_agent import AIAgent as RealAIAgent
+
 import hermes_cli.runtime_provider as rp
+
+
+def _install_real_agent_probe_guards(monkeypatch):
+    context_length = MagicMock(return_value=262144)
+    endpoint_metadata = MagicMock(side_effect=AssertionError("constructor attempted endpoint metadata access"))
+    local_server = MagicMock(side_effect=AssertionError("constructor attempted local-server detection"))
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.fetch_endpoint_model_metadata", endpoint_metadata)
+    monkeypatch.setattr("agent.model_metadata.detect_local_server_type", local_server)
+    return context_length, endpoint_metadata, local_server
+
+
+def _assert_real_agent_probe_guards(probes):
+    context_length, endpoint_metadata, local_server = probes
+    context_length.assert_called()
+    endpoint_metadata.assert_not_called()
+    local_server.assert_not_called()
 
 MIMO_URL = "https://token-plan-cn.xiaomimimo.com/v1"
 MIMO_KEY = "sk-mimo-entry-key"
@@ -169,6 +190,74 @@ class TestResumeRoundTrip:
 
         assert kwargs["base_url"] == MIMO_URL
         assert kwargs["api_key"] == MIMO_KEY
+
+
+@pytest.mark.parametrize("requested", ["custom", "custom:remote"])
+def test_tui_modern_requested_identity_resolves_without_reverse_inference(
+    requested, tmp_path, monkeypatch,
+):
+    import run_agent
+    import tui_gateway.server as server
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    config = deepcopy(LEGACY_LIST_CONFIG)
+    captured = {}
+    canonical = MagicMock(side_effect=AssertionError("modern row reverse-inferred"))
+    resolved = MagicMock(return_value={
+        "provider": "custom", "requested_provider": requested,
+        "api_key": "synthetic-key", "base_url": MIMO_URL,
+        "api_mode": "chat_completions",
+        "request_overrides": {"extra_body": {"route": "provider"}},
+        "credential_pool": None, "command": None, "args": [],
+        "max_output_tokens": None,
+    })
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *_a, **_k: None)
+    monkeypatch.setattr(rp, "canonical_custom_identity", canonical)
+    monkeypatch.setattr(rp, "resolve_runtime_provider", resolved)
+    monkeypatch.setattr(run_agent, "OpenAI", MagicMock(return_value=MagicMock()))
+    constructor_probes = _install_real_agent_probe_guards(monkeypatch)
+
+    def construct(*args, **kwargs):
+        captured["kwargs"] = deepcopy(kwargs)
+        captured["agent"] = RealAIAgent(*args, **kwargs)
+        return captured["agent"]
+
+    row = {"model": "mimo-v2.5-pro", "model_config": json.dumps({
+        "model": "mimo-v2.5-pro", "provider": "custom",
+        "requested_provider": requested, "base_url": MIMO_URL,
+        "api_mode": "chat_completions",
+    })}
+    overrides = server._stored_session_runtime_overrides(row)
+    fake_cfg = {"agent": {"system_prompt": ""}, "model": {"default": "unused"}}
+    with (
+        patch("tui_gateway.server._load_cfg", return_value=fake_cfg),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch("run_agent.AIAgent", side_effect=construct),
+    ):
+        agent = server._make_agent("sid-modern", "key-modern", model_override=overrides["model_override"])
+    canonical.assert_not_called()
+    assert resolved.call_args.kwargs["requested"] == requested
+    assert isinstance(agent, RealAIAgent)
+    assert (agent.provider, agent.requested_provider) == ("custom", requested)
+    assert agent._caller_request_overrides == {}
+    assert agent._provider_request_overrides == {"extra_body": {"route": "provider"}}
+    _assert_real_agent_probe_guards(constructor_probes)
+
+
+@pytest.mark.parametrize("invalid", [None, "", "   ", [], {}, "custom:"])
+def test_tui_present_invalid_requested_identity_fails_closed(invalid):
+    from tui_gateway.server import _stored_session_runtime_overrides
+
+    row = {"model": "mimo-v2.5-pro", "model_config": json.dumps({
+        "provider": "custom", "requested_provider": invalid, "base_url": MIMO_URL,
+    })}
+    with pytest.raises(ValueError, match="requested_provider"):
+        _stored_session_runtime_overrides(row)
 
 
 # --- Regression: bare "custom" WITHOUT a base_url (GH #44022 / #47714) ------
@@ -341,5 +430,4 @@ class TestModelNameRecoversEntryIdentity:
             rp.find_custom_provider_identity_by_model("hermes-ultra-sft")
             == "custom:hermes-ultra"
         )
-
 

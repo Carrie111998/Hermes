@@ -7,13 +7,48 @@ and assert that the separate requested identity reaches each capability gate.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+from run_agent import AIAgent as RealAIAgent
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 
 
 MODEL = "qwen3.8-max-preview"
 REQUESTED_PROVIDER = "custom:qwen-token-plan"
+
+
+def _install_real_agent_probe_guards(monkeypatch):
+    context_length = MagicMock(return_value=262144)
+    endpoint_metadata = MagicMock(side_effect=AssertionError("constructor attempted endpoint metadata access"))
+    local_server = MagicMock(side_effect=AssertionError("constructor attempted local-server detection"))
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.fetch_endpoint_model_metadata", endpoint_metadata)
+    monkeypatch.setattr("agent.model_metadata.detect_local_server_type", local_server)
+    return context_length, endpoint_metadata, local_server
+
+
+def _assert_real_agent_probe_guards(probes):
+    context_length, endpoint_metadata, local_server = probes
+    context_length.assert_called()
+    endpoint_metadata.assert_not_called()
+    local_server.assert_not_called()
+
+
+def _install_real_agent_factory(monkeypatch, target, captured):
+    captured["constructor_probes"] = _install_real_agent_probe_guards(monkeypatch)
+
+    def construct(*args, **kwargs):
+        captured["args"] = deepcopy(args)
+        captured["kwargs"] = deepcopy(kwargs)
+        agent = RealAIAgent(*args, **kwargs)
+        captured["agent"] = agent
+        agent.run_conversation = MagicMock(return_value={"final_response": "synthetic-response", "messages": []})
+        agent.chat = MagicMock(return_value="synthetic-response")
+        return agent
+
+    monkeypatch.setattr(target, construct)
 
 
 class _RuntimeCLI(CLIAgentSetupMixin):
@@ -123,3 +158,59 @@ def test_named_identity_reaches_agent_and_vision_tool_native_gates():
         assert _should_use_native_vision_fast_path() is True
     finally:
         reset_runtime_main(token)
+
+
+def test_cli_primary_real_agent_keeps_provider_layer(tmp_path, monkeypatch):
+    import cli
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    runtime = {
+        "provider": "custom", "requested_provider": "ollama",
+        "api_key": "synthetic-key", "base_url": "http://127.0.0.1:11434/v1",
+        "api_mode": "chat_completions", "request_overrides": {},
+        "credential_pool": None, "command": "synthetic-command", "args": ["--synthetic"],
+        "max_output_tokens": None,
+    }
+    cli_instance = _RuntimeCLI(model="synthetic-model", provider="ollama")
+    cli_instance.__dict__.update({
+        "max_tokens": 4096, "max_turns": 2, "enabled_toolsets": [],
+        "disabled_toolsets": [], "verbose": False, "tool_progress_mode": "all",
+        "system_prompt": "", "prefill_messages": [], "reasoning_config": None,
+        "_providers_only": None, "_providers_ignore": None, "_providers_order": None,
+        "_provider_sort": None, "_provider_require_params": False,
+        "_provider_data_collection": None, "_openrouter_min_coding_score": None,
+        "session_id": "synthetic-session", "_session_db": MagicMock(),
+        "_resumed": False, "conversation_history": [],
+        "checkpoints_enabled": False, "checkpoint_max_snapshots": 5,
+        "checkpoint_max_total_size_mb": 50, "checkpoint_max_file_size_mb": 10,
+        "pass_session_id": False, "ignore_rules": True, "streaming_enabled": False,
+        "_inline_diffs_enabled": False, "_pending_title": None,
+    })
+    cli_instance._clarify_callback = None
+    cli_instance.finalize_preloaded_skills = lambda: None
+    cli_instance._install_tool_callbacks = lambda: None
+    cli_instance._ensure_tirith_security = lambda: None
+    cli_instance._ensure_runtime_credentials = lambda: True
+    cli_instance._current_reasoning_callback = lambda: None
+    cli_instance._on_thinking = None
+    cli_instance._on_tool_progress = None
+    cli_instance._on_tool_start = None
+    cli_instance._on_tool_complete = None
+    cli_instance._stream_delta = None
+    cli_instance._on_tool_gen_start = None
+    cli_instance._on_notice = None
+    cli_instance._on_notice_clear = None
+    cli_instance._on_reaction = None
+    captured = {}
+    monkeypatch.setattr("run_agent.OpenAI", MagicMock(return_value=MagicMock()))
+    _install_real_agent_factory(monkeypatch, "cli.AIAgent", captured)
+    monkeypatch.setattr("agent.credits_tracker.seed_credits_at_session_start", lambda *_a: None)
+
+    assert cli_instance._init_agent(runtime_override=runtime) is True
+    assert isinstance(captured["agent"], RealAIAgent)
+    assert captured["kwargs"]["requested_provider"] == "ollama"
+    assert captured["kwargs"]["provider_request_overrides"] == {}
+    assert (cli_instance.agent.provider, cli_instance.agent.requested_provider) == ("custom", "ollama")
+    assert cli_instance.agent._caller_request_overrides == {}
+    assert cli_instance.agent._provider_request_overrides == {}
+    _assert_real_agent_probe_guards(captured["constructor_probes"])

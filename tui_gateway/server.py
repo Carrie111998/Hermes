@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -2956,11 +2957,18 @@ def _ensure_session_db_row(session: dict) -> None:
     for src_key, cfg_key in (
         ("model", "model"),
         ("provider", "provider"),
+        ("requested_provider", "requested_provider"),
         ("base_url", "base_url"),
         ("api_mode", "api_mode"),
     ):
         if val := override.get(src_key):
             model_config[cfg_key] = str(val)
+    if "base_url" in model_config:
+        safe_base_url = _persistable_runtime_base_url(model_config["base_url"])
+        if safe_base_url:
+            model_config["base_url"] = safe_base_url
+        else:
+            model_config.pop("base_url", None)
     # The composer override may carry the RESOLVED provider "custom" for a named
     # ``providers:`` / ``custom_providers:`` entry. Persisting bare "custom" here
     # (the very first DB write for a fresh desktop session, before the agent is
@@ -2969,7 +2977,10 @@ def _ensure_session_db_row(session: dict) -> None:
     # the durable ``custom:<name>`` identity from the override's base_url, else
     # the configured provider, so a routable identity is persisted from the
     # start (matches _runtime_model_config's normalization).
-    if str(model_config.get("provider") or "").strip().lower() == "custom":
+    if (
+        "requested_provider" not in model_config
+        and str(model_config.get("provider") or "").strip().lower() == "custom"
+    ):
         try:
             from hermes_cli.runtime_provider import canonical_custom_identity
 
@@ -4019,7 +4030,14 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # regression vector). If none names a real entry,
     # drop the bare provider entirely so resume falls back to the configured
     # default rather than the broken OpenRouter route.
-    if provider.strip().lower() == "custom":
+    if "requested_provider" in model_config:
+        requested = model_config["requested_provider"]
+        if not isinstance(requested, str) or not requested.strip() or requested.strip().endswith(":"):
+            raise ValueError("invalid persisted requested_provider")
+        requested_provider = requested.strip().lower()
+    else:
+        requested_provider = provider
+    if "requested_provider" not in model_config and provider.strip().lower() == "custom":
         healed = None
         try:
             from hermes_cli.runtime_provider import canonical_custom_identity
@@ -4032,6 +4050,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
                 "custom provider identity recovery failed", exc_info=True
             )
         provider = healed or ("" if not base_url else provider)
+        requested_provider = provider
 
     if model:
         # Use the same dict-shaped override that live /model switches use so a
@@ -4042,6 +4061,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["model_override"] = {
             "model": model,
             "provider": provider or None,
+            "requested_provider": requested_provider or None,
             "base_url": base_url or None,
             "api_mode": api_mode or None,
         }
@@ -4059,11 +4079,33 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     return overrides
 
 
+def _persistable_runtime_base_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    host = hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if port is not None and (scheme, port) not in {("http", 80), ("https", 443)}:
+        host = f"{host}:{port}"
+    return urlunsplit((scheme, host, parsed.path, "", ""))
+
+
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
-    base_url = str(getattr(agent, "base_url", "") or "").strip()
+    requested_provider = str(getattr(agent, "requested_provider", "") or "").strip()
+    base_url = _persistable_runtime_base_url(getattr(agent, "base_url", ""))
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
@@ -4071,7 +4113,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     if model:
         config["model"] = model
     if provider:
-        if provider.strip().lower() == "custom":
+        if provider.strip().lower() == "custom" and not requested_provider:
             # ``agent.provider`` is the RESOLVED provider, and for any named
             # ``providers:`` / ``custom_providers:`` entry that is the literal
             # string "custom" — persisting it loses the entry identity, so a
@@ -4100,6 +4142,10 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
                     "custom provider identity lookup failed", exc_info=True
                 )
         config["provider"] = provider
+    if requested_provider:
+        config["requested_provider"] = requested_provider
+    else:
+        config.pop("requested_provider", None)
     if base_url:
         config["base_url"] = base_url
     else:
@@ -4709,10 +4755,13 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     return {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
+        "requested_provider": getattr(agent, "requested_provider", ""),
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
+        "caller_request_overrides": copy.deepcopy(getattr(agent, "_caller_request_overrides", {}) or {}),
+        "provider_request_overrides": copy.deepcopy(getattr(agent, "_provider_request_overrides", {}) or {}),
     }
 
 
@@ -4720,6 +4769,13 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
+    if hasattr(agent, "_set_caller_request_overrides"):
+        agent._set_caller_request_overrides(snapshot.get("caller_request_overrides") or {})
+    if hasattr(agent, "_set_provider_request_overrides"):
+        agent._set_provider_request_overrides(snapshot.get("provider_request_overrides") or {})
+    requested_provider = snapshot.get("requested_provider")
+    if requested_provider:
+        agent.requested_provider = requested_provider
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
@@ -4738,6 +4794,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+        if requested_provider:
+            agent.requested_provider = requested_provider
 
 
 def _apply_model_switch(
@@ -4940,6 +4998,7 @@ def _apply_model_switch(
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
+            "requested_provider": getattr(result, "requested_provider", result.target_provider),
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
@@ -6492,6 +6551,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
         "provider": getattr(agent, "provider", None) or None,
+        "requested_provider": getattr(agent, "requested_provider", None) or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
@@ -6520,7 +6580,8 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(str(getattr(agent, "model", "") or "")),
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "request_overrides": copy.deepcopy(getattr(agent, "_caller_request_overrides", {}) or {}),
+        "provider_request_overrides": copy.deepcopy(getattr(agent, "_provider_request_overrides", {}) or {}),
         "platform": "tui",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
@@ -6910,12 +6971,20 @@ def _make_agent(
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
-        requested_provider = model_override.get("provider") or provider_override or None
+        requested_provider = (
+            model_override.get("requested_provider")
+            or model_override.get("provider")
+            or provider_override
+            or None
+        )
         override_base_url = model_override.get("base_url")
         override_api_key = model_override.get("api_key")
         override_api_mode = model_override.get("api_mode")
         resolve_kwargs = {}
-        if str(requested_provider or "").strip().lower() == "custom":
+        if (
+            "requested_provider" not in model_override
+            and str(requested_provider or "").strip().lower() == "custom"
+        ):
             # Session rows persisted before the custom-provider identity fix
             # (see _runtime_model_config) stored the resolved provider
             # "custom", which _get_named_custom_provider cannot match back to
@@ -6976,12 +7045,14 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
+        requested_provider=runtime.get("requested_provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        provider_request_overrides=copy.deepcopy(runtime.get("request_overrides") or {}),
         quiet_mode=True,
         # verbose_logging controls DEBUG-level agent logging; it is intentionally
         # independent of tool_progress_mode (which only controls per-tool

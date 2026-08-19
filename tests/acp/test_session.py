@@ -4,13 +4,35 @@ import contextlib
 import io
 import json
 import time
+from copy import deepcopy
 from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch
 
+from run_agent import AIAgent as RealAIAgent
+
 from acp_adapter import session as acp_session
 from acp_adapter.session import SessionManager, SessionState
 from hermes_state import SessionDB
+
+
+def _install_real_agent_probe_guards(monkeypatch):
+    context_length = MagicMock(return_value=262144)
+    endpoint_metadata = MagicMock(side_effect=AssertionError("constructor attempted endpoint metadata access"))
+    local_server = MagicMock(side_effect=AssertionError("constructor attempted local-server detection"))
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.fetch_endpoint_model_metadata", endpoint_metadata)
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", MagicMock(return_value={}))
+    monkeypatch.setattr("agent.model_metadata.detect_local_server_type", local_server)
+    return context_length, endpoint_metadata, local_server
+
+
+def _assert_real_agent_probe_guards(probes):
+    context_length, endpoint_metadata, local_server = probes
+    context_length.assert_called()
+    endpoint_metadata.assert_not_called()
+    local_server.assert_not_called()
 
 
 def _mock_agent():
@@ -375,3 +397,56 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+@pytest.mark.parametrize("requested", ["custom", "custom:remote"])
+def test_acp_modern_requested_identity_resolves_without_reverse_inference(requested, tmp_path, monkeypatch):
+    import run_agent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    db = MagicMock()
+    db.get_session.return_value = {
+        "source": "acp", "model": "synthetic-model",
+        "model_config": json.dumps({"cwd": str(tmp_path), "provider": "custom", "requested_provider": requested, "base_url": "https://remote.example/v1", "api_mode": "chat_completions"}),
+    }
+    db.get_messages_as_conversation.return_value = []
+    canonical = MagicMock(side_effect=AssertionError("modern ACP row reverse-inferred"))
+    resolved = MagicMock(return_value={"provider": "custom", "requested_provider": requested, "api_key": "synthetic-key", "base_url": "https://remote.example/v1", "api_mode": "chat_completions", "request_overrides": {"extra_body": {"route": "provider"}}, "credential_pool": None, "command": None, "args": [], "max_output_tokens": None})
+    monkeypatch.setattr("hermes_cli.runtime_provider.canonical_custom_identity", canonical)
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolved)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": {"default": "synthetic-model", "provider": requested}})
+    monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *_a: None)
+    monkeypatch.setattr(run_agent, "OpenAI", MagicMock(return_value=MagicMock()))
+    constructor_probes = _install_real_agent_probe_guards(monkeypatch)
+    captured = {}
+
+    def construct(*args, **kwargs):
+        captured["kwargs"] = deepcopy(kwargs)
+        captured["agent"] = RealAIAgent(*args, **kwargs)
+        return captured["agent"]
+
+    with patch("run_agent.AIAgent", side_effect=construct):
+        restored = SessionManager(db=db)._restore("modern-acp-row")
+    assert restored is not None
+    canonical.assert_not_called()
+    assert resolved.call_args.kwargs["requested"] == requested
+    assert isinstance(restored.agent, RealAIAgent)
+    assert (restored.agent.provider, restored.agent.requested_provider) == ("custom", requested)
+    assert restored.agent._caller_request_overrides == {}
+    assert restored.agent._provider_request_overrides == {"extra_body": {"route": "provider"}}
+    _assert_real_agent_probe_guards(constructor_probes)
+
+
+def test_acp_persist_writes_safe_requested_provider_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    db = MagicMock()
+    db.get_session.return_value = None
+    agent = SimpleNamespace(
+        provider="custom", requested_provider="custom:remote",
+        base_url="https://" + "synthetic-user" + ":" + "synthetic-pass" + "@remote.example/v1?synthetic_token=value#fragment",
+        api_mode="chat_completions", _session_db=None, _session_db_created=False,
+    )
+    state = SessionState(session_id="safe-acp", agent=agent, cwd=str(tmp_path), model="synthetic-model", history=[], cancel_event=None)
+    SessionManager(db=db)._persist(state)
+    config = db.create_session.call_args.kwargs["model_config"]
+    assert config == {"cwd": str(tmp_path), "model": "synthetic-model", "provider": "custom", "requested_provider": "custom:remote", "base_url": "https://remote.example/v1", "api_mode": "chat_completions"}

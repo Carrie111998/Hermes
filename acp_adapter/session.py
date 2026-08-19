@@ -18,12 +18,34 @@ import re
 import sys
 import time
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _persistable_runtime_base_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    host = hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if port is not None and (scheme, port) not in {("http", 80), ("https", 443)}:
+        host = f"{host}:{port}"
+    return urlunsplit((scheme, host, parsed.path, "", ""))
 
 
 def _translate_acp_cwd(cwd: str) -> str:
@@ -432,14 +454,18 @@ class SessionManager:
 
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
-        session_meta = {"cwd": state.cwd}
+        session_meta = {"cwd": state.cwd, "model": model_str}
         provider = getattr(state.agent, "provider", None)
+        requested_provider = getattr(state.agent, "requested_provider", None)
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
         if isinstance(provider, str) and provider.strip():
             session_meta["provider"] = provider.strip()
-        if isinstance(base_url, str) and base_url.strip():
-            session_meta["base_url"] = base_url.strip()
+        if isinstance(requested_provider, str) and requested_provider.strip():
+            session_meta["requested_provider"] = requested_provider.strip()
+        safe_base_url = _persistable_runtime_base_url(base_url)
+        if safe_base_url:
+            session_meta["base_url"] = safe_base_url
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
         cwd_json = json.dumps(session_meta)
@@ -452,7 +478,7 @@ class SessionManager:
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=session_meta,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -538,7 +564,13 @@ class SessionManager:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
                     cwd = meta.get("cwd", ".")
-                    requested_provider = meta.get("provider") or requested_provider
+                    if "requested_provider" in meta:
+                        requested = meta["requested_provider"]
+                        if not isinstance(requested, str) or not requested.strip() or requested.strip().endswith(":"):
+                            return None
+                        requested_provider = requested.strip().lower()
+                    else:
+                        requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
@@ -649,11 +681,14 @@ class SessionManager:
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
+                    "requested_provider": runtime.get("requested_provider"),
                     "api_mode": api_mode or runtime.get("api_mode"),
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),
-                    "command": runtime.get("command"),
-                    "args": list(runtime.get("args") or []),
+                    "acp_command": runtime.get("command"),
+                    "acp_args": list(runtime.get("args") or []),
+                    "credential_pool": runtime.get("credential_pool"),
+                    "provider_request_overrides": copy.deepcopy(runtime.get("request_overrides") or {}),
                 }
             )
         except Exception:

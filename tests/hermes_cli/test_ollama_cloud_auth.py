@@ -10,6 +10,29 @@ Covers:
 """
 
 import os
+from copy import deepcopy
+from unittest.mock import MagicMock
+
+from run_agent import AIAgent as RealAIAgent
+
+
+def _install_real_agent_probe_guards(monkeypatch):
+    context_length = MagicMock(return_value=262144)
+    endpoint_metadata = MagicMock(side_effect=AssertionError("constructor attempted endpoint metadata access"))
+    local_server = MagicMock(side_effect=AssertionError("constructor attempted local-server detection"))
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.fetch_endpoint_model_metadata", endpoint_metadata)
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", MagicMock(return_value={}))
+    monkeypatch.setattr("agent.model_metadata.detect_local_server_type", local_server)
+    return context_length, endpoint_metadata, local_server
+
+
+def _assert_real_agent_probe_guards(probes):
+    context_length, endpoint_metadata, local_server = probes
+    context_length.assert_called()
+    endpoint_metadata.assert_not_called()
+    local_server.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -470,3 +493,57 @@ class TestFallbackEdgeCases:
 
         assert fb_base_url_hint is None
         assert fb_api_key_hint is None
+
+
+def test_oneshot_real_agent_forwards_complete_remote_named_ollama_binding(tmp_path, monkeypatch):
+    import run_agent
+    from hermes_cli import oneshot
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = {"model": {"default": "synthetic-model", "provider": "ollama"}, "providers": {"ollama": {"name": "Remote Named Ollama", "base_url": "https://ollama.remote.example/v1", "api_key": "synthetic-key", "transport": "openai_chat", "extra_body": {"route": "remote-named"}}}, "fallback_providers": []}
+    pool = MagicMock(name="SyntheticCredentialPool")
+    runtime = {"provider": "custom", "requested_provider": "ollama", "api_key": "synthetic-key", "base_url": "https://ollama.remote.example/v1", "api_mode": "chat_completions", "request_overrides": {"extra_body": {"route": "remote-named"}}, "credential_pool": pool, "command": "synthetic-command", "args": ["--synthetic"], "max_output_tokens": 4096}
+    sdk_client = MagicMock(name="SyntheticOneShotSDKClient")
+    openai_factory = MagicMock(return_value=sdk_client)
+    monkeypatch.setattr(run_agent, "OpenAI", openai_factory)
+    constructor_probes = _install_real_agent_probe_guards(monkeypatch)
+    captured = {}
+
+    def construct(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = dict(kwargs)
+        agent = RealAIAgent(*args, **kwargs)
+        captured["agent"] = agent
+        agent.run_conversation = MagicMock(return_value={"final_response": "synthetic one-shot response", "messages": [], "api_calls": 0, "completed": True})
+        agent.shutdown_memory_provider = MagicMock()
+        agent.close = MagicMock()
+        return agent
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: deepcopy(config))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", MagicMock(return_value=runtime))
+    monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", MagicMock(return_value=None))
+    monkeypatch.setattr(oneshot, "_create_session_db_for_oneshot", lambda: None)
+    monkeypatch.setattr(oneshot, "get_fallback_chain", lambda _cfg: [])
+    monkeypatch.setattr(run_agent, "AIAgent", construct)
+
+    final, result = oneshot._run_agent("synthetic prompt", model="synthetic-model", provider="ollama", toolsets=[], use_config_toolsets=False)
+    assert final == "synthetic one-shot response"
+    assert result["completed"] is True
+    assert isinstance(captured["agent"], RealAIAgent)
+    kwargs = captured["kwargs"]
+    assert (kwargs["provider"], kwargs["requested_provider"]) == ("custom", "ollama")
+    assert kwargs["provider_request_overrides"] == {"extra_body": {"route": "remote-named"}}
+    assert kwargs["credential_pool"] is pool
+    assert kwargs["acp_command"] == "synthetic-command"
+    assert kwargs["acp_args"] == ["--synthetic"]
+    assert kwargs["max_tokens"] == 4096
+    assert captured["agent"]._caller_request_overrides == {}
+    assert captured["agent"]._provider_request_overrides == {"extra_body": {"route": "remote-named"}}
+    captured["agent"].run_conversation.assert_called_once_with("synthetic prompt")
+    captured["agent"].shutdown_memory_provider.assert_called_once()
+    captured["agent"].close.assert_called_once()
+    sdk_client.chat.completions.create.assert_not_called()
+    openai_factory.assert_called_once()
+    _assert_real_agent_probe_guards(constructor_probes)

@@ -284,5 +284,21 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
 
 
+def test_tui_one_turn_snapshot_deep_copies_provider_identity_layers():
+    from tui_gateway import server
+
+    agent = types.SimpleNamespace(
+        model="synthetic-model", provider="custom", requested_provider="custom:remote",
+        api_key="synthetic-key", base_url="https://remote.example/v1", api_mode="chat_completions",
+        _caller_request_overrides={"extra_body": {"caller": "value"}},
+        _provider_request_overrides={"extra_body": {"provider": "value"}},
+    )
+    snapshot = server._snapshot_agent_model_runtime(agent)
+    assert snapshot["requested_provider"] == "custom:remote"
+    assert snapshot["caller_request_overrides"] == {"extra_body": {"caller": "value"}}
+    assert snapshot["provider_request_overrides"] == {"extra_body": {"provider": "value"}}
+    snapshot["caller_request_overrides"]["extra_body"]["caller"] = "changed"
+    assert agent._caller_request_overrides == {"extra_body": {"caller": "value"}}
+
 
 

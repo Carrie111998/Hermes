@@ -124,6 +124,8 @@ def test_restore_session_model_swaps_running_agent_in_place():
 class _Result:
     new_model = "deepseek-v4-flash-free"
     target_provider = "custom:opencode-zen"
+    provider = "custom"
+    requested_provider = "custom:opencode-zen"
     base_url = "https://oz/v1"
     api_mode = ""
 
@@ -143,9 +145,11 @@ def test_persist_model_switch_writes_model_and_both_route_shapes():
     assert written["model"] == ("s1", "deepseek-v4-flash-free")
     sid, patch = written["patch"]
     # Nested shape for the CLI reader...
-    assert patch["gateway_runtime"]["provider"] == "custom:opencode-zen"
+    assert patch["gateway_runtime"]["provider"] == "custom"
+    assert patch["gateway_runtime"]["requested_provider"] == "custom:opencode-zen"
     # ...and top-level for the TUI gateway's _stored_session_runtime_overrides.
-    assert patch["provider"] == "custom:opencode-zen"
+    assert patch["provider"] == "custom"
+    assert patch["requested_provider"] == "custom:opencode-zen"
     assert patch["base_url"] == "https://oz/v1"
     # Both shapes use or-None so stale keys are deleted (not merely omitted)
     # in BOTH gateway_runtime and top-level — the asymmetry that caused the
@@ -213,8 +217,8 @@ def test_persist_model_switch_swallows_db_errors():
     stub._persist_model_switch_to_session(_Result())  # must not raise
 
 
-def test_persist_model_switch_heals_bare_custom(monkeypatch):
-    """Bare 'custom' is not routable — heal to custom:<name> or drop (C1)."""
+def test_persist_model_switch_keeps_explicit_modern_custom_identity(monkeypatch):
+    """An explicit modern requested identity must not be reverse-inferred."""
     written = {}
 
     class _DB:
@@ -227,24 +231,18 @@ def test_persist_model_switch_heals_bare_custom(monkeypatch):
     class _BareResult:
         new_model = "qwen3.6-plus"
         target_provider = "custom"
+        provider = "custom"
+        requested_provider = "custom"
         base_url = "https://my-endpoint/v1"
         api_mode = ""
 
     import hermes_cli.runtime_provider as rp
-    monkeypatch.setattr(rp, "canonical_custom_identity",
-                        lambda base_url=None, model=None: "custom:myendpoint")
+    monkeypatch.setattr(rp, "canonical_custom_identity", pytest.fail)
     stub = _make_stub(_session_db=_DB(), session_id="s1")
     stub._persist_model_switch_to_session(_BareResult())
-    assert written["patch"]["provider"] == "custom:myendpoint"
-
-    # Healing fails -> provider dropped (explicit None deletes any stale
-    # persisted provider), never persisted bare.
-    monkeypatch.setattr(rp, "canonical_custom_identity",
-                        lambda base_url=None, model=None: None)
-    written.clear()
-    stub._persist_model_switch_to_session(_BareResult())
-    assert written["patch"]["provider"] is None
-    assert written["patch"]["gateway_runtime"]["provider"] is None
+    assert written["patch"]["provider"] == "custom"
+    assert written["patch"]["requested_provider"] == "custom"
+    assert written["patch"]["gateway_runtime"]["provider"] == "custom"
 
 
 def test_restore_session_model_heals_bare_custom_stored_rows(monkeypatch):
@@ -276,7 +274,8 @@ def test_round_trip_persist_then_restore(tmp_path, monkeypatch):
     restored = _make_stub()
     restored._restore_session_model(meta)
     assert restored.model == "deepseek-v4-flash-free"
-    assert restored.provider == "custom:opencode-zen"
+    assert restored.provider == "custom"
+    assert restored.requested_provider == "custom:opencode-zen"
     assert restored.base_url == "https://oz/v1"
 
 
@@ -365,3 +364,49 @@ def test_restore_session_model_restores_billing_provider_fallback():
     })
     assert stub.model == "glm-4.7"
     assert stub.provider == "minimax"
+
+
+@pytest.mark.parametrize("requested", ["custom", "custom:remote"])
+def test_cli_modern_requested_provider_is_authoritative(requested, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    canonical = pytest.fail
+    monkeypatch.setattr("hermes_cli.runtime_provider.canonical_custom_identity", lambda **_kwargs: canonical("modern rows must not reverse-infer identity"))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kwargs: {"provider": "custom", "requested_provider": requested, "api_key": "synthetic-key", "base_url": "https://remote.example/v1", "api_mode": "chat_completions", "request_overrides": {}, "credential_pool": None, "command": None, "args": [], "max_output_tokens": None})
+    stub = _make_stub()
+    stub._restore_session_model(_row(model_config={"gateway_runtime": {"provider": "custom", "requested_provider": requested, "base_url": "https://remote.example/v1", "api_mode": "chat_completions"}}))
+    assert stub.provider == "custom"
+    assert stub.requested_provider == requested
+
+
+@pytest.mark.parametrize("invalid", [None, "", "   ", [], {}, "custom:"])
+def test_cli_present_invalid_requested_provider_fails_closed(invalid):
+    stub = _make_stub()
+    with pytest.raises(ValueError, match="requested_provider"):
+        stub._restore_session_model(_row(model_config={"gateway_runtime": {"provider": "custom", "requested_provider": invalid, "base_url": "https://remote.example/v1"}}))
+    assert stub.model == "ambient-model"
+    assert stub.requested_provider == "openrouter"
+
+
+def test_cli_absent_requested_provider_legacy_heals_on_next_write(monkeypatch):
+    monkeypatch.setattr("hermes_cli.runtime_provider.canonical_custom_identity", lambda **_kwargs: "custom:remote")
+    written = {}
+
+    class DB:
+        def update_session_model(self, session_id, model):
+            written["model"] = (session_id, model)
+
+        def patch_session_model_config(self, session_id, patch):
+            written["patch"] = (session_id, patch)
+
+    stub = _make_stub(_session_db=DB(), session_id="synthetic-session")
+    stub._restore_session_model(_row(model_config={"gateway_runtime": {"provider": "custom", "base_url": "https://remote.example/v1", "api_mode": "chat_completions"}}))
+    assert stub.requested_provider == "custom:remote"
+    result = _Result()
+    result.provider = "custom"
+    result.requested_provider = stub.requested_provider
+    result.base_url = "https://" + "synthetic-user" + ":" + "synthetic-pass" + "@remote.example/v1?token=value#fragment"
+    stub._persist_model_switch_to_session(result)
+    route = written["patch"][1]["gateway_runtime"]
+    assert route["requested_provider"] == "custom:remote"
+    assert route["base_url"] == "https://remote.example/v1"
+    assert not ({"api_key", "request_overrides", "provider_request_overrides"} & route.keys())

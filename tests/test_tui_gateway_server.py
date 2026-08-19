@@ -5,9 +5,10 @@ import sys
 import threading
 import time
 import types
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -17,6 +18,24 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tools import async_delegation as ad
 from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
+from run_agent import AIAgent as RealAIAgent
+
+
+def _install_real_agent_probe_guards(monkeypatch):
+    context_length = MagicMock(return_value=262144)
+    endpoint_metadata = MagicMock(side_effect=AssertionError("constructor attempted endpoint metadata access"))
+    local_server = MagicMock(side_effect=AssertionError("constructor attempted local-server detection"))
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.fetch_endpoint_model_metadata", endpoint_metadata)
+    monkeypatch.setattr("agent.model_metadata.detect_local_server_type", local_server)
+    return context_length, endpoint_metadata, local_server
+
+
+def _assert_real_agent_probe_guards(probes):
+    context_length, endpoint_metadata, local_server = probes
+    context_length.assert_called()
+    endpoint_metadata.assert_not_called()
+    local_server.assert_not_called()
 
 
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
@@ -3624,6 +3643,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     assert captured["model_override"] == {
         "model": "gpt-5.4",
         "provider": "openai-codex",
+        "requested_provider": "openai-codex",
         "base_url": "https://custom.example/v1",
         "api_mode": "chat_completions",
     }
@@ -19830,3 +19850,24 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_background_agent_kwargs_keep_identity_and_private_layers_isolated(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    agent = types.SimpleNamespace(
+        model="synthetic-model", provider="custom", requested_provider="custom:remote",
+        base_url="https://remote.example/v1", api_key="synthetic-key", api_mode="chat_completions",
+        acp_command="synthetic-command", acp_args=["--synthetic"], enabled_toolsets=[],
+        _caller_request_overrides={"extra_body": {"caller": "value"}},
+        _provider_request_overrides={"extra_body": {"provider": "value"}},
+        request_overrides={"extra_body": {"provider": "value", "caller": "value"}},
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"max_turns": 2}})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_k: [])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    kwargs = server._background_agent_kwargs(agent, "task-id")
+    assert kwargs["requested_provider"] == "custom:remote"
+    assert kwargs["request_overrides"] == {"extra_body": {"caller": "value"}}
+    assert kwargs["provider_request_overrides"] == {"extra_body": {"provider": "value"}}
+    kwargs["request_overrides"]["extra_body"]["caller"] = "changed"
+    assert agent._caller_request_overrides == {"extra_body": {"caller": "value"}}

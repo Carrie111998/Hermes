@@ -39,13 +39,34 @@ import time
 import uuid
 import textwrap
 from collections import deque
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
+
+
+def _persistable_runtime_base_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    host = hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if port is not None and (scheme, port) not in {("http", 80), ("https", 443)}:
+        host = f"{host}:{port}"
+    return urlunsplit((scheme, host, parsed.path, "", ""))
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -8530,7 +8551,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         sid = getattr(self, "session_id", None)
         if not db or not sid:
             return
-        provider = result.target_provider
+        provider = getattr(result, "provider", None) or result.target_provider
+        requested_provider = getattr(result, "requested_provider", None) or result.target_provider
         # Bare "custom" is the resolved billing class, not a routable
         # identity — persisting it verbatim makes a later resume hard-fail
         # when the config default has moved off the custom endpoint
@@ -8538,15 +8560,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # custom while the config provider is still custom-ish). Heal to
         # the durable custom:<name> menu key, else drop the provider —
         # same recovery the TUI gateway applies on its read path.
-        if str(provider or "").strip().lower() == "custom":
-            try:
-                from hermes_cli.runtime_provider import canonical_custom_identity
-                provider = canonical_custom_identity(
-                    base_url=result.base_url or None,
-                    model=result.new_model or None,
-                ) or None
-            except Exception:
-                provider = None
         # Both shapes use the same or-None discipline so stale keys from a
         # previous switch are deleted (not merely omitted) in BOTH the
         # nested gateway_runtime dict (CLI reader) and the top-level keys
@@ -8557,7 +8570,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # stale-key bug (#85261 simplify-code review).
         route = {
             "provider": provider or None,
-            "base_url": result.base_url or None,
+            "requested_provider": requested_provider or None,
+            "base_url": _persistable_runtime_base_url(result.base_url) or None,
             "api_mode": result.api_mode or None,
         }
         try:
@@ -8601,6 +8615,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # An explicit -m / --model on the command line overrides resume.
         if getattr(self, "_explicit_model_override", False):
             return
+        # Read raw metadata here because the compatibility reader filters None
+        # values and cannot distinguish an absent requested identity from a
+        # present invalid one.
+        raw_model_config = (session_meta or {}).get("model_config")
+        parsed_model_config = {}
+        if isinstance(raw_model_config, dict):
+            parsed_model_config = raw_model_config
+        elif isinstance(raw_model_config, str) and raw_model_config.strip():
+            try:
+                candidate = json.loads(raw_model_config)
+                if isinstance(candidate, dict):
+                    parsed_model_config = candidate
+            except (TypeError, ValueError):
+                pass
+        nested_runtime = parsed_model_config.get("gateway_runtime")
+        nested_runtime = nested_runtime if isinstance(nested_runtime, dict) else {}
+        identity_container = nested_runtime if "requested_provider" in nested_runtime else parsed_model_config
+        has_requested_identity = "requested_provider" in identity_container
+        if has_requested_identity:
+            candidate = identity_container["requested_provider"]
+            if not isinstance(candidate, str) or not candidate.strip() or candidate.strip().endswith(":"):
+                raise ValueError("invalid persisted requested_provider")
+            stored_requested_provider = candidate.strip().lower()
+        else:
+            stored_requested_provider = None
         # Stored provider/endpoint via the canonical row-level reader
         # (prefers model_config.gateway_runtime, falls back to the TUI
         # gateway's top-level keys).
@@ -8615,7 +8654,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # provider so resume keeps the ambient default. (Stricter than the
         # TUI gateway's recovery, which keeps bare "custom" when a base_url
         # exists — the CLI's resolve path would hard-fail on it, #14676.)
-        if str(stored_provider or "").strip().lower() == "custom":
+        if not has_requested_identity and str(stored_provider or "").strip().lower() == "custom":
             try:
                 from hermes_cli.runtime_provider import canonical_custom_identity
                 stored_provider = canonical_custom_identity(
@@ -8624,14 +8663,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 ) or None
             except Exception:
                 stored_provider = None
+        if has_requested_identity:
+            stored_provider_for_resolution = stored_requested_provider
+        else:
+            stored_provider_for_resolution = stored_provider
         model_changed = stored_model != self.model
-        provider_changed = bool(stored_provider) and stored_provider != self.provider
+        provider_changed = bool(stored_provider_for_resolution) and stored_provider_for_resolution != self.requested_provider
         if not model_changed and not provider_changed:
             return
         self.model = stored_model
-        if stored_provider:
+        if stored_provider_for_resolution:
+            self.requested_provider = stored_provider_for_resolution
             self.provider = stored_provider
-            self.requested_provider = stored_provider
             if stored_base_url:
                 self.base_url = stored_base_url
             if stored_api_mode:
@@ -8649,7 +8692,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # runtime provider resolution owns credentials.
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-                resolved = resolve_runtime_provider(requested=stored_provider)
+                resolved = resolve_runtime_provider(requested=stored_provider_for_resolution)
+                if resolved.get("provider"):
+                    self.provider = resolved["provider"]
                 if resolved.get("api_key"):
                     self.api_key = resolved["api_key"]
                     self._credential_pool = resolved.get("credential_pool")

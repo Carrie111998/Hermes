@@ -149,3 +149,12 @@ def test_cli_restore_model_runtime_prefers_primary_runtime():
     assert stub.agent.model == "old/model"
     assert stub.agent.provider == "openrouter"
     assert stub.agent.calls == []
+
+
+def test_cli_one_turn_snapshot_retains_requested_provider_identity():
+    import cli as cli_mod
+
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    snapshot = cli_mod.HermesCLI._snapshot_model_runtime(stub)
+    assert snapshot["requested_provider"] == "openrouter"

@@ -6,25 +6,76 @@ provider/base_url/api_key empty in AIAgent, causing HTTP 404.
 """
 
 import os
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
+from run_agent import AIAgent as RealAIAgent
 
-def test_make_agent_passes_resolved_provider():
+
+def _install_real_agent_probe_guards(monkeypatch):
+    context_length = MagicMock(return_value=262144)
+    endpoint_metadata = MagicMock(
+        side_effect=AssertionError("constructor attempted endpoint metadata access")
+    )
+    local_server = MagicMock(
+        side_effect=AssertionError("constructor attempted local-server detection")
+    )
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length", context_length,
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.fetch_endpoint_model_metadata", endpoint_metadata,
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.detect_local_server_type", local_server,
+    )
+    return context_length, endpoint_metadata, local_server
+
+
+def _assert_real_agent_probe_guards(probes):
+    context_length, endpoint_metadata, local_server = probes
+    context_length.assert_called()
+    endpoint_metadata.assert_not_called()
+    local_server.assert_not_called()
+
+
+def _install_real_agent_factory(monkeypatch, target, captured):
+    captured["constructor_probes"] = _install_real_agent_probe_guards(monkeypatch)
+
+    def construct(*args, **kwargs):
+        captured["args"] = deepcopy(args)
+        captured["kwargs"] = deepcopy(kwargs)
+        agent = RealAIAgent(*args, **kwargs)
+        captured["agent"] = agent
+        agent.run_conversation = MagicMock(
+            return_value={"final_response": "synthetic-response", "messages": []}
+        )
+        agent.chat = MagicMock(return_value="synthetic-response")
+        return agent
+
+    monkeypatch.setattr(target, construct)
+
+
+def test_make_agent_passes_resolved_provider(tmp_path, monkeypatch):
     """_make_agent forwards provider/base_url/api_key/api_mode from
     resolve_runtime_provider to AIAgent."""
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     fake_runtime = {
-        "provider": "anthropic",
-        "base_url": "https://api.anthropic.com",
-        "api_key": "sk-test-key",
-        "api_mode": "anthropic_messages",
+        "provider": "custom",
+        "requested_provider": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "api_key": "synthetic-key",
+        "api_mode": "chat_completions",
         "command": None,
         "args": None,
         "credential_pool": None,
+        "request_overrides": {},
+        "max_output_tokens": None,
     }
 
     fake_cfg = {
-        "model": {"default": "claude-opus-4-6", "provider": "anthropic"},
+        "model": {"default": "synthetic-model", "provider": "ollama"},
         "agent": {"system_prompt": "test"},
     }
 
@@ -39,12 +90,15 @@ def test_make_agent_passes_resolved_provider():
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             return_value=fake_runtime,
         ) as mock_resolve,
-        patch("run_agent.AIAgent") as mock_agent,
     ):
-
         from tui_gateway.server import _make_agent
+        import run_agent
 
-        _make_agent("sid-1", "key-1")
+        monkeypatch.setattr(run_agent, "OpenAI", MagicMock(return_value=MagicMock()))
+        captured = {}
+        _install_real_agent_factory(monkeypatch, "run_agent.AIAgent", captured)
+
+        agent = _make_agent("sid-1", "key-1")
 
         # target_model comes from _resolve_startup_runtime() which reads
         # _load_cfg().  Due to module-level caching in tui_gateway.server,
@@ -53,11 +107,18 @@ def test_make_agent_passes_resolved_provider():
         mock_resolve.assert_called_once()
         assert mock_resolve.call_args.kwargs.get("requested") is None
 
-        call_kwargs = mock_agent.call_args
-        assert call_kwargs.kwargs["provider"] == "anthropic"
-        assert call_kwargs.kwargs["base_url"] == "https://api.anthropic.com"
-        assert call_kwargs.kwargs["api_key"] == "sk-test-key"
-        assert call_kwargs.kwargs["api_mode"] == "anthropic_messages"
+        call_kwargs = captured["kwargs"]
+        assert call_kwargs["provider"] == "custom"
+        assert call_kwargs["requested_provider"] == "ollama"
+        assert call_kwargs["provider_request_overrides"] == {}
+        assert call_kwargs["base_url"] == "http://127.0.0.1:11434/v1"
+        assert call_kwargs["api_key"] == "synthetic-key"
+        assert call_kwargs["api_mode"] == "chat_completions"
+        assert isinstance(agent, RealAIAgent)
+        assert (agent.provider, agent.requested_provider) == ("custom", "ollama")
+        assert agent._caller_request_overrides == {}
+        assert agent._provider_request_overrides == {}
+        _assert_real_agent_probe_guards(captured["constructor_probes"])
 
 
 def test_probe_config_health_flags_null_sections():

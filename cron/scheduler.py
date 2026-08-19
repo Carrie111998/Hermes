@@ -5563,6 +5563,8 @@ def run_job(
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
+            provider_request_overrides=dict(runtime.get("request_overrides") or {}),
+            max_tokens=runtime.get("max_output_tokens"),
             providers_allowed=pr.get("only"),
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),

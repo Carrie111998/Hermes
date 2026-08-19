@@ -15,6 +15,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 from __future__ import annotations
 
 import sys
+import copy
 
 from rich.markup import escape as _escape
 
@@ -92,6 +93,8 @@ class CLIAgentSetupMixin:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
+        resolved_requested_provider = runtime.get("requested_provider") or self.requested_provider
+        resolved_provider_overrides = copy.deepcopy(runtime.get("request_overrides") or {})
         # A callable api_key is a bearer-token provider (Azure Foundry
         # Entra ID — ``azure_identity_adapter.build_token_provider``).
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
@@ -138,10 +141,12 @@ class CLIAgentSetupMixin:
             or resolved_acp_args != self.acp_args
         )
         self.provider = resolved_provider
+        self.requested_provider = resolved_requested_provider
         self.api_mode = resolved_api_mode
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
         self._credential_pool = resolved_credential_pool
+        self._provider_request_overrides = resolved_provider_overrides
         self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
@@ -309,6 +314,9 @@ class CLIAgentSetupMixin:
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
+            "provider_request_overrides": copy.deepcopy(
+                getattr(self, "_provider_request_overrides", {}) or {}
+            ),
         }
         route = {
             "model": self.model,
@@ -321,6 +329,7 @@ class CLIAgentSetupMixin:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                repr(runtime["provider_request_overrides"]),
             ),
         }
 
@@ -486,6 +495,9 @@ class CLIAgentSetupMixin:
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
+                "provider_request_overrides": copy.deepcopy(
+                    getattr(self, "_provider_request_overrides", {}) or {}
+                ),
             }
             effective_model = model_override or self.model
             self.agent = AIAgent(
@@ -498,6 +510,9 @@ class CLIAgentSetupMixin:
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
+                provider_request_overrides=copy.deepcopy(
+                    runtime.get("provider_request_overrides") or {}
+                ),
                 max_tokens=self.max_tokens,
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,

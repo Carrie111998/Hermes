@@ -5,9 +5,11 @@ import itertools
 import json
 import logging
 import os
+from copy import deepcopy
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
+from run_agent import AIAgent as RealAIAgent
 
 from cron.scheduler import (
     SILENT_MARKER,
@@ -23,6 +25,25 @@ from cron.scheduler import (
 )
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+def _install_real_agent_probe_guards(monkeypatch):
+    context_length = MagicMock(return_value=262144)
+    endpoint_metadata = MagicMock(side_effect=AssertionError("constructor attempted endpoint metadata access"))
+    local_server = MagicMock(side_effect=AssertionError("constructor attempted local-server detection"))
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", context_length)
+    monkeypatch.setattr("agent.model_metadata.fetch_endpoint_model_metadata", endpoint_metadata)
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", MagicMock(return_value={}))
+    monkeypatch.setattr("agent.model_metadata.detect_local_server_type", local_server)
+    return context_length, endpoint_metadata, local_server
+
+
+def _assert_real_agent_probe_guards(probes):
+    context_length, endpoint_metadata, local_server = probes
+    context_length.assert_called()
+    endpoint_metadata.assert_not_called()
+    local_server.assert_not_called()
 
 
 class TestSummarizeCronFailureForDelivery:
@@ -563,6 +584,72 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_run_job_real_agent_forwards_complete_runtime_binding(self, tmp_path, monkeypatch):
+        import run_agent
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        job = {"id": "provider-binding-job", "name": "provider binding job", "prompt": "synthetic cron prompt", "enabled_toolsets": []}
+        config = {"model": {"default": "synthetic-model", "provider": "custom:remote"}, "agent": {"max_turns": 2}, "cron": {"preflight": False}, "fallback_providers": []}
+        runtime = {"provider": "custom", "requested_provider": "custom:remote", "api_key": "synthetic-key", "base_url": "https://remote.example/v1", "api_mode": "chat_completions", "request_overrides": {"extra_body": {"route": "provider-owned"}}, "credential_pool": None, "command": "synthetic-command", "args": ["--synthetic"], "max_output_tokens": 3072}
+        fake_db = MagicMock(name="SyntheticCronSessionDB")
+        fake_db.get_compression_tip.side_effect = lambda session_id: session_id
+        sdk_client = MagicMock(name="SyntheticCronSDKClient")
+        openai_factory = MagicMock(return_value=sdk_client)
+        monkeypatch.setattr(run_agent, "OpenAI", openai_factory)
+        constructor_probes = _install_real_agent_probe_guards(monkeypatch)
+        captured = {}
+
+        def construct(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = dict(kwargs)
+            agent = RealAIAgent(*args, **kwargs)
+            captured["agent"] = agent
+            agent.run_conversation = MagicMock(return_value={"final_response": "synthetic cron response", "messages": [], "api_calls": 0, "completed": True})
+            agent.close = MagicMock()
+            return agent
+
+        empty_pool = MagicMock(name="EmptyCredentialPool")
+        empty_pool.has_credentials.return_value = False
+        with (
+            patch("cron.scheduler._hermes_home", hermes_home),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("cron.scheduler._preflight_job_config", return_value=None),
+            patch("cron.scheduler.load_config", return_value=deepcopy(config)),
+            patch("hermes_cli.config.load_config", return_value=deepcopy(config)),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=fake_db),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=deepcopy(runtime)),
+            patch("agent.credential_pool.load_pool", return_value=empty_pool),
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+            patch("cron.scheduler._resolve_cron_enabled_toolsets", return_value=[]),
+            patch("cron.scheduler._resolve_cron_disabled_toolsets", return_value=[]),
+            patch("run_agent.AIAgent", side_effect=construct),
+        ):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True and error is None
+        assert final_response == "synthetic cron response"
+        assert "synthetic cron response" in output
+        assert isinstance(captured["agent"], RealAIAgent)
+        kwargs = captured["kwargs"]
+        assert (kwargs["provider"], kwargs["requested_provider"]) == ("custom", "custom:remote")
+        assert kwargs["provider_request_overrides"] == {"extra_body": {"route": "provider-owned"}}
+        assert kwargs["acp_command"] == "synthetic-command"
+        assert kwargs["acp_args"] == ["--synthetic"]
+        assert kwargs["max_tokens"] == 3072
+        assert captured["agent"]._caller_request_overrides == {}
+        assert captured["agent"]._provider_request_overrides == {"extra_body": {"route": "provider-owned"}}
+        captured["agent"].run_conversation.assert_called_once()
+        captured["agent"].close.assert_called_once()
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+        sdk_client.chat.completions.create.assert_not_called()
+        openai_factory.assert_called_once()
+        _assert_real_agent_probe_guards(constructor_probes)
 
 
     @contextlib.contextmanager
