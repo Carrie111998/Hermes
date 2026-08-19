@@ -375,14 +375,6 @@ export const host = {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
   },
 
-  /** Open a stored session the way core surfaces do (focus an existing
-   *  tile/main, else load into main). When `profile` names a non-active
-   *  profile, its backend is activated first so the resume routes to the
-   *  right state.db — the same soft profile swap the unified sidebar does.
-   *  `keepAllProfilesScope` (default true) keeps the Sessions sidebar in the
-   *  unified all-profiles view instead of narrowing it to the target
-   *  profile's sessions — a cross-profile open from a plugin surface is a
-   *  navigation, not a scope choice; pass false to also scope the sidebar. */
   /** Pre-dial a profile's gateway socket in the background — pool-only, no
    *  activation, no navigation, no scope change (openGatewayForProfile; it
    *  already no-ops for shared-remote routes and the primary). Roster UIs
@@ -496,6 +488,10 @@ export const host = {
   ensureAgent: async (connectionId: null | string, profile: string): Promise<void> =>
     ensureGatewayAgent(connectionId, (profile ?? '').trim() || 'default'),
 
+  /** Open a stored session the way core surfaces do. A plugin/Bot Mode open
+   *  is navigation, not a workspace switch — keepAllProfilesScope defaults
+   *  true so Sessions stays on the unified list (the bot forever-chat is
+   *  hidden and would otherwise look like every session disappeared). */
   openSession: async (storedSessionId: string, options: PluginOpenSessionOptions = {}): Promise<void> => {
     const generation = ++openSessionGeneration
     const profile = (options.profile ?? '').trim()
@@ -511,10 +507,12 @@ export const host = {
     if (profile && profile !== $activeGatewayProfile.get()) {
       await ensureGatewayProfile(profile)
       profileActiveAt = Date.now()
+    }
 
-      if (options.keepAllProfilesScope !== false) {
-        setShowAllProfiles(true)
-      }
+    // Opening a bot/plugin chat is navigation, not a workspace switch. Always
+    // restore the unified Sessions list unless the caller opted into scoping.
+    if (profile && options.keepAllProfilesScope !== false) {
+      setShowAllProfiles(true)
     }
 
     if (generation !== openSessionGeneration) {

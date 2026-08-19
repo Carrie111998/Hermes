@@ -112,7 +112,7 @@ test('pin: preferred_session present opens the resolved session and keeps the pi
       intent: 'main',
       awaitHydration: true,
       expectHistory: true,
-      keepAllProfilesScope: false
+      keepAllProfilesScope: true
     }
   }])
   assert.equal(runtime.saved.length, 0, 'a live pin must not be rewritten')

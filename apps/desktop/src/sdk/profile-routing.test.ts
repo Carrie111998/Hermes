@@ -104,7 +104,7 @@ const { openSession: openSessionCore } = await import('@/app/open-session')
 const { deleteProfile } = await import('@/hermes')
 const { requestGatewayForAgent, requestGatewayForProfile, retireLocalProfileGateways } = await import('@/store/gateway')
 
-const { $activeGatewayProfile, $gatewaySwapTarget, $profiles, ensureGatewayProfile, refreshProfiles } =
+const { $activeGatewayProfile, $gatewaySwapTarget, $profiles, ensureGatewayProfile, refreshProfiles, setShowAllProfiles } =
   await import('@/store/profile')
 
 const { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } = await import('@/store/session-states')
@@ -503,5 +503,21 @@ describe('profile-aware plugin session opens', () => {
     expect($activeGatewayProfile.get()).toBe('hyoseob')
     expect($selectedStoredSessionId.get()).toBe('chat-b')
     expect($gatewaySwapTarget.get()).toBeNull()
+  })
+
+  it('keeps the Sessions sidebar in all-profiles even when the bot is already live', async () => {
+    $activeGatewayProfile.set('hyoseob')
+    setMockAtom($selectedStoredSessionId, 'bot-chat')
+    setMockAtom($activeSessionId, 'runtime-live')
+    setMockAtom($messages, [{ id: 'history', parts: [], role: 'assistant' }] as never)
+
+    await host.openSession('bot-chat', {
+      profile: 'hyoseob',
+      awaitHydration: true,
+      expectHistory: true,
+      hydrationTimeoutMs: 1_000
+    })
+
+    expect(setShowAllProfiles).toHaveBeenCalledWith(true)
   })
 })
