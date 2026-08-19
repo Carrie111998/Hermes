@@ -56,8 +56,8 @@ vi.mock('../hooks/use-on-profile-switch', () => ({
 }))
 
 vi.mock('@/app/hooks/use-config-record', () => ({
+  hermesConfigCacheWriter: () => vi.fn(),
   invalidateHermesConfig: vi.fn(),
-  setHermesConfigCache: vi.fn(),
   useHermesConfigRecord: () => {
     getHermesConfigRecord()
 
@@ -119,8 +119,10 @@ describe('ModelSettings profile scope', () => {
   it('follows the active profile (undefined, never null) when unscoped', async () => {
     await renderModelSettings()
 
-    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledWith(undefined))
-    expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, undefined)
+    await waitFor(() =>
+      expect(getGlobalModelInfo).toHaveBeenCalledWith(undefined, { timeoutMs: 5_000 })
+    )
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ timeoutMs: 5_000 }, undefined)
     expect(getAuxiliaryModels).toHaveBeenCalledWith(undefined)
     expect(getMoaModels).toHaveBeenCalledWith(undefined)
   })
@@ -128,8 +130,10 @@ describe('ModelSettings profile scope', () => {
   it('reads through the explicit scope override when one is set', async () => {
     await renderModelSettings('research')
 
-    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledWith('research'))
-    expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, 'research')
+    await waitFor(() =>
+      expect(getGlobalModelInfo).toHaveBeenCalledWith('research', { timeoutMs: 5_000 })
+    )
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ timeoutMs: 5_000 }, 'research')
     expect(getAuxiliaryModels).toHaveBeenCalledWith('research')
     expect(getMoaModels).toHaveBeenCalledWith('research')
   })
@@ -362,12 +366,32 @@ describe('ModelSettings', () => {
     await renderModelSettings()
 
     expect(await screen.findByText('Vision')).toBeTruthy()
-    expect(screen.getByText('Applies to new sessions. Use the model picker in the composer to hot-swap the active chat.')).toBeTruthy()
+    expect(
+      screen.getByText('Applies to new sessions. Use the model picker in the composer to hot-swap the active chat.')
+    ).toBeTruthy()
     expect(screen.getAllByRole('button', { name: 'Set to main' }).length).toBeGreaterThan(0)
-    expect(getGlobalModelInfo).toHaveBeenCalledWith(null, { timeoutMs: 5_000 })
+    expect(getGlobalModelInfo).toHaveBeenCalledWith(undefined, { timeoutMs: 5_000 })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ timeoutMs: 5_000 }, undefined)
 
     await act(async () => {
       resolveOptions({ providers: [] })
+    })
+  })
+
+  it('lists independent refresh failures on separate lines', async () => {
+    getGlobalModelInfo.mockRejectedValueOnce(new Error('Model metadata request timed out'))
+    getGlobalModelOptions.mockRejectedValueOnce(new Error('Model options request timed out'))
+
+    await renderModelSettings()
+
+    await waitFor(() => {
+      const error = screen.getByText(/Model metadata request timed out/)
+      const lines = error.textContent?.split('\n') ?? []
+      expect(lines).toHaveLength(2)
+      expect(lines).toEqual(
+        expect.arrayContaining(['Model metadata request timed out', 'Model options request timed out'])
+      )
+      expect(error.className).toContain('whitespace-pre-line')
     })
   })
 
