@@ -791,7 +791,11 @@ def _sudo_nopasswd_works() -> bool:
     cache) so an expired sudo timestamp cannot make a later command silently
     block waiting for a password.
     """
-    terminal_env = os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
+    # Resolve through the bridged config snapshot, not process-global env, so a
+    # config.yaml terminal.backend: docker on cold start does not probe the
+    # host's sudo state.  "unknown" (untrusted snapshot) is treated as
+    # non-local and fails closed (no sudo probe).
+    terminal_env = resolve_terminal_backend()
     if terminal_env != "local":
         return False
 
@@ -1327,9 +1331,10 @@ def _docker_session_isolation_enabled() -> bool:
     ``container_persistent: true`` the documented ONE-long-lived-container
     contract is unchanged.
     """
-    if _resolve_backend_type() != "docker":
+    snapshot = _terminal_env_snapshot()
+    if _resolve_backend_type(snapshot) != "docker":
         return False
-    return _terminal_env_snapshot().get("TERMINAL_CONTAINER_PERSISTENT", "true").lower() not in {"true", "1", "yes"}
+    return snapshot.get("TERMINAL_CONTAINER_PERSISTENT", "true").lower() not in {"true", "1", "yes"}
 
 
 _ISOLATION_OVERRIDE_KEYS = frozenset({
@@ -1548,6 +1553,13 @@ def _terminal_env_snapshot() -> Dict[str, str]:
     orig = os.environ
     env = dict(orig)
 
+    # Control sentinels must come from this function only, never from the
+    # inherited process environment: a pre-existing _config_bridge_failed /
+    # _config_unreadable variable would make resolve_terminal_backend() return
+    # "unknown" and _get_env_config() raise even when the bridge succeeds.
+    env.pop("_config_bridge_failed", None)
+    env.pop("_config_unreadable", None)
+
     # Probe raw config readability before bridging.  ``apply_terminal_config_to_env()``
     # calls ``read_raw_config()`` and ``load_config_readonly()``, both of which handle
     # parse errors gracefully (return ``{}`` / fall back to last-known-good) instead of
@@ -1585,12 +1597,47 @@ def _terminal_env_snapshot() -> Dict[str, str]:
 
     # Restore explicit worker overrides for timeout/lifetime so that
     # subprocess callers (e.g. kanban _default_spawn) that intentionally
-    # set a longer value are not clobbered by config defaults.
+    # set a longer value are not clobbered by config defaults.  The one
+    # exception: a key pinned by the MANAGED scope (administrator-forced,
+    # per managed_scope §4.1 the pinned leaf inverts env-over-config
+    # precedence) must win over a stale process-env value, exactly as the
+    # backend key does in this PR series.
+    pinned = _terminal_config_pinned_env_vars()
     for key in ("TERMINAL_TIMEOUT", "TERMINAL_LIFETIME_SECONDS"):
-        if key in orig:
+        if key in orig and key not in pinned:
             env[key] = orig[key]
 
     return env
+
+
+def _terminal_config_pinned_env_vars() -> set:
+    """Return the ``TERMINAL_*`` env vars pinned by the MANAGED config.
+
+    Only managed-scope pins count here: a worker's explicit env override must
+    still beat a *user* config value (that is the pre-existing contract the
+    restore loop implements), but it must NOT beat an administrator-forced
+    managed value (managed_scope §4.1).  Keys that only appear in
+    ``DEFAULT_CONFIG`` are backfill-only and never pinned.
+    """
+    pinned: set = set()
+    try:
+        from hermes_cli import managed_scope
+        from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+
+        managed_keys = {
+            key[len("terminal."):]
+            for key in managed_scope.managed_config_keys()
+            if key.startswith("terminal.")
+        }
+        for cfg_key in managed_keys:
+            env_var = TERMINAL_CONFIG_ENV_MAP.get(cfg_key)
+            if env_var:
+                pinned.add(env_var)
+    except Exception:
+        # Fail open: if the managed scope can't be inspected, treat nothing as
+        # pinned so a worker override is preserved (safe availability default).
+        pass
+    return pinned
 
 
 def _probe_config_unreadable() -> bool:
@@ -1604,7 +1651,19 @@ def _probe_config_unreadable() -> bool:
     unrecognized ``terminal.backend`` — is a security risk (it may carry
     ``terminal.backend: docker``) and must fail closed rather than silently
     downgrading an isolated backend to host-local execution.
+
+    Both the user config (``HERMES_HOME/config.yaml``) and the managed-scope
+    config (``/etc/hermes/config.yaml`` or ``$HERMES_MANAGED_DIR``) are probed:
+    a malformed MANAGED file is fail-open in ``managed_scope.load_managed_config``
+    (it returns ``{}``), which would silently drop an administrator-pinned
+    ``terminal.backend: docker`` and downgrade to host execution — the same
+    fail-closed invariant the user-config probe protects.
     """
+    return _probe_user_config_unreadable() or _probe_managed_config_unreadable()
+
+
+def _probe_user_config_unreadable() -> bool:
+    """Probe the user-scope config.yaml (``get_config_path()``)."""
     try:
         from hermes_cli.config import get_config_path, fast_safe_load
         config_path = get_config_path()
@@ -1615,9 +1674,42 @@ def _probe_config_unreadable() -> bool:
         return False
     except Exception:
         return True
+    return _terminal_config_shape_unreadable(data)
 
-    # A present document that is empty, a list, or a scalar cannot carry a
-    # trustworthy terminal.backend — treat it as unreadable.
+
+def _probe_managed_config_unreadable() -> bool:
+    """Probe the managed-scope config.yaml when a managed scope is present.
+
+    ``managed_scope.load_managed_config()`` fails open on a malformed managed
+    file (returns ``{}`` and logs loudly), so an admin's pinned
+    ``terminal.backend`` silently vanishes on parse failure.  Detect that here
+    so ``_terminal_env_snapshot()`` fails closed instead of downgrading.
+    """
+    try:
+        import yaml
+
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+        if managed_dir is None:
+            return False
+        managed_path = managed_dir / "config.yaml"
+        managed_path.stat()
+        with open(managed_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    return _terminal_config_shape_unreadable(data)
+
+
+def _terminal_config_shape_unreadable(data) -> bool:
+    """Return True when a parsed config root cannot carry a trustworthy backend.
+
+    A present document that is empty, a list, or a scalar cannot carry a
+    trustworthy terminal.backend — treat it as unreadable.
+    """
     if not isinstance(data, dict):
         return True
 
@@ -1635,7 +1727,7 @@ def _probe_config_unreadable() -> bool:
 def _resolve_backend_type(env: Optional[Dict[str, str]] = None) -> str:
     """Return the terminal backend type after bridging config.yaml."""
     source = _terminal_env_snapshot() if env is None else env
-    env_val = source.get("TERMINAL_ENV")
+    env_val = (source.get("TERMINAL_ENV") or "").strip().lower()
     if env_val:
         return env_val
     return "local"

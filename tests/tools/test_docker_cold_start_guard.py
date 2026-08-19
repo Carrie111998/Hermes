@@ -47,6 +47,45 @@ class TestResolveBackendType:
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         assert _tt_mod._resolve_backend_type() == "ssh"
 
+    def test_normalizes_case_and_whitespace(self, monkeypatch):
+        """Backend values must be normalized (strip + lowercase) like the validator.
+
+        Regression (CodeRabbit #61882): _probe_config_unreadable() accepts
+        terminal.backend: Docker / " docker", but _resolve_backend_type()
+        returned the value verbatim, so case-sensitive consumers (env_probe's
+        ``in _REMOTE_BACKENDS``, credential_files, _get_env_config's
+        ``in _CONTAINER_BACKENDS``) took host-local branches for a config that
+        requested an isolated backend.
+        """
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+
+        def _mock_load_config():
+            return {"terminal": {"backend": "Docker"}}
+
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", _mock_load_config)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly", _mock_load_config,
+        )
+        assert _tt_mod._resolve_backend_type() == "docker"
+
+        # Whitespace variant too.
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config",
+            lambda: {"terminal": {"backend": " docker "}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"terminal": {"backend": " docker "}},
+        )
+        assert _tt_mod._resolve_backend_type() == "docker"
+
+        # Environment value is normalized the same way.
+        monkeypatch.setenv("TERMINAL_ENV", "  Modal ")
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+        assert _tt_mod._resolve_backend_type() == "modal"
+
     def test_falls_back_to_config_when_env_not_set(self, monkeypatch):
         """When TERMINAL_ENV is not set, read terminal.backend from config.yaml."""
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
@@ -129,8 +168,20 @@ class TestResolveBackendType:
         # Stale env var is replaced by the config value.
         assert config["docker_image"] == "python:3.12-slim"
 
-    def test_config_bridge_failure_raises_when_backend_is_docker(self, monkeypatch):
+    def _isolate_hermes_home(self, monkeypatch, tmp_path):
+        """Point HERMES_HOME at an empty temp dir so _probe_config_unreadable()
+        can never read an inherited/ambient config.yaml and divert the test onto
+        the unreadable-config path (CodeRabbit #61882)."""
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+
+    def test_config_bridge_failure_raises_when_backend_is_docker(
+        self, monkeypatch, tmp_path,
+    ):
         """When config bridge fails and config intends Docker, fail closed."""
+        self._isolate_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setenv("TERMINAL_ENV", "local")
         monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "stale-image")
 
@@ -147,8 +198,11 @@ class TestResolveBackendType:
         with pytest.raises(RuntimeError, match="Refusing to downgrade"):
             _tt_mod._get_env_config()
 
-    def test_config_bridge_failure_allows_local_when_backend_is_local(self, monkeypatch):
+    def test_config_bridge_failure_allows_local_when_backend_is_local(
+        self, monkeypatch, tmp_path,
+    ):
         """When config bridge fails but config intends local, it is safe to proceed."""
+        self._isolate_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setenv("TERMINAL_ENV", "local")
 
         monkeypatch.setattr(
@@ -162,8 +216,11 @@ class TestResolveBackendType:
         config = _tt_mod._get_env_config()
         assert config["env_type"] == "local"
 
-    def test_config_bridge_failure_preserves_explicit_termin_env(self, monkeypatch):
+    def test_config_bridge_failure_preserves_explicit_termin_env(
+        self, monkeypatch, tmp_path,
+    ):
         """When bridge fails but TERMINAL_ENV=docker was explicitly set, keep it."""
+        self._isolate_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "my-image")
 
@@ -317,6 +374,67 @@ class TestProbeConfigUnreadableShapes:
         assert _tt_mod._probe_config_unreadable() is False
 
     def test_absent_config_is_readable(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+
+        assert _tt_mod._probe_config_unreadable() is False
+
+
+class TestProbeManagedConfigUnreadable:
+    """_probe_config_unreadable() must also fail closed on a malformed MANAGED config.
+
+    Regression: ``managed_scope.load_managed_config()`` is fail-open (returns {} on a
+    parse error), so an admin-pinned ``terminal.backend: docker`` silently vanished
+    and a stale ``TERMINAL_ENV=local`` downgraded an isolated backend to host
+    execution — the managed-config counterpart of the user-config probe.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _managed(self, monkeypatch, tmp_path):
+        self._managed_dir = tmp_path / "managed"
+        self._managed_dir.mkdir()
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(self._managed_dir))
+        from hermes_cli import managed_scope
+
+        managed_scope.invalidate_managed_cache()
+        yield
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+        managed_scope.invalidate_managed_cache()
+
+    def test_malformed_managed_config_is_unreadable(self, monkeypatch, tmp_path):
+        """A present-but-unparseable managed config.yaml must fail closed."""
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        (self._managed_dir / "config.yaml").write_text(
+            "terminal:\n  backend: docker\n  broken [[[ yaml", encoding="utf-8",
+        )
+
+        assert _tt_mod._probe_config_unreadable() is True
+        with pytest.raises(RuntimeError, match="config.yaml is unreadable"):
+            _tt_mod._get_env_config()
+
+    def test_managed_config_pins_docker_over_stale_local(self, monkeypatch, tmp_path):
+        """A clean managed terminal.backend: docker must override stale TERMINAL_ENV."""
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        (self._managed_dir / "config.yaml").write_text(
+            "terminal:\n  backend: docker\n  docker_image: python:3.12\n",
+            encoding="utf-8",
+        )
+
+        assert _tt_mod._probe_config_unreadable() is False
+        cfg = _tt_mod._get_env_config()
+        assert cfg["env_type"] == "docker"
+        assert cfg["docker_image"] == "python:3.12"
+
+    def test_absent_managed_config_stays_readable(self, monkeypatch, tmp_path):
+        """No managed file at all (or no managed scope) is the normal benign case."""
         hermes_home = tmp_path / "hermes_home"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))

@@ -18,13 +18,9 @@ from hermes_constants import get_hermes_home
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Each test starts with clean TERMINAL_* env."""
-    for name in (
-        "TERMINAL_ENV",
-        "TERMINAL_CWD",
-        "TERMINAL_DOCKER_IMAGE",
-        "TERMINAL_SSH_HOST",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    for name in tuple(os.environ):
+        if name.startswith("TERMINAL_"):
+            monkeypatch.delenv(name, raising=False)
     yield
 
 
@@ -187,6 +183,41 @@ def test_worker_timeout_override_survives_bridge(monkeypatch):
     assert config["env_type"] == "docker"
     assert config["timeout"] == 600
     assert config["lifetime_seconds"] == 900
+
+
+def test_managed_timeout_pin_beats_stale_process_env(monkeypatch, tmp_path):
+    """An administrator-pinned managed ``terminal.timeout`` must win over a stale
+    process-env ``TERMINAL_TIMEOUT``.
+
+    Regression: ``_terminal_env_snapshot()`` restored the worker-scoped
+    timeout/lifetime values from the process env unconditionally, clobbering a
+    managed-scope pin — the same precedence inversion the PR fixes for the
+    backend key.  A managed pin is administrator-forced (managed_scope §4.1), so
+    it must override even an explicitly-set env value.
+    """
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    (managed_dir / "config.yaml").write_text(
+        "terminal:\n"
+        "  backend: docker\n"
+        "  timeout: 600\n"
+        "  lifetime_seconds: 900\n"
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "local")       # stale, must lose
+    monkeypatch.setenv("TERMINAL_TIMEOUT", "180")     # stale, must lose
+    monkeypatch.setenv("TERMINAL_LIFETIME_SECONDS", "300")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "docker"
+    assert config["timeout"] == 600
+    assert config["lifetime_seconds"] == 900
+    managed_scope.invalidate_managed_cache()
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
 
 
 def test_bridge_applies_config_default_when_no_worker_override(monkeypatch):

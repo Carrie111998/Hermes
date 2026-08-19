@@ -544,8 +544,9 @@ def to_agent_visible_cache_path(
       the host path is directly readable and translation would dangle
       (cache dirs are not remapped into that sandbox).
 
-    Backend is identified by TERMINAL_ENV (same env var
-    tools/terminal_tool.py reads in _get_environment_config).
+    Backend is resolved through ``resolve_terminal_backend()`` — the bridged
+    config snapshot from ``tools/terminal_tool.py`` (config.yaml
+    ``terminal.backend`` wins over any process-level ``TERMINAL_ENV``).
     """
     from tools.terminal_tool import resolve_terminal_backend
     backend = resolve_terminal_backend()
