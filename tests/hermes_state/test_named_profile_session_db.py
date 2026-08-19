@@ -166,3 +166,75 @@ def test_make_agent_binds_named_profile_home_store(homes, monkeypatch):
 
     assert _ids(profile / "state.db") == {"20260820_tui_worker"}
     assert _ids(root / "state.db") == set()
+
+
+def test_agent_session_db_retargets_explicit_launch_handle(homes, monkeypatch):
+    root, profile = homes
+    from tui_gateway import server
+
+    launch = SessionDB(db_path=root / "state.db")
+    sid = "sid-worker"
+    monkeypatch.setattr(server, "_get_db", lambda: launch)
+    with server._sessions_lock:
+        server._sessions[sid] = {"profile_home": str(profile)}
+    try:
+        db = server._agent_session_db(sid, launch)
+        assert db is not launch
+        db.create_session("20260820_tui_worker", "tui", profile_name="worker")
+        db.close()
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+        launch.close()
+
+    assert _ids(profile / "state.db") == {"20260820_tui_worker"}
+    assert _ids(root / "state.db") == set()
+
+
+def test_agent_session_db_binds_from_profile_name_without_home(homes, monkeypatch):
+    root, profile = homes
+    from tui_gateway import server
+
+    launch = SessionDB(db_path=root / "state.db")
+    sid = "sid-worker"
+    monkeypatch.setattr(server, "_get_db", lambda: launch)
+    with server._sessions_lock:
+        server._sessions[sid] = {"profile_name": "worker"}
+    try:
+        db = server._agent_session_db(sid, launch)
+        assert db is not launch
+        db.create_session("20260820_tui_worker", "tui", profile_name="worker")
+        db.close()
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+        launch.close()
+
+    assert _ids(profile / "state.db") == {"20260820_tui_worker"}
+    assert _ids(root / "state.db") == set()
+
+
+def test_agent_session_db_does_not_fallback_to_launch_on_open_failure(homes, monkeypatch):
+    root, _profile = homes
+    from tui_gateway import server
+
+    launch = SessionDB(db_path=root / "state.db")
+    sid = "sid-worker"
+    monkeypatch.setattr(server, "_get_db", lambda: launch)
+
+    class Boom(Exception):
+        pass
+
+    def boom_db(**_kwargs):
+        raise Boom("profile store unavailable")
+
+    monkeypatch.setattr("hermes_state.SessionDB", boom_db)
+    with server._sessions_lock:
+        server._sessions[sid] = {"profile_home": str(root / "profiles" / "worker")}
+    try:
+        with pytest.raises(Boom):
+            server._agent_session_db(sid)
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+        launch.close()

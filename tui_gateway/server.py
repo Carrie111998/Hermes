@@ -7000,26 +7000,24 @@ def _resolve_runtime_with_fallback(
 def _agent_session_db(sid: str, session_db=None):
     """Bind the agent to the session's profile store, not the launch DB.
 
-    Bot Mode session.create stores ``profile_home`` on the live session, but
-    ``_make_agent`` used to default to ``_get_db()`` (the process launch
-    state.db). Turns then persisted under the root store with
-    ``profile_name=worker``, which is why opening the named profile looked blank.
+    Bot Mode often hands the launch ``state.db`` into ``_make_agent``. If the
+    live session is a named profile, that handle must still be retargeted.
+    A failed profile-store open must not silently fall back to launch.
     """
-    if session_db is not None:
-        return session_db
     rec = _sessions.get(sid) or {}
     home = rec.get("profile_home")
+    name = (
+        (rec.get("profile") or rec.get("profile_name") or "").strip()
+        or (Path(home).name if home else None)
+    )
     if home:
         from hermes_state import SessionDB
 
-        try:
-            return SessionDB(db_path=Path(home) / "state.db")
-        except Exception:
-            logger.debug("failed to open profile session db for agent", exc_info=True)
+        return SessionDB(db_path=Path(home) / "state.db")
     from hermes_state import session_db_for_named_profile
 
-    name = Path(home).name if home else None
-    return session_db_for_named_profile(_get_db(), name) or _get_db()
+    base = session_db if session_db is not None else _get_db()
+    return session_db_for_named_profile(base, name) or base
 
 
 def _make_agent(
