@@ -2001,6 +2001,8 @@ export const ja = defineLocale({
     terminalSelectionMissingTitle: 'ターミナル選択を利用できません',
     terminalSelectionMissingBody:
       '送信前にターミナル行を再選択（Ctrl/Cmd+L）してください — チップに元のテキストがありません。',
+    queuedTerminalSelectionExpiredBody:
+      'キュー内のターミナル選択はもう利用できません。行を再選択（Ctrl/Cmd+L）して、もう一度キューに入れてください。',
     previewUnavailable: 'プレビューは利用できません',
     previewLabel: label => `${label} のプレビュー`,
     couldNotPreview: label => `${label} をプレビューできませんでした`,

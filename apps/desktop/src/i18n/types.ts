@@ -1937,6 +1937,7 @@ export interface Translations {
     queueStuckBody: string
     terminalSelectionMissingTitle: string
     terminalSelectionMissingBody: string
+    queuedTerminalSelectionExpiredBody: string
     previewUnavailable: string
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string

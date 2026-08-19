@@ -9,10 +9,14 @@ import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
+  getFrozenQueuedTransport,
   getQueuedPrompts,
   isQueueParked,
-  parkQueuedPrompts
+  parkQueuedPrompts,
+  resetFrozenQueuedTransportsForTests,
+  simulateComposerQueueReloadForTests
 } from '@/store/composer-queue'
+import { $notifications, clearNotifications } from '@/store/notifications'
 
 import type { QueueEditState } from '../composer-utils'
 import type { ChatBarProps } from '../types'
@@ -68,6 +72,8 @@ describe('useComposerQueue park integration', () => {
     window.localStorage.clear()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    resetFrozenQueuedTransportsForTests()
+    clearNotifications()
     clearComposerTerminalSelections()
   })
 
@@ -76,6 +82,8 @@ describe('useComposerQueue park integration', () => {
     vi.restoreAllMocks()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    resetFrozenQueuedTransportsForTests()
+    clearNotifications()
     clearComposerTerminalSelections()
   })
 
@@ -224,9 +232,10 @@ describe('useComposerQueue park integration', () => {
     const queued = getQueuedPrompts(SESSION_KEY)
 
     expect(queued).toHaveLength(1)
-    expect(queued[0]?.text).toContain('selection A')
-    expect(queued[0]?.text).not.toContain('@terminal:')
+    expect(queued[0]?.text).toBe('look at @terminal:`zsh:23-58`')
     expect(queued[0]?.displayText).toBe('look at @terminal:`zsh:23-58`')
+    expect(queued[0]?.text).not.toContain('selection A')
+    expect(getFrozenQueuedTransport(queued[0]!.id)).toContain('selection A')
     expect(draftRef.current).toBe('')
 
     setComposerTerminalSelection('zsh:23-58', 'selection B from another tab')
@@ -238,6 +247,32 @@ describe('useComposerQueue park integration', () => {
     expect(onSubmit).toHaveBeenCalledTimes(1)
     expect(onSubmit.mock.calls[0]?.[0]).toContain('selection A')
     expect(onSubmit.mock.calls[0]?.[0]).not.toContain('selection B')
-    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({ fromQueue: true })
+    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({
+      displayText: 'look at @terminal:`zsh:23-58`',
+      fromQueue: true
+    })
+  })
+
+  it('blocks drain after a simulated reload when the runtime terminal payload is gone', async () => {
+    setComposerTerminalSelection('zsh:23-58', 'selection A')
+
+    const { hook, onSubmit } = renderQueueHook({
+      busy: true,
+      draft: 'look at @terminal:`zsh:23-58`'
+    })
+
+    act(() => {
+      expect(hook.result.current.queueCurrentDraft()).toBe(true)
+    })
+
+    simulateComposerQueueReloadForTests()
+
+    await act(async () => {
+      expect(await hook.result.current.drainNextQueued()).toBe(false)
+    })
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+    expect($notifications.get().some(n => n.message.includes('Re-select the lines'))).toBe(true)
   })
 })

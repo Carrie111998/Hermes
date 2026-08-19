@@ -8,7 +8,8 @@ import {
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
   getQueuedPrompts,
-  parkQueuedPrompts
+  parkQueuedPrompts,
+  resetFrozenQueuedTransportsForTests
 } from '@/store/composer-queue'
 import { $sessions, setSessions } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
@@ -62,6 +63,7 @@ describe('useBackgroundQueueDrain', () => {
   beforeEach(() => {
     vi.useRealTimers()
     clearAllSessionStates()
+    resetFrozenQueuedTransportsForTests()
   })
 
   afterEach(() => {
@@ -70,6 +72,7 @@ describe('useBackgroundQueueDrain', () => {
     vi.useRealTimers()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    resetFrozenQueuedTransportsForTests()
     $sessions.set([])
     clearAllSessionStates()
   })
@@ -100,9 +103,10 @@ describe('useBackgroundQueueDrain', () => {
     const submitText = vi.fn(async () => true)
 
     enqueueQueuedPrompt('stored-session-a', {
-      text: '```terminal\nselection A\n```\n\nlook at',
+      text: 'look at @terminal:`zsh:23-58`',
       displayText: 'look at @terminal:`zsh:23-58`',
-      attachments: []
+      attachments: [],
+      frozenTransport: '```terminal\nselection A\n```\n\nlook at'
     })
     clearAllSessionStates()
 

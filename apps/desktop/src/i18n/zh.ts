@@ -2478,6 +2478,7 @@ export const zh: Translations = {
     queueStuckBody: '排队的对话多次发送失败。它仍在队列中，请重试发送。',
     terminalSelectionMissingTitle: '无法使用终端选区',
     terminalSelectionMissingBody: '发送前请重新选择终端行（Ctrl/Cmd+L）— 此标签没有原始文本。',
+    queuedTerminalSelectionExpiredBody: '队列中的终端选区已不可用。请重新选择行（Ctrl/Cmd+L）并再次加入队列。',
     previewUnavailable: '预览不可用',
     previewLabel: label => `预览 ${label}`,
     couldNotPreview: label => `无法预览 ${label}`,

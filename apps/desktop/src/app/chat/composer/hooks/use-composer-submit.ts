@@ -256,10 +256,14 @@ export function useComposerSubmit({
 
     void Promise.resolve(onSteer(frozen.transportText)).then(accepted => {
       if (!accepted && activeQueueSessionKey) {
+        const hasTerminalTransport = frozen.displayText !== frozen.transportText
+
         enqueueQueuedPrompt(activeQueueSessionKey, {
-          text: frozen.transportText,
+          text: frozen.displayText,
           attachments: [],
-          ...(frozen.displayText !== frozen.transportText ? { displayText: frozen.displayText } : {})
+          ...(hasTerminalTransport
+            ? { displayText: frozen.displayText, frozenTransport: frozen.transportText }
+            : {})
         })
       }
     })

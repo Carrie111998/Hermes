@@ -2296,6 +2296,8 @@ export const en: Translations = {
     terminalSelectionMissingTitle: 'Terminal selection unavailable',
     terminalSelectionMissingBody:
       'Re-select the terminal lines (Ctrl/Cmd+L) before sending — this chip has no original text.',
+    queuedTerminalSelectionExpiredBody:
+      'This queued terminal selection is no longer available. Re-select the lines (Ctrl/Cmd+L) and queue the message again.',
     previewUnavailable: 'Preview unavailable',
     previewLabel: label => `Preview ${label}`,
     couldNotPreview: label => `Could not preview ${label}`,
