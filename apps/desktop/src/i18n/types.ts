@@ -1875,6 +1875,7 @@ export interface Translations {
   composer: {
     message: string
     wakingProfile: (profile: string) => string
+    profileSwitchFailed: (profile: string) => string
     placeholderStarting: string
     placeholderReconnecting: string
     placeholderFollowUp: string

@@ -2,6 +2,7 @@ import { atom, batch, computed } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
 import { getProfiles, setApiRequestProfile, STARTUP_REQUEST_TIMEOUT_MS } from '@/hermes'
+import { translateNow } from '@/i18n'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import {
   arraysEqual,
@@ -14,6 +15,7 @@ import {
 } from '@/lib/storage'
 import { invalidateCronModelImpactScopeState } from '@/store/cron-model-impact-scope'
 import { $gateway, openGatewayForProfile, prepareGatewayForAgent, prepareGatewayForProfile } from '@/store/gateway'
+import { notifyError } from '@/store/notifications'
 import { setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
@@ -361,10 +363,14 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
         setConnection(connection)
       }
     })
-  })().catch(() => {
+  })().catch(error => {
     // Descriptor lookup failed: the switch fails as a unit. Nothing was
     // published, so every atom still consistently describes the previous
-    // profile; the user can retry the switch.
+    // profile; the user can retry the switch. selectProfile/newSessionInProfile
+    // call this fire-and-forget, so without a notification here the "waking
+    // up" overlay just vanishes with no explanation — the rail looks broken
+    // rather than having declined an unreachable switch.
+    notifyError(error, translateNow('composer.profileSwitchFailed', target))
   })
 
   try {

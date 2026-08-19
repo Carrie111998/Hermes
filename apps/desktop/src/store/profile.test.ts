@@ -17,6 +17,7 @@ const prepareGatewayForProfile = vi.fn(async (_profile: string) => activateGatew
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
+const notifyError = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
@@ -31,6 +32,7 @@ vi.mock('@/hermes', () => ({
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
+vi.mock('@/store/notifications', () => ({ notifyError }))
 
 const {
   $activeGatewayProfile,
@@ -76,6 +78,7 @@ beforeEach(() => {
   vi.stubGlobal('window', { hermesDesktop: { getConnection } })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
+  notifyError.mockClear()
 })
 
 afterEach(() => {
@@ -124,6 +127,20 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect(activateGateway).not.toHaveBeenCalled()
     expect($activeGatewayProfile.get()).toBe('default')
     expect($connection.get()?.mode).toBe('local')
+  })
+
+  it('notifies the user when a fire-and-forget switch fails (#89622)', async () => {
+    // selectProfile/newSessionInProfile call ensureGatewayProfile without
+    // awaiting it, and a failed switch publishes nothing. Without a
+    // notification here, the rail's "waking up" overlay just disappears with
+    // no explanation — the switch silently no-ops instead of visibly failing.
+    const error = new Error('backend unreachable')
+
+    getConnection.mockRejectedValue(error)
+
+    await ensureGatewayProfile('vps-remote')
+
+    expect(notifyError).toHaveBeenCalledWith(error, expect.stringContaining('vps-remote'))
   })
 
   it('never publishes the new gateway before its connection descriptor', async () => {
