@@ -293,6 +293,30 @@ class TestReasoningStyle:
             ), plat
 
 
+class TestToolProgressCodeBlocks:
+    """Per-platform fenced-code rendering for command-like tool progress."""
+
+    def test_defaults_to_enabled(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "tool_progress_code_blocks") is True
+
+    def test_platform_override_disables_code_blocks(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "telegram": {"tool_progress_code_blocks": False},
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(config, "telegram", "tool_progress_code_blocks")
+            is False
+        )
+
+
 class TestLiveStatusSetting:
     """display.live_status — tri-state normalisation + platform overrides."""
 

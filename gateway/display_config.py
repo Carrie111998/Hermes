@@ -40,6 +40,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     #   "subtext"   -> each line prefixed with "-# " (Discord small grey subtext)
     # Discord defaults to "subtext"; everywhere else defaults to "code".
     "reasoning_style": "code",
+    # Render command-like tool progress in fenced blocks when the platform
+    # supports them. Set false globally or per platform for compact plain text.
+    "tool_progress_code_blocks": True,
     "tool_preview_length": 0,
     "streaming": None,  # None = follow top-level streaming config
     # Gateway-only assistant/status chatter controls. These default on for
@@ -274,6 +277,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
+        "tool_progress_code_blocks",
     }:
         if isinstance(value, str):
             val = value.strip().lower()
