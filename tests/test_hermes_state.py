@@ -1902,15 +1902,20 @@ class TestTitleUniqueness:
 
 
 
+def _seed_title(db, sid, title, at=None):
+    """Create a titled session; pin started_at when *at* is given (ordering)."""
+    db.create_session(sid, "cli")
+    db.set_session_title(sid, title)
+    if at is not None:
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (at, sid))
+
+
 class TestTitleLineage:
     """Tests for title lineage resolution and auto-numbering."""
 
     def test_resolve_exact_title(self, db):
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
+        _seed_title(db, "s1", "my project")
         assert db.resolve_session_by_title("my project") == "s1"
-
-
 
     def test_resolve_nonexistent_title(self, db):
         assert db.resolve_session_by_title("nonexistent") is None
@@ -1918,27 +1923,15 @@ class TestTitleLineage:
     def test_resolve_ignores_newer_invalid_named_continuation(self, db):
         """A newer `foo #bar` must not hijack exact `foo` binding."""
         t0 = time.time() - 1000
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "foo #bar")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s2")
-        )
+        _seed_title(db, "s1", "foo", t0)
+        _seed_title(db, "s2", "foo #bar", t0 + 1000)
         assert db.resolve_session_by_title("foo") == "s1"
 
     def test_resolve_ignores_newer_fullwidth_digit_continuation(self, db):
         """A fullwidth-digit lookalike `foo #２` must not bind as a continuation."""
         t0 = time.time() - 1000
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "foo #２")  # fullwidth ２ (U+FF12)
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s2")
-        )
+        _seed_title(db, "s1", "foo", t0)
+        _seed_title(db, "s2", "foo #２", t0 + 1000)  # fullwidth ２ (U+FF12)
         assert db.resolve_session_by_title("foo") == "s1"
 
     @pytest.mark.parametrize(
@@ -1951,63 +1944,31 @@ class TestTitleLineage:
     def test_resolve_rejects_invalid_near_miss_continuation(self, db, lookalike):
         """None of these near-misses may bind as a numbered continuation."""
         t0 = time.time() - 1000
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", lookalike)
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s2")
-        )
+        _seed_title(db, "s1", "foo", t0)
+        _seed_title(db, "s2", lookalike, t0 + 1000)
         assert db.resolve_session_by_title("foo") == "s1"
 
     def test_resolve_valid_continuation_beats_newer_invalid(self, db):
         """A valid `foo #2` wins even when a newer `foo #bar` exists."""
         t0 = time.time() - 1000
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "foo #2")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
-        )
-        db.create_session("s3", "cli")
-        db.set_session_title("s3", "foo #bar")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s3")
-        )
+        _seed_title(db, "s1", "foo", t0)
+        _seed_title(db, "s2", "foo #2", t0 + 100)
+        _seed_title(db, "s3", "foo #bar", t0 + 1000)
         assert db.resolve_session_by_title("foo") == "s2"
 
     def test_resolve_multiple_valid_continuations_newest_wins(self, db):
         """Multiple valid continuations keep newest-by-started_at precedence."""
         t0 = time.time() - 1000
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "foo #2")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
-        )
-        db.create_session("s3", "cli")
-        db.set_session_title("s3", "foo #3")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "s3")
-        )
+        _seed_title(db, "s1", "foo", t0)
+        _seed_title(db, "s2", "foo #2", t0 + 100)
+        _seed_title(db, "s3", "foo #3", t0 + 200)
         assert db.resolve_session_by_title("foo") == "s3"
 
     def test_resolve_leading_zero_continuation_accepted(self, db):
         """ASCII leading-zero `foo #01` stays a valid continuation (#15)."""
         t0 = time.time() - 1000
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo")
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "foo #01")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
-        )
+        _seed_title(db, "s1", "foo", t0)
+        _seed_title(db, "s2", "foo #01", t0 + 100)
         assert db.resolve_session_by_title("foo") == "s2"
 
     def test_next_title_no_existing(self, db):
@@ -2016,18 +1977,14 @@ class TestTitleLineage:
 
     def test_next_title_invalid_only_occupant_keeps_base(self, db):
         """Only `foo #bar` exists → next for `foo` stays `foo`, not `foo #2`."""
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo #bar")
+        _seed_title(db, "s1", "foo #bar")
         assert db.get_next_title_in_lineage("foo") == "foo"
 
     def test_next_title_ignores_deeper_suffix_inflation(self, db):
         """`foo #2 #5` is not a direct child of `foo`; next is `foo #3`."""
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "foo #2")
-        db.create_session("s3", "cli")
-        db.set_session_title("s3", "foo #2 #5")
+        _seed_title(db, "s1", "foo")
+        _seed_title(db, "s2", "foo #2")
+        _seed_title(db, "s3", "foo #2 #5")
         assert db.get_next_title_in_lineage("foo") == "foo #3"
 
     def test_next_title_fullwidth_digit_stays_literal_base(self, db):
@@ -2036,27 +1993,33 @@ class TestTitleLineage:
 
     def test_next_title_admits_leading_zero_direct_child(self, db):
         """ASCII `foo #01` is a valid direct child; next is `foo #2`."""
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "foo #01")
+        _seed_title(db, "s1", "foo #01")
         assert db.get_next_title_in_lineage("foo") == "foo #2"
 
     def test_next_title_embedded_hash_base(self, db):
         """`topic # hash` is the literal base; `topic # hash #2` is its child."""
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "topic # hash")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "topic # hash #2")
+        _seed_title(db, "s1", "topic # hash")
+        _seed_title(db, "s2", "topic # hash #2")
         assert db.get_next_title_in_lineage("topic # hash") == "topic # hash #3"
 
-    def test_next_title_wildcard_cjk_bases_keep_literal_children(self, db):
+    @pytest.mark.parametrize(
+        ("base", "lookalike"),
+        [
+            ("100% sure", "100Xsure #5"),  # literal %
+            ("test_project", "testXproject #5"),  # literal _
+            ("path\\to", "pathXto #5"),  # literal backslash
+            ("專案報告", None),  # CJK — no ASCII lookalike widens
+        ],
+    )
+    def test_next_title_wildcard_cjk_bases_keep_literal_children(
+        self, db, base, lookalike
+    ):
         """`%`/`_`/`\\`/CJK bases count only their own direct children."""
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "100% sure")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "100% sure #2")
-        db.create_session("s3", "cli")
-        db.set_session_title("s3", "100Xsure #5")  # must not count for "100% sure"
-        assert db.get_next_title_in_lineage("100% sure") == "100% sure #3"
+        _seed_title(db, "s1", base)
+        _seed_title(db, "s2", f"{base} #2")
+        if lookalike is not None:
+            _seed_title(db, "s3", lookalike)
+        assert db.get_next_title_in_lineage(base) == f"{base} #3"
 
 
 
@@ -2067,10 +2030,8 @@ class TestTitleSqlWildcards:
 
     def test_resolve_title_with_underscore(self, db):
         """A title like 'test_project' should not match 'testXproject #2'."""
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "test_project")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "testXproject #2")
+        _seed_title(db, "s1", "test_project")
+        _seed_title(db, "s2", "testXproject #2")
         # Resolving "test_project" should return s1 (exact), not s2
         assert db.resolve_session_by_title("test_project") == "s1"
 
@@ -2087,14 +2048,8 @@ class TestTitleSqlWildcards:
     def test_literal_bases_admit_own_continuation(self, db, base):
         """Literal `%`/`_`/`\\`/`#`/CJK bases admit their own ` #2` continuation."""
         t0 = time.time() - 1000
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", base)
-        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", f"{base} #2")
-        db._conn.execute(
-            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
-        )
+        _seed_title(db, "s1", base, t0)
+        _seed_title(db, "s2", f"{base} #2", t0 + 100)
         assert db.resolve_session_by_title(base) == "s2"
 
 

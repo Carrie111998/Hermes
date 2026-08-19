@@ -8504,9 +8504,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
-        If not, searches for "title #N" variants and returns the latest one.
+        If not, searches for strict "title #N" variants and returns the latest one.
         If the exact title exists AND numbered variants exist, returns the
-        latest numbered variant (the most recent continuation).
+        latest strict-valid numbered variant (the most recent continuation).
+
+        A numbered variant is admitted only when the full title matches the
+        literal ``base + " #" + ASCII[0-9]+`` grammar (see
+        :meth:`_numbered_title_variant_value`); near-misses such as ``foo #bar``
+        or ``foo #２`` are ignored rather than hijacking exact title binding.
         """
         # First try exact match
         exact = self.get_session_by_title(title)
