@@ -703,3 +703,141 @@ def test_notification_without_keyword_emits_nothing(bus):
     types = [et for et, _ in events]
     assert EventType.INTERVIEW_SIGNAL not in types
     assert EventType.OFFER_SIGNAL not in types
+
+
+class TestBlockedQuestionLegacyEnvelopeBackstop:
+    """The translator must salvage BLOCKED_QUESTION envelopes that predate the
+    producer-side contract fix.
+
+    Every one of the 38 `application_blocked` events on the live bus between
+    2026-07-20 19:14:29 and 2026-08-19 01:06:40 carried `payload={}`: the
+    applier writes BLOCKED_QUESTION straight into ~/.hermes/mailbox/main/inbox
+    with keys `job_id`/`api_job_id`/`questions`/`failureMessage`, and
+    `_copy_fields(inner, ["company","title","job_key","question"])` drops every
+    key whose value is None. The CRITICAL WhatsApp page therefore rendered
+    "Application blocked at ?: needs your input"
+    (whatsapp_escalator.py:379) and the Telegram summary was the bare literal
+    "Blocked question" (MailboxWatcher._summarize reads payload["question"]).
+
+    The producer is fixed separately; this is the backstop, so a stale producer,
+    a replayed envelope, or a third emitter can never re-empty the payload.
+    """
+
+    # Shape copied from a real envelope,
+    # mailbox/main/processed/20260819T010544_BLOCKED_QUESTION_applier_f9e6d24a.json
+    # (identifiers zero-filled -- a real job UUID under an `api_*` key trips
+    # the gitleaks generic-api-key rule on entropy).
+    def _legacy(self, **over):
+        payload = {
+            "job_id": "bcff95e9-c08e-40f4-ac5d-e32c4f947d0e",
+            "api_job_id": "56874381-0000-0000-0000-000000000000",
+            "attempt_id": "applier-dry-run-20260819T010048Z-56874381",
+            "questions": [
+                {"label": "First Name*", "type": "text", "selector": "#first_name"},
+                {"label": "Email*", "type": "text", "selector": "#email"},
+            ],
+            "failureMessage": (
+                "Greenhouse still has unanswered required fields after standard "
+                "profile and document filling."
+            ),
+            "screenshots": [],
+            "artifacts": [],
+        }
+        payload.update(over)
+        return payload
+
+    def _blocked(self, bus):
+        events = _recent_domain_events(bus)
+        return next(p for et, p in events if et == EventType.APPLICATION_BLOCKED)
+
+    def test_question_is_built_from_the_questions_list(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy())
+        _translate(bus)
+        question = self._blocked(bus)["question"]
+        assert "First Name*" in question
+        assert "Email*" in question
+
+    def test_job_key_is_aliased_from_job_id(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy())
+        _translate(bus)
+        assert self._blocked(bus)["job_key"] == "bcff95e9-c08e-40f4-ac5d-e32c4f947d0e"
+
+    def test_job_key_falls_back_to_api_job_id(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy(job_id=None))
+        _translate(bus)
+        assert self._blocked(bus)["job_key"] == "56874381-0000-0000-0000-000000000000"
+
+    def test_question_falls_back_to_failure_message(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy(questions=[]))
+        _translate(bus)
+        assert "unanswered required fields" in self._blocked(bus)["question"]
+
+    def test_question_is_never_absent_even_for_an_empty_envelope(self, bus):
+        """`_summarize` and the WhatsApp page both key on `question`; a missing
+        key is what produced "needs your input" for a month."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", {})
+        _translate(bus)
+        assert self._blocked(bus)["question"].strip()
+
+    def test_question_is_truncated_to_the_summary_budget(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy(questions=[
+            {"label": "Q%d %s" % (i, "x" * 40)} for i in range(20)
+        ]))
+        _translate(bus)
+        assert len(self._blocked(bus)["question"]) <= 200
+
+    def test_company_and_title_are_backfilled_from_pipeline_state(
+        self, bus, tmp_path, monkeypatch
+    ):
+        import events.subscribers.mailbox_translator as mt
+        pipeline = tmp_path / "pipeline.json"
+        pipeline.write_text(json.dumps({"jobs": [
+            {"job_id": "bcff95e9-c08e-40f4-ac5d-e32c4f947d0e",
+             "title": "Director Finance", "company": "Petra Funds Group"},
+        ]}), encoding="utf-8")
+        monkeypatch.setattr(mt, "PIPELINE_PATH", pipeline)
+
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy())
+        _translate(bus)
+        out = self._blocked(bus)
+        assert out["company"] == "Petra Funds Group"
+        assert out["title"] == "Director Finance"
+
+    def test_backfill_is_best_effort_when_pipeline_state_is_missing(
+        self, bus, tmp_path, monkeypatch
+    ):
+        import events.subscribers.mailbox_translator as mt
+        monkeypatch.setattr(mt, "PIPELINE_PATH", tmp_path / "nope.json")
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy())
+        _translate(bus)
+        assert self._blocked(bus)["question"]
+
+    def test_a_wellformed_envelope_is_passed_through_untouched(self, bus):
+        """The fixed producer already emits all four keys — the backstop must
+        not rewrite what it sends."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy(
+            job_key="ext-1", company="Acme Corp", title="VP Finance",
+            question="The ATS dry run needs answers: Work authorization?",
+        ))
+        _translate(bus)
+        out = self._blocked(bus)
+        assert out["job_key"] == "ext-1"
+        assert out["company"] == "Acme Corp"
+        assert out["title"] == "VP Finance"
+        assert out["question"] == "The ATS dry run needs answers: Work authorization?"
+
+    def test_the_rendered_whatsapp_page_head_is_no_longer_the_placeholder(self, bus):
+        """Mirrors whatsapp_escalator.py:379 exactly."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", self._legacy(
+            company="Petra Funds Group",
+        ))
+        _translate(bus)
+        out = self._blocked(bus)
+        text = "Application blocked at %s: %s" % (
+            out.get("company", "?"), out.get("question", "needs your input"))
+        assert text != "Application blocked at ?: needs your input"
+        assert text.startswith("Application blocked at Petra Funds Group: ")
+        # Not just the company — the tail must be the real question, never the
+        # "needs your input" default that stood in for a month.
+        assert "needs your input" not in text
+        assert "First Name*" in text

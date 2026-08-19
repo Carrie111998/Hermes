@@ -240,6 +240,45 @@ class MailboxTranslator(BaseSubscriber):
         except Exception:
             return {}
 
+    def _blocked_question_payload(self, inner: Dict[str, Any]) -> Dict[str, Any]:
+        """APPLICATION_BLOCKED payload, tolerant of the applier's envelope.
+
+        Two producers emit BLOCKED_QUESTION. The notifier-bridge
+        (services/notifier-bridge/src/transport.ts `buildMailboxEnvelope`)
+        satisfies the company/title/job_key/question contract directly. The
+        applier writes its own envelope straight into the mailbox with
+        job_id/api_job_id/questions/failureMessage instead — a plain
+        `_copy_fields` of the four contract keys dropped all of them, so every
+        `application_blocked` event on the live bus from 2026-07-20 to
+        2026-08-19 landed as `{}`.
+
+        Anything the producer supplies wins; this only fills the gaps, so a
+        fixed producer passes through untouched.
+        """
+        payload = _copy_fields(inner, ["company", "title", "job_key", "question"])
+
+        if not payload.get("job_key"):
+            job_ref = inner.get("job_id") or inner.get("api_job_id")
+            if job_ref:
+                payload["job_key"] = job_ref
+
+        # Always present: both the WhatsApp CRITICAL page and
+        # MailboxWatcher._summarize key on `question`, and a missing key is what
+        # rendered as "needs your input".
+        if not payload.get("question"):
+            payload["question"] = _blocked_question_text(inner)
+
+        if not payload.get("title") or not payload.get("company"):
+            for ref in (payload.get("job_key"), inner.get("api_job_id")):
+                meta = self._pipeline_metadata(ref)
+                for k in ("title", "company"):
+                    if not payload.get(k) and meta.get(k):
+                        payload[k] = meta[k]
+                if payload.get("title") and payload.get("company"):
+                    break
+
+        return payload
+
     def handle(self, event: Event) -> None:
         payload = event.payload or {}
         message_type = payload.get("message_type", "")
@@ -402,8 +441,9 @@ class MailboxTranslator(BaseSubscriber):
                 inner, ["company", "title", "job_key", "submission_id"]), None))
 
         elif message_type == "BLOCKED_QUESTION":
-            results.append((EventType.APPLICATION_BLOCKED, _copy_fields(
-                inner, ["company", "title", "job_key", "question"]), None))
+            results.append(
+                (EventType.APPLICATION_BLOCKED,
+                 self._blocked_question_payload(inner), None))
 
         elif message_type == "PIPELINE_UPDATE":
             transition = _stage_transition_payload(inner, from_agent)
@@ -479,3 +519,60 @@ def _job_payload(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def _copy_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
     return {f: d.get(f) for f in fields if d.get(f) is not None}
+
+
+# Wording mirrors `blockedQuestionText` in jobflow-platform
+# services/notifier-bridge/src/transport.ts and `blocked_question_text` in the
+# applier sweep, so all three renderings of this event type read identically.
+_BLOCKED_QUESTION_PROMPT = (
+    "The ATS dry run needs answers for required application questions"
+)
+# MailboxWatcher._summarize truncates at 200 chars; cut it here so the ellipsis
+# lands on a boundary we chose.
+_BLOCKED_QUESTION_MAX_CHARS = 200
+
+
+def _question_labels(value: Any) -> List[str]:
+    """Human labels of the fields the ATS adapter could not answer.
+
+    Real payloads are a list of {label,type,selector} dicts, but bare strings
+    are tolerated because the browser-worker adapters are not uniform about it.
+    """
+    if not isinstance(value, list):
+        return []
+    labels: List[str] = []
+    for entry in value:
+        if isinstance(entry, str):
+            label = entry.strip()
+        elif isinstance(entry, dict):
+            label = next(
+                (str(entry[k]).strip()
+                 for k in ("label", "question", "name") if entry.get(k)),
+                "",
+            )
+        else:
+            label = ""
+        if label:
+            labels.append(label)
+    return labels
+
+
+def _blocked_question_text(inner: Dict[str, Any]) -> str:
+    """The `question` text Diego reads on the CRITICAL page.
+
+    Never empty: the escalator's own `payload.get("question", ...)` default is
+    the "needs your input" placeholder this exists to eliminate.
+    """
+    detail = "; ".join(
+        _question_labels(inner.get("questions") or inner.get("unansweredQuestions"))
+    )
+    if not detail:
+        detail = str(inner.get("failureMessage") or "").strip()
+    text = (
+        f"{_BLOCKED_QUESTION_PROMPT}: {detail}"
+        if detail
+        else f"{_BLOCKED_QUESTION_PROMPT}."
+    )
+    if len(text) > _BLOCKED_QUESTION_MAX_CHARS:
+        text = text[: _BLOCKED_QUESTION_MAX_CHARS - 1] + "…"
+    return text
