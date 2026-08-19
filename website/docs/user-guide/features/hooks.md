@@ -1315,6 +1315,8 @@ Side-effect failures are logged at debug level and do not crash the gateway. The
 
 Plugins or profile code can attach reaction actions to outbound Discord messages by appending a reaction manifest to text delivered through `send_message`, cron, kanban, MCP delivery, or other send paths. The Discord sender strips the marker before message splitting, sends any Discord-specific message sections, then adds the configured bot reactions to the delivered Discord messages:
 
+Discord reactions are exposed through plugin hooks/manifests and adapter delivery helpers, not as direct core Discord tool actions.
+
 ```text
 Decision summary for today.
 [HERMES_REACTION_ACTIONS]{

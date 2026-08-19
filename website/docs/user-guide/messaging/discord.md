@@ -421,6 +421,8 @@ Controls whether the bot adds emoji reactions to messages as visual feedback:
 
 Disable this if you find the reactions distracting or if the bot's role doesn't have the **Add Reactions** permission.
 
+Plugin hooks and reaction manifests can still request explicit outbound reactions; these are delivery helpers, not direct core Discord tool actions.
+
 #### `discord.ignored_channels`
 
 **Type:** string or list — **Default:** `[]`

@@ -83,6 +83,7 @@ _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # every slash command — not just the overflow ones. We keep the desired set
 # at or below this limit at registration time.
 _DISCORD_MAX_APP_COMMANDS = 100
+_AGENT_REACTION_MEMORY = 1024
 _DISCORD_SELECT_FIELD_LIMIT = 100
 _DISCORD_BUTTON_LABEL_LIMIT = 80
 _DISCORD_ELLIPSIS = "\u2026"
@@ -1178,6 +1179,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+        # Reaction helpers default to the message that triggered the active
+        # turn. Store both a thread and its parent for auto-threaded turns.
+        self._last_inbound_by_chat: Dict[str, str] = {}
+        self._agent_reactions: Dict[Tuple[str, str], str] = {}
         # Persistent set of bot-authored lifecycle/status message IDs that
         # should not act as conversational history boundaries after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
@@ -3350,6 +3355,86 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] add_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
+    def _record_inbound_reaction_target(self, event: MessageEvent) -> None:
+        """Remember an inbound message as the default reaction target."""
+        source = getattr(event, "source", None)
+        message_id = str(
+            getattr(event, "message_id", "")
+            or getattr(getattr(event, "raw_message", None), "id", "")
+            or ""
+        )
+        if not message_id:
+            return
+        for chat_key in (getattr(source, "chat_id", None), getattr(source, "parent_chat_id", None)):
+            if chat_key:
+                self._last_inbound_by_chat[str(chat_key)] = message_id
+
+    async def _fetch_reaction_target(self, chat_id: str, message_id: str) -> Optional[Any]:
+        """Fetch a reaction target, trying a thread's parent when needed."""
+        if not self._client:
+            return None
+        try:
+            channel_id, target_id = int(chat_id), int(message_id)
+        except (TypeError, ValueError):
+            return None
+        channel = self._client.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self._client.fetch_channel(channel_id)
+            except Exception as exc:
+                logger.debug("[%s] reaction channel fetch failed: %s", self.name, exc)
+                return None
+        for candidate in (channel, self._thread_parent_channel(channel)):
+            fetch_message = getattr(candidate, "fetch_message", None)
+            if not callable(fetch_message):
+                continue
+            try:
+                message = await fetch_message(target_id)
+            except Exception as exc:
+                logger.debug("[%s] reaction message fetch failed: %s", self.name, exc)
+                continue
+            if message is not None:
+                return message
+        return None
+
+    def _resolve_reaction_target_id(self, chat_id: str, message_id: Optional[str]) -> Optional[str]:
+        target = message_id or self._last_inbound_by_chat.get(str(chat_id))
+        return str(target) if target else None
+
+    async def add_reaction(
+        self, chat_id: str, emoji: str, message_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Add an explicit plugin/adapter reaction to a delivered Discord message."""
+        target = self._resolve_reaction_target_id(chat_id, message_id)
+        if not target:
+            return {"success": False, "error": "no message to react to — pass message_id"}
+        message = await self._fetch_reaction_target(chat_id, target)
+        if message is None:
+            return {"success": False, "error": f"message {target} not found in chat {chat_id}"}
+        if not await self._add_reaction(message, emoji):
+            return {"success": False, "error": "reaction failed (see gateway debug log)"}
+        self._agent_reactions[(str(chat_id), target)] = emoji
+        while len(self._agent_reactions) > _AGENT_REACTION_MEMORY:
+            self._agent_reactions.pop(next(iter(self._agent_reactions)))
+        return {"success": True, "message_id": target}
+
+    async def remove_reaction(
+        self, chat_id: str, message_id: Optional[str] = None, emoji: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Remove an explicit bot reaction, defaulting to the remembered emoji."""
+        target = self._resolve_reaction_target_id(chat_id, message_id)
+        if not target:
+            return {"success": False, "error": "no message to unreact — pass message_id"}
+        reaction = emoji or self._agent_reactions.get((str(chat_id), target))
+        if not reaction:
+            return {"success": False, "error": f"no reaction of ours to retract on message {target}"}
+        message = await self._fetch_reaction_target(chat_id, target)
+        if message is None:
+            return {"success": False, "error": f"message {target} not found in chat {chat_id}"}
+        if not await self._remove_reaction(message, reaction):
+            return {"success": False, "error": "unreact failed (see gateway debug log)"}
+        self._agent_reactions.pop((str(chat_id), target), None)
+        return {"success": True, "message_id": target}
     async def _remove_reaction(self, message: Any, emoji: str) -> bool:
         """Remove the bot's own emoji reaction from a Discord message."""
         if not message or not hasattr(message, "remove_reaction") or not self._client or not self._client.user:
@@ -3368,6 +3453,7 @@ class DiscordAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
+        self._record_inbound_reaction_target(event)
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
             acked = await self._add_reaction(message, "👀")

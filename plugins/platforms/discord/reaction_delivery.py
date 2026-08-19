@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Awaitable, Callable
-from urllib.parse import quote
 
 from agent.secret_scope import get_secret
 from gateway.platforms.base import BasePlatformAdapter
+
+try:
+    from .reaction_requests import ReactionError, add_reaction_request
+except ImportError:
+    from reaction_requests import ReactionError, add_reaction_request  # type: ignore
 
 try:
     from .reaction_manifest import (
@@ -27,17 +31,6 @@ except ImportError:
 
 StandaloneSender = Callable[..., Awaitable[dict[str, Any]]]
 CaptionSplit = Callable[..., tuple[str | None, str]]
-
-
-def discord_reaction_route_emoji(emoji: str) -> str:
-    """Return the URL path segment Discord expects for a reaction emoji."""
-    import re
-
-    emoji = (emoji or "").strip()
-    custom = re.fullmatch(r"<a?:([^:<>]+):(\d+)>", emoji)
-    if custom:
-        emoji = f"{custom.group(1)}:{custom.group(2)}"
-    return quote(emoji, safe="")
 
 
 async def add_manifest_reaction_with_retry(
@@ -68,11 +61,11 @@ async def add_manifest_reaction_with_retry(
     except Exception:
         session_kwargs, request_kwargs = {}, {}
 
-    route_emoji = discord_reaction_route_emoji(emoji)
-    url = (
-        "https://discord.com/api/v10/channels/"
-        f"{chat_id}/messages/{message_id}/reactions/{route_emoji}/@me"
-    )
+    try:
+        request = add_reaction_request(chat_id, message_id, emoji)
+    except ReactionError as exc:
+        return f"Discord reaction add skipped for message {message_id} emoji {emoji}: {exc}"
+    url = f"https://discord.com/api/v10{request['path']}"
     headers = {"Authorization": f"Bot {token}"}
 
     for attempt in range(max_attempts):

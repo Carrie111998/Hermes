@@ -143,6 +143,64 @@ async def test_reactions_disabled_via_env(adapter, monkeypatch):
     adapter.send.assert_awaited_once()
 
 
+class _ReactionChannel:
+    def __init__(self, channel_id, messages=None, parent=None):
+        self.id = int(channel_id)
+        self._messages = messages or {}
+        self.parent = parent
+
+    async def fetch_message(self, message_id):
+        message = self._messages.get(int(message_id))
+        if message is None:
+            raise RuntimeError("Unknown Message")
+        return message
+
+
+def _reaction_target(message_id):
+    return SimpleNamespace(
+        id=int(message_id), add_reaction=AsyncMock(), remove_reaction=AsyncMock()
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_add_reaction_targets_explicit_message(adapter):
+    message = _reaction_target(555)
+    channel = _ReactionChannel(123, {555: message})
+    adapter._client.get_channel = lambda channel_id: channel if channel_id == 123 else None
+
+    result = await adapter.add_reaction("123", "🟢", message_id="555")
+
+    assert result == {"success": True, "message_id": "555"}
+    message.add_reaction.assert_awaited_once_with("🟢")
+
+
+@pytest.mark.asyncio
+async def test_adapter_reaction_uses_thread_parent_and_ignores_lifecycle_toggle(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    message = _reaction_target(777)
+    parent = _ReactionChannel(123, {777: message})
+    thread = _ReactionChannel(888, parent=parent)
+    adapter._client.get_channel = lambda channel_id: {123: parent, 888: thread}.get(channel_id)
+
+    result = await adapter.add_reaction("888", "🔴", message_id="777")
+
+    assert result == {"success": True, "message_id": "777"}
+    message.add_reaction.assert_awaited_once_with("🔴")
+
+
+@pytest.mark.asyncio
+async def test_adapter_remove_reaction_removes_bot_own_tracked_emoji(adapter):
+    message = _reaction_target(555)
+    channel = _ReactionChannel(123, {555: message})
+    adapter._client.get_channel = lambda channel_id: channel if channel_id == 123 else None
+
+    await adapter.add_reaction("123", "🟢", message_id="555")
+    result = await adapter.remove_reaction("123", message_id="555")
+
+    assert result == {"success": True, "message_id": "555"}
+    message.remove_reaction.assert_awaited_once_with("🟢", adapter._client.user)
+
+
 # ---------------------------------------------------------------------------
 # on_discord_reaction_add plugin hook (raw reaction events)
 # ---------------------------------------------------------------------------
