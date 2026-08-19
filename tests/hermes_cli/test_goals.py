@@ -798,3 +798,67 @@ class TestContractAndBackgroundCompose:
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Goal-judge session-runtime forwarding (mid-session preset swap)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestGoalJudgeMainRuntime:
+    """Regression: the goal judge's ``auto`` auxiliary resolution must follow
+    the session's current provider/model (e.g. after a mid-session preset
+    swap), not a process-global snapshot from another session or from before
+    the swap. ``main_runtime`` is threaded session → evaluate_after_turn →
+    judge_goal → call_llm."""
+
+    def test_judge_goal_forwards_main_runtime_to_call_llm(self):
+        from hermes_cli import goals
+
+        captured = {}
+
+        def _fake_call_llm(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(
+                choices=[
+                    MagicMock(
+                        message=MagicMock(content='{"done": false, "reason": "keep going"}')
+                    )
+                ]
+            )
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+            goals.judge_goal(
+                "goal",
+                "response",
+                main_runtime={"provider": "openrouter", "model": "model-x"},
+            )
+
+        assert captured.get("main_runtime") == {
+            "provider": "openrouter",
+            "model": "model-x",
+        }
+
+    def test_evaluate_after_turn_forwards_main_runtime_to_judge_goal(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="rt-fwd-sid-1", default_max_turns=20)
+        mgr.set("do a thing")
+
+        captured = {}
+
+        def _fake_judge(*args, **kwargs):
+            captured.update(kwargs)
+            return ("continue", "ok", False, None, False)
+
+        with patch.object(goals, "judge_goal", side_effect=_fake_judge):
+            mgr.evaluate_after_turn(
+                "step 1",
+                main_runtime={"provider": "openrouter", "model": "model-x"},
+            )
+
+        assert captured.get("main_runtime") == {
+            "provider": "openrouter",
+            "model": "model-x",
+        }
+
