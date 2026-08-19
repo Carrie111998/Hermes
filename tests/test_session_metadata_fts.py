@@ -263,3 +263,20 @@ class TestRebuildMarkers:
             assert n == 3
         finally:
             db.close()
+
+    def test_optimize_backfills_session_unicode_lane(self, tmp_path):
+        # Upgrade path: a DB that already has sessions at open (here via the
+        # legacy row_id migration) seeds the Unicode lane's H/P markers, so
+        # the empty index is never served as complete. optimize_fts_storage
+        # must drive the session-lane backfill until the lane serves — the
+        # three session lanes are not optional extras but the substrate the
+        # candidate router relies on.
+        db = self._open_legacy(tmp_path)
+        try:
+            assert db._session_fts_rebuild_gap(db._conn) is not None
+            db.optimize_fts_storage()
+            assert db._session_fts_rebuild_gap(db._conn) is None
+            res = db._metadata_candidate_row_ids("Alpha")
+            assert res.row_ids  # served via FTS, not just the LIKE fallback
+        finally:
+            db.close()

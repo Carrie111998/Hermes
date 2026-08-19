@@ -1351,6 +1351,20 @@ class SessionSearchMixin:
             _emit("backfill")
             _pause(time.monotonic() - _t0)
 
+        # Phase 1c: backfill the session-metadata lanes (Unicode / CJK /
+        # trigram), each with its own H/P marker pair. Driven from here so a
+        # DB that already had sessions at open (the upgrade path — any DB
+        # created before the session-metadata substrate existed) converges to
+        # serving via FTS instead of the whole-store LIKE fallback forever.
+        # Each lane's step is a no-op when nothing is pending.
+        for lane in _FTS_SESSION_LANES:
+            while True:
+                _t0 = time.monotonic()
+                if not self._fts_session_lane_step(lane):
+                    break
+                _emit("backfill")
+                _pause(time.monotonic() - _t0)
+
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")
         while True:
