@@ -118,12 +118,16 @@ def test_classifier_decision_requires_known_profile_and_confidence():
 
 
 class FakeAdapter:
-    def __init__(self, *, thread_id: str = "777"):
+    def __init__(self, *, thread_id: str = "777", authorized: bool = True):
         self.thread_id = thread_id
+        self.authorized = authorized
         self.create_handoff_thread = AsyncMock(return_value=thread_id)
         self.handle_message = AsyncMock()
         self.send = AsyncMock()
         self.sources = []
+
+    def _is_sender_authorized(self, _user_id, _chat_type=None, _chat_id=None):
+        return self.authorized
 
     def build_source(self, **kwargs):
         self.sources.append(kwargs)
@@ -228,6 +232,29 @@ async def test_lobby_falls_back_when_target_thread_cannot_be_created(tmp_path):
     target_adapter.handle_message.assert_not_awaited()
     source_adapter.send.assert_awaited_once()
     assert "could not create" in source_adapter.send.await_args.args[1].lower()
+
+
+@pytest.mark.asyncio
+async def test_lobby_fails_closed_when_target_profile_rejects_user(tmp_path):
+    from gateway.smart_lobby import SmartLobbyDecision, SmartLobbyStore
+
+    source_adapter = FakeAdapter()
+    target_adapter = FakeAdapter(authorized=False)
+    runner = Harness()
+    runner.config = SimpleNamespace(smart_lobby=_raw_config())
+    runner.adapters = {Platform.DISCORD: source_adapter}
+    runner._profile_adapters = {"work": {Platform.DISCORD: target_adapter}}
+    runner.source_adapter = source_adapter
+    runner._smart_lobby_store = SmartLobbyStore(tmp_path / "smart-lobby.db")
+    runner._classify_smart_lobby = AsyncMock(
+        return_value=SmartLobbyDecision(profile="work", confidence=0.9, title="Investigate CI")
+    )
+
+    assert await runner._maybe_route_smart_lobby(_event()) is True
+    target_adapter.create_handoff_thread.assert_not_awaited()
+    target_adapter.handle_message.assert_not_awaited()
+    source_adapter.send.assert_awaited_once()
+    assert "not authorized" in source_adapter.send.await_args.args[1].lower()
 
 
 @pytest.mark.asyncio

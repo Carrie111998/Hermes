@@ -397,6 +397,30 @@ class GatewaySmartLobbyMixin:
         if not callable(create_thread) or not callable(build_source) or not callable(handle_message):
             return False
 
+        source_adapter = getattr(self, "_adapter_for_source")(source)
+        target_auth = getattr(target_adapter, "_is_sender_authorized", None)
+        authorized = (
+            target_auth(source.user_id, "thread", candidate.channel_id)
+            if callable(target_auth)
+            else None
+        )
+        if authorized is not True:
+            logger.warning(
+                "Smart lobby target profile rejected sender: profile=%s user=%s",
+                decision.profile,
+                source.user_id,
+            )
+            if source_adapter is not None:
+                try:
+                    await source_adapter.send(
+                        source.chat_id,
+                        f"`{decision.profile}` owns this request, but you are not authorized "
+                        "for that profile. The request was not executed.",
+                    )
+                except Exception:
+                    logger.debug("Smart lobby authorization notice failed", exc_info=True)
+            return True
+
         store = self._get_smart_lobby_store()
         created, reservation = store.reserve(
             source_key=source_key,
@@ -404,7 +428,6 @@ class GatewaySmartLobbyMixin:
             channel_id=candidate.channel_id,
             title=_clean_title(decision.title, event.text),
         )
-        source_adapter = getattr(self, "_adapter_for_source")(source)
         if not created:
             # A previous process/turn already crossed the external-side-effect
             # boundary. Never create or dispatch again. If the thread id was
