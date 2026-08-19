@@ -38,7 +38,7 @@ def _force_ready(conn, task_id: str) -> None:
         )
 
 
-def _seed_child_proof(conn, oid: str, child_id: str, *, head: str = "abc") -> str:
+def _seed_child_proof(conn, oid: str, child_id: str, *, head: str = "a" * 40) -> str:
     sup.upsert_unit(
         conn,
         objective_id=oid,
@@ -369,6 +369,9 @@ def test_bot_chat_success_failure_malformed_no_output(kanban_home, monkeypatch):
 
 
 def test_judge_fail_correction_exact_head_pass(kanban_home):
+    old = "a" * 40
+    new = "b" * 40
+    moved = "c" * 40
     with kb.connect() as conn:
         parent, child, oid = _graph(conn)
         conn.execute(
@@ -376,27 +379,27 @@ def test_judge_fail_correction_exact_head_pass(kanban_home):
             ("/tmp/fake-repo", child),
         )
         first = contract.record_review_verdict(
-            conn, task_id=child, verdict="fail", head="aaa", blockers=["p1"],
+            conn, task_id=child, verdict="fail", head=old, blockers=["p1"],
         )
         assert first["review_cap"] is False
         stale = contract.record_review_verdict(
-            conn, task_id=child, verdict="pass", head="aaa",
-            current_head="bbb",
+            conn, task_id=child, verdict="pass", head=old,
+            current_head=new,
         )
         assert stale["invalidated"] is True
         units = {u["ref"]: u for u in sup.list_units(conn, oid)}
         assert units[child]["status"] != "done"
         passed = contract.record_review_verdict(
-            conn, task_id=child, verdict="pass", head="bbb",
-            current_head="bbb",
+            conn, task_id=child, verdict="pass", head=new,
+            current_head=new,
         )
         assert passed["verdict"] == "pass"
         units = {u["ref"]: u for u in sup.list_units(conn, oid)}
         assert units[child]["status"] == "done"
-        moved = sup.invalidate_stale_reviews(
-            conn, git_head_fn=lambda path: "ccc" if path == "/tmp/fake-repo" else None,
+        moved_ids = sup.invalidate_stale_reviews(
+            conn, git_head_fn=lambda path: moved if path == "/tmp/fake-repo" else None,
         )
-        assert child in moved
+        assert child in moved_ids
         assert not sup.objective_is_complete(conn, oid)
 
 
@@ -645,3 +648,78 @@ def test_missing_head_review_fails_closed(kanban_home):
         assert missing_live.get("ok") is False
         units = {u["ref"]: u for u in sup.list_units(conn, oid)}
         assert units.get(child, {}).get("status") != "done"
+
+
+def test_abbreviated_head_current_head_pair_fails_closed(kanban_home, tmp_path):
+    live = _init_git_head(kanban_home.parent / "repo-short")
+    short = live[:7]
+    assert len(short) == 7
+    with kb.connect() as conn:
+        parent, child, oid = _graph(conn)
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?",
+            (str(kanban_home.parent / "repo-short"), child),
+        )
+        denied = contract.record_review_verdict(
+            conn, task_id=child, verdict="pass", head=short, current_head=short,
+        )
+        assert denied.get("ok") is False
+        assert "40-character" in str(denied.get("error") or "")
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        assert units.get(child, {}).get("status") != "done"
+        digest = _seed_child_proof(conn, oid, child, head=short)
+        issued = contract.issue_descendant_grant(
+            conn, objective_id=oid, supervisor_task_id=parent,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest, caller_task_id=parent,
+        )
+        assert issued["ok"] is False
+        assert kb.get_task(conn, child).status != "done"
+
+
+def test_stale_proof_after_later_failed_run_cannot_issue_or_consume_grant(kanban_home):
+    with kb.connect() as conn:
+        parent, child, oid = _graph(conn)
+        digest = _seed_child_proof(conn, oid, child)
+        issued_before = contract.issue_descendant_grant(
+            conn, objective_id=oid, supervisor_task_id=parent,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest, caller_task_id=parent,
+        )
+        assert issued_before["ok"] is True
+        now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, error) "
+                "VALUES (?, 'failed', 'failed', ?, ?, 'boom')",
+                (child, now - 10, now),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='blocked', current_run_id=NULL, "
+                "claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                (child,),
+            )
+        packet = contract.build_canonical_evidence(conn, child)
+        assert packet.get("run_id")
+        assert packet.get("run_outcome") == "failed"
+        assert contract.persisted_proof_present(packet) is False
+        issued = contract.issue_descendant_grant(
+            conn, objective_id=oid, supervisor_task_id=parent,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=contract.canonical_evidence_hash(packet),
+            caller_task_id=parent,
+        )
+        assert issued["ok"] is False
+        replay = contract.issue_descendant_grant(
+            conn, objective_id=oid, supervisor_task_id=parent,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest, caller_task_id=parent,
+        )
+        assert replay["ok"] is False
+        closed = contract.reconcile_descendant(
+            conn, supervisor_task_id=parent, descendant_task_id=child,
+            transition="complete", evidence_hash=digest,
+            caller_task_id=parent, objective_id=oid,
+        )
+        assert closed["ok"] is False
+        assert kb.get_task(conn, child).status != "done"

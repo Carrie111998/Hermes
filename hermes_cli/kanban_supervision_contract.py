@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from typing import Any, Callable, Optional
@@ -23,7 +24,10 @@ PROCESS_EXIT_STATUSES = frozenset({
 })
 SUCCESS_MARKERS = frozenset({"pass", "success", "ok", "done", "completed"})
 FAILURE_MARKERS = frozenset({"fail", "failed", "error", "failure", "timeout", "timed_out"})
+SUCCESS_RUN_STATUSES = frozenset({"done", "completed"})
+FAILURE_RUN_STATUSES = frozenset({"failed", "error", "crashed", "killed"})
 BLOCKING_VERDICTS = frozenset({"fail", "insufficient_evidence"})
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REVIEW_CAP = 5
 REVIEW_CAP_CHOICES = ("Add 5 reviews", "Stop here", "Uncap until pass")
 CLASS_SUCCESS = "success"
@@ -35,6 +39,48 @@ NONTERMINAL_EXIT_CLASSES = frozenset({CLASS_FAILURE, CLASS_MALFORMED, CLASS_NO_O
 
 def _now() -> int:
     return int(time.time())
+
+
+def _full_git_sha(value: Optional[str]) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if _FULL_GIT_SHA_RE.fullmatch(text):
+        return text
+    return None
+
+
+def _latest_ended_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, outcome, summary, status FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
+def _run_is_successful_proven(run: Optional[sqlite3.Row]) -> bool:
+    if run is None:
+        return False
+    outcome = str(run["outcome"] or "").strip().lower()
+    status = str(run["status"] or "").strip().lower()
+    if outcome in FAILURE_MARKERS or status in FAILURE_RUN_STATUSES:
+        return False
+    return outcome in SUCCESS_MARKERS or status in SUCCESS_RUN_STATUSES
+
+
+def _canonical_proof_is_current(proof: dict[str, Any], run: Optional[sqlite3.Row]) -> bool:
+    """True when unit proof is still bound to the latest successful/proven run."""
+    if not proof:
+        return False
+    if run is None:
+        return True
+    if not _run_is_successful_proven(run):
+        return False
+    proof_run = proof.get("run_id")
+    if proof_run is None:
+        return True
+    try:
+        return int(proof_run) == int(run["id"])
+    except (TypeError, ValueError):
+        return False
 
 
 def ensure_contract_tables(conn: sqlite3.Connection) -> None:
@@ -169,11 +215,9 @@ def build_canonical_evidence(conn: sqlite3.Connection, task_id: str) -> dict[str
                     proof = loaded
             except Exception:
                 proof = {}
-    run = conn.execute(
-        "SELECT id, outcome, summary FROM task_runs WHERE task_id = ? "
-        "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
+    run = _latest_ended_run(conn, task_id)
+    if not _canonical_proof_is_current(proof, run):
+        proof = {}
     return {
         "task_id": task_id,
         "run_id": int(run["id"]) if run else None,
@@ -187,9 +231,39 @@ def build_canonical_evidence(conn: sqlite3.Connection, task_id: str) -> dict[str
 
 def persisted_proof_present(packet: dict[str, Any]) -> bool:
     proof = packet.get("proof") or {}
-    if proof.get("verdict") or proof.get("head") or proof.get("type"):
+    if not (proof.get("verdict") or proof.get("head") or proof.get("type")):
+        return False
+    run_id = packet.get("run_id")
+    if run_id is None:
         return True
-    return False
+    outcome = str(packet.get("run_outcome") or "").strip().lower()
+    if outcome in FAILURE_MARKERS or (outcome and outcome not in SUCCESS_MARKERS):
+        return False
+    proof_run = proof.get("run_id")
+    if proof_run is None:
+        return True
+    try:
+        return int(proof_run) == int(run_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _grant_head_error(
+    conn: sqlite3.Connection, task_id: str, packet: dict[str, Any]
+) -> Optional[str]:
+    proof = packet.get("proof") or {}
+    submitted = packet.get("head") or proof.get("head")
+    submitted_sha = _full_git_sha(submitted)
+    if not submitted_sha:
+        return f"{task_id} proof HEAD is not a full 40-character SHA"
+    from hermes_cli.kanban_supervisor import _task_git_head
+
+    live = _task_git_head(conn, task_id)
+    if live:
+        live_sha = _full_git_sha(live)
+        if not live_sha or live_sha != submitted_sha:
+            return f"{task_id} proof HEAD does not match live Git HEAD"
+    return None
 
 
 def process_exit_evidence(proof: dict[str, Any]) -> dict[str, Any]:
@@ -270,6 +344,9 @@ def issue_descendant_grant(
             "ok": False,
             "error": f"{descendant_task_id} has no persisted exact-run/revision/review proof",
         }
+    denied_head = _grant_head_error(conn, descendant_task_id, packet)
+    if denied_head:
+        return {"ok": False, "error": denied_head}
     expected = canonical_evidence_hash(packet)
     if evidence_hash != expected:
         return {
@@ -458,6 +535,9 @@ def reconcile_descendant(
                 "ok": False,
                 "error": f"{descendant_task_id} has no persisted exact-run/revision/review proof",
             }
+        denied_head = _grant_head_error(conn, descendant_task_id, packet)
+        if denied_head:
+            return {"ok": False, "error": denied_head}
         expected = canonical_evidence_hash(packet)
         if evidence_hash != expected:
             return {
@@ -617,18 +697,43 @@ def record_review_verdict(
         workspace = row["workspace_path"]
     if live_head is None and git_head_fn is not None:
         live_head = git_head_fn(workspace)
+    stale = False
     if verdict_n == "pass" and not blockers:
         submitted = str(head or "").strip()
         current = str(live_head or "").strip()
-        if not submitted or not current:
+        workspace_live = None
+        if git_head_fn is not None:
+            workspace_live = git_head_fn(workspace)
+        elif workspace:
+            from hermes_cli.kanban_supervisor import git_head as _git_head
+
+            workspace_live = _git_head(workspace)
+        head_error = None
+        if not _full_git_sha(submitted) or not _full_git_sha(current):
+            head_error = "exact-head review requires full 40-character submitted and current HEAD"
+        if head_error:
             return {
                 "ok": False,
-                "error": "exact-head review requires submitted and current HEAD",
+                "error": head_error,
                 "verdict": "insufficient_evidence",
                 "head": head,
                 "current_head": live_head,
             }
-    stale = bool(verdict_n == "pass" and not blockers and head and live_head and head != live_head)
+        live_sha = _full_git_sha(workspace_live) if workspace_live else None
+        if workspace_live and not live_sha:
+            return {
+                "ok": False,
+                "error": "exact-head review requires full 40-character live Git HEAD",
+                "verdict": "insufficient_evidence",
+                "head": head,
+                "current_head": live_head,
+            }
+        submitted_sha = _full_git_sha(submitted)
+        current_sha = _full_git_sha(current)
+        stale = bool(
+            (submitted_sha and current_sha and submitted_sha != current_sha)
+            or (live_sha and submitted_sha and live_sha != submitted_sha)
+        )
     payload = {
         "verdict": verdict_n,
         "head": head,
@@ -668,6 +773,10 @@ def record_review_verdict(
         return {"ok": True, "verdict": "stale_pass", "review_cap": False, "invalidated": True}
 
     if verdict_n == "pass" and not blockers:
+        bound_run = _latest_ended_run(conn, task_id)
+        bound_run_id = (
+            int(bound_run["id"]) if bound_run is not None and _run_is_successful_proven(bound_run) else None
+        )
         upsert_unit(
             conn,
             objective_id=oid,
@@ -678,9 +787,10 @@ def record_review_verdict(
             proof={
                 "type": "jude_verdict",
                 "verdict": "pass",
-                "head": head,
+                "head": _full_git_sha(head),
                 "blockers": [],
                 "verified": True,
+                **({"run_id": bound_run_id} if bound_run_id is not None else {}),
             },
         )
         if git_head_fn is not None:
