@@ -213,6 +213,59 @@ test('pin: precise hit but failed hydration keeps the pin and surfaces the failu
     'must not fork the forever-chat on a hiccup')
 })
 
+test('pin: hydration timeout on a waking backend retries internally and succeeds', async () => {
+  const opened = []
+  const runtime = loadOpenPath({
+    openSession: async id => {
+      opened.push(id)
+      if (opened.length === 1) throw new Error("Timed out loading ops's session history.")
+    },
+    request: async method => {
+      if (method === 'profiles.list') {
+        return {
+          profiles: [{
+            name: 'ops',
+            preferred_session: {
+              id: 'pin-1', resolved_id: 'pin-1', title: 'Bot Chat',
+              preview: 'latest', started_at: 1, last_active: 2, message_count: 3
+            }
+          }]
+        }
+      }
+      return {}
+    }
+  })
+
+  const result = await runtime.openBotCanonicalChat('ops', 'pin-1', HISTORY)
+
+  assert.equal(result, 'pin-1')
+  assert.deepEqual(opened, ['pin-1', 'pin-1'], 'a hydration timeout is retried once before surfacing')
+  assert.equal(runtime.saved.length, 0, 'a confirmed-live pin must survive a retried hydration timeout')
+})
+
+test('pin: hydration timeout that fails twice still surfaces the failure', async () => {
+  const runtime = loadOpenPath({
+    openSession: async () => { throw new Error("Timed out loading ops's session history.") },
+    request: async method => {
+      if (method === 'profiles.list') {
+        return {
+          profiles: [{
+            name: 'ops',
+            preferred_session: {
+              id: 'pin-1', resolved_id: 'pin-1', title: 'Bot Chat',
+              preview: 'latest', started_at: 1, last_active: 2, message_count: 3
+            }
+          }]
+        }
+      }
+      return {}
+    }
+  })
+
+  await assert.rejects(runtime.openBotCanonicalChat('ops', 'pin-1', HISTORY), /Timed out loading/)
+  assert.equal(runtime.saved.length, 0, 'a confirmed-live pin must survive a persistent hydration timeout')
+})
+
 // ── transient failures must never destroy the pin ──────────────────────────
 
 test('transient: profiles.list failure keeps the pin when the direct open works', async () => {
