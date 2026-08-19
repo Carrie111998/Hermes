@@ -54,6 +54,7 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
@@ -492,6 +493,16 @@ def _basetemp_for(file: Path, repo_root: Path) -> Path:
     with _basetemp_lock:
         if _BASETEMP_ROOT is None:
             _BASETEMP_ROOT = Path(tempfile.mkdtemp(prefix="hermes-parallel-"))
+            # The end-of-run call is on the normal path only; nothing runs it
+            # when the process leaves by another door (Ctrl-C, an unhandled
+            # exception, a file-timeout kill, the host-saturation abort). Each
+            # of those stranded the whole tree: 60 roots / 1526.3 MB were
+            # measured in %TEMP% on 2026-08-19, accruing ~26/day. Registering
+            # here rather than at import keeps the "don't dirty the filesystem
+            # for pure-helper imports" property. _cleanup_basetemps() clears
+            # _BASETEMP_ROOT, so the normal path and this handler cannot
+            # double-remove.
+            atexit.register(_cleanup_basetemps)
 
     try:
         relative = file.resolve().relative_to(repo_root.resolve())
@@ -510,8 +521,17 @@ def _cleanup_basetemps() -> None:
     """Remove the invocation's basetemp tree after every worker has exited."""
     global _BASETEMP_ROOT  # noqa: PLW0603 — invocation-scoped lazy state
     if _BASETEMP_ROOT is not None:
-        shutil.rmtree(_BASETEMP_ROOT, ignore_errors=True)
-        _BASETEMP_ROOT = None
+        root, _BASETEMP_ROOT = _BASETEMP_ROOT, None
+        shutil.rmtree(root, ignore_errors=True)
+        # ignore_errors keeps cleanup non-fatal, but on its own it also makes a
+        # locked tree indistinguishable from a clean sweep -- that silence is
+        # why 6 roots holding 76-374 MB each sat unnoticed. Say so instead.
+        if root.exists():
+            print(
+                f"warning: could not fully remove basetemp root {root} "
+                "(locked or in use); it will be left behind",
+                file=sys.stderr,
+            )
 
 
 def _split_file_list(value: str) -> List[str]:

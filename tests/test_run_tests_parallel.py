@@ -913,3 +913,52 @@ def test_run_tests_sh_forwards_the_windows_os_path_vars():
         "it re-arms the %SystemDrive% junk-tree vector wherever run_tests.sh "
         "actually executes (CI)."
     )
+
+
+def test_basetemp_root_is_reclaimed_when_the_runner_dies_without_finishing(
+    tmp_path: Path,
+) -> None:
+    """An interrupted run must not strand its per-invocation basetemp root.
+
+    ``_cleanup_basetemps()`` is called once, on the normal path, after every
+    worker has exited. Nothing runs it when the process leaves by any other
+    door — Ctrl-C, an unhandled exception, a file-timeout kill, or the
+    host-saturation abort this runner has its own guards for. Each of those
+    strands the whole ``hermes-parallel-*`` tree.
+
+    Measured in %TEMP% on 2026-08-19: 60 stranded roots spanning 2.3 days,
+    1526.3 MB, accumulating at roughly 26 per day. The shape matches this
+    exit path exactly — 54 of the 60 were empty (the root is created lazily
+    the moment the first file is scheduled, so a run that dies early leaves
+    nothing but the root) and 6 held 76-374 MB from runs that died mid-flight.
+    """
+
+    script = tmp_path / "die_without_cleanup.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(run_tests_parallel.__file__).parent.parent)!r})\n"
+        "from pathlib import Path\n"
+        "from scripts import run_tests_parallel as r\n"
+        # Create the root exactly the way a real run does, then leave by an
+        # abnormal door without ever reaching _cleanup_basetemps().
+        "bt = r._basetemp_for(Path('tests/x/test_a.py'), Path('.').resolve())\n"
+        "print(r._BASETEMP_ROOT, flush=True)\n"
+        "raise SystemExit(3)\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 3, proc.stderr
+    root = Path(proc.stdout.strip().splitlines()[-1])
+    assert root.name.startswith("hermes-parallel-"), root
+
+    assert not root.exists(), (
+        f"basetemp root {root} survived a run that exited without reaching "
+        "_cleanup_basetemps() -- this is the %TEMP% leak"
+    )
