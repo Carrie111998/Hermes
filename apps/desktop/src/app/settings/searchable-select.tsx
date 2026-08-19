@@ -88,7 +88,7 @@ export function SearchableSelect({
           <Codicon className="shrink-0 opacity-60" name={open ? 'chevron-up' : 'chevron-down'} size="1rem" />
         </button>
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-[var(--radix-popover-trigger-width)] p-0">
+      <PopoverContent align="start" className="w-[var(--radix-popover-trigger-width)] min-w-60 p-0">
         <Command filter={rankSearchOption}>
           <CommandInput autoFocus placeholder={placeholder} />
           <CommandList>
@@ -97,13 +97,13 @@ export function SearchableSelect({
               {clearLabel && (
                 <CommandItem onSelect={() => handleSelect('')} value={clearLabel}>
                   <Codicon className={cn('mr-2 size-4', value === '' ? 'opacity-100' : 'opacity-0')} name="check" />
-                  {clearLabel}
+                  <span className="min-w-0 flex-1 truncate">{clearLabel}</span>
                 </CommandItem>
               )}
               {options.map(option => (
                 <CommandItem key={option} onSelect={() => handleSelect(option)} value={option}>
                   <Codicon className={cn('mr-2 size-4', option === value ? 'opacity-100' : 'opacity-0')} name="check" />
-                  {option}
+                  <span className="min-w-0 flex-1 truncate">{option}</span>
                 </CommandItem>
               ))}
             </CommandGroup>

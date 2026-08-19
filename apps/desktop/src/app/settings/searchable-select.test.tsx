@@ -95,6 +95,24 @@ describe('SearchableSelect', () => {
 
     expect(screen.getByRole('combobox').textContent).toContain('Search…')
   })
+
+  it('wraps option text in a truncating span so narrow popovers stay readable', () => {
+    render(
+      <SearchableSelect
+        clearLabel="System default"
+        onChange={vi.fn()}
+        options={['Africa/Abidjan', 'America/Argentina/Buenos_Aires']}
+        value=""
+      />
+    )
+
+    fireEvent.click(screen.getByRole('combobox'))
+
+    // Long IANA identifiers must ellipsize (truncate) instead of wrapping and
+    // clipping mid-word when the popover is narrower than the option text.
+    expect(screen.getByText('Africa/Abidjan').className).toContain('truncate')
+    expect(screen.getByText('System default').className).toContain('truncate')
+  })
 })
 
 describe('ConfigField searchable routing', () => {
