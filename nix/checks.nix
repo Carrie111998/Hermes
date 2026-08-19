@@ -624,6 +624,23 @@ json.dump(load_config(), sys.stdout, default=str)
             (echo "FAIL: install-stamp.json missing at Contents/Resources"; exit 1)
           echo "PASS: install stamp at Contents/Resources/install-stamp.json"
 
+          # Each helper's own Info.plist must be rebranded too, not just its
+          # file/folder names.
+          helper_plist=$(ls "$APP"/Contents/Frameworks/Hermes\ Helper*.app/Contents/Info.plist | head -1)
+          test -n "$helper_plist" || (echo "FAIL: no helper Info.plist found"; exit 1)
+          if grep -q "Electron" "$helper_plist"; then
+            echo "FAIL: $helper_plist still references Electron: $(grep Electron "$helper_plist")"
+            exit 1
+          fi
+          grep -q "com.nousresearch.hermes.helper" "$helper_plist" || \
+            (echo "FAIL: helper Info.plist missing rebranded CFBundleIdentifier"; exit 1)
+          echo "PASS: helper Info.plist rebranded"
+
+          # Bundle must carry a coherent signature end to end (ad-hoc is fine).
+          codesign --verify --deep --strict "$APP" || \
+            (echo "FAIL: codesign --verify --deep --strict failed on $APP"; exit 1)
+          echo "PASS: bundle signature is internally consistent"
+
           echo "=== All desktop layout checks passed ==="
           mkdir -p $out
           echo "ok" > $out/result

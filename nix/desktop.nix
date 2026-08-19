@@ -248,6 +248,17 @@ stdenv.mkDerivation {
       fi
     done
 
+    # Each helper's own Info.plist still says "Electron Helper (...)" /
+    # com.github.Electron.helper internally — rebrand that too, not just the
+    # path. (Temp file instead of `sed -i`: BSD vs GNU sed disagree on it.)
+    for plist in "$out/Applications/Hermes.app/Contents/Frameworks/"Hermes\ Helper*.app/Contents/Info.plist; do
+      sed \
+        -e 's/Electron Helper/Hermes Helper/g' \
+        -e 's/com\.github\.Electron\.helper/com.nousresearch.hermes.helper/g' \
+        "$plist" > "$plist.new"
+      mv "$plist.new" "$plist"
+    done
+
     # Update Info.plist with our custom values
     cp ${infoPlist} $out/Applications/Hermes.app/Contents/Info.plist
 
@@ -277,6 +288,22 @@ stdenv.mkDerivation {
       --add-flags "$out/Applications/Hermes.app/Contents/Resources/app" \
       --set HERMES_DESKTOP_HERMES "${lib.getExe hermesAgent}" \
       --set ELECTRON_IS_DEV 0
+
+    # Renaming/editing the bundle above leaves every Mach-O in it unsigned
+    # (nixpkgs' electron binaries only carry a lightweight adhoc,
+    # linker-signed signature that never covered Info.plist/Resources
+    # anyway). Ad-hoc (`-s -`, no cert/Apple account needed) matches
+    # nixpkgs' own convention for this exact situation (see e.g. the
+    # `opencode` and `lmstudio` derivations, and stdenv's own fixup-phase
+    # sign() in pkgs/os-specific/darwin/by-name/si/signingUtils). Sign
+    # leaf-first — each helper, then the main binary, then the bundle
+    # itself — rather than `--deep`, which nixpkgs avoids for the same
+    # reason Apple's docs discourage it.
+    for helper in "$out/Applications/Hermes.app/Contents/Frameworks/"Hermes\ Helper*.app; do
+      codesign --force --sign - "$helper"
+    done
+    codesign --force --sign - "$out/Applications/Hermes.app/Contents/MacOS/Hermes"
+    codesign --force --sign - "$out/Applications/Hermes.app"
 
     runHook postInstall
   '' else ''
