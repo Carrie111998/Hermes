@@ -286,11 +286,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         modality = "image" if is_edit else "text"
 
         base_url = _resolve_base_url()
-        client = (
-            openai.OpenAI(api_key=api_key, base_url=base_url)
-            if base_url
-            else openai.OpenAI(api_key=api_key)
-        )
+        client = openai.OpenAI(base_url=base_url) if base_url else openai.OpenAI()
 
         if is_edit:
             # images.edit() expects file-like objects. Download/read each
