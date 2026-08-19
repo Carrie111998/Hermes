@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -951,8 +952,9 @@ def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, capl
 
     monkeypatch.setattr(relay_runtime.importlib, "import_module", missing_relay)
 
-    assert relay_runtime.get_runtime() is None
-    host = relay_runtime.get_host()
+    with caplog.at_level(logging.INFO, logger="agent.relay_runtime"):
+        assert relay_runtime.get_runtime() is None
+        host = relay_runtime.get_host()
     assert isinstance(host, relay_runtime.NoopRelayRuntime)
     assert host.profile_key == relay_runtime.current_profile_key()
     assert "nemo_relay" in host.reason
@@ -962,7 +964,85 @@ def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, capl
         args={"command": "true"},
     ) == {"command": "true"}
     assert not relay_runtime.emit_mark("hermes.probe", session_id="s1")
+    # The missing-binding case is a supported fail-open path, not a failure:
+    # log a single INFO line (no traceback) explaining the degrade so an
+    # admin can still see it in the gateway log. The old WARNING+traceback
+    # string is no longer the expected signal here.
+    assert "Hermes Relay runtime unavailable" in caplog.text
+    assert "nemo_relay" in caplog.text
+    # And critically: no multi-line traceback. We assert this both by
+    # checking no WARNING/ERROR records were emitted on this logger and
+    # by confirming caplog.text contains no Traceback frame headers.
+    relay_records = [
+        r for r in caplog.records if r.name == "agent.relay_runtime"
+    ]
+    assert all(r.levelno < logging.WARNING for r in relay_records), (
+        f"expected only INFO-or-below for the fail-open case, got: "
+        f"{[(r.levelname, r.getMessage()) for r in relay_records]}"
+    )
+    assert "Traceback (most recent call last):" not in caplog.text
+    relay_runtime._reset_for_tests()
+
+
+def test_core_runtime_fail_open_does_not_repeat_per_profile(monkeypatch, caplog):
+    """The missing-binding notice must be announced once per process, not
+    once per profile. Otherwise a multi-profile gateway floods the log
+    with the same line on every conversation turn that triggers host
+    initialisation."""
+    relay_shared_metrics._reset_for_tests()
+    relay_runtime._reset_for_tests()
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def missing_relay(name, *args, **kwargs):
+        if name == "nemo_relay":
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(relay_runtime.importlib, "import_module", missing_relay)
+
+    with caplog.at_level(logging.INFO, logger="agent.relay_runtime"):
+        # Pretend three profiles initialise — each one resolves to a
+        # different profile_key so the registry actually builds a fresh
+        # host for each. Only one log line should be emitted.
+        profile_a = relay_runtime.current_profile_key()
+        profile_b = profile_a + "::b"
+        profile_c = profile_a + "::c"
+        for pk in (profile_a, profile_b, profile_c):
+            relay_runtime.HOST_REGISTRY.for_profile(pk)
+    relay_runtime._reset_for_tests()
+
+    info_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "agent.relay_runtime" and r.levelno == logging.INFO
+    ]
+    assert len(info_lines) == 1, (
+        f"expected exactly one degrade notice across N profiles, got "
+        f"{len(info_lines)}: {info_lines}"
+    )
+
+
+def test_core_runtime_unknown_failure_still_logs_traceback(monkeypatch, caplog):
+    """Genuinely unexpected failures during RelayRuntime init must keep
+    the WARNING+traceback so they aren't silently swallowed — only the
+    documented 'binding not provisioned' path is downgraded."""
+    relay_shared_metrics._reset_for_tests()
+    relay_runtime._reset_for_tests()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("synthetic relay init failure")
+
+    monkeypatch.setattr(relay_runtime.RelayRuntime, "__init__", boom)
+
+    with caplog.at_level(logging.WARNING, logger="agent.relay_runtime"):
+        host = relay_runtime.get_host()
+    assert isinstance(host, relay_runtime.NoopRelayRuntime)
+    assert "synthetic relay init failure" in host.reason
     assert "Hermes Relay runtime initialization failed" in caplog.text
+    assert "Traceback (most recent call last):" in caplog.text
     relay_runtime._reset_for_tests()
 
 

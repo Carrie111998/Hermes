@@ -25,6 +25,20 @@ RUNTIME_SCHEMA_VERSION = "hermes.relay.runtime.v1"
 RUNTIME_INSTANCE_KEY = "hermes.relay.runtime_instance"
 _PROFILE_KEY_CACHE: dict[str, str] = {}
 
+# Track reasons we've already announced so we don't repeat the same
+# degraded-binding notice on every profile init in a long-running gateway.
+_ANNOUNCED_REASONS: set[str] = set()
+
+# Exception types that mean "the Relay binding isn't provisioned on this
+# deployment" (the platform has no wheel, or it was deliberately excluded
+# from the installed extra set) rather than "something went wrong". These
+# are the supported fail-open path: ``RelayHostRegistry.for_profile`` still
+# falls back to ``NoopRelayRuntime`` exactly as it did before, but the log
+# line is a single INFO entry with no traceback instead of a multi-line
+# WARNING stack frame that shows up once per profile and drowns the real
+# signals in the gateway log.
+_RELAY_PROVISIONING_ERRORS: tuple[type[BaseException], ...] = (ModuleNotFoundError, ImportError)
+
 
 @dataclass
 class RelaySession:
@@ -428,9 +442,34 @@ class RelayHostRegistry:
             try:
                 host = RelayRuntime(profile_key=key)
             except Exception as exc:
-                logger.warning(
-                    "Hermes Relay runtime initialization failed", exc_info=True
-                )
+                # The two documented "Relay binding isn't provisioned on
+                # this deployment" failures (``ModuleNotFoundError`` when
+                # the platform has no wheel, ``ImportError`` when an
+                # optional transitive in the binding itself is missing)
+                # are the supported fail-open path. ``NoopRelayRuntime``
+                # takes over and the rest of the runtime is unchanged —
+                # tool intercepts become pass-through, managed execution
+                # reports disabled, and emit_mark becomes a silent no-op.
+                # Announce the degrade once per process (not once per
+                # profile, not once per request) and skip the traceback
+                # so this doesn't drown the real signals in the gateway
+                # log every time a new profile is initialised.
+                if isinstance(exc, _RELAY_PROVISIONING_ERRORS):
+                    reason = f"{type(exc).__name__}: {exc}"
+                    if reason not in _ANNOUNCED_REASONS:
+                        _ANNOUNCED_REASONS.add(reason)
+                        logger.info(
+                            "Hermes Relay runtime unavailable; falling back "
+                            "to no-op host (%s). Tool intercepts and "
+                            "managed execution will be disabled for this "
+                            "deployment.",
+                            reason,
+                        )
+                else:
+                    logger.warning(
+                        "Hermes Relay runtime initialization failed",
+                        exc_info=True,
+                    )
                 host = NoopRelayRuntime(profile_key=key, reason=str(exc))
             self._hosts[key] = host
             return host
@@ -1076,3 +1115,4 @@ def _reset_for_tests() -> None:
     SESSION_COORDINATOR._reset_active_turns_for_tests()
     HOST_REGISTRY.shutdown_all()
     _PROFILE_KEY_CACHE.clear()
+    _ANNOUNCED_REASONS.clear()
