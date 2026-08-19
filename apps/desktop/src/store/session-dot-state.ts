@@ -97,6 +97,32 @@ const STATUS_RANK: Record<SessionStatusBucket, number> = {
 /** Loudest first — what ordering by status sorts on. */
 export const sessionStatusRank = (state?: SessionDotState): number => STATUS_RANK[sessionStatusBucket(state)]
 
+/**
+ * The loudest status bucket across a group of sessions. This is what a
+ * collapsed branch, repo, or project row paints for the work under it. Each
+ * state folds into its filter bucket first, so `stalled` and `background`
+ * read as working, the same fold the sidebar filter uses. A session that is
+ * absent from the map is idle. An empty group is idle. The function is pure,
+ * so a caller can feed it through a scalar selector and repaint only on a
+ * real change.
+ */
+export function maxSessionDotState(
+  sessionIds: readonly string[],
+  states: Readonly<Record<string, SessionDotState>>
+): SessionStatusBucket {
+  let max: SessionStatusBucket = 'idle'
+
+  for (const id of sessionIds) {
+    const bucket = sessionStatusBucket(states[id])
+
+    if (STATUS_RANK[bucket] < STATUS_RANK[max]) {
+      max = bucket
+    }
+  }
+
+  return max
+}
+
 let dotStates: Readonly<Record<string, SessionDotState>> = {}
 
 export const $sessionDotStateById = computed(

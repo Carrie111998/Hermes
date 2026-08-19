@@ -122,6 +122,9 @@ interface SidebarSessionsSectionProps {
   projectOverview?: SidebarProjectTree[]
   // Per-project preview rows (from the backend tree), keyed by project id.
   projectOverviewPreviews?: Record<string, SessionInfo[]>
+  // Per-project unfiltered session-id sets (tree and live cache), keyed by
+  // project id. This feeds each overview row's aggregate status dot.
+  projectStatusSessionIds?: Record<string, string[]>
   // True while the backend project tree is loading (overview skeleton).
   projectsLoading?: boolean
   onEnterProject?: (id: string) => void
@@ -194,6 +197,7 @@ export function SidebarSessionsSection({
   groups,
   projectOverview,
   projectOverviewPreviews,
+  projectStatusSessionIds,
   projectsLoading = false,
   onEnterProject,
   projectContent,
@@ -422,6 +426,7 @@ export function SidebarSessionsSection({
         previewSessions={projectOverviewPreviews?.[project.id]}
         project={project}
         renderRows={renderRows}
+        statusSessionIds={projectStatusSessionIds?.[project.id] ?? []}
       />
     )
 

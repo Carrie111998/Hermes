@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useState } from 'react'
 
+import { GroupStatusDot } from '@/app/chat/session-status-dot'
 import { Codicon } from '@/components/ui/codicon'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
 import type { SessionInfo } from '@/hermes'
@@ -19,7 +20,7 @@ import { SidebarGroupRow, SidebarRowLead, SidebarRowLink, SidebarRowStack } from
 import { rankSessions } from '../order'
 
 import { PROJECT_PREVIEW_COUNT, SIDEBAR_GROUP_PAGE, useWorkspaceNodeOpen } from './model'
-import type { SidebarSessionGroup } from './workspace-groups'
+import { laneStatusSessionIds, type SidebarSessionGroup } from './workspace-groups'
 import {
   WorkspaceAddButton,
   WorkspaceContextMenu,
@@ -61,13 +62,25 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   const hiddenCount = isProfileGroup ? 0 : sessions.length - visibleSessions.length
   const nextCount = Math.min(SIDEBAR_GROUP_PAGE, hiddenCount)
 
-  // Leading glyph: a home mark for the repo's primary checkout (labeled by its
-  // live branch), a branch/kanban mark otherwise.
+  // Leading glyph: a home mark for the repo's primary checkout (labeled by
+  // its live branch), a branch/kanban mark otherwise. When a session under
+  // the lane is not idle, the lane's aggregate status dot takes the glyph's
+  // slot. The slot is the same fixed lead cell, so nothing shifts. At idle
+  // the glyph returns. The aggregate reads the unfiltered membership
+  // (`laneStatusSessionIds`) and all rows, not the visible page. Collapsed
+  // or truncated work must still show.
+  const statusSessionIds = laneStatusSessionIds(group)
+
   const leadingIcon = (
-    <Codicon
-      className="shrink-0 text-(--ui-text-tertiary)"
-      name={group.isKanban ? 'checklist' : group.isHome ? 'home' : 'git-branch'}
-      size="0.75rem"
+    <GroupStatusDot
+      idle={
+        <Codicon
+          className="shrink-0 text-(--ui-text-tertiary)"
+          name={group.isKanban ? 'checklist' : group.isHome ? 'home' : 'git-branch'}
+          size="0.75rem"
+        />
+      }
+      sessionIds={statusSessionIds}
     />
   )
 

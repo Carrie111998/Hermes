@@ -4,7 +4,15 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import type { SessionInfo } from '@/types/hermes'
 
 import { $sessions, $unreadFinishedSessionIds, setSessions } from './session'
-import { $delegatingSessionIds, $sessionDotStateById, hasLiveTurn, showsRunningArc } from './session-dot-state'
+import {
+  $delegatingSessionIds,
+  $sessionDotStateById,
+  hasLiveTurn,
+  maxSessionDotState,
+  type SessionDotState,
+  sessionStatusBucket,
+  showsRunningArc
+} from './session-dot-state'
 import { clearAllSessionStates, publishSessionState } from './session-states'
 import { $unreadWriteGuard } from './session-unread-remote'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
@@ -146,5 +154,37 @@ describe('persisted unread (backend watermark)', () => {
     setSessions([storedRow('s1')])
 
     expect($sessionDotStateById.get()['s1'] ?? 'idle').not.toBe('unread')
+  })
+})
+
+describe('maxSessionDotState', () => {
+  const ALL_STATES: SessionDotState[] = ['background', 'draft', 'idle', 'needs-input', 'stalled', 'unread', 'working']
+
+  const states = (entries: Record<string, SessionDotState>): Record<string, SessionDotState> => entries
+
+  it('is idle for an empty group and for ids with no recorded state', () => {
+    expect(maxSessionDotState([], {})).toBe('idle')
+    expect(maxSessionDotState(['a', 'b'], {})).toBe('idle')
+  })
+
+  it('folds a single member into its bucket, the same fold the sidebar filter uses', () => {
+    for (const state of ALL_STATES) {
+      expect(maxSessionDotState(['a', 'b'], states({ a: state }))).toBe(sessionStatusBucket(state))
+    }
+  })
+
+  it('ranks the buckets: needs-input > working > unread > draft > idle', () => {
+    expect(maxSessionDotState(['a', 'b'], states({ a: 'working', b: 'needs-input' }))).toBe('needs-input')
+    expect(maxSessionDotState(['a', 'b'], states({ a: 'unread', b: 'background' }))).toBe('working')
+    expect(maxSessionDotState(['a', 'b'], states({ a: 'draft', b: 'unread' }))).toBe('unread')
+    expect(maxSessionDotState(['a', 'b'], states({ a: 'draft', b: 'idle' }))).toBe('draft')
+  })
+
+  it('is order-independent', () => {
+    for (const a of ALL_STATES) {
+      for (const b of ALL_STATES) {
+        expect(maxSessionDotState(['a', 'b'], states({ a, b }))).toBe(maxSessionDotState(['b', 'a'], states({ a, b })))
+      }
+    }
   })
 })

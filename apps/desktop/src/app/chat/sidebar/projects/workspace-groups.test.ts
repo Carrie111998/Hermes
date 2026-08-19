@@ -13,6 +13,7 @@ import {
   NO_PROJECT_ID,
   overlayLiveLanes,
   overlayLivePreviews,
+  projectStatusSessionIds,
   sessionProjectColor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
@@ -927,6 +928,18 @@ describe('overlayLiveLanes', () => {
     expect(overlaid.sessionCount).toBe(2)
   })
 
+  it('keeps the Home lane statusSessionIds marker through the overlay rebuild', () => {
+    // The exclusion recorded a pinned working session on the Home lane. A
+    // detached live session then triggers the lane rebuild. The marker must
+    // survive, or the pinned work goes dark on the Home row.
+    const home = homeNode([makeSession(null, { id: 'kept' })])
+    home.repos[0].groups[0].statusSessionIds = ['pinned-worker', 'kept']
+
+    const overlaid = overlayLiveLanes(home, [makeSession(null, { id: 'fresh' })], new Set())
+
+    expect(overlaid.repos[0].groups[0].statusSessionIds).toEqual(['pinned-worker', 'kept'])
+  })
+
   it('leaves Home alone for a session that has a cwd', () => {
     // A cwd-carrying row the backend hasn't placed yet (junk root, deleted
     // workspace) needs its probes — guessing here would flicker it into Home
@@ -1121,5 +1134,121 @@ describe('excludeProjectSessions', () => {
     const overlaid = overlayLiveLanes(filtered, [], new Set(['someone-else']))
 
     expect(overlaid.repos[0].groups.map(g => g.id)).toEqual(['wt'])
+  })
+})
+
+describe('status membership (statusSessionIds)', () => {
+  const repoWithLane = (sessions: SessionInfo[]): SidebarProjectTree =>
+    projectNode({
+      id: '/www/app',
+      repos: [
+        {
+          id: '/www/app',
+          label: 'app',
+          path: '/www/app',
+          groups: [{ id: '/www/app::branch::main', isMain: true, label: 'main', path: '/www/app', sessions }],
+          sessionCount: sessions.length
+        }
+      ],
+      sessionCount: sessions.length
+    })
+
+  it('excludeProjectSessions records what it hid so aggregates keep seeing it', () => {
+    const pinned = makeSession('/www/app', { id: 'pinned' })
+    const kept = makeSession('/www/app', { id: 'kept' })
+
+    const filtered = excludeProjectSessions(repoWithLane([pinned, kept]), s => s.id === 'pinned')
+    const lane = filtered.repos[0].groups[0]
+
+    expect(lane.sessions.map(s => s.id)).toEqual(['kept'])
+    // Both ids stay visible to the status aggregate. The exclusion only
+    // moved the row. The work under the branch is unchanged.
+    expect(lane.statusSessionIds).toContain('pinned')
+    expect(lane.statusSessionIds).toContain('kept')
+  })
+
+  it('leaves untouched lanes without the marker (sessions already carry the set)', () => {
+    const kept = makeSession('/www/app', { id: 'kept' })
+
+    const filtered = excludeProjectSessions(repoWithLane([kept]), () => false)
+
+    expect(filtered.repos[0].groups[0].statusSessionIds).toBeUndefined()
+  })
+
+  it('mergeRepoWorktreeGroups carries the marker through the home-lane fold', () => {
+    const repo = {
+      id: '/www/app',
+      path: '/www/app',
+      groups: [
+        {
+          id: '/www/app::branch::main',
+          isMain: true,
+          label: 'main',
+          path: '/www/app',
+          sessions: [makeSession('/www/app', { id: 'kept' })],
+          statusSessionIds: ['pinned', 'kept']
+        }
+      ]
+    }
+
+    const worktrees: HermesGitWorktree[] = [
+      { branch: 'main', detached: false, isMain: true, locked: false, path: '/www/app' }
+    ]
+
+    const merged = mergeRepoWorktreeGroups(repo, worktrees)
+    const home = merged.find(g => g.isHome)
+
+    expect(home?.statusSessionIds).toEqual(expect.arrayContaining(['pinned', 'kept']))
+  })
+})
+
+describe('projectStatusSessionIds', () => {
+  it('unions lane rows, exclusion-hidden ids, previews, and live rows per project', () => {
+    const laneRow = makeSession('/www/app', { id: 'lane-row' })
+    const preview = makeSession('/www/app', { id: 'preview-row' })
+
+    const node = projectNode({
+      id: '/www/app',
+      previewSessions: [preview],
+      repos: [
+        {
+          id: '/www/app',
+          label: 'app',
+          path: '/www/app',
+          groups: [
+            {
+              id: '/www/app::branch::main',
+              isMain: true,
+              label: 'main',
+              path: '/www/app',
+              sessions: [laneRow],
+              statusSessionIds: ['hidden-pin']
+            }
+          ],
+          sessionCount: 1
+        }
+      ],
+      sessionCount: 1
+    })
+
+    const live = makeSession('/www/app/src', { id: 'live-row', git_repo_root: '/www/app' })
+    const ids = projectStatusSessionIds([node], [live], [])
+
+    expect(ids['/www/app']).toEqual(expect.arrayContaining(['lane-row', 'hidden-pin', 'preview-row', 'live-row']))
+  })
+
+  it('files detached live rows under the Home bucket', () => {
+    const ids = projectStatusSessionIds([homeNode([])], [makeSession(null, { id: 'detached' })], [])
+
+    expect(ids[NO_PROJECT_ID]).toEqual(['detached'])
+  })
+
+  it('maps a live row to its explicit project by folder, like the lanes do', () => {
+    const node = projectNode({ id: 'p_app', path: '/www/app' })
+    const live = makeSession('/www/app/src', { id: 'live-row', git_repo_root: '/www/app' })
+
+    const ids = projectStatusSessionIds([node], [live], [makeProject('p_app', ['/www/app'])])
+
+    expect(ids['p_app']).toEqual(['live-row'])
   })
 })

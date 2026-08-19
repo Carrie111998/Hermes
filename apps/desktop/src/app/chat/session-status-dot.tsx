@@ -1,10 +1,11 @@
 import { useStore } from '@nanostores/react'
+import type * as React from 'react'
 
 import { type Translations, useI18n } from '@/i18n'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $sessionColorById, sessionColorFor } from '@/store/session-color'
-import { $sessionDotStateById, type SessionDotState } from '@/store/session-dot-state'
+import { $sessionDotStateById, maxSessionDotState, type SessionDotState } from '@/store/session-dot-state'
 import type { SessionInfo } from '@/types/hermes'
 
 // A pure lookup table: each state maps to its className, aria-label, and title.
@@ -157,5 +158,46 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
         />
       )}
     </span>
+  )
+}
+
+export interface GroupStatusDotProps {
+  /** Stored session ids of every session under the group, unfiltered. The
+   *  aggregate must see work that the status filter or a pin hid. */
+  sessionIds: readonly string[]
+  /** What the slot shows when the aggregate is idle or the group is empty.
+   *  A lane passes its glyph. A project row passes nothing, so the slot
+   *  stays reserved but empty. */
+  idle?: React.ReactNode
+}
+
+/**
+ * GROUP STATUS DOT — the aggregate that a collapsible row (branch lane, repo
+ * header, project row) paints for the work under it: the loudest status
+ * bucket across its sessions, in the same visual language as the session
+ * dot. It renders through the same variant table, so a branch can never
+ * disagree with the rows inside it. It resolves through a scalar selector,
+ * so the row repaints only when its own aggregate flips, never on each
+ * member edge.
+ */
+export function GroupStatusDot({ sessionIds, idle }: GroupStatusDotProps): React.ReactNode {
+  const { t } = useI18n()
+  const r = t.sidebar.row
+
+  const state = useStoreSelector($sessionDotStateById, states => maxSessionDotState(sessionIds, states))
+
+  if (state === 'idle') {
+    return <>{idle ?? null}</>
+  }
+
+  const variant = DOT_VARIANTS[state]
+
+  return (
+    <span
+      aria-label={variant.ariaLabel?.(r)}
+      className={variant.className}
+      role={variant.role}
+      title={variant.title?.(r)}
+    />
   )
 }

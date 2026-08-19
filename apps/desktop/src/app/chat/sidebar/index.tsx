@@ -159,6 +159,7 @@ import {
   PROJECT_PREVIEW_COUNT,
   ProjectBackRow,
   ProjectMenu,
+  projectStatusSessionIds,
   projectTreeCwd,
   sessionRecency as sessionTime,
   type SidebarProjectTree,
@@ -983,7 +984,9 @@ export function ChatSidebar({
     // RepoFlatSection, AFTER the visual git-worktree lanes are merged in (so
     // out-of-tree worktrees can be placed). Here we just order the snapshot and
     // drop pinned rows — the hydrated lanes come straight from the backend, so
-    // they haven't been through projectModel's filter.
+    // they have not been through projectModel's filter. The exclusion records
+    // the hidden ids on each lane's `statusSessionIds`. As a result, the lane
+    // and repo status aggregates continue to see that work.
     // The label comes from the overview node either way — that's the model's
     // presentation copy (Home is translated there), not the raw payload's.
     return excludeProjectSessions(
@@ -1109,6 +1112,15 @@ export function ChatSidebar({
         rankIds: sortOrderIds
       }),
     [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds]
+  )
+
+  // Per-project unfiltered status membership for the overview rows' aggregate
+  // dots. This reads `scopedSessions`, which only the profile scope narrows,
+  // not the narrowed `agentSessions`. A pinned or filtered-out session that
+  // works must still light its project row.
+  const overviewStatusSessionIds = useMemo<Record<string, string[]>>(
+    () => projectStatusSessionIds(projectOverview ?? [], scopedSessions, projects),
+    [projectOverview, scopedSessions, projects]
   )
 
   const onEnterProject = useCallback(
@@ -1800,6 +1812,7 @@ export function ChatSidebar({
                 projectOverviewPreviews={overviewPreviews}
                 projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
+                projectStatusSessionIds={overviewStatusSessionIds}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
                 rootClassName={cn(
                   'min-h-32 flex-1 overflow-hidden p-0',

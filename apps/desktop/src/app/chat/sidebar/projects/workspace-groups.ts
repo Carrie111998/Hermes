@@ -30,6 +30,11 @@ export interface SidebarSessionGroup {
   isKanban?: boolean
   mode?: 'profile' | 'source' | 'workspace'
   sourceId?: string
+  // Every session under this lane before display exclusions (pins, the status
+  // filter). `excludeProjectSessions` sets this when it drops rows, so the
+  // lane's status aggregate continues to see work whose row is hidden. Absent
+  // when the lane was never filtered. Then `sessions` is the full set.
+  statusSessionIds?: string[]
 }
 
 /** A repo node: holds its branch/worktree lanes (`repo -> lane -> sessions`). */
@@ -114,6 +119,16 @@ export function kanbanWorktreeDir(path: string): null | string {
 
 /** Label for a main-checkout lane whose session recorded no branch. */
 export const DEFAULT_BRANCH_LABEL = 'main'
+
+/**
+ * The ids a lane's status aggregate covers: the lane's rows unioned with the
+ * ids that display exclusions (pins, the status filter) recorded on
+ * `statusSessionIds`. One helper, so the lane row and the repo header can
+ * never drift apart on what counts.
+ */
+export const laneStatusSessionIds = (group: SidebarSessionGroup): string[] => [
+  ...new Set([...group.sessions.map(session => session.id), ...(group.statusSessionIds ?? [])])
+]
 
 /** Id of the Home bucket (must match the backend tree's `NO_PROJECT_ID`). */
 export const NO_PROJECT_ID = '__no_project__'
@@ -257,13 +272,19 @@ export function mergeRepoWorktreeGroups(
   const reconciled = repo.groups.filter(group => !group.isMain).map(reconcile)
 
   if (homeBranch) {
+    // The fold rebuilds the lane. The pre-exclusion status membership of each
+    // folded main lane must ride along. If it does not, the home lane's
+    // aggregate goes blind to hidden (pinned or filtered) work.
+    const statusIds = new Set(mainGroups.flatMap(group => group.statusSessionIds ?? []))
+
     reconciled.push({
       id: branchLaneId(repo.id, homeBranch),
       label: homeBranch,
       path: repo.path,
       isMain: true,
       isHome: true,
-      sessions: dedupeById(mainGroups.flatMap(group => group.sessions))
+      sessions: dedupeById(mainGroups.flatMap(group => group.sessions)),
+      ...(statusIds.size ? { statusSessionIds: [...statusIds] } : {})
     })
   } else {
     reconciled.push(...mainGroups)
@@ -633,7 +654,17 @@ function overlayHomeLane(
   }
 
   const sessions = detached.reduce(upsertSession, kept)
-  const nextLane = { id: NO_PROJECT_ID, label: project.label, path: null, sessions }
+
+  // The rebuild replaces the lane object. The recorded pre-exclusion status
+  // membership must ride along, or pinned work under Home goes dark the
+  // moment a detached live session triggers this overlay.
+  const nextLane: SidebarSessionGroup = {
+    id: NO_PROJECT_ID,
+    label: project.label,
+    path: null,
+    sessions,
+    ...(lane?.statusSessionIds?.length ? { statusSessionIds: lane.statusSessionIds } : {})
+  }
 
   return {
     ...project,
@@ -673,7 +704,16 @@ export function excludeProjectSessions(
 
       repoChanged = true
 
-      return { ...group, sessions }
+      // Record the pre-exclusion membership. The rows leave the lane, but
+      // the lane's status aggregate must continue to count them. A pinned
+      // session still runs its turn under this branch.
+      const statusIds = new Set(group.statusSessionIds ?? [])
+
+      for (const session of group.sessions) {
+        statusIds.add(session.id)
+      }
+
+      return { ...group, sessions, statusSessionIds: [...statusIds] }
     })
 
     if (!repoChanged) {
@@ -732,6 +772,59 @@ interface PreviewOverlayOptions {
   removed?: ReadonlySet<string>
   /** The active sort key as an id order; recency when empty. */
   rankIds?: string[]
+}
+
+/**
+ * Per-project status membership for the overview rows: every session id known
+ * to belong to each project. The tree node's lanes and previews (which reach
+ * past the loaded page) are unioned with the live cache. The live cache maps
+ * by the same membership rule the lanes group by. The set is unfiltered on
+ * purpose: the overview aggregate must also see pinned and filtered-out work.
+ * Keyed by project id. Detached live rows land under the Home bucket.
+ */
+export function projectStatusSessionIds(
+  projects: SidebarProjectTree[],
+  live: SessionInfo[],
+  explicitProjects: ProjectInfo[]
+): Record<string, string[]> {
+  const byProject = new Map<string, Set<string>>()
+
+  const claim = (projectId: string, sessionId: string): void => {
+    const ids = byProject.get(projectId) ?? new Set<string>()
+    ids.add(sessionId)
+    byProject.set(projectId, ids)
+  }
+
+  for (const node of projects) {
+    for (const repo of node.repos) {
+      for (const group of repo.groups) {
+        for (const id of laneStatusSessionIds(group)) {
+          claim(node.id, id)
+        }
+      }
+    }
+
+    for (const session of node.previewSessions ?? []) {
+      claim(node.id, session.id)
+    }
+  }
+
+  for (const session of live) {
+    const projectId =
+      liveSessionProjectId(session, explicitProjects) ?? (isDetachedSession(session) ? NO_PROJECT_ID : null)
+
+    if (projectId) {
+      claim(projectId, session.id)
+    }
+  }
+
+  const out: Record<string, string[]> = {}
+
+  for (const [projectId, ids] of byProject) {
+    out[projectId] = [...ids]
+  }
+
+  return out
 }
 
 /** Merge live sessions into per-project overview previews, keyed by project id. */

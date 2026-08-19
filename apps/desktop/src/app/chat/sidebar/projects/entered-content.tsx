@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useMemo, useState } from 'react'
 
+import { GroupStatusDot } from '@/app/chat/session-status-dot'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import {
@@ -25,6 +26,7 @@ import { SidebarRowStack } from '../chrome'
 import { useWorkspaceNodeOpen } from './model'
 import { SidebarWorkspaceGroup } from './workspace-group'
 import {
+  laneStatusSessionIds,
   mergeRepoWorktreeGroups,
   overlayRepoLanes,
   type SidebarProjectTree,
@@ -257,6 +259,10 @@ function RepoFlatSection({
     )
   }
 
+  // The repo header's aggregate covers every lane under it, the visible rows
+  // and the exclusion-hidden rows. A collapsed repo still reports its work.
+  const repoStatusSessionIds = [...new Set(ordered.flatMap(laneStatusSessionIds))]
+
   return (
     <SidebarRowStack>
       <WorkspaceHeader
@@ -274,7 +280,12 @@ function RepoFlatSection({
           )
         }
         emphasis
-        icon={<Codicon className="shrink-0 text-(--ui-text-tertiary)" name="repo" size="0.75rem" />}
+        icon={
+          <GroupStatusDot
+            idle={<Codicon className="shrink-0 text-(--ui-text-tertiary)" name="repo" size="0.75rem" />}
+            sessionIds={repoStatusSessionIds}
+          />
+        }
         label={repo.label}
         onToggle={toggleOpen}
         open={open}

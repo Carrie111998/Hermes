@@ -1,6 +1,7 @@
 import type * as React from 'react'
 import { useRef } from 'react'
 
+import { GroupStatusDot } from '@/app/chat/session-status-dot'
 import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -67,6 +68,11 @@ interface ProjectOverviewRowProps {
   renderRows?: (sessions: SessionInfo[]) => React.ReactNode
   activeProjectId?: null | string
   previewSessions?: SessionInfo[]
+  // Every session id under this project, unfiltered. Pins and status filters
+  // are included, for the row's aggregate status dot. The overview node's own
+  // lanes arrive empty, so the sidebar computes this from the tree and the
+  // live cache (`projectStatusSessionIds`).
+  statusSessionIds?: readonly string[]
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
@@ -81,6 +87,7 @@ export function ProjectOverviewRow({
   renderRows,
   activeProjectId,
   previewSessions,
+  statusSessionIds,
   reorderable = false,
   dragging = false,
   dragHandleProps,
@@ -127,13 +134,24 @@ export function ProjectOverviewRow({
       className={cn(dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)')}
       data-glass-opaque={dragging ? '' : undefined}
       label={
-        <SidebarRowLink
-          aria-label={s.projects.enter(project.label)}
-          labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
-          onClick={() => onEnter?.(project.id)}
-        >
-          {project.label}
-        </SidebarRowLink>
+        <>
+          <SidebarRowLink
+            aria-label={s.projects.enter(project.label)}
+            labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
+            onClick={() => onEnter?.(project.id)}
+          >
+            {project.label}
+          </SidebarRowLink>
+          {/* The aggregate status slot. The identity icon stays in the lead.
+              The dot sits beside the label in a fixed-size cell. The cell is
+              reserved at idle, so a project that starts work does not shift
+              the row. */}
+          {statusSessionIds ? (
+            <span className="grid size-3.5 shrink-0 place-items-center">
+              <GroupStatusDot sessionIds={statusSessionIds} />
+            </span>
+          ) : null}
+        </>
       }
       lead={lead}
       // The label is grab surface too, not just the lead's grabber — same
