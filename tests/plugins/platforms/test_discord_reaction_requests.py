@@ -16,6 +16,8 @@ from plugins.platforms.discord.reaction_requests import (
 def test_unicode_and_keycap_emoji_paths_are_encoded():
     assert encode_emoji_path("👍") == "%F0%9F%91%8D"
     assert encode_emoji_path("1️⃣") == "1%EF%B8%8F%E2%83%A3"
+    assert encode_emoji_path("#️⃣") == "%23%EF%B8%8F%E2%83%A3"
+    assert encode_emoji_path("*️⃣") == "%2A%EF%B8%8F%E2%83%A3"
 
 
 def test_custom_emoji_path_is_encoded():

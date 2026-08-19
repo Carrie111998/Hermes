@@ -24,10 +24,10 @@ def validate_emoji(emoji: str) -> str:
         raise ReactionError("emoji must be a non-empty string")
     if emoji.strip() != emoji:
         raise ReactionError("emoji must not have surrounding whitespace")
-    if _FORBIDDEN.search(emoji):
-        raise ReactionError(f"emoji {emoji!r} contains forbidden characters")
     if _CUSTOM_EMOJI_RE.fullmatch(emoji) or _KEYCAP_EMOJI_RE.fullmatch(emoji):
         return emoji
+    if _FORBIDDEN.search(emoji):
+        raise ReactionError(f"emoji {emoji!r} contains forbidden characters")
 
     codepoints = list(emoji)
     if any(char.isascii() and char.isalnum() for char in codepoints):

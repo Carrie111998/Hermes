@@ -222,7 +222,7 @@ SEND_MESSAGE_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["send", "list", "react", "unreact"],
-                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks; Discord reactions are plugin-owned through hooks/manifests). 'unreact' retracts a previously-added reaction."
             },
             "target": {
                 "type": "string",
@@ -293,6 +293,11 @@ def _handle_react(args, remove=False):
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
+    if platform_name == "discord":
+        return tool_error(
+            "Discord reactions are plugin-owned; use Discord reaction hooks or "
+            "reaction manifests instead of send_message react/unreact."
+        )
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
     prepare_send_message_platforms()

@@ -383,6 +383,21 @@ class TestSendMessageTool:
         assert leaked not in result["error"]
         assert "access_token=***" in result["error"]
 
+    def test_discord_reactions_are_not_model_callable(self):
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "react",
+                    "target": "discord:123",
+                    "emoji": "👍",
+                    "message_id": "456",
+                }
+            )
+        )
+
+        assert "error" in result
+        assert "Discord reactions are plugin-owned" in result["error"]
+
 
 class TestSendTelegramMediaDelivery:
     def test_sends_photo_with_caption_for_media_tag(self, tmp_path, monkeypatch):
