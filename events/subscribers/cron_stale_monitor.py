@@ -157,7 +157,17 @@ class CronStaleMonitor(BaseSubscriber):
         if not isinstance(raw, (list, tuple)):
             return
         exit_reason = event.payload.get("exit_reason")
-        now = datetime.now(timezone.utc)
+        try:
+            stopped_at = datetime.fromisoformat(event.timestamp)
+        except (TypeError, ValueError):
+            # A corrupt stamp is no reason to report nothing; the poll clock
+            # only inflates the age, which is the pre-fix behaviour.
+            logger.warning(
+                "CronStaleMonitor: unparseable timestamp %r on %s; measuring "
+                "the shutdown age from the poll clock",
+                event.timestamp, event.event_id,
+            )
+            stopped_at = datetime.now(timezone.utc)
 
         for correlation_id in raw:
             job_id = self._started_event_ids.pop(correlation_id, None)
@@ -169,17 +179,20 @@ class CronStaleMonitor(BaseSubscriber):
                 continue
             started_at, job_name = entry
             try:
-                age = (now - started_at).total_seconds()
+                age = max(0.0, (stopped_at - started_at).total_seconds())
             except (TypeError, ValueError):
                 age = 0.0
             self._pending_shutdown.append({
                 "job_id": job_id,
                 "job_name": job_name,
-                # Measured HERE, against the GATEWAY_STOPPED, not at flush
-                # time: age_seconds means "how far into the run did the
-                # shutdown land", and it predates the staging. Computing it at
-                # the flush would silently redefine it to include however long
-                # teardown took — minutes, on this box.
+                # From the GATEWAY_STOPPED's OWN stamp — not the flush clock
+                # (2a4ece2c07) and not this poll's clock either. age_seconds
+                # means "how far into the run did the shutdown land", so both
+                # of those redefine it: the flush adds however long teardown
+                # took, and staging adds up to a whole poll_interval_seconds
+                # (60). Production, 2026-08-19: a 14s-old run was reported at
+                # 68, against a 1200s wedge threshold. Matches
+                # _age_at_shutdown, the successor-side path, clamp included.
                 "age_seconds": int(age),
                 "exit_reason": exit_reason,
                 "gateway_stopped_event_id": event.event_id,
@@ -199,8 +212,8 @@ class CronStaleMonitor(BaseSubscriber):
             job_id = record["job_id"]
             job_name = record["job_name"]
             exit_reason = record["exit_reason"]
-            # Computed when the shutdown was seen, not now — see the staging
-            # site. The flush may be minutes later.
+            # Computed from the GATEWAY_STOPPED's own stamp, not now — see
+            # the staging site. The flush may be minutes later.
             age = record["age_seconds"]
             try:
                 self.bus.emit(

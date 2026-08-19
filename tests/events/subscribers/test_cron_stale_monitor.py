@@ -661,6 +661,67 @@ class TestShutdownAttributionTiming:
             f"staged within {staged_within:.2f}s)"
         )
 
+    def test_age_is_measured_at_the_shutdown_not_at_the_poll(self, bus):
+        """The other half of the same question: which CLOCK, not which MOMENT.
+
+        Measuring at the staging site fixed the flush drift, but the staging
+        site still read ``datetime.now()`` — and staging happens when the
+        subscriber POLLS the GATEWAY_STOPPED, not when the gateway stopped.
+        ``poll_interval_seconds`` is 60, so the answer carried up to a whole
+        poll interval of inflation, and it is read against a 1200s wedge
+        threshold. Production, 2026-08-19: runs started 16:00:40Z, gateway
+        stopped 16:00:54Z (true age 14s), handled 16:01:48Z — the emitted
+        rows said 68.
+
+        Exact, not bounded: both stamps are durable and backdated here, so the
+        answer is arithmetic and no amount of box load can move it.
+        """
+        STARTED_AGO = 900
+        STOPPED_AGO = 840  # the shutdown landed 60s into the run
+        TRUE_AGE = STARTED_AGO - STOPPED_AGO
+
+        now = datetime.now(timezone.utc)
+        started_id = _emit_started(
+            bus, "job-killed", started_at=now - timedelta(seconds=STARTED_AGO),
+        )
+        stopped_id = _emit_gateway_stopped(bus, [started_id])
+        _backdate(bus, stopped_id, now - timedelta(seconds=STOPPED_AGO))
+
+        mon = _monitor(bus)
+        mon.poll()  # stages, STOPPED_AGO seconds after the shutdown
+        mon.shutdown()
+
+        evts = [e for e in _stale_events(bus)
+                if e.payload.get("scope") == "gateway_stopped"]
+        assert len(evts) == 1
+        assert evts[0].payload["age_seconds"] == TRUE_AGE, (
+            f"age_seconds={evts[0].payload['age_seconds']} is measured from "
+            f"the poll, not from the GATEWAY_STOPPED (true age {TRUE_AGE}s)"
+        )
+
+    def test_a_shutdown_stamped_before_the_run_started_reports_zero(self, bus):
+        """Clock skew must not produce a negative age.
+
+        ``_age_at_shutdown``, the successor-side path, already clamps; the
+        in-process path has to agree with it or the same shutdown reads
+        differently depending on which side reported it.
+        """
+        now = datetime.now(timezone.utc)
+        started_id = _emit_started(
+            bus, "job-skewed", started_at=now - timedelta(seconds=100),
+        )
+        stopped_id = _emit_gateway_stopped(bus, [started_id])
+        _backdate(bus, stopped_id, now - timedelta(seconds=160))
+
+        mon = _monitor(bus)
+        mon.poll()
+        mon.shutdown()
+
+        evts = [e for e in _stale_events(bus)
+                if e.payload.get("scope") == "gateway_stopped"]
+        assert len(evts) == 1
+        assert evts[0].payload["age_seconds"] == 0
+
 
 # =========================================================================
 # Successor-side reconstruction (2026-08-17)
