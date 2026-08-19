@@ -220,6 +220,20 @@ test('behavior: a remote Connections row opens through its captured route withou
   assert.equal(opened[0][0].connectionId, 'work')
 })
 
+test('behavior: pointer entry does not warm an SSH Connections row', () => {
+  const { row, warmed } = renderBotRow({
+    connectionId: 'shell',
+    connectionKind: 'ssh',
+    connectionLabel: 'Shell',
+    name: 'research',
+    remoteSource: true,
+    sourceScoped: true
+  })
+
+  row.props.onPointerEnter()
+  assert.deepEqual(warmed, [])
+})
+
 test('behavior: remote default never opens the same-name local chat', async () => {
   const bot = {
     connectionId: 'mac-mini',
