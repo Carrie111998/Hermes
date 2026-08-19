@@ -4570,6 +4570,36 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     return surfaces
 
 
+def _disabled_toolsets_from_config(config: dict | None) -> set[str]:
+    """Return the profile's hard toolset denylist in its normalized form.
+
+    GUI capabilities are injected after the normal CLI tool resolver runs, and
+    focus posture returns before that resolver entirely.  Both paths therefore
+    need the same final denylist pass that ``_get_platform_tools`` applies.
+    """
+    if not isinstance(config, dict):
+        return set()
+
+    agent_cfg = config.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        return set()
+
+    raw = agent_cfg.get("disabled_toolsets")
+    if not raw:
+        return set()
+
+    try:
+        from agent.skill_utils import parse_config_string_list
+
+        return {
+            name.strip()
+            for name in parse_config_string_list(raw)
+            if name.strip()
+        }
+    except Exception:
+        return set()
+
+
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     session_platform = platform or _resolve_session_platform()
     explicit = [
@@ -4596,7 +4626,14 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 # coding posture returns before the fallback path that normally
                 # adds them — without this the desktop loses its pane/project
                 # tools exactly when sitting in a repo (see below).
-                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+                try:
+                    from hermes_cli.config import load_config
+
+                    cfg = load_config()
+                except Exception:
+                    cfg = None
+                enabled = {*selection, *_gui_surface_toolsets(session_platform)}
+                return sorted(enabled - _disabled_toolsets_from_config(cfg))
         except Exception:
             pass
 
@@ -4713,7 +4750,9 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
         # folding them in here is the gate that exposes them on exactly the
         # surface that can answer them.
-        return sorted(enabled | _gui_surface_toolsets(session_platform))
+        enabled |= _gui_surface_toolsets(session_platform)
+        enabled -= _disabled_toolsets_from_config(cfg)
+        return sorted(enabled)
     except Exception:
         if fallback_notice is not None:
             print(

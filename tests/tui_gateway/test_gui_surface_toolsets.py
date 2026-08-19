@@ -109,6 +109,51 @@ class TestResolverPlumbing:
         assert "desktop_ui" in desktop
         assert "desktop_ui" not in tui
 
+    def test_config_denylist_wins_over_desktop_surface_injection(self, no_desktop_env):
+        """A GUI session must not resurrect capabilities the profile denied."""
+        import agent.coding_context as cc
+        import hermes_cli.config as config_mod
+
+        no_desktop_env.setattr(cc, "coding_selection", lambda **_: None)
+        no_desktop_env.setattr(
+            config_mod,
+            "load_config",
+            lambda: {
+                "agent": {"disabled_toolsets": ["desktop_ui", "project"]},
+                "platform_toolsets": {"cli": ["memory"]},
+            },
+        )
+
+        enabled = server._load_enabled_toolsets("desktop")
+
+        assert enabled is not None
+        assert "memory" in enabled
+        assert "desktop_ui" not in enabled
+        assert "project" not in enabled
+
+    def test_focus_posture_cannot_bypass_serialized_profile_denylist(
+        self, no_desktop_env
+    ):
+        """The posture early-return obeys the same hard suppression contract."""
+        import agent.coding_context as cc
+        import hermes_cli.config as config_mod
+
+        no_desktop_env.setattr(
+            cc, "coding_selection", lambda **_: ["coding", "figma"]
+        )
+        no_desktop_env.setattr(
+            config_mod,
+            "load_config",
+            lambda: {
+                # Config editors may persist the list as a JSON-array string.
+                "agent": {
+                    "disabled_toolsets": '["coding", "figma", "desktop_ui", "project"]'
+                }
+            },
+        )
+
+        assert server._load_enabled_toolsets("desktop") == []
+
     def test_explicit_env_pin_still_wins(self, no_desktop_env):
         """HERMES_TUI_TOOLSETS is an operator override; surface can't re-add."""
         no_desktop_env.setenv("HERMES_TUI_TOOLSETS", "web,memory")
