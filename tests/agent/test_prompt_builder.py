@@ -500,6 +500,39 @@ class TestBuildContextFilesPrompt:
         assert "Allowed startup context" in result
         assert "DENIED STARTUP CONTEXT" not in result
 
+    def test_permissions_deny_skips_agents_override_and_loads_agents(self, tmp_path):
+        """A denied high-priority override cannot shadow an allowed AGENTS.md."""
+        from unittest.mock import patch
+
+        override = tmp_path / "AGENTS.override.md"
+        override.write_text("DENIED OVERRIDE CONTEXT")
+        (tmp_path / "AGENTS.md").write_text("Allowed AGENTS context")
+
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(override)],
+        ):
+            result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Allowed AGENTS context" in result
+        assert "DENIED OVERRIDE CONTEXT" not in result
+
+    def test_agents_override_symlink_to_sensitive_file_is_blocked(self, tmp_path):
+        """AGENTS.override.md inherits the canonical sensitive-file guard."""
+        secret = tmp_path / "secrets" / ".env"
+        secret.parent.mkdir()
+        secret.write_text("OVERRIDE_CONTEXT_SECRET=must-not-load", encoding="utf-8")
+        try:
+            (tmp_path / "AGENTS.override.md").symlink_to(secret)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+        (tmp_path / "AGENTS.md").write_text("Allowed fallback context")
+
+        result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Allowed fallback context" in result
+        assert "OVERRIDE_CONTEXT_SECRET" not in result
+
     def test_permissions_deny_relative_rule_skips_exact_context_file(self, tmp_path):
         """Relative context-file rules are anchored to the project cwd."""
         from unittest.mock import patch
@@ -772,6 +805,29 @@ class TestBuildContextFilesPrompt:
 
         assert _load_agents_md(sub) == ""
 
+    # --- AGENTS.override.md personal override (port of pi#7681) ---
+
+    def test_agents_override_md_wins_over_agents_md(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
+        (tmp_path / "AGENTS.override.md").write_text("Use Black instead.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Use Black instead" in result
+        assert "Ruff for linting" not in result
+        assert "AGENTS.override.md" in result
+
+    def test_agents_override_md_loads_alone(self, tmp_path):
+        (tmp_path / "AGENTS.override.md").write_text("Override-only context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Override-only context" in result
+        assert "Project Context" in result
+
+    def test_hermes_md_still_wins_over_agents_override(self, tmp_path):
+        (tmp_path / ".hermes.md").write_text("Hermes-first context.")
+        (tmp_path / "AGENTS.override.md").write_text("Override context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Hermes-first context" in result
+        assert "Override context" not in result
+
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
@@ -828,8 +884,35 @@ class TestBuildContextFilesPrompt:
 
         mock_ensure.assert_not_called()
 
+    def test_permissions_deny_blocks_profile_scoped_soul_before_metadata_probe(
+        self, tmp_path
+    ):
+        from pathlib import Path
+        from unittest.mock import patch
 
+        profile_home = tmp_path / "profile-home"
+        profile_home.mkdir()
+        soul = profile_home / "SOUL.md"
+        original_exists = Path.exists
 
+        def guarded_exists(path_obj):
+            if path_obj == soul:
+                raise AssertionError("denied profile SOUL.md metadata was probed")
+            return original_exists(path_obj)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(soul)],
+            ),
+            patch.object(Path, "exists", guarded_exists),
+            patch("hermes_cli.config.ensure_hermes_home") as mock_ensure,
+        ):
+            from agent.prompt_builder import load_soul_md
+
+            assert load_soul_md(home_override=profile_home) is None
+
+        mock_ensure.assert_not_called()
 
     # --- .hermes.md / HERMES.md discovery ---
 
