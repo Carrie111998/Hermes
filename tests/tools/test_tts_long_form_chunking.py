@@ -79,13 +79,35 @@ class TestSplitTextForTts:
         text = "I don’t think it’s wise to go. " * 6
         chunks = _split_text_for_tts(text, 80)
         assert all(len(c) <= 80 for c in chunks)
-        # No chunk may split a curly-apostrophe word.
+        # No chunk may end with a bare curly apostrophe (mid-word split), and
+        # no chunk may START with a curly apostrophe continuation ('t / 's).
+        # These boundary assertions are impossible to satisfy under the old
+        # hard-break regex — that is exactly how the bug stayed masked.
         for chunk in chunks:
-            assert "don’" not in chunk.rstrip("’") + "t" or "don’t" in chunk
-            assert "it’" not in chunk.rstrip("’") + "s" or "it’s" in chunk
+            assert not chunk.endswith(("don’", "it’")), (
+                f"chunk split mid-word, ends with dangling apostrophe: {chunk!r}"
+            )
+            assert not chunk.startswith(("’t", "’s")), (
+                f"chunk split mid-word, starts with apostrophe tail: {chunk!r}"
+            )
         # The words survive intact somewhere (no content loss).
         joined = " ".join(chunks)
         assert "don’t" in joined and "it’s" in joined
+
+    def test_cjk_closing_quote_not_orphaned_at_chunk_start(self):
+        """Regression (AI review #84622): '…你好。”然后…' must not leave the
+        closing ” orphaned at the START of the next chunk. Chunk starts must
+        be clean (no dangling closing quote). Under the old regex this
+        scenario produced '” 然后他走了。' as a chunk start."""
+        text = "他说：“你好。”然后他走了。"
+        chunks = _split_text_for_tts(text, 8)
+        assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
+        # No chunk may start with a closing quote.
+        for chunk in chunks:
+            assert not chunk.startswith(("”", "’")), (
+                f"chunk starts with orphaned closing quote: {chunk!r}"
+            )
+        assert len(chunks) >= 2
 
     def test_cjk_closing_quote_still_breaks_via_preceding_punct(self):
         """A Chinese closing quote at sentence end is preceded by 。/！/？,

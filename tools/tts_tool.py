@@ -586,7 +586,13 @@ def _split_text_for_tts(text: str, max_chars: int) -> List[str]:
             # mid-word. A Chinese closing quote at sentence end is almost
             # always preceded by 。/！/？ already, so the boundary still
             # lands correctly without them (triage #84622).
-            r"(?<=[.!?;:,])\s+|(?<=[。！？；，、：])(?:\s+|(?=[^\s]))",
+            #
+            # Additionally, a hard break right after a sentence-final mark
+            # must not fire when the NEXT char is a closing quote: "…你好。”
+            # 然后…" would otherwise orphan the ” at the start of the next
+            # chunk. The (?!”|’) guard keeps the quote attached to the
+            # sentence it closes (AI review #84622).
+            r"(?<=[.!?;:,])\s+|(?<=[。！？；，、：])(?!”|’)(?:\s+|(?=[^\s]))",
             normalized,
         )
         if sentence.strip()
