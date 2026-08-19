@@ -260,6 +260,24 @@ def test_tui_present_invalid_requested_identity_fails_closed(invalid):
         _stored_session_runtime_overrides(row)
 
 
+def test_tui_unknown_present_identity_failure_never_constructs_agent(monkeypatch):
+    """A resolver grammar error on a stored identity must abort before construction."""
+    import tui_gateway.server as server
+
+    resolver = MagicMock(side_effect=ValueError("persisted identity is not routable"))
+    constructor = MagicMock()
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolver)
+
+    with patch("run_agent.AIAgent", constructor):
+        with pytest.raises(ValueError, match="not routable"):
+            server._make_agent(
+                "tui-invalid-route", "synthetic-key",
+                model_override={"model": "stored-model", "provider": "custom", "requested_provider": "unknown:route"},
+            )
+
+    constructor.assert_not_called()
+
+
 # --- Regression: bare "custom" WITHOUT a base_url (GH #44022 / #47714) ------
 #
 # The recurring Desktop/TUI "No LLM provider configured" regression. Every
@@ -430,4 +448,3 @@ class TestModelNameRecoversEntryIdentity:
             rp.find_custom_provider_identity_by_model("hermes-ultra-sft")
             == "custom:hermes-ultra"
         )
-

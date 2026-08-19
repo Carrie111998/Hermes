@@ -7,6 +7,7 @@ used instead of the ambient config default (#57588-class, #79536).
 """
 
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -410,3 +411,55 @@ def test_cli_absent_requested_provider_legacy_heals_on_next_write(monkeypatch):
     assert route["requested_provider"] == "custom:remote"
     assert route["base_url"] == "https://remote.example/v1"
     assert not ({"api_key", "request_overrides", "provider_request_overrides"} & route.keys())
+
+
+def test_cli_in_place_resume_installs_resolved_route_binding(monkeypatch):
+    """Removing the post-swap route install loses the requested identity and provider layer."""
+    class LiveAgent:
+        def __init__(self):
+            self.model = "ambient-model"
+            self.provider = "openrouter"
+            self.requested_provider = "openrouter"
+            self._caller_request_overrides = {"extra_body": {"caller": "keep"}, "caller_only": True}
+            self._provider_request_overrides = {"extra_body": {"old": "drop"}}
+            self._request_overrides = {}
+            self._primary_runtime = {}
+
+        def _set_provider_request_overrides(self, value):
+            self._provider_request_overrides = deepcopy(value)
+            effective = deepcopy(self._provider_request_overrides)
+            effective.update(deepcopy(self._caller_request_overrides))
+            effective["extra_body"] = {
+                **self._provider_request_overrides.get("extra_body", {}),
+                **self._caller_request_overrides.get("extra_body", {}),
+            }
+            self._request_overrides = effective
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.requested_provider = kwargs["new_provider"]
+            self._primary_runtime = {"requested_provider": kwargs["new_provider"]}
+
+    provider_layer = {"extra_body": {"route": "fresh"}, "provider_only": True}
+    runtime = {
+        "provider": "custom", "requested_provider": "ollama",
+        "api_key": "synthetic-key", "base_url": "http://127.0.0.1:11434/v1",
+        "api_mode": "chat_completions", "request_overrides": provider_layer,
+        "credential_pool": None,
+    }
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kwargs: runtime)
+    agent = LiveAgent()
+    stub = _make_stub(agent=agent)
+
+    stub._restore_session_model(_row(model_config={"gateway_runtime": {
+        "provider": "custom", "requested_provider": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1", "api_mode": "chat_completions",
+    }}))
+    provider_layer["extra_body"]["route"] = "mutated-after-resume"
+
+    assert agent.requested_provider == "ollama"
+    assert agent._provider_request_overrides == {"extra_body": {"route": "fresh"}, "provider_only": True}
+    assert agent._caller_request_overrides == {"extra_body": {"caller": "keep"}, "caller_only": True}
+    assert agent._request_overrides == {"extra_body": {"route": "fresh", "caller": "keep"}, "provider_only": True, "caller_only": True}
+    assert agent._primary_runtime["requested_provider"] == "ollama"

@@ -556,6 +556,7 @@ class SessionManager:
         # Extract cwd from model_config.
         cwd = "."
         requested_provider = row.get("billing_provider")
+        has_requested_provider = False
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
         mc = row.get("model_config")
@@ -565,6 +566,7 @@ class SessionManager:
                 if isinstance(meta, dict):
                     cwd = meta.get("cwd", ".")
                     if "requested_provider" in meta:
+                        has_requested_provider = True
                         requested = meta["requested_provider"]
                         if not isinstance(requested, str) or not requested.strip() or requested.strip().endswith(":"):
                             return None
@@ -575,6 +577,20 @@ class SessionManager:
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        # Legacy rows stored only the resolved ``custom`` bucket. Recover a
+        # routable identity from their safe endpoint/model before resolution;
+        # a subsequent normal persistence then heals the durable metadata.
+        if not has_requested_provider and str(requested_provider or "").strip().lower() == "custom":
+            try:
+                from hermes_cli.runtime_provider import canonical_custom_identity
+
+                requested_provider = canonical_custom_identity(
+                    base_url=restored_base_url or None,
+                    model=row.get("model") or None,
+                ) or requested_provider
+            except Exception:
+                logger.debug("ACP legacy custom identity recovery failed", exc_info=True)
 
         model = row.get("model") or None
 
@@ -692,6 +708,11 @@ class SessionManager:
                 }
             )
         except Exception:
+            # A persisted identity is authoritative. Constructing an ambient
+            # agent after it fails resolver validation silently rebinds the
+            # resumed session to the wrong route.
+            if requested_provider:
+                raise
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)

@@ -450,3 +450,68 @@ def test_acp_persist_writes_safe_requested_provider_metadata(tmp_path, monkeypat
     SessionManager(db=db)._persist(state)
     config = db.create_session.call_args.kwargs["model_config"]
     assert config == {"cwd": str(tmp_path), "model": "synthetic-model", "provider": "custom", "requested_provider": "custom:remote", "base_url": "https://remote.example/v1", "api_mode": "chat_completions"}
+
+
+def test_acp_legacy_bare_custom_restores_identity_and_heals_on_persist(tmp_path, monkeypatch):
+    """Removing legacy recovery would rebind a stored custom endpoint as bare custom."""
+    db = MagicMock()
+    db.get_session.return_value = {
+        "source": "acp",
+        "model": "legacy-model",
+        "model_config": json.dumps({
+            "cwd": str(tmp_path), "provider": "custom",
+            "base_url": "https://legacy.example/v1", "api_mode": "chat_completions",
+        }),
+    }
+    db.get_messages_as_conversation.return_value = []
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.canonical_custom_identity",
+        lambda **_kwargs: "custom:legacy",
+    )
+    resolved = MagicMock(return_value={
+        "provider": "custom", "requested_provider": "custom:legacy",
+        "api_key": "synthetic-key", "base_url": "https://legacy.example/v1",
+        "api_mode": "chat_completions", "request_overrides": {},
+        "credential_pool": None, "command": None, "args": [],
+    })
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolved)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": {"default": "legacy-model"}})
+    monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *_args: None)
+    agent = SimpleNamespace(
+        model="legacy-model", provider="custom", requested_provider="custom:legacy",
+        base_url="https://legacy.example/v1", api_mode="chat_completions",
+        _session_db=None, _session_db_created=False,
+    )
+
+    with patch("run_agent.AIAgent", return_value=agent):
+        manager = SessionManager(db=db)
+        restored = manager._restore("legacy-acp-row")
+
+    assert restored is not None
+    assert resolved.call_args.kwargs["requested"] == "custom:legacy"
+    manager._persist(restored)
+    healed = json.loads(db.update_session_meta.call_args.args[1])
+    assert healed["requested_provider"] == "custom:legacy"
+
+
+def test_acp_unknown_present_identity_fails_closed_without_agent_construction(tmp_path, monkeypatch):
+    """Removing resolver-failure handling would construct an unbound default agent."""
+    db = MagicMock()
+    db.get_session.return_value = {
+        "source": "acp", "model": "synthetic-model",
+        "model_config": json.dumps({
+            "cwd": str(tmp_path), "provider": "custom", "requested_provider": "unknown:route",
+        }),
+    }
+    db.get_messages_as_conversation.return_value = []
+    resolver = MagicMock(side_effect=ValueError("unknown persisted provider"))
+    constructor = MagicMock()
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolver)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": {"default": "synthetic-model"}})
+    monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *_args: None)
+
+    with patch("run_agent.AIAgent", constructor):
+        assert SessionManager(db=db)._restore("unknown-acp-row") is None
+
+    assert resolver.call_args.kwargs["requested"] == "unknown:route"
+    constructor.assert_not_called()

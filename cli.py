@@ -8669,6 +8669,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             stored_provider_for_resolution = stored_provider
         model_changed = stored_model != self.model
         provider_changed = bool(stored_provider_for_resolution) and stored_provider_for_resolution != self.requested_provider
+        resolved_runtime = None
         if not model_changed and not provider_changed:
             return
         self.model = stored_model
@@ -8693,8 +8694,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
                 resolved = resolve_runtime_provider(requested=stored_provider_for_resolution)
+                resolved_runtime = resolved
                 if resolved.get("provider"):
                     self.provider = resolved["provider"]
+                if resolved.get("requested_provider"):
+                    self.requested_provider = resolved["requested_provider"]
                 if resolved.get("api_key"):
                     self.api_key = resolved["api_key"]
                     self._credential_pool = resolved.get("credential_pool")
@@ -8721,6 +8725,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=self.base_url or "",
                     api_mode=self.api_mode or "",
                 )
+                if resolved_runtime is not None:
+                    resolved_requested = resolved_runtime.get("requested_provider")
+                    if resolved_requested:
+                        self.agent.requested_provider = resolved_requested
+                    if hasattr(self.agent, "_set_provider_request_overrides"):
+                        self.agent._set_provider_request_overrides(
+                            copy.deepcopy(
+                                resolved_runtime.get("request_overrides") or {}
+                            )
+                        )
+                    primary_runtime = getattr(self.agent, "_primary_runtime", None)
+                    if isinstance(primary_runtime, dict):
+                        primary_runtime = copy.deepcopy(primary_runtime)
+                        primary_runtime["requested_provider"] = (
+                            resolved_requested or self.agent.requested_provider
+                        )
+                        self.agent._primary_runtime = primary_runtime
             except Exception:
                 logger.debug(
                     "In-place agent model swap on resume failed", exc_info=True
