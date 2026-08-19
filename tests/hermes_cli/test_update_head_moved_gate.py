@@ -126,7 +126,10 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
     _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
 
-    hermes_main.cmd_update(args)  # completes normally (no SystemExit)
+    # Bypass the update-approval staging gate — this test exercises the
+    # post-pull HEAD-movement gate, not the staging path (matches
+    # tests/hermes_cli/test_cmd_update.py's approved=True convention).
+    hermes_main.cmd_update(args, approved=True)  # completes normally (no SystemExit)
 
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
@@ -139,8 +142,11 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
     _patch_update_deps(monkeypatch, tmp_path, _make_head_pinned_side_effect())
 
+    # Bypass the update-approval staging gate — this test exercises the
+    # post-pull HEAD-movement gate, not the staging path (matches
+    # tests/hermes_cli/test_cmd_update.py's approved=True convention).
     with pytest.raises(SystemExit) as exc_info:
-        hermes_main.cmd_update(args)
+        hermes_main.cmd_update(args, approved=True)
 
     assert exc_info.value.code == 1
     out = capsys.readouterr().out
