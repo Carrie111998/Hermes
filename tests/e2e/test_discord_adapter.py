@@ -80,6 +80,41 @@ class TestMentionStrippedCommandDispatch:
         assert "/new" in response
 
 
+class TestHandoffThreadContinuation:
+    async def test_unmentioned_reply_in_created_thread_is_admitted(
+        self, discord_adapter, monkeypatch
+    ):
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+        discord_adapter._fetch_channel_context = AsyncMock(return_value="")
+        discord_adapter._text_batch_delay_seconds = 0
+        discord_adapter.handle_message = AsyncMock()
+
+        thread = make_fake_thread(thread_id=90002, name="Daily brief")
+        parent = thread.parent
+        parent.create_thread = AsyncMock(return_value=thread)
+        parent.send = AsyncMock()
+        discord_adapter._client = SimpleNamespace(
+            user=discord_adapter._client.user,
+            get_channel=lambda _channel_id: parent,
+            fetch_channel=AsyncMock(),
+        )
+
+        thread_id = await discord_adapter.create_handoff_thread(
+            str(parent.id), "Daily brief"
+        )
+        msg = make_discord_message(
+            content="Continue without a mention",
+            channel=thread,
+            mentions=[],
+        )
+
+        await dispatch(discord_adapter, msg)
+
+        assert thread_id == str(thread.id)
+        discord_adapter.handle_message.assert_awaited_once()
+
+
 class TestAutoThreadingPreservesCommand:
     async def test_command_detected_after_auto_thread(self, discord_adapter, bot_user, monkeypatch):
         """@mention /help in channel with auto-thread → thread created AND command dispatched."""

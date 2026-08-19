@@ -7384,12 +7384,16 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=1440,
                     reason=reason,
                 )
-                return str(thread.id)
+                thread_id = str(thread.id)
         except Exception as direct_error:
             logger.debug(
                 "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
                 self.name, direct_error,
             )
+        else:
+            if create is not None:
+                self._threads.mark(thread_id)
+                return thread_id
 
         # Fallback: post a seed message and create the thread from it.
         try:
@@ -7402,13 +7406,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=1440,
                 reason=reason,
             )
-            return str(thread.id)
+            thread_id = str(thread.id)
         except Exception as fallback_error:
             logger.warning(
                 "[%s] Handoff thread: both create paths failed for parent %s: %s",
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+        self._threads.mark(thread_id)
+        return thread_id
 
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
