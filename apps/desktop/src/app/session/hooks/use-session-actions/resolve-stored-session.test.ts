@@ -67,8 +67,8 @@ describe('resolveStoredSession profile ownership', () => {
     const resolved = await resolveStoredSession('s1')
 
     expect(resolved?.profile).toBe('default')
-    // rung 2 (bare) then rung 3 (stamped cross-profile probe)
-    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    // rung 2 (active profile) then rung 3 (stamped cross-profile probe)
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1', 'meta')
     expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
 
@@ -82,7 +82,23 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).not.toHaveBeenCalled()
   })
 
-  it('stamps the active profile on a bare by-id hit from an older backend', async () => {
+  it('scopes the first by-id lookup to the active profile', async () => {
+    mockGetSession.mockImplementation(async (_storedSessionId, profile) => {
+      if (profile === 'meta') {
+        return session({ id: 's1' })
+      }
+
+      throw new Error('404: Session not found')
+    })
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('meta')
+    expect(mockGetSession).toHaveBeenCalledTimes(1)
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'meta')
+  })
+
+  it('stamps the active profile on a scoped by-id hit from an older backend', async () => {
     mockGetSession.mockResolvedValueOnce(session({ id: 's1' }))
 
     const resolved = await resolveStoredSession('s1')
@@ -90,6 +106,7 @@ describe('resolveStoredSession profile ownership', () => {
     expect(resolved?.profile).toBe('meta')
     // the upserted cache row is owned too, so the next hit short-circuits
     expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'meta')
   })
 
   it('probed desktop profile overrides a remote backend answering as its own "default"', async () => {
@@ -104,6 +121,8 @@ describe('resolveStoredSession profile ownership', () => {
 
     expect(resolved?.profile).toBe('meta')
     expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1', 'default')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'meta')
   })
 
   it('stamps the probed profile on a scoped hit from an older backend that omits it', async () => {
@@ -115,6 +134,8 @@ describe('resolveStoredSession profile ownership', () => {
     expect(resolved?.profile).toBe('default')
     // the cached row is owned too — no unowned row is ever re-cached
     expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('default')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1', 'meta')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
 
   it('resolveSessionProfile routes a default-profile session from a non-default gateway', async () => {
@@ -122,5 +143,7 @@ describe('resolveStoredSession profile ownership', () => {
     mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
 
     await expect(resolveSessionProfile('s1')).resolves.toBe('default')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1', 'meta')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
 })
