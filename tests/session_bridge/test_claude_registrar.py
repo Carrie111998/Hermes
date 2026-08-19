@@ -1585,6 +1585,16 @@ def test_fixed_launch_failure_codes_and_cleanup(
     assert result.detail not in {"pty unavailable", "Authentication required"}
 
 
+# Ceiling for in-process reader tests whose fake stream ENDS (StopIteration ->
+# EOF).  EOF is what returns the read, so this is a guard and never the operative
+# deadline.  A ceiling below _RESPONSE_SETTLE_SECONDS (0.5) instead makes itself
+# the deadline, turning the assertion into a race against the fake's own sleeps.
+# Tests that deliberately assert ON the deadline -- e.g.
+# test_winpty_slow_drip_after_candidate_stays_bounded_by_global_timeout, which
+# checks `elapsed < 1.0` -- keep their own small value and must NOT use this.
+_READER_EOF_GUARD_SECONDS = 30.0
+
+
 def test_winpty_wrapper_uses_real_read_signature_without_unbounded_keyword() -> None:
     class Process:
         def __init__(self):
@@ -1619,7 +1629,9 @@ def test_winpty_reader_does_not_stop_on_registered_text_inside_prompt_echo() -> 
             return next(self.chunks)
 
     process = Process()
-    output = _WinPtyProcess(process).read_until(0.2, prompt=prompt)
+    output = _WinPtyProcess(process).read_until(
+        _READER_EOF_GUARD_SECONDS, prompt=prompt
+    )
     assert output.strip() == "REGISTERED"
     assert process.calls == 3
 
@@ -1758,7 +1770,7 @@ def test_winpty_reader_drains_extra_output_after_registered_before_acceptance() 
             return next(self.chunks)
 
     process = Process()
-    output = _WinPtyProcess(process).read_until(0.2)
+    output = _WinPtyProcess(process).read_until(_READER_EOF_GUARD_SECONDS)
     assert output.strip().splitlines() == ["REGISTERED", "extra"]
     assert process.calls >= 2
 
@@ -1776,7 +1788,7 @@ def test_winpty_quiet_period_resets_for_each_partial_post_response_chunk() -> No
             return next(self.chunks)
 
     process = Process()
-    output = _WinPtyProcess(process).read_until(0.5)
+    output = _WinPtyProcess(process).read_until(_READER_EOF_GUARD_SECONDS)
     assert output.strip().splitlines() == ["REGISTERED", "extra"]
     assert process.calls == 4
 
@@ -3015,6 +3027,37 @@ def test_offline_fixture_named_terminating_scenarios_record_exit(
     }
 
 
+# Deadlock guard for the real-ConPTY tests, which spawn a genuine python.exe
+# behind a real pseudoconsole.  Nothing asserts on how much of it is consumed, so
+# it is sized for the worst host rather than for expected latency: the previous
+# 10s readiness budget expired on a loaded box and surfaced as
+# `_PtyReadinessTimeout: terminal_input_not_enabled`.  Reads still return as soon
+# as the reader settles, so a large ceiling costs nothing on the happy path.
+_REAL_CONPTY_GUARD_SECONDS = 120.0
+
+
+def _wait_for_fixture_event(record: Path, event: str, timeout: float) -> None:
+    """Block until the fake Claude fixture has recorded ``event``.
+
+    The record file is rewritten whole on each append, so a concurrent read can
+    catch it mid-write; treat a partial parse as "not yet".
+    """
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            events = json.loads(record.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            events = []
+        if any(entry.get("event") == event for entry in events):
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"fixture never recorded {event!r} within {timeout}s: {events}"
+            )
+        time.sleep(0.01)
+
+
 def _real_conpty_available() -> bool:
     if not sys.platform.startswith("win"):
         return False
@@ -3057,14 +3100,24 @@ def test_real_windows_conpty_fixture_exit_and_cleanup(
         if scenario == "registered"
         else "registration prompt"
     )
-    startup = process.read_until_ready(10.0)
+    startup = process.read_until_ready(_REAL_CONPTY_GUARD_SECONDS)
     assert "\x1b[?2004h" in startup
     process.write(f"\x1b[200~{registration_prompt}\x1b[201~\r")
-    output = process.read_until(10.0, prompt=registration_prompt)
+    if scenario == "delayed_extra":
+        # Wait for the EFFECT -- the fixture has written and flushed the trailing
+        # line -- rather than betting it arrives inside the reader's
+        # _RESPONSE_SETTLE_SECONDS (0.5s) window.  That bet races real ConPTY
+        # transport latency and loses under load, truncating the drain to
+        # ["REGISTERED"].  Whether a *temporally* delayed line still lands inside
+        # the settle window is covered in-process, without a subprocess, by
+        # test_winpty_reader_drains_extra_output_after_registered_before_acceptance;
+        # here both lines only need to be in the stream before the drain starts.
+        _wait_for_fixture_event(record, "extra", _REAL_CONPTY_GUARD_SECONDS)
+    output = process.read_until(_REAL_CONPTY_GUARD_SECONDS, prompt=registration_prompt)
     process.write("/exit\r")
     assert output.strip().splitlines() == expected_lines
-    assert process.wait(10.0) == expected_exit
-    cleanup = process.close(5.0)
+    assert process.wait(_REAL_CONPTY_GUARD_SECONDS) == expected_exit
+    cleanup = process.close(_REAL_CONPTY_GUARD_SECONDS)
     assert cleanup == PtyCleanupResult(True, True, True, expected_exit)
     assert cleanup.registrar_reader_stopped is True
     assert cleanup.transport_reader_stopped is True

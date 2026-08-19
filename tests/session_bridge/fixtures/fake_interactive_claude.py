@@ -93,6 +93,11 @@ def main() -> int:
         time.sleep(float(os.environ.get("FAKE_CLAUDE_EXTRA_DELAY", "0.05")))
         sys.stdout.write("extra\r\n")
         sys.stdout.flush()
+        # Recorded AFTER the flush, so a reader that observes this event knows the
+        # trailing line is already in the PTY stream.  That lets the test wait on
+        # the effect instead of betting the line lands inside the reader's
+        # _RESPONSE_SETTLE_SECONDS window -- a bet it loses on a loaded host.
+        _record(event="extra")
     exit_frame = ""
     while not exit_frame.strip():
         raw_exit = sys.stdin.buffer.readline()
