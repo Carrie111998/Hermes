@@ -163,6 +163,57 @@ class TestCheckSystemdTimingAlignment:
         assert result["mismatch"] is False
         assert "--user" not in calls[0]
 
+    def test_not_found_preferred_manager_falls_back(self, monkeypatch):
+        """A synthetic timeout from a missing preferred unit is ignored."""
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        calls = []
+
+        def fake_run(command, **_kwargs):
+            calls.append(command)
+            if "--user" not in command:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout="LoadState=loaded\nTimeoutStopUSec=3min 30s\n",
+            )
+
+        cgroup = "0::/system.slice/hermes-gateway.service\n"
+        with patch("builtins.open", mock_open(read_data=cgroup)), \
+             patch("subprocess.run", side_effect=fake_run):
+            result = sf.check_systemd_timing_alignment(180.0)
+
+        assert result is not None
+        assert result["timeout_stop_sec"] == 210.0
+        assert "--user" not in calls[0]
+        assert "--user" in calls[1]
+
+    def test_user_slice_queries_user_manager_first(self, monkeypatch):
+        """A user-slice service asks the user manager before the system manager."""
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        calls = []
+
+        def fake_run(command, **_kwargs):
+            calls.append(command)
+            return SimpleNamespace(
+                returncode=0,
+                stdout="LoadState=loaded\nTimeoutStopUSec=3min 30s\n",
+            )
+
+        cgroup = (
+            "0::/user.slice/user-1000.slice/user@1000.service/"
+            "app.slice/hermes-gateway.service\n"
+        )
+        with patch("builtins.open", mock_open(read_data=cgroup)), \
+             patch("subprocess.run", side_effect=fake_run):
+            result = sf.check_systemd_timing_alignment(180.0)
+
+        assert result is not None
+        assert result["mismatch"] is False
+        assert "--user" in calls[0]
+
     def test_returns_none_when_unit_undeterminable(self, monkeypatch):
         monkeypatch.setenv("INVOCATION_ID", "abc")
         # /proc/self/cgroup likely doesn't end in .service for the test runner
