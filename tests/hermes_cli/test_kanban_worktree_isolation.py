@@ -66,6 +66,37 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
+def test_resolve_linked_repo_root_anchor_materializes_task_worktree(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    linked_root = _add_worktree(repo, tmp_path / "linked-root", "anchor/main")
+    branch = "wt/linked-anchor-task"
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="linked anchor",
+            workspace_kind="worktree",
+            workspace_path=str(linked_root),
+            branch_name=branch,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    workspace, resolved_branch = kb._resolve_worktree_workspace(task)
+    expected = linked_root / ".worktrees" / tid
+    assert workspace == expected
+    assert resolved_branch == branch
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert head == branch
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
