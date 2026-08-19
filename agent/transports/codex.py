@@ -625,6 +625,10 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.pop("timeout", None)
 
         if is_codex_backend:
+            # Consumer ChatGPT Codex rejects prompt_cache_retention with HTTP 400.
+            # Strip it at build time to protect against request_overrides injection (#89897).
+            kwargs.pop("prompt_cache_retention", None)
+
             # The Codex backend rejects body-level ``extra_headers`` with
             # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
             # to actual HTTP request headers (not body fields).  ``session_id``
