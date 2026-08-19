@@ -2223,6 +2223,30 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
     sys.stderr.write("\n".join(lines) + "\n\n")
 
 
+def _env_file_sets(var_name: str) -> bool:
+    """Return True only if HERMES_HOME/.env has an uncommented ``var_name=`` line.
+
+    Hermes itself exports TERMINAL_CWD into os.environ at runtime (gateway,
+    session restore, cron jobs), so the process environment alone cannot
+    distinguish "user set this in .env" from "we set it ourselves".
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        env_path = get_hermes_home() / ".env"
+        for line in env_path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[len("export "):].lstrip()
+            if stripped.startswith(f"{var_name}="):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> None:
     """Warn if MESSAGING_CWD or TERMINAL_CWD is set in .env instead of config.yaml.
 
@@ -2244,13 +2268,16 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
     config_has_explicit_cwd = config_cwd not in {".", "auto", "cwd", ""}
 
     lines: list[str] = []
-    if messaging_cwd:
+    if messaging_cwd and _env_file_sets("MESSAGING_CWD"):
         lines.append(
             f"  \033[33m⚠\033[0m MESSAGING_CWD={messaging_cwd} found in .env — "
             f"this is deprecated."
         )
-    if terminal_cwd_env and not config_has_explicit_cwd:
-        # TERMINAL_CWD in env but not from config bridge — likely from .env
+    if (
+        terminal_cwd_env
+        and not config_has_explicit_cwd
+        and _env_file_sets("TERMINAL_CWD")
+    ):
         lines.append(
             f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "
             f"this is deprecated."
