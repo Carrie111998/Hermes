@@ -213,3 +213,75 @@ async def test_multiplex_scope_entry_failure_releases_claimed_turn(
     assert runner._running_agents == {}
 
 
+@pytest.mark.asyncio
+async def test_multiplex_profile_resolution_failure_releases_claimed_turn():
+    runner, _adapter = _make_runner()
+    runner.config.multiplex_profiles = True
+
+    def _fail_resolution(_source):
+        raise RuntimeError("profile resolution failed")
+
+    runner._resolve_profile_home_for_source = _fail_resolution
+    event = _make_event("hello")
+    event.source.profile = "fitness"
+
+    with pytest.raises(RuntimeError, match="profile resolution failed"):
+        await runner._handle_message(event)
+
+    assert runner._running_agents == {}
+
+
+def test_profile_runtime_scope_restores_home_when_secret_hydration_fails(
+    tmp_path, monkeypatch
+):
+    from gateway import run as run_mod
+    from hermes_constants import get_hermes_home
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "fitness"
+    root.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    def _fail_hydration(_profile_home):
+        raise RuntimeError("hydration failed")
+
+    monkeypatch.setattr(
+        "hermes_cli.env_loader.hydrate_profile_secret_sources",
+        _fail_hydration,
+    )
+
+    with pytest.raises(RuntimeError, match="hydration failed"):
+        with run_mod._profile_runtime_scope(profile):
+            pass
+
+    assert Path(get_hermes_home()) == root
+
+
+def test_profile_runtime_scope_restores_home_when_secret_cleanup_fails(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+    from gateway import run as run_mod
+    from hermes_constants import get_hermes_home
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "fitness"
+    root.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    original_reset = secret_scope.reset_secret_scope
+
+    def _reset_then_fail(token):
+        original_reset(token)
+        raise RuntimeError("secret cleanup failed")
+
+    monkeypatch.setattr(secret_scope, "reset_secret_scope", _reset_then_fail)
+
+    with pytest.raises(RuntimeError, match="secret cleanup failed"):
+        with run_mod._profile_runtime_scope(profile):
+            assert Path(get_hermes_home()) == profile
+
+    assert Path(get_hermes_home()) == root
+
+

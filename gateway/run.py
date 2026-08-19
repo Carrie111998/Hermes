@@ -2091,12 +2091,17 @@ def _profile_runtime_scope(profile_home: "Path"):
     from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
-    hydrate_profile_secret_sources(Path(profile_home))
-    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    secret_token = None
     try:
-        yield
+        hydrate_profile_secret_sources(Path(profile_home))
+        secret_token = set_secret_scope(
+            build_profile_secret_scope(Path(profile_home))
+        )
+        try:
+            yield
+        finally:
+            reset_secret_scope(secret_token)
     finally:
-        reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
 
@@ -17740,18 +17745,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
-        _turn_scope = _nullcontext()
-        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            _turn_scope = _profile_runtime_scope(
-                self._resolve_profile_home_for_source(source)
-            )
-
         # Authorization and route stamping above intentionally run in the
         # owning adapter's scope.  Once the turn is claimed, keep the routed
         # scope through post-turn bookkeeping and durable-marker cleanup too;
         # both paths resolve profile-local state after the agent returns.
         _turn_scope_entered = False
         try:
+            _turn_scope = _nullcontext()
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                _turn_scope = _profile_runtime_scope(
+                    self._resolve_profile_home_for_source(source)
+                )
             with _turn_scope:
                 _turn_scope_entered = True
                 try:
