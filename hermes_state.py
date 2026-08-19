@@ -301,12 +301,60 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS missions (
+    mission_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    status TEXT NOT NULL,
+    root_session_id TEXT NOT NULL REFERENCES sessions(id),
+    current_session_id TEXT NOT NULL REFERENCES sessions(id),
+    current_checkpoint_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mission_sessions (
+    mission_id TEXT NOT NULL REFERENCES missions(mission_id),
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    relation TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
+);
+
+CREATE TABLE IF NOT EXISTS mission_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL REFERENCES missions(mission_id),
+    parent_checkpoint_id TEXT REFERENCES mission_checkpoints(checkpoint_id),
+    state_version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    status TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    completed_steps TEXT NOT NULL,
+    pending_steps TEXT NOT NULL,
+    blocker TEXT,
+    blocking_unknown TEXT,
+    next_action TEXT,
+    forbidden_retries TEXT NOT NULL,
+    terminal_state TEXT,
+    canonical_repo TEXT,
+    repo_observed_head TEXT,
+    codegraph_project TEXT,
+    codegraph_fingerprint TEXT,
+    approval_reference TEXT,
+    safety_reference TEXT,
+    financial_reference TEXT,
+    convergence_reference TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_missions_current_session ON missions(current_session_id);
+CREATE INDEX IF NOT EXISTS idx_mission_sessions_mission ON mission_sessions(mission_id);
+CREATE INDEX IF NOT EXISTS idx_mission_checkpoints_mission ON mission_checkpoints(mission_id, created_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -973,6 +1021,301 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Durable mission/checkpoint persistence
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _mission_checkpoint_row(checkpoint) -> tuple:
+        """Convert typed checkpoint state to storage fields."""
+        from agent.durable_mission import validate_checkpoint
+
+        checkpoint = validate_checkpoint(checkpoint)
+        return (
+            checkpoint.checkpoint_id,
+            checkpoint.mission_id,
+            checkpoint.parent_checkpoint_id,
+            checkpoint.state_version,
+            checkpoint.created_at or time.time(),
+            checkpoint.status,
+            checkpoint.objective,
+            checkpoint.phase,
+            json.dumps(checkpoint.completed_steps, ensure_ascii=False),
+            json.dumps(checkpoint.pending_steps, ensure_ascii=False),
+            checkpoint.blocker,
+            checkpoint.blocking_unknown,
+            checkpoint.next_action,
+            json.dumps(checkpoint.forbidden_retries, ensure_ascii=False),
+            checkpoint.terminal_state,
+            checkpoint.canonical_repo,
+            checkpoint.repo_observed_head,
+            checkpoint.codegraph_project,
+            checkpoint.codegraph_fingerprint,
+            json.dumps(checkpoint.approval_reference, ensure_ascii=False)
+            if checkpoint.approval_reference is not None else None,
+            json.dumps(checkpoint.safety_reference, ensure_ascii=False)
+            if checkpoint.safety_reference is not None else None,
+            json.dumps(checkpoint.financial_reference, ensure_ascii=False)
+            if checkpoint.financial_reference is not None else None,
+            json.dumps(checkpoint.convergence_reference, ensure_ascii=False)
+            if checkpoint.convergence_reference is not None else None,
+        )
+
+    @staticmethod
+    def _mission_checkpoint_from_row(row):
+        """Convert a database row to typed checkpoint state."""
+        from agent.durable_mission import (
+            MissionCheckpoint,
+            MissionCheckpointCompatibilityError,
+            MissionCheckpointIntegrityError,
+            validate_checkpoint,
+        )
+
+        def _json(value, fallback):
+            if value is None:
+                return fallback
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise MissionCheckpointIntegrityError(
+                    "checkpoint contains invalid JSON"
+                ) from exc
+
+        try:
+            checkpoint = MissionCheckpoint(
+                mission_id=row["mission_id"],
+                checkpoint_id=row["checkpoint_id"],
+                parent_checkpoint_id=row["parent_checkpoint_id"],
+                state_version=row["state_version"],
+                created_at=row["created_at"],
+                status=row["status"],
+                objective=row["objective"],
+                phase=row["phase"],
+                completed_steps=_json(row["completed_steps"], []),
+                pending_steps=_json(row["pending_steps"], []),
+                blocker=row["blocker"],
+                blocking_unknown=row["blocking_unknown"],
+                next_action=row["next_action"],
+                forbidden_retries=_json(row["forbidden_retries"], []),
+                terminal_state=row["terminal_state"],
+                canonical_repo=row["canonical_repo"],
+                repo_observed_head=row["repo_observed_head"],
+                codegraph_project=row["codegraph_project"],
+                codegraph_fingerprint=row["codegraph_fingerprint"],
+                approval_reference=_json(row["approval_reference"], None),
+                safety_reference=_json(row["safety_reference"], None),
+                financial_reference=_json(row["financial_reference"], None),
+                convergence_reference=_json(row["convergence_reference"], None),
+            )
+            return validate_checkpoint(checkpoint)
+        except MissionCheckpointIntegrityError:
+            raise
+        except MissionCheckpointCompatibilityError:
+            raise
+        except Exception as exc:
+            raise MissionCheckpointIntegrityError(
+                "checkpoint row is corrupt"
+            ) from exc
+
+    def create_mission(
+        self,
+        mission_id: str,
+        *,
+        root_session_id: str,
+        current_session_id: str = None,
+    ) -> str:
+        """Create durable mission identity and bind its root session."""
+        if not mission_id or not root_session_id:
+            raise ValueError("mission_id and root_session_id are required")
+        current_session_id = current_session_id or root_session_id
+
+        def _do(conn):
+            for sid in (root_session_id, current_session_id):
+                if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None:
+                    raise ValueError(f"session does not exist: {sid}")
+            now = time.time()
+            conn.execute(
+                """INSERT INTO missions
+                   (mission_id, schema_version, created_at, updated_at, status,
+                    root_session_id, current_session_id)
+                   VALUES (?, 1, ?, ?, 'ACTIVE', ?, ?)""",
+                (mission_id, now, now, root_session_id, current_session_id),
+            )
+            conn.execute(
+                "INSERT INTO mission_sessions (mission_id, session_id, relation, created_at) "
+                "VALUES (?, ?, 'root', ?)",
+                (mission_id, root_session_id, now),
+            )
+            if current_session_id != root_session_id:
+                conn.execute(
+                    "INSERT INTO mission_sessions (mission_id, session_id, relation, created_at) "
+                    "VALUES (?, ?, 'current', ?)",
+                    (mission_id, current_session_id, now),
+                )
+
+        self._execute_write(_do)
+        return mission_id
+
+    def get_mission(self, mission_id: str):
+        row = self._conn.execute(
+            "SELECT * FROM missions WHERE mission_id = ?", (mission_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_mission_for_session(self, session_id: str):
+        row = self._conn.execute(
+            """SELECT m.* FROM missions m
+               JOIN mission_sessions ms ON ms.mission_id = m.mission_id
+               WHERE ms.session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def write_mission_checkpoint(self, checkpoint) -> str:
+        """Atomically insert checkpoint and advance mission pointer."""
+        from agent.durable_mission import MissionCheckpointIntegrityError
+
+        row = self._mission_checkpoint_row(checkpoint)
+
+        def _do(conn):
+            mission = conn.execute(
+                "SELECT current_checkpoint_id FROM missions WHERE mission_id = ?",
+                (checkpoint.mission_id,),
+            ).fetchone()
+            if mission is None:
+                raise MissionCheckpointIntegrityError("mission does not exist")
+            current_id = mission[0]
+            if current_id is None:
+                if checkpoint.parent_checkpoint_id is not None:
+                    raise MissionCheckpointIntegrityError(
+                        "first checkpoint cannot have a parent"
+                    )
+            elif checkpoint.parent_checkpoint_id != current_id:
+                raise MissionCheckpointIntegrityError(
+                    "checkpoint parent is not current checkpoint"
+                )
+            conn.execute(
+                """INSERT INTO mission_checkpoints
+                   (checkpoint_id, mission_id, parent_checkpoint_id, state_version,
+                    created_at, status, objective, phase, completed_steps,
+                    pending_steps, blocker, blocking_unknown, next_action,
+                    forbidden_retries, terminal_state, canonical_repo,
+                    repo_observed_head, codegraph_project, codegraph_fingerprint,
+                    approval_reference, safety_reference, financial_reference,
+                    convergence_reference)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                row,
+            )
+            conn.execute(
+                "UPDATE missions SET current_checkpoint_id = ?, status = ?, updated_at = ? "
+                "WHERE mission_id = ?",
+                (checkpoint.checkpoint_id, checkpoint.status, time.time(), checkpoint.mission_id),
+            )
+
+        self._execute_write(_do)
+        return checkpoint.checkpoint_id
+
+    def load_mission_checkpoint(self, mission_id: str):
+        from agent.durable_mission import MissionCheckpointRequiredError
+
+        mission = self.get_mission(mission_id)
+        if mission is None or mission["current_checkpoint_id"] is None:
+            raise MissionCheckpointRequiredError(
+                f"required checkpoint missing for mission: {mission_id}"
+            )
+        row = self._conn.execute(
+            "SELECT * FROM mission_checkpoints WHERE checkpoint_id = ? AND mission_id = ?",
+            (mission["current_checkpoint_id"], mission_id),
+        ).fetchone()
+        if row is None:
+            raise MissionCheckpointRequiredError(
+                f"required checkpoint missing for mission: {mission_id}"
+            )
+        return self._mission_checkpoint_from_row(row)
+
+    def bind_mission_session(
+        self, mission_id: str, old_session_id: str, new_session_id: str
+    ) -> None:
+        """Atomically bind a rotated session while retaining mission identity."""
+        def _do(conn):
+            mission = conn.execute(
+                "SELECT current_session_id FROM missions WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchone()
+            if mission is None:
+                raise ValueError(f"mission does not exist: {mission_id}")
+            if mission[0] != old_session_id:
+                raise ValueError("mission session binding is stale")
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (new_session_id,)).fetchone() is None:
+                raise ValueError(f"session does not exist: {new_session_id}")
+            now = time.time()
+            conn.execute(
+                "INSERT INTO mission_sessions (mission_id, session_id, relation, created_at) "
+                "VALUES (?, ?, 'continuation', ?)",
+                (mission_id, new_session_id, now),
+            )
+            conn.execute(
+                "UPDATE missions SET current_session_id = ?, updated_at = ? WHERE mission_id = ?",
+                (new_session_id, now, mission_id),
+            )
+
+        self._execute_write(_do)
+
+    def rotate_mission_session(
+        self,
+        mission_id: str,
+        old_session_id: str,
+        new_session_id: str,
+        source: str,
+        **kwargs,
+    ) -> str:
+        """Atomically create a compression child and advance mission binding."""
+        def _do(conn):
+            mission = conn.execute(
+                "SELECT current_session_id FROM missions WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchone()
+            if mission is None or mission[0] != old_session_id:
+                raise ValueError("mission session binding is stale or missing")
+            now = time.time()
+            conn.execute(
+                """INSERT INTO sessions
+                   (id, source, user_id, model, model_config, system_prompt,
+                    parent_session_id, cwd, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_session_id,
+                    source,
+                    kwargs.get("user_id"),
+                    kwargs.get("model"),
+                    json.dumps(kwargs.get("model_config"))
+                    if kwargs.get("model_config") else None,
+                    kwargs.get("system_prompt"),
+                    old_session_id,
+                    kwargs.get("cwd"),
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO mission_sessions (mission_id, session_id, relation, created_at) "
+                "VALUES (?, ?, 'continuation', ?)",
+                (mission_id, new_session_id, now),
+            )
+            conn.execute(
+                "UPDATE missions SET current_session_id = ?, updated_at = ? WHERE mission_id = ?",
+                (new_session_id, now, mission_id),
+            )
+
+        self._execute_write(_do)
+        return new_session_id
+
+    def assert_mission_session(self, mission_id: str, session_id: str) -> None:
+        if self.get_mission_for_session(session_id) is None:
+            raise ValueError("session is not bound to durable mission")
+        mission = self.get_mission_for_session(session_id)
+        if mission["mission_id"] != mission_id:
+            raise ValueError("session belongs to another durable mission")
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 

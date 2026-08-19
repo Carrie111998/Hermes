@@ -370,6 +370,7 @@ class AIAgent:
         provider_data_collection: str = None,
         openrouter_min_coding_score: Optional[float] = None,
         session_id: str = None,
+        mission_id: str = None,
         tool_progress_callback: callable = None,
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
@@ -443,6 +444,7 @@ class AIAgent:
             provider_data_collection=provider_data_collection,
             openrouter_min_coding_score=openrouter_min_coding_score,
             session_id=session_id,
+            mission_id=mission_id,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -520,8 +522,16 @@ class AIAgent:
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
             )
+            if not self.mission_id:
+                bound_mission = self._session_db.get_mission_for_session(self.session_id)
+                if bound_mission:
+                    self.mission_id = bound_mission["mission_id"]
+            if self.mission_id:
+                self._session_db.assert_mission_session(self.mission_id, self.session_id)
             self._session_db_created = True
         except Exception as e:
+            if self.mission_id:
+                raise
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
             logger.warning(

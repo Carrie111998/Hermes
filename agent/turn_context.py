@@ -89,6 +89,13 @@ def build_turn_context(
 
     agent._ensure_db_session()
 
+    # Durable missions restore before any user/model context is assembled.
+    # Missing, corrupt, incompatible, or inconsistent checkpoints raise and
+    # prevent conversation_loop from reaching provider invocation.
+    from agent.durable_mission import restore_mission_for_turn
+
+    restore_mission_for_turn(agent)
+
     # Tell auxiliary_client what the live main provider/model are for this turn.
     try:
         from agent.auxiliary_client import set_runtime_main
@@ -339,6 +346,14 @@ def build_turn_context(
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
+
+    durable_projection = getattr(agent, "_durable_mission_projection", "")
+    if durable_projection:
+        plugin_user_context = (
+            f"{plugin_user_context}\n\n{durable_projection}"
+            if plugin_user_context
+            else durable_projection
+        )
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}

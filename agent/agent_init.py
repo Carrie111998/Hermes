@@ -181,6 +181,7 @@ def init_agent(
     provider_data_collection: str = None,
     openrouter_min_coding_score: Optional[float] = None,
     session_id: str = None,
+    mission_id: str = None,
     tool_progress_callback: callable = None,
     tool_start_callback: callable = None,
     tool_complete_callback: callable = None,
@@ -249,6 +250,8 @@ def init_agent(
             openrouter/pareto-code router. Only applied when model == "openrouter/pareto-code".
             None or empty = let OpenRouter pick the strongest available coder.
         session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
+        mission_id (str): Optional durable mission identity. When set, a valid
+            SessionDB checkpoint is required before model context construction.
         tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
         clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
             Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
@@ -301,6 +304,7 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
+    agent.mission_id = mission_id
     agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""

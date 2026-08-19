@@ -531,13 +531,24 @@ def compress_context(
             except Exception:
                 pass
             agent._session_db_created = False
-            agent._session_db.create_session(
-                session_id=agent.session_id,
-                source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                model=agent.model,
-                model_config=agent._session_init_model_config,
-                parent_session_id=old_session_id,
-            )
+            if getattr(agent, "mission_id", None):
+                agent._session_db.rotate_mission_session(
+                    mission_id=agent.mission_id,
+                    old_session_id=old_session_id,
+                    new_session_id=agent.session_id,
+                    source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model=agent.model,
+                    model_config=agent._session_init_model_config,
+                    system_prompt=new_system_prompt,
+                )
+            else:
+                agent._session_db.create_session(
+                    session_id=agent.session_id,
+                    source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model=agent.model,
+                    model_config=agent._session_init_model_config,
+                    parent_session_id=old_session_id,
+                )
             agent._session_db_created = True
             # Auto-number the title for the continuation session
             if old_title:
@@ -550,6 +561,8 @@ def compress_context(
             # Reset flush cursor — new session starts with no messages written
             agent._last_flushed_db_idx = 0
         except Exception as e:
+            if getattr(agent, "mission_id", None):
+                raise
             logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
     # Notify the context engine that the session_id rotated because of
