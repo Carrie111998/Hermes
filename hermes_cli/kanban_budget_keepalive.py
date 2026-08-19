@@ -717,7 +717,7 @@ def _complete_or_clear_kanban_claim(
 
     now = _now()
     persisted = request_id or ""
-    with kb.write_txn(conn):
+    with kb.write_txn(conn, allow_nested=True):
         cur = conn.execute(
             """
             UPDATE kanban_budget_decisions
@@ -877,7 +877,7 @@ def record_kanban_budget_exhausted(
     send_card: Optional[dict[str, Any]] = None
     decision: Optional[BudgetDecision] = None
 
-    with kb.write_txn(conn):
+    with kb.write_txn(conn, allow_nested=True):
         existing = get_decision(conn, task_id)
 
         if existing and existing.status in (

@@ -3171,7 +3171,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
-    if getattr(conn, "in_transaction", False):
+    if getattr(conn, "in_transaction", False) is True:
         if not allow_nested:
             raise RuntimeError(
                 "write_txn: already inside a transaction. Nested composition "
