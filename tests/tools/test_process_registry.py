@@ -2373,10 +2373,15 @@ class TestOriginUiSessionOwnership:
         with patch.object(registry, "_write_checkpoint"):
             registry._move_to_finished(s)
 
-        event = registry.completion_queue.get_nowait()
+        results = registry.drain_notifications(
+            owns_event=lambda event: event.get("origin_ui_session_id") == "tab_origin"
+        )
+        assert len(results) == 1
+        event, formatted = results[0]
         assert event["type"] == "completion"
         assert event["origin_ui_session_id"] == "tab_origin"
         assert event["session_key"] == "shared-key"
+        assert "proc_owner_completion" in formatted
 
     def test_watch_match_notification_carries_the_origin_tab(self, registry):
         s = _make_session(sid="proc_owner_watch")
@@ -2427,3 +2432,66 @@ class TestOriginUiSessionOwnership:
                 assert fresh.recover_from_checkpoint() == 1
 
         assert fresh._running["proc_owner_ckpt"].origin_ui_session_id == "tab_origin"
+
+
+# ── Prefix resolution (Factory Droid-inspired task-ID prefixes) ──────────────
+
+
+class TestGetByPrefix:
+    """ProcessRegistry.get() resolves unique ID prefixes like git short hashes."""
+
+    def test_full_id_still_exact(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_4dae56ca81f6") is s
+
+    def test_unique_prefix_resolves(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_4dae5") is s
+
+    def test_bare_suffix_resolves(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("4dae56") is s
+
+    def test_finished_sessions_also_resolve(self, registry):
+        s = _make_session(sid="proc_9bee77aa0011", exited=True, exit_code=0)
+        registry._finished[s.id] = s
+        assert registry.get("proc_9bee") is s
+
+    def test_ambiguous_prefix_returns_none(self, registry):
+        a = _make_session(sid="proc_4dae56ca81f6")
+        b = _make_session(sid="proc_4dae99999999")
+        registry._running[a.id] = a
+        registry._running[b.id] = b
+        assert registry.get("proc_4dae") is None
+
+    def test_too_short_prefix_returns_none(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_4da") is None
+        assert registry.get("4da") is None
+        assert registry.get("proc_") is None
+        assert registry.get("") is None
+
+    def test_exact_id_wins_over_prefix_scan(self, registry):
+        # A session whose FULL id happens to be a prefix of another's must
+        # resolve to itself, never trigger the ambiguity path.
+        short = _make_session(sid="proc_4dae")
+        long = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[short.id] = short
+        registry._running[long.id] = long
+        assert registry.get("proc_4dae") is short
+
+    def test_no_match_returns_none(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_ffff") is None
+
+    def test_poll_accepts_prefix(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6", output="hello world")
+        registry._running[s.id] = s
+        result = registry.poll("4dae56ca")
+        assert result["session_id"] == "proc_4dae56ca81f6"
+        assert result["status"] == "running"
