@@ -289,6 +289,10 @@ describe('profile-aware plugin session opens', () => {
   it('waits until the target Bot Chat runtime and history are on main before resolving', async () => {
     vi.mocked(ensureGatewayProfile).mockImplementationOnce(async (target: null | string | undefined) => {
       $activeGatewayProfile.set(target || 'default')
+
+      // The switch published: ensureGatewayProfile reports that as `true`
+      // now, so a stub that returned void no longer satisfies the type.
+      return true
     })
 
     let resolved = false
@@ -338,6 +342,10 @@ describe('profile-aware plugin session opens', () => {
   it('requests an explicit resume on a cold open where selection has not settled (#89206)', async () => {
     vi.mocked(ensureGatewayProfile).mockImplementationOnce(async (target: null | string | undefined) => {
       $activeGatewayProfile.set(target || 'default')
+
+      // The switch published: ensureGatewayProfile reports that as `true`
+      // now, so a stub that returned void no longer satisfies the type.
+      return true
     })
 
     // Cold-start shape from the field: the persisted route already points at
@@ -394,6 +402,10 @@ describe('profile-aware plugin session opens', () => {
   it('resolves a history-bearing wake on transcript paint without waiting for the runtime (paint-first)', async () => {
     vi.mocked(ensureGatewayProfile).mockImplementationOnce(async (target: null | string | undefined) => {
       $activeGatewayProfile.set(target || 'default')
+
+      // The switch published: ensureGatewayProfile reports that as `true`
+      // now, so a stub that returned void no longer satisfies the type.
+      return true
     })
 
     setMockAtom($selectedStoredSessionId, null)
@@ -468,6 +480,10 @@ describe('profile-aware plugin session opens', () => {
   it('lets the latest rapid bot selection win and cancels the older hydration wait', async () => {
     vi.mocked(ensureGatewayProfile).mockImplementation(async (target: null | string | undefined) => {
       $activeGatewayProfile.set(target || 'default')
+
+      // The switch published: ensureGatewayProfile reports that as `true`
+      // now, so a stub that returned void no longer satisfies the type.
+      return true
     })
 
     const firstOutcome = host

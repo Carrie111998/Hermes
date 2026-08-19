@@ -295,7 +295,14 @@ async function resolveConnectionForProfile(profile: string) {
 // their sockets — so their sessions keep streaming concurrently. A null/empty
 // target means "no explicit profile" → keep the current gateway (a plain new
 // chat stays put; single-profile users never leave the primary).
-export async function ensureGatewayProfile(profile: string | null | undefined): Promise<void> {
+//
+// Resolves to whether the active gateway now serves `profile`. A switch can
+// decline to publish - `prepareGatewayForProfile`'s thunk returns false when
+// its entry was torn down mid-dial or its activation epoch was superseded -
+// and that answer used to be discarded here, so the promise resolved
+// successfully having changed nothing at all. The profile rail click then did
+// nothing, reported nothing, and left no way for the caller to know (#89586).
+export async function ensureGatewayProfile(profile: string | null | undefined): Promise<boolean> {
   if (profile == null || !String(profile).trim()) {
     // "No explicit profile" = use the current gateway. But if an explicit swap
     // (e.g. the user just picked a profile in the switcher) is still in flight,
@@ -305,13 +312,15 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
       await gatewaySwitch.catch(() => undefined)
     }
 
-    return
+    // No explicit target: whatever is active is by definition what was asked
+    // for, so this is a satisfied request rather than a declined switch.
+    return true
   }
 
   const target = normalizeProfileKey(profile)
 
   if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
-    return
+    return true
   }
 
   // Serialize concurrent activations so two rapid session switches don't race
@@ -320,11 +329,15 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
     await gatewaySwitch.catch(() => undefined)
 
     if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
-      return
+      return true
     }
   }
 
   $gatewaySwapTarget.set(target)
+  // Set by the batch below and read after the switch settles: the thunk's
+  // verdict is the ONLY signal that separates "switched" from "declined", and
+  // batch() discards whatever its callback returns.
+  let published = false
   gatewaySwitch = (async () => {
     // Resolve the target's connection descriptor and open (or reuse) its
     // socket BEFORE anything is published — without closing the profile you
@@ -355,16 +368,21 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
         return
       }
 
+      published = true
       $activeGatewayProfile.set(target)
 
       if (connection) {
         setConnection(connection)
       }
     })
-  })().catch(() => {
+  })().catch((error: unknown) => {
     // Descriptor lookup failed: the switch fails as a unit. Nothing was
     // published, so every atom still consistently describes the previous
-    // profile; the user can retry the switch.
+    // profile. `published` stays false, so the caller is told the switch did
+    // not happen - and the reason is logged rather than dropped, because an
+    // empty catch here made a failed switch and a successful one produce
+    // byte-identical observable behaviour (#89586).
+    console.warn('[profile] gateway switch failed', { error, profile: target })
   })
 
   try {
@@ -373,6 +391,8 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
     gatewaySwitch = null
     $gatewaySwapTarget.set(null)
   }
+
+  return published
 }
 
 // Registry-aware sibling of syncConnectionToActiveProfile: a connection-scoped
@@ -415,7 +435,12 @@ async function resolveConnectionForActiveAgent(
 //    descriptor.
 // Only a null connectionId falls through to the legacy profile path. Explicit
 // `local` is a registry identity and must use the genuinely-local route.
-export async function ensureGatewayAgent(connectionId: null | string, profile: string): Promise<void> {
+//
+// Resolves to whether the activation was published, for the same reason the
+// profile seam does (#89586): `prepareGatewayForAgent`'s thunk already reports
+// a disposed target, and dropping that answer left "switched" and "the target
+// stopped existing mid-dial" indistinguishable to every caller.
+export async function ensureGatewayAgent(connectionId: null | string, profile: string): Promise<boolean> {
   const target = normalizeProfileKey(profile)
   const connection = (connectionId ?? '').trim() || null
 
@@ -429,6 +454,7 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
   }
 
   $gatewaySwapTarget.set(target)
+  let published = false
   gatewaySwitch = (async () => {
     // Dial the agent's socket and resolve its descriptor without publishing
     // either, exactly like the profile path above. Activating first and then
@@ -454,6 +480,7 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
         return
       }
 
+      published = true
       $activeGatewayProfile.set(target)
 
       // Remote-aware paths (image.attach_bytes vs image.attach, /api/fs/*,
@@ -472,6 +499,8 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
     gatewaySwitch = null
     $gatewaySwapTarget.set(null)
   }
+
+  return published
 }
 
 // ── Sidebar profile scope (the "workspace switcher" model) ─────────────────

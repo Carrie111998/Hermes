@@ -470,8 +470,14 @@ export const host = {
    *  and rapid switches can't land out of order. The local source falls
    *  through to the profile path — single-source plugins keep working
    *  against older behavior unchanged. */
-  ensureAgent: async (connectionId: null | string, profile: string): Promise<void> =>
-    ensureGatewayAgent(connectionId, (profile ?? '').trim() || 'default'),
+  ensureAgent: async (connectionId: null | string, profile: string): Promise<void> => {
+    // The store seam now reports whether the activation published (#89586).
+    // Deliberately NOT widened here: this is the public plugin SDK surface,
+    // and changing its resolved type is a compatibility decision for the
+    // maintainers rather than a side effect of an internal fix. Awaited and
+    // discarded so the plugin contract is byte-for-byte what it was.
+    await ensureGatewayAgent(connectionId, (profile ?? '').trim() || 'default')
+  },
 
   openSession: async (storedSessionId: string, options: PluginOpenSessionOptions = {}): Promise<void> => {
     const generation = ++openSessionGeneration

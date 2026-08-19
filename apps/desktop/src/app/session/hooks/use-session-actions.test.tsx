@@ -535,7 +535,7 @@ describe('createBackendSessionForSend profile routing', () => {
   })
 
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {
-    const profileReady = deferred<void>()
+    const profileReady = deferred<boolean>()
     vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)
 
     setCurrentModel('anthropic/claude-sonnet-4.6')
@@ -571,7 +571,7 @@ describe('createBackendSessionForSend profile routing', () => {
     setCurrentProvider('openai-codex')
     setCurrentReasoningEffort('low')
     setCurrentFastMode(true)
-    profileReady.resolve()
+    profileReady.resolve(true)
 
     await act(async () => {
       await createPromise

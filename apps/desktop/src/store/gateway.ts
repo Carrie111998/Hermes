@@ -812,8 +812,14 @@ export async function prepareGatewayForProfile(profile: string): Promise<() => b
 
 // Make `profile` the active gateway, lazily opening its socket if needed. The
 // primary is a no-op fast path. Background sockets are never closed here.
-export async function ensureGatewayForProfile(profile: string): Promise<void> {
-  ;(await prepareGatewayForProfile(profile))()
+//
+// Reports whether the activation was PUBLISHED, exactly like the agent-scoped
+// `ensureGatewayForAgent`. The thunk has always returned that answer and this
+// seam used to drop it on the floor, so a rejected activation (entry torn down
+// mid-dial, or an epoch superseded by an eviction) was indistinguishable from
+// a completed switch to every caller (#89586).
+export async function ensureGatewayForProfile(profile: string): Promise<boolean> {
+  return (await prepareGatewayForProfile(profile))()
 }
 
 // Reconnect the active gateway after a transient request failure. Primary
