@@ -39,8 +39,43 @@ def test_fabricated_tool_transcripts_detected():
     )
     assert _is_failed_reference(fabricated)
     # Either bracket alone is enough — an advisor has no tools.
-    assert _is_failed_reference("advice then [tool result: {}] more text")
+    assert _is_failed_reference('[tool result: {"output": "ok"}]')
     assert _is_failed_reference("[called tool: read_file({})]")
+
+
+def test_quoted_bracket_markers_are_not_fabrication():
+    """The digest hands advisors substance artifacts in fences and detail
+    lines in `> ` quotes — an advisor QUOTING task material that contains
+    bracket markers (reviewing a log/transcript) is real advice, not a
+    fabricated action log (upstream review point on #85229)."""
+    fenced = (
+        "The transcript you're reviewing shows the degradation pattern:\n"
+        "~~~\n"
+        "[called tool: terminal({})]\n"
+        "[tool result: {'exit': 0}]\n"
+        "~~~\n"
+        "Recommend stripping these markers before the advisor sees them."
+    )
+    assert not _is_failed_reference(fenced)
+
+    backtick_fenced = fenced.replace("~~~", "```")
+    assert not _is_failed_reference(backtick_fenced)
+
+    quoted = (
+        "The log line in question:\n"
+        "> [tool result: {'output': 'Cloning...'}]\n"
+        "This is the imitable syntax the digest view removes."
+    )
+    assert not _is_failed_reference(quoted)
+
+    # Mid-sentence mention is commentary, not an action log.
+    assert not _is_failed_reference(
+        "advice: strip any [tool result: ...] markers from the digest"
+    )
+
+    # But an unquoted action-log line after a closed fence still fails.
+    reopened = fenced + "\n[called tool: terminal({})]"
+    assert _is_failed_reference(reopened)
 
 
 def test_scaffold_echoes_detected():
@@ -97,7 +132,7 @@ def test_truncated_thinking_becomes_actionable_failure(monkeypatch):
         "agent.moa_loop._slot_runtime",
         return_value={"provider": "openrouter", "model": "some/thinking-model"},
     ), patch("agent.moa_loop.call_llm", side_effect=fake_call_llm), patch(
-        "agent.moa_loop._maybe_apply_moa_cache_control", side_effect=lambda msgs, rt: msgs
+        "agent.moa_loop._maybe_apply_moa_cache_control", side_effect=lambda msgs, rt, **kw: msgs
     ):
         _label, text, _acct = _run_reference(
             slot, [{"role": "user", "content": "hi"}], max_tokens=800
@@ -126,7 +161,7 @@ def test_empty_without_cap_stays_placeholder(monkeypatch):
         "agent.moa_loop._slot_runtime",
         return_value={"provider": "openrouter", "model": "some/model"},
     ), patch("agent.moa_loop.call_llm", side_effect=fake_call_llm), patch(
-        "agent.moa_loop._maybe_apply_moa_cache_control", side_effect=lambda msgs, rt: msgs
+        "agent.moa_loop._maybe_apply_moa_cache_control", side_effect=lambda msgs, rt, **kw: msgs
     ):
         _label, text, _acct = _run_reference(
             slot, [{"role": "user", "content": "hi"}], max_tokens=None

@@ -1434,6 +1434,10 @@ def _reference_messages_digest(
             else:
                 turn["actions"].append(_narrate_tool_action(name, args_text, text))
             recent.append((name, args_text, text))
+            # Only the last K entries feed the detail section; trim on append
+            # so a long session doesn't retain every raw result text in
+            # memory for the whole render.
+            del recent[:-_REFERENCE_DETAIL_RESULTS]
         # Any other role is ignored.
     _flush_pending()
 
@@ -1456,7 +1460,7 @@ def _reference_messages_digest(
     # every iteration anyway, so the detail rides here instead of rewriting
     # stable frames (which would break the advisor cache prefix).
     if rendered and rendered[-1].get("role") == "assistant":
-        detail = _detail_section(recent[-_REFERENCE_DETAIL_RESULTS:])
+        detail = _detail_section(recent)  # already trimmed to the last K
         content = _ADVISORY_INSTRUCTION + ("\n\n" + detail if detail else "")
         rendered.append({"role": "user", "content": content})
 
@@ -1533,6 +1537,35 @@ _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correctio
 _ADVISORY_ECHO_ANCHOR_LEN = 60
 
 
+def _contains_fabricated_action_log(text: str) -> bool:
+    """True when advisor output contains bracket action-log lines as its OWN
+    prose — the fabricated ``[called tool:]``/``[tool result:]`` transcripts
+    degraded advisors emit (they have no tools, so any such log is invented).
+
+    Line-anchored and quote-aware: the digest itself hands advisors substance
+    artifacts inside ``~~~``/`` ``` `` fences and ``> ``-quoted detail lines,
+    so an advisor legitimately QUOTING task material that contains those
+    tokens (reviewing a log file or an agent transcript) must not be
+    misclassified. Only an unquoted line that *starts* with a bracket marker
+    counts — the shape of an action log, not a mention or a quotation.
+    """
+    fence: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+            continue
+        if fence is not None or stripped.startswith(">"):
+            continue
+        if stripped.startswith("[called tool:") or stripped.startswith("[tool result:"):
+            return True
+    return False
+
+
 def _is_failed_reference(text: str) -> bool:
     """Return whether a reference output is unusable as advice.
 
@@ -1543,9 +1576,12 @@ def _is_failed_reference(text: str) -> bool:
 
       - blank text / the ``(empty response)`` placeholder (observed when a
         thinking advisor burns its whole output cap on reasoning);
-      - fabricated action transcripts (``[called tool:`` / ``[tool result:``
-        blocks — an advisor has no tools, so any such text is confabulated
-        and, injected into the aggregator prompt, reads as a fake action log);
+      - fabricated action transcripts (unquoted lines starting with
+        ``[called tool:`` / ``[tool result:`` — an advisor has no tools, so
+        an action log in its own voice is confabulated and, injected into
+        the aggregator prompt, reads as a fake action log; quoted/fenced
+        occurrences are task material and pass — see
+        ``_contains_fabricated_action_log``);
       - verbatim echoes of context scaffolding (the advisory instruction or
         the interrupt marker) instead of actual analysis.
 
@@ -1558,7 +1594,7 @@ def _is_failed_reference(text: str) -> bool:
     sentinel = stripped.lower()
     if sentinel.startswith("[failed:") or sentinel.startswith("[skipped:"):
         return True
-    if "[called tool:" in text or "[tool result:" in text:
+    if _contains_fabricated_action_log(text):
         return True
     if (
         stripped.startswith(_ADVISORY_INSTRUCTION[:_ADVISORY_ECHO_ANCHOR_LEN])
@@ -1585,6 +1621,24 @@ def _degraded_notice(failed_labels: list[str], policy: str) -> str:
     if not failed_labels or policy.strip().lower() == "silent":
         return ""
     return f"[Reference models unavailable: {', '.join(failed_labels)}]"
+
+
+def _reference_view_fields(cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """Resolve the advisory-view fields from a preset (or flattened moa
+    config) into ``_reference_messages`` kwargs.
+
+    Two call paths read these fields: ``MoAChatCompletions.create`` from the
+    per-preset dict, and the one-shot ``/moa`` path in ``conversation_loop``
+    from the flattened top-level config. Keeping key names and defaults in
+    one place stops the two from silently diverging (e.g. one falling back
+    to "digest" while the other honors an override).
+    """
+    cfg = cfg or {}
+    return {
+        "view": str(cfg.get("reference_view") or "digest"),
+        "detail_tools": cfg.get("reference_detail_tools"),
+        "prose_budget": cfg.get("reference_prose_budget"),
+    }
 
 
 def aggregate_moa_context(
@@ -2355,8 +2409,8 @@ class MoAChatCompletions:
         if not preset.get("enabled", True):
             reference_models = []
 
-        # Internal harness forks (background review/curator) inherit the MoA
-        # provider from the parent agent but run harness-generated prompts,
+        # Internal harness forks (agent/background_review.py, agent/curator.py)
+        # inherit the MoA provider from the parent agent but run harness-generated prompts,
         # not the user's task. Fanning advisors out on those burned ~100K+
         # tokens per housekeeping turn, and advisors sometimes answered the
         # harness prompt instead of the task (observed in traces). The fork
@@ -2368,12 +2422,7 @@ class MoAChatCompletions:
         from agent.usage_pricing import CanonicalUsage
 
         reference_outputs: list[tuple[str, str, Any]] = []
-        ref_messages = _reference_messages(
-            messages,
-            view=str(preset.get("reference_view") or "digest"),
-            detail_tools=preset.get("reference_detail_tools"),
-            prose_budget=preset.get("reference_prose_budget"),
-        )
+        ref_messages = _reference_messages(messages, **_reference_view_fields(preset))
 
         # Fan-out cadence. "user_turn" (default — cheapest cadence, #67199):
         # advisors run ONCE per user turn; subsequent tool iterations reuse
