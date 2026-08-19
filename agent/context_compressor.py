@@ -745,8 +745,9 @@ def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> st
     hint = (
         # The public tool's query shape receives current_session_id from
         # agent/tool_executor.py. Passing session_id here would switch the tool
-        # to its bounded READ shape and ignore the query.
-        f" Recover with session_search(query=...)"
+        # to its bounded READ shape and ignore the query. Discovery defaults to
+        # user/assistant, so demoted tool output needs an explicit tool filter.
+        f" Recover with session_search(query=..., role_filter='tool', detail='full')"
         if session_id else ""
     )
     return (
@@ -822,7 +823,8 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
         "session history. If you need any detail this summary does not carry "
         "(exact command output, file contents, error text, earlier "
         "reasoning), recover it with: "
-        f"session_search(query='<keywords>') — "
+        f"session_search(query='<keywords>', "
+        "role_filter='user,assistant,tool', detail='full') — "
         "do not guess at lost specifics when you can look them up."
     )
 
