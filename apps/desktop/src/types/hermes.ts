@@ -1177,8 +1177,8 @@ export interface SessionSearchResult {
   session_started: number | null
   snippet: string
   source: string | null
-  /** Stored session title, when the backend hydrated the row (metadata/ID
-   *  hits carry it; message-content hits may not). */
+  /** Stored session title, hydrated by the server via
+   *  `get_session_rich_row` (all search lanes). */
   title?: string | null
 }
 
