@@ -235,6 +235,14 @@ $activeGatewayProfile.subscribe(value => {
 // so a lazy spawn doesn't read as a hang. Single-profile users never swap.
 export const $gatewaySwapTarget = atom<string | null>(null)
 
+// Last gateway-switch failure, published instead of being swallowed by the
+// switch's internal catch. The rail used to die SILENTLY on a failed
+// descriptor lookup or dial — a dead click with no log and no UI state read
+// as a broken rail, and the user had no way to know the switch even ran.
+// Surfacing it lets the swap overlay show why the switch didn't happen, and
+// makes the failure diagnosable in the console on the first click.
+export const $gatewaySwitchError = atom<{ profile: string; message: string } | null>(null)
+
 // ── Hover-intent backend pre-warm ───────────────────────────────────────────
 // A cold switch to a profile whose pool backend isn't running pays the full
 // spawn (Python boot + port announce + readiness probe — measured ~2.5-3s)
@@ -269,6 +277,14 @@ export function prewarmProfileBackend(name: string): void {
 }
 
 let gatewaySwitch: Promise<void> | null = null
+
+// A switch that never settles (a hung descriptor IPC, a wedged dial) must not
+// brick the rail: every later click awaits the previous switch's promise, so
+// one stuck switch would make ALL subsequent profile clicks silently dead.
+// Bound the wait so a wedged switch degrades to a visible error instead of a
+// permanent no-op. Longer than the gateway connect timeout (15s) plus a cold
+// spawn, so healthy switches never hit it.
+export const GATEWAY_SWITCH_MUTEX_TIMEOUT_MS = 30_000
 
 // The target profile's connection descriptor (mode / baseUrl / …), resolved
 // CONCURRENTLY with the socket work so the switch can publish the profile
@@ -328,13 +344,25 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   // Serialize concurrent activations so two rapid session switches don't race
   // the active pointer.
   if (gatewaySwitch) {
-    await gatewaySwitch.catch(() => undefined)
+    // Bound the mutex wait: a wedged in-flight switch (hung descriptor IPC or
+    // stuck dial) must not block every later click forever. The previous
+    // switch failing-open here is safe — the activation epoch guard (see
+    // applyActive) means a stale switch can no longer publish once THIS one
+    // begins; and any real failure it would have surfaced gets surfaced by
+    // the new attempt (or its own catch, whichever lands first).
+    await Promise.race([
+      gatewaySwitch.catch(() => undefined),
+      new Promise(resolve => setTimeout(resolve, GATEWAY_SWITCH_MUTEX_TIMEOUT_MS))
+    ])
 
     if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
       return
     }
   }
 
+  // A fresh switch attempt clears the previous failure: the error atom shows
+  // the LAST failed switch, and an in-flight retry hasn't failed yet.
+  $gatewaySwitchError.set(null)
   $gatewaySwapTarget.set(target)
   gatewaySwitch = (async () => {
     // ensureGatewayForProfile opens (or reuses) the target's socket and points
@@ -357,13 +385,28 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
         setConnection(connection)
       }
     })
-  })()
+  })().catch(error => {
+    // The switch failed as a unit (socket dial or activation). Surfaced here
+    // instead of swallowed: a dead click with no log and no UI state read as
+    // a broken rail, and hid the real reason (e.g. a failing dial) from both
+    // the console and the swap overlay.
+    const message = error instanceof Error ? error.message : String(error ?? 'unknown error')
+    console.error(`[profile] gateway switch to "${target}" failed: ${message}`)
+    $gatewaySwitchError.set({ profile: target, message })
+  })
+
+  const currentSwitch = gatewaySwitch
 
   try {
-    await gatewaySwitch
+    await currentSwitch
   } finally {
-    gatewaySwitch = null
-    $gatewaySwapTarget.set(null)
+    // Only the OWNER of the mutex clears it. If the bounded mutex wait above
+    // let a newer switch start while this one was still wedged, this stale
+    // finally must not null out the NEWER switch's promise or its swap target.
+    if (gatewaySwitch === currentSwitch) {
+      gatewaySwitch = null
+      $gatewaySwapTarget.set(null)
+    }
   }
 }
 
@@ -415,7 +458,13 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
 
   // Serialize against any in-flight profile/agent switch (shared mutex).
   if (gatewaySwitch) {
-    await gatewaySwitch.catch(() => undefined)
+    // Bounded like the profile path: a wedged in-flight switch must not block
+    // every later activation forever. The epoch guard makes a stale switch's
+    // late activation a no-op, so failing open here is safe.
+    await Promise.race([
+      gatewaySwitch.catch(() => undefined),
+      new Promise(resolve => setTimeout(resolve, GATEWAY_SWITCH_MUTEX_TIMEOUT_MS))
+    ])
   }
 
   $gatewaySwapTarget.set(target)
@@ -449,11 +498,18 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
     })
   })()
 
+  const currentSwitch = gatewaySwitch
+
   try {
-    await gatewaySwitch
+    await currentSwitch
   } finally {
-    gatewaySwitch = null
-    $gatewaySwapTarget.set(null)
+    // Only the OWNER of the mutex clears it. If the bounded mutex wait above
+    // let a newer switch start while this one was still wedged, this stale
+    // finally must not null out the NEWER switch's promise or its swap target.
+    if (gatewaySwitch === currentSwitch) {
+      gatewaySwitch = null
+      $gatewaySwapTarget.set(null)
+    }
   }
 }
 

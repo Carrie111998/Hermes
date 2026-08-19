@@ -2210,6 +2210,7 @@ export const en: Translations = {
   composer: {
     message: 'Message',
     wakingProfile: profile => `Waking up ${profile}…`,
+    switchFailed: profile => `Couldn't switch to ${profile}`,
     placeholderStarting: 'Starting Hermes...',
     placeholderReconnecting: 'Reconnecting to Hermes…',
     placeholderFollowUp: 'Send follow-up',

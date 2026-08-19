@@ -1737,6 +1737,7 @@ export const ar = defineLocale({
   composer: {
     message: 'الرسالة',
     wakingProfile: profile => `جار إيقاظ ${profile}`,
+    switchFailed: profile => `تعذّر التبديل إلى ${profile}`,
     placeholderStarting: 'جار بدء Hermes...',
     placeholderReconnecting: 'جار إعادة الاتصال...',
     placeholderFollowUp: 'اكتب متابعة...',

@@ -22,11 +22,13 @@ vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
 const {
   $activeGatewayProfile,
+  $gatewaySwitchError,
   $profiles,
   ensureGatewayProfile,
   invalidateProfileListFetches,
   prewarmProfileBackend,
-  refreshProfiles
+  refreshProfiles,
+  GATEWAY_SWITCH_MUTEX_TIMEOUT_MS
 } = await import('./profile')
 
 const { $connection } = await import('./session')
@@ -96,13 +98,60 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect($connection.get()?.mode).toBe('local')
   })
 
-  it('leaves the prior connection intact when the descriptor fetch fails', async () => {
-    getConnection.mockRejectedValue(new Error('backend unreachable'))
+  it('leaves the prior connection intact when the switch fails', async () => {
+    // The gateway activation rejected (socket dial / descriptor lookup inside
+    // ensureGatewayForProfile). That failure is surfaced ($gatewaySwitchError
+    // + console.error) instead of swallowed, so a dead click with no log and
+    // no UI state never happens again. Nothing else was published: the
+    // connection descriptor and active profile stay on the previous one.
+    ensureGatewayForProfile.mockRejectedValueOnce(new Error('backend unreachable'))
 
     await ensureGatewayProfile('vps-remote')
 
     // Best-effort: boot/reconnect resyncs later; we must not null it out here.
     expect($connection.get()?.mode).toBe('local')
+    expect($activeGatewayProfile.get()).toBe('default')
+    expect($gatewaySwitchError.get()).toEqual({ profile: 'vps-remote', message: 'backend unreachable' })
+  })
+
+  it('clears a previous switch error once a fresh switch attempt starts', async () => {
+    // The error atom holds the LAST failed switch. A new attempt must clear it
+    // first so a retry that succeeds does not leave a stale failure banner.
+    ensureGatewayForProfile.mockRejectedValueOnce(new Error('first attempt failed'))
+    await ensureGatewayProfile('vps-remote')
+    expect($gatewaySwitchError.get()).toEqual({ profile: 'vps-remote', message: 'first attempt failed' })
+
+    ensureGatewayForProfile.mockResolvedValueOnce(undefined)
+    await ensureGatewayProfile('vps-remote')
+
+    expect($gatewaySwitchError.get()).toBeNull()
+    expect($activeGatewayProfile.get()).toBe('vps-remote')
+  })
+
+  it('a wedged in-flight switch cannot block later clicks forever (bounded mutex)', async () => {
+    // A hung descriptor IPC (never resolves, never rejects) used to wedge the
+    // gatewaySwitch mutex: every later click awaited the stuck promise and
+    // the rail went permanently dead. The mutex wait is now bounded, so a
+    // wedged switch degrades to a visible no-op instead of a silent one.
+    vi.useFakeTimers()
+
+    try {
+      getConnection.mockReturnValueOnce(new Promise(() => undefined)) // wedged switch
+      const wedged = ensureGatewayProfile('vps-remote')
+      await vi.advanceTimersByTimeAsync(0) // let the wedged call arm its mutex
+
+      // Second click while the first is stuck: must not await it forever.
+      getConnection.mockResolvedValue(localConn({ profile: 'coder' }))
+      const retry = ensureGatewayProfile('coder')
+
+      await vi.advanceTimersByTimeAsync(GATEWAY_SWITCH_MUTEX_TIMEOUT_MS + 1)
+      await retry
+
+      expect($activeGatewayProfile.get()).toBe('coder')
+      expect(wedged).not.toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('does not churn $connection when the target is already the active profile', async () => {

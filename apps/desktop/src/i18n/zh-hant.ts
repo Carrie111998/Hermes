@@ -1849,6 +1849,7 @@ export const zhHant = defineLocale({
   composer: {
     message: '訊息',
     wakingProfile: profile => `正在喚醒 ${profile}…`,
+    switchFailed: profile => `無法切換到 ${profile}`,
     placeholderStarting: '正在啟動 Hermes...',
     placeholderReconnecting: '正在重新連線至 Hermes…',
     placeholderFollowUp: '傳送後續訊息',

@@ -29,7 +29,7 @@ import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
-import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
+import { $activeGatewayProfile, $gatewaySwapTarget, $gatewaySwitchError, $profiles } from '@/store/profile'
 import {
   $contextSuggestions,
   $freshDraftReady,
@@ -377,6 +377,7 @@ export const ChatView = memo(function ChatView({
   const freshDraftReady = useStore($freshDraftReady)
   const gatewayState = useStore($gatewayState)
   const gatewaySwapTarget = useStore($gatewaySwapTarget)
+  const gatewaySwitchError = useStore($gatewaySwitchError)
   const gatewayOpen = gatewayState === 'open'
   const introPersonality = useStore($introPersonality)
   const introSeed = useStore($introSeed)
@@ -636,7 +637,7 @@ export const ChatView = memo(function ChatView({
           {/* A session drag hovering an EDGE hands the visual to the zone
               target; the link overlay shows only for the center region. */}
           <ChatDropOverlay kind={overlayKind} />
-          <ChatSwapOverlay profile={gatewaySwapTarget} />
+          <ChatSwapOverlay error={gatewaySwitchError} profile={gatewaySwapTarget} />
         </div>
         {/* Composer renders OUTSIDE the contain:[layout paint] wrapper above:
             that wrapper is a containing block for — and clips — position:fixed

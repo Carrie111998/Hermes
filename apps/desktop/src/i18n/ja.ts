@@ -1911,6 +1911,7 @@ export const ja = defineLocale({
   composer: {
     message: 'メッセージ',
     wakingProfile: profile => `${profile} を起動中…`,
+    switchFailed: profile => `${profile} に切り替えられません`,
     placeholderStarting: 'Hermes を起動中...',
     placeholderReconnecting: 'Hermes に再接続中…',
     placeholderFollowUp: 'フォローアップを送信',
