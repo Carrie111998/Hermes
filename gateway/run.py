@@ -21302,35 +21302,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # snapshot from another session or from before the swap. This mirrors
         # the runtime the next conversation turn would use (#goal judge
         # RateLimitError loop after preset switches — 2026-08-04).
-        _main_runtime = None
-        try:
-            _turn_model, _turn_runtime = self._resolve_session_agent_runtime(
-                source=source,
-                session_key=self._session_key_for_source(source) if source else None,
-            )
-            if _turn_model:
-                _main_runtime = dict(_turn_runtime or {})
-                _main_runtime["model"] = _turn_model
-        except Exception:
-            logger.debug("goal continuation: session runtime resolution failed", exc_info=True)
-
         # evaluate_after_turn calls judge_goal() which makes a synchronous
-        # HTTP request to the auxiliary LLM.  Running it on the event-loop
-        # thread would block Discord heartbeats for 10-40 s and cause
-        # connection flaps, so we offload it to a thread-pool executor.
+        # HTTP request to the auxiliary LLM. Running both the runtime
+        # resolution and goal evaluation in the same executor closure keeps
+        # all blocking work off the event-loop thread while preserving the
+        # resolved per-session runtime for the judge.
         # _run_in_executor_with_context (not bare run_in_executor): the
         # profile secret scope and auxiliary runtime context are contextvars,
         # and a default-executor hop would drop them — aux-client provider
         # resolution would then read credentials unscoped and fail under
         # multiplexing (same pattern as compression in slash_commands.py).
-        decision = await self._run_in_executor_with_context(
-            lambda: mgr.evaluate_after_turn(
+        def _evaluate_goal_after_turn():
+            _main_runtime = None
+            try:
+                _turn_model, _turn_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=self._session_key_for_source(source) if source else None,
+                )
+                if _turn_model:
+                    _main_runtime = dict(_turn_runtime or {})
+                    _main_runtime["model"] = _turn_model
+            except Exception:
+                logger.debug("goal continuation: session runtime resolution failed", exc_info=True)
+
+            return mgr.evaluate_after_turn(
                 final_response or "",
                 user_initiated=True,
                 background_processes=_bg_procs,
                 main_runtime=_main_runtime,
-            ),
-        )
+            )
+
+        decision = await self._run_in_executor_with_context(_evaluate_goal_after_turn)
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the

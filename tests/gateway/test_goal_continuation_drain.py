@@ -18,6 +18,7 @@ silently stalling goal loops on messaging gateways.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -241,9 +242,15 @@ async def test_runner_passes_resolved_session_runtime_to_goal_judge(hermes_home)
     runner.adapters = {Platform.SLACK: adapter}
 
     # Simulate a per-session route resolved after a preset swap.
-    runner._resolve_session_agent_runtime = MagicMock(
-        return_value=("model-x", {"provider": "openrouter", "base_url": "https://example"})
-    )
+    loop_thread_id = threading.get_ident()
+    resolver_thread_ids = []
+    evaluation_thread_ids = []
+
+    def _resolve_runtime(**kwargs):
+        resolver_thread_ids.append(threading.get_ident())
+        return "model-x", {"provider": "openrouter", "base_url": "https://example"}
+
+    runner._resolve_session_agent_runtime = MagicMock(side_effect=_resolve_runtime)
     runner._session_key_for_source = MagicMock(return_value=adapter_key)
 
     GoalManager(session_entry.session_id).set("ship it")
@@ -254,7 +261,16 @@ async def test_runner_passes_resolved_session_runtime_to_goal_judge(hermes_home)
         captured.update(kwargs)
         return ("continue", "still needs work", False, None, False)
 
-    with patch("hermes_cli.goals.judge_goal", side_effect=_fake_judge):
+    evaluate_after_turn = GoalManager.evaluate_after_turn
+
+    def _record_evaluation_thread(self, *args, **kwargs):
+        evaluation_thread_ids.append(threading.get_ident())
+        return evaluate_after_turn(self, *args, **kwargs)
+
+    with (
+        patch.object(GoalManager, "evaluate_after_turn", _record_evaluation_thread),
+        patch("hermes_cli.goals.judge_goal", side_effect=_fake_judge),
+    ):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -262,6 +278,16 @@ async def test_runner_passes_resolved_session_runtime_to_goal_judge(hermes_home)
         )
         await asyncio.sleep(0.05)
 
+    assert resolver_thread_ids and all(
+        thread_id != loop_thread_id for thread_id in resolver_thread_ids
+    ), "session runtime resolution must not run on the event-loop thread"
+    assert evaluation_thread_ids and all(
+        thread_id != loop_thread_id for thread_id in evaluation_thread_ids
+    ), "goal evaluation must not run on the event-loop thread"
+    runner._resolve_session_agent_runtime.assert_called_once_with(
+        source=src,
+        session_key=adapter_key,
+    )
     assert captured.get("main_runtime") == {
         "provider": "openrouter",
         "base_url": "https://example",
