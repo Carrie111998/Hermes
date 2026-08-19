@@ -118,39 +118,49 @@ class _FakePsycopgConn:
 
 
 # ---------------------------------------------------------------------------
-# Test A: execute() path reconnects and retries on broken connection
+# Test A: execute() must NOT replay a write on a fresh connection
 # ---------------------------------------------------------------------------
 
 
-class TestExecuteRetriesOnBrokenConnection:
-    """A stale TCP connection is discovered during execute(), not cursor()."""
+class TestExecuteFailsClosedOnBrokenConnection:
+    """Connection loss during a write must propagate, not silently replay.
 
-    def test_execute_retries_once_on_broken_connection(self):
-        """_PostgresCursor.execute() reconnects and retries once on a broken
-        connection error (the stale-TCP failure path).
-        """
-        from hermes_state_postgres import (
-            _PostgresConnection,
-            _PostgresCursor,
-            _is_connection_broken_error,
-        )
+    A stale TCP connection is usually discovered during execute() rather than
+    at cursor() time, which makes reconnect-and-replay look like the obvious
+    repair. It is unsafe:
 
-        # Build a psycopg cursor that fails the first execute and succeeds the
-        # second (simulating: first cursor is stale, reconnect gives a fresh one).
+      * ``_reconnect()`` builds the replacement with ``autocommit=True``, so a
+        replayed statement does not belong to the ``BEGIN`` that the enclosing
+        ``_execute_write`` closure opened. It self-commits while the closure
+        believes it is still transactional, so the closure can report success
+        over a partially-applied write.
+      * The replacement connection does not hold the transaction-scoped
+        advisory locks the original acquired.
+      * The first execute's outcome is UNKNOWN when the response is lost — the
+        server may already have applied it — so replay can double-apply a
+        non-idempotent statement.
+
+    Retry belongs at the whole-closure level in ``_execute_write`` and only for
+    known-clean aborts (40001 / 40P01), where the server guarantees the
+    transaction applied nothing.
+    """
+
+    def test_execute_does_not_replay_on_broken_connection(self):
+        """A broken-connection error propagates; the statement is not replayed."""
+        from hermes_state_postgres import _PostgresConnection, _PostgresCursor
+
         call_counts = {"execute": 0}
 
-        class _StaleFirstCursor(_FakePsycopgCursor):
+        class _StaleCursor(_FakePsycopgCursor):
             def execute(self, sql, params=()):
                 call_counts["execute"] += 1
-                if call_counts["execute"] == 1:
-                    raise _FakePsycopgError()  # stale-connection error
-                # Second call succeeds
+                raise _FakePsycopgError()  # stale-connection error
 
         class _FakeConn2:
             autocommit = False
 
             def cursor(self):
-                return _StaleFirstCursor()
+                return _StaleCursor()
 
             def commit(self):
                 pass
@@ -161,7 +171,6 @@ class TestExecuteRetriesOnBrokenConnection:
             def close(self):
                 pass
 
-        # Wire a _PostgresConnection that has this as its inner conn.
         pg_conn = _PostgresConnection.__new__(_PostgresConnection)
         pg_conn._conn = _FakeConn2()
         pg_conn._dsn = "postgresql://fake/db"
@@ -170,23 +179,29 @@ class TestExecuteRetriesOnBrokenConnection:
 
         def _fake_reconnect():
             reconnects[0] += 1
-            # Reconnect replaces the inner conn with another copy
             pg_conn._conn = _FakeConn2()
 
         pg_conn._reconnect = _fake_reconnect
         pg_conn._ensure_live = lambda: None
 
-        # Create cursor and execute — the first execute() call will raise a
-        # broken-connection error; the adapter must reconnect and retry.
         cur = _PostgresCursor(_FakeConn2().cursor(), conn=pg_conn)
-        # Manually replace the underlying cursor with a stale one
-        cur._cursor = _StaleFirstCursor()
+        cur._cursor = _StaleCursor()
 
-        # This must NOT raise despite the first execute failing
-        cur.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)", ("k", "v"))
+        # The error must surface rather than being swallowed by a replay.
+        with pytest.raises(Exception):
+            cur.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)", ("k", "v")
+            )
 
-        assert reconnects[0] == 1, "adapter must reconnect once"
-        assert call_counts["execute"] == 2, "execute must be called twice (fail + retry)"
+        assert call_counts["execute"] == 1, (
+            "the statement must be attempted exactly once — replaying a write "
+            "on a fresh autocommit connection can self-commit outside the "
+            "caller's transaction and double-apply a non-idempotent statement"
+        )
+        assert reconnects[0] == 0, (
+            "cursor-level execute must not reconnect; connection loss during a "
+            "write has to fail closed so the caller can decide"
+        )
 
     def test_execute_does_not_retry_non_connection_errors(self):
         """Non-connection errors propagate immediately without a reconnect."""
@@ -258,8 +273,9 @@ class TestExecuteRetriesOnBrokenConnection:
         with pytest.raises(_FakePsycopgError):
             cur.execute("SELECT 1")
 
-        # Reconnect is called once; the second execute failure propagates
-        assert reconnects[0] == 1
+        # No reconnect at cursor level: the failure propagates on the first
+        # attempt so the caller (_execute_write) owns the retry decision.
+        assert reconnects[0] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -3238,7 +3238,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        postgres_dsn: Optional[str] = None,
+    ):
+        """Open the session store.
+
+        ``postgres_dsn`` pins the physical store explicitly for this instance.
+        Callers that must open a *specific* profile's store (the backend-aware
+        seam) pass it here instead of mutating process-global
+        ``HERMES_STATE_*`` env vars: env mutation is visible to every other
+        thread constructing a ``SessionDB`` concurrently, so a caller could
+        observe another profile's pinned DSN and open the wrong physical store.
+        When None, the backend is resolved normally from env vars + config.
+        """
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
@@ -3361,6 +3377,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     or ""
                 ).strip()
                 _pg_explicitly_selected = _pg_env_backend == "postgres" or bool(_pg_env_dsn)
+                # An explicit DSN passed to the constructor pins the physical
+                # store for THIS instance only — no process-global env
+                # mutation, so a concurrent SessionDB() on another thread can
+                # never observe it and open the wrong store.
+                if postgres_dsn:
+                    _pg_explicitly_selected = True
                 try:
                     from hermes_state_postgres import maybe_open_postgres
 
@@ -3397,7 +3419,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                     maybe_open_postgres = None  # type: ignore[assignment]
                 if maybe_open_postgres is not None:
-                    pg_conn = maybe_open_postgres(read_only, SCHEMA_VERSION)
+                    pg_conn = maybe_open_postgres(
+                        read_only, SCHEMA_VERSION, dsn_override=postgres_dsn
+                    )
                     if pg_conn is not None:
                         self._conn = pg_conn
                         self._is_postgres = True

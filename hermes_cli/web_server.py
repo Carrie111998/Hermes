@@ -12194,6 +12194,19 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
             return open_store_for_profile(profile, read_only=read_only)
         db_path = Path(home) / "state.db"
     else:
+        # The default/current profile. Its backend is resolved from this
+        # process's own env + config, exactly as SessionDB() would — passing an
+        # explicit db_path here would pin SQLite and split the dashboard's
+        # reads away from a Postgres-backed live write path.
+        try:
+            from hermes_state_postgres import resolve_postgres_dsn
+
+            if resolve_postgres_dsn():
+                from hermes_state import SessionDB
+
+                return SessionDB(read_only=read_only)
+        except ImportError:
+            pass  # Postgres backend not installed — SQLite is correct.
         db_path = Path(_default_db_path())
     return _open_session_db_at_path(db_path, read_only=read_only)
 

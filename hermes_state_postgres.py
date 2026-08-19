@@ -1361,22 +1361,30 @@ class _PostgresCursor:
         want_id = _needs_returning_id(translated) and " RETURNING " not in translated.upper()
         if want_id:
             translated = translated.rstrip().rstrip(";") + " RETURNING id"
-        # execute() is where a stale TCP connection is actually discovered —
-        # the server drops it between cursor() and the real round-trip. Wrap
-        # with one reconnect-and-retry at this level so the defect path
-        # (stale connection surfaced on EXECUTE, not on cursor()) is covered.
-        # We only retry when the connection adapter reference is available and
-        # the connection is the one that was handed to us at cursor time.
-        try:
-            self._cursor.execute(translated, params or ())
-        except Exception as exc:
-            if not _is_connection_broken_error(exc) or self._conn is None:
-                raise
-            # Reconnect the parent _PostgresConnection and obtain a fresh
-            # psycopg cursor for the retry, then re-run the statement once.
-            self._conn._reconnect()
-            self._cursor = self._conn._conn.cursor()
-            self._cursor.execute(translated, params or ())
+        # NO reconnect-and-replay here, deliberately.
+        #
+        # A dropped connection is usually discovered on this round-trip rather
+        # than at cursor() time, so replaying the statement on a fresh
+        # connection looks like the obvious repair. It is not safe:
+        #
+        #   * ``_reconnect()`` builds the replacement with ``autocommit=True``,
+        #     so the replayed statement does NOT belong to the ``BEGIN`` the
+        #     enclosing ``_execute_write`` closure opened. It commits on its
+        #     own while the rest of the closure believes it is still in a
+        #     transaction, and the closure can then report success over a
+        #     partially-applied write.
+        #   * The new connection does not hold the transaction-scoped advisory
+        #     locks the original acquired, so the serialization those locks
+        #     provide is silently lost mid-closure.
+        #   * The first execute's outcome is UNKNOWN when the response is lost:
+        #     the server may already have applied it. Replaying can therefore
+        #     double-apply a non-idempotent statement.
+        #
+        # Connection loss during a write must fail closed and propagate. Retry
+        # belongs at the whole-closure level in ``_execute_write``, and only
+        # for known-clean aborts (40001 serialization failure / 40P01 deadlock)
+        # where the server guarantees the transaction applied nothing.
+        self._cursor.execute(translated, params or ())
         if want_id:
             row = self._cursor.fetchone()
             self.lastrowid = row[0] if row else None
@@ -1699,12 +1707,6 @@ def connect_postgres(database_url: str) -> _PostgresConnection:
 _ENV_DSN_KEYS = ("HERMES_STATE_DATABASE_URL", "HERMES_STATE_POSTGRES_DSN")
 _ENV_BACKEND_KEYS = ("HERMES_STATE_BACKEND",)
 
-# Serializes the env-var pinning ``open_store_for_profile`` performs around
-# ``SessionDB()``. The backend selectors are process-global, so two threads
-# opening stores for different profiles concurrently could otherwise observe
-# each other's DSN.
-_SEAM_ENV_LOCK = threading.Lock()
-
 
 def resolve_postgres_dsn(config: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Return the configured PostgreSQL DSN, or None when not selected.
@@ -1783,6 +1785,7 @@ def maybe_open_postgres(
     read_only: bool,
     schema_version: int,
     config: Optional[Dict[str, Any]] = None,
+    dsn_override: Optional[str] = None,
 ) -> Optional[_PostgresConnection]:
     """Open the PostgreSQL backend if it is configured, else return None.
 
@@ -1791,12 +1794,17 @@ def maybe_open_postgres(
       * ``read_only`` is requested — the read-only cross-profile attach path is
         SQLite-specific and intentionally not served by this backend.
 
+    ``dsn_override`` pins the target explicitly, bypassing env/config
+    resolution entirely. The backend-aware profile seam uses it so opening
+    another profile's store never mutates process-global state that a
+    concurrent ``SessionDB()`` on another thread could observe.
+
     Otherwise opens the adapter connection, initializes the schema, and returns
     the live connection. Raises if the DSN is missing or psycopg is absent.
     """
     if read_only:
         return None
-    dsn = resolve_postgres_dsn(config)
+    dsn = dsn_override or resolve_postgres_dsn(config)
     if not dsn:
         return None
     conn = connect_postgres(dsn)
@@ -1852,6 +1860,11 @@ def open_store_for_profile(
 
     # Load the *target* profile's own config.yaml — deliberately NOT using
     # load_config() which reads the ACTIVE process's HERMES_HOME.
+    #
+    # An ABSENT config legitimately means "no backend selected" -> SQLite.
+    # An EXISTING config that cannot be read or parsed does NOT: it may be the
+    # only source selecting Postgres, and treating it as SQLite recreates the
+    # split-history failure this seam exists to prevent. Fail closed.
     config: Dict[str, Any] = {}
     config_path = profile_dir / "config.yaml"
     if config_path.is_file():
@@ -1860,14 +1873,21 @@ def open_store_for_profile(
 
             with open(config_path, encoding="utf-8") as _f:
                 loaded = _yaml.safe_load(_f)
-            if isinstance(loaded, dict):
-                config = loaded
-        except Exception:
-            logger.debug(
-                "open_store_for_profile: could not load config.yaml for %r",
-                canon,
-                exc_info=True,
+        except Exception as _cfg_exc:
+            raise RuntimeError(
+                f"profile {canon!r} has a config.yaml at {config_path} that "
+                f"could not be read or parsed ({_cfg_exc}); refusing to assume "
+                f"the SQLite backend, because that file may be the only source "
+                f"selecting Postgres. Fix or remove the file."
+            ) from _cfg_exc
+        if loaded is not None and not isinstance(loaded, dict):
+            raise RuntimeError(
+                f"profile {canon!r} has a config.yaml at {config_path} whose "
+                f"top level is {type(loaded).__name__}, not a mapping; refusing "
+                f"to assume the SQLite backend from an unusable config."
             )
+        if isinstance(loaded, dict):
+            config = loaded
 
     sessions_cfg = (config.get("sessions") or {}) if config else {}
     backend = str(sessions_cfg.get("state_backend") or "sqlite").strip().lower()
@@ -1893,27 +1913,15 @@ def open_store_for_profile(
         # seam-built store.  Driving ``__init__`` means future additions to it
         # are picked up for free.
         #
-        # ``__init__`` resolves the backend from the environment, so the target
-        # profile's DSN/backend is pinned for the duration of the constructor.
-        # This is process-global state, hence the lock and the restore.
+        # The DSN is passed as an explicit constructor argument, NOT by
+        # temporarily mutating process-global ``HERMES_STATE_*`` env vars. Env
+        # mutation is visible to every thread: an unrelated ``SessionDB()``
+        # constructed concurrently could observe this profile's pinned DSN and
+        # open the wrong physical store. A lock around the seam cannot prevent
+        # that, because the racing constructor is not a seam caller.
         from hermes_state import SessionDB
 
-        with _SEAM_ENV_LOCK:
-            _saved = {
-                key: os.environ.get(key)
-                for key in ("HERMES_STATE_BACKEND", *_ENV_DSN_KEYS)
-            }
-            try:
-                os.environ["HERMES_STATE_BACKEND"] = "postgres"
-                os.environ["HERMES_STATE_DATABASE_URL"] = dsn
-                os.environ.pop("HERMES_STATE_POSTGRES_DSN", None)
-                db = SessionDB()
-            finally:
-                for key, value in _saved.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
+        db = SessionDB(postgres_dsn=dsn)
 
         if not getattr(db, "_is_postgres", False):
             db.close()
@@ -1946,34 +1954,46 @@ def profile_selects_postgres(profile_name: str) -> bool:
     """
     from pathlib import Path
 
-    try:
-        from hermes_cli import profiles as profiles_mod
+    from hermes_cli import profiles as profiles_mod
 
-        canon = profiles_mod.normalize_profile_name(profile_name)
-        if not profiles_mod.profile_exists(canon):
-            return False
-        config_path = Path(profiles_mod.get_profile_dir(canon)) / "config.yaml"
-        if not config_path.is_file():
-            return False
+    canon = profiles_mod.normalize_profile_name(profile_name)
+    if not profiles_mod.profile_exists(canon):
+        return False
+    config_path = Path(profiles_mod.get_profile_dir(canon)) / "config.yaml"
+    # No config at all is a legitimate "no selection" -> SQLite.
+    if not config_path.is_file():
+        return False
+
+    # A config that EXISTS but cannot be read or parsed must not be reported as
+    # "not Postgres": it may be the only source selecting Postgres, and a False
+    # here routes the caller to SQLite, splitting history. Fail closed.
+    try:
         import yaml as _yaml
 
         with open(config_path, encoding="utf-8") as _f:
             loaded = _yaml.safe_load(_f)
-        if not isinstance(loaded, dict):
-            return False
-        backend = (
-            str((loaded.get("sessions") or {}).get("state_backend") or "")
-            .strip()
-            .lower()
+    except Exception as _cfg_exc:
+        raise RuntimeError(
+            f"profile {canon!r} has a config.yaml at {config_path} that could "
+            f"not be read or parsed ({_cfg_exc}); cannot determine whether it "
+            f"selects the Postgres backend. Refusing to answer 'not Postgres' "
+            f"from an unreadable selection source."
+        ) from _cfg_exc
+
+    if loaded is None:
+        return False  # empty file — genuinely no selection
+    if not isinstance(loaded, dict):
+        raise RuntimeError(
+            f"profile {canon!r} has a config.yaml at {config_path} whose top "
+            f"level is {type(loaded).__name__}, not a mapping; cannot determine "
+            f"the selected backend."
         )
-        return backend in ("postgres", "postgresql", "pg")
-    except Exception:
-        logger.debug(
-            "profile_selects_postgres: could not resolve backend for %r",
-            profile_name,
-            exc_info=True,
-        )
-        return False
+    backend = (
+        str((loaded.get("sessions") or {}).get("state_backend") or "")
+        .strip()
+        .lower()
+    )
+    return backend in ("postgres", "postgresql", "pg")
 
 
 def is_postgres_retryable(exc: BaseException) -> bool:
@@ -2193,7 +2213,12 @@ def _build_where(
     """Build shared WHERE clauses for FTS and ILIKE paths."""
     where = []
     if not include_inactive:
-        where.append(f"{prefix}.active = 1")
+        # Match the SQLite search visibility contract exactly: rewind/undo rows
+        # (active=0, compacted=0) are hidden, but compaction-archived rows
+        # (active=0, compacted=1) stay searchable — they are still part of the
+        # conversation record. A bare ``active = 1`` here would silently drop
+        # every compacted message from search after moving to PostgreSQL.
+        where.append(f"({prefix}.active = 1 OR {prefix}.compacted = 1)")
     if source_filter is not None:
         where.append("s.source IN (%s)" % ",".join("?" for _ in source_filter))
         params.extend(source_filter)
