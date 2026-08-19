@@ -1915,9 +1915,148 @@ class TestTitleLineage:
     def test_resolve_nonexistent_title(self, db):
         assert db.resolve_session_by_title("nonexistent") is None
 
+    def test_resolve_ignores_newer_invalid_named_continuation(self, db):
+        """A newer `foo #bar` must not hijack exact `foo` binding."""
+        t0 = time.time() - 1000
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "foo #bar")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s2")
+        )
+        assert db.resolve_session_by_title("foo") == "s1"
+
+    def test_resolve_ignores_newer_fullwidth_digit_continuation(self, db):
+        """A fullwidth-digit lookalike `foo #２` must not bind as a continuation."""
+        t0 = time.time() - 1000
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "foo #２")  # fullwidth ２ (U+FF12)
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s2")
+        )
+        assert db.resolve_session_by_title("foo") == "s1"
+
+    @pytest.mark.parametrize(
+        # NOTE: `foo #2 ` (trailing space) is intentionally absent — the
+        # storage layer's sanitize_title() strips it to the valid `foo #2`,
+        # so it is unrepresentable as an invalid near-miss.
+        "lookalike",
+        ["foo #", "foo # 2", "foo #2x", "foo #2.0"],
+    )
+    def test_resolve_rejects_invalid_near_miss_continuation(self, db, lookalike):
+        """None of these near-misses may bind as a numbered continuation."""
+        t0 = time.time() - 1000
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", lookalike)
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s2")
+        )
+        assert db.resolve_session_by_title("foo") == "s1"
+
+    def test_resolve_valid_continuation_beats_newer_invalid(self, db):
+        """A valid `foo #2` wins even when a newer `foo #bar` exists."""
+        t0 = time.time() - 1000
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "foo #2")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
+        )
+        db.create_session("s3", "cli")
+        db.set_session_title("s3", "foo #bar")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 1000, "s3")
+        )
+        assert db.resolve_session_by_title("foo") == "s2"
+
+    def test_resolve_multiple_valid_continuations_newest_wins(self, db):
+        """Multiple valid continuations keep newest-by-started_at precedence."""
+        t0 = time.time() - 1000
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "foo #2")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
+        )
+        db.create_session("s3", "cli")
+        db.set_session_title("s3", "foo #3")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "s3")
+        )
+        assert db.resolve_session_by_title("foo") == "s3"
+
+    def test_resolve_leading_zero_continuation_accepted(self, db):
+        """ASCII leading-zero `foo #01` stays a valid continuation (#15)."""
+        t0 = time.time() - 1000
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "foo #01")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
+        )
+        assert db.resolve_session_by_title("foo") == "s2"
+
     def test_next_title_no_existing(self, db):
         """With no existing sessions, base title is returned as-is."""
         assert db.get_next_title_in_lineage("my project") == "my project"
+
+    def test_next_title_invalid_only_occupant_keeps_base(self, db):
+        """Only `foo #bar` exists → next for `foo` stays `foo`, not `foo #2`."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo #bar")
+        assert db.get_next_title_in_lineage("foo") == "foo"
+
+    def test_next_title_ignores_deeper_suffix_inflation(self, db):
+        """`foo #2 #5` is not a direct child of `foo`; next is `foo #3`."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "foo #2")
+        db.create_session("s3", "cli")
+        db.set_session_title("s3", "foo #2 #5")
+        assert db.get_next_title_in_lineage("foo") == "foo #3"
+
+    def test_next_title_fullwidth_digit_stays_literal_base(self, db):
+        """`foo #２` is not a numbered suffix; base stays literal `foo #２`."""
+        assert db.get_next_title_in_lineage("foo #２") == "foo #２"
+
+    def test_next_title_admits_leading_zero_direct_child(self, db):
+        """ASCII `foo #01` is a valid direct child; next is `foo #2`."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "foo #01")
+        assert db.get_next_title_in_lineage("foo") == "foo #2"
+
+    def test_next_title_embedded_hash_base(self, db):
+        """`topic # hash` is the literal base; `topic # hash #2` is its child."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "topic # hash")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "topic # hash #2")
+        assert db.get_next_title_in_lineage("topic # hash") == "topic # hash #3"
+
+    def test_next_title_wildcard_cjk_bases_keep_literal_children(self, db):
+        """`%`/`_`/`\\`/CJK bases count only their own direct children."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "100% sure")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "100% sure #2")
+        db.create_session("s3", "cli")
+        db.set_session_title("s3", "100Xsure #5")  # must not count for "100% sure"
+        assert db.get_next_title_in_lineage("100% sure") == "100% sure #3"
 
 
 
@@ -1934,6 +2073,29 @@ class TestTitleSqlWildcards:
         db.set_session_title("s2", "testXproject #2")
         # Resolving "test_project" should return s1 (exact), not s2
         assert db.resolve_session_by_title("test_project") == "s1"
+
+    @pytest.mark.parametrize(
+        "base",
+        [
+            "100% sure",  # literal %
+            "test_project",  # literal _
+            "path\\to",  # literal backslash
+            "topic # hash",  # embedded #
+            "專案報告",  # CJK
+        ],
+    )
+    def test_literal_bases_admit_own_continuation(self, db, base):
+        """Literal `%`/`_`/`\\`/`#`/CJK bases admit their own ` #2` continuation."""
+        t0 = time.time() - 1000
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", base)
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "s1"))
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", f"{base} #2")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "s2")
+        )
+        assert db.resolve_session_by_title(base) == "s2"
 
 
 
