@@ -84,6 +84,7 @@ _TITLE_PROMPT_TEMPLATE = (
     "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
+    "- Output the title directly — no analysis, no chain-of-thought.\n"
     "__LANGUAGE_RULE__\n"
     'Good: {"title": "Fix login button on mobile"}\n'
     'Good: {"title": "Postgres connection pool exhaustion"}\n'
@@ -411,6 +412,14 @@ def generate_title(
         )
         content = response.choices[0].message.content or ""
         title = _clean_title(_extract_title_text(content))
+        # Reasoning models may spend the whole budget on `reasoning_content`
+        # and return empty `content` (finish_reason: length). Their chain of
+        # thought usually states the title candidate anyway, so fall back to
+        # it rather than letting a truncated reply lose the work.
+        if not title:
+            reasoning = getattr(response.choices[0].message, "reasoning_content", "") or ""
+            if reasoning:
+                title = _clean_title(_extract_title_text(reasoning))
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
         # with many words is a model that ignored the task and answered
         # the user's message instead ("I don't have context on X — that's
