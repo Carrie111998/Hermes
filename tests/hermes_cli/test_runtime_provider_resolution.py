@@ -949,6 +949,31 @@ def test_zai_dotenv_base_url_keeps_explicit_pool_route(monkeypatch):
     assert resolved["base_url"] == "https://proxy.example.com/zai/v4"
 
 
+def test_zai_explicit_default_env_url_overrides_model_config(monkeypatch):
+    """An explicit env route remains authoritative even when it equals the default."""
+    default_url = "https://api.z.ai/api/paas/v4"
+    entry = SimpleNamespace(
+        access_token="glm-key",
+        runtime_api_key="glm-key",
+        source="env:GLM_API_KEY",
+        base_url=default_url,
+        runtime_base_url=None,
+    )
+    monkeypatch.setenv("GLM_BASE_URL", default_url)
+
+    resolved = rp._resolve_runtime_from_pool_entry(
+        provider="zai",
+        entry=entry,
+        requested_provider="zai",
+        model_cfg={
+            "provider": "zai",
+            "base_url": "https://proxy.example.com/zai/v4",
+        },
+    )
+
+    assert resolved["base_url"] == default_url
+
+
 def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch):
     """opencode-zen/go re-derive api_mode from the effective model on every
     resolve, ignoring any persisted ``api_mode`` in config. Refs #16878 /

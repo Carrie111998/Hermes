@@ -568,8 +568,8 @@ def _resolve_runtime_from_pool_entry(
         explicit_env_url = ""
         if pconfig and pconfig.base_url_env_var:
             explicit_env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip()
-        config_may_override_pool_url = pool_url_is_default or (
-            entry_source.startswith("env:") and not explicit_env_url
+        config_may_override_pool_url = not explicit_env_url and (
+            pool_url_is_default or entry_source.startswith("env:")
         )
         if configured_provider == provider and config_may_override_pool_url:
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
