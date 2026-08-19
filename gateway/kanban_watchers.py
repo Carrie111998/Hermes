@@ -217,7 +217,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "starvation")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "budget_exhausted", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "starvation")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -771,7 +771,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "starvation")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "starvation", "budget_exhausted")
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -808,6 +808,16 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "starvation" in _wake_kinds:
+                                _starve_label = t("gateway.kanban.wake.starvation")
+                                if _starve_label == "gateway.kanban.wake.starvation":
+                                    _starve_label = "is starved and needs an owner decision"
+                                _parts.append(_starve_label)
+                            if "budget_exhausted" in _wake_kinds:
+                                _budget_label = t("gateway.kanban.wake.budget_exhausted")
+                                if _budget_label == "gateway.kanban.wake.budget_exhausted":
+                                    _budget_label = "ran out of turns"
+                                _parts.append(_budget_label)
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
