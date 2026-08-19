@@ -20,6 +20,21 @@ export interface UpdateScriptHandoff {
   scriptPath: string
 }
 
+/** Preserve the local carried-patch branch for the reviewed safe updater.
+ * Remote-healing is correct for deleted integration branches, but this branch
+ * is intentionally local-only and must never be rewritten to `main` in the
+ * durable handoff result. */
+export async function resolvePosixHandoffBranch(
+  currentBranch: string,
+  healRemoteBranch: (branch: string) => Promise<string>
+): Promise<string> {
+  if (currentBranch === 'hermes-local-fixes') {
+    return currentBranch
+  }
+
+  return healRemoteBranch(currentBranch)
+}
+
 /**
  * Repo-owned Windows update hand-off (frozen-binary escape hatch).
  *

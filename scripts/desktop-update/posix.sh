@@ -38,7 +38,7 @@ set -u
 ORIGINAL_ARGS=("$@")
 INSTALL_ROOT="" BRANCH="main" DESKTOP_PID=0 RELAUNCH_TARGET=""
 RELAUNCH_CWD="" SANDBOX_FALLBACK=0 RELAUNCH_ARGS=()
-NO_UI=0 NO_MARKER_CLEANUP=0 SELF_TEST_UI=0 SELF_TEST_GATE=0 SELF_TEST_MARKER=0
+NO_UI=0 NO_MARKER_CLEANUP=0 SELF_TEST_UI=0 SELF_TEST_GATE=0 SELF_TEST_MARKER=0 SELF_TEST_COMMAND=0
 HANDOFF_DAEMONIZED=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,19 +52,20 @@ while [ $# -gt 0 ]; do
     --no-marker-cleanup) NO_MARKER_CLEANUP=1; shift ;;
     --self-test-ui) SELF_TEST_UI=1; shift ;;
     --self-test-gate) SELF_TEST_GATE=1; shift ;;
+    --self-test-command) SELF_TEST_COMMAND=1; shift ;;
     --daemonized) HANDOFF_DAEMONIZED=1; shift ;;
     --self-test-marker) SELF_TEST_MARKER=1; NO_UI=1; NO_MARKER_CLEANUP=1; shift ;;
     --) shift; RELAUNCH_ARGS=("$@"); shift $# ;;
     *) echo "unknown arg: $1" >&2; exit 64 ;;
   esac
 done
-[ "$SELF_TEST_UI" -eq 1 ] || [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
+[ "$SELF_TEST_UI" -eq 1 ] || [ "$SELF_TEST_COMMAND" -eq 1 ] || [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}"
 HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
 MARKER="$HERMES_HOME/.hermes-update-in-progress"
-LOG_DIR="$HERMES_HOME/logs"; mkdir -p "$LOG_DIR" 2>/dev/null || true
+LOG_DIR="$HERMES_HOME/logs"
 LOG="$LOG_DIR/desktop-update-handoff.log"
 RESULT="$HERMES_HOME/.hermes-update-result.json"
 STATUS="${TMPDIR:-/tmp}/hermes-update-status.$$"
@@ -75,6 +76,30 @@ FINAL_MSG="update did not complete"
 DONE_NOTE=""  # set when the update succeeded but the app will NOT reopen itself
 
 log() { echo "$(date +%Y-%m-%dT%H:%M:%S%z) $1" | tee -a "$LOG" 2>/dev/null; }
+
+select_update_mode() {
+  local current safe_updater
+  current="$(git -C "$INSTALL_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  safe_updater="$HERMES_HOME/scripts/update-hermes-local.py"
+  if [ "$current" = "hermes-local-fixes" ]; then
+    if [ ! -x "$safe_updater" ]; then
+      echo "safe updater is missing or not executable: $safe_updater" >&2
+      return 3
+    fi
+    echo "safe"
+    return 0
+  fi
+  echo "builtin"
+}
+
+# Command selection self-test must be side-effect free: no logs, markers, UI,
+# result files, or cache changes before this exit.
+if [ "$SELF_TEST_COMMAND" -eq 1 ]; then
+  select_update_mode
+  exit $?
+fi
+
+mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 # Keep a durable signal breadcrumb.  A detached hand-off used to leave only the
 # generic FINAL_MSG when it was terminated while the updater child was running,
@@ -517,30 +542,50 @@ cd "$INSTALL_ROOT" || {
   log "$FINAL_MSG"; exit 3
 }
 export PYTHONUNBUFFERED=1
-# --keep-stash: never re-apply local source edits after the update (they stay
-# parked in git stash). Probe --help first: older installed backends don't
-# know the flag and argparse would abort with exit 2, which collides with the
-# "close all Hermes windows" sentinel.
-KEEP_STASH=""
-if "$HERMES_BIN" update --help 2>/dev/null | grep -q -- '--keep-stash'; then
-  KEEP_STASH="--keep-stash"
-else
-  log "installed hermes predates --keep-stash; running without it"
-fi
-log "running: hermes update --yes --gateway $KEEP_STASH --branch $BRANCH"
-publish_stage "Updating code and dependencies"
-OUT="$("$HERMES_BIN" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
-printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
-log "hermes update exit code: $CODE"
+UPDATE_MODE="$(select_update_mode)" || {
+  FINAL_CODE=3 FINAL_MSG="Update aborted: safe updater is required for the local patch branch but is unavailable. Nothing was changed."
+  log "$FINAL_MSG"; exit 3
+}
 
-if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
-  # Retry once: update-boundary class (fresh code on disk, stale in memory).
-  # Exit 2 ("close all Hermes windows") is not retryable.
-  log "retrying once (freshly pulled fix loads on the second run)"
-  publish_stage "Retrying update"
+if [ "$UPDATE_MODE" = "safe" ]; then
+  SAFE_UPDATER="$HERMES_HOME/scripts/update-hermes-local.py"
+  log "running reviewed safe updater: $SAFE_UPDATER"
+  publish_stage "Updating local patch branch safely"
+  OUT="$("$SAFE_UPDATER" 2>&1)"; CODE=$?
+  printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
+  log "safe updater exit code: $CODE"
+  if [ "$CODE" -eq 0 ]; then
+    log "safe update verified; rebuilding Desktop"
+    publish_stage "Rebuilding Desktop"
+    "$HERMES_BIN" desktop --force-build --build-only >> "$LOG" 2>&1 || CODE=$?
+    log "Desktop rebuild exit code: $CODE"
+  fi
+else
+  # --keep-stash: never re-apply local source edits after the update (they stay
+  # parked in git stash). Probe --help first: older installed backends don't
+  # know the flag and argparse would abort with exit 2, which collides with the
+  # "close all Hermes windows" sentinel.
+  KEEP_STASH=""
+  if "$HERMES_BIN" update --help 2>/dev/null | grep -q -- '--keep-stash'; then
+    KEEP_STASH="--keep-stash"
+  else
+    log "installed hermes predates --keep-stash; running without it"
+  fi
+  log "running: hermes update --yes --gateway $KEEP_STASH --branch $BRANCH"
+  publish_stage "Updating code and dependencies"
   OUT="$("$HERMES_BIN" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
   printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
-  log "retry exit code: $CODE"
+  log "hermes update exit code: $CODE"
+
+  if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
+    # Retry once: update-boundary class (fresh code on disk, stale in memory).
+    # Exit 2 ("close all Hermes windows") is not retryable.
+    log "retrying once (freshly pulled fix loads on the second run)"
+    publish_stage "Retrying update"
+    OUT="$("$HERMES_BIN" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
+    printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
+    log "retry exit code: $CODE"
+  fi
 fi
 trap 'on_signal TERM' TERM
 

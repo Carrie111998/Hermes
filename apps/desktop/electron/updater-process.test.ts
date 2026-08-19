@@ -8,6 +8,7 @@ import {
   collectRelaunchArgs,
   MARKER_SELF_ADOPT_EPOCH_MS,
   observeUpdaterHandoff,
+  resolvePosixHandoffBranch,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
@@ -249,6 +250,28 @@ test('wrapHandoffForDetachedConsole routes through cmd start with own console', 
     '-Branch',
     'main'
   ])
+})
+
+test('resolvePosixHandoffBranch preserves local patch branch without remote healing', async () => {
+  let healCalls = 0
+  const branch = await resolvePosixHandoffBranch('hermes-local-fixes', async () => {
+    healCalls += 1
+    return 'main'
+  })
+
+  assert.equal(branch, 'hermes-local-fixes')
+  assert.equal(healCalls, 0)
+})
+
+test('resolvePosixHandoffBranch still heals ordinary deleted branches', async () => {
+  let received = ''
+  const branch = await resolvePosixHandoffBranch('bb/gui', async candidate => {
+    received = candidate
+    return 'main'
+  })
+
+  assert.equal(received, 'bb/gui')
+  assert.equal(branch, 'main')
 })
 
 test('resolvePosixScriptHandoff returns the bash recipe when the script exists', () => {

@@ -300,6 +300,7 @@ import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   collectRelaunchArgs,
   observeUpdaterHandoff,
+  resolvePosixHandoffBranch,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
@@ -4039,7 +4040,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
     const current = (head.stdout || '').trim()
 
     if (head.code === 0 && current && current !== 'HEAD') {
-      branch = await resolveHealedBranch(updateRoot, current)
+      branch = await resolvePosixHandoffBranch(current, candidate => resolveHealedBranch(updateRoot, candidate))
     }
   } catch {
     // best effort
