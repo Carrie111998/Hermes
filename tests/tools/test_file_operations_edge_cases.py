@@ -205,12 +205,18 @@ class TestPaginationBounds:
 
         def fake_exec(command, *args, **kwargs):
             commands.append(command)
-            if command.startswith("if [ -f ") or command.startswith("wc -c"):
-                return MagicMock(exit_code=0, stdout="12")
+            if command.startswith("if [ -f "):
+                return MagicMock(
+                    exit_code=0,
+                    stdout="__hermes_read_probe__12\nbGluZTEKbGluZTIK",
+                )
             if command.startswith("head -c"):
                 return MagicMock(exit_code=0, stdout="line1\nline2\n")
             if command.startswith("sed -n"):
-                return MagicMock(exit_code=0, stdout="line1\n")
+                return MagicMock(
+                    exit_code=0,
+                    stdout="line1\n__hermes_read_page__2:x\n",
+                )
             if command.startswith("wc -l"):
                 return MagicMock(exit_code=0, stdout="2")
             return MagicMock(exit_code=0, stdout="")
@@ -221,7 +227,11 @@ class TestPaginationBounds:
         assert result.error is None
         assert "1|line1" in result.content
         sed_commands = [cmd for cmd in commands if cmd.startswith("sed -n")]
-        assert sed_commands == ["sed -n '1,1p' 'notes.txt' | cut -b1-8001"]
+        assert len(sed_commands) == 1
+        assert sed_commands[0].startswith(
+            "sed -n '1,1p' 'notes.txt' | cut -b1-8001"
+        )
+        assert "wc -l < 'notes.txt'" in sed_commands[0]
 
     def test_search_clamps_offset_and_limit_before_building_head_pipeline(self):
         env = MagicMock()

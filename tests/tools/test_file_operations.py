@@ -303,17 +303,24 @@ class TestShellFileOpsHelpers:
 
         def side_effect(command, **kwargs):
             commands.append(command)
-            # The size probe gates `wc -c` behind `[ -f ]` so a FIFO or device
-            # cannot block the read; it still reports a plain byte count.
-            if command.startswith("if [ -f ") or command.startswith("wc -c"):
-                return {"output": "5\n", "returncode": 0}
+            # The probe gates every file-opening operation behind `[ -f ]`,
+            # then returns size and a base64 byte sample together.
+            if command.startswith("if [ -f "):
+                import base64 as b64
+                return {
+                    "output": "__hermes_read_probe__5\n" + b64.b64encode(b"hello").decode(),
+                    "returncode": 0,
+                }
             if command.startswith("head -c") and "| base64" in command:
                 import base64 as b64
                 return {"output": b64.b64encode(b"hello").decode(), "returncode": 0}
             if command.startswith("head -c"):
                 return {"output": "hello", "returncode": 0}
             if command.startswith("sed -n"):
-                return {"output": "hello\n", "returncode": 0}
+                return {
+                    "output": "hello\n__hermes_read_page__1:1\n",
+                    "returncode": 0,
+                }
             if command.startswith("wc -l"):
                 return {"output": "1\n", "returncode": 0}
             return {"output": "", "returncode": 0}
@@ -323,16 +330,15 @@ class TestShellFileOpsHelpers:
         result = ops.read_file(r"C:\Users\alice\notes.txt")
 
         assert result.error is None
-        assert commands[0] == (
-            "if [ -f '/c/Users/alice/notes.txt' ]; "
-            "then wc -c < '/c/Users/alice/notes.txt' 2>/dev/null; "
-            "elif [ -e '/c/Users/alice/notes.txt' ]; "
-            "then echo __hermes_not_regular__; "
-            "else exit 1; fi"
+        assert commands[0].startswith("if [ -f '/c/Users/alice/notes.txt' ]; then ")
+        assert "wc -c < '/c/Users/alice/notes.txt'" in commands[0]
+        assert "elif [ -e '/c/Users/alice/notes.txt' ]" in commands[0]
+        assert "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null | base64" in commands[0]
+        assert commands[1].startswith(
+            "sed -n '1,2000p' '/c/Users/alice/notes.txt' | cut -b1-8001"
         )
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null | base64"
-        assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt' | cut -b1-8001"
-        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
+        assert "wc -l < '/c/Users/alice/notes.txt'" in commands[1]
+        assert len(commands) == 2
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
@@ -355,12 +361,19 @@ class TestShellFileOpsHelpers:
         )
 
         def side_effect(command, **kwargs):
-            if command.startswith("if [ -f ") or command.startswith("wc -c"):
-                return {"output": "12\n", "returncode": 0}
+            if command.startswith("if [ -f "):
+                import base64 as b64
+                return {
+                    "output": "__hermes_read_probe__12\n" + b64.b64encode(b"print('ok')\n").decode(),
+                    "returncode": 0,
+                }
             if command.startswith("head -c"):
                 return {"output": "print('ok')\n", "returncode": 0}
             if command.startswith("sed -n"):
-                return {"output": leaked, "returncode": 0}
+                return {
+                    "output": leaked + "__hermes_read_page__1:1\n",
+                    "returncode": 0,
+                }
             if command.startswith("wc -l"):
                 return {"output": "1\n", "returncode": 0}
             return {"output": "", "returncode": 0}
@@ -776,12 +789,24 @@ class TestByteLayerBinaryDetection:
         import base64 as b64
 
         def side_effect(command, **kwargs):
-            if command.startswith("if [ -f ") or command.startswith("wc -c"):
-                return {"output": f"{len(cjk_bytes)}\n", "returncode": 0}
+            if command.startswith("if [ -f "):
+                return {
+                    "output": (
+                        f"__hermes_read_probe__{len(cjk_bytes)}\n"
+                        + b64.b64encode(cjk_bytes[:1000]).decode()
+                    ),
+                    "returncode": 0,
+                }
             if command.startswith("head -c") and "| base64" in command:
                 return {"output": b64.b64encode(cjk_bytes[:1000]).decode(), "returncode": 0}
             if command.startswith("sed -n"):
-                return {"output": cjk_bytes.decode("utf-8", errors="replace"), "returncode": 0}
+                return {
+                    "output": (
+                        cjk_bytes.decode("utf-8", errors="replace")
+                        + "\n__hermes_read_page__1:0\n"
+                    ),
+                    "returncode": 0,
+                }
             if command.startswith("wc -l"):
                 return {"output": "1\n", "returncode": 0}
             return {"output": "", "returncode": 0}

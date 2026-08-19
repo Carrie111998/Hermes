@@ -800,6 +800,8 @@ DEFAULT_SEARCH_LIMIT = 50
 # Echoed by the size probe when the path exists but is not a regular file.
 # `wc -c` prints only digits, so this can never collide with a real size.
 NOT_REGULAR_SENTINEL = "__hermes_not_regular__"
+_READ_PROBE_MARKER = "__hermes_read_probe__"
+_READ_PAGE_MARKER = "__hermes_read_page__"
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -1341,6 +1343,78 @@ class ShellFileOperations(FileOperations):
             f"else exit 1; fi"
         )
 
+    def _read_probe_cmd(self, path: str, sample_length: int = 1000) -> str:
+        """Build the regular-file gate, size probe, and byte sample command.
+
+        Keeping these operations in one backend execution avoids two extra
+        process starts (or remote round trips) while preserving the important
+        ordering: ``[ -f ]`` gates every operation that opens the path.
+        """
+        arg = self._escape_shell_arg(path)
+        return (
+            f"if [ -f {arg} ]; then "
+            f"size=$(wc -c < {arg} 2>/dev/null) || exit 1; "
+            f"printf '{_READ_PROBE_MARKER}%s\\n' \"$size\"; "
+            f"head -c {sample_length} {arg} 2>/dev/null | base64; "
+            f"elif [ -e {arg} ]; then echo {NOT_REGULAR_SENTINEL}; "
+            f"else exit 1; fi"
+        )
+
+    @staticmethod
+    def _parse_read_probe(output: str) -> tuple[Optional[int], Optional[bytes]]:
+        """Parse ``_read_probe_cmd`` output without trusting terminal wrappers."""
+        cleaned = _strip_terminal_fence_leaks(output or "")
+        match = re.search(
+            rf"(?:^|\n){re.escape(_READ_PROBE_MARKER)}(\d+)\r?\n",
+            cleaned,
+        )
+        if match is None:
+            return None, None
+        encoded = "".join(cleaned[match.end():].split())
+        if not encoded:
+            return int(match.group(1)), b""
+        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+            return int(match.group(1)), None
+        try:
+            return int(match.group(1)), base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return int(match.group(1)), None
+
+    def _read_page_cmd(
+        self,
+        path: str,
+        offset: int,
+        end_line: int,
+        line_clamp_bytes: int,
+    ) -> str:
+        """Build one command for page content and its line metadata."""
+        arg = self._escape_shell_arg(path)
+        return (
+            f"sed -n '{offset},{end_line}p' {arg} | cut -b1-{line_clamp_bytes}; "
+            f"total=$(wc -l < {arg}) || exit 1; tail_nl=x; "
+            f"if [ \"$total\" -le {end_line} ]; then "
+            f"tail_nl=$(tail -c 1 {arg} | wc -l) || exit 1; fi; "
+            f"printf '{_READ_PAGE_MARKER}%s:%s\\n' \"$total\" \"$tail_nl\""
+        )
+
+    @staticmethod
+    def _parse_read_page(output: str) -> tuple[Optional[str], int, Optional[bool]]:
+        """Return page text, total lines, and final-newline state."""
+        cleaned = _strip_terminal_fence_leaks(output or "")
+        matches = list(re.finditer(
+            rf"(?:^|\n){re.escape(_READ_PAGE_MARKER)}(\d+):([01x])\r?\n?",
+            cleaned,
+        ))
+        if not matches:
+            return None, 0, None
+        match = matches[-1]
+        content_end = match.start()
+        if cleaned[content_end:content_end + 1] == "\n":
+            content_end += 1
+        tail_state = match.group(2)
+        has_final_newline = None if tail_state == "x" else tail_state == "1"
+        return cleaned[:content_end], int(match.group(1)), has_final_newline
+
     @staticmethod
     def _not_regular_error(path: str) -> ReadResult:
         """Error for a path that exists but would block if read."""
@@ -1474,10 +1548,16 @@ class ShellFileOperations(FileOperations):
         
         offset, limit = normalize_read_pagination(offset, limit)
         
-        # Check if file exists and get size (POSIX, works on Linux + macOS)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        # Gate regular files, get the byte size, and sample raw bytes in one
+        # backend execution. This ordering must remain intact: image/binary
+        # decisions happen only after the non-blocking ``[ -f ]`` gate.
+        probe_result = self._exec(self._read_probe_cmd(path))
 
-        if stat_result.exit_code != 0:
+        probe_output = _strip_terminal_fence_leaks(probe_result.stdout or "")
+        file_size, sample_bytes = self._parse_read_probe(probe_result.stdout)
+        if file_size is None and probe_output.strip() == NOT_REGULAR_SENTINEL:
+            return self._not_regular_error(path)
+        if file_size is None:
             # File not found. Before failing, try unicode-equivalent
             # spellings — NFC/NFD, narrow no-break space, curly quotes
             # render identically in a terminal, so the model retyping a
@@ -1497,14 +1577,6 @@ class ShellFileOperations(FileOperations):
             # No equivalent spelling — suggest similar files
             return self._suggest_similar_files(path)
 
-        stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
-        if stat_output.strip() == NOT_REGULAR_SENTINEL:
-            return self._not_regular_error(path)
-        try:
-            file_size = int(stat_output.strip())
-        except ValueError:
-            file_size = 0
-        
         # Check if file is too large
         if file_size > MAX_FILE_SIZE:
             # Still try to read, but warn
@@ -1524,7 +1596,6 @@ class ShellFileOperations(FileOperations):
         
         # Read a sample to check for binary content — at the byte layer when
         # the transport allows, falling back to the legacy text heuristic.
-        sample_bytes = self._sample_file_bytes(path)
         if sample_bytes is not None:
             ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
             is_binary = ext_binary or self._is_likely_binary_bytes(sample_bytes)
@@ -1578,29 +1649,23 @@ class ShellFileOperations(FileOperations):
         from tools.tool_output_limits import get_max_line_length
         line_clamp_bytes = 4 * get_max_line_length() + 1
         end_line = offset + limit - 1
-        read_cmd = (
-            f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)}"
-            f" | cut -b1-{line_clamp_bytes}"
+        read_cmd = self._read_page_cmd(
+            path, offset, end_line, line_clamp_bytes,
         )
         read_result = self._exec(read_cmd)
         
         if read_result.exit_code != 0:
             return ReadResult(error=f"Failed to read file: {read_result.stdout}")
-        read_output = _strip_terminal_fence_leaks(read_result.stdout)
+        read_output, total_lines, has_final_newline = self._parse_read_page(
+            read_result.stdout
+        )
+        if read_output is None:
+            return ReadResult(error=f"Failed to parse file metadata: {path}")
         # Strip a leading UTF-8 BOM so the model never sees a phantom U+FEFF
         # before the first real character. Only meaningful on the first
         # chunk (the marker lives at byte 0); later pages can't carry it.
         if offset == 1:
             read_output, _ = _strip_bom(read_output)
-        
-        # Get total line count
-        wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
-        wc_result = self._exec(wc_cmd)
-        wc_output = _strip_terminal_fence_leaks(wc_result.stdout)
-        try:
-            total_lines = int(wc_output.strip())
-        except ValueError:
-            total_lines = 0
         
         # Check if truncated
         truncated = total_lines > end_line
@@ -1612,12 +1677,8 @@ class ShellFileOperations(FileOperations):
         # so a file whose final line has no trailing newline would grow a
         # phantom empty last line. Only possible when this page reaches the
         # file's final line; probe the last byte and strip the artifact.
-        if not truncated and read_output.endswith('\n'):
-            tail_cmd = f"tail -c 1 {self._escape_shell_arg(path)} | wc -l"
-            tail_result = self._exec(tail_cmd)
-            tail_output = _strip_terminal_fence_leaks(tail_result.stdout)
-            if tail_result.exit_code == 0 and tail_output.strip() == "0":
-                read_output = read_output[:-1]
+        if not truncated and has_final_newline is False and read_output.endswith('\n'):
+            read_output = read_output[:-1]
 
         # Ambiguous-silence guards: an empty content string is
         # indistinguishable, from inside the model, from a broken tool —

@@ -72,6 +72,28 @@ def test_normal_multiline_read_unchanged(tmp_path, ops):
     assert result.content.startswith("1|alpha\n2|beta\n3|gamma")
 
 
+def test_text_read_uses_two_backend_executions(tmp_path):
+    """The regular-file probe and page metadata each use one shell call."""
+    p = tmp_path / "plain.txt"
+    p.write_text("alpha\nbeta\n", encoding="utf-8")
+    env = LocalEnvironment()
+    calls = []
+    execute = env.execute
+
+    def recording_execute(command, **kwargs):
+        calls.append(command)
+        return execute(command, **kwargs)
+
+    env.execute = recording_execute
+    result = ShellFileOperations(env).read_file(str(p))
+
+    assert result.error is None
+    assert result.content.startswith("1|alpha\n2|beta")
+    assert len(calls) == 2
+    assert calls[0].startswith("if [ -f ")
+    assert calls[1].startswith("sed -n ")
+
+
 def test_no_trailing_newline_preserved(tmp_path, ops):
     """cut newline-terminates its output; read_file must strip the artifact."""
     p = tmp_path / "nonl.txt"
