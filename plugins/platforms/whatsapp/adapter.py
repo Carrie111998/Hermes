@@ -869,7 +869,36 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             logger.error("[%s] %s", self.name, message)
             self._set_fatal_error("whatsapp_bridge_exited", message, retryable=True)
             self._close_bridge_log()
-            await self._notify_fatal_error()
+            if asyncio.current_task() is getattr(self, "_poll_task", None):
+                # The runner's fatal handler disconnects this adapter, and
+                # disconnect() cancels the poll task.  Awaiting the handler
+                # from that same poll task creates a cancellation cycle:
+                # poll -> fatal handler -> disconnect -> poll.  Hand recovery
+                # to an independently owned task so teardown can finish and
+                # the runner can queue WhatsApp for reconnection.
+                notification_task = asyncio.create_task(
+                    self._notify_fatal_error()
+                )
+                background_tasks = getattr(self, "_background_tasks", None)
+                if isinstance(background_tasks, set):
+                    background_tasks.add(notification_task)
+
+                def finish_notification(task: asyncio.Task) -> None:
+                    if isinstance(background_tasks, set):
+                        background_tasks.discard(task)
+                    try:
+                        task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception(
+                            "[%s] Fatal-error notification task failed",
+                            self.name,
+                        )
+
+                notification_task.add_done_callback(finish_notification)
+            else:
+                await self._notify_fatal_error()
         return self.fatal_error_message or message
 
     async def disconnect(self) -> None:

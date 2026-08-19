@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +128,66 @@ class TestCloseBridgeLog:
 
         mock_fh.close.assert_called_once()
         assert adapter._bridge_log_fh is None
+
+
+@pytest.mark.asyncio
+async def test_poll_detected_bridge_exit_completes_real_runner_recovery(
+    monkeypatch, tmp_path
+):
+    """A bridge crash detected by the poll task must reach the reconnect queue.
+
+    The real fatal handler disconnects the failed adapter.  If the poll task
+    awaits that handler inline, ``disconnect()`` cancels the same poll task and
+    cancellation aborts the handler before it can queue WhatsApp for recovery.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from gateway.run import GatewayRunner
+
+    adapter = _make_adapter()
+    adapter._running = True
+    adapter._http_session = MagicMock(closed=True)
+    adapter._poll_task = None
+    adapter._shutting_down = False
+    adapter._platform_lock_identity = None
+
+    bridge_process = MagicMock()
+    bridge_process.poll.return_value = 1
+    adapter._bridge_process = bridge_process
+
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(enabled=True, token="token")
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.delivery_router.adapters = runner.adapters
+    runner.stop = AsyncMock()
+    adapter.set_fatal_error_handler(runner._handle_adapter_fatal_error)
+
+    with patch(
+        "plugins.platforms.whatsapp.adapter._terminate_bridge_process"
+    ):
+        poll_task = asyncio.create_task(adapter._poll_messages())
+        adapter._poll_task = poll_task
+        done, _pending = await asyncio.wait({poll_task}, timeout=0.5)
+        assert poll_task in done
+
+        for _ in range(100):
+            if (
+                Platform.WHATSAPP in runner._failed_platforms
+                and adapter._http_session is None
+            ):
+                break
+            await asyncio.sleep(0.005)
+
+    assert runner.adapters == {}
+    assert Platform.WHATSAPP in runner._failed_platforms
+    assert runner._failed_platforms[Platform.WHATSAPP]["attempts"] == 0
+    assert adapter._http_session is None
+    assert adapter._poll_task is None
+    runner.stop.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
