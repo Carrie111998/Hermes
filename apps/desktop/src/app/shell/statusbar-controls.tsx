@@ -104,7 +104,8 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
             'flex h-5 shrink-0 items-stretch justify-between gap-2 bg-(--ui-sidebar-surface-background) px-1 py-0 text-(--ui-text-tertiary) [-webkit-app-region:no-drag]',
             className
           )}
-          data-slot="statusbar"
+          data-slot="context-menu-trigger"
+          data-statusbar=""
           {...props}
         >
           {/* `overflow-x-clip` (not `overflow-x-auto`) so a wide status item — for
