@@ -1067,3 +1067,85 @@ class TestCronStaleBody:
             "ran_at": "not-a-timestamp",
         })
         assert "jobflow-scout" in body
+
+
+class TestAgentNoteBody:
+    """agent_note_body() renders arbitrary agent-authored prose verbatim.
+
+    The type exists because every other plausible EventType discards free
+    text (see the 2026-08-19 spec): boot_summary_body renders the SAME
+    content-free string for any payload, which then collapses two distinct
+    messages onto one RepeatGuard fingerprint and drops the second silently.
+    So the contract these tests pin is 'the caller's words reach the topic
+    unaltered' — and, where they cannot, that the loss is VISIBLE.
+    """
+
+    def test_headline_and_detail_render_verbatim(self):
+        from events.formatting import agent_note_body
+        detail = "First line.\nSecond line.\n  indented third."
+        body = agent_note_body({
+            "headline": "Verdict: the :7483 health probe is a false alarm",
+            "detail": detail,
+        })
+        assert body == (
+            "Verdict: the :7483 health probe is a false alarm\n" + detail
+        )
+
+    def test_headline_alone_is_the_whole_body(self):
+        from events.formatting import agent_note_body
+        assert agent_note_body({"headline": "Sweep finished clean."}) == (
+            "Sweep finished clean."
+        )
+
+    def test_detail_alone_renders_without_a_leading_blank_line(self):
+        from events.formatting import agent_note_body
+        body = agent_note_body({"detail": "Only the detail was supplied."})
+        assert body == "Only the detail was supplied."
+
+    def test_two_different_notes_produce_different_bodies(self):
+        """The defect this type exists to fix, at the body level."""
+        from events.formatting import agent_note_body
+        a = agent_note_body({"headline": "Verdict A", "detail": "because X"})
+        b = agent_note_body({"headline": "Verdict B", "detail": "because Y"})
+        assert a != b
+
+    def test_empty_payload_falls_back_to_key_values_not_a_plausible_blank(self):
+        """No headline and no detail must NOT render a confident empty
+        message — that is exactly the boot_summary failure mode. Anything
+        the caller did send has to remain visible."""
+        from events.formatting import agent_note_body
+        body = agent_note_body({"unexpected_key": "the payload the agent sent"})
+        assert "unexpected_key" in body
+        assert "the payload the agent sent" in body
+
+    def test_truly_empty_payload_says_so(self):
+        from events.formatting import agent_note_body
+        body = agent_note_body({})
+        assert body.strip()
+        assert "empty" in body.lower()
+
+    def test_reserved_keys_are_not_echoed_into_the_body(self):
+        """status/attention steer the header and routing; repeating them in
+        the body is noise."""
+        from events.formatting import agent_note_body
+        body = agent_note_body({
+            "headline": "Rollout done", "attention": "warn", "status": "failed",
+        })
+        assert body == "Rollout done"
+
+    def test_oversize_detail_truncates_visibly(self):
+        from events.formatting import AGENT_NOTE_MAX_CHARS, agent_note_body
+        body = agent_note_body({"headline": "Big", "detail": "x" * 9000})
+        assert len(body) <= AGENT_NOTE_MAX_CHARS
+        assert "truncated" in body.lower()
+
+    def test_body_within_the_cap_is_untouched(self):
+        from events.formatting import agent_note_body
+        body = agent_note_body({"headline": "Small", "detail": "y" * 100})
+        assert "truncated" not in body.lower()
+        assert body == "Small\n" + "y" * 100
+
+    def test_non_string_detail_does_not_raise(self):
+        from events.formatting import agent_note_body
+        body = agent_note_body({"headline": "H", "detail": ["a", "b"]})
+        assert "H" in body

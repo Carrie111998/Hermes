@@ -102,6 +102,14 @@ class _Spec:
     # Per-type floor applied on top of the class clamp (e.g. a detected
     # secret must stay IMMEDIATE-grade even though its default is HIGH).
     priority_floor: Optional[Priority] = None
+    # Symmetric counterpart: a per-type CEILING on the effective priority.
+    # Added 2026-08-19 for AGENT_NOTE, whose producer is arbitrary agent code
+    # — capping at HIGH is what makes "an agent note never pages" true by
+    # construction rather than by convention, because _derive_wa escalates a
+    # WARN route only at CRITICAL. Belongs here, with the routing data, for
+    # the same reason priority_floor does: it is a property of the type, not
+    # a branch in the derivation.
+    priority_cap: Optional[Priority] = None
 
 
 _E = EventType
@@ -234,6 +242,15 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.CURATOR_DAILY: _Spec(Attention.INFO, AGENTS_MEMORY),
     _E.MEMORY_CONSOLIDATED: _Spec(Attention.INFO, AGENTS_MEMORY),
     _E.SKILL_EVOLVED: _Spec(Attention.INFO, AGENTS_MEMORY),
+    # Arbitrary agent-authored prose. This entry is only the DEFAULT: the
+    # caller declares the class in payload["attention"] (hook below), because
+    # the type carries no semantics for the policy to read. The cap is the
+    # load-bearing half — with priority_cap=HIGH, _derive_wa returns None for
+    # every reachable (attention, priority) pair, so no payload an agent can
+    # author reaches WhatsApp. See the AGENT_NOTE clamp after the human-gate
+    # block for why the ceiling is enforced there and not here.
+    _E.AGENT_NOTE: _Spec(Attention.INFO, AGENTS_MEMORY,
+                         priority_cap=Priority.HIGH),
     # ----- daily brief / conversational ------------------------------
     _E.DIGEST_GENERATED: _Spec(Attention.TRACE, DAILY_BRIEF),
     _E.MAILBOX_MESSAGE: _Spec(Attention.TRACE, DAILY_BRIEF),  # hook: NOTIFICATION `to:`
@@ -255,6 +272,26 @@ AGENT_TOPIC_MAP: Dict[str, str] = {
     'devflow': DEVFLOW, 'devflow-standup': DEVFLOW, 'devflow-bridge': DEVFLOW,
     'critic': CRITIC, 'curator': AGENTS_MEMORY,
     'watchdog': ALERTS, 'scribe': DAILY_BRIEF,
+}
+
+# AGENT_NOTE caller-declared attention class → the lane it means.
+# "act" is accepted here rather than dropped so the clamp below can LOG a
+# rejected escalation attempt; silently mapping it to INFO would hide a
+# producer that believes it is paging.
+_AGENT_NOTE_ATTENTION: Dict[str, Attention] = {
+    "info": Attention.INFO,
+    "warn": Attention.WARN,
+    "trace": Attention.TRACE,
+    "act": Attention.ACT,
+}
+
+# Class → topic for AGENT_NOTE, following the v3 convention. ACT maps to
+# ALERTS because the clamp below rewrites ACT to WARN; it never survives.
+_AGENT_NOTE_TOPIC: Dict[Attention, str] = {
+    Attention.INFO: AGENTS_MEMORY,
+    Attention.WARN: ALERTS,
+    Attention.TRACE: OPS_TRACE,
+    Attention.ACT: ALERTS,
 }
 
 # Single failures from JobFlow pipeline agents demote to the domain topic
@@ -443,7 +480,17 @@ def classify(
     et = event.event_type
 
     # --- conditional hooks (migrated from pre-v3 scattered overrides) ---
-    if et == EventType.AGENT_ITERATION:
+    if et == EventType.AGENT_NOTE:
+        # The caller declares the attention class; the topic follows from it
+        # by the v3 class→lane convention rather than being named directly,
+        # so a note cannot be filed into a domain topic where it means
+        # nothing. An unrecognised or absent value keeps the INFO default —
+        # a typo must not silently promote a note into Alerts.
+        attention = _AGENT_NOTE_ATTENTION.get(
+            str(payload.get("attention") or "").strip().lower(), Attention.INFO)
+        topic_key = _AGENT_NOTE_TOPIC[attention]
+
+    elif et == EventType.AGENT_ITERATION:
         agent = (payload.get('agent') or '').strip().lower()
         topic_key = AGENT_TOPIC_MAP.get(agent, JOBFLOW)
 
@@ -557,6 +604,26 @@ def classify(
         attention = Attention.WARN
         topic_key = ALERTS
 
+    # AGENT_NOTE ceiling. THIS MUST STAY AFTER THE HUMAN-GATE BLOCK ABOVE.
+    #
+    # structured_human_gate() promotes ANY event carrying action_required +
+    # a recognised action_kind straight to ACT/ACTION_REQUIRED, and _derive_wa
+    # then always escalates an ACT route. AGENT_NOTE payloads are written by
+    # arbitrary agent code, so those two keys would be a self-service phone
+    # page. Clamping here — after every promotion path has run — is what makes
+    # the ceiling hold; moved into the conditional-hooks block it would be
+    # silently overridden and this file would still read as if it were safe.
+    # tests/events/test_routing_policy.py pins both the clamp and the
+    # placement.
+    if et is EventType.AGENT_NOTE and attention is Attention.ACT:
+        logger.warning(
+            "agent_note from %s requested ACT; clamped to WARN on %s "
+            "(agent notes never page — see the 2026-08-19 AGENT_NOTE spec)",
+            event.source, ALERTS,
+        )
+        attention = Attention.WARN
+        topic_key = ALERTS
+
     # Preserve routing-v3's single-failure domain demotion for explicit
     # failure event types. Verdict-promoted wrappers are deliberately absent
     # from JOBFLOW_DEMOTE_TYPES and therefore remain in Alerts.
@@ -568,6 +635,9 @@ def classify(
     priority = _clamp(priority, verdict.priority_floor)
     priority = _clamp(priority, spec.priority_floor)
     priority = _cap(priority, _class_cap(attention))
+    # Per-type ceiling last, so it beats every floor above it — including the
+    # verdict floor, which a payload key such as status:"failed" can raise.
+    priority = _cap(priority, spec.priority_cap)
 
     # --- WhatsApp tier ---------------------------------------------------
     wa_tier = _derive_wa(attention, priority, wa)

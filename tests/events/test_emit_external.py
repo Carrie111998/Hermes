@@ -88,3 +88,55 @@ def test_malformed_json_is_rejected(bus, monkeypatch):
     monkeypatch.setattr("events.emit_external.EventBus", lambda *a, **k: bus)
     monkeypatch.setattr("sys.stdin", io.StringIO("{not json"))
     assert main(["--type", "boot_summary", "--source", "x"]) == 2
+
+
+def test_emits_an_agent_note_and_the_prose_survives(bus, monkeypatch):
+    """The out-of-process path for AGENT_NOTE (2026-08-19). A PowerShell or
+    shell caller with a sentence to send now has a type that keeps it, so
+    nothing has to borrow boot_summary and watch its text be discarded."""
+    monkeypatch.setattr("events.emit_external.EventBus", lambda *a, **k: bus)
+    detail = "Line one.\nLine two."
+    rc = _run(monkeypatch,
+              ["--type", "agent_note", "--source", "claude-code"],
+              {"headline": "Sweep finished", "detail": detail,
+               "attention": "warn"})
+    assert rc == 0
+    events = bus.query()
+    assert len(events) == 1
+    assert events[0].event_type is EventType.AGENT_NOTE
+    assert events[0].payload["headline"] == "Sweep finished"
+    assert events[0].payload["detail"] == detail
+    assert events[0].priority is Priority.NORMAL
+
+
+def test_agent_note_rendered_end_to_end_keeps_its_words(bus, monkeypatch):
+    """Round-trip through the bus and the notifier body: the text a caller
+    piped in is the text that reaches the topic."""
+    from events.formatting import agent_note_body
+    monkeypatch.setattr("events.emit_external.EventBus", lambda *a, **k: bus)
+    rc = _run(monkeypatch,
+              ["--type", "agent_note", "--source", "laptop-start"],
+              {"headline": "Boot recovered after retry",
+               "detail": "docker took 3 attempts.\ngbrain came up clean."})
+    assert rc == 0
+    body = agent_note_body(bus.query()[0].payload)
+    assert body == ("Boot recovered after retry\n"
+                    "docker took 3 attempts.\ngbrain came up clean.")
+
+
+def test_agent_note_critical_override_cannot_page(bus, monkeypatch):
+    """--priority critical is accepted at the CLI (it is a real Priority) but
+    the routing cap keeps the effective priority at HIGH and wa_tier None, so
+    an out-of-process caller cannot buy a phone page either."""
+    from events.routing_policy import classify
+    monkeypatch.setattr("events.emit_external.EventBus", lambda *a, **k: bus)
+    rc = _run(monkeypatch,
+              ["--type", "agent_note", "--source", "some-script",
+               "--priority", "critical"],
+              {"headline": "urgent!", "attention": "warn"})
+    assert rc == 0
+    event = bus.query()[0]
+    assert event.priority is Priority.CRITICAL      # stored as requested
+    route = classify(event)
+    assert route.priority is Priority.HIGH          # delivered capped
+    assert route.wa_tier is None

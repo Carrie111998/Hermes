@@ -2779,3 +2779,106 @@ class TestCronStaleBody:
         body = notifier._format_payload(event)
         assert "jobflow-tracker-weekly has been running 20m 13s" in body
         assert "shutdown" not in body and "owner exited" not in body
+
+
+class TestAgentNoteDelivery:
+    """End-to-end: an agent note reaches the topic with its words intact.
+
+    The regression under test (2026-08-19): with no type that renders free
+    text, callers picked boot_summary, whose body function ignores the
+    payload and emits the same string every time. RepeatGuard fingerprints
+    the RENDERED message, so the second of two distinct verdicts was
+    suppressed with no dead-letter and no audit line — only a missing
+    notification_delivered entry.
+    """
+
+    def _notifier(self, bus, topics_config, verbosity_config):
+        return TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+
+    def _note(self, headline, detail=None, attention=None, priority=None):
+        payload = {"headline": headline}
+        if detail is not None:
+            payload["detail"] = detail
+        if attention is not None:
+            payload["attention"] = attention
+        return Event.create(
+            EventType.AGENT_NOTE, "claude-code", payload, priority=priority,
+        )
+
+    def test_headline_and_detail_survive_into_the_message(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = self._note(
+            "Verdict: gbrain :7483 /health is not evidence of health",
+            "It races SELECT 1 against a 3s deadline.\n"
+            "A serviced tools/call is the only proof.",
+        )
+        message = notifier.format_message(event)
+        assert "Verdict: gbrain :7483 /health is not evidence of health" in message
+        assert "It races SELECT 1 against a 3s deadline." in message
+        assert "A serviced tools/call is the only proof." in message
+        assert "AGENT_NOTE" in message          # header survives
+        assert "claude-code" in message         # source header survives
+
+    def test_two_distinct_notes_both_deliver(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The exact incident. Under boot_summary both rendered identically
+        and the second was swallowed by RepeatGuard."""
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        first = notifier.format_message(
+            self._note("Verdict A: the health probe is a false alarm",
+                       "Re-probe with a real tools/call."))
+        second = notifier.format_message(
+            self._note("Verdict B: the venv trampoline is not an orphan",
+                       "Check ParentProcessId before killing."))
+        assert first != second
+        thread = "108"
+        assert notifier._repeat_guard.is_repeat(thread, first) is False
+        assert notifier._repeat_guard.is_repeat(thread, second) is False
+
+    def test_a_verbatim_repeat_is_still_suppressed(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The guard stays armed — a looping agent costs one message per
+        window, not one per fire."""
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        message = notifier.format_message(
+            self._note("Sweep clean", "nothing to report"))
+        thread = "108"
+        assert notifier._repeat_guard.is_repeat(thread, message) is False
+        assert notifier._repeat_guard.is_repeat(thread, message) is True
+
+    def test_multiline_detail_is_not_collapsed(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        body = notifier._format_payload(
+            self._note("H", "one\ntwo\nthree"))
+        assert body == "H\none\ntwo\nthree"
+
+    def test_note_without_headline_still_shows_its_payload(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.AGENT_NOTE, "claude-code",
+            {"finding": "the counter was never incremented"},
+        )
+        body = notifier._format_payload(event)
+        assert "the counter was never incremented" in body
+
+    def test_warn_note_passes_the_alerts_verbosity_gate(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """watchdog_alerts runs significant_only/min_priority normal in
+        production; the WARN class floor is what clears it."""
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = self._note("something looks wrong", attention="warn",
+                           priority=Priority.LOW)
+        route = classify(event, known_topic_keys=notifier.topics.keys())
+        assert route.priority.level >= Priority.NORMAL.level
+        assert notifier._passes_verbosity("watchdog_alerts", route, event)

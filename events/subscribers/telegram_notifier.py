@@ -625,6 +625,16 @@ class TelegramNotifier(BaseSubscriber):
             from events.formatting import boot_summary_body
             return boot_summary_body(p)
 
+        if et == EventType.AGENT_NOTE:
+            # 2026-08-19: the only type whose body is the caller's own prose.
+            # Renders headline + detail VERBATIM — the same treatment
+            # AGENT_ITERATION gives a structured `brief` below. Every other
+            # branch in this method reads type-specific fields and would
+            # discard free text; that discard is what silently collapsed two
+            # distinct notes onto one RepeatGuard fingerprint.
+            from events.formatting import agent_note_body
+            return agent_note_body(p)
+
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"
 

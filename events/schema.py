@@ -539,6 +539,34 @@ class EventType(Enum):
     # means changing it there too.
     BOOT_SUMMARY = ("boot_summary", Priority.HIGH, "🥾")
 
+    # Arbitrary agent- or script-authored prose — added 2026-08-19. Every
+    # other type renders only the fields ITS branch of
+    # TelegramNotifier._format_payload knows, so a caller with a sentence to
+    # send had to borrow the least-wrong type and watch the sentence be
+    # discarded. Worse than ugly: a borrowed type renders IDENTICALLY for any
+    # payload, and RepeatGuard fingerprints the RENDERED message, so two
+    # distinct notes collapsed to one fingerprint and the second was dropped
+    # with no dead-letter and no audit line (2026-08-19 spec). That is why the
+    # calling code left the bus for the raw Bot API, losing the dot, icon,
+    # source header and durable queue.
+    #
+    # The body renders `headline` + a multi-line `detail` VERBATIM — the same
+    # contract AGENT_ITERATION already honours for its structured `brief`.
+    # Because the type has no intrinsic semantics, the CALLER declares the
+    # attention class in the payload (`attention`: info|warn|trace); see
+    # events/routing_policy.py. That declaration is capped: `act` clamps to
+    # WARN and _Spec(priority_cap=HIGH) keeps wa_tier None for every possible
+    # payload, so an agent note can never page the phone. Payload:
+    #   headline (str, required) — one line, the subject
+    #   detail (str, optional)   — multi-line free text, rendered verbatim
+    #   attention (str, optional)— info (default) | warn | trace
+    # NORMAL default: INFO notes stay calm and the WARN class floor lifts the
+    # ones that matter without the producer having to know the floors.
+    # Icon: a spiral notepad reads as 'a note someone wrote'. Verified free
+    # across all members and disjoint from the glyphs already in both topics
+    # this type can reach (agents_memory 📚🚀🧠, watchdog_alerts's 26).
+    AGENT_NOTE = ("agent_note", Priority.NORMAL, "🗒️")
+
     def __init__(self, type_string: str, default_priority: Priority, icon: str):
         # The icon is REQUIRED, and that is the whole point of it living here
         # rather than in a parallel dict — see the class docstring. Omitting it

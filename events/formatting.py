@@ -775,6 +775,79 @@ def cron_stale_body(p: dict) -> str:
     )
 
 
+# AGENT_NOTE body cap. Telegram's own message limit is 4096 characters and
+# the header + separator eat some of that; 3000 leaves room and matches the
+# spirit of CRON_SUMMARY_MAX_CHARS (1500) without truncating a genuine
+# multi-paragraph verdict. Truncation is always ANNOUNCED — see below.
+AGENT_NOTE_MAX_CHARS = 3000
+
+# Payload keys that steer the header (verdict machinery, events/outcomes.py)
+# or the routing (events/routing_policy.py) rather than the prose. Echoing
+# them back into the body would be noise, so the no-headline fallback skips
+# them — but ONLY them, so nothing the caller actually wrote is hidden.
+_AGENT_NOTE_STEERING_KEYS = frozenset({
+    "headline", "detail", "attention",
+    "status", "reason", "outcome", "result", "conclusion", "message_type",
+    "action_required", "action_kind",
+})
+
+
+def agent_note_body(payload: dict) -> str:
+    """Verbatim AGENT_NOTE body (2026-08-19).
+
+    The one type carrying arbitrary agent-authored prose, so this function's
+    whole job is to NOT interpret it: ``headline`` then ``detail``, newlines
+    and all, exactly as AGENT_ITERATION renders a structured ``brief``.
+
+    Two rules earn their place, and both exist because of the defect that
+    motivated the type (see docs/superpowers/specs/2026-08-19-agent-note-
+    event-type-design.md):
+
+    * **Never render a confident blank.** A payload with no prose falls
+      through to key:value lines rather than a plausible-looking empty
+      message. boot_summary_body rendering "Boot ? finished ?" for a payload
+      it did not understand is what let two distinct messages collapse onto
+      one RepeatGuard fingerprint and vanish.
+    * **Truncation is announced.** A silent cut would recreate that same
+      failure in miniature — two long notes sharing a prefix would render
+      identically and the second would be suppressed.
+    """
+    p = payload if isinstance(payload, dict) else {}
+
+    def _text(value) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    headline = _text(p.get("headline"))
+    # rstrip only: leading indentation can be meaningful in a pasted block.
+    detail = p.get("detail")
+    detail = detail.rstrip() if isinstance(detail, str) else ""
+
+    parts = [part for part in (headline, detail) if part]
+    if parts:
+        body = "\n".join(parts)
+    else:
+        # No prose. Surface whatever the caller DID send, minus the keys that
+        # only steer header/routing, so a malformed note is diagnosable from
+        # the message itself instead of requiring a bus query.
+        leftovers = [
+            f"{k}: {v}" for k, v in p.items()
+            if k not in _AGENT_NOTE_STEERING_KEYS and v not in (None, "", [], {})
+        ]
+        if leftovers:
+            body = "(agent note with no headline)\n" + "\n".join(leftovers[:10])
+        else:
+            body = "(empty agent note — the producer sent no headline or detail)"
+
+    if len(body) <= AGENT_NOTE_MAX_CHARS:
+        return body
+    # Announce the loss with the exact character count, and keep the count out
+    # of the kept text so the note stays readable up to the cut.
+    dropped = len(body) - AGENT_NOTE_MAX_CHARS
+    note = f"\n…truncated {dropped} chars"
+    keep = max(0, AGENT_NOTE_MAX_CHARS - len(note))
+    return body[:keep] + note
+
+
 def boot_summary_body(payload: dict, *, max_listed: int = 5) -> str:
     """Plain-language BOOT_SUMMARY body (2026-07-27).
 

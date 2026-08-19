@@ -744,3 +744,114 @@ def test_non_disk_pressure_is_unchanged():
         payload={"reasons": ["commit_high"], "commit_pct": 98.4},
     ))
     assert route.attention is Attention.WARN
+
+
+# ------------------------------------------------------------- AGENT_NOTE
+#
+# AGENT_NOTE is the one type with no intrinsic semantics, so the caller
+# declares its attention class in the payload. These tests pin the two
+# things that make that safe: the class ceiling, and the fact that NOTHING
+# in a caller-supplied payload can lift a note onto the phone.
+
+class TestAgentNoteRouting:
+    def test_default_is_info_on_agents_memory(self):
+        route = classify(make_event(EventType.AGENT_NOTE, {"headline": "hi"}))
+        assert route.attention is Attention.INFO
+        assert route.topic_key == AGENTS_MEMORY
+        assert route.wa_tier is None
+
+    def test_warn_lands_on_alerts_at_normal_or_higher(self):
+        route = classify(make_event(
+            EventType.AGENT_NOTE, {"headline": "hi", "attention": "warn"}))
+        assert route.attention is Attention.WARN
+        assert route.topic_key == ALERTS
+        assert route.priority.level >= Priority.NORMAL.level
+        assert route.wa_tier is None
+
+    def test_trace_batches_on_the_ops_firehose(self):
+        route = classify(make_event(
+            EventType.AGENT_NOTE, {"headline": "hi", "attention": "trace"}))
+        assert route.attention is Attention.TRACE
+        assert route.topic_key == OPS_TRACE
+        assert route.batch is True
+
+    def test_unrecognised_attention_falls_back_to_info(self):
+        route = classify(make_event(
+            EventType.AGENT_NOTE, {"headline": "hi", "attention": "banana"}))
+        assert route.attention is Attention.INFO
+        assert route.topic_key == AGENTS_MEMORY
+
+    def test_attention_is_case_and_whitespace_tolerant(self):
+        route = classify(make_event(
+            EventType.AGENT_NOTE, {"headline": "hi", "attention": "  WARN "}))
+        assert route.attention is Attention.WARN
+
+    def test_act_is_clamped_to_warn_and_never_pages(self):
+        route = classify(make_event(
+            EventType.AGENT_NOTE, {"headline": "hi", "attention": "act"}))
+        assert route.attention is Attention.WARN
+        assert route.topic_key == ALERTS
+        assert route.wa_tier is None
+
+    def test_structured_human_gate_cannot_smuggle_a_note_into_act(self):
+        """action_required + action_kind promotes ANY event to ACT/page
+        (routing_policy.structured_human_gate). The AGENT_NOTE clamp runs
+        AFTER that gate precisely so a caller-supplied payload cannot buy a
+        phone page. Placed before the gate, this test fails."""
+        route = classify(make_event(EventType.AGENT_NOTE, {
+            "headline": "hi",
+            "action_required": True,
+            "action_kind": "approval",
+        }))
+        assert route.attention is not Attention.ACT
+        assert route.topic_key != ACTION_REQUIRED
+        assert route.wa_tier is None
+
+    def test_critical_priority_is_capped_to_high_and_still_never_pages(self):
+        """The closed valve: WARN + CRITICAL would otherwise derive
+        WA_URGENT in _derive_wa."""
+        route = classify(make_event(
+            EventType.AGENT_NOTE,
+            {"headline": "hi", "attention": "warn"},
+            priority=Priority.CRITICAL,
+        ))
+        assert route.priority is Priority.HIGH
+        assert route.wa_tier is None
+
+    def test_failed_status_still_never_pages(self):
+        """status: failed promotes an INFO note to WARN/Alerts via the
+        verdict machinery. That promotion is intended; a page is not."""
+        route = classify(make_event(
+            EventType.AGENT_NOTE, {"headline": "hi", "status": "failed"}))
+        assert route.attention is Attention.WARN
+        assert route.topic_key == ALERTS
+        assert route.wa_tier is None
+
+    @pytest.mark.parametrize("payload", [
+        {"headline": "h", "attention": "act", "action_required": True,
+         "action_kind": "credential"},
+        {"headline": "h", "attention": "act", "status": "failed"},
+        {"headline": "h", "attention": "warn", "action_required": True,
+         "action_kind": "decision", "status": "error"},
+    ])
+    def test_no_payload_combination_ever_escalates(self, payload):
+        for priority in Priority:
+            route = classify(make_event(
+                EventType.AGENT_NOTE, payload, priority=priority))
+            assert route.wa_tier is None, (payload, priority)
+            assert route.priority.level <= Priority.HIGH.level
+
+
+def test_agent_note_never_escalates_via_the_whatsapp_adapter():
+    """classify_tier() is a thin adapter over classify(); asserting through
+    it proves the escalator itself stays silent, which is why the design
+    adds no whatsapp_escalator branch."""
+    from events.subscribers.whatsapp_escalator import classify_tier
+    for priority in Priority:
+        event = make_event(
+            EventType.AGENT_NOTE,
+            {"headline": "h", "attention": "act", "action_required": True,
+             "action_kind": "approval"},
+            priority=priority,
+        )
+        assert classify_tier(event) is None
