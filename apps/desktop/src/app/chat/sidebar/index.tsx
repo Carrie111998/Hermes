@@ -125,6 +125,7 @@ import {
   setCurrentCwd
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
+import { isPinUnpinPending } from '@/store/session-pin-sync'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
@@ -547,13 +548,17 @@ export function ChatSidebar({
   // Local pin ids first (hand-picked order), then server-flagged pins the
   // local set doesn't know about — a backend `pinned=1` row must never be
   // invisible just because localStorage is cold or was clobbered (#85969).
+  // A row just unpinned locally is excluded from that fallback too, via
+  // isPinUnpinPending — its cached `pinned` flag is stale until the PATCH is
+  // confirmed, and the fallback must not use it to re-add the row (#89700).
   const pinnedSessions = useMemo(
     () =>
-      resolvePinnedSessions(pinnedSessionIds, sessionByAnyId, [
-        ...visibleSessions,
-        ...cronSessions,
-        ...messagingSessions
-      ]),
+      resolvePinnedSessions(
+        pinnedSessionIds,
+        sessionByAnyId,
+        [...visibleSessions, ...cronSessions, ...messagingSessions],
+        isPinUnpinPending
+      ),
     [pinnedSessionIds, sessionByAnyId, visibleSessions, cronSessions, messagingSessions]
   )
 

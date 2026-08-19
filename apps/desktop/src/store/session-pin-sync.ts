@@ -46,6 +46,17 @@ function profileFor(pinId: string): null | string | undefined {
   return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
 }
 
+/**
+ * True while a local unpin's PATCH(false) hasn't been confirmed by a page yet.
+ * The cached `$sessions` row for this id can still read `pinned: true` (the
+ * PATCH ack doesn't rewrite it), so the sidebar's server-flagged fallback
+ * (session-index.ts) must not use that stale flag to re-add the row while
+ * this is true, or the unpin never sticks (#89700).
+ */
+export function isPinUnpinPending(pinId: string): boolean {
+  return unconfirmed.get(pinId)?.value === false
+}
+
 /** PATCH the flag, guarding reads against pages that predate the write. */
 function writePin(id: string, pinned: boolean, profile?: null | string): Promise<void> {
   unconfirmed.set(id, { at: Date.now(), value: pinned })
