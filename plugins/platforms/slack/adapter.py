@@ -67,6 +67,9 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+_SLACK_DM_HEADING_SEPARATOR_RE = re.compile(r"^[\s\u3000、,，:：]+")
+_DEFAULT_SLACK_DM_HEADING_ACK = "Heading received. Send details in this thread."
+
 # User-Agent prefix for outbound Slack API calls so platform partners can
 # identify HermesAgent traffic — matching other Hermes outbound surfaces
 # that already set ``HermesAgent/<version>`` for platform-partner attribution.
@@ -3542,6 +3545,69 @@ class SlackAdapter(BasePlatformAdapter):
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+    def _slack_dm_heading_prefixes(self) -> tuple[str, ...]:
+        """Return configured prefixes for top-level one-to-one DM headings."""
+        raw = self.config.extra.get("dm_heading_prefixes")
+        if raw is None:
+            return ()
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple, set)):
+            return ()
+        prefixes = tuple(str(value).strip() for value in raw if str(value).strip())
+        return prefixes
+
+    def _slack_dm_heading_ack(self) -> str:
+        """Return the direct acknowledgement sent for a DM heading."""
+        raw = self.config.extra.get("dm_heading_ack", _DEFAULT_SLACK_DM_HEADING_ACK)
+        return str(raw).strip() or _DEFAULT_SLACK_DM_HEADING_ACK
+
+    def _is_slack_dm_heading_text(self, text: str) -> bool:
+        """Return whether *text* is a configured heading, not ordinary prose."""
+        normalized = (text or "").strip()
+        for prefix in self._slack_dm_heading_prefixes():
+            if normalized == prefix:
+                return True
+            suffix = normalized[len(prefix) :] if normalized.startswith(prefix) else ""
+            if suffix and _SLACK_DM_HEADING_SEPARATOR_RE.match(suffix):
+                return True
+        return False
+
+    def _is_slack_top_level_dm_heading(self, event: dict, text: str) -> bool:
+        """Return whether a raw Slack event is a top-level 1:1 DM heading.
+
+        Deliberately checks raw ``thread_ts`` presence instead of
+        ``SessionSource.thread_id``. The latter is synthesized from the
+        message ts for top-level DMs when per-message DM sessions are enabled.
+        A present-but-equal ``thread_ts`` is also treated as a real thread
+        marker, as required by Slack payload semantics.
+        """
+        return (
+            event.get("channel_type") == "im"
+            and "thread_ts" not in event
+            and self._is_slack_dm_heading_text(text)
+        )
+
+    async def _send_slack_dm_heading_ack(
+        self, event: dict, *, team_id: str
+    ) -> None:
+        """Acknowledge a DM heading directly, without Gateway/Agent dispatch."""
+        channel_id = str(event.get("channel") or "")
+        message_ts = str(event.get("ts") or "")
+        if not channel_id or not message_ts:
+            logger.warning("[Slack] Cannot acknowledge DM heading without channel/ts")
+            return
+        result = await self.send(
+            channel_id,
+            self._slack_dm_heading_ack(),
+            reply_to=message_ts,
+            metadata={"thread_id": message_ts, "team_id": team_id},
+        )
+        if not result.success:
+            logger.warning(
+                "[Slack] DM heading acknowledgement failed: %s", result.error
+            )
+
     def _cron_continuable_surface(self) -> str:
         """Resolve the continuable-cron delivery surface for this platform.
 
@@ -6056,6 +6122,21 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id,
                 )
                 return
+
+        # Top-level one-to-one DM headings are an inbound routing control, not
+        # an Agent turn. Stop here — before session keying, thread hydration,
+        # attachment downloads, and MessageEvent dispatch — and acknowledge
+        # directly through the Slack adapter. This must use raw event
+        # ``thread_ts`` presence because top-level DM session scoping may have
+        # already synthesized ``source.thread_id = event.ts``.
+        if self._is_slack_top_level_dm_heading(event, text):
+            await self._send_slack_dm_heading_ack(event, team_id=str(team_id or ""))
+            logger.info(
+                "[Slack] Suppressed Agent dispatch for top-level DM heading: channel=%s ts=%s",
+                channel_id,
+                ts,
+            )
+            return
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a

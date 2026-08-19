@@ -223,6 +223,30 @@ Or run the interactive setup:
 hermes gateway setup    # Select Slack when prompted
 ```
 
+### Slack DM thread headings
+
+Hermes can optionally reserve top-level one-to-one DM messages as thread headings. This
+feature is disabled by default. When configured, a matching message is acknowledged
+directly by the Slack adapter and is not dispatched to the Agent. Replies posted inside
+that Slack thread are still processed normally.
+
+Enable it by configuring `dm_heading_prefixes` under the Slack platform's `extra` settings:
+
+```yaml
+platforms:
+  slack:
+    extra:
+      dm_heading_prefixes:
+        - "Topic"
+      dm_heading_ack: "Heading received. Send details in this thread."
+```
+
+`dm_heading_prefixes` accepts a list of prefixes. Exact matches and matches followed
+by whitespace, full-width whitespace, or common punctuation are treated as headings;
+ordinary prose such as `スレッドについて調べて` is not. Only top-level `channel_type=im`
+messages are affected. The adapter uses raw Slack `thread_ts` presence, not the
+session source's synthesized `thread_id`, so real thread replies are never suppressed.
+
 Then start the gateway:
 
 ```bash
