@@ -430,6 +430,33 @@ def test_merge_interrupted_history_matrix():
     assert {"role": "user", "content": "OTHER"} not in merged
     assert {"role": "assistant", "content": "obsolete"} not in merged
 
+    # Transformed current-turn user (context-reference / HUD note wrap).
+    wrapped = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "[file.md]\n\nretry me"},
+    ]
+    merged = server._merge_interrupted_api_history(
+        live, wrapped, turn_start_history=turn_start, current_prompt="retry me"
+    )
+    assert merged[:3] == live
+    assert merged[-1]["content"] == "[file.md]\n\nretry me"
+
+    # Multimodal current-turn user tail after a truncated snapshot.
+    multimodal_user = {
+        "role": "user",
+        "content": [{"type": "text", "text": "retry me"}, {"type": "image_url", "image_url": {"url": "x"}}],
+    }
+    returned_mm = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        multimodal_user,
+    ]
+    merged = server._merge_interrupted_api_history(
+        live, returned_mm, turn_start_history=turn_start, current_prompt="retry me"
+    )
+    assert merged[-1] is multimodal_user
+
     # G: new current-turn compaction rewrite is accepted.
     compacted = [
         {

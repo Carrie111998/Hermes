@@ -7855,6 +7855,35 @@ def _interrupted_result_allows_rewrite(
     return flagged and not any(_is_compaction_summary_message(msg) for msg in returned_history)
 
 
+def _message_text(msg: Any) -> str:
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(parts)
+    return ""
+
+
+def _is_current_turn_user_row(msg: Any, current_prompt: str | None, known_fps: set) -> bool:
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return False
+    if _message_fingerprint(msg) in known_fps:
+        return False
+    if not current_prompt:
+        return True
+    text = _message_text(msg)
+    if current_prompt == text or current_prompt in text or (text and text in current_prompt):
+        return True
+    return isinstance(msg.get("content"), list)
+
+
 def _merge_interrupted_api_history(
     live_history: list,
     returned_history: list,
@@ -7879,27 +7908,26 @@ def _merge_interrupted_api_history(
     if shared_live == len(live):
         return returned
 
+    live_fps = {_message_fingerprint(msg) for msg in live}
     turn_start = list(turn_start_history) if turn_start_history is not None else None
     if turn_start is not None:
         shared_turn = _common_history_prefix_len(turn_start, returned)
         if shared_turn == len(turn_start):
-            existing = {_message_fingerprint(msg) for msg in live}
             tail = [
                 msg
                 for msg in returned[shared_turn:]
-                if _message_fingerprint(msg) not in existing
+                if _message_fingerprint(msg) not in live_fps
             ]
             return [*live, *tail]
+        turn_fps = {_message_fingerprint(msg) for msg in turn_start}
+        known = live_fps | turn_fps
+        last = returned[shared_turn:][-1] if shared_turn < len(returned) else None
+        if last is not None and _is_current_turn_user_row(last, current_prompt, known):
+            return [*live, last]
+        return live
 
-    live_fps = {_message_fingerprint(msg) for msg in live}
     last = returned[-1] if returned else None
-    if (
-        current_prompt
-        and isinstance(last, dict)
-        and last.get("role") == "user"
-        and last.get("content") == current_prompt
-        and _message_fingerprint(last) not in live_fps
-    ):
+    if last is not None and _is_current_turn_user_row(last, current_prompt, live_fps):
         return [*live, last]
     return live
 
