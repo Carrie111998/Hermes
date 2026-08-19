@@ -5281,6 +5281,30 @@ def _looks_structured_value(value: str) -> bool:
     return False
 
 
+def _parse_list_value(raw: str) -> Optional[list]:
+    """Parse a CLI string as a list value.
+
+    Accepts list literals (``'["a", "b"]'`` and YAML flow/block lists like
+    ``"[a, b]"`` or ``"- curl\\n- git"`` via ``yaml.safe_load``; JSON is a
+    YAML subset), comma-separated values (``"a,b"``), or a single value
+    (``"x"`` becomes ``["x"]``). Returns ``None`` when the input is
+    list-shaped but fails to parse as a list (clear intent failure rather
+    than silent fallback).
+    """
+    raw = raw.strip()
+    if raw.startswith("[") or _looks_structured_value(raw):
+        try:
+            parsed = yaml.safe_load(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except yaml.YAMLError:
+            pass
+        return None
+    if "," in raw:
+        return [v.strip() for v in raw.split(",") if v.strip()]
+    return [raw] if raw else []
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5358,11 +5382,53 @@ def set_config_value(key: str, value: str, force: bool = False):
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.
 
+    # Guard: detect list-valued keys and parse the input as a list instead of
+    # writing a corrupting scalar. List keys are detected from DEFAULT_CONFIG
+    # defaults (e.g. toolsets) AND from the existing config value (e.g.
+    # plugins.enabled, which is absent from DEFAULT_CONFIG but list-valued;
+    # _get_nested also resolves list-index paths like custom_providers.0).
+    # A leading `[` is also treated as list intent for keys that are not
+    # string-defaulted (covers first-set of unknown keys), but never for
+    # known string-typed keys: their bracket-looking values (shell
+    # one-liners starting with `[[`, ...) stay strings (e4ea0a0ed).
+    # Non-string values (programmatic callers passing a real list) pass
+    # through untouched.
+    _list_default = _default_value_for_key(key)
+    _is_list_key = isinstance(_list_default, list) or isinstance(
+        _get_nested(user_config, key), list
+    )
+    _looks_like_list = (
+        isinstance(value, str)
+        and not isinstance(_list_default, str)
+        and value.strip().startswith("[")
+    )
+    if _is_list_key or _looks_like_list:
+        if isinstance(value, str):
+            _parsed = _parse_list_value(value)
+            if _parsed is not None:
+                value = _parsed
+            elif _is_list_key:
+                # Guaranteed corruption if written as a scalar: refuse.
+                print(
+                    f"✗ '{key}' is a list-valued setting. The value could not be\n"
+                    f"  parsed as a list. Use JSON array syntax:\n"
+                    f"    hermes config set {key} '[\"item1\", \"item2\"]'\n"
+                    f"  Or comma-separated:\n"
+                    f"    hermes config set {key} 'item1,item2'\n"
+                    f"  Or use `hermes config edit` to edit the file directly.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # Intent-only trigger whose literal failed to parse: not
+            # actually a list. Fall through to the coercion chain, which
+            # stores the raw string with a warning (pre-guard behaviour).
+
     # Preserve values for string-typed settings.  In particular, enum members
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
+    # Skip scalar coercion when the value was already parsed as a list above.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    if not isinstance(value, list) and not isinstance(_list_default, str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:
@@ -5372,11 +5438,13 @@ def set_config_value(key: str, value: str, force: bool = False):
         elif value.replace('.', '', 1).isdigit():
             coerced_value = float(value)
         elif _looks_structured_value(value):
-            # List/mapping literals -- e.g.
-            #   hermes config set platform_toolsets.line '["file","web"]'
+            # Mapping literals -- e.g.
+            #   hermes config set approvals.buttons '{allow: ["ok"]}'
             # or a multi-line YAML block:
             #   hermes config set custom_providers '- name: foo
             #     base_url: https://...'
+            # (List literals never reach here: the list-key guard above
+            # captures every leading-``[`` value first.)
             # Without this, such values were stored as a raw STRING, and every
             # reader that gates on isinstance(..., list) (``_get_platform_tools``,
             # ``_get_enabled_set``, ...) silently ignored them and fell back to

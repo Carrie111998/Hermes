@@ -1501,3 +1501,110 @@ def test_default_config_has_no_duplicate_top_level_keys():
             if "model" in keys and "kanban" in keys:  # the DEFAULT_CONFIG literal
                 dupes = {k for k in keys if keys.count(k) > 1}
                 assert not dupes, f"duplicate DEFAULT_CONFIG keys: {sorted(dupes)}"
+
+
+class TestSetConfigListValuedGuard:
+    """`hermes config set` detects list-valued keys and parses the input."""
+
+    def _set_and_load(self, tmp_path, monkeypatch, key, value, initial="model: test/model\n"):
+        """set_config_value against a temp config; returns the written YAML."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(initial, encoding="utf-8")
+        monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
+        monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+        set_config_value(key, value)
+        import yaml
+        with open(config_path) as f:
+            return yaml.safe_load(f)
+
+    def test_list_key_json_array_parsed(self, tmp_path, monkeypatch):
+        """Setting a list-valued key with JSON array syntax writes a real list."""
+        cfg = self._set_and_load(tmp_path, monkeypatch, "toolsets", '["hermes-cli", "browser"]')
+        assert cfg["toolsets"] == ["hermes-cli", "browser"]
+
+    def test_list_key_yaml_flow_list_parsed(self, tmp_path, monkeypatch):
+        """YAML flow lists that are not valid JSON (unquoted items) parse too:
+        the guard shares yaml.safe_load with the structured-value path."""
+        cfg = self._set_and_load(tmp_path, monkeypatch, "toolsets", "[hermes-cli, browser]")
+        assert cfg["toolsets"] == ["hermes-cli", "browser"]
+
+    def test_list_key_multiline_block_parsed(self, tmp_path, monkeypatch):
+        """Multi-line YAML block style (the style the docs advertise) parses
+        for a list-defaulted key instead of collapsing into one element."""
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "command_allowlist", "- curl\n- git"
+        )
+        assert cfg["command_allowlist"] == ["curl", "git"]
+
+    def test_string_typed_key_keeps_bracket_looking_value(self, tmp_path, monkeypatch):
+        """A known string-typed key given a value starting with '[' keeps the
+        string (e4ea0a0ed): the intent trigger never fires for str defaults."""
+        _default = "x"
+        from hermes_cli import config as _config
+        orig = _config._default_value_for_key
+
+        def _stub(k):
+            return "placeholder" if k == "quick_phrases" else orig(k)
+
+        monkeypatch.setattr(_config, "_default_value_for_key", _stub)
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "quick_phrases", "[[ -f x ]] && echo hi"
+        )
+        assert cfg["quick_phrases"] == "[[ -f x ]] && echo hi"
+
+    def test_intent_only_unparseable_bracket_stored_as_string(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Leading-[ on an unknown key that fails to parse falls through to
+        the coercion chain: stored as string with main's warning, not a hard
+        refusal (pre-guard behaviour for open keys)."""
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "open_thing.deep", "[[ broken"
+        )
+        assert cfg["open_thing"]["deep"] == "[[ broken"
+
+    def test_non_string_list_value_passes_through(self, tmp_path, monkeypatch):
+        """Programmatic callers passing a real list hit no string parsing."""
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "toolsets", ["a", "b"]
+        )
+        assert cfg["toolsets"] == ["a", "b"]
+
+    def test_list_key_comma_separated_parsed(self, tmp_path, monkeypatch):
+        """Comma-separated input for a list-valued key is parsed as a list."""
+        cfg = self._set_and_load(tmp_path, monkeypatch, "toolsets", "hermes-cli,browser")
+        assert cfg["toolsets"] == ["hermes-cli", "browser"]
+
+    def test_existing_list_key_detected(self, tmp_path, monkeypatch):
+        """A key absent from DEFAULT_CONFIG but list-valued in the existing
+        config (e.g. plugins.enabled) is detected and parsed."""
+        cfg = self._set_and_load(
+            tmp_path, monkeypatch, "plugins.enabled", "new_plugin",
+            initial="plugins:\n  enabled:\n    - old_plugin\n",
+        )
+        assert cfg["plugins"]["enabled"] == ["new_plugin"]
+
+    def test_malformed_json_array_refused(self, tmp_path, monkeypatch, capsys):
+        """Input starting with [ that fails JSON parse is refused."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model: test/model\n", encoding="utf-8")
+        monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
+        monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+        with pytest.raises(SystemExit) as exc_info:
+            set_config_value("toolsets", "[broken json")
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "list-valued" in captured.err
+
+    def test_scalar_key_still_works(self, tmp_path, monkeypatch):
+        """A scalar key (e.g. terminal.backend) is set normally."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model: test/model\n", encoding="utf-8")
+        monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
+        monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+        set_config_value("terminal.backend", "local")
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        assert cfg["terminal"]["backend"] == "local"
+
