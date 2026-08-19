@@ -5075,10 +5075,17 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
         return "chat_completions"
 
     if provider == "opencode-go":
-        if normalized.startswith("gpt-"):
-            # GPT models on Go (gpt-5.6-luna) are served via /v1/responses
-            # per the published Go endpoint table, same as GPT on Zen:
-            # https://opencode.ai/docs/go/#endpoints
+        if normalized.startswith("gpt-") or normalized.startswith("muse-"):
+            # GPT + Muse Spark on Go are served via /v1/responses per
+            # https://opencode.ai/docs/go/#api-%E7%AB%AF%E7%82%B9
+            # Muse Spark 1.2 is listed with endpoint /v1/responses and
+            # requires reasoning-aware max_output_tokens.
+            # Hotfix (2026-08-19): Muse Spark "-contributor" checkpoints on
+            # opencode-go only answer on /v1/chat/completions; /v1/responses
+            # returns 404/auth errors. Keep non-contributor muse/gpt on
+            # codex_responses so a future standard muse-spark-1.2 still works.
+            if normalized.endswith("-contributor"):
+                return "chat_completions"
             return "codex_responses"
         if normalized.startswith("minimax-"):
             return "anthropic_messages"
