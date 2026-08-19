@@ -422,7 +422,8 @@ class GatewaySmartLobbyMixin:
             return True
 
         store = self._get_smart_lobby_store()
-        created, reservation = store.reserve(
+        created, reservation = await asyncio.to_thread(
+            store.reserve,
             source_key=source_key,
             profile=decision.profile,
             channel_id=candidate.channel_id,
@@ -455,7 +456,12 @@ class GatewaySmartLobbyMixin:
             create_thread(candidate.channel_id, _clean_title(decision.title, event.text)),
         )
         if not thread_id:
-            store.update(source_key, status="failed", error_kind="thread_create")
+            await asyncio.to_thread(
+                store.update,
+                source_key,
+                status="failed",
+                error_kind="thread_create",
+            )
             logger.warning(
                 "Smart lobby could not create target thread: profile=%s channel=%s",
                 decision.profile,
@@ -471,7 +477,12 @@ class GatewaySmartLobbyMixin:
                 except Exception:
                     logger.debug("Smart lobby thread-create error notice failed", exc_info=True)
             return True
-        store.update(source_key, status="thread_created", thread_id=str(thread_id))
+        await asyncio.to_thread(
+            store.update,
+            source_key,
+            status="thread_created",
+            thread_id=str(thread_id),
+        )
 
         routed_source = build_source(
             chat_id=str(thread_id),
@@ -507,7 +518,8 @@ class GatewaySmartLobbyMixin:
         try:
             await cast(Awaitable[Any], handle_message(routed_event))
         except Exception:
-            store.update(
+            await asyncio.to_thread(
+                store.update,
                 source_key,
                 status="failed",
                 thread_id=str(thread_id),
@@ -526,7 +538,12 @@ class GatewaySmartLobbyMixin:
                 )
             return True
 
-        store.update(source_key, status="delivered", thread_id=str(thread_id))
+        await asyncio.to_thread(
+            store.update,
+            source_key,
+            status="delivered",
+            thread_id=str(thread_id),
+        )
         if source_adapter is not None:
             try:
                 await source_adapter.send(
