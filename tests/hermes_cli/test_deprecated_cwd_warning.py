@@ -5,25 +5,42 @@ class TestDeprecatedCwdWarning:
     """Warn when MESSAGING_CWD or TERMINAL_CWD is set in .env."""
 
     def test_messaging_cwd_triggers_warning(self, monkeypatch, capsys):
-        monkeypatch.setenv("MESSAGING_CWD", "/some/path")
-        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        import hermes_cli.config as config_mod
 
-        from hermes_cli.config import warn_deprecated_cwd_env_vars
-        warn_deprecated_cwd_env_vars(config={})
+        monkeypatch.setattr(
+            config_mod, "load_env", lambda: {"MESSAGING_CWD": "/some/path"}
+        )
+
+        config_mod.warn_deprecated_cwd_env_vars(config={})
 
         captured = capsys.readouterr()
         assert "MESSAGING_CWD" in captured.err
         assert "deprecated" in captured.err.lower()
         assert "config.yaml" in captured.err
 
-
     def test_both_deprecated_vars_warn(self, monkeypatch, capsys):
-        monkeypatch.setenv("MESSAGING_CWD", "/msg/path")
-        monkeypatch.setenv("TERMINAL_CWD", "/term/path")
+        import hermes_cli.config as config_mod
 
-        from hermes_cli.config import warn_deprecated_cwd_env_vars
-        warn_deprecated_cwd_env_vars(config={})
+        monkeypatch.setattr(
+            config_mod,
+            "load_env",
+            lambda: {"MESSAGING_CWD": "/msg/path", "TERMINAL_CWD": "/term/path"},
+        )
+
+        config_mod.warn_deprecated_cwd_env_vars(config={})
 
         captured = capsys.readouterr()
         assert "MESSAGING_CWD" in captured.err
         assert "TERMINAL_CWD" in captured.err
+
+    def test_process_env_alone_does_not_warn(self, monkeypatch, capsys):
+        """Runtime-bridged TERMINAL_CWD (not in .env) must not false-positive."""
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(config_mod, "load_env", lambda: {})
+        monkeypatch.setenv("TERMINAL_CWD", "/runtime/bridged/path")
+
+        config_mod.warn_deprecated_cwd_env_vars(config={})
+
+        captured = capsys.readouterr()
+        assert "deprecated" not in captured.err.lower()
