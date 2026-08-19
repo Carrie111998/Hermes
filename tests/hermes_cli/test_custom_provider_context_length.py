@@ -138,6 +138,32 @@ class TestGetModelContextLengthHonorsOverride:
             patch.object(_mm, "_is_known_provider_base_url", return_value=False),
         ]
 
+    def test_glm_5_3_resolves_to_1m_not_generic_202k(self):
+        """glm-5.3 must resolve to the 1M window it shares with glm-5.2
+        (post-training refresh of the same base), not the generic ~202K
+        GLM fallback that older variants (5, 5.1, 5-turbo) hit.
+
+        Regression test for the longest-key-first substring match: before
+        the glm-5.3 table entry existed, "glm-5.3" fell through to the
+        bare "glm" key (202,752) and Hermes under-reported the context
+        window by ~5x.
+        """
+        from agent.model_metadata import get_model_context_length
+
+        patches = self._mock_all_probes()
+        for p in patches:
+            p.start()
+        try:
+            ctx = get_model_context_length(
+                "glm-5.3",
+                base_url="https://api.z.ai/api/coding/paas/v4",
+                provider="zai",
+            )
+        finally:
+            for p in patches:
+                p.stop()
+        assert ctx == 1_048_576
+
     def test_custom_providers_override_wins_over_default_fallback(self):
         from agent.model_metadata import get_model_context_length
         custom = [
