@@ -4284,7 +4284,7 @@ class SessionBridgeCoordinator:
     async def _scan_all_claude_history(self) -> ScanSummary:
         adapter = self._adapter(Provider.CLAUDE)
         discovered_paths = await self._provider_call(_call, adapter, "discover")
-        ordered_paths, unavailable_paths = await asyncio.to_thread(
+        ordered_paths, unavailable_paths, _fingerprints = await asyncio.to_thread(
             _sort_claude_paths,
             discovered_paths,
         )
@@ -4578,9 +4578,8 @@ class SessionBridgeCoordinator:
             discovery_mode,
         )
         discovered_paths = await self._provider_call(_call, adapter, "discover")
-        ordered_paths, unavailable_paths = await asyncio.to_thread(
-            _sort_claude_paths,
-            discovered_paths,
+        ordered_paths, unavailable_paths, discovered_fingerprints = (
+            await asyncio.to_thread(_sort_claude_paths, discovered_paths)
         )
         paths_by_native_id: dict[str, Path] = {}
         current_fingerprints: dict[str, dict[str, int]] = {}
@@ -4590,9 +4589,8 @@ class SessionBridgeCoordinator:
             native_id = path.stem
             if native_id in paths_by_native_id:
                 continue
-            try:
-                fingerprint = _claude_path_fingerprint(path)
-            except OSError:
+            fingerprint = discovered_fingerprints.get(native_id)
+            if fingerprint is None:
                 unavailable_ids.add(native_id)
                 continue
             paths_by_native_id[native_id] = path
@@ -4668,7 +4666,17 @@ class SessionBridgeCoordinator:
                     # rediscovered from its fingerprint and no catalog/native
                     # history is deleted or fabricated here.
                     continue
-                fingerprint = await asyncio.to_thread(_claude_path_fingerprint, path)
+                # Reuse the discovery-time fingerprint rather than re-stat.
+                # It is also the SAFER value to commit: it is never newer than
+                # the bytes we are about to parse, so a transcript that changed
+                # in between simply re-stages next cycle. Committing a fresher
+                # fingerprint than the content actually read could swallow that
+                # change permanently.
+                fingerprint = discovered_fingerprints.get(native_id)
+                if fingerprint is None:
+                    fingerprint = await asyncio.to_thread(
+                        _claude_path_fingerprint, path
+                    )
                 current_fingerprints[native_id] = fingerprint
                 parsed = await self._provider_call(_call, adapter, "parse", path)
                 projection = _projection_from_parse(parsed)
@@ -5565,22 +5573,37 @@ def _load_default_awatch() -> _AWatchFactory:
     return awatch
 
 
-def _sort_claude_paths(paths: object) -> tuple[list[Path], list[Path]]:
+def _sort_claude_paths(
+    paths: object,
+) -> tuple[list[Path], list[Path], dict[str, dict[str, int]]]:
+    """Order transcripts newest-first, and hand back their fingerprints.
+
+    The fingerprint comes from the SAME ``stat_result`` used to sort, because
+    the caller needs both and a second stat buys nothing. This pass runs in a
+    worker thread, so folding the fingerprints in here also takes them off the
+    event loop -- ``_claude_path_fingerprint`` used to be called inline while
+    scanning, statting the whole corpus synchronously under uvicorn.
+    """
     try:
         normalized = [Path(path) for path in paths]  # type: ignore[union-attr]
     except TypeError as exc:
         raise RuntimeError("Claude discovery returned no path list") from exc
     sortable: list[tuple[float, str, str, Path]] = []
     unavailable: list[Path] = []
+    fingerprints: dict[str, dict[str, int]] = {}
     for path in normalized:
         try:
-            modified_at = float(path.stat().st_mtime)
+            stat = path.stat()
         except OSError:
             unavailable.append(path)
             continue
-        sortable.append((-modified_at, path.stem, str(path), path))
+        sortable.append((-float(stat.st_mtime), path.stem, str(path), path))
+        fingerprints.setdefault(
+            path.stem,
+            {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)},
+        )
     sortable.sort()
-    return [entry[3] for entry in sortable], unavailable
+    return [entry[3] for entry in sortable], unavailable, fingerprints
 
 
 def _claude_path_fingerprint(path: Path) -> dict[str, int]:
