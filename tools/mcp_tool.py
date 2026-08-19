@@ -3677,15 +3677,14 @@ class MCPServerTask:
         """
         if self._registered_tool_names:
             # Quick reconnect: tools were already registered but we just
-            # rediscovered them.  If the set changed, delegate to the
-            # canonical _refresh_tools() which handles diff, deregistration,
-            # ownership checks, and pagination.
-            new_names = {
-                mcp_prefixed_tool_name(self.name, t.name)
-                for t in self._tools
-            }
-            if set(self._registered_tool_names) == new_names:
-                return
+            # rediscovered them.  Delegate to the canonical _refresh_tools()
+            # which fetches the full tool list from the server, diffs
+            # against the current registry, re-registers all tools (updating
+            # schema, descriptions, and metadata), and removes stale entries.
+            # This is always called even when the raw tool names are
+            # unchanged, because _refresh_tools() -> _register_server_tools()
+            # replaces ToolEntry objects in-place, ensuring schema/metadata
+            # changes are picked up.
             await self._refresh_tools()
             return
         if not self._ready.is_set():
