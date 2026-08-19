@@ -88,6 +88,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `toolsets` | No | List of toolset keys (e.g. `["terminal", "file", "web"]`) that **replaces** the platform-level webhook toolset for runs triggered by this route only. Manual config edit only — not settable via `hermes webhook subscribe`, so agent-created subscriptions cannot self-grant elevated tools. Names are validated the same way as `platform_toolsets` entries (unknown or platform-restricted names are dropped). See [Per-route toolsets](#per-route-toolsets). |
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
+| `handoff_to` | No | After a successful agent run, move the exact webhook session into a new thread on the destination platform's configured home channel. Initially supports `discord`. This trusted route setting is not payload-templated, is exclusive with ordinary `deliver` output, and cannot be combined with `deliver_only`. See [Session handoff](#session-handoff). |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
 
 ### Full example
@@ -124,6 +125,11 @@ platforms:
             - field: "ref"
               equals: "refs/heads/main"
           deliver: "telegram"
+        completed-build:
+          events: ["build.completed"]
+          secret: "build-webhook-secret"
+          prompt: "Review build {build.id}, explain the result, and prepare next steps."
+          handoff_to: "discord"
 ```
 
 ### Payload Filters
@@ -320,6 +326,31 @@ The `deliver` field controls where the agent's response goes after processing th
 | `bluebubbles` | Routes the response to BlueBubbles (iMessage). Uses the home channel, or specify `chat_id` in `deliver_extra`. |
 
 For cross-platform delivery, the target platform must also be enabled and connected in the gateway. If no `chat_id` is provided in `deliver_extra`, the response is sent to that platform's configured home channel.
+
+---
+
+## Session handoff {#session-handoff}
+
+Use `handoff_to: discord` when the webhook's completed agent session should become a conversation rather than a one-shot notification. After the run succeeds, the gateway creates one thread under Discord's configured home channel, atomically moves the webhook session to that thread, and delivers the handoff there. The next reply in the thread resumes the same session ID with its full user, assistant, and tool transcript.
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      routes:
+        release-finished:
+          secret: "release-webhook-secret"
+          events: ["release.finished"]
+          prompt: |
+            Verify release {release.version}, summarize the evidence, and
+            identify anything the operator should do next.
+          handoff_to: discord
+```
+
+The destination comes only from trusted local route configuration; payload fields cannot choose or interpolate it. Configure the Discord home channel first with `/sethome`. Handoff mode is exclusive: it does not also post the legacy webhook response to `deliver` or the parent channel, and `deliver_only: true` is rejected. A repeated delivery ID reuses the durable handoff marker and does not create another session or thread. In a multiplexed gateway, handoff routes currently belong to the default profile; a named `profile` on a handoff route is rejected instead of silently reading another profile's session store or home channel.
+
+Routes without `handoff_to` retain the normal delivery behavior described above.
 
 ---
 
