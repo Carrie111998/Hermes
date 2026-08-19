@@ -216,7 +216,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -246,6 +246,149 @@ _FTS_TRIGGERS = (
 )
 
 
+# ── Session metadata FTS substrate (#128 / fork #25) ──────────────────
+# ``sessions`` gains a named stable ``row_id`` so external-content FTS can
+# key documents on a stable integer identity. ``id`` stays the logical /
+# public identity every API, relationship and ``messages.session_id``
+# reference continues to use.
+SESSION_TABLE_REBUILD_SQL = """
+CREATE TABLE sessions_new (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    git_metadata_generation INTEGER NOT NULL DEFAULT 0,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    title_source TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+)
+"""
+
+
+# Indexes on ``sessions`` that DROP TABLE removes during the row_id swap;
+# the migration recreates them inside the same transaction (all IF NOT EXISTS
+# so the later SCHEMA_SQL / DEFERRED_INDEX_SQL passes no-op on them).
+SESSION_INDEX_SQL_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
+    "ON sessions(session_key, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer ON sessions("
+    "source, user_id, chat_id, chat_type, thread_id, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state "
+    "ON sessions(handoff_state, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash "
+    "ON sessions(system_prompt_hash)",
+)
+
+
+# Unicode session-metadata external-content FTS over raw
+# (title, id, display_name), keyed by named ``sessions.row_id``. Triggers are
+# gated on a dedicated H/P marker pair (``fts_session_rebuild_*``) so an
+# empty external index is never served as complete — historical rows are
+# backfilled by the resumable chunk engine, and rows committing after the
+# high-water mark are live-indexed by the triggers.
+SESSIONS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title,
+    id,
+    display_name,
+    content='sessions',
+    content_rowid='row_id',
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+"""
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -257,7 +400,8 @@ CREATE TABLE IF NOT EXISTS system_prompts (
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     source TEXT NOT NULL,
     user_id TEXT,
     session_key TEXT,
