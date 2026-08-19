@@ -8833,34 +8833,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 id_params.append(_like_pattern(id_needle))
             if search_needle:
-                # Same chain-membership trick as id_query, but matching either
-                # the title, the gateway display_name, or the id of any session
-                # in the chain. display_name is the persisted gateway peer/chat
-                # identity (issue #9006), so `/sessions search` finds a channel
-                # or DM by name, not only by title. The compact
-                # (punctuation-stripped) variant lets `an94` match `AN-94` and
-                # `#an-94-ops`.
-                compact_needle = re.sub(r"[\W_]+", "", search_needle)
-                compact_sql = (
-                    "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
-                    " '-', ''), '_', ''), '.', ''), ' ', '')"
-                )
-                search_clause = (
-                    "EXISTS (SELECT 1 FROM chain cq"
-                    " JOIN sessions cs ON cs.id = cq.cur_id"
-                    " WHERE cq.root_id = s.id"
-                    " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
-                    " OR LOWER(COALESCE(cs.display_name, '')) LIKE ? ESCAPE '\\'"
-                    " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
-                )
-                id_params.extend([_like_pattern(search_needle)] * 3)
-                if compact_needle:
-                    search_clause += (
-                        f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
-                        f" OR {compact_sql.format('cs.display_name')} LIKE ? ESCAPE '\\'"
+                # Candidate-first metadata discovery through the shared router:
+                # the query is routed to the session-metadata FTS lanes
+                # (Unicode / CJK / trigram) and the compression chain is
+                # restricted to the resulting row_ids. Zero candidates or an
+                # unavailable route falls back to the bounded canonical LIKE
+                # lane below (raw + compact title/display_name/id).
+                metadata = self._metadata_candidate_row_ids(search_query)
+                if metadata.row_ids:
+                    placeholders = ",".join("?" for _ in metadata.row_ids)
+                    filter_clauses.append(
+                        "EXISTS (SELECT 1 FROM chain cq"
+                        " JOIN sessions cs ON cs.id = cq.cur_id"
+                        " WHERE cq.root_id = s.id"
+                        f" AND cs.row_id IN ({placeholders}))"
                     )
-                    id_params.extend([_like_pattern(compact_needle)] * 2)
-                filter_clauses.append(search_clause + "))")
+                    id_params.extend(metadata.row_ids)
+                else:
+                    # Same chain-membership trick as id_query, but matching
+                    # either the title, the gateway display_name, or the id of
+                    # any session in the chain. display_name is the persisted
+                    # gateway peer/chat identity (issue #9006), so
+                    # `/sessions search` finds a channel or DM by name. The
+                    # compact (punctuation-stripped) variant lets `an94` match
+                    # `AN-94` and `#an-94-ops`.
+                    compact_needle = re.sub(r"[\W_]+", "", search_needle)
+                    compact_sql = (
+                        "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
+                        " '-', ''), '_', ''), '.', ''), ' ', '')"
+                    )
+                    search_clause = (
+                        "EXISTS (SELECT 1 FROM chain cq"
+                        " JOIN sessions cs ON cs.id = cq.cur_id"
+                        " WHERE cq.root_id = s.id"
+                        " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
+                        " OR LOWER(COALESCE(cs.display_name, '')) LIKE ? ESCAPE '\\'"
+                        " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
+                    )
+                    id_params.extend([_like_pattern(search_needle)] * 3)
+                    if compact_needle:
+                        search_clause += (
+                            f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
+                            f" OR {compact_sql.format('cs.display_name')} LIKE ? ESCAPE '\\'"
+                        )
+                        id_params.extend([_like_pattern(compact_needle)] * 2)
+                    filter_clauses.append(search_clause + "))")
             if filter_clauses:
                 combined = " AND ".join(filter_clauses)
                 outer_where = (

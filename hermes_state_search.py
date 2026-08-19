@@ -14,7 +14,8 @@ import os
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
@@ -26,12 +27,33 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _session_metadata_compact_sql,
+    compact_session_metadata_text,
     escape_like as _escape_like,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
+
+@dataclass(frozen=True)
+class MetadataCandidateResult:
+    """Outcome of routing one metadata search query to whole-store row_ids.
+
+    ``path`` names the lane that produced the final ``row_ids``: ``"none"``
+    (empty query), ``"like"`` (direct / zero-result / route-failure canonical
+    LIKE fallback), ``"unicode"`` (raw Unicode token lane), ``"cjk+unicode"``
+    (CJK+Unicode union), or ``"trigram"`` (normalized trigram lane).
+    ``status`` is ``"hits"`` when ``row_ids`` is non-empty and ``"zero"`` when
+    the search ran but matched nothing. ``row_ids`` are stable
+    ``sessions.row_id`` values - never public text IDs.
+    """
+
+    path: Literal["none", "like", "unicode", "cjk+unicode", "trigram"]
+    status: Literal["hits", "zero"]
+    row_ids: Tuple[int, ...]
+
 
 # Characters FTS5's query grammar rejects outside a quoted phrase. Anything
 # missing from this set reaches MATCH raw and raises, which the execute site
@@ -589,6 +611,310 @@ class SessionSearchMixin:
             )
         self._execute_write(_do)
         self._sessions_trigram_available = True
+
+    # ── Metadata candidate router (#128 / fork #14, #37, #89) ─────────────
+    # Whole-store metadata discovery routes a query to one of the session
+    # metadata FTS lanes (Unicode / CJK / trigram) and falls back to a bounded
+    # canonical LIKE scan when the routed lane cannot serve (unavailable,
+    # pending rebuild, zero hits, or an unindexable query). Candidate-first:
+    # a successful non-empty routed result never runs the LIKE fallback.
+    @staticmethod
+    def _metadata_search_needle(raw_query: str) -> str:
+        """Bound and trim a raw metadata search query."""
+        return (raw_query or "")[:MAX_FTS5_QUERY_CHARS].strip()
+
+    def _metadata_query_has_explicit_token_syntax(self, needle: str) -> bool:
+        """True when *needle* carries explicit FTS5 token intent (a balanced
+        double-quoted phrase, a standalone AND/OR/NOT, or a legal trailing
+        prefix star). Only these route a bare Latin query down the raw Unicode
+        token lane; ordinary picker text is a literal/infix query."""
+        if '"' in needle:
+            open_quote = False
+            for ch in needle:
+                if ch == '"':
+                    open_quote = not open_quote
+            if not open_quote:
+                return True
+        if re.search(r"\b(?:AND|OR|NOT)\b", needle, flags=re.IGNORECASE):
+            return True
+        if "*" in needle and re.search(r"[A-Za-z0-9_]\*", needle):
+            return True
+        return False
+
+    def _classify_metadata_query(self, needle: str) -> str:
+        """Classify a bounded metadata search needle into a route.
+
+        Returns "none" (empty), "like" (direct canonical LIKE fallback: a
+        lone CJK run or a literal whose raw/compact needle is < 3 chars),
+        "cjk" (CJK 2+ run + Unicode union), "unicode" (explicit FTS token
+        syntax), or "trigram" (plain literal/infix with a usable 3+ char
+        needle). CJK classification takes precedence (issue #37 routing).
+        """
+        needle = needle.strip()
+        if not needle:
+            return "none"
+        if self._has_lone_cjk_run(needle):
+            return "like"
+        if self._contains_cjk(needle):
+            return "cjk"
+        if self._metadata_query_has_explicit_token_syntax(needle):
+            return "unicode"
+        if len(needle) >= 3 and len(compact_session_metadata_text(needle)) >= 3:
+            return "trigram"
+        return "like"
+
+    @staticmethod
+    def _metadata_literal_fallback_needle(needle: str) -> str:
+        """Strip FTS5 query syntax so a fallback LIKE searches literal
+        content (balanced quotes, boolean operators, trailing prefix stars)."""
+        open_quote = False
+        out = []
+        for ch in needle or "":
+            if ch == '"':
+                open_quote = not open_quote
+                continue
+            out.append(ch)
+        cleaned = "".join(out)
+        cleaned = re.sub(
+            r"\s*\b(?:AND|OR|NOT)\b\s*", " ", cleaned, flags=re.IGNORECASE
+        )
+        return re.sub(r"\*+\s*$", "", cleaned).strip()
+
+    def _metadata_like_fallback_row_ids(
+        self, needle: str, *, conn=None
+    ) -> List[int]:
+        """Bounded canonical LIKE fallback over stable ``row_id`` only.
+
+        Strips FTS5 syntax first; every predicate uses ``ESCAPE '\\'`` with an
+        escaped pattern so ``%`` / ``_`` / ``\\`` stay literal - a bare ``%``
+        or ``_`` can never become an accidental match-all scan. Matches raw
+        title / raw id / raw display_name plus canonical compact title /
+        compact display_name (case-insensitive via LOWER).
+        """
+        needle = self._metadata_literal_fallback_needle(needle)
+        if not needle:
+            return []
+
+        def _escape(text: str) -> str:
+            return (
+                text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+
+        pattern = f"%{_escape(needle)}%"
+        compact_needle = compact_session_metadata_text(needle)
+        compact_pattern = (
+            f"%{_escape(compact_needle)}%" if compact_needle else None
+        )
+        clauses = [
+            "LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'",
+            "LOWER(COALESCE(s.id, '')) LIKE ? ESCAPE '\\'",
+            "LOWER(COALESCE(s.display_name, '')) LIKE ? ESCAPE '\\'",
+        ]
+        params: List[Any] = [pattern] * 3
+        if compact_pattern is not None:
+            clauses.append(
+                "LOWER("
+                f"{_session_metadata_compact_sql('s.title')}) LIKE ? ESCAPE '\\'"
+            )
+            params.append(compact_pattern)
+            clauses.append(
+                "LOWER("
+                f"{_session_metadata_compact_sql('s.display_name')}) "
+                "LIKE ? ESCAPE '\\'"
+            )
+            params.append(compact_pattern)
+        sql = f"SELECT s.row_id FROM sessions s WHERE {' OR '.join(clauses)}"
+        if conn is not None:
+            return [r["row_id"] for r in conn.execute(sql, params).fetchall()]
+        with self._read_ctx() as conn:
+            return [r["row_id"] for r in conn.execute(sql, params).fetchall()]
+
+    def _session_fts_rebuild_gap(self, conn=None) -> Optional[Tuple[int, int]]:
+        """Bounded unindexed Unicode session gap ``(progress, high_water]``
+        while a rebuild is pending; None when no rebuild is pending."""
+        def _read(c):
+            row = c.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if row is None:
+                return None
+            high_water = int(row[0])
+            p = c.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_progress'"
+            ).fetchone()
+            progress = int(p[0]) if p is not None else 0
+            if progress >= high_water:
+                return None
+            return progress, high_water
+        if conn is not None:
+            return _read(conn)
+        with self._read_ctx() as conn:
+            return _read(conn)
+
+    def _fts_metadata_candidates(
+        self, raw_query: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """Raw Unicode session-metadata candidates (title/id/display_name)
+        via external-content ``sessions_fts``. Returns ``(ok, row_ids)``; ok
+        is False when the lane cannot serve (rebuild pending / corrupt), so
+        callers fall back to the bounded LIKE lane."""
+        if self._session_fts_rebuild_gap(conn=conn) is not None:
+            return False, []
+        sanitized = self._sanitize_fts5_query(raw_query)
+        if not sanitized:
+            return True, []
+
+        def _run(conn):
+            try:
+                rows = conn.execute(
+                    "SELECT row_id FROM sessions_fts "
+                    "WHERE sessions_fts MATCH ?",
+                    (sanitized,),
+                ).fetchall()
+                return True, [r["row_id"] for r in rows]
+            except sqlite3.OperationalError:
+                return False, []
+
+        if conn is not None:
+            return _run(conn)
+        with self._read_ctx() as conn:
+            return _run(conn)
+
+    @staticmethod
+    def _trigram_match_needle(needle: str) -> str:
+        """Quote a needle as a safe FTS5 trigram phrase."""
+        return '"' + needle.replace('"', '""') + '"'
+
+    def _fts_session_trigram_candidates(
+        self, needle: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """Compact trigram session-metadata candidates. Returns ``(ok,
+        row_ids)``; ok is False when the lane is unavailable."""
+        if not getattr(self, "_sessions_trigram_available", False):
+            return False, []
+        compact_needle = compact_session_metadata_text(needle)
+        if len(compact_needle) < 3:
+            return False, []
+        q = self._trigram_match_needle(compact_needle)
+
+        def _run(conn):
+            try:
+                rows = conn.execute(
+                    "SELECT row_id FROM sessions_fts_trigram "
+                    "WHERE sessions_fts_trigram MATCH ?",
+                    (q,),
+                ).fetchall()
+                return True, [r["row_id"] for r in rows]
+            except sqlite3.OperationalError:
+                return False, []
+
+        if conn is not None:
+            return _run(conn)
+        with self._read_ctx() as conn:
+            return _run(conn)
+
+    def _fts_cjk_metadata_candidates(
+        self, needle: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """CJK session-metadata candidates. Returns ``(ok, row_ids)``; ok
+        is False when the CJK lane cannot serve."""
+        if not getattr(self, "_sessions_cjk_available", False):
+            return False, []
+
+        def _run(conn):
+            try:
+                rows = conn.execute(
+                    "SELECT row_id FROM sessions_fts_cjk "
+                    "WHERE sessions_fts_cjk MATCH ?",
+                    (needle,),
+                ).fetchall()
+                return True, [r["row_id"] for r in rows]
+            except sqlite3.OperationalError:
+                return False, []
+
+        if conn is not None:
+            return _run(conn)
+        with self._read_ctx() as conn:
+            return _run(conn)
+
+    def _metadata_candidate_row_ids_on_conn(
+        self, needle: str, conn
+    ) -> "MetadataCandidateResult":
+        """Inner router over a caller-provided coherent read snapshot."""
+
+        def _like_fallback() -> "MetadataCandidateResult":
+            row_ids = tuple(self._metadata_like_fallback_row_ids(needle, conn=conn))
+            return MetadataCandidateResult(
+                path="like",
+                status="hits" if row_ids else "zero",
+                row_ids=row_ids,
+            )
+
+        route = self._classify_metadata_query(needle)
+        if route == "like":
+            return _like_fallback()
+        if route == "unicode":
+            fts_ok, candidates = self._fts_metadata_candidates(needle, conn=conn)
+            if fts_ok and candidates:
+                return MetadataCandidateResult(
+                    path="unicode", status="hits", row_ids=tuple(candidates)
+                )
+            return _like_fallback()
+        if route == "trigram":
+            fts_ok, candidates = self._fts_session_trigram_candidates(needle, conn=conn)
+            if fts_ok and candidates:
+                return MetadataCandidateResult(
+                    path="trigram", status="hits", row_ids=tuple(candidates)
+                )
+            return _like_fallback()
+        if route == "cjk":
+            servable, cjk_candidates = self._fts_cjk_metadata_candidates(
+                needle, conn=conn
+            )
+            if not servable:
+                return _like_fallback()
+            fts_ok, uni_candidates = self._fts_metadata_candidates(needle, conn=conn)
+            if not fts_ok:
+                return _like_fallback()
+            union: Dict[int, None] = {}
+            for r in cjk_candidates or []:
+                union[r] = None
+            for r in uni_candidates or []:
+                union[r] = None
+            if union:
+                return MetadataCandidateResult(
+                    path="cjk+unicode", status="hits", row_ids=tuple(union)
+                )
+            return _like_fallback()
+        # Defensive: an unknown classifier result never fabricates a match.
+        return _like_fallback()
+
+    def _metadata_candidate_row_ids(
+        self, raw_query: str, *, conn=None
+    ) -> "MetadataCandidateResult":
+        """Route one metadata search query to whole-store ``row_id``
+        candidates.
+
+        Bounds the query, classifies it, runs the routed candidate lane(s) or
+        the bounded canonical-LIKE fallback. A successful non-empty routed
+        result never runs the LIKE fallback; a valid zero or route failure
+        runs it exactly once.
+        """
+        needle = self._metadata_search_needle(raw_query)
+        if not needle:
+            return MetadataCandidateResult(path="none", status="zero", row_ids=())
+        if conn is not None:
+            return self._metadata_candidate_row_ids_on_conn(needle, conn)
+        with self._read_ctx() as conn:
+            conn.execute("BEGIN")
+            try:
+                return self._metadata_candidate_row_ids_on_conn(needle, conn)
+            finally:
+                conn.execute("ROLLBACK")
 
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
