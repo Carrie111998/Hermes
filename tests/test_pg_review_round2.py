@@ -144,7 +144,7 @@ class TestUnreadableConfigFailsClosed:
             tmp_path, monkeypatch, "sessions:\n  state_backend: [unclosed\n"
         )
 
-        with pytest.raises(RuntimeError, match="could not be read or parsed"):
+        with pytest.raises(RuntimeError, match="not usable|could not be read or parsed"):
             open_store_for_profile(name)
 
     def test_malformed_yaml_selector_raises_rather_than_returning_false(
@@ -156,24 +156,25 @@ class TestUnreadableConfigFailsClosed:
             tmp_path, monkeypatch, "sessions:\n  state_backend: [unclosed\n"
         )
 
-        with pytest.raises(RuntimeError, match="could not be read or parsed"):
+        with pytest.raises(RuntimeError, match="not usable|could not be read or parsed"):
             profile_selects_postgres(name)
 
-    def test_non_mapping_config_is_treated_as_no_selection(
-        self, tmp_path, monkeypatch
-    ):
-        """A non-mapping top level reads as "nothing selected" -> SQLite.
+    @pytest.mark.parametrize(
+        "body", ("- just\n- a\n- list\n", "a-bare-scalar\n")
+    )
+    def test_non_mapping_config_fails_closed(self, tmp_path, monkeypatch, body):
+        """A structurally invalid root cannot answer 'not Postgres'.
 
-        ``read_user_config_raw()`` normalizes a non-mapping YAML root to
-        ``{}``, so by the time the seam sees it there is no selection to
-        honour. The load-bearing case — unparseable YAML, where the operator's
-        intent is unknown — still raises (covered above).
+        Returning False here routes a cross-profile reader to SQLite. A list
+        or scalar root means the operator wrote something unusable, so their
+        intent is as unknown as it is for unparseable YAML — and both must
+        fail closed rather than pick a physical store on the operator's behalf.
         """
         from hermes_state_postgres import profile_selects_postgres
 
-        name = self._make_profile(tmp_path, monkeypatch, "- just\n- a\n- list\n")
-
-        assert profile_selects_postgres(name) is False
+        name = self._make_profile(tmp_path, monkeypatch, body)
+        with pytest.raises(RuntimeError, match="not usable"):
+            profile_selects_postgres(name)
 
     def test_empty_config_is_a_legitimate_sqlite_selection(
         self, tmp_path, monkeypatch

@@ -50,11 +50,41 @@ class TestReadOnlyDoesNotBypassPostgres:
         import hermes_state_postgres as hsp
         from hermes_state import SessionDB
 
-        sentinel_conn = object()
+        # A read-only open now validates and locks down the connection, so the
+        # double must answer the schema/version probes rather than be an inert
+        # sentinel.
+        class _ReadyConn:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, sql, params=()):
+                self.executed.append(sql)
+                outer = self
+
+                class _Cur:
+                    def fetchone(self):
+                        return (1,) if "information_schema" in sql else None
+
+                    def fetchall(self):
+                        return []
+                return _Cur()
+
+            def commit(self):
+                return None
+
+            def close(self):
+                return None
+
+        sentinel_conn = _ReadyConn()
         monkeypatch.setattr(
             hsp, "connect_postgres", lambda dsn: sentinel_conn
         )
         monkeypatch.setattr(hsp, "init_postgres_schema", lambda conn, ver: None)
+        monkeypatch.setattr(
+            hsp, "postgres_migration_version",
+            lambda c: max((m.version for m in hsp._PG_ONLY_MIGRATIONS),
+                          default=0),
+        )
 
         db = SessionDB(
             read_only=True, postgres_dsn="postgresql://example/db"
@@ -75,12 +105,33 @@ class TestReadOnlyDoesNotBypassPostgres:
 
         opened: dict = {}
 
+        class _ReadyConn:
+            def execute(self, sql, params=()):
+                class _Cur:
+                    def fetchone(self):
+                        return (1,) if "information_schema" in sql else None
+
+                    def fetchall(self):
+                        return []
+                return _Cur()
+
+            def commit(self):
+                return None
+
+            def close(self):
+                return None
+
         def _fake_connect(dsn):
             opened["dsn"] = dsn
-            return object()
+            return _ReadyConn()
 
         monkeypatch.setattr(hsp, "connect_postgres", _fake_connect)
         monkeypatch.setattr(hsp, "init_postgres_schema", lambda conn, ver: None)
+        monkeypatch.setattr(
+            hsp, "postgres_migration_version",
+            lambda c: max((m.version for m in hsp._PG_ONLY_MIGRATIONS),
+                          default=0),
+        )
 
         conn = hsp.maybe_open_postgres(
             True, 1, dsn_override="postgresql://example/db"
@@ -279,7 +330,7 @@ class TestActiveConfigFailsClosed:
         monkeypatch.delenv("HERMES_STATE_DATABASE_URL", raising=False)
         monkeypatch.delenv("HERMES_STATE_POSTGRES_DSN", raising=False)
 
-        with pytest.raises(RuntimeError, match="could not be read or parsed"):
+        with pytest.raises(RuntimeError, match="not usable|could not be read or parsed"):
             hsp.resolve_postgres_dsn()
 
     def test_absent_active_config_is_a_legitimate_sqlite_selection(
@@ -297,28 +348,27 @@ class TestActiveConfigFailsClosed:
         # No config.yaml at all -> no selection -> SQLite, no raise.
         hsp._assert_active_config_parseable()
 
-    def test_non_mapping_active_config_is_treated_as_no_selection(
-        self, tmp_path, monkeypatch
-    ):
-        """A non-mapping top level normalizes to "no selection" -> SQLite.
+    def test_non_mapping_active_config_fails_closed(self, tmp_path, monkeypatch):
+        """A structurally invalid root cannot authorize a SQLite fallback.
 
-        ``read_user_config_raw()`` returns ``{}`` for a YAML document whose
-        root is not a mapping, so it is indistinguishable from an empty file
-        by the time it reaches this validator. That is acceptable: the
-        dangerous case is *unparseable* YAML (covered above), where the
-        operator's real selection is unknown. A well-formed document that
-        simply is not a config mapping expresses no backend selection.
+        A list or scalar at the top level means the operator wrote something
+        whose intent cannot be determined — exactly as unknown as unparseable
+        YAML. Reading it as "nothing configured" would silently route the
+        process to SQLite while the operator may have meant PostgreSQL,
+        splitting session history across two physical stores.
         """
         import hermes_state_postgres as hsp
 
-        home = tmp_path / "hermes_home"
-        home.mkdir()
-        (home / "config.yaml").write_text("- a\n- b\n", encoding="utf-8")
-        monkeypatch.setattr(hsp, "get_hermes_home", lambda: home, raising=False)
-        monkeypatch.setenv("HERMES_HOME", str(home))
+        for body in ("- a\n- b\n", "just-a-string\n"):
+            home = tmp_path / f"home_{abs(hash(body))}"
+            home.mkdir()
+            (home / "config.yaml").write_text(body, encoding="utf-8")
+            monkeypatch.setattr(hsp, "get_hermes_home", lambda h=home: h,
+                                raising=False)
+            monkeypatch.setenv("HERMES_HOME", str(home))
 
-        # Must not raise: this is a legitimate (if odd) "nothing selected".
-        hsp._assert_active_config_parseable()
+            with pytest.raises(RuntimeError, match="not usable"):
+                hsp._assert_active_config_parseable()
 
 
 # ---------------------------------------------------------------------------

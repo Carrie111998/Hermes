@@ -1917,7 +1917,7 @@ def _assert_active_config_parseable() -> None:
     so fail closed and let the operator fix it.
     """
     try:
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import read_user_config_for_authority
         from hermes_constants import get_hermes_home
     except Exception:
         return  # config layer unavailable; nothing to validate
@@ -1926,26 +1926,20 @@ def _assert_active_config_parseable() -> None:
     if not config_path.is_file():
         return  # absent is a legitimate "no selection"
 
-    # read_user_config_raw() is the sanctioned raw reader: it returns the file
-    # exactly as written (no DEFAULT_CONFIG merge) and RAISES on unparseable
-    # YAML, which is the distinction load_config() deliberately erases. This is
-    # a raw-file diagnostic — an explicitly legal call site for it.
+    # read_user_config_for_authority() is the strict reader: it preserves root
+    # shape, so an existing-but-structurally-unusable file is distinguishable
+    # from a genuinely empty one. load_config() flattens both to defaults, and
+    # read_user_config_raw() flattens both to {} — either would let a file the
+    # operator clearly wrote something into be read as "chose SQLite".
     try:
-        loaded = read_user_config_raw(config_path)
+        read_user_config_for_authority(config_path)
     except Exception as exc:
         raise RuntimeError(
-            f"config.yaml at {config_path} exists but could not be read or "
-            f"parsed ({exc}); refusing to resolve the session state backend "
-            f"from degraded defaults, because this file may be the only source "
-            f"selecting PostgreSQL. Fix or remove the file."
+            f"config.yaml at {config_path} exists but is not usable as a "
+            f"backend-selection source ({exc}); refusing to resolve the "
+            f"session state backend from degraded defaults, because this file "
+            f"may be the only source selecting PostgreSQL. Fix or remove it."
         ) from exc
-
-    if loaded is not None and not isinstance(loaded, dict):
-        raise RuntimeError(
-            f"config.yaml at {config_path} has a {type(loaded).__name__} at its "
-            f"top level, not a mapping; refusing to resolve the session state "
-            f"backend from an unusable config."
-        )
 
 
 def _prepare_readonly_postgres(
@@ -2153,22 +2147,16 @@ def open_store_for_profile(
     config_path = profile_dir / "config.yaml"
     if config_path.is_file():
         try:
-            from hermes_cli.config import read_user_config_raw
+            from hermes_cli.config import read_user_config_for_authority
 
-            loaded = read_user_config_raw(config_path)
+            loaded = read_user_config_for_authority(config_path)
         except Exception as _cfg_exc:
             raise RuntimeError(
-                f"profile {canon!r} has a config.yaml at {config_path} that "
-                f"could not be read or parsed ({_cfg_exc}); refusing to assume "
-                f"the SQLite backend, because that file may be the only source "
-                f"selecting Postgres. Fix or remove the file."
+                f"profile {canon!r} has a config.yaml at {config_path} that is "
+                f"not usable as a backend-selection source ({_cfg_exc}); "
+                f"refusing to assume the SQLite backend, because that file may "
+                f"be the only source selecting Postgres. Fix or remove it."
             ) from _cfg_exc
-        if loaded is not None and not isinstance(loaded, dict):
-            raise RuntimeError(
-                f"profile {canon!r} has a config.yaml at {config_path} whose "
-                f"top level is {type(loaded).__name__}, not a mapping; refusing "
-                f"to assume the SQLite backend from an unusable config."
-            )
         if isinstance(loaded, dict):
             config = loaded
 
@@ -2264,25 +2252,19 @@ def profile_selects_postgres(profile_name: str) -> bool:
     # "not Postgres": it may be the only source selecting Postgres, and a False
     # here routes the caller to SQLite, splitting history. Fail closed.
     try:
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import read_user_config_for_authority
 
-        loaded = read_user_config_raw(config_path)
+        loaded = read_user_config_for_authority(config_path)
     except Exception as _cfg_exc:
         raise RuntimeError(
-            f"profile {canon!r} has a config.yaml at {config_path} that could "
-            f"not be read or parsed ({_cfg_exc}); cannot determine whether it "
-            f"selects the Postgres backend. Refusing to answer 'not Postgres' "
-            f"from an unreadable selection source."
+            f"profile {canon!r} has a config.yaml at {config_path} that is not "
+            f"usable as a backend-selection source ({_cfg_exc}); cannot "
+            f"determine whether it selects the Postgres backend. Refusing to "
+            f"answer 'not Postgres' from an unusable selection source."
         ) from _cfg_exc
 
     if loaded is None:
-        return False  # empty file — genuinely no selection
-    if not isinstance(loaded, dict):
-        raise RuntimeError(
-            f"profile {canon!r} has a config.yaml at {config_path} whose top "
-            f"level is {type(loaded).__name__}, not a mapping; cannot determine "
-            f"the selected backend."
-        )
+        return False  # absent or genuinely empty — no selection
     backend = (
         str((loaded.get("sessions") or {}).get("state_backend") or "")
         .strip()
