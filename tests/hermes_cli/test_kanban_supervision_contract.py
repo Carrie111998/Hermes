@@ -594,3 +594,49 @@ def test_e2e_objective_done_only_after_all_gates_survives_reopen(kanban_home, mo
         assert status == "done"
         assert sup.objective_is_complete(conn, oid)
         assert len(remoko.calls) == 1
+
+
+def test_failed_run_without_canonical_proof_cannot_issue_or_consume_grant(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        parent, child, oid = _graph(conn)
+        now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, error) "
+                "VALUES (?, 'failed', 'failed', ?, ?, 'boom')",
+                (child, now - 10, now),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='blocked', current_run_id=NULL, "
+                "claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                (child,),
+            )
+        packet = contract.build_canonical_evidence(conn, child)
+        assert packet.get("run_id")
+        assert contract.persisted_proof_present(packet) is False
+        issued = contract.issue_descendant_grant(
+            conn, objective_id=oid, supervisor_task_id=parent,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=contract.canonical_evidence_hash(packet),
+            caller_task_id=parent,
+        )
+        assert issued["ok"] is False
+        assert kb.get_task(conn, child).status != "done"
+
+
+def test_missing_head_review_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        parent, child, oid = _graph(conn)
+        missing_submitted = contract.record_review_verdict(
+            conn, task_id=child, verdict="pass", head=None, current_head="abc",
+        )
+        assert missing_submitted.get("ok") is False
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        assert units.get(child, {}).get("status") != "done"
+        missing_live = contract.record_review_verdict(
+            conn, task_id=child, verdict="pass", head="abc", current_head=None,
+            git_head_fn=lambda _p: None,
+        )
+        assert missing_live.get("ok") is False
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        assert units.get(child, {}).get("status") != "done"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -395,7 +396,14 @@ def ensure_objective(
     if existing:
         return str(existing["id"])
     now = _now()
-    origin = origin or _durable_notify_origin(conn, root_task_id) or capture_session_origin()
+    if origin is None:
+        origin = _durable_notify_origin(conn, root_task_id)
+    worker_task = os.environ.get("HERMES_KANBAN_TASK") or ""
+    if origin is None or not origin.usable:
+        if worker_task:
+            origin = SessionOrigin()
+        else:
+            origin = capture_session_origin()
     profile = (
         delegator_profile
         or origin.profile
@@ -573,7 +581,7 @@ def note_delegate_spawn(
                 os.environ.get("HERMES_KANBAN_TASK")
                 or _synthetic_session_root()
             )
-            origin = resolve_notify_origin(conn, root) or capture_session_origin()
+            origin = resolve_notify_origin(conn, root)
             oid = os.environ.get("HERMES_OBJECTIVE_ID") or ensure_objective(
                 conn, root, origin=origin
             )
@@ -661,7 +669,7 @@ def note_bot_chat_handoff(
         conn = kb.connect()
         try:
             root = os.environ.get("HERMES_KANBAN_TASK") or _synthetic_session_root()
-            origin = resolve_notify_origin(conn, root) or capture_session_origin()
+            origin = resolve_notify_origin(conn, root)
             oid = os.environ.get("HERMES_OBJECTIVE_ID") or ensure_objective(
                 conn, root, origin=origin
             )
@@ -738,11 +746,19 @@ def _mark_units_by_ref(
     ref: str,
     status: str,
     proof: Optional[dict] = None,
+    objective_id: Optional[str] = None,
 ) -> None:
     ensure_supervisor_tables(conn)
+    owning = objective_id or os.environ.get("HERMES_OBJECTIVE_ID") or ""
+    if not owning and kind == "kanban":
+        obj = get_objective_for_root(conn, _root_task_id(conn, ref))
+        owning = str(obj["id"]) if obj else ""
+    if not owning:
+        return
     rows = conn.execute(
-        "SELECT id, objective_id, ref FROM kanban_objective_units WHERE kind = ?",
-        (kind,),
+        "SELECT id, objective_id, ref FROM kanban_objective_units "
+        "WHERE kind = ? AND objective_id = ?",
+        (kind, owning),
     ).fetchall()
     now = _now()
     proof_json = json.dumps(proof, ensure_ascii=False) if proof else None
@@ -788,19 +804,38 @@ def note_kanban_terminal(
         logger.debug("note_kanban_terminal failed for %s", task_id, exc_info=True)
 
 
+_TRUSTED_JUDE_AUTHORS = frozenset({"jude", "jude-verdict"})
+_REVIEWED_HEAD_RE = re.compile(
+    r"(?im)^reviewed_head\s*[:=]\s*([0-9a-f]{7,40})\s*$"
+)
+
+
 def _maybe_record_jude_proof(conn: sqlite3.Connection, task_id: str) -> None:
     comments = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC",
+        "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC",
         (task_id,),
     ).fetchall()
-    has_pass = any(
-        (c["body"] or "") and "jude-verdict: pass" in (c["body"] or "").lower()
-        for c in comments
-    )
-    if not has_pass:
+    live = _task_git_head(conn, task_id)
+    if not live:
         return
-    head = _task_git_head(conn, task_id)
-    proof = {"type": "jude_verdict", "verdict": "pass", "head": head}
+    trusted = False
+    for comment in comments:
+        author = str(comment["author"] or "").strip().lower()
+        body = comment["body"] or ""
+        if author not in _TRUSTED_JUDE_AUTHORS:
+            continue
+        if "jude-verdict: pass" not in body.lower():
+            continue
+        match = _REVIEWED_HEAD_RE.search(body)
+        if match is None:
+            continue
+        reviewed = match.group(1)
+        if live.startswith(reviewed) or reviewed.startswith(live):
+            trusted = True
+            break
+    if not trusted:
+        return
+    proof = {"type": "jude_verdict", "verdict": "pass", "head": live}
     conn.execute(
         """
         UPDATE kanban_objective_units

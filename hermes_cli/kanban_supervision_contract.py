@@ -177,6 +177,7 @@ def build_canonical_evidence(conn: sqlite3.Connection, task_id: str) -> dict[str
     return {
         "task_id": task_id,
         "run_id": int(run["id"]) if run else None,
+        "run_outcome": (run["outcome"] if run else None),
         "head": proof.get("head"),
         "verdict": proof.get("verdict"),
         "predicate": predicate,
@@ -188,7 +189,7 @@ def persisted_proof_present(packet: dict[str, Any]) -> bool:
     proof = packet.get("proof") or {}
     if proof.get("verdict") or proof.get("head") or proof.get("type"):
         return True
-    return packet.get("run_id") is not None
+    return False
 
 
 def process_exit_evidence(proof: dict[str, Any]) -> dict[str, Any]:
@@ -616,6 +617,17 @@ def record_review_verdict(
         workspace = row["workspace_path"]
     if live_head is None and git_head_fn is not None:
         live_head = git_head_fn(workspace)
+    if verdict_n == "pass" and not blockers:
+        submitted = str(head or "").strip()
+        current = str(live_head or "").strip()
+        if not submitted or not current:
+            return {
+                "ok": False,
+                "error": "exact-head review requires submitted and current HEAD",
+                "verdict": "insufficient_evidence",
+                "head": head,
+                "current_head": live_head,
+            }
     stale = bool(verdict_n == "pass" and not blockers and head and live_head and head != live_head)
     payload = {
         "verdict": verdict_n,
