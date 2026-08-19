@@ -317,16 +317,7 @@ export interface TranscriptRow {
   msg: Msg
 }
 
-export interface SubagentTab {
-  id: string
-  name: string
-  status: 'running' | 'completed' | 'failed'
-  parentSid: string
-}
-
 export interface UiState {
-  activeSubagents: SubagentTab[]
-  parentOrchestratorSid: string | null
   battery: boolean
   batteryStatus: BatteryInfo | null
   bgTasks: Set<string>

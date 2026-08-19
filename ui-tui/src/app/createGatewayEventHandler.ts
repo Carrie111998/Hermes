@@ -761,35 +761,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
 
-      case 'subagent.status': {
-        const p = ev.payload
-        if (!p?.child_sid) {
-          return
-        }
-        const sid = String(p.child_sid)
-        const name = String(p.name || 'subagent')
-        const status = (p.status || 'running') as 'running' | 'completed' | 'failed'
-        const parentSid = String(p.parent_sid || '')
-
-        patchUiState(state => {
-          const current = state.activeSubagents || []
-          if (status === 'running') {
-            const exists = current.some(a => a.id === sid)
-            const updated = exists
-              ? current.map(a => (a.id === sid ? { ...a, status, name } : a))
-              : [...current, { id: sid, name, status, parentSid }]
-            return { ...state, activeSubagents: updated }
-          } else {
-            // Remove finished/failed subagent
-            return {
-              ...state,
-              activeSubagents: current.filter(a => a.id !== sid)
-            }
-          }
-        })
-        return
-      }
-
       case 'skin.changed':
         if (ev.payload) {
           applySkin(ev.payload)

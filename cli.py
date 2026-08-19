@@ -6101,28 +6101,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # active_count() iterates an in-memory records dict under a lock —
         # cheap and only counts records still in the "running" state.
         try:
-            from tools.async_delegation import active_count as _async_active_count, list_async_delegations
+            from tools.async_delegation import active_count as _async_active_count
             snapshot["active_background_subagents"] = _async_active_count()
-            
-            # Extract names of currently running subagents
-            active_dels = list_async_delegations()
-            running_names = []
-            for d in active_dels:
-                if d.get("status") in ("running", "stalling", "finalizing"):
-                    # Check task definitions or goals
-                    tasks = d.get("tasks", [])
-                    for t in tasks:
-                        t_name = t.get("agent") or t.get("name")
-                        if t_name and t_name not in running_names:
-                            running_names.append(t_name)
-                    if not tasks and d.get("agent"):
-                        running_names.append(d["agent"])
-            if running_names:
-                snapshot["subagents_label"] = "🤖 " + ", ".join(running_names) + " ●"
-            else:
-                snapshot["subagents_label"] = ""
         except Exception:
-            snapshot["subagents_label"] = ""
+            pass
 
         # Standing /goal state (Ralph loop). GoalManager is cached on self and
         # keeps its state in memory, so this is a cheap attribute read — no DB
@@ -6172,29 +6154,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
-
-        # CWD & Branch detection for status bar
-        try:
-            cwd_str = str(getattr(self, 'cwd', None) or os.getcwd())
-            home_dir = str(Path.home())
-            if cwd_str.startswith(home_dir):
-                display_cwd = "~" + cwd_str[len(home_dir):]
-            else:
-                display_cwd = cwd_str
-            if len(display_cwd) > 28:
-                display_cwd = f"~.../{Path(cwd_str).name}"
-            
-            branch_str = ""
-            try:
-                import subprocess
-                res = subprocess.run(["git", "branch", "--show-current"], cwd=cwd_str, capture_output=True, text=True, timeout=1)
-                if res.returncode == 0 and res.stdout.strip():
-                    branch_str = f" (🌿 {res.stdout.strip()})"
-            except Exception:
-                pass
-            snapshot["cwd_label"] = f"📂 {display_cwd}{branch_str}"
-        except Exception:
-            snapshot["cwd_label"] = ""
 
         return snapshot
 
@@ -6971,10 +6930,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " · "))
-                        if snapshot.get("subagents_label"):
-                            frags.append(("class:status-bar-accent", snapshot["subagents_label"]))
-                        else:
-                            frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                        frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
                     if goal_segment:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", goal_segment))
@@ -6994,9 +6950,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
-                    if width >= 90 and snapshot.get("cwd_label"):
-                        frags.append(("class:status-bar-dim", " · "))
-                        frags.append(("class:status-bar-strong", snapshot["cwd_label"]))
                     frags.append(("class:status-bar", " "))
                 else:
                     if snapshot["context_length"]:
@@ -7032,10 +6985,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " │ "))
-                        if snapshot.get("subagents_label"):
-                            frags.append(("class:status-bar-accent", snapshot["subagents_label"]))
-                        else:
-                            frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                        frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
                     if goal_segment:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", goal_segment))
@@ -7067,9 +7017,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
-                    if width >= 90 and snapshot.get("cwd_label"):
-                        frags.append(("class:status-bar-dim", " │ "))
-                        frags.append(("class:status-bar-strong", snapshot["cwd_label"]))
                     frags.append(("class:status-bar", " "))
 
             # Stash indicator (📌 N) — appended after all width tiers so the
@@ -11629,9 +11576,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_debug_command(cmd_original)
         elif canonical == "update":
             if self._handle_update_command():
-                return False
-        elif canonical in ("restart", "reload-session", "reboot"):
-            if self._handle_restart_command():
                 return False
         elif canonical == "version":
             from hermes_cli.main import _print_version_info
@@ -16604,39 +16548,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             manipulate user input from a keybinding handler.
         """
 
-    def _get_subagents_bar_fragments(self):
-        """Render responsive subagent pill bar underneath the input composer."""
-        try:
-            from tools.async_delegation import list_async_delegations
-            active_dels = list_async_delegations()
-            running = []
-            for d in active_dels:
-                if d.get("status") in ("running", "stalling", "finalizing"):
-                    tasks = d.get("tasks", [])
-                    for t in tasks:
-                        t_name = t.get("agent") or t.get("name")
-                        if t_name and t_name not in running:
-                            running.append(t_name)
-                    if not tasks and d.get("agent"):
-                        running.append(d["agent"])
-            if not running:
-                return []
-            
-            width = self._get_tui_terminal_width()
-            frags = [("class:subagent-bar-label", " Subagents: ")]
-            for name in running:
-                pill = f" [ 🤖 {name} ● Working ] "
-                frags.append(("class:subagent-pill", pill))
-                frags.append(("", " "))
-            
-            total_w = sum(self._status_bar_display_width(t) for _, t in frags)
-            if total_w > width:
-                # Responsive collapse on narrow terminals
-                return [("class:subagent-pill", f" 🤖 {len(running)} working ")]
-            return frags
-        except Exception:
-            return []
-
     def _build_tui_layout_children(
         self,
         *,
@@ -16681,7 +16592,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 image_bar,
                 input_area,
                 input_rule_bot,
-                getattr(self, "_subagents_bar_widget", None),
                 voice_status_bar,
                 completions_menu,
             ] if item is not None
@@ -18886,19 +18796,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             filter=Condition(lambda: cli_ref._voice_mode),
         )
 
-        # Subagents action bar underneath input area (visible only when subagents are active)
-        def _get_subagents_bar():
-            return cli_ref._get_subagents_bar_fragments()
-
-        subagents_bar = ConditionalContainer(
-            Window(
-                FormattedTextControl(_get_subagents_bar),
-                height=1,
-                wrap_lines=False,
-            ),
-            filter=Condition(lambda: bool(cli_ref._get_subagents_bar_fragments())),
-        )
-
         status_bar = ConditionalContainer(
             Window(
                 content=FormattedTextControl(lambda: cli_ref._get_status_bar_fragments()),
@@ -18942,8 +18839,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 and bool(len(cli_ref._prompt_stash))
             ),
         )
-
-        self._subagents_bar_widget = subagents_bar
 
         # Allow wrapper CLIs to register extra keybindings.
         self._register_extra_tui_keybindings(kb, input_area=input_area)
@@ -18998,8 +18893,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'status-bar-plan': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-build': 'bg:#1a1a2e #8FBC8F',
             'status-bar-session-title': 'bg:#FFD700 #1a1a2e bold',
-            'subagent-bar-label': '#888888 italic',
-            'subagent-pill': 'bg:#2a2a4e #87CEEB bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges

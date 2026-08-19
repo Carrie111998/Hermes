@@ -294,12 +294,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'switching session…' })
 
-      const currentSid = getUiState().sid
-      // If switching to a subagent session, remember parent orchestrator sid
-      if (currentSid && !currentSid.startsWith('sub-') && id.startsWith('sub-')) {
-        patchUiState({ parentOrchestratorSid: currentSid })
-      }
-
       gw.request<SessionActivateResponse>('session.activate', { session_id: id })
         .then(raw => {
           const r = asRpcResult<SessionActivateResponse>(raw)

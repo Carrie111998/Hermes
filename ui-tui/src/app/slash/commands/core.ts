@@ -147,17 +147,6 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    aliases: ['reboot', 'reload-session'],
-    help: 'restart session and reload modules/configs',
-    name: 'restart',
-    run: (_arg, ctx) => {
-      ctx.transcript.sys('restarting session...')
-      // Exit code 43 signals the Python wrapper to relaunch and resume session.
-      setTimeout(() => ctx.session.dieWithCode(43), 100)
-    }
-  },
-
-  {
     help: 'update Hermes Agent to the latest version (exits TUI)',
     name: 'update',
     run: (_arg, ctx) => {

@@ -2840,18 +2840,6 @@ def _launch_tui(
         print()
         relaunch(["update"], preserve_inherited=False)
 
-    # Exit code 43 = TUI requested session restart. Relaunch in place with --tui and resume.
-    if code == 43:
-        from hermes_cli.relaunch import relaunch
-
-        print()
-        print("🔄 Restarting Hermes TUI...")
-        print()
-        args_to_pass = ["--tui"]
-        if resume_session_id:
-            args_to_pass.extend(["-r", resume_session_id])
-        relaunch(args_to_pass, preserve_inherited=False)
-
     sys.exit(code)
 
 

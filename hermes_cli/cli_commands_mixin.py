@@ -3674,18 +3674,6 @@ class CLICommandsMixin:
         )
         run_debug_share(args)
 
-    def _handle_restart_command(self) -> bool:
-        """Handle /restart — restart the session and reload all modules in place."""
-        current_sid = getattr(self, "session_id", None)
-        print()
-        print("  🔄 Restarting Hermes CLI session...")
-        print()
-        if current_sid:
-            self._pending_relaunch = ["--resume", current_sid]
-        else:
-            self._pending_relaunch = []
-        return True
-
     def _handle_update_command(self) -> bool:
         """Handle /update — update Hermes Agent to the latest version.
 
