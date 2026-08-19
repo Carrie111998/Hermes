@@ -203,6 +203,14 @@ const $groupChats = atom({})
 /** Group whose room view is open in the Bots pane (secondary navigation,
  *  same pattern as $botSessionsWorkspace). */
 const $groupChatWorkspace = atom(null)
+/** Groups whose room is currently rendered by a MAIN-window tab. Selection
+ *  ($groupChatWorkspace) only says which room is highlighted; this says who is
+ *  already DRAWING it. Without the distinction the Bots panel rendered its own
+ *  in-panel copy alongside the main tab — two live rooms, and the roster gone
+ *  (#89788). A plain Map (groupChatMainTabs) can't drive that: the panel needs
+ *  a reactive value to re-render on. */
+const $groupChatMainOwned = atom({})
+
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
 
@@ -9333,10 +9341,30 @@ function GroupChatWorkspace({ group, members, onBack }) {
  *  disband (or the room view's own Back) can retire the tab it opened. */
 const groupChatMainTabs = new Map()
 
+/** Reactive mirror of groupChatMainTabs — see $groupChatMainOwned. */
+function setGroupChatMainOwned(group, owned) {
+  const prev = $groupChatMainOwned.get()
+
+  if (Boolean(prev[group]) === Boolean(owned)) {
+    return
+  }
+
+  const next = { ...prev }
+
+  if (owned) {
+    next[group] = true
+  } else {
+    delete next[group]
+  }
+
+  $groupChatMainOwned.set(next)
+}
+
 function closeGroupChatMainTab(group) {
   const close = groupChatMainTabs.get(group)
 
   groupChatMainTabs.delete(group)
+  setGroupChatMainOwned(group, false)
 
   if ($groupChatWorkspace.get() === group) {
     $groupChatWorkspace.set(null)
@@ -9369,7 +9397,6 @@ function GroupChatMainView({ group }) {
  *  view on desktops whose SDK predates the main-area door. */
 function openGroupChat(group) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
-  $groupChatWorkspace.set(group)
 
   if (typeof host.openWorkspace === 'function') {
     try {
@@ -9379,6 +9406,7 @@ function openGroupChat(group) {
         render: () => jsx(GroupChatMainView, { group }),
         onClose: () => {
           groupChatMainTabs.delete(group)
+          setGroupChatMainOwned(group, false)
 
           if ($groupChatWorkspace.get() === group) {
             $groupChatWorkspace.set(null)
@@ -9387,6 +9415,9 @@ function openGroupChat(group) {
       })
 
       groupChatMainTabs.set(group, close)
+      // The main window draws this room now: the panel keeps the roster.
+      setGroupChatMainOwned(group, true)
+      $groupChatWorkspace.set(group)
 
       return
     } catch {
@@ -9394,8 +9425,10 @@ function openGroupChat(group) {
     }
   }
 
-  // The selected-group atom was set before trying the main-window door, so
-  // older desktops naturally render the in-panel room as the fallback.
+  // Older desktops have no main-window door: nobody owns the render, so the
+  // selection alone makes the panel show the in-panel room as the fallback.
+  setGroupChatMainOwned(group, false)
+  $groupChatWorkspace.set(group)
 }
 
 /** One group chat as ONE roster row — the Discord shape: stacked member
@@ -9524,6 +9557,7 @@ function BotsPane() {
   const activityToasts = useValue($activityToasts)
   const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
+  const groupChatMainOwned = useValue($groupChatMainOwned)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
 
@@ -9622,7 +9656,9 @@ function BotsPane() {
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
-  if (groupChatName && groupChatMembers.length) {
+  // Selected AND nobody else is drawing it. When the main-window tab owns the
+  // room, rendering here too gave two live rooms and hid the roster (#89788).
+  if (groupChatName && groupChatMembers.length && !groupChatMainOwned[groupChatName]) {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
   }
 

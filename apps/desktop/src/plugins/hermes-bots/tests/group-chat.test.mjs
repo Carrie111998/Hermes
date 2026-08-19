@@ -104,7 +104,7 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupChatMainOwned, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -821,4 +821,64 @@ test('group room preview renders the bot HANDLE, not the raw profile name', () =
   assert.match(pluginSource, /const lastHandle = botHandle\(lastFrom \|\| 'bot', members\.find\(/)
   assert.match(pluginSource, /\? `\$\{last\.from\?\.kind === 'user' \? 'You' : `@\$\{lastHandle\}`\}/)
   assert.doesNotMatch(pluginSource, /`@\$\{last\.from\?\.name \|\| 'bot'\}`/)
+})
+
+test('main-window tab owns the room: the Bots panel must not draw a second copy', () => {
+  // #89788: selection alone made the panel render its own GroupChatWorkspace
+  // beside the main tab — two live rooms, each with its own composer, and the
+  // bots roster replaced.
+  const gc = load(() => '(pass)')
+
+  gc.host.openWorkspace = () => () => undefined
+  gc.openGroupChat('Core')
+
+  assert.equal(gc.$groupChatWorkspace.get(), 'Core')        // still selected
+  assert.equal(gc.$groupChatMainOwned.get().Core, true)     // main window draws it
+})
+
+test('no main-window door: the in-panel room stays the fallback', () => {
+  const gc = load(() => '(pass)')
+
+  gc.host.openWorkspace = undefined
+  gc.openGroupChat('Core')
+
+  assert.equal(gc.$groupChatWorkspace.get(), 'Core')
+  assert.equal(gc.$groupChatMainOwned.get().Core, undefined)
+})
+
+test('a failed main-window door falls back to the in-panel room', () => {
+  const gc = load(() => '(pass)')
+
+  gc.host.openWorkspace = () => {
+    throw new Error('no main-area door on this desktop')
+  }
+  gc.openGroupChat('Core')
+
+  assert.equal(gc.$groupChatWorkspace.get(), 'Core')
+  assert.equal(gc.$groupChatMainOwned.get().Core, undefined)
+})
+
+test('closing the main tab hands the room back', () => {
+  const gc = load(() => '(pass)')
+  let onClose
+
+  gc.host.openWorkspace = (_id, options) => {
+    onClose = options.onClose
+    return () => onClose()
+  }
+
+  gc.openGroupChat('Core')
+  assert.equal(gc.$groupChatMainOwned.get().Core, true)
+
+  gc.closeGroupChatMainTab('Core')
+  assert.equal(gc.$groupChatMainOwned.get().Core, undefined)
+  assert.equal(gc.$groupChatWorkspace.get(), null)
+})
+
+test('source contract: the panel renders the room only when nothing else owns it', () => {
+  assert.match(
+    pluginSource,
+    /if \(groupChatName && groupChatMembers\.length && !groupChatMainOwned\[groupChatName\]\) \{/
+  )
+  assert.doesNotMatch(pluginSource, /if \(groupChatName && groupChatMembers\.length\) \{/)
 })
