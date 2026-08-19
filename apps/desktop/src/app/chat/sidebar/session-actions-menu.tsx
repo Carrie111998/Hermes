@@ -175,7 +175,7 @@ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; session
   const openCreateAndMove = () => {
     triggerHaptic('selection')
 
-    const prefill = cwd && !currentProjectId ? cwd : cwd
+    const prefill = cwd
 
     openProjectCreate({
       prefillFolder: prefill || undefined,
