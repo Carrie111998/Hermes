@@ -148,6 +148,28 @@ _STATE_LABELS = {
 }
 
 
+def _label_is_noise(event: Event, verdict: OutcomeVerdict) -> bool:
+    """True iff the verdict label says nothing worth a word in the header.
+
+    Exactly one case (2026-08-19, found by the AGENT_NOTE live delivery test —
+    no offline assertion covered it): an agent note carrying no status/outcome
+    key evaluates to UNKNOWN and rendered as "UNKNOWN AGENT_NOTE", which reads
+    as a determination that FAILED rather than one that was never called for.
+    A note is a statement; it has no operation behind it to have an outcome.
+
+    Deliberately NOT generalised to every type. For an operation — a cron run,
+    a probe, a delivery — UNKNOWN is real information: the result could not be
+    established, which is the distinction the failure-wins outcome contract
+    exists to preserve. Suppressing it there would hide a signal, so this stays
+    a one-type exception rather than becoming a rule about UNKNOWN.
+
+    The DOT is untouched: header_dot() derives it separately via
+    marker_for_verdict(), so a note keeps its priority colour.
+    """
+    return (event.event_type is EventType.AGENT_NOTE
+            and verdict.state is OutcomeState.UNKNOWN)
+
+
 def format_header(
     event: Event,
     verdict: OutcomeVerdict | None = None,
@@ -159,11 +181,10 @@ def format_header(
     Legacy callers that omit ``verdict`` retain the historical unlabeled header.
     """
     dot = header_dot(event, verdict)
-    label = (
-        f" {_STATE_LABELS.get(verdict.state, verdict.state.value.upper())}"
-        if verdict is not None
-        else ""
-    )
+    if verdict is None or _label_is_noise(event, verdict):
+        label = ""
+    else:
+        label = f" {_STATE_LABELS.get(verdict.state, verdict.state.value.upper())}"
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
 

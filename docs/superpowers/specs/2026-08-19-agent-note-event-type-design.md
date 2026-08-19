@@ -1,7 +1,7 @@
 # AGENT_NOTE — an EventType for arbitrary agent-authored text
 
 **Date:** 2026-08-19
-**Status:** approved, implementing
+**Status:** done — landed 2026-08-19 as `c9ce2918ed`
 **Repo:** `~/.hermes/agent-src`
 
 ## Problem
@@ -9,8 +9,13 @@
 There is no EventType that carries arbitrary agent- or script-authored prose to
 chat. Every semantically-plausible type is special-cased in
 `TelegramNotifier._format_payload` (`events/subscribers/telegram_notifier.py:533`),
-and each branch renders only the fields *its* type knows. A generic key:value
-fallback exists (`:697`) but 64 of the 82 types never reach it.
+and each branch renders only the fields *its* type knows. **Measured: 23 of the
+82 types are special-cased** and never reach the generic key:value fallback at
+`:697`; the other 59 do, but landing a note on one of them means mislabelling it
+as `agent_error` / `interview_signal` / `offer_signal`, which is worse than a bad
+render. (An earlier draft of this line said "64 of the 82 never reach it" — that
+was inherited from the incident report and is backwards; count the `EventType.`
+references inside `_format_payload` to re-derive it.)
 
 So a caller with a sentence to send picks the least-wrong existing type and the
 sentence is discarded. Concretely, emitting
@@ -184,6 +189,28 @@ FAILED or DEGRADED verdict promotes an INFO note to WARN on Alerts
 (`routing_policy.py:552-557`) — consistent with intent.
 
 `action_required` / `action_kind` are neutralised by the post-gate clamp above.
+
+### Header: the UNKNOWN verdict label is suppressed (follow-up, same day)
+
+Found by the **live** delivery test, which no offline assertion had covered: a
+note carrying no `status`/`outcome` key evaluates to `OutcomeState.UNKNOWN`, and
+`format_header` renders the verdict label whenever a verdict is passed
+(`events/formatting.py:151-166`). Delivered messages therefore read
+`🟡 UNKNOWN 🗒️ AGENT_NOTE — …`, which parses as *a determination that failed*
+rather than *one that was never called for*. A note is a statement; there is no
+operation behind it to have an outcome.
+
+`_label_is_noise(event, verdict)` suppresses the label for **AGENT_NOTE with an
+UNKNOWN verdict only**. Deliberately not generalised: for an operation — a cron
+run, a probe, a delivery — UNKNOWN is real information (the result could not be
+established), which is exactly the distinction the failure-wins outcome contract
+exists to preserve. Suppressing it there would hide a signal, so this stays a
+one-type exception rather than becoming a rule about UNKNOWN.
+
+The **dot is untouched** — `header_dot()` derives it separately via
+`marker_for_verdict()`, so a note keeps its priority colour. A caller who *does*
+set `status` still gets the label: `"failed"` renders red and `FAILED`, which is
+the whole point of keeping the reserved keys live.
 
 ## Files touched
 

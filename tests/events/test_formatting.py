@@ -10,6 +10,7 @@ from events.formatting import (
     format_header, format_event_message, format_whatsapp_message,
     format_whatsapp_header,
 )
+from events.outcomes import OutcomeState
 from events.routing_policy import classify
 from events.schema import Event, EventType, Priority
 
@@ -1149,3 +1150,59 @@ class TestAgentNoteBody:
         from events.formatting import agent_note_body
         body = agent_note_body({"headline": "H", "detail": ["a", "b"]})
         assert "H" in body
+
+
+class TestAgentNoteHeaderOmitsUnknownVerdict:
+    """An agent note is a statement, not an operation with an outcome.
+
+    format_header renders the verdict label whenever a verdict is passed, so a
+    note with no status/outcome key wore "UNKNOWN" — which reads as a failed
+    determination rather than "no determination was called for". Surfaced by
+    the 2026-08-19 live delivery test, not by any offline assertion.
+
+    Scoped to AGENT_NOTE: for every other type UNKNOWN is a real statement
+    about an operation whose result could not be established, and suppressing
+    it would hide information.
+    """
+
+    def _note(self, payload=None):
+        return _make_event(EventType.AGENT_NOTE, payload=payload or {"headline": "hi"})
+
+    def test_unknown_verdict_label_is_omitted(self):
+        event = self._note()
+        verdict = classify(event).verdict
+        assert verdict.state is OutcomeState.UNKNOWN, "precondition"
+        header = format_header(event, verdict=verdict)
+        assert "UNKNOWN" not in header
+
+    def test_the_dot_and_icon_survive_the_omission(self):
+        """Only the label goes: the priority dot is a separate derivation
+        (header_dot -> marker_for_verdict) and must not be collateral damage."""
+        event = self._note()
+        header = format_header(event, verdict=classify(event).verdict)
+        assert header.startswith(priority_dot(Priority.NORMAL))
+        assert EventType.AGENT_NOTE.icon in header
+        assert "AGENT_NOTE" in header
+
+    def test_a_real_verdict_is_still_labelled(self):
+        """status:"failed" is how a caller colours a note — suppressing THAT
+        would make the reserved-key feature useless."""
+        event = self._note({"headline": "hi", "status": "failed"})
+        verdict = classify(event).verdict
+        assert verdict.state is OutcomeState.FAILED, "precondition"
+        assert "FAILED" in format_header(event, verdict=verdict)
+
+    @pytest.mark.parametrize("et", [EventType.JOB_DISCOVERED,
+                                    EventType.STAGE_TRANSITION,
+                                    EventType.GATEWAY_HEALTH])
+    def test_other_event_types_still_show_unknown(self, et):
+        """No collateral change: UNKNOWN on an operation IS information — the
+        result could not be established. Only a note has no result to report."""
+        event = _make_event(et, payload={})
+        verdict = classify(event).verdict
+        assert verdict.state is OutcomeState.UNKNOWN, "precondition"
+        assert "UNKNOWN" in format_header(event, verdict=verdict)
+
+    def test_no_verdict_passed_is_unchanged(self):
+        event = self._note()
+        assert "UNKNOWN" not in format_header(event)
