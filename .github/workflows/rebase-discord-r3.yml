@@ -1,0 +1,111 @@
+name: Rebase Discord R3 onto current main
+
+on:
+  push:
+    branches: [fix/dc-media-mixin]
+    paths: [.github/workflows/rebase-discord-r3.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebuild R3 from current upstream main
+        env:
+          OLD_HEAD: f71c8bb6c73c5131bd7ca1e7e3827ee700a92601
+        run: |
+          set -euo pipefail
+          git config user.name "Andrex Ibiza, MBA"
+          git config user.email "andrexibiza@gmail.com"
+          git fetch https://github.com/NousResearch/hermes-agent.git main
+          UPSTREAM_SHA="$(git rev-parse FETCH_HEAD)"
+          git reset --hard "$UPSTREAM_SHA"
+
+          git checkout "$OLD_HEAD" -- \
+            contributors/emails/andrexibiza@gmail.com \
+            contributors/emails/discord-media-seam-fixer@users.noreply.github.com \
+            plugins/platforms/discord/media_send_mixin.py \
+            tests/plugins/discord/test_discord_media_send_seam.py
+
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+          import re
+
+          path = Path("plugins/platforms/discord/adapter.py")
+          source = path.read_text()
+          tree = ast.parse(source)
+          cls = next(
+              n for n in tree.body
+              if isinstance(n, ast.ClassDef) and n.name == "DiscordAdapter"
+          )
+          names = {
+              "send_image_file",
+              "send_image",
+              "send_animation",
+              "send_video",
+              "send_document",
+              "send_typing",
+              "stop_typing",
+          }
+          methods = [
+              n for n in cls.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names
+          ]
+          found = {n.name for n in methods}
+          if found != names:
+              raise SystemExit(f"R3 current-main method set drifted: found={sorted(found)}")
+
+          lines = source.splitlines(keepends=True)
+          for node in sorted(methods, key=lambda n: n.lineno, reverse=True):
+              start = node.lineno - 1
+              end = node.end_lineno
+              while end < len(lines) and lines[end].strip() == "":
+                  end += 1
+              del lines[start:end]
+          source = "".join(lines)
+
+          import_line = "from .media_send_mixin import DiscordMediaSendMixin\n"
+          class_re = re.compile(r"^class DiscordAdapter\(([^)]*)\):", re.MULTILINE)
+          match = class_re.search(source)
+          if not match:
+              raise SystemExit("DiscordAdapter class line not found")
+          bases = [b.strip() for b in match.group(1).split(",") if b.strip()]
+          if "DiscordMediaSendMixin" not in bases:
+              bases.insert(0, "DiscordMediaSendMixin")
+          source = class_re.sub(
+              "class DiscordAdapter(" + ", ".join(bases) + "):", source, count=1
+          )
+          if import_line not in source:
+              class_pos = source.index("class DiscordAdapter(")
+              source = source[:class_pos] + import_line + "\n" + source[class_pos:]
+
+          path.write_text(source)
+          PY
+
+          python -m py_compile plugins/platforms/discord/adapter.py plugins/platforms/discord/media_send_mixin.py
+          python -m pytest -q \
+            tests/plugins/discord/test_discord_media_send_seam.py \
+            tests/gateway/test_discord_send.py \
+            tests/gateway/test_send_image_file.py \
+            tests/gateway/test_send_multiple_images.py
+          git diff --check
+
+          rm -f .github/workflows/rebase-discord-r3.yml
+          git add -- \
+            contributors/emails/andrexibiza@gmail.com \
+            contributors/emails/discord-media-seam-fixer@users.noreply.github.com \
+            plugins/platforms/discord/adapter.py \
+            plugins/platforms/discord/media_send_mixin.py \
+            tests/plugins/discord/test_discord_media_send_seam.py
+          git commit -s -m "refactor(discord): rebase media send shard onto current main" \
+            -m "Reapply the existing R3 media/typing seam to the exact current upstream adapter using AST method boundaries, preserving current-main code outside the seven owned methods and the shard's patchability contract." \
+            -m "Part of #78647" -m "Part of #78634" -m "Part of #79564" -m "Part of #79772"
+          git push --force-with-lease origin HEAD:fix/dc-media-mixin
