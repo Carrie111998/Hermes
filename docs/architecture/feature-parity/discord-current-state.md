@@ -30,7 +30,7 @@ PR #90307 makes this class fail closed by digest-locking `(id, name, product_sta
 |---|---|---|---|---|
 | M1 | Structured inbound message model — full doc alignment | `accepted` | `candidate_unwired` | #86440: Candidate projection is not on main and no accepted ingress consumer is named in the live repository. |
 | M2 | Agent-facing edit/delete | `accepted` | `candidate_unwired` | #86449: Request builder is not connected to the model-callable Discord transport on main. |
-| M3 | Outbound reaction actions | `accepted` | `candidate_blocked` | #89405: #89405 has the real consumer path, but it still changes adapter.py while the G-lane extraction is unmerged and #86419 remains an open duplicate publication node. |
+| M3 | Outbound reaction actions | `accepted` | `candidate_blocked` | #89405: #89405 has the real consumer path and now includes the remove-all builder with attribution preserved. #86419 was closed as superseded after verification; the remaining blocker is the unmerged G-lane/consumer seam. |
 | M4 | Rich embeds — typed outbound + ingress projection | `accepted` | `candidate_unwired` | #86324: Typed embed builder/projection is not wired through the production send and ingress paths on main. |
 | M5 | Poll read-projection | `accepted` | `candidate_unwired` | #86451: Poll projection has no production ingress consumer on main. |
 | M6 | Attachment contract — routing, preflight, bounded reads | `accepted` | `candidate_unwired` | #86499: Attachment routing/preflight/bounded-read candidate has no accepted end-to-end consumer on main. |
@@ -82,7 +82,7 @@ PR #90307 makes this class fail closed by digest-locking `(id, name, product_sta
 
 ## Immediate topology decisions encoded here
 
-- M3 authority is #89405; #86419 is a superseded candidate, but closure still requires verification of behavior, provenance, and exact-head tests.
+- M3 authority is #89405. #86419 was closed as superseded after current-head verification confirmed remove-all coverage, the real plugin/adapter consumer path, and explicit provenance.
 - W1 remains rejected and `tools/discord_api/webhooks.py` remains forbidden absent a concrete consumer.
 - W3 remains multiplex profile routing; W4 remains proactive/home/cron delivery; W5 remains paired-deferred/rejected OAuth.
 - A1–A6 remain blocked until target guild/profile/requester authority is explicit.
