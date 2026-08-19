@@ -26,7 +26,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__previewKind = previewKind;\nglobalThis.__generatedSessionTitle = generatedSessionTitle;\nglobalThis.__isGenericTitle = isGenericTitle;'
+      '\nglobalThis.__previewKind = previewKind;\nglobalThis.__generatedSessionTitle = generatedSessionTitle;\nglobalThis.__isGenericTitle = isGenericTitle;\nglobalThis.__formatBotTokenCount = formatBotTokenCount;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -87,7 +87,17 @@ test('generatedSessionTitle: caps the generated label length', () => {
   assert.ok(out.length <= 34, `expected <= 34 chars, got ${out.length}: ${out}`)
 })
 
-// ── render smoke: BotRow must paint the new row furniture without throwing ──
+test('formatBotTokenCount: keeps compact labels readable across unit boundaries', () => {
+  const format = runtime().__formatBotTokenCount
+
+  assert.equal(format(999), '999 tokens')
+  assert.equal(format(999_500), '1.0M tokens')
+  assert.equal(format(1_000_000), '1.0M tokens')
+  assert.equal(format(1_500_000_000), '1.5B tokens')
+  assert.equal(format(0), '')
+})
+
+// ── render: BotRow must paint the new row furniture without throwing ──
 
 function renderRuntime() {
   const atom = value => ({ get: () => value, set: () => undefined })
@@ -168,6 +178,9 @@ const DM_BOT = {
   last_session: {
     id: 's1',
     title: 'Bot Chat',
+    model: 'anthropic/claude-sonnet-4',
+    input_tokens: 1200,
+    output_tokens: 345,
     preview: 'Message from 🤖 manager (@manager): Learn-share: skill installed in your profile',
     last_active: Math.floor(Date.now() / 1000) - 5
   }
@@ -179,6 +192,8 @@ test('render: BotRow shows the sender badge and stripped DM preview', () => {
   const text = textOf(tree)
   assert.match(text, /@manager/)
   assert.match(text, /Learn-share/)
+  assert.match(text, /anthropic\/claude-sonnet-4/)
+  assert.match(text, /1.5k tokens/)
   assert.doesNotMatch(text, /Message from/)
 })
 

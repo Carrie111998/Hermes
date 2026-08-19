@@ -4820,6 +4820,10 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
       ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
       : previewSession?.preview || bot.description || 'No conversations yet — say hi'
   )
+  const usageModel = previewSession?.model
+  const usageTokens =
+    (Number(previewSession?.input_tokens) || 0) + (Number(previewSession?.output_tokens) || 0)
+  const usageTokenLabel = formatBotTokenCount(usageTokens)
 
   const warm = () => {
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
@@ -4983,6 +4987,19 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                     title: 'Active in the last 90s'
                   })
                 : null,
+              usageModel
+                ? jsx('span', {
+                    className: 'max-w-[9rem] truncate text-[0.6875rem] text-(--ui-text-quaternary)',
+                    title: usageModel,
+                    children: usageModel
+                  })
+                : null,
+              usageTokenLabel
+                ? jsx('span', {
+                    className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                    children: usageTokenLabel
+                  })
+                : null,
               last
                 ? jsx('span', {
                     className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
@@ -5106,6 +5123,37 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
       })
     ]
   })
+}
+
+function formatBotTokenCount(value) {
+  const count = Number(value)
+
+  if (!Number.isFinite(count) || count <= 0) {
+    return ''
+  }
+
+  if (count < 1000) {
+    const rounded = Math.round(count)
+    return rounded >= 1000 ? '1.0k tokens' : `${rounded} tokens`
+  }
+
+  const units = ['', 'k', 'M', 'B']
+  let scaled = count
+  let unitIndex = 0
+
+  while (scaled >= 1000 && unitIndex < units.length - 1) {
+    scaled /= 1000
+    unitIndex += 1
+  }
+
+  const precision = scaled < 10 ? 1 : 0
+  const rounded = Number(scaled.toFixed(precision))
+
+  if (rounded >= 1000 && unitIndex < units.length - 1) {
+    return `${(rounded / 1000).toFixed(1)}${units[unitIndex + 1]} tokens`
+  }
+
+  return `${scaled.toFixed(precision)}${units[unitIndex]} tokens`
 }
 
 // ── model picker (provider/model dropdowns via model.options) ───────────────
