@@ -966,6 +966,168 @@ def test_current_database_quarantines_orphan_sidebar_resolution(tmp_path):
         repaired.close()
 
 
+def _insert_orphan_reconciliation_proof(db_path, digest):
+    """Strand a proof exactly as the 2026-08-09 foreign_keys=OFF DELETE did."""
+
+    damaged = sqlite3.connect(db_path)
+    try:
+        damaged.execute("PRAGMA foreign_keys=OFF")
+        damaged.execute(
+            """INSERT INTO session_sidebar_reconciliation_proofs (
+                   proof_digest, job_id, source_session_id, bridge_id,
+                   marker_digest, placement_generation, delivery_generation,
+                   reconciliation_generation, completed_at, expires_at,
+                   inventory_digest, state, match_count, recovered_thread_id,
+                   fixed_reason, created_at
+               ) VALUES (
+                   ?, 'orphaned-proof-job', 'claude:orphaned-proof-source',
+                   'sidebar:orphaned-proof-bridge', ?, 1, 1,
+                   'codex:1785547162144598:generation', 100.5, 130.5,
+                   ?, 'absence_proven', 0, NULL, NULL, 100.5
+               )""",
+            (digest, "a" * 64, "b" * 64),
+        )
+        damaged.execute(
+            """DELETE FROM session_bridge_migrations
+               WHERE migration_name =
+                   'sidebar_reconciliation_proof_orphan_quarantine_v31'"""
+        )
+        damaged.commit()
+    finally:
+        damaged.close()
+
+
+def test_current_database_quarantines_orphan_sidebar_reconciliation_proof(tmp_path):
+    """A proof whose parent job vanished must move to quarantine intact."""
+
+    db_path = tmp_path / "sidebar-reconciliation-proof-orphan.db"
+    current = hermes_state.SessionDB(db_path)
+    current.close()
+
+    digest = "c" * 64
+    _insert_orphan_reconciliation_proof(db_path, digest)
+
+    repaired = hermes_state.SessionDB(db_path)
+    try:
+        assert repaired._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_reconciliation_proofs"
+        ).fetchone()[0] == 0
+        quarantined = repaired._conn.execute(
+            """SELECT proof_digest, job_id, source_session_id, bridge_id,
+                      marker_digest, placement_generation, delivery_generation,
+                      reconciliation_generation, completed_at, expires_at,
+                      inventory_digest, state, match_count, recovered_thread_id,
+                      fixed_reason, created_at, reason
+                 FROM session_sidebar_reconciliation_proof_quarantine"""
+        ).fetchone()
+        assert quarantined is not None
+        # Every column is preserved verbatim -- this table is the only surviving
+        # record of the reconciliation, so a lossy move would defeat the point.
+        assert tuple(quarantined) == (
+            digest,
+            "orphaned-proof-job",
+            "claude:orphaned-proof-source",
+            "sidebar:orphaned-proof-bridge",
+            "a" * 64,
+            1,
+            1,
+            "codex:1785547162144598:generation",
+            100.5,
+            130.5,
+            "b" * 64,
+            "absence_proven",
+            0,
+            None,
+            None,
+            100.5,
+            "missing_parent_job",
+        )
+        assert repaired._conn.execute(
+            "PRAGMA foreign_key_check(session_sidebar_reconciliation_proofs)"
+        ).fetchall() == []
+        assert repaired._conn.execute(
+            """SELECT COUNT(*) FROM session_bridge_migrations
+               WHERE migration_name =
+                   'sidebar_reconciliation_proof_orphan_quarantine_v31'"""
+        ).fetchone()[0] == 1
+    finally:
+        repaired.close()
+
+
+def test_reconciliation_proof_quarantine_restores_immutability_triggers(tmp_path):
+    """The migration drops the guards to move rows; it must put them back."""
+
+    db_path = tmp_path / "sidebar-reconciliation-proof-triggers.db"
+    current = hermes_state.SessionDB(db_path)
+    current.close()
+
+    _insert_orphan_reconciliation_proof(db_path, "d" * 64)
+
+    repaired = hermes_state.SessionDB(db_path)
+    try:
+        assert {
+            row[0]
+            for row in repaired._conn.execute(
+                """SELECT name FROM sqlite_master
+                   WHERE type = 'trigger'
+                     AND tbl_name = 'session_sidebar_reconciliation_proofs'"""
+            ).fetchall()
+        } == {
+            "trg_sidebar_reconciliation_proofs_no_update",
+            "trg_sidebar_reconciliation_proofs_no_delete",
+        }
+
+        # Arm the guards: a surviving proof must still be undeletable and
+        # unupdatable. A migration that left the table unguarded would pass the
+        # name check above only if it recreated them, but this proves they bite.
+        repaired._conn.execute(
+            """INSERT INTO sessions (id, source, started_at)
+               VALUES ('guard-source', 'claude', 1)"""
+        )
+        repaired._conn.execute(
+            """INSERT INTO session_sidebar_jobs (
+                   id, idempotency_key, source_session_id, bridge_id, state,
+                   attempts, next_attempt_at, eligible_at, created_at, updated_at
+               ) VALUES (
+                   'guard-job', 'guard-idempotency', 'guard-source',
+                   'sidebar:guard-bridge', 'sidebar_pending', 0, 1, 1, 1, 1
+               )"""
+        )
+        repaired._conn.execute(
+            """INSERT INTO session_sidebar_reconciliation_proofs (
+                   proof_digest, job_id, source_session_id, bridge_id,
+                   marker_digest, placement_generation, delivery_generation,
+                   reconciliation_generation, completed_at, expires_at,
+                   inventory_digest, state, match_count, recovered_thread_id,
+                   fixed_reason, created_at
+               ) VALUES (
+                   ?, 'guard-job', 'guard-source', 'sidebar:guard-bridge',
+                   ?, 1, 1, 'codex:1:generation', 200.0, 230.0,
+                   ?, 'absence_proven', 0, NULL, NULL, 200.0
+               )""",
+            ("e" * 64, "a" * 64, "b" * 64),
+        )
+        repaired._conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            repaired._conn.execute(
+                "DELETE FROM session_sidebar_reconciliation_proofs "
+                "WHERE proof_digest = ?",
+                ("e" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            repaired._conn.execute(
+                "UPDATE session_sidebar_reconciliation_proofs "
+                "SET match_count = 1 WHERE proof_digest = ?",
+                ("e" * 64,),
+            )
+        assert repaired._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_reconciliation_proofs"
+        ).fetchone()[0] == 1
+    finally:
+        repaired.close()
+
+
 def test_v28_characterization_event_rebuild_rolls_back_and_reopens(
     tmp_path, monkeypatch
 ):

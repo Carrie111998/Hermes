@@ -1202,6 +1202,7 @@ def test_v24_bridge_migration_is_independent_of_fts_schema_version(
         "claude_characterization_events_v28",
         "claude_characterization_event_orphan_quarantine_v29",
         "sidebar_resolution_orphan_quarantine_v30",
+        "sidebar_reconciliation_proof_orphan_quarantine_v31",
     }
     first._conn.execute(
         """UPDATE session_claude_visibility_jobs

@@ -1778,6 +1778,33 @@ CREATE TABLE IF NOT EXISTS session_sidebar_orphan_resolution_quarantine (
     PRIMARY KEY (resolution_table, original_resolution_rowid)
 );
 
+-- Orphaned reconciliation proofs, quarantined by the v31 migration. The proofs
+-- ledger is immutable by trigger and ON DELETE RESTRICT, so a parent job that
+-- vanishes (the 2026-08-09 foreign_keys=OFF bulk DELETE) strands its children
+-- permanently: they cannot be reached by any consumer -- every read is keyed on
+-- session_sidebar_jobs.reconciliation_proof_digest -- and cannot be removed.
+-- This FK-free table keeps the exact evidence while restoring integrity.
+CREATE TABLE IF NOT EXISTS session_sidebar_reconciliation_proof_quarantine (
+    proof_digest TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    bridge_id TEXT NOT NULL,
+    marker_digest TEXT NOT NULL,
+    placement_generation INTEGER NOT NULL,
+    delivery_generation INTEGER NOT NULL,
+    reconciliation_generation TEXT NOT NULL,
+    completed_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    inventory_digest TEXT NOT NULL,
+    state TEXT NOT NULL,
+    match_count INTEGER NOT NULL,
+    recovered_thread_id TEXT,
+    fixed_reason TEXT,
+    created_at REAL NOT NULL,
+    reason TEXT NOT NULL CHECK (reason = 'missing_parent_job'),
+    quarantined_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
     id TEXT PRIMARY KEY,
     source_session_id TEXT NOT NULL UNIQUE,
@@ -2161,6 +2188,31 @@ _SIDEBAR_ORPHAN_RESOLUTION_QUARANTINE_COLUMNS = (
     "job_id",
     "source_session_id",
     "payload_json",
+    "reason",
+    "quarantined_at",
+)
+
+_SIDEBAR_RECONCILIATION_PROOF_COLUMNS = (
+    "proof_digest",
+    "job_id",
+    "source_session_id",
+    "bridge_id",
+    "marker_digest",
+    "placement_generation",
+    "delivery_generation",
+    "reconciliation_generation",
+    "completed_at",
+    "expires_at",
+    "inventory_digest",
+    "state",
+    "match_count",
+    "recovered_thread_id",
+    "fixed_reason",
+    "created_at",
+)
+
+_SIDEBAR_RECONCILIATION_PROOF_QUARANTINE_COLUMNS = (
+    *_SIDEBAR_RECONCILIATION_PROOF_COLUMNS,
     "reason",
     "quarantined_at",
 )
@@ -3779,6 +3831,158 @@ class SessionDB:
                 connection.rollback()
             raise
 
+    @staticmethod
+    def _validate_sidebar_reconciliation_proof_quarantine(
+        cursor: sqlite3.Cursor,
+        *,
+        expected_rows: int | None = None,
+    ) -> None:
+        table_name = "session_sidebar_reconciliation_proof_quarantine"
+        columns = tuple(
+            row[1]
+            for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        )
+        if columns != _SIDEBAR_RECONCILIATION_PROOF_QUARANTINE_COLUMNS:
+            raise RuntimeError("sidebar reconciliation proof quarantine changed")
+        if expected_rows is not None:
+            actual_rows = cursor.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if int(actual_rows) != expected_rows:
+                raise RuntimeError("sidebar reconciliation proof quarantine changed")
+
+    def _apply_sidebar_reconciliation_proof_orphan_quarantine_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Preserve reconciliation proofs whose parent sidebar job is gone.
+
+        ``session_sidebar_reconciliation_proofs`` is an append-only ledger: both
+        UPDATE and DELETE raise, and its ``job_id`` is ON DELETE RESTRICT. When a
+        parent job disappeared anyway -- the 2026-08-09 bulk DELETE ran with
+        ``foreign_keys`` OFF, so RESTRICT never fired -- the children were left
+        permanently stranded. They are unreachable by every consumer (each read is
+        keyed on ``session_sidebar_jobs.reconciliation_proof_digest``, which no
+        surviving job carries for them) yet cannot be removed, so they would
+        report as foreign-key violations forever.
+
+        Same remedy as v29/v30: one transaction moves the exact rows, every column
+        preserved, into an FK-free audit table. The immutability triggers are
+        dropped and restored verbatim from ``sqlite_master`` inside that
+        transaction, so the ledger is guarded again the moment it commits.
+        """
+
+        migration_name = "sidebar_reconciliation_proof_orphan_quarantine_v31"
+        proof_table = "session_sidebar_reconciliation_proofs"
+        quarantine_table = "session_sidebar_reconciliation_proof_quarantine"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        if self._bridge_migration_applied(cursor, migration_name):
+            self._validate_sidebar_reconciliation_proof_quarantine(cursor)
+            if cursor.execute(
+                f'PRAGMA foreign_key_check("{proof_table}")'
+            ).fetchone() is not None:
+                raise RuntimeError("sidebar reconciliation proof foreign key violation")
+            return
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                self._validate_sidebar_reconciliation_proof_quarantine(cursor)
+                if cursor.execute(
+                    f'PRAGMA foreign_key_check("{proof_table}")'
+                ).fetchone() is not None:
+                    raise RuntimeError(
+                        "sidebar reconciliation proof foreign key violation"
+                    )
+                connection.commit()
+                return
+
+            self._validate_sidebar_reconciliation_proof_quarantine(cursor)
+            proof_columns = ", ".join(
+                f'proof."{column}"' for column in _SIDEBAR_RECONCILIATION_PROOF_COLUMNS
+            )
+            orphan_rows = cursor.execute(
+                f"""SELECT {proof_columns}
+                    FROM "{proof_table}" AS proof
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM session_sidebar_jobs AS job
+                        WHERE job.id = proof.job_id
+                    )
+                    ORDER BY proof.created_at, proof.proof_digest"""
+            ).fetchall()
+
+            if orphan_rows:
+                trigger_rows = cursor.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND tbl_name = ?",
+                    (proof_table,),
+                ).fetchall()
+                if any(
+                    not isinstance(row["name"], str) or not isinstance(row["sql"], str)
+                    for row in trigger_rows
+                ):
+                    raise RuntimeError(
+                        "sidebar reconciliation proof trigger is malformed"
+                    )
+                for trigger_row in trigger_rows:
+                    trigger_name = trigger_row["name"].replace('"', '""')
+                    cursor.execute(f'DROP TRIGGER "{trigger_name}"')
+                insert_columns = ", ".join(
+                    f'"{column}"'
+                    for column in _SIDEBAR_RECONCILIATION_PROOF_QUARANTINE_COLUMNS
+                )
+                placeholders = ", ".join(
+                    "?" for _ in _SIDEBAR_RECONCILIATION_PROOF_QUARANTINE_COLUMNS
+                )
+                quarantined_at = time.time()
+                for orphan_row in orphan_rows:
+                    cursor.execute(
+                        f'INSERT INTO "{quarantine_table}" ({insert_columns}) '
+                        f"VALUES ({placeholders})",
+                        (*tuple(orphan_row), "missing_parent_job", quarantined_at),
+                    )
+                for orphan_row in orphan_rows:
+                    cursor.execute(
+                        f'DELETE FROM "{proof_table}" WHERE proof_digest = ?',
+                        (orphan_row["proof_digest"],),
+                    )
+                for trigger_row in trigger_rows:
+                    cursor.execute(trigger_row["sql"])
+                restored = {
+                    row["name"]
+                    for row in cursor.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'trigger' AND tbl_name = ?",
+                        (proof_table,),
+                    ).fetchall()
+                }
+                if restored != {row["name"] for row in trigger_rows}:
+                    raise RuntimeError(
+                        "sidebar reconciliation proof triggers were not restored"
+                    )
+
+            if cursor.execute(
+                f'PRAGMA foreign_key_check("{proof_table}")'
+            ).fetchone() is not None:
+                raise RuntimeError("sidebar reconciliation proof foreign key violation")
+            self._validate_sidebar_reconciliation_proof_quarantine(
+                cursor, expected_rows=len(orphan_rows)
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
     def _apply_claude_auth_recovery_call_started_migration(
         self, cursor: sqlite3.Cursor
     ) -> None:
@@ -3893,6 +4097,7 @@ class SessionDB:
         self._apply_claude_characterization_events_v28_migration(cursor)
         self._apply_claude_characterization_event_orphan_quarantine_migration(cursor)
         self._apply_sidebar_resolution_orphan_quarantine_migration(cursor)
+        self._apply_sidebar_reconciliation_proof_orphan_quarantine_migration(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
