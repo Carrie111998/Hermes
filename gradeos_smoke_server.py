@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import yaml
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
@@ -247,6 +248,78 @@ def _compact_attachment(attachment: Dict[str, Any]) -> Dict[str, Any]:
     return compact
 
 
+def _image_refs_from_attachments(attachments: List[Dict[str, Any]]) -> List[str]:
+    """Return only the image data/URL refs already authorized for this request."""
+    refs: List[str] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        mime_type = str(item.get("mime_type") or "").strip().lower()
+        data_url = str(item.get("data_url") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if kind != "image" and not mime_type.startswith("image/"):
+            continue
+        if data_url.startswith("data:image/"):
+            refs.append(data_url)
+        elif url.startswith(("http://", "https://")):
+            refs.append(url)
+    return refs
+
+
+def _multimodal_user_message(text: str, attachments: List[Dict[str, Any]]) -> Any:
+    """Return a native-vision user message when image refs are present."""
+    image_refs = _image_refs_from_attachments(attachments)
+    if not image_refs:
+        return text
+    hint_lines = [f"[Image {index} attached]" for index in range(1, len(image_refs) + 1)]
+    parts: List[Dict[str, Any]] = [
+        {"type": "text", "text": f"{text}\n\n" + "\n".join(hint_lines)}
+    ]
+    parts.extend(
+        {"type": "image_url", "image_url": {"url": ref}} for ref in image_refs
+    )
+    return parts
+
+
+def _configure_native_vision() -> None:
+    """Mark the GradeOS Hermes model as vision-capable in its own config."""
+    if not os.environ.get("HERMES_HOME"):
+        return
+    if os.getenv("GRADEOS_HERMES_NATIVE_VISION", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return
+    try:
+        from hermes_constants import get_hermes_home
+
+        config_path = get_hermes_home() / "config.yaml"
+        data: Dict[str, Any] = {}
+        if config_path.exists():
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                data = loaded
+        model_cfg = data.get("model")
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+            data["model"] = model_cfg
+        if "supports_vision" not in model_cfg:
+            model_cfg["supports_vision"] = True
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+
+_configure_native_vision()
+
+
 def _json_from_text(text: str) -> Optional[Dict[str, Any]]:
     stripped = text.strip()
     if not stripped:
@@ -402,13 +475,14 @@ async def teacher_agent_chat(
         "</gradeos-context>\n\n"
         f"Teacher question:\n{request.message}"
     )
+    user_message = _multimodal_user_message(enriched_message, request.attachments)
     set_gradeos_session_scope(
         session_id,
         teacher_id=request.teacher.teacher_id,
         scope=request.scope,
     )
     agent = _build_agent(session_id, session_key)
-    result = await asyncio.to_thread(agent.run_conversation, enriched_message)
+    result = await asyncio.to_thread(agent.run_conversation, user_message)
     content = ""
     usage: Dict[str, Any] = {}
     if isinstance(result, dict):
@@ -502,8 +576,9 @@ async def student_agent_chat(
         "</gradeos-student-context>\n\n"
         f"Student question:\n{request.message}"
     )
+    user_message = _multimodal_user_message(enriched_message, request.attachments)
     agent = _build_student_agent(session_id, session_key)
-    result = await asyncio.to_thread(agent.run_conversation, enriched_message)
+    result = await asyncio.to_thread(agent.run_conversation, user_message)
     content = ""
     usage: Dict[str, Any] = {}
     if isinstance(result, dict):
