@@ -105,6 +105,19 @@ export const transcriptPaneBudget = (mountedPanes: number, hidden: boolean): num
   hidden
     ? HIDDEN_TRANSCRIPT_RENDER_BUDGET
     : Math.max(Math.ceil(RENDER_BUDGET / Math.max(1, mountedPanes)), RENDER_BUDGET / 4)
+
+/**
+ * Whether the render-phase budget clamp should fire: only when the pane is
+ * actually HOT-HIDDEN (kept mounted in the background, where a stale full
+ * transcript must never commit in one go). A VISIBLE pane expands its budget
+ * beyond `paneBudget` on purpose — the "Show earlier" click adds a page each
+ * time — and clamping there would cancel that expansion on the very next
+ * render, leaving the affordance dead on every session heavy enough to have
+ * hidden rows (click shows nothing).
+ */
+export function shouldClampTranscriptBudget(renderBudget: number, paneBudget: number, paneHidden: boolean): boolean {
+  return paneHidden && renderBudget > paneBudget
+}
 // Units the backfill adds per committed step (see the backfill effect). ~8-15
 // ordinary turns or 1-2 tool-heavy ones per frame — big enough to fill a page
 // in ~10 frames, small enough that no single commit approaches a frame budget.
@@ -433,9 +446,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     setBudgetSessionKey(sessionKey)
     setHadGroups(hasGroups)
     setRenderBudget(FIRST_PAINT_BUDGET)
-  } else if (renderBudget > paneBudget) {
+  } else if (shouldClampTranscriptBudget(renderBudget, paneBudget, paneLifecycle === 'hot-hidden')) {
     // Apply the hidden budget during render so React never first commits the
-    // stale full transcript after this pane moves to the background.
+    // stale full transcript after this pane moves to the background. Guarded
+    // on the pane being hot-hidden: a visible pane's "Show earlier" expands
+    // renderBudget past paneBudget on purpose, and an unconditional clamp
+    // cancelled that expansion on the next render (the affordance did nothing
+    // on sessions heavy enough to have hidden rows).
     setRenderBudget(paneBudget)
   } else if (hadGroups !== hasGroups) {
     setHadGroups(hasGroups)

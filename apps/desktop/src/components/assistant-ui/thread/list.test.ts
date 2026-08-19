@@ -9,12 +9,31 @@ import {
   liveTailStart,
   type MessageGroup,
   resolveThreadScrollTarget,
+  shouldClampTranscriptBudget,
   subscribeToThreadForeground,
   transcriptPaneBudget
 } from './list'
 
 afterEach(() => {
   vi.restoreAllMocks()
+})
+
+describe('shouldClampTranscriptBudget', () => {
+  it('clamps a hot-hidden pane back to its hidden budget', () => {
+    expect(shouldClampTranscriptBudget(1200, HIDDEN_TRANSCRIPT_RENDER_BUDGET, true)).toBe(true)
+  })
+
+  it('never clamps a VISIBLE pane — "Show earlier" expands past paneBudget on purpose', () => {
+    // Regression: the clamp used to fire unconditionally, cancelling the
+    // "Show earlier" budget expansion on the very next render, so the button
+    // did nothing on any session heavy enough to have hidden rows.
+    expect(shouldClampTranscriptBudget(1200, 600, false)).toBe(false)
+  })
+
+  it('leaves a budget at or under the pane budget alone', () => {
+    expect(shouldClampTranscriptBudget(600, 600, true)).toBe(false)
+    expect(shouldClampTranscriptBudget(599, 600, true)).toBe(false)
+  })
 })
 
 describe('subscribeToThreadForeground', () => {
