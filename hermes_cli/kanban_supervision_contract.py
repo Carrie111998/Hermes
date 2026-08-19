@@ -178,6 +178,43 @@ def task_in_objective(conn: sqlite3.Connection, objective_id: str, task_id: str)
     return bool(root) and is_graph_descendant(conn, root, task_id)
 
 
+def supervisor_owns_objective(
+    conn: sqlite3.Connection,
+    supervisor_task_id: str,
+    objective_id: str,
+) -> bool:
+    """True when ``objective_id`` is rooted at the supervisor or an ancestor.
+
+    Graph membership is the ownership relation. A sibling root that shares a
+    descendant does not own that sibling's objective, even when the shared
+    child carries proof for the other objective.
+    """
+    from hermes_cli.kanban_supervisor import get_objective
+
+    oid = str(objective_id or "").strip()
+    supervisor = str(supervisor_task_id or "").strip()
+    if not oid or not supervisor:
+        return False
+    obj = get_objective(conn, oid)
+    if obj is None:
+        return False
+    root = str(obj.get("root_task_id") or "").strip()
+    if not root:
+        return False
+    if supervisor == root:
+        return True
+    return is_graph_descendant(conn, root, supervisor)
+
+
+def _foreign_supervisor_objective_error(
+    supervisor_task_id: str, objective_id: str
+) -> str:
+    return (
+        f"objective {objective_id} is not the owning objective of "
+        f"supervisor {supervisor_task_id}"
+    )
+
+
 def task_has_live_claim(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None) -> bool:
     now = int(now if now is not None else _now())
     row = conn.execute(
@@ -199,13 +236,20 @@ def task_has_live_claim(conn: sqlite3.Connection, task_id: str, *, now: Optional
 
 
 def build_canonical_evidence(
-    conn: sqlite3.Connection, task_id: str, *, objective_id: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    objective_id: str,
+    supervisor_task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     proof: dict[str, Any] = {}
     predicate = None
     oid = str(objective_id or "").strip()
     unit = None
-    if oid:
+    owned = True
+    if supervisor_task_id is not None:
+        owned = supervisor_owns_objective(conn, supervisor_task_id, oid)
+    if oid and owned:
         unit = conn.execute(
             "SELECT proof, terminal_predicate FROM kanban_objective_units "
             "WHERE objective_id = ? AND kind = 'kanban' AND ref = ? "
@@ -333,6 +377,13 @@ def issue_descendant_grant(
         return {"ok": False, "error": denied}
     if get_objective(conn, objective_id) is None:
         return {"ok": False, "error": f"objective {objective_id} not found"}
+    if not supervisor_owns_objective(conn, supervisor_task_id, objective_id):
+        return {
+            "ok": False,
+            "error": _foreign_supervisor_objective_error(
+                supervisor_task_id, objective_id
+            ),
+        }
     if not is_graph_descendant(conn, supervisor_task_id, descendant_task_id):
         return {
             "ok": False,
@@ -346,7 +397,10 @@ def issue_descendant_grant(
     if task_has_live_claim(conn, descendant_task_id):
         return {"ok": False, "error": f"{descendant_task_id} still has a live claim"}
     packet = build_canonical_evidence(
-        conn, descendant_task_id, objective_id=objective_id
+        conn,
+        descendant_task_id,
+        objective_id=objective_id,
+        supervisor_task_id=supervisor_task_id,
     )
     if packet.get("objective_id") != objective_id or not persisted_proof_present(packet):
         return {
@@ -509,6 +563,13 @@ def reconcile_descendant(
     denied = _caller_is_supervisor(supervisor_task_id, caller_task_id)
     if denied:
         return {"ok": False, "error": denied}
+    if not supervisor_owns_objective(conn, supervisor_task_id, objective_id):
+        return {
+            "ok": False,
+            "error": _foreign_supervisor_objective_error(
+                supervisor_task_id, objective_id
+            ),
+        }
     if not is_graph_descendant(conn, supervisor_task_id, descendant_task_id):
         return {
             "ok": False,
@@ -539,7 +600,10 @@ def reconcile_descendant(
                 "grant_id": grant["id"],
             }
         packet = build_canonical_evidence(
-            conn, descendant_task_id, objective_id=objective_id
+            conn,
+            descendant_task_id,
+            objective_id=objective_id,
+            supervisor_task_id=supervisor_task_id,
         )
         if packet.get("objective_id") != objective_id or not persisted_proof_present(packet):
             return {

@@ -767,6 +767,104 @@ def test_foreign_objective_proof_cannot_satisfy_consume_or_read(kanban_home):
         assert _unit_proof(conn, oid_a, child).get("verdict") == "pass"
 
 
+def test_cross_bound_objective_supervisor_issue_consume_read_fail_closed(kanban_home):
+    """A-proof + B-supervisor fails closed; same-objective A and B stay valid."""
+    workspace = kanban_home.parent / "repo-cross-bind"
+    with kb.connect() as conn:
+        parent_a, parent_b, child, oid_a, oid_b, digest_a = (
+            _shared_descendant_two_objectives(conn, workspace)
+        )
+        assert contract.supervisor_owns_objective(conn, parent_a, oid_a) is True
+        assert contract.supervisor_owns_objective(conn, parent_b, oid_b) is True
+        assert contract.supervisor_owns_objective(conn, parent_b, oid_a) is False
+        assert contract.supervisor_owns_objective(conn, parent_a, oid_b) is False
+
+        packet_cross = contract.build_canonical_evidence(
+            conn, child, objective_id=oid_a, supervisor_task_id=parent_b,
+        )
+        assert packet_cross.get("proof") == {}
+        assert packet_cross.get("head") is None
+        assert packet_cross.get("verdict") is None
+        assert contract.persisted_proof_present(packet_cross) is False
+
+        issued_cross = contract.issue_descendant_grant(
+            conn, objective_id=oid_a, supervisor_task_id=parent_b,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest_a, caller_task_id=parent_b,
+        )
+        assert issued_cross["ok"] is False
+        err_issue = str(issued_cross.get("error") or "")
+        assert "owning objective" in err_issue
+        assert kb.get_task(conn, child).status != "done"
+
+        contract.ensure_contract_tables(conn)
+        now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO kanban_reconcile_grants (
+                    id, objective_id, supervisor_task_id, descendant_task_id,
+                    transition, evidence_hash, consumed_at, created_at
+                ) VALUES (?, ?, ?, ?, 'complete', ?, NULL, ?)
+                """,
+                ("rg_cross_bind", oid_a, parent_b, child, digest_a, now),
+            )
+        closed_cross = contract.reconcile_descendant(
+            conn, supervisor_task_id=parent_b, descendant_task_id=child,
+            transition="complete", evidence_hash=digest_a,
+            caller_task_id=parent_b, objective_id=oid_a,
+        )
+        assert closed_cross["ok"] is False
+        err_consume = str(closed_cross.get("error") or "")
+        assert "owning objective" in err_consume
+        assert "already consumed" not in err_consume
+        assert kb.get_task(conn, child).status != "done"
+        planted = conn.execute(
+            "SELECT consumed_at FROM kanban_reconcile_grants WHERE id = ?",
+            ("rg_cross_bind",),
+        ).fetchone()
+        assert planted["consumed_at"] is None
+
+        packet_a = contract.build_canonical_evidence(
+            conn, child, objective_id=oid_a, supervisor_task_id=parent_a,
+        )
+        assert contract.persisted_proof_present(packet_a) is True
+        issued_a = contract.issue_descendant_grant(
+            conn, objective_id=oid_a, supervisor_task_id=parent_a,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest_a, caller_task_id=parent_a,
+        )
+        assert issued_a["ok"] is True
+
+        digest_b = _seed_child_proof(conn, oid_b, child, workspace=workspace)
+        packet_b = contract.build_canonical_evidence(
+            conn, child, objective_id=oid_b, supervisor_task_id=parent_b,
+        )
+        assert contract.persisted_proof_present(packet_b) is True
+        issued_b = contract.issue_descendant_grant(
+            conn, objective_id=oid_b, supervisor_task_id=parent_b,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest_b, caller_task_id=parent_b,
+        )
+        assert issued_b["ok"] is True
+        closed_a = contract.reconcile_descendant(
+            conn, supervisor_task_id=parent_a, descendant_task_id=child,
+            transition="complete", evidence_hash=digest_a,
+            caller_task_id=parent_a, objective_id=oid_a,
+        )
+        assert closed_a["ok"] is True
+        assert closed_a["consumed"] is True
+        assert kb.get_task(conn, child).status == "done"
+        closed_b = contract.reconcile_descendant(
+            conn, supervisor_task_id=parent_b, descendant_task_id=child,
+            transition="complete", evidence_hash=digest_b,
+            caller_task_id=parent_b, objective_id=oid_b,
+        )
+        assert closed_b["ok"] is True
+        assert closed_b["consumed"] is True
+        assert kb.get_task(conn, child).status == "done"
+
+
 def test_missing_head_review_fails_closed(kanban_home):
     with kb.connect() as conn:
         parent, child, oid = _graph(conn)
