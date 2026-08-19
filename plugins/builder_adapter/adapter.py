@@ -493,9 +493,9 @@ class BuilderDispatchAdapter:
             cycle_state = self.cycle_registry.get(request.cycle_id)
             if not isinstance(cycle_state, dict):
                 raise AdapterError("CONTRACT_MISMATCH", "cycle is not registered")
-            snapshot = self._snapshot_for_cycle(cycle_state)
-            if hasattr(snapshot, "raw"):
-                manifest_raw = snapshot.raw("allowed_path_manifest")
+            governance_snapshot = self._snapshot_for_cycle(cycle_state)
+            if hasattr(governance_snapshot, "raw"):
+                manifest_raw = governance_snapshot.raw("allowed_path_manifest")
             else:
                 manifest_raw = self.git.verify_artifact(
                     self.governance_repo,
@@ -508,7 +508,7 @@ class BuilderDispatchAdapter:
                     "DISPATCH_STATE_UNKNOWN",
                     "exclusive worker termination cannot be proven",
                 )
-            _, effective_profile = self._attest_profile()
+            _, effective_profile = self._attest_profile(governance_snapshot)
             completion = CompletionAttestor(
                 self.git,
                 self.validation,
@@ -517,7 +517,7 @@ class BuilderDispatchAdapter:
             )
             evidence = completion.complete(
                 request,
-                snapshot,
+                governance_snapshot,
                 record["principal"],
                 record["request_sha256"],
                 manifest,
