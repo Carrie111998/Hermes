@@ -1648,6 +1648,21 @@ agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
 
+## Intent-Ack Continuation Vocabulary
+
+`agent.intent_ack_continuation` is the runtime counterpart to prompt-side tool-use enforcement. When an enabled model ends a turn by only announcing an action, Hermes nudges it to continue and make the tool call. The detector keeps its built-in English vocabulary by default. Add literal phrases when your model uses different wording or another language:
+
+```yaml
+agent:
+  intent_ack_continuation: true
+  intent_ack_vocabulary:
+    future_ack_markers: ["我来", "让我", "接下来我"]
+    action_markers: ["查一下", "看看", "编译", "部署"]
+    workspace_markers: ["代码库", "项目", "文件"]
+```
+
+The lists are additive and use case-insensitive literal substring matching; they do not replace the built-in markers and are not regular expressions. `future_ack_markers` and `action_markers` apply to every enabled mode. `workspace_markers` matters only in the default `"auto"` Codex scope, where the acknowledgement must also refer to a filesystem or repository. The existing two-continuation-per-turn limit is unchanged.
+
 ## Tool-Loop Guardrails
 
 Hermes detects when the agent is stuck in an unproductive tool-calling loop — the same tool call failing repeatedly, the same tool failing over and over, or an idempotent call returning the same result with no progress. By default it injects a **warning** into the tool result so the model self-corrects; it does not hard-stop, since a person watching the CLI/TUI can intervene.

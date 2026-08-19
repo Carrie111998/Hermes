@@ -1166,6 +1166,21 @@ agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
 
+## 意图确认继续执行词汇
+
+`agent.intent_ack_continuation` 是提示词侧工具使用强制的运行时补充。当已启用的模型仅声明下一步操作便结束轮次时，Hermes 会提示它继续并实际调用工具。检测器默认保留内置英文词汇；当模型使用其他表达或语言时，可以添加字面短语：
+
+```yaml
+agent:
+  intent_ack_continuation: true
+  intent_ack_vocabulary:
+    future_ack_markers: ["我来", "让我", "接下来我"]
+    action_markers: ["查一下", "看看", "编译", "部署"]
+    workspace_markers: ["代码库", "项目", "文件"]
+```
+
+这些列表是增量配置，使用不区分大小写的字面子字符串匹配；它们不会替换内置标记，也不是正则表达式。`future_ack_markers` 和 `action_markers` 适用于所有已启用模式。`workspace_markers` 仅影响默认 `"auto"` 的 Codex 范围，该范围还要求意图确认提及文件系统或代码仓库。每轮最多继续两次的现有限制保持不变。
+
 ## TTS 配置
 
 ```yaml

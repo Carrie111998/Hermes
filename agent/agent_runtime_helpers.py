@@ -3737,6 +3737,21 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 
+def _intent_ack_custom_markers(agent, key: str) -> Tuple[str, ...]:
+    """Return normalized additive markers from ``agent.intent_ack_vocabulary``."""
+    vocabulary = getattr(agent, "_intent_ack_vocabulary", {})
+    if not isinstance(vocabulary, dict):
+        return ()
+    markers = vocabulary.get(key, ())
+    if not isinstance(markers, list):
+        return ()
+    return tuple(
+        marker.strip().casefold()
+        for marker in markers
+        if isinstance(marker, str) and marker.strip()
+    )
+
+
 def looks_like_codex_intermediate_ack(
     agent,
     user_message: Any,
@@ -3760,15 +3775,16 @@ def looks_like_codex_intermediate_ack(
     if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
         return False
 
-    assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
+    assistant_text = agent._strip_think_blocks(assistant_content or "").strip().casefold()
     if not assistant_text:
         return False
     if len(assistant_text) > 1200:
         return False
 
+    custom_future_ack_markers = _intent_ack_custom_markers(agent, "future_ack_markers")
     has_future_ack = bool(
         re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
-    )
+    ) or any(marker in assistant_text for marker in custom_future_ack_markers)
     if not has_future_ack:
         return False
 
@@ -3792,7 +3808,7 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
-    )
+    ) + _intent_ack_custom_markers(agent, "action_markers")
     workspace_markers = (
         "directory",
         "current directory",
@@ -3807,7 +3823,7 @@ def looks_like_codex_intermediate_ack(
         "file tree",
         "files",
         "path",
-    )
+    ) + _intent_ack_custom_markers(agent, "workspace_markers")
 
     assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
     if not assistant_mentions_action:
@@ -3826,7 +3842,7 @@ def looks_like_codex_intermediate_ack(
     # raises ``AttributeError`` — flatten to text first.
     from agent.codex_responses_adapter import _summarize_user_message_for_log
 
-    user_text = _summarize_user_message_for_log(user_message).strip().lower()
+    user_text = _summarize_user_message_for_log(user_message).strip().casefold()
     user_targets_workspace = (
         any(marker in user_text for marker in workspace_markers)
         or "~/" in user_text
