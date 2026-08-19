@@ -322,6 +322,35 @@ class MailboxTranslator(BaseSubscriber):
 
         return payload
 
+    def _submit_result_emissions(
+        self, inner: Dict[str, Any]
+    ) -> List[Tuple[EventType, Dict[str, Any], None]]:
+        """Translate the applier's report of a REAL submission.
+
+        SUBMIT_RESULT (tmp_ready_sweep_cron.py:811,834) is the applier's only
+        statement that a submission actually happened, and it had no branch at
+        all — so the sole `application_submitted` event ever on the bus was a
+        synthetic Mission-Control drill. The branch that did exist,
+        SUBMIT_CONFIRM, is Diego's go-ahead: an authorization, not an outcome.
+
+        Success and failure share the message type and differ only in
+        `status`, so they must not collapse: APPLICATION_SUBMITTED is a
+        _SUCCESS_EVENT_TYPE while APPLICATION_FAILED is CRITICAL
+        (events/outcomes.py), and booking a failed submit as success is worse
+        than not reporting it.
+        """
+        if inner.get("status") == "submitted":
+            payload = self._identified_payload(
+                inner, ["company", "title", "job_key", "submission_id",
+                        "artifacts"])
+            if not payload.get("submission_id") and inner.get("confirmation_id"):
+                payload["submission_id"] = inner["confirmation_id"]
+            return [(EventType.APPLICATION_SUBMITTED, payload, None)]
+
+        payload = self._identified_payload(
+            inner, ["company", "title", "job_key", "error", "artifacts"])
+        return [(EventType.APPLICATION_FAILED, payload, None)]
+
     def _followup_emissions(
         self, inner: Dict[str, Any]
     ) -> List[Tuple[EventType, Dict[str, Any], None]]:
@@ -511,9 +540,23 @@ class MailboxTranslator(BaseSubscriber):
             results.append((EventType.TAILOR_COMPLETED, self._identified_payload(
                 inner, ["company", "title", "job_key", "artifacts"]), None))
 
-        elif message_type in ("SUBMIT_REQUEST", "DRY_RUN_COMPLETE"):
+        # SUBMIT_REQUEST deliberately absent (2026-08-19). It is a COMMAND
+        # main -> applier — `mode: dry_run`, `submission_authorized: false`,
+        # an `applier-dry-run:` idempotency key (jobflow_dispatch/contracts.py
+        # :50-53) — so translating it fired the HIGH ACT/ACTION_REQUIRED page
+        # "Dry-run complete for X. Approve submission?" at the moment the dry
+        # run was REQUESTED, before the applier had run anything. Naming the
+        # job in that payload only made a false claim well-named. It also
+        # booked the job as _PENDING (events/outcomes.py:77) — "waiting on
+        # Diego" — when it was waiting on the applier. The message still
+        # reaches the bus as `mailbox_message` for audit, and still wakes the
+        # applier via the dispatch route, which is a separate table.
+        elif message_type == "DRY_RUN_COMPLETE":
             results.append((EventType.APPLICATION_READY, self._identified_payload(
                 inner, ["company", "title", "job_key", "artifacts"]), None))
+
+        elif message_type == "SUBMIT_RESULT":
+            results.extend(self._submit_result_emissions(inner))
 
         elif message_type == "SUBMIT_CONFIRM":
             results.append((EventType.APPLICATION_SUBMITTED, _copy_fields(
