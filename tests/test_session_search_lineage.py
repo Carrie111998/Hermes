@@ -795,23 +795,9 @@ def _bulk_positive_chain(db, prefix, n, source="cli"):
 
 def _seed_bound_chain(db, n=6):
     """A positive compression chain longer than the monkeypatched budget."""
-    base = "bhit"
-    for i in range(n):
-        db.create_session(f"{base}-{i}", source="cli")
-    for i in range(n - 1):
-        child, parent = f"{base}-{i}", f"{base}-{i + 1}"
-        db._conn.execute("PRAGMA foreign_keys = OFF")
-        db._conn.execute(
-            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
-            (parent, child),
-        )
-        db._conn.execute(
-            "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
-            (parent,),
-        )
-        db._conn.commit()
-        db._conn.execute("PRAGMA foreign_keys = ON")
-    db.append_message(f"{base}-0", role="user", content="bound needle chain")
+    ids = _chain_sessions(db, "bhit", n)
+    _link_positive_chain(db, ids)
+    db.append_message("bhit-0", role="user", content="bound needle chain")
 
 
 def test_discover_bound_hit_returns_truncated_safe_prefix(db, monkeypatch):
