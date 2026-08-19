@@ -188,6 +188,51 @@ def _permission_denied(message_id: Any) -> dict[str, Any]:
     }
 
 
+def _permission_granted_once(message_id: Any, option_id: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": message_id,
+        "result": {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            }
+        },
+    }
+
+
+def _approved_execute_option(params: Any) -> str | None:
+    """Return an offered one-shot grant after Hermes approves the command."""
+    if not isinstance(params, dict):
+        return None
+    tool_call = params.get("toolCall") or {}
+    if not isinstance(tool_call, dict) or tool_call.get("kind") != "execute":
+        return None
+    raw_input = tool_call.get("rawInput") or {}
+    if not isinstance(raw_input, dict):
+        return None
+    command = raw_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+
+    try:
+        from tools.terminal_tool import _check_all_guards
+
+        decision = _check_all_guards(command.strip(), "local")
+    except Exception:
+        return None
+    if not isinstance(decision, dict) or decision.get("approved") is not True:
+        return None
+
+    for option in params.get("options") or []:
+        if not isinstance(option, dict) or option.get("kind") != "allow_once":
+            continue
+        option_id = option.get("optionId")
+        if isinstance(option_id, str) and option_id.strip():
+            return option_id
+    return None
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -776,7 +821,12 @@ class CopilotACPClient:
         params = msg.get("params") or {}
 
         if method == "session/request_permission":
-            response = _permission_denied(message_id)
+            option_id = _approved_execute_option(params)
+            response = (
+                _permission_granted_once(message_id, option_id)
+                if option_id
+                else _permission_denied(message_id)
+            )
         elif method == "fs/read_text_file":
             try:
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)

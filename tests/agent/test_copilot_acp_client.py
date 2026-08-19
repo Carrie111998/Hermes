@@ -22,8 +22,6 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = CopilotACPClient(acp_cwd="/tmp")
 
-
-
     def test_stream_true_preserves_tool_call_deltas(self) -> None:
         tool_response = (
             "<tool_call>"
@@ -54,7 +52,6 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         )
         self.assertEqual(chunks[1].choices, [])
 
-
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()
         handled = self.client._handle_server_message(
@@ -69,7 +66,156 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertTrue(payload)
         return json.loads(payload)
 
+    def test_execute_permission_uses_hermes_guard_and_selects_allow_once(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {
+                    "kind": "execute",
+                    "title": "Read project metadata",
+                    "rawInput": {"command": "head -n 1 pyproject.toml"},
+                },
+                "options": [
+                    {"optionId": "allow_once", "kind": "allow_once"},
+                    {"optionId": "allow_always", "kind": "allow_always"},
+                    {"optionId": "reject_once", "kind": "reject_once"},
+                ],
+            },
+        }
 
+        with patch(
+            "tools.terminal_tool._check_all_guards",
+            return_value={"approved": True, "message": None},
+        ) as guard:
+            response = self._dispatch(request, cwd="/tmp")
+
+        guard.assert_called_once_with("head -n 1 pyproject.toml", "local")
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "selected", "optionId": "allow_once"},
+        )
+
+    def test_execute_permission_denies_when_hermes_guard_blocks(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {
+                    "kind": "execute",
+                    "rawInput": {"command": "rm -rf /"},
+                },
+                "options": [
+                    {"optionId": "allow_once", "kind": "allow_once"},
+                    {"optionId": "reject_once", "kind": "reject_once"},
+                ],
+            },
+        }
+
+        with patch(
+            "tools.terminal_tool._check_all_guards",
+            return_value={"approved": False, "message": "hardline block"},
+        ):
+            response = self._dispatch(request, cwd="/tmp")
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "cancelled"},
+        )
+
+    def test_execute_permission_never_upgrades_to_allow_always(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {
+                    "kind": "execute",
+                    "rawInput": {"command": "head -n 1 pyproject.toml"},
+                },
+                "options": [
+                    {"optionId": "allow_always", "kind": "allow_always"},
+                    {"optionId": "reject_once", "kind": "reject_once"},
+                ],
+            },
+        }
+
+        with patch(
+            "tools.terminal_tool._check_all_guards",
+            return_value={"approved": True, "message": None},
+        ):
+            response = self._dispatch(request, cwd="/tmp")
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "cancelled"},
+        )
+
+    def test_permission_without_execute_command_fails_closed(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {"kind": "edit", "rawInput": {"path": "note.md"}},
+                "options": [
+                    {"optionId": "allow_once", "kind": "allow_once"},
+                ],
+            },
+        }
+
+        with patch("tools.terminal_tool._check_all_guards") as guard:
+            response = self._dispatch(request, cwd="/tmp")
+
+        guard.assert_not_called()
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "cancelled"},
+        )
+
+    def test_permission_guard_exception_fails_closed(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {
+                    "kind": "execute",
+                    "rawInput": {"command": "head -n 1 pyproject.toml"},
+                },
+                "options": [
+                    {"optionId": "allow_once", "kind": "allow_once"},
+                ],
+            },
+        }
+
+        with patch(
+            "tools.terminal_tool._check_all_guards",
+            side_effect=RuntimeError("guard unavailable"),
+        ):
+            response = self._dispatch(request, cwd="/tmp")
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "cancelled"},
+        )
+
+    def test_permission_with_malformed_params_fails_closed(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "session/request_permission",
+            "params": ["not", "an", "object"],
+        }
+
+        response = self._dispatch(request, cwd="/tmp")
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "cancelled"},
+        )
 
     def test_read_text_file_redacts_sensitive_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
