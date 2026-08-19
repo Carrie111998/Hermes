@@ -260,23 +260,6 @@ def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
-def _is_compacted_message(db, message_id) -> bool:
-    """Return True if *message_id* is a compaction-archived row.
-
-    Compaction archives are ``active=0, compacted=1`` — the content was
-    summarised away from live context by :meth:`archive_and_compact`.
-    Rewind/undo rows are ``active=0, compacted=0`` and must stay hidden.
-
-    Used by ``_discover`` to distinguish a compaction-archived FTS hit on the
-    current session (pre-compaction content no longer in live context — should
-    stay discoverable) from an active live hit (already in context — skip).
-    Returns False on any error so the caller falls back to the safe default
-    (skip the current session).
-    """
-    state = _get_message_storage_state(db, message_id)
-    return state is not None and state["active"] == 0 and state["compacted"] == 1
-
-
 def _annotate_rebuild_status(db, payload: Dict[str, Any]) -> None:
     """Add a rebuild-progress note when the deferred FTS backfill (schema
     v23) is still running, so the agent can tell the user why older results
