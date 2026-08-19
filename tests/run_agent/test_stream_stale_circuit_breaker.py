@@ -103,6 +103,39 @@ class TestStreamStaleCircuitBreaker:
         assert agent._consecutive_stale_streams == 3
 
     @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_half_open_probe_recovers_after_cooldown(self, monkeypatch):
+        """A latched single-provider session eventually gets one real attempt,
+        whose success closes the breaker without a model swap or new session."""
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+        clock = [100.0]
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers.time.monotonic", lambda: clock[0]
+        )
+
+        agent = _make_anthropic_agent()
+        agent._consecutive_stale_streams = 3
+        agent._anthropic_client.messages.stream.return_value = _good_stream_cm()
+
+        # Opening the circuit still blocks immediately and starts the cooldown.
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            agent._interruptible_streaming_api_call({})
+        agent._anthropic_client.messages.stream.assert_not_called()
+
+        # Calls during the cooldown remain protected from another stale wait.
+        clock[0] = 159.9
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            agent._interruptible_streaming_api_call({})
+        agent._anthropic_client.messages.stream.assert_not_called()
+
+        # At the boundary, one half-open probe reaches the recovered provider.
+        clock[0] = 160.0
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response is not None
+        agent._anthropic_client.messages.stream.assert_called_once()
+        assert agent._consecutive_stale_streams == 0
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
     def test_success_resets_streak(self, monkeypatch):
         """A stream that completes successfully clears the consecutive-stale
         streak so a recovered provider resumes normally."""
