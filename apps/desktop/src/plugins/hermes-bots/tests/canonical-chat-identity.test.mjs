@@ -111,7 +111,8 @@ test('pin: preferred_session present opens the resolved session and keeps the pi
       profile: 'ops',
       intent: 'main',
       awaitHydration: true,
-      expectHistory: true
+      expectHistory: true,
+      retryHydrationTimeoutOnce: true
     }
   }])
   assert.equal(runtime.saved.length, 0, 'a live pin must not be rewritten')
@@ -213,13 +214,17 @@ test('pin: precise hit but failed hydration keeps the pin and surfaces the failu
     'must not fork the forever-chat on a hiccup')
 })
 
-test('pin: hydration timeout on a waking backend retries internally and succeeds', async () => {
-  const opened = []
+test('pin: a waking-backend hydration timeout asks the SDK to retry internally', async () => {
+  // The internal retry-and-succeed behavior lives in host.openSession itself
+  // (apps/desktop/src/sdk/index.ts) now, because only that layer sees the
+  // $resumeExhaustedSessionId latch that the core stranded-session overlay
+  // reads — a plugin-side retry can silently resolve while that overlay stays
+  // latched (hermes-agent#89617). This harness stubs host.openSession with a
+  // bare mock, so it can only prove the plugin ASKS for the retry, not that
+  // the overlay never appears; see profile-routing.test.ts for that.
+  const opts = []
   const runtime = loadOpenPath({
-    openSession: async id => {
-      opened.push(id)
-      if (opened.length === 1) throw new Error("Timed out loading ops's session history.")
-    },
+    openSession: async (id, options) => { opts.push(options) },
     request: async method => {
       if (method === 'profiles.list') {
         return {
@@ -239,11 +244,11 @@ test('pin: hydration timeout on a waking backend retries internally and succeeds
   const result = await runtime.openBotCanonicalChat('ops', 'pin-1', HISTORY)
 
   assert.equal(result, 'pin-1')
-  assert.deepEqual(opened, ['pin-1', 'pin-1'], 'a hydration timeout is retried once before surfacing')
-  assert.equal(runtime.saved.length, 0, 'a confirmed-live pin must survive a retried hydration timeout')
+  assert.equal(opts.length, 1)
+  assert.equal(opts[0].retryHydrationTimeoutOnce, true, 'the SDK must own the hydration-timeout retry')
 })
 
-test('pin: hydration timeout that fails twice still surfaces the failure', async () => {
+test('pin: a persistent hydration timeout still surfaces the failure', async () => {
   const runtime = loadOpenPath({
     openSession: async () => { throw new Error("Timed out loading ops's session history.") },
     request: async method => {

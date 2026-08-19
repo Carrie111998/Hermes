@@ -3172,20 +3172,19 @@ async function openStoredBotChat(name, storedId, summary) {
     typeof summary?.message_count === 'number' && Number.isFinite(summary.message_count)
   const expectHistory = hasAuthoritativeCount ? summary.message_count > 0 : true
 
-  const openOptions = { profile: name, intent: 'main', awaitHydration: true, expectHistory }
-
-  try {
-    await host.openSession(storedId, openOptions)
-  } catch (error) {
-    // A profile backend that just woke up can lose the hydration-timeout race
-    // even though the session is fine (hermes-agent#89617) — clicking Retry
-    // succeeds because the backend is warm by then. Do that retry internally
-    // once so a cold-start hiccup does not surface as a session-history error.
-    if (typeof error?.message !== 'string' || !error.message.startsWith('Timed out loading ')) {
-      throw error
-    }
-    await host.openSession(storedId, openOptions)
-  }
+  // A profile backend that just woke up can lose the hydration-timeout race
+  // even though the session is fine (hermes-agent#89617) — clicking Retry
+  // succeeds because the backend is warm by then. retryHydrationTimeoutOnce
+  // asks the SDK layer to retry that same wait internally, BEFORE it arms the
+  // core stranded-session overlay: a plugin-side retry can't do this because
+  // only host.openSession sees the resume-exhausted latch that overlay reads.
+  await host.openSession(storedId, {
+    profile: name,
+    intent: 'main',
+    awaitHydration: true,
+    expectHistory,
+    retryHydrationTimeoutOnce: true
+  })
 
   return storedId
 }

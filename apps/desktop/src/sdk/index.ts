@@ -208,6 +208,12 @@ interface PluginOpenSessionOptions {
   intent?: OpenSessionIntent
   keepAllProfilesScope?: boolean
   profile?: null | string
+  /** A cold profile backend can lose the hydration-timeout race once and still
+   *  be fine on a second try. When set, a hydration timeout is retried
+   *  internally before it reaches the caller or arms the core stranded-session
+   *  overlay ($resumeExhaustedSessionId) — a caller-side retry can't do this
+   *  itself because only this SDK layer sees $resumeExhaustedSessionId. */
+  retryHydrationTimeoutOnce?: boolean
 }
 
 function waitForFocusedSessionHydration({
@@ -504,71 +510,85 @@ export const host = {
       $gatewaySwapTarget.set(targetProfile)
     }
 
+    // Bounded to 2 attempts (never more): a cold profile backend can lose the
+    // hydration-timeout race once and still be fine moments later, but this is
+    // a caller-opt-in retry of the SAME wait, not a backoff loop.
+    const maxAttempts = options.awaitHydration && options.retryHydrationTimeoutOnce ? 2 : 1
+
     try {
-      openSession(
-        storedSessionId,
-        (to: string, opts?: { replace?: boolean }) => {
-          const target = to.startsWith('#') ? to : `#${to}`
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          openSession(
+            storedSessionId,
+            (to: string, opts?: { replace?: boolean }) => {
+              const target = to.startsWith('#') ? to : `#${to}`
 
-          if (opts?.replace) {
-            window.location.replace(target)
-          } else {
-            window.location.hash = target
+              if (opts?.replace) {
+                window.location.replace(target)
+              } else {
+                window.location.hash = target
+              }
+            },
+            options.intent ?? 'in-place'
+          )
+
+          // Judge the main surface AFTER the open: on a cold start the persisted
+          // route can already point at this session while selection has not
+          // settled, so a pre-open "already selected" precondition skips the
+          // resume exactly when it is needed (#89206 — blank Bot Chat with the
+          // roster preview intact). The surface is healthy only when this stored
+          // session is selected, a runtime is bound, and the expected transcript
+          // is present; anything less gets an explicit sequenced resume request.
+          // The route-resume effect only honors the request while the route
+          // points at this session, and consumes it alongside any resume the
+          // navigation itself triggers, so a redundant request is a no-op.
+          const surfaceHealthy =
+            $selectedStoredSessionId.get() === storedSessionId &&
+            Boolean($activeSessionId.get()) &&
+            (!expectHistory || $messages.get().length > 0)
+
+          if (options.awaitHydration && !surfaceHealthy) {
+            requestSessionResume(storedSessionId)
           }
-        },
-        options.intent ?? 'in-place'
-      )
 
-      // Judge the main surface AFTER the open: on a cold start the persisted
-      // route can already point at this session while selection has not
-      // settled, so a pre-open "already selected" precondition skips the
-      // resume exactly when it is needed (#89206 — blank Bot Chat with the
-      // roster preview intact). The surface is healthy only when this stored
-      // session is selected, a runtime is bound, and the expected transcript
-      // is present; anything less gets an explicit sequenced resume request.
-      // The route-resume effect only honors the request while the route
-      // points at this session, and consumes it alongside any resume the
-      // navigation itself triggers, so a redundant request is a no-op.
-      const surfaceHealthy =
-        $selectedStoredSessionId.get() === storedSessionId &&
-        Boolean($activeSessionId.get()) &&
-        (!expectHistory || $messages.get().length > 0)
+          if (options.awaitHydration) {
+            await waitForFocusedSessionHydration({
+              expectHistory,
+              generation,
+              profile: targetProfile,
+              storedSessionId,
+              timeoutMs: Math.max(1, options.hydrationTimeoutMs ?? DEFAULT_SESSION_HYDRATION_TIMEOUT_MS)
+            })
+          }
 
-      if (options.awaitHydration && !surfaceHealthy) {
-        requestSessionResume(storedSessionId)
+          break
+        } catch (error) {
+          const isHydrationTimeout = error instanceof Error && error.message.startsWith('Timed out loading ')
+
+          if (options.awaitHydration && generation === openSessionGeneration && isHydrationTimeout) {
+            console.warn('[bot-wake] hydration timed out', {
+              attempt,
+              hydrationWaitMs: Date.now() - profileActiveAt,
+              profile: targetProfile,
+              profileActivationMs: profileActiveAt - wakeStartedAt,
+              runtimeBound: Boolean($activeSessionId.get()),
+              selectionSettled: $selectedStoredSessionId.get() === storedSessionId,
+              storedSessionId,
+              transcriptPainted: $messages.get().length > 0
+            })
+
+            if (attempt < maxAttempts) {
+              continue
+            }
+
+            // Reuse the core stranded-session surface: it renders the explicit
+            // error and Retry button, and the normal resume path clears the latch.
+            setResumeExhaustedSessionId(storedSessionId)
+          }
+
+          throw error
+        }
       }
-
-      if (options.awaitHydration) {
-        await waitForFocusedSessionHydration({
-          expectHistory,
-          generation,
-          profile: targetProfile,
-          storedSessionId,
-          timeoutMs: Math.max(1, options.hydrationTimeoutMs ?? DEFAULT_SESSION_HYDRATION_TIMEOUT_MS)
-        })
-      }
-    } catch (error) {
-      if (
-        options.awaitHydration &&
-        generation === openSessionGeneration &&
-        error instanceof Error &&
-        error.message.startsWith('Timed out loading ')
-      ) {
-        console.warn('[bot-wake] hydration timed out', {
-          hydrationWaitMs: Date.now() - profileActiveAt,
-          profile: targetProfile,
-          profileActivationMs: profileActiveAt - wakeStartedAt,
-          runtimeBound: Boolean($activeSessionId.get()),
-          selectionSettled: $selectedStoredSessionId.get() === storedSessionId,
-          storedSessionId,
-          transcriptPainted: $messages.get().length > 0
-        })
-        // Reuse the core stranded-session surface: it renders the explicit
-        // error and Retry button, and the normal resume path clears the latch.
-        setResumeExhaustedSessionId(storedSessionId)
-      }
-
-      throw error
     } finally {
       if (options.awaitHydration && generation === openSessionGeneration) {
         $gatewaySwapTarget.set(null)
