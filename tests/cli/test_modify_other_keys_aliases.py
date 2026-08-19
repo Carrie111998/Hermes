@@ -415,6 +415,45 @@ def test_keypad_navigation_maps_to_arrows():
     assert _parse("\x1b[57420u") == [Keys.Down]
 
 
+# ---------------------------------------------------------------------------
+# Lock-state modifier variants (Num Lock / Caps Lock)
+# ---------------------------------------------------------------------------
+
+
+def test_numlock_plain_navigation_variants_do_not_leak():
+    """Ghostty can report navigation keys with modifier 129 (1 + Num Lock).
+
+    prompt_toolkit knows the plain legacy sequences, but not the lock-state
+    variants, so they used to leak as literal text like ``[1;129D``.
+    """
+    assert _parse("\x1b[1;129A") == [Keys.Up]
+    assert _parse("\x1b[1;129B") == [Keys.Down]
+    assert _parse("\x1b[1;129C") == [Keys.Right]
+    assert _parse("\x1b[1;129D") == [Keys.Left]
+    assert _parse("\x1b[1;129H") == [Keys.Home]
+    assert _parse("\x1b[1;129F") == [Keys.End]
+    assert _parse("\x1b[2;129~") == [Keys.Insert]
+    assert _parse("\x1b[3;129~") == [Keys.Delete]
+    assert _parse("\x1b[5;129~") == [Keys.PageUp]
+    assert _parse("\x1b[6;129~") == [Keys.PageDown]
+
+
+def test_numlock_modified_navigation_variants_preserve_modifier_semantics():
+    """Lock-state bits must not erase real Ctrl/Alt navigation modifiers."""
+    assert _parse("\x1b[1;133D") == [Keys.ControlLeft]
+    assert _parse("\x1b[1;133C") == [Keys.ControlRight]
+    assert _parse("\x1b[1;131D") == [Keys.Escape, Keys.Left]
+    assert _parse("\x1b[1;131C") == [Keys.Escape, Keys.Right]
+
+
+def test_numlock_ctrl_letter_variants_preserve_control_keys():
+    """Ctrl+C / Ctrl+D can arrive as CSI-u with the Num Lock state bit set."""
+    assert _parse("\x1b[99;133u") == [Keys.ControlC]
+    assert _parse("\x1b[100;133u") == [Keys.ControlD]
+    assert _parse("\x1b[27;133;99~") == [Keys.ControlC]
+    assert _parse("\x1b[27;133;100~") == [Keys.ControlD]
+
+
 def test_f13_maps_to_f13():
     assert _parse("\x1b[57376u") == [Keys.F13]
 

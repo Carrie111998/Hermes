@@ -244,18 +244,29 @@ def install_modify_other_keys_aliases() -> int:
 
     changed = 0
 
+    def _modifier_lock_variants(modifier: int) -> tuple[int, ...]:
+        """Return modifier values with terminal lock-state bits preserved.
+
+        xterm/Kitty modifiers are 1-based bitfields. Ghostty can include
+        lock-state bits such as Num Lock (128) and Caps Lock (64), so Ctrl+C
+        may arrive as modifier 133 (5 + 128), and plain arrows may arrive as
+        129 (1 + 128).  Those lock bits should not change the semantic key.
+        """
+        return (modifier, modifier + 64, modifier + 128, modifier + 192)
+
     def _install_paired(modifier: int, mapping: dict) -> None:
         """Install both modifyOtherKeys (ESC[27;N;CP~) and CSI-u (ESC[CP;Nu)
         mappings for the given modifier and codepoint→key mapping."""
         nonlocal changed
         for codepoint, key_val in mapping.items():
-            for seq in (
-                f"\x1b[27;{modifier};{codepoint}~",
-                f"\x1b[{codepoint};{modifier}u",
-            ):
-                if seq not in ANSI_SEQUENCES:
-                    ANSI_SEQUENCES[seq] = key_val
-                    changed += 1
+            for mod in _modifier_lock_variants(modifier):
+                for seq in (
+                    f"\x1b[27;{mod};{codepoint}~",
+                    f"\x1b[{codepoint};{mod}u",
+                ):
+                    if seq not in ANSI_SEQUENCES:
+                        ANSI_SEQUENCES[seq] = key_val
+                        changed += 1
 
     # Ctrl+letter / Ctrl+digit / Ctrl+symbol (modifier 5)
     _install_paired(5, ctrl_key_map)
@@ -379,6 +390,50 @@ def install_modify_other_keys_aliases() -> int:
         if seq not in ANSI_SEQUENCES:
             ANSI_SEQUENCES[seq] = key_val
             changed += 1
+
+    # -- Lock-state variants for navigation keys ----
+    # Ghostty can preserve Num Lock / Caps Lock state in the modifier value
+    # (e.g. 129 = 1 + Num Lock).  prompt_toolkit already knows the ordinary
+    # modified navigation forms like ESC[1;5D (Ctrl+Left), but not the same
+    # sequences with lock bits included, so those leaked into the prompt.
+    nav_arrow_keys = {
+        "A": Keys.Up,
+        "B": Keys.Down,
+        "C": Keys.Right,
+        "D": Keys.Left,
+        "H": Keys.Home,
+        "F": Keys.End,
+    }
+    nav_tilde_keys = {
+        2: Keys.Insert,
+        3: Keys.Delete,
+        5: Keys.PageUp,
+        6: Keys.PageDown,
+    }
+
+    for final, plain_key in nav_arrow_keys.items():
+        for mod in range(1, 17):
+            base_seq = f"\x1b[1;{mod}{final}"
+            key_val = plain_key if mod == 1 else ANSI_SEQUENCES.get(base_seq)
+            if key_val is None:
+                continue
+            for lock_mod in _modifier_lock_variants(mod)[1:]:
+                seq = f"\x1b[1;{lock_mod}{final}"
+                if seq not in ANSI_SEQUENCES:
+                    ANSI_SEQUENCES[seq] = key_val
+                    changed += 1
+
+    for code, plain_key in nav_tilde_keys.items():
+        for mod in range(1, 17):
+            base_seq = f"\x1b[{code};{mod}~"
+            key_val = plain_key if mod == 1 else ANSI_SEQUENCES.get(base_seq)
+            if key_val is None:
+                continue
+            for lock_mod in _modifier_lock_variants(mod)[1:]:
+                seq = f"\x1b[{code};{lock_mod}~"
+                if seq not in ANSI_SEQUENCES:
+                    ANSI_SEQUENCES[seq] = key_val
+                    changed += 1
 
     # New longer sequences can flip "is this a prefix of a longer match?"
     # answers the VT100 parser already cached — drop the cache so parsers
