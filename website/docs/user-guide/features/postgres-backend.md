@@ -287,9 +287,25 @@ Every Postgres-only migration statement is `IF NOT EXISTS`-guarded, so a
 database with no `pg_migration_version` row simply replays the list; existing
 objects are left alone and anything missing is created.
 
-**Read-only cross-profile attach stays on SQLite.** The read-only path used to
-poll another profile's database is SQLite-specific and is not served by this
-backend.
+**Read-only opens read PostgreSQL, but cannot write to it.** Read-only callers
+— the dashboard's status and session listing, cron history, usage analytics,
+and resume lookup — are served from the same physical store as the live write
+path. Routing them to a local `state.db` instead would report on a different
+database than the one being written to.
+
+Because those callers are not the owner of the store, a read-only open is
+restricted in three ways:
+
+- It runs no DDL. Schema is created and migrated only by writable opens.
+- It fails, rather than provisioning, when the schema is absent — or when the
+  store's recorded migration version is *older* than the running build
+  expects, since queries may reference columns it does not have. A store
+  *newer* than the running build is accepted: the schema only grows, so an
+  older reader's queries still work, and refusing it would break rolling
+  upgrades.
+- The connection sets `default_transaction_read_only`, so the server itself
+  rejects any write with SQLSTATE `25006`. The prohibition is enforced by
+  PostgreSQL, not by convention.
 
 **Structured message content uses a `U+0001` sentinel prefix.** PostgreSQL's
 `text` type cannot store `NUL`, so the marker distinguishing JSON-encoded

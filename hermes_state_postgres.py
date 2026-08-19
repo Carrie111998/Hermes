@@ -1948,6 +1948,104 @@ def _assert_active_config_parseable() -> None:
         )
 
 
+def _prepare_readonly_postgres(
+    conn: Any, schema_version: int, dsn: str
+) -> None:
+    """Validate and lock down a connection opened for read-only use.
+
+    Read-only opens serve the dashboard's status/session listing, cron
+    history, usage analytics, and resume lookup. They must never be able to
+    change the store they are reporting on, so this does the opposite of
+    :func:`init_postgres_schema`: it verifies, and it refuses.
+
+    Three things happen here, in order:
+
+    1. **Engine-level write prohibition.** ``default_transaction_read_only``
+       is set on the session, so PostgreSQL itself rejects INSERT/UPDATE/
+       DELETE/DDL with ``read_only_sql_transaction`` (25006). This is chosen
+       over an adapter-side statement inspector deliberately: a parser that
+       tries to classify SQL as read or write is a permanent source of
+       both false negatives (a write shape it fails to recognise) and false
+       positives, and it protects nothing against code that reaches the raw
+       connection. The server has no such gap.
+
+    2. **Schema must already exist.** A read-only caller is not the owner of
+       this store. If the base tables are absent the correct answer is an
+       error telling the operator to provision it, not silent creation of a
+       schema through a path that claims to read.
+
+    3. **Schema must not be older than this build expects.** "Stale" is
+       defined as *the store's recorded PostgreSQL migration version is lower
+       than the highest migration this build knows about*. That specific
+       direction is what matters: a store behind this build may be missing
+       columns, tables, or indexes that the reader's own queries reference,
+       so serving from it produces errors or silently wrong results. The
+       reverse — a store AHEAD of this build, written by a newer Hermes — is
+       deliberately allowed: the schema only ever grows, so a newer store
+       still satisfies an older reader's queries, and refusing it would break
+       every mixed-version deployment during a rollout.
+    """
+    # 1. Engine-enforced read-only. Do this FIRST so nothing below can write
+    #    even if a later check is added carelessly.
+    conn.execute("SET default_transaction_read_only = on")
+    conn.commit()
+
+    # 2. Base schema present?
+    try:
+        cur = conn.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = 'sessions'"
+        )
+        has_sessions = cur.fetchone() is not None
+    except Exception as exc:
+        raise RuntimeError(
+            f"read-only PostgreSQL open could not inspect the schema at "
+            f"{_redact_dsn(dsn)}: {exc}"
+        ) from exc
+
+    if not has_sessions:
+        raise RuntimeError(
+            f"read-only PostgreSQL open refused: no Hermes schema found at "
+            f"{_redact_dsn(dsn)} (the 'sessions' table is absent). A "
+            f"read-only open never provisions schema — that is the job of a "
+            f"writable open. Start Hermes normally against this database "
+            f"once, or run 'hermes migrate state-to-postgres', to create it."
+        )
+
+    # 3. Behind this build?
+    expected = max((m.version for m in _PG_ONLY_MIGRATIONS), default=0)
+    try:
+        recorded = postgres_migration_version(conn)
+    except Exception as exc:
+        raise RuntimeError(
+            f"read-only PostgreSQL open could not read the migration ledger "
+            f"at {_redact_dsn(dsn)}: {exc}"
+        ) from exc
+
+    if recorded < expected:
+        raise RuntimeError(
+            f"read-only PostgreSQL open refused: the store at "
+            f"{_redact_dsn(dsn)} is at PostgreSQL migration version "
+            f"{recorded}, but this build expects {expected}. A read-only "
+            f"open will not migrate it. Start Hermes normally against this "
+            f"database once to apply the pending migrations, then retry."
+        )
+
+
+def _redact_dsn(dsn: str) -> str:
+    """A DSN safe to put in an error message: no password, no query string."""
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(dsn)
+        host = parts.hostname or "?"
+        port = f":{parts.port}" if parts.port else ""
+        db = (parts.path or "/?").lstrip("/") or "?"
+        return f"{host}{port}/{db}"
+    except Exception:
+        return "the configured PostgreSQL server"
+
+
 def maybe_open_postgres(
     read_only: bool,
     schema_version: int,
@@ -1959,29 +2057,42 @@ def maybe_open_postgres(
     Returns None (so the caller proceeds with SQLite) when the configured
     backend is not "postgres".
 
-    ``read_only`` is accepted for signature compatibility with the SQLite path
-    but is deliberately NOT a gate. It describes a SQLite *attach mode* (a URI
-    open that takes no write lock), not which physical store owns the data.
-    Refusing Postgres for read-only callers sent every dashboard/helper reader
-    to the local ``state.db`` while the live write path was on Postgres — the
-    dual-truth split this backend exists to prevent. A read-only caller simply
-    issues no writes; the adapter serves its SELECTs from the same store.
+    ``read_only`` does NOT select the backend — it describes how the caller
+    intends to use the store, not which physical store owns the data. Gating
+    the backend on it sent every dashboard/helper reader to the local
+    ``state.db`` while the live write path was on PostgreSQL, which is the
+    dual-truth split this backend exists to prevent.
+
+    It DOES, however, change what this function is permitted to do:
+
+      * **No DDL.** A read-only open never provisions or reconciles schema.
+        Schema is owned by writable opens. A status/resume/analytics reader
+        must not be able to create tables or apply migrations through a path
+        presented as read-only.
+      * **Fail closed on an unusable store.** If the schema is absent, or its
+        recorded migration version is older than this build expects, the open
+        raises instead of mutating it or silently serving a store it cannot
+        correctly read.
+      * **Enforced write prohibition.** The returned handle has
+        ``default_transaction_read_only`` set on the session, so the SERVER
+        rejects writes. This is an engine-level guarantee, not a convention
+        the caller is trusted to honour.
 
     ``dsn_override`` pins the target explicitly, bypassing env/config
     resolution entirely. The backend-aware profile seam uses it so opening
     another profile's store never mutates process-global state that a
     concurrent ``SessionDB()`` on another thread could observe.
 
-    Otherwise opens the adapter connection, initializes the schema, and returns
-    the live connection. Raises if the DSN is missing or psycopg is absent.
+    Raises if the DSN is missing or psycopg is absent.
     """
     dsn = dsn_override or resolve_postgres_dsn(config)
     if not dsn:
         return None
     conn = connect_postgres(dsn)
-    # Schema init is idempotent (every statement is IF NOT EXISTS-guarded) and
-    # a read-only caller may legitimately be the first to touch a fresh store.
-    init_postgres_schema(conn, schema_version)
+    if read_only:
+        _prepare_readonly_postgres(conn, schema_version, dsn)
+    else:
+        init_postgres_schema(conn, schema_version)
     return conn
 
 
