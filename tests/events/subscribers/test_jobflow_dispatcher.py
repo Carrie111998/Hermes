@@ -15,7 +15,7 @@ import sqlite3
 import pytest
 
 from events.schema import Event, EventType, Priority
-from events.subscribers.jobflow_dispatcher import JobFlowDispatcher
+from events.subscribers.jobflow_dispatcher import MODE_ENV, JobFlowDispatcher
 from jobflow_dispatch.store import ActivationStore
 
 
@@ -81,7 +81,13 @@ class TestActivation:
 
 
 class TestModes:
-    def test_off_is_the_default_and_dispatches_nothing(self, store, woken):
+    def test_off_is_the_default_and_dispatches_nothing(self, store, woken, monkeypatch):
+        # The "default" this asserts is the CODE default. resolve_mode(None)
+        # falls back to os.getenv(MODE_ENV), so an operator who has opted in
+        # -- profiles/main/.env carries HERMES_JOBFLOW_EVENT_DISPATCH=on, and
+        # the nightly gate runs under that env -- would otherwise make this
+        # test read the live deployment's mode and fail on a healthy tree.
+        monkeypatch.delenv(MODE_ENV, raising=False)
         d = JobFlowDispatcher(
             bus=None, store=store,
             resolve_job_id=lambda a: "j1",
