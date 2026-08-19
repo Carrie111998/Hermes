@@ -3483,6 +3483,114 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
 
 
+@method("session.steer_peer")
+def _(rid, params: dict) -> dict:
+    """Steer another live session (peer) without interrupting it.
+
+    Prime-agent peer-to-peer steer port. Reuses ``AIAgent.steer`` on the
+    target session's agent, so the message-role invariant holds (no new user
+    turn, no role alternation). Authority mirrors subagent steering:
+    ``owner_session_id``/``owner_transport``/``owner_session_record`` must
+    match the gateway's exact steer authority for the invoking session.
+    """
+    from tools.delegate_tool import steer_session
+
+    target_id = str(params.get("session_id") or "").strip()
+    if not target_id:
+        return _err(rid, 4000, "session_id required")
+    text = (params.get("text") or "").strip()
+    if not text:
+        return _err(rid, 4002, "text is required")
+    invoking_session_id = str(
+        params.get("session_id_self") or params.get("invoking_session_id") or ""
+    ).strip()
+    invoking_transport, invoking_session = _current_session_steer_authority(
+        invoking_session_id or None
+    )
+    if invoking_transport is None or invoking_session is None:
+        return _err(rid, 4011, "steer authority unavailable")
+
+    # Resolve the target's live agent from the gateway's in-process session map.
+    from tui_gateway.server import _sessions, _sessions_lock
+
+    def _resolve(target: str):
+        if target == "__list__":
+            with _sessions_lock:
+                return [s for s in _sessions.keys()]
+        with _sessions_lock:
+            rec = _sessions.get(target)
+        if not rec:
+            return None
+        return rec.get("agent")
+
+    queued = steer_session(
+        target_id,
+        text,
+        resolve_agent=_resolve,
+        owner_session_id=invoking_session_id or None,
+        owner_transport=invoking_transport,
+        owner_session_record=invoking_session,
+    )
+    return _ok(
+        rid,
+        {
+            "status": "queued" if queued else "rejected",
+            "session_id": target_id,
+            "text": text,
+        },
+    )
+
+
+@method("session.steer_broadcast")
+def _(rid, params: dict) -> dict:
+    """Steer every reachable live target (peer sessions + child subagents).
+
+    Prime-agent broadcast port. Fans the same correction out to all local
+    live sessions (excluding the sender) and all active delegated children.
+    Returns per-target counts so the caller sees partial delivery. Authority
+    mirrors subagent steering via the invoking session's exact steer triple.
+    """
+    from tools.delegate_tool import steer_broadcast
+
+    text = (params.get("text") or "").strip()
+    if not text:
+        return _err(rid, 4002, "text is required")
+    invoking_session_id = str(
+        params.get("session_id_self") or params.get("invoking_session_id") or ""
+    ).strip()
+    exclude = (
+        str(params.get("exclude_session_id") or invoking_session_id or "").strip()
+        or None
+    )
+    invoking_transport, invoking_session = _current_session_steer_authority(
+        invoking_session_id or None
+    )
+    if invoking_transport is None or invoking_session is None:
+        return _err(rid, 4011, "steer authority unavailable")
+
+    from tui_gateway.server import _sessions, _sessions_lock
+
+    def _resolve(target: str):
+        if target == "__list__":
+            with _sessions_lock:
+                return [s for s in _sessions.keys()]
+        with _sessions_lock:
+            rec = _sessions.get(target)
+        if not rec:
+            return None
+        return rec.get("agent")
+
+    counts = steer_broadcast(
+        text,
+        resolve_agent=_resolve,
+        exclude_session_id=exclude,
+        owner_session_id=invoking_session_id or None,
+        owner_transport=invoking_transport,
+        owner_session_record=invoking_session,
+    )
+    return _ok(rid, {"status": "broadcast", "counts": counts, "text": text})
+
+
 @method("session.redirect")
 def _(rid, params: dict) -> dict:
     """Redirect the active model turn while preserving valid work/context."""

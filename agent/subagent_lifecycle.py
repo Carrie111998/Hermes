@@ -58,6 +58,7 @@ class SubagentLaunchRequest:
     working_directory: Optional[str] = None
     parent_session_id: Optional[str] = None
     correlation_id: Optional[str] = None
+    name: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
 
@@ -68,6 +69,7 @@ class SubagentHandle:
     subagent_id: str
     parent_session_id: Optional[str]
     correlation_id: Optional[str]
+    name: Optional[str] = None
     created_at: float
     provider: Optional[str]
     model: Optional[str]

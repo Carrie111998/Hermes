@@ -353,6 +353,235 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
+def _peer_session_resolver():
+    """Return a ``resolve_agent(target)`` callable for live peer sessions.
+
+    Mirrors ``_capture_gateway_steer_authority``: this is an in-process bridge
+    to the gateway's session→agent map, not a serializable capability. Outside
+    a live gateway (e.g. the CLI helper path) it returns ``None`` so callers
+    fail closed instead of inventing peer targets. The resolver supports the
+    ``"__list__"`` sentinel used by ``steer_broadcast`` to enumerate targets.
+    """
+    try:
+        from tui_gateway.server import _sessions, _sessions_lock
+
+        def _resolve(target: str):
+            if target == "__list__":
+                with _sessions_lock:
+                    return list(_sessions.keys())
+            with _sessions_lock:
+                rec = _sessions.get(target)
+            if not rec:
+                return None
+            return rec.get("agent")
+
+        return _resolve
+    except Exception:
+        return None
+
+
+def steer_session(
+    session_id: str,
+    text: str,
+    *,
+    resolve_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> bool:
+    """Queue steering text into another live session without stopping it.
+
+    The peer-to-peer mirror of ``steer_subagent``. Live-session resolution is
+    injected via ``resolve_agent(session_id) -> Optional[AIAgent]`` so this
+    module stays free of gateway internals (the gateway passes its own
+    in-process session→agent map). Returns True if the resolved agent queued
+    the text via ``AIAgent.steer``; False for an empty/unknown target, a
+    resolver that found no agent, or a resolver that itself returned None.
+    Authority is the caller's responsibility — the gateway passes the same
+    ``owner_session_*`` triple it uses for subagent steering.
+
+    Reuses the existing steer drain (appends to the target's last tool
+    result), so the message-role invariant is preserved: no new user turn,
+    no role alternation violation (prime-agent peer-steer port).
+    """
+    if not text or not text.strip():
+        return False
+    if session_id is None:
+        return False
+    if not callable(resolve_agent):
+        return False
+    try:
+        agent = resolve_agent(session_id)
+    except Exception as exc:
+        logger.debug("steer_session(%s) resolve failed: %s", session_id, exc)
+        return False
+    if agent is None or not hasattr(agent, "steer"):
+        return False
+    try:
+        return bool(agent.steer(text))
+    except Exception as exc:
+        logger.debug("steer_session(%s) steer failed: %s", session_id, exc)
+        return False
+
+
+def steer_broadcast(
+    text: str,
+    *,
+    resolve_agent: Any = None,
+    exclude_session_id: Optional[str] = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> Dict[str, int]:
+    """Steer every reachable live target (peer sessions + child subagents).
+
+    Combines ``steer_session`` (peer) and ``steer_subagent`` (child) so a
+    single call fans the same correction out to the whole local agent tree.
+    ``exclude_session_id`` (typically the sender) is skipped to avoid
+    self-steering. Returns a count dict ``{"sessions": n, "subagents": m,
+    "failed": k}`` so callers can report partial delivery. Resolution of
+    peer sessions is delegated to ``resolve_agent``; child subagents come
+    from the in-process delegation registry (owner authority required).
+    """
+    result: Dict[str, int] = {"sessions": 0, "subagents": 0, "failed": 0}
+    if not text or not text.strip():
+        return result
+    if callable(resolve_agent):
+        target_ids: list[str] = []
+        try:
+            candidates = resolve_agent("__list__")
+        except Exception:
+            candidates = None
+        if isinstance(candidates, (list, tuple, set)):
+            for sid in candidates:
+                sid = str(sid)
+                if exclude_session_id is not None and sid == exclude_session_id:
+                    continue
+                try:
+                    ag = resolve_agent(sid)
+                except Exception:
+                    ag = None
+                if ag is None:
+                    continue
+                if steer_session(
+                    sid,
+                    text,
+                    resolve_agent=resolve_agent,
+                    owner_session_id=owner_session_id,
+                    owner_transport=owner_transport,
+                    owner_session_record=owner_session_record,
+                ):
+                    result["sessions"] += 1
+                else:
+                    result["failed"] += 1
+    with _active_subagents_lock:
+        child_ids = list(_active_subagents.keys())
+    for cid in child_ids:
+        ok = steer_subagent(
+            cid,
+            text,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        )
+        if ok:
+            result["subagents"] += 1
+        else:
+            result["failed"] += 1
+    return result
+
+
+def list_subagents(
+    parent_agent: Any = None,
+    *,
+    name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Snapshot of live subagents owned by *parent_agent* (spawn tree).
+
+    Unlike ``list_active_subagents`` (which returns every live child, no
+    ownership filter), this is scoped to children descended from
+    *parent_agent* and surfaces the ``name`` field for the prime-agent
+    peer/child steer port. Pass ``name`` to resolve a single named child.
+    Safe to call from any thread — returns a copy.
+    """
+    with _active_subagents_lock:
+        records = list(_active_subagents.values())
+    entries = []
+    for r in records:
+        if not _owns_subagent_record(r, parent_agent):
+            continue
+        if name is not None and (r.get("name") or "") != name:
+            continue
+        entries.append(
+            {
+                k: v
+                for k, v in r.items()
+                if k
+                not in {
+                    "agent",
+                    "owner_session_id",
+                    "owner_transport",
+                    "owner_session_record",
+                    "accepting_steer",
+                }
+            }
+        )
+    return entries
+
+
+def steer_subagent_by_name(
+    name: str,
+    text: str,
+    parent_agent: Any,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> Dict[str, Any]:
+    """Steer a live child resolved by its friendly ``name`` (not id).
+
+    Returns a structured result so callers can surface the two distinct
+    failure modes precisely (prime-agent steer port requirement):
+      * {"status": "queued", ...}            — name resolved + steer accepted
+      * {"status": "no_such_subagent"}       — no owned child with that name
+      * {"status": "not_accepting"}          — known but closed/terminal
+      * {"status": "empty_text"}             — nothing to send
+    This reuses ``steer_subagent`` (same lock + accepting_steer gate), so no
+    new race is introduced and the AIAgent.steer signature is untouched.
+    """
+    name = (name or "").strip()
+    text = (text or "").strip()
+    if not text:
+        return {"status": "empty_text"}
+    if not name:
+        return {"status": "no_such_subagent"}
+    matches = list_subagents(parent_agent, name=name)
+    if not matches:
+        return {"status": "no_such_subagent", "name": name}
+    # If multiple children share a name, steer the first still-accepting one;
+    # if all are closed, report the precise not-accepting state.
+    for r in matches:
+        sid = r.get("subagent_id")
+        if sid and steer_subagent(
+            sid,
+            text,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
+            return {
+                "status": "queued",
+                "subagent_id": sid,
+                "name": name,
+                "text": text,
+            }
+    return {
+        "status": "not_accepting",
+        "name": name,
+        "subagent_id": matches[0].get("subagent_id"),
+    }
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -468,6 +697,8 @@ def _handle_control_action(
     subagent_id: Optional[str],
     message: Optional[str],
     parent_agent: Any,
+    *,
+    name: Optional[str] = None,
 ) -> str:
     """Synchronous control plane for delegate_task: list/steer/stop.
 
@@ -487,6 +718,7 @@ def _handle_control_action(
             entries.append(
                 {
                     "subagent_id": r.get("subagent_id"),
+                    "name": r.get("name"),
                     "parent_id": r.get("parent_id"),
                     "goal": r.get("goal"),
                     "model": r.get("model"),
@@ -513,16 +745,29 @@ def _handle_control_action(
             )
         return json.dumps(payload, ensure_ascii=False)
 
-    # steer / stop need a resolvable, owned target.
+    # steer / stop need a resolvable, owned target. Resolve by name when no
+    # explicit subagent_id is given (prime-agent peer/child steer port).
     sid = (subagent_id or "").strip()
+    resolved_by_name = False
+    if not sid and name:
+        named = list_subagents(parent_agent, name=(name or "").strip())
+        if named:
+            sid = named[0].get("subagent_id") or ""
+            resolved_by_name = True
     if not sid:
         return tool_error(
             f"action='{action}' requires subagent_id (from the spawn dispatch "
-            "response or action='list')."
+            "response or action='list') or a 'name' matching an owned child."
         )
     with _active_subagents_lock:
         record = _active_subagents.get(sid)
     if record is None or not _owns_subagent_record(record, parent_agent):
+        if resolved_by_name:
+            return tool_error(
+                f"No live subagent named '{name}' in this conversation's spawn "
+                "tree (or it has already finished). Use action='list' to see "
+                "live children."
+            )
         return tool_error(
             f"No live subagent '{sid}' in this conversation's spawn tree. It "
             "may have already finished (its result arrives as a normal "
@@ -562,6 +807,7 @@ def _handle_control_action(
                 {
                     "action": "steer",
                     "subagent_id": sid,
+                    "name": record.get("name"),
                     "status": "queued",
                     "note": (
                         "Steering text queued. The subagent sees it appended "
@@ -579,7 +825,86 @@ def _handle_control_action(
             "message; re-delegate a follow-up task if more work is needed."
         )
 
-    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+    if action == "steer_peer":
+        text = (message or "").strip()
+        if not text:
+            return tool_error(
+                "action='steer_peer' requires a non-empty 'message'."
+            )
+        # Resolve the invoking session's live-agent authority so the peer
+        # steer reuses the gateway's exact steer triple (same as subagent
+        # steering). The resolver itself is injected by the gateway layer.
+        owner_session_id = getattr(parent_agent, "session_id", None) or None
+        owner_transport, owner_session_record = _capture_gateway_steer_authority(
+            owner_session_id
+        )
+        resolve_agent = _peer_session_resolver()
+        if not callable(resolve_agent):
+            return tool_error(
+                "action='steer_peer' is unavailable outside a live gateway "
+                "session (no session→agent resolver)."
+            )
+        target = (subagent_id or "").strip()
+        if not target:
+            return tool_error(
+                "action='steer_peer' requires a target session_id (the peer "
+                "session to steer)."
+            )
+        if steer_session(
+            target,
+            text,
+            resolve_agent=resolve_agent,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
+            return json.dumps(
+                {
+                    "action": "steer_peer",
+                    "session_id": target,
+                    "status": "queued",
+                    "text": text,
+                },
+                ensure_ascii=False,
+            )
+        return tool_error(
+            f"Could not steer peer session '{target}' — unknown, not alive, or "
+            "authority unavailable."
+        )
+
+    if action == "broadcast":
+        text = (message or "").strip()
+        if not text:
+            return tool_error(
+                "action='broadcast' requires a non-empty 'message'."
+            )
+        owner_session_id = getattr(parent_agent, "session_id", None) or None
+        owner_transport, owner_session_record = _capture_gateway_steer_authority(
+            owner_session_id
+        )
+        resolve_agent = _peer_session_resolver()
+        counts = steer_broadcast(
+            text,
+            resolve_agent=resolve_agent,
+            exclude_session_id=owner_session_id,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        )
+        return json.dumps(
+            {
+                "action": "broadcast",
+                "counts": counts,
+                "status": "broadcast",
+                "text": text,
+            },
+            ensure_ascii=False,
+        )
+
+    return tool_error(
+        f"Unknown action '{action}'. Use spawn, list, steer, stop, steer_peer, "
+        "or broadcast."
+    )
 
 
 def _extract_output_tail(
@@ -2619,6 +2944,7 @@ def _run_single_child(
                 "owner_session_id": owner_session_id,
                 "owner_transport": owner_transport,
                 "owner_session_record": owner_session_record,
+                "name": getattr(child, "_subagent_name", None),
             }
         )
 
@@ -3604,6 +3930,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
+    name: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
 ) -> str:
@@ -3637,11 +3964,12 @@ def delegate_task(
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(
-            normalized_action, subagent_id, message, parent_agent
+            normalized_action, subagent_id, message, parent_agent, name=name
         )
     if normalized_action and normalized_action != "spawn":
         return tool_error(
-            f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+            f"Unknown action '{action}'. Use spawn (default), list, steer, "
+            "stop, steer_peer, or broadcast."
         )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -3730,7 +4058,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "name": (name or "").strip() or None,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3829,6 +4162,12 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        # Prime-agent peer/child steer port: a human-friendly name for the
+        # child. Top-level name applies to single-task spawns; batch tasks may
+        # carry their own per-task name.
+        task_name = (t.get("name") or "").strip() or (
+            (name or "").strip() if n_tasks == 1 else None
+        )
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -3885,6 +4224,11 @@ def delegate_task(
         # attribution (child-started background processes report under it).
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
+        # Prime-agent steer: stash the child's friendly name so the
+        # registry-based control plane (list/steer/stop by name) can resolve
+        # it later without touching AIAgent.steer()'s signature.
+        if task_name:
+            setattr(child, "_subagent_name", task_name)
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
@@ -4824,17 +5168,20 @@ DELEGATE_TASK_SCHEMA = {
             },
             "action": {
                 "type": "string",
-                "enum": ["spawn", "list", "steer", "stop"],
+                "enum": ["spawn", "list", "steer", "stop", "steer_peer", "broadcast"],
                 "description": (
                     "Default 'spawn' (omit for normal delegation). Live "
                     "orchestration of running subagents: 'list' shows this "
-                    "conversation's live children (ids, goals, status, "
+                    "conversation's live children (ids, names, goals, status, "
                     "transcript paths); 'steer' queues course-correction text "
-                    "into one child (requires subagent_id + message) without "
-                    "stopping it; 'stop' ends one child early (requires "
-                    "subagent_id) — its partial result still returns as a "
-                    "completion message. Control actions return immediately; "
-                    "goal/tasks are ignored when action is not 'spawn'."
+                    "into one child (requires subagent_id or name + message) "
+                    "without stopping it; 'stop' ends one child early (requires "
+                    "subagent_id or name); 'steer_peer' queues text into another "
+                    "live session (requires text); 'broadcast' fans the same "
+                    "text to every reachable live target (peer sessions + child "
+                    "subagents), excluding the sender. Control actions return "
+                    "immediately; goal/tasks are ignored when action is not "
+                    "'spawn'."
                 ),
             },
             "subagent_id": {
@@ -4842,16 +5189,27 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Target for action='steer'/'stop'. Ids are returned in the "
                     "spawn dispatch response (subagent_ids) and by "
-                    "action='list'."
+                    "action='list'. May be omitted when 'name' uniquely "
+                    "identifies the child instead."
+                ),
+            },
+            "name": {
+                "type": "string",
+                "description": (
+                    "Human-friendly name for the subagent (set at spawn time) "
+                    "and an alternative address for action='steer'/'stop' "
+                    "(resolves to the owned child with this name). Used by the "
+                    "'hermes subagent' CLI and the prime-agent peer/child "
+                    "steer port. Optional; falls back to subagent_id when unset."
                 ),
             },
             "message": {
                 "type": "string",
                 "description": (
-                    "For action='steer': the course correction. Be directive "
-                    "and specific — the child sees it appended to its next "
-                    "tool result mid-run (e.g. \"Stop exploring X; focus on Y "
-                    "and return early results\")."
+                    "For action='steer'/'steer_peer'/'broadcast': the course "
+                    "correction. Be directive and specific — the recipient sees "
+                    "it appended to its next tool result mid-run (e.g. \"Stop "
+                    "exploring X; focus on Y and return early results\")."
                 ),
             },
         },
@@ -4917,6 +5275,7 @@ registry.register(
         output_schema=args.get("output_schema"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
+        name=args.get("name"),
         message=args.get("message"),
         parent_agent=kw.get("parent_agent"),
     ),
