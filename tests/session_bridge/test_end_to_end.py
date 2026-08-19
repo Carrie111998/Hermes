@@ -1248,6 +1248,69 @@ async def test_restart_mid_import_resumes_without_duplicate_catalog_rows(
 
 
 @pytest.mark.asyncio
+async def test_scan_stats_each_transcript_at_most_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One scan cycle must stat a transcript once, not twice.
+
+    _sort_claude_paths stats every discovered path to order it, and then
+    _scan_claude_persistent immediately re-stats every one of them through
+    _claude_path_fingerprint. Same stat_result, taken twice, for the whole
+    corpus on EVERY cycle (catalog_scan_seconds defaults to 3).
+
+    Live bridge 2026-08-18: 3,786 transcripts, so 7,572 stats per cycle. Worse,
+    the fingerprint pass runs directly on the event loop while the sort pass is
+    wrapped in asyncio.to_thread -- so it blocks uvicorn. py-spy put 16.8% of
+    process wall time in pathlib stat, under _claude_path_fingerprint on
+    MainThread.
+    """
+    claude_root = tmp_path / "synthetic-claude-projects"
+    for i in range(12):
+        _write_claude_transcript(
+            claude_root / "project" / f"stat-{i}.jsonl",
+            native_id=f"stat-{i}",
+            content=f"stat needle {i}",
+        )
+
+    counts: dict[str, int] = {}
+    real_stat = Path.stat
+
+    def _counting_stat(self, *args, **kwargs):
+        if self.suffix == ".jsonl":
+            counts[self.name] = counts.get(self.name, 0) + 1
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _counting_stat)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        coordinator = SessionBridgeCoordinator(
+            config=BridgeConfig(),
+            store=SessionBridgeStore(db, clock=lambda: 1_000.0),
+            adapters={
+                Provider.CLAUDE: ClaudeSourceAdapter(
+                    claude_root,
+                    marker_secret=_MARKER_SECRET,
+                )
+            },
+            scan_batch_size=100,
+        )
+        counts.clear()
+        await coordinator.scan_once(Provider.CLAUDE)
+    finally:
+        db.close()
+
+    assert counts, "fixture must actually stat the transcripts"
+    worst = max(counts.values())
+    assert worst <= 1, (
+        f"a transcript was stat()ed {worst} times in one scan cycle "
+        f"(per-file counts: {sorted(counts.values(), reverse=True)[:5]}); "
+        "the sort pass and the fingerprint pass must share one stat_result"
+    )
+
+
+@pytest.mark.asyncio
 async def test_appending_to_a_known_transcript_does_not_rewrite_its_messages(
     tmp_path: Path,
 ) -> None:
