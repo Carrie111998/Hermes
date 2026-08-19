@@ -424,6 +424,7 @@ NON_MESSAGING_SESSION_SURFACES = frozenset(
         "kanban",
         "local",
         "msgraph_webhook",
+        "subagent",
         "tool",
         "tui",
         "webhook",
@@ -443,6 +444,14 @@ def session_is_messaging_surface() -> bool:
     source, and reports messaging when any of them names a surface outside
     :data:`NON_MESSAGING_SESSION_SURFACES`.
     """
+    # A delegated child retains the parent's routing ContextVars so its result
+    # can return to the owner. Those values describe the owner, not the child's
+    # audience, and must not classify internal child work as a human chat turn.
+    from agent.delegation_context import is_delegated_child_process_context
+
+    if is_delegated_child_process_context():
+        return False
+
     import os
 
     platform = os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM", "")

@@ -1141,6 +1141,25 @@ class SessionSchemaMixin:
                 # one large prompt copy per session.
                 self._dedupe_legacy_system_prompts(cursor)
 
+            if current_version < 27:
+                # v27: delegated children created under a gateway/CLI/cron/TUI
+                # parent inherited that parent's human-facing source through
+                # task-local session ContextVars. The _delegate_from marker
+                # identifies direct delegates and their compression lineage,
+                # including continuations whose marker intentionally points
+                # past their immediate parent. v16 also backfilled that marker
+                # onto some source='tool' children, so preserve that explicit
+                # execution surface. Change only source; preserve lineage,
+                # messages, and model_config.
+                cursor.execute(
+                    "UPDATE sessions SET source = 'subagent' "
+                    "WHERE source NOT IN ('subagent', 'tool') "
+                    "AND json_extract("
+                    "CASE WHEN json_valid(model_config) "
+                    "THEN model_config ELSE '{}' END, "
+                    "'$._delegate_from') IS NOT NULL"
+                )
+
             # The FTS storage layout is versioned independently of the main
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at

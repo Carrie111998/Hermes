@@ -91,6 +91,15 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
 
 
 def _session_source_for_agent(platform: Optional[str]) -> str:
+    # A delegate_task child executes inside the parent's ContextVar snapshot so
+    # completion routing can still reach the owning conversation. That snapshot
+    # legitimately contains HERMES_SESSION_SOURCE=discord/telegram/etc., but it
+    # must never become the child session row's source: gateway recovery indexes
+    # human conversations by source and could otherwise adopt the subagent row.
+    from agent.delegation_context import is_delegated_child_process_context
+
+    if is_delegated_child_process_context():
+        return "subagent"
     try:
         from gateway.session_context import get_session_env
 
