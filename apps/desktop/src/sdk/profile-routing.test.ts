@@ -102,7 +102,8 @@ vi.mock('@/store/gateway', async () => {
 const { host } = await import('./index')
 const { openSession: openSessionCore } = await import('@/app/open-session')
 const { deleteProfile } = await import('@/hermes')
-const { requestGatewayForAgent, requestGatewayForProfile, retireLocalProfileGateways } = await import('@/store/gateway')
+const { openGatewayForProfile, requestGatewayForAgent, requestGatewayForProfile, retireLocalProfileGateways } =
+  await import('@/store/gateway')
 
 const { $activeGatewayProfile, $gatewaySwapTarget, $profiles, ensureGatewayProfile, refreshProfiles, setShowAllProfiles } =
   await import('@/store/profile')
@@ -500,9 +501,51 @@ describe('profile-aware plugin session opens', () => {
 
     await second
     expect(await firstOutcome).toMatch(/superseded/i)
-    expect($activeGatewayProfile.get()).toBe('hyoseob')
+    expect($activeGatewayProfile.get()).toBe('remote-worker')
     expect($selectedStoredSessionId.get()).toBe('chat-b')
     expect($gatewaySwapTarget.get()).toBeNull()
+  })
+
+  it('keeps chrome API home on the previous profile when opening a Bot Chat', async () => {
+    $activeGatewayProfile.set('default')
+
+    await host.openSession('bot-chat', {
+      profile: 'worker',
+      keepAllProfilesScope: true
+    })
+
+    expect(ensureGatewayProfile).not.toHaveBeenCalled()
+    expect(openGatewayForProfile).toHaveBeenCalledWith('worker')
+    expect(setShowAllProfiles).toHaveBeenCalledWith(true)
+    expect($activeGatewayProfile.get()).toBe('default')
+  })
+
+  it('defaults keepAllProfilesScope to navigation instead of a workspace switch', async () => {
+    $activeGatewayProfile.set('default')
+
+    await host.openSession('bot-chat', { profile: 'worker' })
+
+    expect(ensureGatewayProfile).not.toHaveBeenCalled()
+    expect(openGatewayForProfile).toHaveBeenCalledWith('worker')
+    expect(setShowAllProfiles).toHaveBeenCalledWith(true)
+    expect($activeGatewayProfile.get()).toBe('default')
+  })
+
+  it('still switches workspace when keepAllProfilesScope is false', async () => {
+    $activeGatewayProfile.set('default')
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async (target: null | string | undefined) => {
+      $activeGatewayProfile.set(target || 'default')
+    })
+
+    await host.openSession('stored-worker', {
+      profile: 'worker',
+      keepAllProfilesScope: false
+    })
+
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('worker')
+    expect(openGatewayForProfile).not.toHaveBeenCalled()
+    expect(setShowAllProfiles).toHaveBeenCalledWith(false)
+    expect($activeGatewayProfile.get()).toBe('worker')
   })
 
   it('keeps the Sessions sidebar in all-profiles even when the bot is already live', async () => {

@@ -79,6 +79,8 @@ import {
 import { runGatewayRestart } from '@/store/system-actions'
 import type { UsageStats } from '@/types/hermes'
 
+import { planPluginOpenSession } from './plugin-open-session-plan'
+
 // -- state: readonly views over the app's live atoms -------------------------
 
 const readonlyAtom = <T>(atomLike: ReadableAtom<T>): ReadableAtom<T> => atomLike
@@ -232,12 +234,14 @@ function waitForFocusedSessionHydration({
   expectHistory,
   generation,
   profile,
+  requireActiveProfile,
   storedSessionId,
   timeoutMs
 }: {
   expectHistory: boolean
   generation: number
   profile: string
+  requireActiveProfile: boolean
   storedSessionId: string
   timeoutMs: number
 }): Promise<void> {
@@ -275,7 +279,8 @@ function waitForFocusedSessionHydration({
         return
       }
 
-      const profileMatches = normalizeProfileKey($activeGatewayProfile.get()) === profile
+      const profileMatches =
+        !requireActiveProfile || normalizeProfileKey($activeGatewayProfile.get()) === profile
       const sessionMatches = $selectedStoredSessionId.get() === storedSessionId
       const runtimeReady = Boolean($activeSessionId.get())
       const historyPainted = Boolean($messages.get().length)
@@ -489,14 +494,22 @@ export const host = {
     ensureGatewayAgent(connectionId, (profile ?? '').trim() || 'default'),
 
   /** Open a stored session the way core surfaces do. A plugin/Bot Mode open
-   *  is navigation, not a workspace switch — keepAllProfilesScope defaults
-   *  true so Sessions stays on the unified list (the bot forever-chat is
-   *  hidden and would otherwise look like every session disappeared). */
+   *  is navigation, not a workspace or chrome API-home switch —
+   *  keepAllProfilesScope defaults true so `$activeGatewayProfile` /
+   *  Sessions REST stay on the previous (usually launch) backend while the
+   *  bot backend is dialed in the background. The bot forever-chat is hidden
+   *  and would otherwise look like every session disappeared. Pass false to
+   *  also scope chrome onto that profile and collapse the sidebar. */
   openSession: async (storedSessionId: string, options: PluginOpenSessionOptions = {}): Promise<void> => {
     const generation = ++openSessionGeneration
     const profile = (options.profile ?? '').trim()
     const targetProfile = normalizeProfileKey(profile || $activeGatewayProfile.get())
     const expectHistory = options.expectHistory ?? false
+    const plan = planPluginOpenSession({
+      activeProfile: $activeGatewayProfile.get(),
+      keepAllProfilesScope: options.keepAllProfilesScope,
+      profile
+    })
     // Wake-path phase timings. Logged ONLY on a hydration timeout (bridged
     // into desktop.log via the renderer-console tap), so a support bundle
     // pinpoints WHERE the budget went — profile activation vs hydration —
@@ -504,15 +517,18 @@ export const host = {
     const wakeStartedAt = Date.now()
     let profileActiveAt = wakeStartedAt
 
-    if (profile && profile !== $activeGatewayProfile.get()) {
-      await ensureGatewayProfile(profile)
+    if (plan.switchWorkspace) {
+      await ensureGatewayProfile(plan.switchWorkspace)
+      profileActiveAt = Date.now()
+    } else if (plan.dialWithoutSwitching) {
+      // Dial the bot backend so session.resume can hydrate, but do not steal
+      // $activeGatewayProfile / chrome REST onto that named profile.
+      await openGatewayForProfile(plan.dialWithoutSwitching)
       profileActiveAt = Date.now()
     }
 
-    // Opening a bot/plugin chat is navigation, not a workspace switch. Always
-    // restore the unified Sessions list unless the caller opted into scoping.
-    if (profile && options.keepAllProfilesScope !== false) {
-      setShowAllProfiles(true)
+    if (plan.showAllProfiles !== null) {
+      setShowAllProfiles(plan.showAllProfiles)
     }
 
     if (generation !== openSessionGeneration) {
@@ -564,6 +580,7 @@ export const host = {
           expectHistory,
           generation,
           profile: targetProfile,
+          requireActiveProfile: plan.requireActiveProfileForHydration,
           storedSessionId,
           timeoutMs: Math.max(1, options.hydrationTimeoutMs ?? DEFAULT_SESSION_HYDRATION_TIMEOUT_MS)
         })
