@@ -468,10 +468,11 @@ def check_telegram_requirements() -> bool:
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
 
 # A single quoted line: an optional '**' expandable opener, one to three '>'
-# markers, then either nothing (an empty line *inside* the quotation) or a
-# space followed by the quoted text.
-_MDV2_QUOTE_LINE = r'(?:\*\*)?>{1,3}(?: [^\n]*)?'
-_MDV2_QUOTE_LINE_RE = re.compile(r'^((?:\*\*)?>{1,3})(?: ([^\n]*))?$')
+# markers, then the quoted text. The space after the marker is OPTIONAL — a
+# sender who writes '>text' means the same thing as one who writes '> text',
+# and a line reduced to its marker is an empty line *inside* the quotation.
+_MDV2_QUOTE_LINE = r'(?:\*\*)?>{1,3} ?[^\n]*'
+_MDV2_QUOTE_LINE_RE = re.compile(r'^((?:\*\*)?>{1,3}) ?([^\n]*)$')
 # A quotation is a run of consecutive quoted lines. Telegram renders such a run
 # as one entity, so the converter has to see it as one block too.
 _MDV2_QUOTE_BLOCK_RE = re.compile(
@@ -8439,25 +8440,30 @@ class TelegramAdapter(BasePlatformAdapter):
         def _convert_blockquote(m):
             lines = m.group(1).split('\n')
             parsed = [_MDV2_QUOTE_LINE_RE.match(line) for line in lines]
-            prefixes = [p.group(1) for p in parsed]
-            contents = [p.group(2) or '' for p in parsed]
+            # The expandable markers are DECORATION, never content: '**' is
+            # dropped from every prefix that carries it and '||' from the end
+            # of the block, wherever the sender happened to put them and
+            # whether or not its counterpart is there. Only the quotation
+            # itself has to be written correctly; the markup is rebuilt below.
+            # Assumed consequence: a literal '||' ending a quotation is eaten
+            # along with them.
+            prefixes = [p.group(1).lstrip('*') for p in parsed]
+            contents = [p.group(2) for p in parsed]
             # A run of bare '>' markers quotes nothing: leave it to the
             # generic escaper, as before.
             if not any(contents):
                 return m.group(1)
-            # Expandable quotation: '**>' opens the block on the first line,
-            # '||' closes it on the last one.
-            expandable = (
-                prefixes[0].startswith('**') and contents[-1].endswith('||')
-            )
-            if expandable:
-                contents[-1] = contents[-1][:-2]
+            expandable = any(p.group(1).startswith('**') for p in parsed)
+            tail = contents[-1].rstrip()
+            if tail.endswith('||'):
+                contents[-1] = tail[:-2]
+                expandable = True
             rendered = '\n'.join(
                 f'{prefix} {_escape_mdv2(content)}' if content else prefix
                 for prefix, content in zip(prefixes, contents)
             )
             if expandable:
-                rendered += '||'
+                rendered = f'**{rendered}||'
             return _ph(rendered)
 
         text = _MDV2_QUOTE_BLOCK_RE.sub(_convert_blockquote, text)
