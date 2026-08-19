@@ -383,7 +383,7 @@ def register(ctx):
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
 - Callback exceptions are logged and skipped; later callbacks continue.
-- The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
+- The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes — e.g. [`pre_tool_call`](#pre_tool_call) can block a tool, [`pre_llm_call`](#pre_llm_call) can inject context, and [`on_budget_check`](#on_budget_check) can inject an advisory budget notice into the user message. Plugin middleware is a separate registry and surface, not another hook category.
 - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
 - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
 
@@ -443,6 +443,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
+| [`on_budget_check`](#on_budget_check) | Directive/control | Once per turn before the loop; the most-severe verdict across all registered plugins wins (ties broken by registration order). A `soft`/`hard` verdict's `message` is injected into the user message. | `session_id`, `task_id`, `turn_id`, `platform`, `sender_id`, `model` | Verdict `message` may reveal spend/budget details; other metadata (scope, limits, spend) is plugin-defined bookkeeping. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
@@ -731,6 +732,81 @@ def guardrails(**kwargs):
 
 def register(ctx):
     ctx.register_hook("pre_llm_call", guardrails)
+```
+
+---
+
+### `on_budget_check`
+
+Fires **once per turn**, in the turn prologue alongside [`pre_llm_call`](#pre_llm_call). A budget plugin returns a verdict on the **accumulated** spend for a scope (session, cron job, user, global, …) and the core surfaces the plugin-authored message as an advisory notice.
+
+This is **retrospective**: the plugin sums cost that has already been recorded — there is no pre-call projection. In this release the verdict is **advisory only** (the message is injected into the user message); the real pre-LLM hard-abort is a later change (the deferred hard gate).
+
+**Callback signature:**
+
+```python
+def my_callback(session_id: str, task_id: str, turn_id: str,
+                platform: str, sender_id: str, model: str, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | `str` | Unique identifier for the current session. A plugin resolves its scope from this (e.g. parsing a `cron_{job_id}_{ts}` session id). |
+| `task_id` | `str` | Identifier for the current task, when present |
+| `turn_id` | `str` | Identifier for the current turn |
+| `platform` | `str` | Where the session is running: `"cli"`, `"telegram"`, `"discord"`, etc. |
+| `sender_id` | `str` | The originating user's id, when present |
+| `model` | `str` | The model identifier for this turn |
+
+Always accept `**kwargs` — new context fields may be added without breaking your plugin.
+
+**Fires:** In `agent/turn_context.py`, inside `build_turn_context()`, right after the `pre_llm_call` dispatch. Fires once per user turn, not once per API call within the tool loop.
+
+**Return value:** A dict describing the verdict. Only `status` is required.
+
+```python
+# Approaching the limit — advisory (soft)
+return {"status": "soft", "message": "[BUDGET] Global spend at 82% of the daily cap.",
+        "scope": "global", "spent": 8.2, "limit": 10.0, "pct": 82}
+
+# Over the limit
+return {"status": "hard", "message": "[BUDGET] Daily cap exceeded — spend is paused."}
+
+# Within budget — nothing surfaced
+return {"status": "ok"}
+
+# No opinion for this scope
+return None
+```
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `status` | yes | `"ok"`, `"soft"`, or `"hard"` |
+| `message` | for `soft`/`hard` | Plugin-authored notice the core injects verbatim |
+| everything else | no | Metadata the core does **not** act on (`scope`, `scope_id`, `window`, `spent`, `limit`, `pct`, `based_on_estimates`, `degraded`, …) |
+
+**Aggregation:** When **multiple plugins** register the hook, the **most-severe** verdict wins (`hard` > `soft` > `ok`). Ties at equal severity are broken by **hook registration order** — the first registered verdict is kept. Non-dict results and results without a valid `status` are ignored.
+
+**Where the message is injected:** For a `soft`/`hard` verdict, the `message` is appended to the current turn's **user message** — the same ephemeral channel as [`pre_llm_call`](#pre_llm_call), never the system prompt (so the prompt cache prefix is preserved) and never persisted to the session database.
+
+**Discoverability nudge:** When **no** plugin registers `on_budget_check`, a one-time note is injected on the **first turn** of a session, telling the user that cost enforcement is available but not active. Silence it with `agent.budget_enforcement_hint: false` in the config. The nudge never appears when a budget plugin is installed.
+
+**Use cases:** Cost caps per session / cron job / user / workspace, spend dashboards, degraded-mode warnings.
+
+**Example — soft cap at 80% of a daily limit:**
+
+```python
+def budget_verdict(session_id, **kwargs):
+    spent, limit = my_store.accumulated_cost(session_id), 10.0
+    if spent >= limit:
+        return {"status": "hard", "message": f"[BUDGET] Daily cap of ${limit:.2f} reached."}
+    if spent >= 0.8 * limit:
+        pct = round(100 * spent / limit)
+        return {"status": "soft", "message": f"[BUDGET] Spend at {pct}% of the ${limit:.2f} daily cap."}
+    return {"status": "ok"}
+
+def register(ctx):
+    ctx.register_hook("on_budget_check", budget_verdict)
 ```
 
 ---
