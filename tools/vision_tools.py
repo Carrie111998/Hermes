@@ -10,7 +10,7 @@ Available tools:
 - vision_analyze_tool: Analyze images from URLs with custom prompts
 
 Features:
-- Downloads images from URLs and converts to base64 for API compatibility
+- Preserves public image URLs, with an inline-base64 compatibility fallback
 - Comprehensive image description
 - Context-aware analysis based on user queries
 - Automatic temporary file cleanup
@@ -1306,9 +1306,10 @@ async def vision_analyze_tool(
     """
     Analyze an image from a URL or local file path using vision AI.
     
-    This tool accepts either an HTTP/HTTPS URL or a local file path. For URLs,
-    it downloads the image first. In both cases, the image is converted to base64
-    and processed using Gemini 3 Flash Preview via OpenRouter API.
+    This tool accepts either an HTTP/HTTPS URL or a local file path. HTTP(S)
+    inputs are validated and passed to the provider as public URLs, with the
+    resolved bytes retained as an inline-base64 compatibility fallback. Local
+    inputs and cropped regions are sent inline.
     
     The user_prompt parameter is expected to be pre-formatted by the calling
     function (typically model_tools.py) to include both full description
@@ -1459,7 +1460,19 @@ async def vision_analyze_tool(
         # Use the prompt as provided (model_tools.py now handles full description formatting)
         comprehensive_prompt = user_prompt
         
-        # Prepare the message with base64-encoded image
+        # Preserve validated public URLs for providers that reject inline
+        # base64 images. resolve_image_source() above still downloads and
+        # validates the bytes first, retaining the existing SSRF, website
+        # policy, MIME, normalization, and size guards. Keep cropped regions
+        # inline because the original URL does not represent the crop.
+        public_image_url = (
+            image_url
+            if region is None and _image_url_shape_ok(image_url)
+            else None
+        )
+
+        # Prepare the message. The inline payload remains available as a
+        # fallback for providers that cannot fetch the public URL themselves.
         messages = [
             {
                 "role": "user",
@@ -1471,7 +1484,7 @@ async def vision_analyze_tool(
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": image_data_url
+                            "url": public_image_url or image_data_url
                         }
                     }
                 ]
@@ -1506,26 +1519,47 @@ async def vision_analyze_tool(
         if model:
             call_kwargs["model"] = model
         _load_auxiliary_client()
-        # Try full-size image first; on size-related rejection, downscale and retry.
+        async def _retry_with_resized_inline(api_error):
+            """Downscale and retry an inline image after a size rejection."""
+            nonlocal image_data_url
+            if not (
+                _is_image_size_error(api_error)
+                and len(image_data_url) > _RESIZE_TARGET_BYTES
+            ):
+                raise api_error
+            logger.info(
+                "API rejected image (%.1f MB, likely too large); "
+                "auto-resizing to ~%.0f MB and retrying...",
+                len(image_data_url) / (1024 * 1024),
+                _RESIZE_TARGET_BYTES / (1024 * 1024),
+            )
+            image_data_url = await _run_encode_on_cpu_executor(
+                _resize_image_for_vision,
+                temp_image_path,
+                mime_type=detected_mime_type,
+                scale_out=_scale_info,
+            )
+            messages[0]["content"][1]["image_url"]["url"] = image_data_url
+            return await async_call_llm(**call_kwargs)
+
+        # Try a validated public URL first. If the provider cannot fetch URLs,
+        # retry with the already-resolved inline image to preserve compatibility.
+        # Inline size rejections retain the existing downscale-and-retry path.
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
-            if (_is_image_size_error(_api_err)
-                    and len(image_data_url) > _RESIZE_TARGET_BYTES):
+            if public_image_url:
                 logger.info(
-                    "API rejected image (%.1f MB, likely too large); "
-                    "auto-resizing to ~%.0f MB and retrying...",
-                    len(image_data_url) / (1024 * 1024),
-                    _RESIZE_TARGET_BYTES / (1024 * 1024),
+                    "Vision provider could not use the public image URL; "
+                    "retrying with inline image bytes"
                 )
-                image_data_url = await _run_encode_on_cpu_executor(
-                    _resize_image_for_vision,
-                    temp_image_path, mime_type=detected_mime_type,
-                    scale_out=_scale_info)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
-                response = await async_call_llm(**call_kwargs)
+                try:
+                    response = await async_call_llm(**call_kwargs)
+                except Exception as _inline_err:
+                    response = await _retry_with_resized_inline(_inline_err)
             else:
-                raise
+                response = await _retry_with_resized_inline(_api_err)
         
         # Extract the analysis — fall back to reasoning if content is empty
         analysis = extract_content_or_reasoning(response)
