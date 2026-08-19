@@ -6997,6 +6997,31 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def _agent_session_db(sid: str, session_db=None):
+    """Bind the agent to the session's profile store, not the launch DB.
+
+    Bot Mode session.create stores ``profile_home`` on the live session, but
+    ``_make_agent`` used to default to ``_get_db()`` (the process launch
+    state.db). Turns then persisted under the root store with
+    ``profile_name=worker``, which is why opening the named profile looked blank.
+    """
+    if session_db is not None:
+        return session_db
+    rec = _sessions.get(sid) or {}
+    home = rec.get("profile_home")
+    if home:
+        from hermes_state import SessionDB
+
+        try:
+            return SessionDB(db_path=Path(home) / "state.db")
+        except Exception:
+            logger.debug("failed to open profile session db for agent", exc_info=True)
+    from hermes_state import session_db_for_named_profile
+
+    name = Path(home).name if home else None
+    return session_db_for_named_profile(_get_db(), name) or _get_db()
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -7174,7 +7199,7 @@ def _make_agent(
         provider_data_collection=_pr.get("data_collection"),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
-        session_db=session_db if session_db is not None else _get_db(),
+        session_db=_agent_session_db(sid, session_db),
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
