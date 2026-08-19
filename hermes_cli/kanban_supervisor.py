@@ -1121,6 +1121,10 @@ class RemokoClient:
     def get_request(self, request_id: str) -> dict:
         raise NotImplementedError
 
+    def find_request(self, external_id: str) -> dict:
+        """Look up a live request by durable external_id. Empty if none."""
+        return {}
+
 
 def _unwrap_remoko_payload(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
@@ -1186,6 +1190,21 @@ def _live_remoko_client() -> Optional[RemokoClient]:
                 return result
             return {"raw": result}
 
+        def find_request(self, external_id: str) -> dict:
+            for tool in (
+                "mcp__remoko__list_pending",
+                "mcp__remoko__list_unprocessed",
+            ):
+                try:
+                    result = call_mcp_tool(tool, {})
+                except Exception:
+                    logger.debug("remoko %s failed", tool, exc_info=True)
+                    continue
+                match = _match_remoko_external(result, external_id)
+                if match:
+                    return match
+            return {}
+
     return _McpRemoko()
 
 
@@ -1195,6 +1214,249 @@ def _existing_remoko_request_id(
     if obj.get("remoko_external_id") == external_id and obj.get("remoko_request_id"):
         return str(obj["remoko_request_id"])
     return None
+
+
+def _parse_event_payload(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _supervisor_event(conn: sqlite3.Connection, event_key: str) -> Optional[dict[str, Any]]:
+    if not _table_exists(conn, "kanban_supervisor_events"):
+        return None
+    row = conn.execute(
+        "SELECT event_key, kind, task_id, objective_id, payload, created_at "
+        "FROM kanban_supervisor_events WHERE event_key = ?",
+        (event_key,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _remoko_request_id_from(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    request_id = str(data.get("request_id") or data.get("id") or "").strip()
+    external_id = str(data.get("external_id") or "").strip()
+    if not request_id or request_id == external_id:
+        return None
+    return request_id
+
+
+def _iter_remoko_records(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        candidates: Any = raw
+    else:
+        data = _unwrap_remoko_payload(raw)
+        if isinstance(data, list):
+            candidates = data
+        elif isinstance(data, dict):
+            nested = (
+                data.get("items")
+                or data.get("requests")
+                or data.get("pending")
+                or data.get("unprocessed")
+                or data.get("data")
+            )
+            if isinstance(nested, list):
+                candidates = nested
+            elif isinstance(nested, dict):
+                candidates = list(nested.values())
+            else:
+                candidates = [data]
+        else:
+            candidates = []
+    records: list[dict[str, Any]] = []
+    for item in candidates or []:
+        if not isinstance(item, dict):
+            continue
+        unwrapped = _unwrap_remoko_payload(item)
+        records.append(unwrapped or item)
+    return records
+
+
+def _match_remoko_external(raw: Any, external_id: str) -> dict[str, Any]:
+    if not external_id:
+        return {}
+    for rec in _iter_remoko_records(raw):
+        if rec.get("external_id") == external_id and _remoko_request_id_from(rec):
+            return rec
+    return {}
+
+
+def _find_live_remoko_request(client: RemokoClient, external_id: str) -> Optional[str]:
+    finder = getattr(client, "find_request", None)
+    raw: Any = {}
+    if callable(finder):
+        try:
+            raw = finder(external_id)
+        except Exception:
+            logger.warning("remoko find_request failed for %s", external_id, exc_info=True)
+            return None
+    rec = _match_remoko_external(raw, external_id)
+    if not rec and isinstance(raw, dict):
+        rec = raw if raw.get("external_id") == external_id else {}
+    return _remoko_request_id_from(rec)
+
+
+def _commit_owner_blocker_request(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    task_id: str,
+    decision_key: str,
+    external_id: str,
+    event_key: str,
+    request_id: str,
+    choices: Optional[list[str]] = None,
+) -> str:
+    from hermes_cli.kanban_db import _append_event, block_task, write_txn
+
+    with write_txn(conn, allow_nested=True):
+        obj = get_objective(conn, objective_id)
+        already = _existing_remoko_request_id(conn, obj or {}, external_id)
+        if already:
+            return already
+        event = _supervisor_event(conn, event_key)
+        prior = _parse_event_payload((event or {}).get("payload"))
+        already_logged = _remoko_request_id_from(prior) == request_id
+        conn.execute(
+            """
+            UPDATE kanban_supervisor_events
+               SET payload = ?
+             WHERE event_key = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "external_id": external_id,
+                        "decision_key": decision_key,
+                        "request_id": request_id,
+                        "status": "sent",
+                        "choices": list(choices or prior.get("choices") or [])[:4],
+                    },
+                    ensure_ascii=False,
+                ),
+                event_key,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE kanban_objectives
+               SET remoko_request_id = ?, remoko_external_id = ?,
+                   status = 'blocked_owner', updated_at = ?
+             WHERE id = ?
+            """,
+            (request_id, external_id, _now(), objective_id),
+        )
+        if not already_logged:
+            _append_event(
+                conn,
+                task_id,
+                "owner_blocker",
+                {
+                    "objective_id": objective_id,
+                    "external_id": external_id,
+                    "request_id": request_id,
+                    "decision_key": decision_key,
+                },
+            )
+    try:
+        block_task(
+            conn,
+            task_id,
+            reason=f"owner decision required: {decision_key}",
+            kind="needs_input",
+        )
+    except Exception:
+        logger.debug("block_task for owner blocker failed", exc_info=True)
+    return request_id
+
+
+def _recover_reserved_owner_blocker(
+    conn: sqlite3.Connection,
+    *,
+    objective_id: str,
+    task_id: str,
+    decision_key: str,
+    external_id: str,
+    event_key: str,
+    choices: Optional[list[str]] = None,
+    remoko: Optional[RemokoClient] = None,
+) -> tuple[bool, Optional[str]]:
+    """Reconcile a reserving event. reserved=True means do not send again."""
+    event = _supervisor_event(conn, event_key)
+    if event is None:
+        return False, None
+    obj = get_objective(conn, objective_id)
+    already = _existing_remoko_request_id(conn, obj or {}, external_id)
+    if already:
+        return True, already
+    payload = _parse_event_payload(event.get("payload"))
+    request_id = _remoko_request_id_from(payload)
+    if request_id is None:
+        client = remoko if remoko is not None else _live_remoko_client()
+        if client is None:
+            return True, None
+        request_id = _find_live_remoko_request(client, external_id)
+    if not request_id:
+        return True, None
+    bound = _commit_owner_blocker_request(
+        conn,
+        objective_id=objective_id,
+        task_id=task_id,
+        decision_key=decision_key,
+        external_id=external_id,
+        event_key=event_key,
+        request_id=request_id,
+        choices=list(choices or payload.get("choices") or [])[:4],
+    )
+    return True, bound
+
+
+def reconcile_reserved_owner_blockers(
+    conn: sqlite3.Connection,
+    *,
+    remoko: Optional[RemokoClient] = None,
+) -> list[str]:
+    """Attach accepted Remoko requests left behind a reserving crash."""
+    if not _table_exists(conn, "kanban_supervisor_events"):
+        return []
+    recovered: list[str] = []
+    rows = conn.execute(
+        "SELECT event_key, task_id, objective_id, payload "
+        "FROM kanban_supervisor_events WHERE kind = 'owner_blocker' "
+        "ORDER BY created_at ASC"
+    ).fetchall()
+    for row in rows:
+        payload = _parse_event_payload(row["payload"])
+        if payload.get("status") != "reserving":
+            continue
+        objective_id = row["objective_id"]
+        task_id = row["task_id"]
+        decision_key = str(payload.get("decision_key") or "")
+        external_id = str(payload.get("external_id") or "")
+        if not objective_id or not task_id or not decision_key or not external_id:
+            continue
+        _reserved, request_id = _recover_reserved_owner_blocker(
+            conn,
+            objective_id=str(objective_id),
+            task_id=str(task_id),
+            decision_key=decision_key,
+            external_id=external_id,
+            event_key=str(row["event_key"]),
+            choices=list(payload.get("choices") or [])[:4],
+            remoko=remoko,
+        )
+        if request_id:
+            recovered.append(request_id)
+    return recovered
 
 
 def _delete_supervisor_event(conn: sqlite3.Connection, event_key: str) -> None:
@@ -1221,7 +1483,7 @@ def request_owner_blocker(
     remoko: Optional[RemokoClient] = None,
 ) -> Optional[str]:
     """Exactly one deduplicated Remoko request per objective+decision_key."""
-    from hermes_cli.kanban_db import _append_event, block_task, write_txn
+    from hermes_cli.kanban_db import write_txn
 
     ensure_supervisor_tables(conn)
     obj = get_objective(conn, objective_id)
@@ -1232,6 +1494,20 @@ def request_owner_blocker(
     existing = _existing_remoko_request_id(conn, obj, external_id)
     if existing:
         return existing
+    _reserved, recovered = _recover_reserved_owner_blocker(
+        conn,
+        objective_id=objective_id,
+        task_id=task_id,
+        decision_key=decision_key,
+        external_id=external_id,
+        event_key=event_key,
+        choices=choices,
+        remoko=remoko,
+    )
+    if recovered:
+        return recovered
+    if _reserved:
+        return _existing_remoko_request_id(conn, obj, external_id)
     with write_txn(conn, allow_nested=True):
         obj = get_objective(conn, objective_id)
         if obj is None:
@@ -1239,7 +1515,19 @@ def request_owner_blocker(
         existing = _existing_remoko_request_id(conn, obj, external_id)
         if existing:
             return existing
-        if _supervisor_event_seen(conn, event_key):
+        _reserved, recovered = _recover_reserved_owner_blocker(
+            conn,
+            objective_id=objective_id,
+            task_id=task_id,
+            decision_key=decision_key,
+            external_id=external_id,
+            event_key=event_key,
+            choices=choices,
+            remoko=remoko,
+        )
+        if recovered:
+            return recovered
+        if _reserved:
             return _existing_remoko_request_id(conn, obj, external_id)
         claimed = _record_supervisor_event(
             conn,
@@ -1255,7 +1543,17 @@ def request_owner_blocker(
             },
         )
         if not claimed:
-            return _existing_remoko_request_id(conn, obj, external_id)
+            _reserved, recovered = _recover_reserved_owner_blocker(
+                conn,
+                objective_id=objective_id,
+                task_id=task_id,
+                decision_key=decision_key,
+                external_id=external_id,
+                event_key=event_key,
+                choices=choices,
+                remoko=remoko,
+            )
+            return recovered or _existing_remoko_request_id(conn, obj, external_id)
 
     payload = {
         "question": purpose[:200],
@@ -1291,57 +1589,16 @@ def request_owner_blocker(
             _delete_supervisor_event(conn, event_key)
         return None
 
-    with write_txn(conn, allow_nested=True):
-        conn.execute(
-            """
-            UPDATE kanban_supervisor_events
-               SET payload = ?
-             WHERE event_key = ?
-            """,
-            (
-                json.dumps(
-                    {
-                        "external_id": external_id,
-                        "decision_key": decision_key,
-                        "request_id": request_id,
-                        "status": "sent",
-                        "choices": list(choices or [])[:4],
-                    },
-                    ensure_ascii=False,
-                ),
-                event_key,
-            ),
-        )
-        conn.execute(
-            """
-            UPDATE kanban_objectives
-               SET remoko_request_id = ?, remoko_external_id = ?,
-                   status = 'blocked_owner', updated_at = ?
-             WHERE id = ?
-            """,
-            (request_id, external_id, _now(), objective_id),
-        )
-        _append_event(
-            conn,
-            task_id,
-            "owner_blocker",
-            {
-                "objective_id": objective_id,
-                "external_id": external_id,
-                "request_id": request_id,
-                "decision_key": decision_key,
-            },
-        )
-    try:
-        block_task(
-            conn,
-            task_id,
-            reason=f"owner decision required: {decision_key}",
-            kind="needs_input",
-        )
-    except Exception:
-        logger.debug("block_task for owner blocker failed", exc_info=True)
-    return request_id
+    return _commit_owner_blocker_request(
+        conn,
+        objective_id=objective_id,
+        task_id=task_id,
+        decision_key=decision_key,
+        external_id=external_id,
+        event_key=event_key,
+        request_id=request_id,
+        choices=list(choices or [])[:4],
+    )
 
 
 def revalidate_owner_answer(
@@ -1653,6 +1910,8 @@ def supervise_once(
             status = reconcile_objective(conn, row["id"])
             if status == "done":
                 result.completed_objectives.append(row["id"])
+    recovered = reconcile_reserved_owner_blockers(conn, remoko=remoko)
+    result.remoko_requests.extend(recovered)
     if _table_exists(conn, "kanban_supervisor_events"):
         rows = conn.execute(
             "SELECT event_key, task_id, payload FROM kanban_supervisor_events "

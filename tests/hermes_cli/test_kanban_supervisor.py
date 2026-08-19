@@ -78,6 +78,24 @@ class FakeRemoko(sup.RemokoClient):
             return {}
         return dict(rec)
 
+    def find_request(self, external_id: str) -> dict:
+        for rec in self.requests.values():
+            if rec.get("external_id") == external_id:
+                return dict(rec)
+        return {}
+
+    def seed(self, *, request_id: str, external_id: str, status: str = "pending") -> str:
+        rec = {
+            "request_id": request_id,
+            "id": request_id,
+            "external_id": external_id,
+            "status": status,
+            "answer": None,
+            "choices": [],
+        }
+        self.requests[request_id] = rec
+        return request_id
+
     def answer(self, request_id: str, answer: str) -> None:
         rec = self.requests[str(request_id)]
         rec["status"] = "answered"
@@ -562,6 +580,7 @@ def test_remoko_failure_does_not_fabricate_request_id(kanban_home):
         def request(self, payload: dict) -> dict:
             raise RuntimeError("inbox down")
 
+    remoko = FakeRemoko()
     with kb.connect() as conn:
         root = kb.create_task(conn, title="root", assignee="default")
         oid = sup.ensure_objective(conn, root)
@@ -575,6 +594,118 @@ def test_remoko_failure_does_not_fabricate_request_id(kanban_home):
         assert obj is not None
         assert not obj.get("remoko_request_id")
         assert obj["status"] != "blocked_owner"
+        retry = sup.request_owner_blocker(
+            conn, objective_id=oid, task_id=root,
+            decision_key="active_pr_starvation",
+            purpose="stuck", remoko=remoko,
+        )
+        assert retry
+        assert len(remoko.calls) == 1
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert obj["remoko_request_id"] == retry
+
+
+def _seed_reserving_owner_blocker(conn, oid: str, task_id: str, decision_key: str = "active_pr_starvation"):
+    external_id = f"obj-{oid}-{decision_key}"
+    event_key = f"remoko:{oid}:{decision_key}"
+    assert sup._record_supervisor_event(
+        conn,
+        event_key=event_key,
+        kind="owner_blocker",
+        task_id=task_id,
+        objective_id=oid,
+        payload={
+            "external_id": external_id,
+            "decision_key": decision_key,
+            "status": "reserving",
+            "choices": ["Update existing PR", "Open a new PR", "Leave it parked", "Wait"],
+        },
+    )
+    return external_id, event_key
+
+
+def test_reserving_event_with_live_request_is_recovered(kanban_home):
+    remoko = FakeRemoko()
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        oid = sup.ensure_objective(conn, root)
+        ext, event_key = _seed_reserving_owner_blocker(conn, oid, root)
+        live_id = remoko.seed(request_id="rk-orphan", external_id=ext)
+        rid = sup.request_owner_blocker(
+            conn, objective_id=oid, task_id=root,
+            decision_key="active_pr_starvation",
+            purpose="stuck",
+            choices=["Update existing PR", "Open a new PR", "Leave it parked", "Wait"],
+            remoko=remoko,
+        )
+        assert rid == live_id
+        assert remoko.calls == []
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert obj["remoko_request_id"] == live_id
+        assert obj["remoko_external_id"] == ext
+        assert obj["status"] == "blocked_owner"
+        event = sup._supervisor_event(conn, event_key)
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["status"] == "sent"
+        assert payload["request_id"] == live_id
+        again = sup.request_owner_blocker(
+            conn, objective_id=oid, task_id=root,
+            decision_key="active_pr_starvation",
+            purpose="stuck", remoko=remoko,
+        )
+        assert again == live_id
+        assert remoko.calls == []
+
+
+def test_reserving_without_live_request_does_not_send_duplicate(kanban_home):
+    remoko = FakeRemoko()
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        oid = sup.ensure_objective(conn, root)
+        ext, event_key = _seed_reserving_owner_blocker(conn, oid, root)
+        rid = sup.request_owner_blocker(
+            conn, objective_id=oid, task_id=root,
+            decision_key="active_pr_starvation",
+            purpose="stuck", remoko=remoko,
+        )
+        assert rid is None
+        assert remoko.calls == []
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert not obj.get("remoko_request_id")
+        assert obj["status"] != "blocked_owner"
+        event = sup._supervisor_event(conn, event_key)
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["status"] == "reserving"
+        assert payload["external_id"] == ext
+
+
+def test_supervise_once_recovers_reserving_after_handled_starvation(kanban_home):
+    remoko = FakeRemoko()
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(conn, title="child", assignee="cole", parents=[root])
+        oid = sup.ensure_objective(conn, root)
+        ext, _event_key = _seed_reserving_owner_blocker(conn, oid, child)
+        live_id = remoko.seed(request_id="rk-tick-orphan", external_id=ext)
+        assert sup._record_supervisor_event(
+            conn,
+            event_key="handled:starvation:already",
+            kind="starvation_handled",
+            task_id=child,
+            payload={"action": "owner_blocker", "request_id": None},
+        )
+        result = sup.supervise_once(conn, remoko=remoko)
+        assert live_id in result.remoko_requests
+        assert remoko.calls == []
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert obj["remoko_request_id"] == live_id
+        assert obj["status"] == "blocked_owner"
 
 
 def test_resume_requires_persisted_request_and_known_choice(kanban_home):
