@@ -16997,12 +16997,35 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()
-            if mode in {"fast", "on"}:
-                agent.service_tier = "priority"
-            elif mode in {"normal", "off"}:
-                agent.service_tier = None
-            elif mode in {"auto", "cold"}:
-                agent.service_tier = mode
+            # Keep request_overrides in lock-step with service_tier: the
+            # transport emits the tier from the overrides, so setting only
+            # service_tier here would leave a session built with a configured
+            # tier still sending it after `/fast off` (reporting normal while
+            # billing the tier), and `/fast on` would relabel without sending.
+            # Mirrors the `config.set key=fast` path above. auto/cold windows
+            # are applied per request by agent.fast_mode, so they clear any
+            # pinned tier keys without resolving new ones.
+            if mode in {"fast", "on", "normal", "off", "auto", "cold"}:
+                _overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                _overrides.pop("service_tier", None)
+                _overrides.pop("speed", None)
+                if mode in {"fast", "on"}:
+                    agent.service_tier = "priority"
+                    from hermes_cli.models import resolve_fast_mode_overrides
+
+                    try:
+                        _resolved = resolve_fast_mode_overrides(
+                            getattr(agent, "model", None)
+                        )
+                    except Exception:
+                        _resolved = None
+                    if _resolved:
+                        _overrides.update(_resolved)
+                elif mode in {"auto", "cold"}:
+                    agent.service_tier = mode
+                else:
+                    agent.service_tier = None
+                agent.request_overrides = _overrides
             _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()
