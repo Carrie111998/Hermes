@@ -893,6 +893,9 @@ def init_agent(
     # normal interrupt propagation available once the fork is constructed.
     agent._background_review_agent = None
     agent._background_review_run = None
+    # Prepared automatic post-turn review (thread + run token), held until the
+    # parent Relay task/turn has fully finalized. Manual /refine is immediate.
+    agent._deferred_background_review = None
     agent._background_review_lock = threading.Lock()
 
     # Store OpenRouter provider preferences

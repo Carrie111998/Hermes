@@ -783,8 +783,9 @@ def finalize_turn(
         messages=messages,
     )
 
-    # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
+    # Queue the background memory/skill review. The outer AIAgent wrapper starts
+    # it only after parent Relay/task/session-lease cleanup has completed, so
+    # the fork cannot share a live physical scope stack with the finishing turn.
     # Suppressed when skip_background_review=True (e.g. cron) — review forks
     # spawn another AIAgent (~30K tokens / event) and cron sessions have no
     # human-in-the-loop benefit from the review.
@@ -799,6 +800,7 @@ def finalize_turn(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
+                defer_until_turn_complete=True,
             )
         except Exception:
             pass  # Background review is best-effort

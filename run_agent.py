@@ -1808,6 +1808,7 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
         focus: Optional[str] = None,
+        defer_until_turn_complete: bool = False,
     ) -> None:
         """Spawn the background memory/skill review thread.
 
@@ -1820,6 +1821,11 @@ class AIAgent:
         ``focus`` is optional user-supplied steering (from ``/refine``)
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
+
+        Automatic reviews pass ``defer_until_turn_complete=True`` from the
+        turn finalizer. They are started by the outer wrapper only after its
+        Relay task/turn and durable session lease have closed. Explicit
+        ``/refine`` calls remain immediate.
         """
         # A delegation subagent (``_delegate_depth > 0``) must not run the
         # automatic post-turn review. Subagents are ephemeral workers already
@@ -1869,8 +1875,35 @@ class AIAgent:
                 daemon=True,
                 name="bg-review",
             )
+            if defer_until_turn_complete:
+                # The run token is already published, closing the gap between
+                # parent finalization and Thread.start(). A concurrent live turn
+                # can cancel this prepared review before it reaches a provider.
+                self._deferred_background_review = (t, review_run)
+                return
             t.start()
         except Exception:
+            finish_background_review_run(self, review_run)
+            raise
+
+    def _flush_deferred_background_review(self) -> None:
+        """Start one queued automatic review after parent turn cleanup."""
+        lock = getattr(self, "_background_review_lock", None)
+        if lock is None:
+            prepared = getattr(self, "_deferred_background_review", None)
+            self._deferred_background_review = None
+        else:
+            with lock:
+                prepared = getattr(self, "_deferred_background_review", None)
+                self._deferred_background_review = None
+        if not isinstance(prepared, tuple) or len(prepared) != 2:
+            return
+        thread, review_run = prepared
+        try:
+            thread.start()
+        except Exception:
+            from agent.background_review import finish_background_review_run
+
             finish_background_review_run(self, review_run)
             raise
 
@@ -8367,29 +8400,11 @@ class AIAgent:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
         # parity. Fence review startup or interrupt an admitted request, then
-        # await that request's exit before opening any live-turn Relay or task
-        # instrumentation for the same session.
+        # bounded-wait for request exit before opening live-turn Relay/task
+        # instrumentation. Foreground retains priority on a pathological abort.
         from agent.background_review import cancel_background_review_for_live_turn
 
-        if not cancel_background_review_for_live_turn(self):
-            failure = (
-                "Live turn not started: the prior background review did not "
-                "acknowledge cancellation before the bounded safety deadline. "
-                "Retry after the review has stopped."
-            )
-            existing_messages = conversation_history
-            if existing_messages is None:
-                existing_messages = getattr(self, "_session_messages", None)
-            return {
-                "final_response": failure,
-                "messages": list(existing_messages or []),
-                "completed": False,
-                "api_calls": 0,
-                "error": failure,
-                "failed": True,
-                "retryable": True,
-                "background_review_cancellation_timeout": True,
-            }
+        cancel_background_review_for_live_turn(self)
 
         from agent.aux_accounting import (
             reset_accounting_context,
@@ -8843,6 +8858,17 @@ class AIAgent:
                         pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    # Start an automatic review only after the parent Relay
+                    # task/turn and durable session lease are fully closed.
+                    # Keep the current profile/accounting ContextVars alive for
+                    # thread propagation, then reset them below.
+                    try:
+                        self._flush_deferred_background_review()
+                    except Exception:
+                        logger.warning(
+                            "Failed to start deferred background review",
+                            exc_info=True,
+                        )
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

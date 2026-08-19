@@ -141,13 +141,24 @@ def cancel_background_review_for_live_turn(agent: Any) -> bool:
     """Cancel the current review and await its request-phase acknowledgement.
 
     Returns ``False`` when acknowledgement is unavailable or misses the bounded
-    deadline.  Callers must then stop before same-session turn-context work.
+    deadline. The live turn retains foreground priority and may proceed after
+    the bounded wait; the warning remains actionable.
     """
     lock = getattr(agent, "_background_review_lock", None)
+    prepared_cancelled = False
     if lock is not None:
         with lock:
             run = getattr(agent, "_background_review_run", None)
             legacy_agent = getattr(agent, "_background_review_agent", None)
+            prepared = getattr(agent, "_deferred_background_review", None)
+            if (
+                run is not None
+                and isinstance(prepared, tuple)
+                and len(prepared) == 2
+                and prepared[1] is run
+            ):
+                agent._deferred_background_review = None
+                prepared_cancelled = True
     else:
         run = getattr(agent, "_background_review_run", None)
         legacy_agent = getattr(agent, "_background_review_agent", None)
@@ -159,6 +170,11 @@ def cancel_background_review_for_live_turn(agent: Any) -> bool:
         return False
 
     review_agent = run.cancel()
+    if prepared_cancelled:
+        # The automatic review was prepared but its daemon had not started.
+        # Retire it synchronously so foreground never waits for a worker that
+        # parent cleanup has not launched yet.
+        finish_background_review_run(agent, run)
     if review_agent is not None:
         _interrupt_background_review(review_agent)
 
@@ -166,9 +182,9 @@ def cancel_background_review_for_live_turn(agent: Any) -> bool:
         timeout=_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS
     )
     if not acknowledged:
-        logger.error(
+        logger.warning(
             "Background review did not acknowledge cancellation within %.1fs; "
-            "refusing to start overlapping live turn",
+            "proceeding with foreground live turn",
             _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS,
         )
     return acknowledged
