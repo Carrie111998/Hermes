@@ -556,6 +556,15 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             return f"-{target}: \"{old[:20]}\""
         return action
 
+    # reasoning_effort: show the target level (+ persistence marker)
+    if tool_name == "reasoning_effort":
+        level = _oneline(str(args.get("level", "")).strip().lower())
+        if not level:
+            return None
+        if args.get("persist"):
+            level += " (persist)"
+        return level
+
     if tool_name == "send_message":
         target = args.get("target", "?")
         msg = _oneline(args.get("message", ""))
@@ -661,6 +670,7 @@ _TOOL_VERBS: dict[str, str] = {
     "clarify": "Asking",
     "memory": "Updating memory",
     "todo": "Updating tasks",
+    "reasoning_effort": "Adjusting reasoning effort",
 }
 
 # Verbs that read better without the raw argument preview appended.

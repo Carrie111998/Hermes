@@ -77,6 +77,21 @@ class TestBuildToolPreview:
         assert safe_args["ref"] == "@e3"
         assert safe_args["text"].startswith("ghp_AB")
 
+    def test_reasoning_effort_preview_shows_target_level(self):
+        assert build_tool_preview("reasoning_effort", {"level": "high"}) == "high"
+
+    def test_reasoning_effort_preview_normalizes_case(self):
+        assert build_tool_preview("reasoning_effort", {"level": " HIGH "}) == "high"
+
+    def test_reasoning_effort_preview_marks_persist(self):
+        result = build_tool_preview(
+            "reasoning_effort", {"level": "low", "persist": True}
+        )
+        assert result == "low (persist)"
+
+    def test_reasoning_effort_preview_empty_level_returns_none(self):
+        assert build_tool_preview("reasoning_effort", {"level": ""}) is None
+
 
 
 

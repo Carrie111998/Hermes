@@ -5272,6 +5272,9 @@ class TurnRunner:
             session_key=ctx.session_key,
             model=model,
         )
+        reasoning_update_callback = self._runner._make_reasoning_update_callback(
+            ctx.session_key
+        )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -5616,6 +5619,7 @@ class TurnRunner:
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
+                reasoning_update_callback=reasoning_update_callback,
                 service_tier=self._runner._service_tier,
                 request_overrides=turn_route.get("request_overrides"),
                 providers_allowed=pr.get("only"),
@@ -5729,6 +5733,7 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
+        agent.reasoning_update_callback = reasoning_update_callback
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
         # Must-deliver notes for THIS turn ride the current user message
@@ -9287,6 +9292,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+
+    def _persist_reasoning_effort_config(self, level: str) -> bool:
+        """Persist agent.reasoning_effort to config.yaml. Returns True on success."""
+        try:
+            from hermes_cli.config import atomic_config_write
+            import yaml
+
+            config_path = _hermes_home / "config.yaml"
+            user_config = {}
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    user_config = yaml.safe_load(f) or {}
+            agent_cfg = user_config.get("agent")
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+                user_config["agent"] = agent_cfg
+            agent_cfg["reasoning_effort"] = level
+            atomic_config_write(config_path, user_config)
+            return True
+        except Exception as e:
+            logger.error("Failed to persist reasoning_effort from tool: %s", e)
+            return False
+
+    def _make_reasoning_update_callback(self, session_key: str):
+        """Keep tool updates durable across cached-agent message resets."""
+        def _callback(level: str, parsed_config: dict, persist: bool = False) -> bool:
+            if persist and self._persist_reasoning_effort_config(level):
+                self._set_session_reasoning_override(session_key, None)
+                self._reasoning_config = dict(parsed_config)
+                return True
+            self._set_session_reasoning_override(session_key, parsed_config)
+            self._reasoning_config = dict(parsed_config)
+            return False
+
+        return _callback
 
     def _resolve_session_service_tier(
         self,
@@ -22225,6 +22265,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
+            reasoning_update_callback = self._make_reasoning_update_callback(
+                self._session_key_for_source(source)
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -22257,6 +22300,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
+                    reasoning_update_callback=reasoning_update_callback,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
