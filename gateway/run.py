@@ -15176,7 +15176,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
-        adapter._multiplex_profile_name = profile_name
         # Runtime status is process-scoped even while message/config work is
         # profile-scoped.  Preserve both dimensions in the key so dashboard
         # and NAS health aggregation can see which secondary profile failed.

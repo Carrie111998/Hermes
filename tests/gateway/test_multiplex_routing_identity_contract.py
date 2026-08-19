@@ -135,7 +135,9 @@ def test_secondary_credential_owner_is_stamped_before_adapter_batch_keying():
     runner._primary_profile_name = "default"
 
     adapter = _adapter(Platform.TELEGRAM, runner)
-    adapter._multiplex_profile_name = "career-ops"
+    # main's canonical owner seam (BasePlatformAdapter.set_owner_profile,
+    # #89860) — not a PR-private field.
+    adapter.set_owner_profile("career-ops")
     source = adapter.build_source(chat_id="chat", chat_type="dm", user_id="user")
 
     # Main now resolves credential ownership at session-keying time

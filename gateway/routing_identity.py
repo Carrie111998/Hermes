@@ -167,7 +167,6 @@ def canonicalize_routing_identity(
     restored_persistence_profile: object = None,
     active_profile: object = DEFAULT_PROFILE,
     served_profiles: Optional[Iterable[object]] = None,
-    credential_claimants: Optional[Iterable[object]] = None,
     route_rejected: bool = False,
 ) -> RoutingIdentity:
     """Resolve one canonical identity or reject the turn.
@@ -177,22 +176,16 @@ def canonicalize_routing_identity(
     authoritative claims are checked before precedence is applied; conflicting
     claims never silently collapse into ``default``.
 
-    ``credential_claimants`` represents every profile claiming the same live
-    credential fingerprint.  More than one distinct claimant is rejected even
-    when a route would otherwise choose one runtime, because two adapters cannot
-    safely poll or send through the same credential concurrently.
+    Duplicate-credential enforcement (one credential, one profile) is a
+    startup invariant enforced by the multiplexer's adapter-install path
+    (``GatewayRunner._configure_profile_adapter`` ``claimed`` map / ``_adapter_credential_fingerprint``),
+    not a per-turn concern here.
     """
 
     if route_rejected:
         raise RoutingIdentityRejected("matched profile route was explicitly rejected")
 
     served = _normalized_set(served_profiles)
-    claimants = _normalized_set(credential_claimants)
-    if claimants is not None and len(claimants) > 1:
-        raise RoutingIdentityConflict(
-            "one credential is claimed by multiple profiles: "
-            + ", ".join(sorted(claimants))
-        )
 
     route = normalize_profile(route_profile) if route_profile not in (None, "") else None
     source = (
@@ -466,7 +459,10 @@ def _credential_owner_for_adapter(
     if carried not in (None, ""):
         return normalize_profile(carried)
 
-    explicit = getattr(adapter, "_multiplex_profile_name", None)
+    # main's set_owner_profile (_configure_profile_adapter, #89860) stores the
+    # canonical credential owner on the adapter. Consume that seam rather than
+    # a duplicate private field.
+    explicit = getattr(adapter, "_owner_profile", None)
     if explicit not in (None, ""):
         return normalize_profile(explicit)
 

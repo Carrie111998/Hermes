@@ -65,15 +65,6 @@ def test_conflicting_route_and_source_reject():
         )
 
 
-def test_duplicate_credential_claimants_reject_even_with_route():
-    with pytest.raises(RoutingIdentityConflict, match="multiple profiles"):
-        canonicalize_routing_identity(
-            route_profile="finance",
-            credential_owner="default",
-            credential_claimants={"default", "career-ops"},
-        )
-
-
 def test_unserved_transport_owner_rejects():
     with pytest.raises(RoutingIdentityRejected, match="transport profile"):
         canonicalize_routing_identity(
