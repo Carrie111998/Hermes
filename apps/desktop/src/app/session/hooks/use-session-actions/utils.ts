@@ -1306,10 +1306,9 @@ export async function resolveStoredSession(
   // machine-wide spawn storm plus a wall of false "Session not found" 404s.
   if (hintedProfile) {
     const key = normalizeProfileKey(hintedProfile)
+
     const hintedCached = allCached.find(
-      session =>
-        sessionMatchesStoredId(session, storedSessionId) &&
-        normalizeProfileKey(session.profile) === key
+      session => sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === key
     )
 
     if (hintedCached) {
