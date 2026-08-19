@@ -11,6 +11,34 @@ import pytest
 from run_agent import AIAgent
 
 
+def _install_task1_constructor_guards(monkeypatch):
+    probes = {
+        "context": MagicMock(return_value=262_144),
+        "endpoint": MagicMock(
+            side_effect=AssertionError("constructor endpoint probe forbidden")
+        ),
+        "local": MagicMock(
+            side_effect=AssertionError("constructor local-service probe forbidden")
+        ),
+    }
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length", probes["context"],
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.fetch_endpoint_model_metadata", probes["endpoint"],
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.detect_local_server_type", probes["local"],
+    )
+    return probes
+
+
+def _assert_task1_constructor_guards(probes):
+    probes["context"].assert_called_once()
+    probes["endpoint"].assert_not_called()
+    probes["local"].assert_not_called()
+
+
 def test_named_loopback_ollama_does_not_apply_configured_provider_headers():
     """Local named Ollama must not reattach headers dropped by its resolver."""
     agent = AIAgent.__new__(AIAgent)
@@ -103,6 +131,12 @@ def test_full_constructor_and_rebuild_isolate_named_local_ollama_provider_body(
     _write_ollama_extra_body_config(tmp_path, base_url=base_url)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("run_agent.OpenAI", MagicMock(return_value=MagicMock()))
+    probes = _install_task1_constructor_guards(monkeypatch)
+    provider_layer = (
+        {"extra_body": {"provider_body_marker": "configured"}}
+        if keeps_provider_body
+        else {}
+    )
 
     agent = AIAgent(
         api_key="synthetic-route-key",
@@ -112,25 +146,41 @@ def test_full_constructor_and_rebuild_isolate_named_local_ollama_provider_body(
         api_mode="chat_completions",
         model="synthetic-model",
         request_overrides={
-            "caller_option": "caller-owned-marker",
+            "caller_option": "retained",
             "extra_body": {"caller_body_marker": "retained"},
         },
+        provider_request_overrides=provider_layer,
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
     )
 
+    assert agent.requested_provider == requested_provider
+    assert agent._provider_request_overrides == provider_layer
+    assert agent._caller_request_overrides == {
+        "caller_option": "retained",
+        "extra_body": {"caller_body_marker": "retained"},
+    }
     expected_extra_body = {"caller_body_marker": "retained"}
     if keeps_provider_body:
         expected_extra_body["provider_body_marker"] = "configured"
     assert agent.request_overrides == {
-        "caller_option": "caller-owned-marker",
+        "caller_option": "retained",
         "extra_body": expected_extra_body,
     }
+    if not keeps_provider_body:
+        assert agent.request_overrides == agent._caller_request_overrides
+        assert agent._client_kwargs.get("default_headers") is None
+    _assert_task1_constructor_guards(probes)
+
+    if keeps_provider_body:
+        provider_layer["extra_body"]["provider_body_marker"] = "mutated-input"
+        assert agent._provider_request_overrides["extra_body"]["provider_body_marker"] == "configured"
+        assert agent.request_overrides["extra_body"]["provider_body_marker"] == "configured"
 
     assert agent._replace_primary_openai_client(reason="test-provider-body") is True
     assert agent.request_overrides == {
-        "caller_option": "caller-owned-marker",
+        "caller_option": "retained",
         "extra_body": expected_extra_body,
     }
 

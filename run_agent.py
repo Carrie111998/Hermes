@@ -46,6 +46,7 @@ import time
 import threading
 import uuid
 import warnings
+from collections.abc import Mapping
 from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -432,6 +433,39 @@ class AIAgent:
         self._base_url_lower = value.lower() if value else ""
         self._base_url_hostname = base_url_hostname(value)
 
+    def _rebuild_effective_request_overrides(self) -> None:
+        provider = copy.deepcopy(self._provider_request_overrides)
+        caller = copy.deepcopy(self._caller_request_overrides)
+        effective = copy.deepcopy(provider)
+        effective.update(copy.deepcopy(caller))
+        provider_body = provider.get("extra_body")
+        caller_body = caller.get("extra_body")
+        if isinstance(provider_body, Mapping) and isinstance(caller_body, Mapping):
+            body = copy.deepcopy(dict(provider_body))
+            body.update(copy.deepcopy(dict(caller_body)))
+            effective["extra_body"] = body
+        self._request_overrides = copy.deepcopy(effective)
+
+    def _set_caller_request_overrides(self, value) -> None:
+        if value is not None and not isinstance(value, Mapping):
+            raise TypeError("caller request overrides must be a mapping")
+        self._caller_request_overrides = copy.deepcopy(dict(value or {}))
+        self._rebuild_effective_request_overrides()
+
+    def _set_provider_request_overrides(self, value) -> None:
+        if value is not None and not isinstance(value, Mapping):
+            raise TypeError("provider request overrides must be a mapping")
+        self._provider_request_overrides = copy.deepcopy(dict(value or {}))
+        self._rebuild_effective_request_overrides()
+
+    @property
+    def request_overrides(self):
+        return self._request_overrides
+
+    @request_overrides.setter
+    def request_overrides(self, value):
+        self._set_caller_request_overrides(value)
+
     def __init__(
         self,
         base_url: str = None,
@@ -510,6 +544,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        provider_request_overrides: dict[str, Any] | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -597,6 +632,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            provider_request_overrides=provider_request_overrides,
         )
 
     def _get_session_db_for_recall(self):

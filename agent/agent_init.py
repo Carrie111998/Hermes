@@ -26,6 +26,8 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
@@ -37,8 +39,6 @@ from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     fetch_model_metadata,
-    is_local_endpoint,
-    query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -471,31 +471,31 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
-def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
+def _provider_request_overrides_for_route(
+    *,
+    requested_provider: str,
+    provider: str,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     from hermes_cli.runtime_provider import _is_named_loopback_ollama_route
 
     if _is_named_loopback_ollama_route(
-        agent.requested_provider or agent.provider,
-        agent.base_url,
+        requested_provider,
+        base_url,
     ):
-        return
+        return {}
 
     extra_body = _custom_provider_extra_body_for_agent(
-        provider=agent.provider,
-        model=agent.model,
-        base_url=agent.base_url,
+        provider=provider,
+        model=model,
+        base_url=base_url,
         custom_providers=custom_providers,
     )
-    if not extra_body:
-        return
-
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
-    existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
-    agent.request_overrides = overrides
+    if not isinstance(extra_body, Mapping) or not extra_body:
+        return {}
+    return {"extra_body": deepcopy(dict(extra_body))}
 
 
 def init_agent(
@@ -575,6 +575,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    provider_request_overrides: dict[str, Any] | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -670,9 +671,9 @@ def init_agent(
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
     agent.requested_provider = (
-        requested_provider.strip().lower()
+        requested_provider.strip()
         if isinstance(requested_provider, str) and requested_provider.strip()
-        else agent.provider
+        else str(provider or "").strip()
     )
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
@@ -920,7 +921,10 @@ def init_agent(
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
-    agent.request_overrides = dict(request_overrides or {})
+    agent._caller_request_overrides = {}
+    agent._provider_request_overrides = {}
+    agent._request_overrides = {}
+    agent.request_overrides = request_overrides
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     
@@ -2483,7 +2487,15 @@ def init_agent(
     # Store for reuse by _check_compression_model_feasibility (auxiliary
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
-    _merge_custom_provider_extra_body(agent, _custom_providers)
+    if provider_request_overrides is None:
+        provider_request_overrides = _provider_request_overrides_for_route(
+            requested_provider=agent.requested_provider,
+            provider=agent.provider,
+            model=agent.model,
+            base_url=agent.base_url,
+            custom_providers=_custom_providers,
+        )
+    agent._set_provider_request_overrides(provider_request_overrides)
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
@@ -2849,18 +2861,6 @@ def init_agent(
             agent._ollama_num_ctx = int(_ollama_num_ctx_override)
         except (TypeError, ValueError):
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
-        try:
-            # ``agent.api_key`` may be a callable (Entra token provider).
-            # Ollama detection makes a manual HTTP request and expects a
-            # string — Azure Foundry isn't a local endpoint so this branch
-            # never fires for Entra, but guard defensively.
-            _key_for_ollama = agent.api_key if isinstance(agent.api_key, str) else ""
-            _detected = query_ollama_num_ctx(agent.model, agent.base_url, api_key=_key_for_ollama or "")
-            if _detected and _detected > 0:
-                agent._ollama_num_ctx = _detected
-        except Exception as exc:
-            _ra().logger.debug("Ollama num_ctx detection failed: %s", exc)
     # Cap auto-detected ollama_num_ctx to the user's explicit context_length.
     # Without this, GGUF metadata can advertise 256K+ which Ollama honours
     # by allocating that much VRAM — blowing up small GPUs even though the
@@ -2956,6 +2956,8 @@ def init_agent(
         "model": agent.model,
         "provider": agent.provider,
         "requested_provider": agent.requested_provider,
+        "caller_request_overrides": deepcopy(agent._caller_request_overrides),
+        "provider_request_overrides": deepcopy(agent._provider_request_overrides),
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
