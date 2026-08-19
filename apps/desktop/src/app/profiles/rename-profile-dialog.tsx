@@ -26,12 +26,18 @@ const identity = (raw: string) => raw
 // Self-contained rename (owns the renameProfile call) so every caller just
 // reacts via onRenamed. Unchanged name is a no-op close.
 export function RenameProfileDialog({
+  connectionId,
   currentName,
   isDefault = false,
   onClose,
   onRenamed,
   open
 }: {
+  /** The machine that owns this profile.
+   *  Manage Profiles lists every registered gateway's profiles, so an action
+   *  has to run on the box the row came from. Omitted / '' = the primary, so
+   *  single-gateway callers are unchanged. */
+  connectionId?: null | string
   currentName: string
   /** Default profile: sets a presentation-only display name (Unicode ok);
    *  the canonical id stays "default" and no backend teardown is needed. */
@@ -89,7 +95,10 @@ export function RenameProfileDialog({
         retireLocalProfileGateways(currentName)
       }
 
-      await renameProfile(currentName, trimmed)
+      // Pass the owning machine ONLY when there is one, so a
+      // single-gateway install issues the byte-identical upstream call.
+      const scope: [] | [string] = connectionId ? [connectionId] : []
+      await renameProfile(currentName, trimmed, ...scope)
       await onRenamed?.(trimmed)
       setStatus('done')
       window.setTimeout(onClose, 800)

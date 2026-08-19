@@ -8,11 +8,17 @@ import { $activeGatewayProfile, normalizeProfileKey, selectProfile, setActivePro
 // Enter-to-confirm + busy/done/error from the shared dialog. The single choke
 // point for every delete entry point (rail + Profiles view).
 export function DeleteProfileDialog({
+  connectionId,
   profile,
   onClose,
   onDeleted,
   open
 }: {
+  /** The machine that owns this profile.
+   *  Manage Profiles lists every registered gateway's profiles, so an action
+   *  has to run on the box the row came from. Omitted / '' = the primary, so
+   *  single-gateway callers are unchanged. */
+  connectionId?: null | string
   profile: { name: string; path: string } | null
   onClose: () => void
   onDeleted?: () => Promise<void> | void
@@ -50,7 +56,10 @@ export function DeleteProfileDialog({
         // racing the (still-dying) backend can't clobber the pill back to it.
         const wasActive = normalizeProfileKey(profile.name) === normalizeProfileKey($activeGatewayProfile.get())
         retireLocalProfileGateways(profile.name)
-        await deleteProfile(profile.name)
+        // Pass the owning machine ONLY when there is one, so a
+        // single-gateway install issues the byte-identical upstream call.
+        const scope: [] | [string] = connectionId ? [connectionId] : []
+        await deleteProfile(profile.name, ...scope)
         await onDeleted?.()
 
         if (wasActive) {

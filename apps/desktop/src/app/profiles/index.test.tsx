@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { atom } from 'nanostores'
 import type * as Nanostores from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -41,7 +42,11 @@ vi.mock('@/store/notifications', () => ({
 }))
 
 vi.mock('@/store/gateway', () => ({
-  retireLocalProfileGateways: vi.fn()
+  retireLocalProfileGateways: vi.fn(),
+  // Manage Profiles now lists every registered gateway, so it pulls in
+  // store/gateway-separation, which mirrors the live gateway's connection.
+  $gateway: atom<unknown>(null),
+  activeGatewayConnectionId: vi.fn(() => null)
 }))
 
 const { $activeGatewayProfile: activeGateway, $profileColors } = vi.hoisted(() => {

@@ -30,11 +30,17 @@ export function isValidProfileName(name: string): boolean {
 // createProfile/updateProfileSoul calls so every caller just refreshes/selects
 // via onCreated. SOUL left blank keeps the cloned/blank persona untouched.
 export function CreateProfileDialog({
+  connectionId,
   onClose,
   onCreated,
   open,
   profiles = []
 }: {
+  /** The machine that owns this profile.
+   *  Manage Profiles lists every registered gateway's profiles, so an action
+   *  has to run on the box the row came from. Omitted / '' = the primary, so
+   *  single-gateway callers are unchanged. */
+  connectionId?: null | string
   onClose: () => void
   onCreated?: (name: string) => Promise<void> | void
   open: boolean
@@ -77,10 +83,13 @@ export function CreateProfileDialog({
     setError(null)
 
     try {
-      await createProfile({ name: trimmed, clone_from: cloneFrom })
+      // Pass the owning machine ONLY when there is one, so a
+      // single-gateway install issues the byte-identical upstream call.
+      const scope: [] | [string] = connectionId ? [connectionId] : []
+      await createProfile({ name: trimmed, clone_from: cloneFrom }, ...scope)
 
       if (soul.trim()) {
-        await updateProfileSoul(trimmed, soul)
+        await updateProfileSoul(trimmed, soul, ...scope)
       }
 
       await onCreated?.(trimmed)
