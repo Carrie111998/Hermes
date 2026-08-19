@@ -27,7 +27,7 @@ const PERCH_SELECTORS = ['[data-slot="composer-surface"]', '[data-slot="profile-
 // A full-width bar pinned to the window bottom (the status bar). When present,
 // the pet walks along its TOP edge instead of the window edge, so it stands on
 // the bar rather than covering it.
-const FLOOR_BAR_SELECTOR = '[data-slot="statusbar"]'
+const FLOOR_BAR_SELECTOR = '[data-statusbar]'
 
 // Sprites carry a few px of transparent padding below the feet; sink the pet by
 // this much so the visible feet meet the surface instead of hovering above it.
