@@ -102,6 +102,20 @@ class FakeRemoko(sup.RemokoClient):
         rec["answer"] = answer
 
 
+class FailOnceRemoko(FakeRemoko):
+    """Jude's repro: first send fails, later ticks must still retry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_left = 1
+
+    def request(self, payload: dict) -> dict:
+        if self.failures_left > 0:
+            self.failures_left -= 1
+            raise RuntimeError("inbox down")
+        return super().request(payload)
+
+
 def test_never_run_ready_child_with_pr_comment_is_dispatchable(
     kanban_home, monkeypatch,
 ):
@@ -682,6 +696,105 @@ def test_reserving_without_live_request_does_not_send_duplicate(kanban_home):
         payload = json.loads(event["payload"])
         assert payload["status"] == "reserving"
         assert payload["external_id"] == ext
+
+
+def test_supervise_once_retries_owner_blocker_after_fail_once_send(kanban_home):
+    remoko = FailOnceRemoko()
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="needs owner", assignee="cole", parents=[root],
+        )
+        kb.complete_task(conn, root, summary="root launched")
+        _seed_prior_run(conn, child)
+        kb.add_comment(conn, child, author="worker", body=PR_URL)
+        oid = sup.ensure_objective(conn, root)
+        for _ in range(3):
+            sup.record_respawn_guard(conn, child, "active_pr")
+
+        first = sup.supervise_once(conn, remoko=remoko)
+        assert first.starvation
+        assert first.starvation[0]["action"] == "owner_blocker"
+        assert first.starvation[0].get("request_id") is None
+        assert remoko.calls == []
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert not obj.get("remoko_request_id")
+        assert obj["status"] != "blocked_owner"
+        reservation = sup._supervisor_event(
+            conn, f"remoko:{oid}:active_pr_starvation",
+        )
+        assert reservation is None
+        handled_rows = conn.execute(
+            "SELECT event_key, payload FROM kanban_supervisor_events "
+            "WHERE kind = 'starvation_handled' AND task_id = ?",
+            (child,),
+        ).fetchall()
+        for row in handled_rows:
+            payload = json.loads(row["payload"] or "{}")
+            assert sup._starvation_handling_is_terminal(payload) is False
+
+        second = sup.supervise_once(conn, remoko=remoko)
+        assert len(remoko.calls) == 1
+        assert second.remoko_requests
+        rid = second.remoko_requests[-1]
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert obj["remoko_request_id"] == rid
+        assert obj["status"] == "blocked_owner"
+
+        third = sup.supervise_once(conn, remoko=remoko)
+        assert len(remoko.calls) == 1
+        assert remoko.calls[0]["external_id"] == f"obj-{oid}-active_pr_starvation"
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert obj["remoko_request_id"] == rid
+        assert not third.starvation or all(
+            action.get("request_id") in {None, rid} for action in third.starvation
+        )
+
+
+def test_supervise_once_retries_poisoned_handled_starvation_without_request(
+    kanban_home,
+):
+    remoko = FakeRemoko()
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="needs owner", assignee="cole", parents=[root],
+        )
+        kb.complete_task(conn, root, summary="root launched")
+        _seed_prior_run(conn, child)
+        kb.add_comment(conn, child, author="worker", body=PR_URL)
+        oid = sup.ensure_objective(conn, root)
+        starvation_key = ""
+        for _ in range(3):
+            ev = sup.record_respawn_guard(conn, child, "active_pr")
+            if ev:
+                starvation_key = f"starvation:{child}:active_pr:{ev['first_guard_at']}"
+        assert starvation_key
+        assert sup._supervisor_event(conn, starvation_key) is not None
+        assert sup._record_supervisor_event(
+            conn,
+            event_key=f"handled:{starvation_key}",
+            kind="starvation_handled",
+            task_id=child,
+            payload={"action": "owner_blocker", "request_id": None},
+        )
+
+        result = sup.supervise_once(conn, remoko=remoko)
+        assert len(remoko.calls) == 1
+        assert result.remoko_requests
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert obj["remoko_request_id"] == result.remoko_requests[-1]
+
+        again = sup.supervise_once(conn, remoko=remoko)
+        assert len(remoko.calls) == 1
+        assert not again.starvation or all(
+            action.get("request_id") == obj["remoko_request_id"]
+            for action in again.starvation
+        )
 
 
 def test_supervise_once_recovers_reserving_after_handled_starvation(kanban_home):

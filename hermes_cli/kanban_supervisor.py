@@ -1891,6 +1891,20 @@ def handle_starvation(
     return action
 
 
+def _starvation_handling_is_terminal(action: Optional[dict[str, Any]]) -> bool:
+    """A failed Remoko send is not a handled starvation event.
+
+    ``request_owner_blocker()`` deletes the reservation and returns no
+    request id. Recording ``handled:{starvation}`` in that state would
+    skip later ticks and never retry the owner blocker.
+    """
+    if not action:
+        return False
+    if action.get("action") == "owner_blocker" and not action.get("request_id"):
+        return False
+    return True
+
+
 def supervise_once(
     conn: sqlite3.Connection,
     *,
@@ -1898,6 +1912,8 @@ def supervise_once(
     dry_run: bool = False,
 ) -> SupervisorResult:
     """One supervisor tick: reconcile ledger, act on starvation, complete."""
+    from hermes_cli.kanban_db import write_txn
+
     result = SupervisorResult()
     if dry_run:
         return result
@@ -1925,21 +1941,27 @@ def supervise_once(
                 except Exception:
                     payload = {}
             handled_key = f"handled:{row['event_key']}"
-            if _supervisor_event_seen(conn, handled_key):
-                continue
+            handled = _supervisor_event(conn, handled_key)
+            if handled is not None:
+                handled_payload = _parse_event_payload(handled.get("payload"))
+                if _starvation_handling_is_terminal(handled_payload):
+                    continue
+                with write_txn(conn, allow_nested=True):
+                    _delete_supervisor_event(conn, handled_key)
             action = handle_starvation(
                 conn,
                 row["task_id"],
                 str(payload.get("reason") or "active_pr"),
                 remoko=remoko,
             )
-            _record_supervisor_event(
-                conn,
-                event_key=handled_key,
-                kind="starvation_handled",
-                task_id=row["task_id"],
-                payload=action,
-            )
+            if _starvation_handling_is_terminal(action):
+                _record_supervisor_event(
+                    conn,
+                    event_key=handled_key,
+                    kind="starvation_handled",
+                    task_id=row["task_id"],
+                    payload=action,
+                )
             result.starvation.append(action)
             if action.get("action") == "auto_repaired":
                 result.repaired.append(row["task_id"])
