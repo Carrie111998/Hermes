@@ -307,6 +307,55 @@ class TestFormatMessageBlockquote:
         assert "\\>" not in result
 
 
+    def test_expandable_blockquote_single_line(self, adapter):
+        """A one-line expandable quote keeps its unescaped end marker."""
+        result = adapter.format_message("**> quoted||")
+        assert result == "**> quoted||"
+
+
+    def test_expandable_blockquote_multiline_is_one_quote(self, adapter):
+        """A multi-line expandable quote must stay a single quotation.
+
+        The end marker '||' sits on the *last* line of the block, so it must
+        be recognised there and left unescaped; escaping it would show '||'
+        as literal text and leave the quote non-expandable.
+        """
+        result = adapter.format_message("**> Line one\n> Line two\n> Line three||")
+        assert result == "**> Line one\n> Line two\n> Line three||"
+        assert "\\|" not in result
+        assert "\\>" not in result
+
+
+    def test_blank_line_inside_blockquote_stays_quoted(self, adapter):
+        """An empty quoted line ('>' alone) must not break the block apart.
+
+        Escaped to '\\>' it ends the quotation, so a quoted message split
+        into paragraphs came out as several disjoint quotes.
+        """
+        result = adapter.format_message("**> Bonjour,\n>\n> Merci !\n> Adrien||")
+        assert result == "**> Bonjour,\n>\n> Merci \\!\n> Adrien||"
+        assert "\\>" not in result
+
+
+    def test_blank_line_inside_regular_blockquote(self, adapter):
+        """Same for a non-expandable quote spanning two paragraphs."""
+        result = adapter.format_message("> Para one\n>\n> Para two")
+        assert result == "> Para one\n>\n> Para two"
+        assert "\\>" not in result
+
+
+    def test_lone_gt_line_outside_quote_still_escaped(self, adapter):
+        """A bare '>' line that quotes nothing is not a quotation."""
+        result = adapter.format_message("before\n>\nafter")
+        assert "\\>" in result
+
+
+    def test_two_blockquotes_separated_by_blank_line(self, adapter):
+        """A truly blank line (no '>') still separates two quotations."""
+        result = adapter.format_message("> one\n\n> two")
+        assert result == "> one\n\n> two"
+
+
 # =========================================================================
 # format_message - mixed/complex
 # =========================================================================
