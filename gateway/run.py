@@ -14935,9 +14935,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # ``write_runtime_status`` preserves fields omitted by later writes.
             # Clear coverage left by a predecessor multiplexer before this
             # independent gateway refreshes the runtime record with its own PID.
-            from gateway.status import write_runtime_status
+            try:
+                from gateway.status import write_runtime_status
 
-            write_runtime_status(served_profiles=[])
+                write_runtime_status(served_profiles=[])
+            except Exception:
+                logger.debug("could not clear served_profiles", exc_info=True)
             return 0
 
         try:
