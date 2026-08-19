@@ -6,6 +6,7 @@ npm it owns, and every other case leaves the original failure alone.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -473,6 +474,58 @@ class TestOpaqueEngineRepair:
         repaired = maybe_repair_npm_engine(str(npm), ELOCK_OUTPUT, quiet=True)
         assert not repaired
         assert _fake_npm_calls(npm) == []
+
+    def test_opaque_failure_on_foreign_nvm_npm_provisions_managed_runtime(
+        self, tmp_path, monkeypatch
+    ):
+        """#78826: nvm/system npm outside engines.npm + empty install output.
+
+        The failing npm is a PATH shim that looks like nvm (not under
+        ``$HERMES_HOME/node``). Repair must probe ``npm --version`` on that
+        shim, provision a Hermes-managed runtime, return the managed npm,
+        and never run ``install --global`` against the foreign toolchain.
+        """
+        home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        nvm_bin = (
+            tmp_path / "nvm" / "versions" / "node" / "v24.18.1" / "bin"
+        )
+        foreign_npm = _write_fake_npm(nvm_bin, version="11.16.0")
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join([str(nvm_bin), os.environ.get("PATH", "")]),
+        )
+
+        assert managed_npm_prefix(foreign_npm) is None
+
+        provisioned: list[str] = []
+
+        def fake_bootstrap() -> str:
+            managed = _write_fake_npm(home / "node" / "bin", version="11.17.0")
+            provisioned.append(str(managed))
+            return str(managed)
+
+        monkeypatch.setattr(
+            npm_engine, "bootstrap_hermes_managed_node", fake_bootstrap
+        )
+
+        repaired = maybe_repair_npm_engine(str(foreign_npm), "", quiet=True)
+
+        assert provisioned, "foreign opaque failure must provision managed Node"
+        assert repaired == provisioned[0]
+        assert repaired != str(foreign_npm)
+        assert Path(repaired).resolve() != foreign_npm.resolve()
+
+        foreign_calls = _fake_npm_calls(foreign_npm)
+        assert any("--version" in c for c in foreign_calls), foreign_calls
+        assert not any("--global" in c for c in foreign_calls), (
+            "foreign/nvm npm must never be the target of install --global: "
+            f"{foreign_calls}"
+        )
+
+        managed_calls = _fake_npm_calls(Path(repaired))
+        assert any("--global" in c for c in managed_calls), managed_calls
 
 
 class TestRepoRangeIsSatisfiable:
