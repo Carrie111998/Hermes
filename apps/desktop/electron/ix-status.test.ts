@@ -68,7 +68,7 @@ test('parseUpdateManifest: same/older/missing versions are NOT updates', () => {
 
 /* ── VPN deep status ─────────────────────────────────────────────────────── */
 
-const EXIT = '3.224.15.124'
+const EXIT = '18.209.130.93'
 
 test('vpn: green ONLY when tunnel up + egress via exit + fresh handshake', () => {
   const status = combineVpnStatus({

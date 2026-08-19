@@ -105,7 +105,7 @@ and `intelli-verse-kube-infra` (override with `IX_FRONTEND_DIR` /
 
 The org's VPN is the existing `usa-vpn` deployment (see
 `intelli-verse-kube-infra/usa-vpn/`): WireGuard via wg-easy v15 on
-Lightsail, endpoint `3.224.15.124:51820`, full tunnel, one `.conf` profile
+NEW-account EC2, endpoint `vpn.intelli-verse-x.ai:51820` (`18.209.130.93`), full tunnel, one `.conf` profile
 per employee. The EKS-hosted admin surfaces (Cloudflare Access / IP
 allowlists pinned to the VPN exit IP) become reachable once connected.
 
@@ -139,7 +139,7 @@ EKS, namespace `aicart`, host `hermes.intelli-verse-x.ai`):
 
    `--insecure` here means session-token auth instead of the Nous Portal
    OAuth gate; keep the ingress restricted (Cloudflare Access or an IP
-   allowlist pinned to the VPN exit IP `3.224.15.124`) — the dashboard
+   allowlist pinned to the VPN exit IP `18.209.130.93`) — the dashboard
    must never be reachable from the open internet.
 
 2. Desktop — connect the VPN (Connect tab), then Settings → Gateway →

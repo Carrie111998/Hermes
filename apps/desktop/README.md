@@ -203,7 +203,7 @@ Connect**; all secrets are encrypted at rest with Electron `safeStorage`
 | admin-mcp gateway URL + bearer token | `https://admin-mcp.intelli-verse-x.ai/` | Org tools directory, MCP status lamp, native copilot tool loop |
 | LiteLLM base URL + API key | `https://litellm.intelli-verse-x.ai` | Native copilot (Copilot tab) |
 | WireGuard `usa-vpn.conf` | imported once via file picker → keychain | VPN connect button + status lamp |
-| Expected VPN egress IP | `3.224.15.124` | Lamp turns green only when exit-IP check matches |
+| Expected VPN egress IP | `18.209.130.93` | Lamp turns green only when exit-IP check matches |
 | Update feed URL | `https://intelliverse-x-desktop.s3.amazonaws.com/ix-agency` | Update poller (launch + every 4 h) — electron-updater channel `.yml` feed |
 | Cognito S2S client id/secret | pool client `7i9clgl5c6dv2qk755ssrrlo80` (secret user-supplied) | Hermes first-run init |
 

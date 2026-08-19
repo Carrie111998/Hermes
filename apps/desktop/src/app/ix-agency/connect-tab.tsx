@@ -267,10 +267,10 @@ export function ConnectTab() {
               </Button>
             </div>
           </Field>
-          <Field label="Expected VPN egress IP (Lightsail exit)">
+          <Field label="Expected VPN egress IP (NEW EC2 exit)">
             <Input
               onChange={e => patch({ vpnExitIp: e.target.value })}
-              placeholder="3.224.15.124"
+              placeholder="18.209.130.93"
               value={settings.vpnExitIp}
             />
           </Field>

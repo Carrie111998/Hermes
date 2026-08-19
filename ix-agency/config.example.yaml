@@ -47,7 +47,7 @@ mcp_servers:
 # Connect tab), pin a session token in ~/.hermes/.env
 # (HERMES_DASHBOARD_SESSION_TOKEN) so desktop Remote Gateway connections
 # survive restarts. Keep the port behind Cloudflare Access or an IP
-# allowlist pinned to the VPN exit IP (3.224.15.124) — never expose it to
+# allowlist pinned to the VPN exit IP (18.209.130.93) — never expose it to
 # the open internet. See ix-agency/README.md → "VPN".
 #
 # Start with:  hermes dashboard --host 0.0.0.0 --port 9119 --insecure --tui --no-open

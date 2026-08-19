@@ -79,7 +79,7 @@ export const DEFAULT_IX_AGENCY_SETTINGS: IxAgencySettings = {
   gatewayToken: '',
   vpnConfPath: '',
   vpnConfSecret: '',
-  vpnExitIp: '3.224.15.124',
+  vpnExitIp: '18.209.130.93',
   litellmUrl: 'https://litellm.intelli-verse-x.ai',
   litellmKey: '',
   customChatModels: '',

@@ -9,7 +9,7 @@
  *    signed electron-updater feed exists for this app — no fake states).
  *  - VPN deep status: green ONLY when the tunnel is up AND a fresh WireGuard
  *    handshake is visible AND the exit-IP check confirms egress through the
- *    company Lightsail endpoint (3.224.15.124 — usa-vpn/EMPLOYEE-GUIDE.md).
+ *    company EC2 VPN exit (18.209.130.93 — vpn.intelli-verse-x.ai).
  *    `wg show` usually needs root on macOS; when unreadable, egress match
  *    still counts as connected and the detail says the handshake was
  *    unverifiable (same tradeoff the Tauri shell documents).
@@ -140,8 +140,8 @@ export async function fetchUpdateStatus(
 
 /* ── VPN deep status (handshake + exit-IP) ──────────────────────────────────── */
 
-/** wg-easy Lightsail exit IP (intelli-verse-kube-infra/usa-vpn). */
-export const DEFAULT_VPN_EXIT_IP = '3.224.15.124'
+/** wg-easy NEW-account EC2 exit IP (intelli-verse-kube-infra/usa-vpn). */
+export const DEFAULT_VPN_EXIT_IP = '18.209.130.93'
 
 const HANDSHAKE_FRESH_SECS = 3 * 60
 
