@@ -515,11 +515,12 @@ export function stageGetWindowsInto(
       bindingDirs = scanBindingDirs()
     }
     if (bindingDirs.length === 0 && arch !== 'arm64') {
-      throw new Error(
-        `[stage-native-deps] get-windows has no win32-${arch} prebuilt binding under lib/binding. ` +
-          'Recover from the checkout root with:\n' +
-          '  npm install-scripts approve get-windows\n' +
-          '  npm rebuild get-windows'
+      // The staged windows.js fails soft (returns no-op stubs) when no
+      // binding is present, and window-below.ts catches the import on
+      // every platform. Degrade instead of failing the Desktop build.
+      console.warn(
+        `[stage-native-deps] get-windows has no win32-${arch} prebuilt binding under lib/binding; ` +
+          'staging the fail-soft JS surface without native window enumeration.'
       )
     }
     for (const dir of bindingDirs) {
@@ -569,9 +570,11 @@ export function stageGetWindows(
     // expected on Linux and win32-arm64 because get-windows 9.3.0 publishes no
     // native prebuilt for either target. The runtime import already fails soft,
     // so disable only window enumeration instead of failing the Desktop build.
-    // Other Windows architectures and macOS have supported native payloads and
-    // remain fail-closed so a broken package cannot ship silently.
-    const canDegrade = platform === 'linux' || (platform === 'win32' && arch === 'arm64')
+    // All win32 arches and Linux can degrade: the STAGED_WINDOWS_JS stub returns
+    // no-op objects when no binding is present, and window-below.ts catches the
+    // import on every platform. macOS has a mandatory Swift helper binary and
+    // remains fail-closed so a broken package cannot ship silently.
+    const canDegrade = platform === 'linux' || platform === 'win32'
     if (canDegrade) {
       console.warn(
         `[stage-native-deps] get-windows not installed (optional dep skipped for ${platform}-${arch}); ` +
