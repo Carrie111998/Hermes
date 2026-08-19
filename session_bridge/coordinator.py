@@ -19,7 +19,13 @@ import uuid
 import hermes_constants
 from agent.redact import redact_sensitive_text
 
-from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
+from .claude_adapter import (
+    AmbiguousPlaceholderCreation,
+    ClaudeCursor,
+    PlaceholderCreationError,
+    decode_claude_cursor,
+    encode_claude_cursor,
+)
 from .claude_visibility import (
     CLAUDE_VISIBILITY_EXCLUSION_CODES,
     ClaudeVisibilityCandidate,
@@ -945,6 +951,7 @@ _PATH_FRAGMENT_RE = re.compile(
 _ATTEMPT_KEY_PREFIX = "session-bridge:attempt:"
 _BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _RATE_STATE_KEY = "session-bridge:mirror-rate"
+_CLAUDE_CURSOR_KEY = "session-bridge:scan:claude:cursors"
 _CLAUDE_FINGERPRINT_KEY = "session-bridge:scan:claude:fingerprints"
 _CLAUDE_STAGED_KEY = "session-bridge:scan:claude:staged-fingerprints"
 _CODEX_SEEN_KEY = "session-bridge:scan:codex:seen"
@@ -1084,6 +1091,7 @@ class SessionBridgeCoordinator:
         self._initial_reconcile_done = asyncio.Event()
         self._background_tasks: list[asyncio.Task[None]] = []
         self._provider_tasks: set[asyncio.Task[Any]] = set()
+        self._claude_immediate_cursors: dict[str, ClaudeCursor] = {}
         self._sidebar_recovery_tasks: set[asyncio.Task[Any]] = set()
         self._provider_health: dict[Provider, _ProviderHealth] = {
             provider: {
@@ -4437,10 +4445,23 @@ class SessionBridgeCoordinator:
         indexed = 0
         rebuilt = 0
         failed = 0
+        incremental = self._claude_incremental_reads(adapter)
+        cursors = self._claude_immediate_cursors
+        # Nothing persists on this path, so drop cursors for transcripts the
+        # walk no longer sees rather than growing the map for the life of the
+        # process.
+        for stale_key in set(cursors) - {str(path) for path in paths}:
+            cursors.pop(stale_key, None)
         for path in paths:
+            cursor_key = str(path)
             try:
-                parsed = await self._provider_call(_call, adapter, "parse", path)
+                previous = cursors.get(cursor_key) if incremental else None
+                parsed = await self._parse_claude(adapter, path, previous)
                 projection = _projection_from_parse(parsed)
+                # ``parsed.rebuild`` is the adapter reporting that it fell back
+                # to reading the whole file, so a rebuild here is always backed
+                # by a complete projection. See _scan_claude_persistent for why
+                # that pairing is the invariant that matters.
                 should_rebuild = bool(getattr(parsed, "rebuild", False))
                 result = await asyncio.to_thread(
                     _upsert,
@@ -4459,6 +4480,9 @@ class SessionBridgeCoordinator:
                 continue
             indexed += 1
             rebuilt += int(should_rebuild or result.rebuilt)
+            # Only a committed upsert may advance the cursor: an offset moved
+            # past bytes the store never accepted would skip them forever.
+            _remember_claude_cursor(cursors, cursor_key, parsed)
         return ScanSummary(
             provider=Provider.CLAUDE,
             discovered=discovered,
@@ -4573,6 +4597,8 @@ class SessionBridgeCoordinator:
             _CLAUDE_FINGERPRINT_KEY
         )
         staged_fingerprints = await self._load_claude_fingerprints(_CLAUDE_STAGED_KEY)
+        incremental = self._claude_incremental_reads(adapter)
+        committed_cursors = await self._load_claude_cursors() if incremental else {}
         backfill_processed = await self._load_backfill_processed(
             provider,
             discovery_mode,
@@ -4678,9 +4704,28 @@ class SessionBridgeCoordinator:
                         _claude_path_fingerprint, path
                     )
                 current_fingerprints[native_id] = fingerprint
-                parsed = await self._provider_call(_call, adapter, "parse", path)
-                projection = _projection_from_parse(parsed)
                 committed_fingerprint = committed_fingerprints.get(native_id)
+                shrank = (
+                    committed_fingerprint is not None
+                    and fingerprint["size"] < committed_fingerprint.get("size", 0)
+                )
+                # A shrunken transcript has to be re-read IN FULL, because the
+                # rebuild below deletes every message mapped to the session
+                # before re-inserting whatever the projection carries: pairing
+                # a rebuild with a cursor-shortened projection would delete the
+                # history and re-insert only the tail. The adapter's own
+                # invalidation does not cover this. Past the 64 KiB head sample
+                # a transcript can lose bytes that sit AFTER the cursor offset
+                # while the head hash and the newline-boundary check both still
+                # pass, and the read then returns rebuild=False with an empty
+                # delta.
+                previous = (
+                    committed_cursors.get(native_id)
+                    if incremental and not shrank
+                    else None
+                )
+                parsed = await self._parse_claude(adapter, path, previous)
+                projection = _projection_from_parse(parsed)
                 # Rebuild only when the transcript was REWRITTEN, not merely
                 # appended to. This was `native_id in committed_fingerprints`
                 # -- a membership test, true for every session ever scanned,
@@ -4695,13 +4740,10 @@ class SessionBridgeCoordinator:
                 # the non-rebuild path only ADDS rows missing from
                 # external_message_map, so records dropped by a compaction or
                 # rewind would otherwise linger forever.
-                should_rebuild = bool(
-                    getattr(parsed, "rebuild", False)
-                    or (
-                        committed_fingerprint is not None
-                        and fingerprint["size"] < committed_fingerprint.get("size", 0)
-                    )
-                )
+                # Both disjuncts imply a full read: ``shrank`` forced
+                # previous=None above, and ``parsed.rebuild`` is the adapter
+                # reporting that it fell back to one.
+                should_rebuild = bool(shrank or getattr(parsed, "rebuild", False))
                 result = await asyncio.to_thread(
                     _upsert,
                     self._store,
@@ -4735,6 +4777,9 @@ class SessionBridgeCoordinator:
             rebuilt += int(should_rebuild or result.rebuilt)
             succeeded_ids.append(native_id)
             committed_fingerprints[native_id] = current_fingerprints[native_id]
+            # Same rule as the immediate path: the cursor advances only once
+            # the store has accepted the messages it covers.
+            _remember_claude_cursor(committed_cursors, native_id, parsed)
 
         selected_set = set(selected_ids)
         unselected_ids = [
@@ -4755,6 +4800,14 @@ class SessionBridgeCoordinator:
             _CLAUDE_FINGERPRINT_KEY,
             committed_fingerprints,
         )
+        if incremental:
+            # Pin the cursor map to the fingerprint key set so it cannot
+            # outgrow the state row it rides beside.
+            await self._save_claude_cursors({
+                native_id: cursor
+                for native_id, cursor in committed_cursors.items()
+                if native_id in committed_fingerprints
+            })
         await self._commit_success_progress(
             provider,
             succeeded_ids=succeeded_ids,
@@ -4773,6 +4826,56 @@ class SessionBridgeCoordinator:
             rebuilt=rebuilt,
             failed=len(failed_ids) + len(unavailable_ids),
             duration_ms=0,
+        )
+
+    async def _parse_claude(
+        self,
+        adapter: object,
+        path: Path,
+        previous: ClaudeCursor | None,
+    ) -> Any:
+        if previous is None:
+            return await self._provider_call(_call, adapter, "parse", path)
+        return await self._provider_call(_call, adapter, "parse", path, previous)
+
+    def _claude_incremental_reads(self, adapter: object) -> bool:
+        """Whether this cycle may hand the adapter a stored read cursor.
+
+        Two gates. The adapter has to accept a second ``parse`` argument at all
+        -- ``ClaudeReadableSource`` only promises ``parse(path)``, and a stand-in
+        that never widened its signature must keep working. And automatic
+        mirroring has to be off: ``classify_mirror_eligibility`` reads the
+        session's FIRST meaningful user message straight out of the projection
+        to clear its debounce window, which a delta projection cannot carry, so
+        an incremental read would quietly stop every automatic mirror from
+        being enqueued. Full reads stay the price of that feature.
+        """
+
+        if self._config.mirrors.automatic_creation:
+            return False
+        return _parse_accepts_cursor(adapter)
+
+    async def _load_claude_cursors(self) -> dict[str, ClaudeCursor]:
+        state = await asyncio.to_thread(
+            _call, self._store, "get_state", _CLAUDE_CURSOR_KEY
+        )
+        return _decode_claude_cursors(state)
+
+    async def _save_claude_cursors(
+        self,
+        cursors: Mapping[str, ClaudeCursor],
+    ) -> None:
+        encoded = {}
+        for native_id, cursor in sorted(cursors.items()):
+            payload = encode_claude_cursor(cursor)
+            if payload is not None:
+                encoded[native_id] = payload
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _CLAUDE_CURSOR_KEY,
+            {"version": 1, "sessions": encoded},
         )
 
     async def _load_claude_fingerprints(
@@ -5609,6 +5712,75 @@ def _sort_claude_paths(
 def _claude_path_fingerprint(path: Path) -> dict[str, int]:
     stat = Path(path).stat()
     return {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
+
+
+def _parse_accepts_cursor(adapter: object) -> bool:
+    """True when ``adapter.parse`` takes a previous-cursor argument.
+
+    Mirrors how the scan already probes ``find_native_sessions_by_stem``: the
+    cursor is an optional adapter capability, and an adapter without it simply
+    gets full reads instead of a TypeError counted as a scan failure.
+    """
+
+    parse = getattr(adapter, "parse", None)
+    if not callable(parse):
+        return False
+    try:
+        signature = inspect.signature(parse)
+    except (TypeError, ValueError):
+        return False
+    for index, parameter in enumerate(signature.parameters.values()):
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if index == 1 and parameter.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }:
+            return True
+    return False
+
+
+def _remember_claude_cursor(
+    cursors: dict[str, ClaudeCursor],
+    key: str,
+    parsed: object,
+) -> None:
+    cursor = getattr(parsed, "cursor", None)
+    if encode_claude_cursor(cursor) is None:
+        # A parser that hands back no usable cursor gets a full read next
+        # cycle, which is exactly the behaviour before cursors existed.
+        cursors.pop(key, None)
+        return
+    cursors[key] = cast("ClaudeCursor", cursor)
+
+
+def _decode_claude_cursors(state: object) -> dict[str, ClaudeCursor]:
+    """Decode the persisted cursor map.
+
+    The envelope is validated as strictly as the fingerprint state it rides
+    beside -- garbage there means something else is writing our key. Individual
+    entries are only DROPPED when they fail to decode: a cursor is a pure read
+    optimisation, and losing one costs a single full read that then rewrites it.
+    """
+
+    if state is None:
+        return {}
+    if not isinstance(state, Mapping):
+        raise RuntimeError("invalid Claude cursor state")
+    typed_state = cast("Mapping[str, Any]", state)
+    if typed_state.get("version") != 1:
+        raise RuntimeError("invalid Claude cursor state")
+    sessions = typed_state.get("sessions")
+    if not isinstance(sessions, Mapping):
+        raise RuntimeError("invalid Claude cursor state")
+    decoded: dict[str, ClaudeCursor] = {}
+    for native_id, raw_cursor in sessions.items():
+        if not isinstance(native_id, str) or not native_id.strip():
+            raise RuntimeError("invalid Claude cursor state")
+        cursor = decode_claude_cursor(raw_cursor)
+        if cursor is not None:
+            decoded[native_id.strip()] = cursor
+    return decoded
 
 
 def _decode_claude_fingerprints(

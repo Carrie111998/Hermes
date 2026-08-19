@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -893,6 +893,49 @@ def _probe_native_id(path: Path) -> str | None:
     with path.open("rb") as stream:
         prefix = stream.read(_NATIVE_ID_PROBE_BYTES)
     return _native_id_from_bytes(prefix)
+
+
+def encode_claude_cursor(cursor: object) -> dict[str, object] | None:
+    """Return a JSON-safe mapping for a cursor, or None when it is unusable.
+
+    The coordinator persists cursors between scan cycles. Encoding refuses
+    anything ``_read_for_parse`` would reject anyway, so a malformed cursor
+    costs one full read instead of poisoning an offset.
+    """
+
+    if not isinstance(cursor, ClaudeCursor) or not _valid_cursor_shape(cursor):
+        return None
+    return {
+        "head_hash": cursor.head_hash,
+        "head_length": cursor.head_length,
+        "offset": cursor.offset,
+    }
+
+
+def decode_claude_cursor(value: object) -> ClaudeCursor | None:
+    """Rebuild a cursor from :func:`encode_claude_cursor` output.
+
+    Returns None for anything that does not round-trip -- including a shape
+    written by a future version -- and the caller falls back to a full read.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    if set(value) != {"head_hash", "head_length", "offset"}:
+        return None
+    offset = value["offset"]
+    head_length = value["head_length"]
+    head_hash = value["head_hash"]
+    if type(offset) is not int or type(head_length) is not int:
+        return None
+    if not isinstance(head_hash, str):
+        return None
+    cursor = ClaudeCursor(
+        offset=offset,
+        head_length=head_length,
+        head_hash=head_hash,
+    )
+    return cursor if _valid_cursor_shape(cursor) else None
 
 
 def _valid_cursor_shape(cursor: ClaudeCursor) -> bool:
