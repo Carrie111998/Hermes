@@ -2117,7 +2117,8 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]uninstall[/] <name>            Remove a hub-installed skill\n"
         "  [cyan]list-modified[/]               List bundled skills you've edited (kept by update)\n"
         "  [cyan]diff[/] <name>                 Diff your copy of a bundled skill vs the stock version\n"
-        "  [cyan]reset[/] <name> [--restore]    Reset bundled-skill tracking (fix 'user-modified' flag)\n"
+        "  [cyan]reset[/] <name> [--restore]    Plain reset only re-baselines a byte-identical copy\n"
+        "       Modified copies stay skipped; --restore replaces them and resumes stock updates\n"
         "  [cyan]publish[/] <path> --repo <r>   Publish a skill to GitHub via PR\n"
         "  [cyan]snapshot[/] export|import      Export/import skill configurations\n"
         "  [cyan]tap[/] list|add|remove         Manage skill sources\n",

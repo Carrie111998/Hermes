@@ -89,6 +89,24 @@ def test_skills_reset_slash_help_distinguishes_plain_reset_from_restore():
     assert "--restore" in output
 
 
+def test_skills_main_help_explains_modified_reset_contract():
+    sink = StringIO()
+    console = Console(
+        file=sink,
+        force_terminal=False,
+        color_system=None,
+        width=200,
+    )
+
+    handle_skills_slash("/skills help", console=console)
+
+    output = " ".join(sink.getvalue().split())
+    assert "Plain reset only re-baselines a byte-identical copy" in output
+    contract = output.lower()
+    assert "modified copies stay skipped" in contract
+    assert "--restore replaces them and resumes stock updates" in contract
+
+
 def test_list_modified_points_to_restore_for_resuming_stock_updates(monkeypatch):
     import tools.skills_sync as skills_sync
 

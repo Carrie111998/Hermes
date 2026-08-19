@@ -237,8 +237,10 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         help="Show how your copy of a bundled skill differs from the stock version",
         description=(
             "Print a unified diff between your local copy of a bundled skill and the "
-            "current bundled (stock) version, so you can confirm what changed before "
-            "running `hermes skills reset`."
+            "current bundled (stock) version. Plain reset only re-baselines a "
+            "byte-identical copy; genuinely modified copies stay preserved and "
+            "skipped. Run `hermes skills reset <name> --restore` to replace the "
+            "modified copy and resume stock updates."
         ),
     )
     skills_diff.add_argument(
