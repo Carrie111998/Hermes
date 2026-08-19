@@ -4,6 +4,7 @@ import type {
   HermesReadFileTextResult,
   HermesSelectPathsOptions
 } from '@/global'
+import { getApiRequestConnection } from '@/hermes'
 import { $connection } from '@/store/session'
 
 export interface DesktopFsRemotePicker {
@@ -43,6 +44,21 @@ export function desktopFsProfile(): string | undefined {
   return $connection.get()?.profile || undefined
 }
 
+// The profile above is one half of an
+// address: every registered machine serves a `default`, so a profile alone
+// cannot say WHICH host owns the path. Without the connection the bridge fell
+// back to the legacy profile route and listed the PRIMARY's filesystem while
+// the live gateway was on another machine — the file tree showed the other
+// box's home directory, or failed outright because the workspace path does not
+// exist there. Empty while the active gateway is the primary's own route, so
+// single-gateway installs are unaffected.
+function desktopFsScope(): { connectionId?: string; profile?: string } {
+  const connectionId = getApiRequestConnection()
+  const profile = desktopFsProfile()
+
+  return { ...(profile ? { profile } : {}), ...(connectionId ? { connectionId } : {}) }
+}
+
 function fsPath(endpoint: string, filePath: string) {
   return `/api/fs/${endpoint}?path=${encodeURIComponent(filePath)}`
 }
@@ -58,9 +74,7 @@ function bridge() {
 }
 
 function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  return bridge().api<T>(
-    body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
-  )
+  return bridge().api<T>(body ? { body, method: 'POST', path, ...desktopFsScope() } : { path, ...desktopFsScope() })
 }
 
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {

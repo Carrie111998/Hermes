@@ -52,6 +52,14 @@ import {
 } from '@/lib/reorder'
 import { cn } from '@/lib/utils'
 import { $hasMultipleConnections } from '@/store/connections'
+import {
+  $attachedConnectionId,
+  $foreignAgents,
+  refreshGatewaySeparation,
+  type RosterAgent,
+  selectForeignAgent,
+  selectPrimaryAgent
+} from '@/store/gateway-separation'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
@@ -165,8 +173,14 @@ export function ProfileRail() {
 
   const isAll = scope === ALL_PROFILES
   const activeKey = normalizeProfileKey(gatewayProfile)
+  // The rail's own squares are drawn from `$profiles`, which describes the
+  // ATTACHED machine (refreshProfiles goes through the ambient connection), so
+  // a name-keyed highlight is honest again: it can only ever match a profile
+  // the live gateway actually serves. Agents on the OTHER machines render as
+  // foreign squares and carry their own highlight.
+  const homeKey = activeKey
   const defaultProfile = profiles.find(profile => profile.is_default)
-  const onDefault = !isAll && activeKey === 'default'
+  const onDefault = !isAll && homeKey === 'default'
 
   const named = sortByProfileOrder(
     profiles.filter(profile => !profile.is_default),
@@ -223,6 +237,24 @@ export function ProfileRail() {
   // wiring.
   useProfileRailRefreshOnActive()
 
+  // The rail's own $profiles cache only ever
+  // holds the ATTACHED backend's profiles, so agents on every other registered
+  // connection are invisible here. Pull the union roster alongside it and draw
+  // the missing ones as extra squares. Re-pulled whenever the local list moves
+  // (a profile switch swaps which backend $profiles describes).
+  const foreignAgents = useStore($foreignAgents)
+  const attachedConnectionId = useStore($attachedConnectionId)
+
+  useEffect(() => {
+    void refreshGatewaySeparation()
+  }, [profiles])
+
+  // Every square drawn from $profiles belongs to the primary's backend, so
+  // picking one re-homes there before delegating to upstream's selectProfile.
+  const selectLocalProfile = (name: string) => {
+    selectPrimaryAgent(name)
+  }
+
   // Open the create dialog when the `profile.create` hotkey fires (the dialog
   // state lives here, so the global keybind bumps a request atom we watch).
   const createRequest = useStore($profileCreateRequest)
@@ -251,7 +283,7 @@ export function ProfileRail() {
             active={isAll || onDefault}
             glyph={isAll ? 'layers' : 'home'}
             label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
-            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
+            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectLocalProfile(defaultProfile.name))}
           />
         ) : (
           <ProfilePill active={isAll} glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
@@ -263,7 +295,7 @@ export function ProfileRail() {
           active
           glyph="home"
           label={profileLabel(defaultProfile)}
-          onSelect={() => selectProfile(defaultProfile.name)}
+          onSelect={() => selectLocalProfile(defaultProfile.name)}
         />
       )}
 
@@ -273,11 +305,11 @@ export function ProfileRail() {
         // covers rename/delete at this scale.
         <div className="flex min-w-0 flex-1 items-center gap-1">
           <ProfileDropdown
-            activeKey={isAll ? null : activeKey}
+            activeKey={isAll ? null : homeKey}
             colors={colors}
             onCreate={() => setCreateOpen(true)}
             onImport={() => void runImportProfileFlow()}
-            onSelect={selectProfile}
+            onSelect={selectLocalProfile}
             profiles={named}
           />
         </div>
@@ -301,7 +333,7 @@ export function ProfileRail() {
                 <div className="relative flex items-center gap-1">
                   {named.map(profile => (
                     <ProfileSquare
-                      active={!isAll && normalizeProfileKey(profile.name) === activeKey}
+                      active={!isAll && normalizeProfileKey(profile.name) === homeKey}
                       color={resolveProfileColor(profile.name, colors)}
                       key={profile.name}
                       label={profileLabel(profile)}
@@ -309,12 +341,27 @@ export function ProfileRail() {
                       onEditSoul={() => setPendingSoul(profile.name)}
                       onRecolor={color => setProfileColor(profile.name, color)}
                       onRename={() => setPendingRename(profile)}
-                      onSelect={() => selectProfile(profile.name)}
+                      onSelect={() => selectLocalProfile(profile.name)}
                     />
                   ))}
                 </div>
               </SortableContext>
             </DndContext>
+          )}
+
+          {/* Agents living on OTHER registered gateways. Outside
+              the DndContext on purpose: the stored rail order is a list of
+              local profile names, and these squares are not part of it. */}
+          {foreignAgents.length > 0 && (
+            <div className="flex items-center gap-1 border-border/60 ml-0.5 border-l pl-1.5">
+              {foreignAgents.map(agent => (
+                <ForeignAgentSquare
+                  active={attachedConnectionId === agent.connectionId}
+                  agent={agent}
+                  key={`${agent.connectionId}::${agent.profile}`}
+                />
+              ))}
+            </div>
           )}
 
           <AddProfileButton label={p.newProfile} onClick={() => setCreateOpen(true)} />
@@ -810,5 +857,53 @@ function ProfileSquare({
         />
       </PopoverContent>
     </Popover>
+  )
+}
+
+/** A rail square for an agent that lives on ANOTHER registered
+ *  gateway.
+ *
+ *  Deliberately thinner than {@link ProfileSquare}: no drag-reorder (the stored
+ *  order is a list of local profile names), no rename/delete/recolor (those are
+ *  operations on the owning machine's profile, not on this app's view of it).
+ *  Selecting one routes through the connection-scoped activation path so the
+ *  app attaches to THAT machine instead of a same-named local profile.
+ *
+ *  The colour is keyed on the connection, not the profile name, so every agent
+ *  from one box reads as one family and two machines' `default` never collide. */
+function ForeignAgentSquare({ active, agent }: { active: boolean; agent: RosterAgent }) {
+  const colors = useStore($profileColors)
+  const hue = resolveProfileColor(agent.connectionId, colors) ?? 'var(--ui-text-quaternary)'
+  const label = `${agent.profile} — ${agent.connectionLabel}${agent.reachable ? '' : ' (unreachable)'}`
+
+  return (
+    <Tip label={label}>
+      <button
+        aria-label={label}
+        aria-pressed={active}
+        className={cn(
+          'grid size-5 shrink-0 select-none place-items-center rounded-[3px] text-[0.5625rem] leading-none font-semibold uppercase',
+          'transition-opacity hover:opacity-100',
+          active ? 'opacity-100' : agent.reachable ? 'opacity-55' : 'opacity-30'
+        )}
+        onClick={() => {
+          // Switching machines is a heavier move than switching profiles (a
+          // different box, its own sessions and cron), so it confirms itself.
+          void selectForeignAgent(agent)
+            .then(() => notify({ kind: 'success', message: label, title: 'Switched gateway' }))
+            .catch(err => notifyError(err, `Could not switch to ${label}`))
+        }}
+        style={{
+          backgroundColor: profileColorSoft(hue, active ? 30 : 22),
+          // A ring marks these as "elsewhere"; the active one thickens to match
+          // the weight ProfileSquare gives its own selection.
+          boxShadow: `inset 0 0 0 ${active ? '1.5px' : '1px'} ${hue}`,
+          color: hue
+        }}
+        type="button"
+      >
+        {(agent.profile || '?').slice(0, 1)}
+      </button>
+    </Tip>
   )
 }

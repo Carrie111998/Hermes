@@ -6,9 +6,10 @@ import { getLatestSessionMessages } from '@/hermes'
 import { preserveLocalAssistantErrors, sealOpenToolParts, toChatMessages } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
+import { $attachedConnectionId } from '@/store/gateway-separation'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
-import { refreshActiveProfile } from '@/store/profile'
+import { refreshActiveProfile, refreshProfiles } from '@/store/profile'
 import {
   $activeSessionId,
   $busy,
@@ -419,6 +420,16 @@ export function useBackgroundSync({
     [activeSessionId, activeStoredSessionId, refreshActiveTranscript]
   )
 
+  // This reseed keyed on the profile NAME
+  // alone, and every registered machine serves a `default`: hopping between two
+  // gateways' `default` changed no name, `gatewayState` was already 'open', so
+  // NOTHING re-pulled. The model, the profile list and the whole session list
+  // stayed as the previous machine had left them — the sidebar showed "No
+  // sessions yet" beside an open session, and the model picker still listed the
+  // other box's models. Keying on the connection too makes a hop reseed exactly
+  // like a profile switch. Constant on single-gateway installs.
+  const attachedConnectionId = useStore($attachedConnectionId)
+
   useEffect(() => {
     if (gatewayState !== 'open') {
       return
@@ -426,6 +437,12 @@ export function useBackgroundSync({
 
     void refreshCurrentModel()
     void refreshActiveProfile()
+    // The rail's own squares are `$profiles`, which is whatever the AMBIENT
+    // connection served. A hop to another registered gateway changes that
+    // ambient connection without changing the profile name, so without this the
+    // rail kept drawing the previous machine's profiles until something else
+    // happened to refetch them.
+    void refreshProfiles().catch(() => undefined)
     void refreshSessions()
 
     // A RELATIVE workspace cwd (config `terminal.cwd: .`) renders as "." in the
@@ -443,7 +460,15 @@ export function useBackgroundSync({
         })
         .catch(() => undefined)
     }
-  }, [activeConnectionId, activeGatewayProfile, gatewayState, refreshCurrentModel, refreshSessions, requestGateway])
+  }, [
+    activeConnectionId,
+    activeGatewayProfile,
+    attachedConnectionId,
+    gatewayState,
+    refreshCurrentModel,
+    refreshSessions,
+    requestGateway
+  ])
 
   // A reconnect loses renderer-only working/attention atoms while the backend
   // keeps the actual turns alive. Re-seed from the gateway's in-memory session
