@@ -473,12 +473,17 @@ class TestStreamingFallback:
         with patch.object(h, "_resolve_direct_stale_timeout", return_value=90.0):
             response = h.direct_streaming_api_call(agent, {"model": "test-model"})
 
-        msg = response["choices"][0]["message"]
-        assert msg["content"] == "Hello world"
-        assert msg["reasoning_content"] == "thinking..."
-        assert msg["tool_calls"][0]["function"]["name"] == "read_file"
-        assert msg["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py"}'
-        assert response["choices"][0]["finish_reason"] == "tool_calls"
+        msg = response.choices[0].message
+        assert msg.content == "Hello world"
+        assert msg.reasoning_content == "thinking..."
+        assert msg.tool_calls[0].function.name == "read_file"
+        assert msg.tool_calls[0].function.arguments == '{"path": "a.py"}'
+        assert response.choices[0].finish_reason == "tool_calls"
+        # Regression (probe #2, 2026-08-19): the conversation loop's
+        # invalid-response diagnostics call vars(response) — a plain dict
+        # return raised TypeError there after a full streamed generation.
+        assert hasattr(response, "choices") and hasattr(response, "model")
+        _ = {k: v for k, v in vars(response).items() if not k.startswith("_")}
         # The wire request must be streaming.
         sent = client.chat.completions.create.call_args
         assert sent.kwargs.get("stream") is True

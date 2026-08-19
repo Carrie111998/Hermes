@@ -1390,6 +1390,8 @@ def direct_streaming_api_call(agent, api_kwargs: dict):
     model_name = None
     role = "assistant"
     usage_obj = None
+    first_chunk_id = None
+    created_ts = None
     last_chunk_time = {"t": time.time()}
     call_start = time.time()
     stream_opened = {"v": False}
@@ -1447,7 +1449,14 @@ def direct_streaming_api_call(agent, api_kwargs: dict):
         # alive, and the accumulated response is returned to the loop).
         last_chunk_time["t"] = time.time()
         nonlocal finish_reason, model_name, role, usage_obj
+        nonlocal first_chunk_id, created_ts
         try:
+            _cid = getattr(chunk, "id", None)
+            if _cid and first_chunk_id is None:
+                first_chunk_id = _cid
+            _cts = getattr(chunk, "created", None)
+            if _cts:
+                created_ts = _cts
             choices = getattr(chunk, "choices", None)
             if choices:
                 first = choices[0]
@@ -1557,22 +1566,52 @@ def direct_streaming_api_call(agent, api_kwargs: dict):
         _reset_stale_streak(agent)
         succeeded = True
         tool_calls = [tool_calls_acc[index] for index in sorted(tool_calls_acc)]
-        return {
+        # Reconstruct a real SDK ChatCompletion, not a dict: the conversation
+        # loop's post-processing contract is attribute-style access on the
+        # response object — including vars(response) in the invalid-response
+        # diagnostics path (conversation_loop.py ~3280) — and the loop's
+        # validity probes (hasattr(response, 'choices') ...) classify a plain
+        # dict as an invalid response. direct_api_call returns the raw SDK
+        # object (line ~1315); match that contract exactly.
+        from openai.types.chat import ChatCompletion, ChatCompletionMessage
+
+        _finish = finish_reason or "stop"
+        if _finish not in {"stop", "length", "tool_calls", "content_filter", "function_call"}:
+            _finish = "stop"
+        _usage = usage_obj
+        if isinstance(_usage, dict):
+            from openai.types.completion_usage import CompletionUsage
+
+            try:
+                _usage = CompletionUsage(**_usage)
+            except Exception:
+                _usage = None
+        message_kwargs = {
+            "role": role,
+            "content": "".join(content_parts) or None,
+        }
+        if tool_calls:
+            message_kwargs["tool_calls"] = tool_calls
+        if reasoning_parts:
+            # Extra field on the SDK model (extra="allow"); preserves GLM
+            # reasoning the same way the Relay path delivers it.
+            message_kwargs["reasoning_content"] = "".join(reasoning_parts)
+        completion_kwargs = {
+            "id": first_chunk_id or f"chatcmpl-direct-stream-{int(call_start)}",
+            "created": created_ts or int(call_start),
             "model": model_name or api_kwargs.get("model", "unknown"),
+            "object": "chat.completion",
             "choices": [
                 {
-                    "conversation": None,
-                    "message": {
-                        "role": role,
-                        "content": "".join(content_parts) or None,
-                        "reasoning_content": "".join(reasoning_parts) or None,
-                        "tool_calls": tool_calls or None,
-                    },
-                    "finish_reason": finish_reason or "stop",
+                    "index": 0,
+                    "message": ChatCompletionMessage(**message_kwargs),
+                    "finish_reason": _finish,
                 }
             ],
-            "usage": usage_obj,
         }
+        if _usage is not None:
+            completion_kwargs["usage"] = _usage
+        return ChatCompletion(**completion_kwargs)
     except Exception as e:
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
