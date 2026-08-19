@@ -63,6 +63,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
+    _session_metadata_compact_sql,
+    compact_session_metadata_text,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
@@ -8856,10 +8858,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # `/sessions search` finds a channel or DM by name. The
                     # compact (punctuation-stripped) variant lets `an94` match
                     # `AN-94` and `#an-94-ops`.
-                    compact_needle = re.sub(r"[\W_]+", "", search_needle)
+                    # Same canonical compact policy as the metadata router /
+                    # trigram lane (one source of truth in hermes_state_common)
+                    # so `an94` matches `AN-94` / `#an-94-ops` identically on
+                    # both the FTS and the LIKE fallback path.
+                    compact_needle = compact_session_metadata_text(search_needle)
                     compact_sql = (
-                        "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
-                        " '-', ''), '_', ''), '.', ''), ' ', '')"
+                        "LOWER("
+                        + _session_metadata_compact_sql("{0}")
+                        + ")"
                     )
                     search_clause = (
                         "EXISTS (SELECT 1 FROM chain cq"

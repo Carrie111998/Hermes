@@ -52,7 +52,6 @@ class MetadataCandidateResult:
     """
 
     path: Literal["none", "like", "unicode", "cjk+unicode", "trigram"]
-    status: Literal["hits", "zero"]
     row_ids: Tuple[int, ...]
 
 
@@ -625,6 +624,29 @@ class SessionSearchMixin:
         with self._read_ctx() as conn:
             return _read(conn)
 
+    def _fts_metadata_lane_match(
+        self, fts_table: str, match_query: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """Run a MATCH on one session-metadata lane, returning ``(ok,
+        row_ids)``. ok is False when the lane's MATCH itself failed (table
+        unavailable / corrupt), so callers can fall back to the bounded LIKE
+        lane instead of trusting a partial result."""
+        def _run(conn):
+            try:
+                rows = conn.execute(
+                    f"SELECT row_id FROM {fts_table} "
+                    f"WHERE {fts_table} MATCH ?",
+                    (match_query,),
+                ).fetchall()
+                return True, [r["row_id"] for r in rows]
+            except sqlite3.OperationalError:
+                return False, []
+
+        if conn is not None:
+            return _run(conn)
+        with self._read_ctx() as conn:
+            return _run(conn)
+
     def _fts_metadata_candidates(
         self, raw_query: str, *, conn=None
     ) -> Tuple[bool, List[int]]:
@@ -637,22 +659,7 @@ class SessionSearchMixin:
         sanitized = self._sanitize_fts5_query(raw_query)
         if not sanitized:
             return True, []
-
-        def _run(conn):
-            try:
-                rows = conn.execute(
-                    "SELECT row_id FROM sessions_fts "
-                    "WHERE sessions_fts MATCH ?",
-                    (sanitized,),
-                ).fetchall()
-                return True, [r["row_id"] for r in rows]
-            except sqlite3.OperationalError:
-                return False, []
-
-        if conn is not None:
-            return _run(conn)
-        with self._read_ctx() as conn:
-            return _run(conn)
+        return self._fts_metadata_lane_match("sessions_fts", sanitized, conn=conn)
 
     @staticmethod
     def _trigram_match_needle(needle: str) -> str:
@@ -670,22 +677,7 @@ class SessionSearchMixin:
         if len(compact_needle) < 3:
             return False, []
         q = self._trigram_match_needle(compact_needle)
-
-        def _run(conn):
-            try:
-                rows = conn.execute(
-                    "SELECT row_id FROM sessions_fts_trigram "
-                    "WHERE sessions_fts_trigram MATCH ?",
-                    (q,),
-                ).fetchall()
-                return True, [r["row_id"] for r in rows]
-            except sqlite3.OperationalError:
-                return False, []
-
-        if conn is not None:
-            return _run(conn)
-        with self._read_ctx() as conn:
-            return _run(conn)
+        return self._fts_metadata_lane_match("sessions_fts_trigram", q, conn=conn)
 
     def _fts_cjk_metadata_candidates(
         self, needle: str, *, conn=None
@@ -694,22 +686,7 @@ class SessionSearchMixin:
         is False when the CJK lane cannot serve."""
         if not getattr(self, "_sessions_cjk_available", False):
             return False, []
-
-        def _run(conn):
-            try:
-                rows = conn.execute(
-                    "SELECT row_id FROM sessions_fts_cjk "
-                    "WHERE sessions_fts_cjk MATCH ?",
-                    (needle,),
-                ).fetchall()
-                return True, [r["row_id"] for r in rows]
-            except sqlite3.OperationalError:
-                return False, []
-
-        if conn is not None:
-            return _run(conn)
-        with self._read_ctx() as conn:
-            return _run(conn)
+        return self._fts_metadata_lane_match("sessions_fts_cjk", needle, conn=conn)
 
     def _metadata_candidate_row_ids_on_conn(
         self, needle: str, conn
@@ -720,7 +697,6 @@ class SessionSearchMixin:
             row_ids = tuple(self._metadata_like_fallback_row_ids(needle, conn=conn))
             return MetadataCandidateResult(
                 path="like",
-                status="hits" if row_ids else "zero",
                 row_ids=row_ids,
             )
 
@@ -731,14 +707,14 @@ class SessionSearchMixin:
             fts_ok, candidates = self._fts_metadata_candidates(needle, conn=conn)
             if fts_ok and candidates:
                 return MetadataCandidateResult(
-                    path="unicode", status="hits", row_ids=tuple(candidates)
+                    path="unicode", row_ids=tuple(candidates)
                 )
             return _like_fallback()
         if route == "trigram":
             fts_ok, candidates = self._fts_session_trigram_candidates(needle, conn=conn)
             if fts_ok and candidates:
                 return MetadataCandidateResult(
-                    path="trigram", status="hits", row_ids=tuple(candidates)
+                    path="trigram", row_ids=tuple(candidates)
                 )
             return _like_fallback()
         if route == "cjk":
@@ -757,7 +733,7 @@ class SessionSearchMixin:
                 union[r] = None
             if union:
                 return MetadataCandidateResult(
-                    path="cjk+unicode", status="hits", row_ids=tuple(union)
+                    path="cjk+unicode", row_ids=tuple(union)
                 )
             return _like_fallback()
         # Defensive: an unknown classifier result never fabricates a match.
@@ -776,7 +752,7 @@ class SessionSearchMixin:
         """
         needle = self._metadata_search_needle(raw_query)
         if not needle:
-            return MetadataCandidateResult(path="none", status="zero", row_ids=())
+            return MetadataCandidateResult(path="none", row_ids=())
         if conn is not None:
             return self._metadata_candidate_row_ids_on_conn(needle, conn)
         with self._read_ctx() as conn:

@@ -44,13 +44,11 @@ class TestRouter:
     def test_unicode_candidates(self, db):
         _seed(db, [("s1", "Arby's Faribault, MN", None, "cli")])
         res = db._metadata_candidate_row_ids("Faribault")
-        assert res.status == "hits"
         assert res.row_ids == (1,)
 
     def test_trigram_compact_candidate(self, db):
         _seed(db, [("s1", "AN-94 Project", None, "cli")])
         res = db._metadata_candidate_row_ids("an94")
-        assert res.status == "hits"
         assert 1 in res.row_ids
 
     def test_like_fallback_on_zero(self, db):
@@ -58,7 +56,7 @@ class TestRouter:
         # trigram route matches nothing; the bounded LIKE lane runs once and
         # also finds nothing -> zero (never an unbounded scan).
         res = db._metadata_candidate_row_ids("Alphazzz")
-        assert res.status == "zero"
+        assert not res.row_ids
 
     def test_literal_percent_does_not_match_all(self, db):
         _seed(
@@ -67,7 +65,7 @@ class TestRouter:
         )
         # A bare "%" is escaped on the LIKE fallback, never a match-all scan.
         res = db._metadata_candidate_row_ids("%")
-        assert res.status == "zero"
+        assert not res.row_ids
 
     def test_literal_underscore_does_not_match_all(self, db):
         _seed(
@@ -77,7 +75,7 @@ class TestRouter:
         # A bare "_" is escaped on the LIKE fallback — if it were a wildcard it
         # would match every row; as a literal it matches nothing.
         res = db._metadata_candidate_row_ids("_")
-        assert res.status == "zero"
+        assert not res.row_ids
 
 
 class TestListSessionsRichRouter:
