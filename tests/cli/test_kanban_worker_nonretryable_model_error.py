@@ -257,3 +257,38 @@ def test_main_with_kanban_task_rate_limit_still_uses_rate_limit_exit_code(
 
     assert exc_info.value.code == KANBAN_RATE_LIMIT_EXIT_CODE
     assert fake_kanban_db.blocks == []
+
+
+def test_block_kanban_task_for_model_error_no_op_with_whitespace_task_id(
+    monkeypatch, fake_kanban_db
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "   ")
+    fake_cli = SimpleNamespace(agent=SimpleNamespace(provider="p"))
+
+    cli._block_kanban_task_for_model_error(fake_cli, _make_result("auth"))
+
+    assert fake_kanban_db.blocks == []
+    assert fake_kanban_db.connections == []
+
+
+def test_block_kanban_task_for_model_error_swallows_connection_close_exception(
+    monkeypatch, fake_kanban_db
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345")
+    fake_cli = SimpleNamespace(agent=SimpleNamespace(provider="p"))
+
+    conn = fake_kanban_db.connect()
+    conn.close = lambda: (_ for _ in ()).throw(RuntimeError("close failed"))
+
+    cli._block_kanban_task_for_model_error(fake_cli, _make_result("auth"))
+
+    assert len(fake_kanban_db.blocks) == 1
+    assert fake_kanban_db.blocks[0]["task_id"] == "t_12345"
+
+
+def test_kanban_model_error_block_reason_replaces_literal_newlines_in_summary():
+    fake_cli = SimpleNamespace(agent=SimpleNamespace(provider="p"))
+    result = _make_result("auth", status_code=403, error="line1\\nline2")
+    reason = cli._kanban_model_error_block_reason(result, fake_cli)
+    assert "line1 line2" in reason
+    assert "\\n" not in reason
