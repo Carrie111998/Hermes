@@ -203,9 +203,16 @@ script branch against the real FastAPI routes with a test-only verifier in
 
 ## Production / Supabase
 
-Apply `server/supabase/migrations/001_initial.sql` for a fresh database. Existing
-installations also apply `server/supabase/migrations/002_chat_sessions.sql` and
-`server/supabase/migrations/003_lead_research.sql`.
+Apply every file in `server/supabase/migrations/` in numeric order, on a fresh
+database and an existing one alike. The directory is the list — do not enumerate
+it here, because an enumerated list goes stale and a skipped migration is how a
+database ends up with document tables that have no RLS.
+
+The server refuses to serve traffic when any of them is missing, naming the gap
+(`REQUIRED_MIGRATIONS`, `server/postgres.py`). If boot fails that way, apply the
+named files and restart; each migration records itself in `schema_migrations` and
+is safe to re-run.
+
 Then configure:
 
 ```text
