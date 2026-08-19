@@ -6623,3 +6623,29 @@ def test_mirror_float_must_provide_run_once() -> None:
             clock=lambda: 0.0,
             mirror_float=object(),
         )
+
+
+def test_cached_index_opt_in_is_capability_detected() -> None:
+    """Scan resolution opts into a TTL'd inventory index only where one exists.
+
+    The scan tolerates a bounded-stale summary; authoritative callers (refresh,
+    characterization) must keep the default active-then-archived lookup. Adapter
+    dispatch here is duck-typed, so a double implementing the narrower signature
+    must not be handed a keyword it cannot accept.
+    """
+
+    from session_bridge.coordinator import _cached_index_kwargs
+
+    class _Supports:
+        def find_native_thread(
+            self, native_id: str, *, allow_cached_index: bool = False
+        ) -> None:
+            return None
+
+    class _DoesNot:
+        def find_native_thread(self, native_id: str) -> None:
+            return None
+
+    assert _cached_index_kwargs(_Supports()) == {"allow_cached_index": True}
+    assert _cached_index_kwargs(_DoesNot()) == {}
+    assert _cached_index_kwargs(object()) == {}

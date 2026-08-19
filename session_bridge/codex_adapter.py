@@ -1317,7 +1317,17 @@ class CodexSourceAdapter:
         *,
         source_kinds: tuple[str, ...] | None = None,
         state_db_only: bool = False,
+        allow_cached_index: bool = False,
     ) -> CodexThreadSummary | None:
+        """Resolve one native thread, searching active inventory then archived.
+
+        ``allow_cached_index`` opts into the TTL'd inventory index, which trades
+        bounded staleness for one inventory fetch per TTL instead of one per
+        lookup.  Only bulk scan resolution may set it; callers that need
+        authoritative state (refresh, characterization) must not, because the
+        index only covers ACTIVE threads -- see below.
+        """
+
         if not isinstance(native_id, str) or not native_id.strip():
             return None
         self._ensure_initialized()
@@ -1332,14 +1342,27 @@ class CodexSourceAdapter:
         # no errors for 20+ minutes; its catalog freshness then aged past the 33s
         # limit and pinned session-bridge-catalog/service/continuity to 'unknown'.
         # Note _inventory_cache was already written here (below) but never read.
-        indexed = self._inventory_index(
-            archived=False, source_kinds=source_kinds, state_db_only=state_db_only
-        )
-        if indexed is not None:
-            hit = indexed.get(wanted)
-            if hit is not None:
-                self._inventory_cache[wanted] = hit
-                return hit
+        #
+        # 2026-08-19: that shortcut was UNCONDITIONAL, which broke this method two
+        # ways, so it is now opt-in and never applies to a bounded lookup.
+        #  1. The index covers archived=False only, so a thread archived inside the
+        #     900s TTL still resolved from the stale ACTIVE index and returned
+        #     early -- the archived search never ran and refresh_session reported
+        #     native_status='active' for an archived thread.
+        #  2. _inventory_index() fetches WITHOUT stop_on_native_id, so it pages the
+        #     whole inventory and follows nextCursor. Under state_db_only -- which
+        #     exists precisely to be one bounded page -- that both violated the
+        #     bound and, on the resulting failure, fell through to fetch the same
+        #     inventory a SECOND time.
+        if allow_cached_index and not state_db_only:
+            indexed = self._inventory_index(
+                archived=False, source_kinds=source_kinds, state_db_only=state_db_only
+            )
+            if indexed is not None:
+                hit = indexed.get(wanted)
+                if hit is not None:
+                    self._inventory_cache[wanted] = hit
+                    return hit
 
         active = self._fetch_inventory(
             archived=False,

@@ -396,7 +396,17 @@ def test_mirror_ledger_is_not_applicable_only_for_valid_authoritative_work() -> 
 
     assert mirror["work_state"]["state"] == "unknown"
     assert mirror["ledger_integrity"]["state"] == "unknown"
-    assert mirror["ledger_integrity"]["code"] == "invalid_measurement"
+    # 2026-08-13 (920acee871): the ledger axis must NOT restate the work failure.
+    # This used to assert "invalid_measurement" -- work_state's code, copied onto a
+    # queue_ledger axis while forcing state="unknown". mirror_jobs has no real
+    # ledger, so the honest verdict is "not tracked", and "invalid_measurement" is
+    # not in the consumer's mirror_jobs ledger vocabulary
+    # ({not_applicable, not_tracked, invalid_observation_time}) -- emitting it made
+    # the consumer reject the axis, voiding the whole evidence envelope and blanking
+    # all four session-bridge monitor rows to 'unknown'.
+    assert mirror["ledger_integrity"]["code"] == "not_tracked"
+    # The invariant behind that fix: the ledger code is never the work code.
+    assert mirror["ledger_integrity"]["code"] != mirror["work_state"]["code"]
 
 
 def test_nonzero_pending_and_retry_without_age_is_not_error() -> None:

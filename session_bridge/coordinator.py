@@ -5057,6 +5057,7 @@ class SessionBridgeCoordinator:
                         adapter,
                         "find_native_thread",
                         native_id,
+                        **_cached_index_kwargs(adapter),
                     )
                 if summary is None:
                     # 2026-08-14: a staged id the source can no longer resolve. This
@@ -5536,6 +5537,33 @@ def _call(instance: object, name: str, *args: object, **kwargs: object) -> Any:
     if not callable(method):
         raise RuntimeError("scan adapter does not implement the required operation")
     return method(*args, **kwargs)
+
+
+def _cached_index_kwargs(adapter: object) -> dict[str, bool]:
+    """Opt scan resolution into the adapter's TTL'd inventory index, if it has one.
+
+    Resolving a staged id that the batch inventory missed used to page the whole
+    Codex inventory per id, which parked a backfill for 20+ minutes (see
+    codex_adapter.find_native_thread). The index collapses that to one fetch per
+    TTL, at the cost of a bounded-stale summary -- acceptable for scan indexing,
+    NOT for refresh or characterization, which is why the adapter defaults it off
+    and only this call site turns it on.
+
+    Adapter dispatch is duck-typed, so detect the capability instead of assuming
+    it: a double implementing the narrower signature must not be handed a keyword
+    it cannot accept.
+    """
+
+    method = getattr(adapter, "find_native_thread", None)
+    if not callable(method):
+        return {}
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "allow_cached_index" in parameters:
+        return {"allow_cached_index": True}
+    return {}
 
 
 def _filesystem_permission_preflight(cwd: str) -> bool:

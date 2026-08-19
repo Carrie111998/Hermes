@@ -1958,6 +1958,66 @@ class TestFindThread:
         ]
         assert policies == [False, False, False, True]
 
+    def test_cached_index_opt_in_serves_many_lookups_from_one_fetch(self) -> None:
+        """The scan's fast path: one inventory fetch resolves many native ids."""
+
+        rows = [
+            {"id": "wanted", "createdAt": 1, "updatedAt": 2, "revision": "r1"},
+            {"id": "other", "createdAt": 1, "updatedAt": 2, "revision": "r1"},
+        ]
+        client = FakeInitializingClient({"thread/list": [{"data": rows}]})
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+        first = adapter.find_native_thread("wanted", allow_cached_index=True)
+        second = adapter.find_native_thread("other", allow_cached_index=True)
+
+        assert first is not None and first.native_id == "wanted"
+        assert second is not None and second.native_id == "other"
+        assert len([m for m, _p, _t in client.calls if m == "thread/list"]) == 1
+
+    def test_default_lookup_ignores_a_warm_index_so_archiving_is_seen(self) -> None:
+        """A warm active index must never answer an authoritative lookup.
+
+        Regression guard for 2026-08-13: find_native_thread consulted the TTL'd
+        index unconditionally, so a thread archived inside the 900s window kept
+        resolving from the stale ACTIVE index and never reached the archived
+        search -- refresh_session reported native_status 'active' for an archived
+        thread.
+        """
+
+        row = {"id": "wanted", "createdAt": 1, "updatedAt": 2, "revision": "r1"}
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [row]},
+                {"data": []},
+                {"threads": [{**row, "archived": True}]},
+            ]
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+        assert adapter.find_native_thread("wanted", allow_cached_index=True) is not None
+
+        found = adapter.find_native_thread("wanted")
+
+        assert found is not None and found.archived is True
+
+    def test_bounded_state_db_lookup_stays_one_page_even_when_opted_in(self) -> None:
+        """state_db_only exists to be a single bounded page; the index pages all."""
+
+        row = {"id": "wanted", "createdAt": 1, "updatedAt": 2, "revision": "r1"}
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row], "nextCursor": "must-not-be-read"}]
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+        found = adapter.find_native_thread(
+            "wanted",
+            state_db_only=True,
+            allow_cached_index=True,
+        )
+
+        assert found is not None and found.native_id == "wanted"
+        assert len([m for m, _p, _t in client.calls if m == "thread/list"]) == 1
+
     def test_find_does_not_hide_thread_from_next_inventory(self) -> None:
         row = {"id": "wanted", "createdAt": 1, "updatedAt": 2}
         client = FakeInitializingClient({
