@@ -10,6 +10,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from plugins.builder_adapter import plugin_tools
 from plugins.builder_adapter.adapter import BuilderDispatchAdapter
 from plugins.builder_adapter.attestation import (
@@ -26,7 +28,7 @@ from tests.plugins.test_builder_adapter_schema import request_payload
 
 GOVERNANCE_REPOSITORY = Path("/opt/bots")
 APPROVED_GOVERNANCE_SNAPSHOT = (
-    "c7c06549bf51726c73d50f1fda6bd96843a19a1f"
+    "93ac9675b3edfee34b5769899b7726c542436460"
 )
 EXPECTED_TOOLS = tuple(sorted(BUILDER_WORKER_POLICY["tool_allowlist"]))
 
@@ -52,6 +54,7 @@ def _schema_registry(snapshot: GovernanceSnapshot, root: Path) -> SchemaRegistry
     return SchemaRegistry(paths)
 
 
+@pytest.mark.integration
 def test_exact_stage1_snapshot_preflight_tool_context_and_fail_closed_validation(
     tmp_path, monkeypatch
 ):
