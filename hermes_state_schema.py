@@ -28,11 +28,13 @@ from hermes_state_common import (
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     FTS_SESSION_CJK_STALE_KEY,
+    FTS_SESSION_TRIGRAM_STALE_KEY,
     SESSION_INDEX_SQL_STATEMENTS,
     SESSION_TABLE_REBUILD_SQL,
     SESSIONS_FTS_CJK_TABLE_SQL,
     SESSIONS_FTS_CJK_TRIGGER_SQL,
     SESSIONS_FTS_SQL,
+    SESSIONS_FTS_TRIGRAM_SQL,
     _FTS_SESSION_CJK_TRIGGERS,
     _ephemeral_child_sql,
 )
@@ -1307,6 +1309,7 @@ class SessionSchemaMixin:
         if fts5_available:
             self._ensure_sessions_fts_schema(cursor)
             self._ensure_sessions_fts_cjk_schema(cursor)
+            self._ensure_sessions_fts_trigram_schema(cursor)
 
         self._conn.commit()
 
@@ -1582,6 +1585,63 @@ class SessionSchemaMixin:
                 "Unicode/trigram/LIKE", exc_info=True,
             )
             self._sessions_cjk_available = False
+
+    def _ensure_sessions_fts_trigram_schema(self, cursor) -> None:
+        """Create / repair / self-heal the optional trigram session metadata
+        index over the compact derived VIEW (mirrors the CJK-session ensure).
+
+        Sets ``self._sessions_trigram_available``. Never raises; a host whose
+        SQLite build lacks the trigram tokenizer degrades to Unicode/CJK/LIKE
+        routing.
+        """
+        trig_present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'sessions_fts_trigram'"
+        ).fetchone())
+        try:
+            cursor.executescript(SESSIONS_FTS_TRIGRAM_SQL)
+            if not trig_present:
+                cursor.execute(
+                    "DELETE FROM state_meta WHERE key = ?",
+                    (FTS_SESSION_TRIGRAM_STALE_KEY,),
+                )
+                n_sessions = cursor.execute(
+                    "SELECT COUNT(*) FROM sessions"
+                ).fetchone()[0]
+                if n_sessions > 0:
+                    hw = cursor.execute(
+                        "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+                    ).fetchone()[0]
+                    for k, v in (
+                        ("fts_session_trigram_rebuild_high_water", str(hw)),
+                        ("fts_session_trigram_rebuild_progress", "0"),
+                    ):
+                        cursor.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (k, v),
+                        )
+            stale = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (FTS_SESSION_TRIGRAM_STALE_KEY,),
+            ).fetchone()
+            if stale:
+                # Capability loss of unknown extent - do not serve until a
+                # capable host resets and rebuilds the index.
+                self._sessions_trigram_available = False
+                return
+            backfill_pending = cursor.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_session_trigram_rebuild_high_water' LIMIT 1"
+            ).fetchone()
+            self._sessions_trigram_available = not backfill_pending
+        except sqlite3.OperationalError:
+            # Includes "no such tokenizer: trigram".
+            logger.warning(
+                "sessions_fts_trigram ensure failed; trigram session search "
+                "stays on Unicode/CJK/LIKE", exc_info=True,
+            )
+            self._sessions_trigram_available = False
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

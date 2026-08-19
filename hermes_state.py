@@ -3435,6 +3435,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # CJK rebuild finish.
                 self._sessions_fts_available = False
                 self._sessions_cjk_available = False
+                self._sessions_trigram_available = False
                 self._init_schema()
 
             def _connect_and_init_with_lock_patience():

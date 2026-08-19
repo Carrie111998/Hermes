@@ -229,10 +229,14 @@ class TestRebuildMarkers:
         return SessionDB(db_path=db_path)
 
     def _session_markers(self, db):
+        # Unicode lane markers only (fts_session_rebuild_*); the CJK/trigram
+        # lanes carry their own independent marker pairs and are covered by
+        # their own test modules.
         return {
             r["key"]: r["value"]
             for r in db._conn.execute(
-                "SELECT key, value FROM state_meta WHERE key LIKE 'fts_session_%'"
+                "SELECT key, value FROM state_meta "
+                "WHERE key LIKE 'fts_session_rebuild_%'"
             ).fetchall()
         }
 
