@@ -96,6 +96,40 @@ def _episode_model_for(finding: dict) -> str:
     return f"{finding.get('window_id')}-window"
 
 
+def _future_resets_at(raw: object) -> str:
+    """Pass `resets_at` through ONLY when it is genuinely in the future.
+
+    Phase 1's episode reaper forgets any episode whose `resets_at` has passed
+    (events/rate_limit_signal.py, _episode_expired) -- correct for a real rate
+    limit, where a passed reset means the limit lifted.
+
+    It is WRONG for this detector's data. Observed live 2026-08-18: anthropic's
+    weekly window reported used_pct 100.0 with resets_at 2026-08-17 -- a day in
+    the PAST on a window that was still fully capped. Handing that value to
+    record() got the episode reaped on the very next read, so every 5-minute
+    poll looked like a brand-new episode and re-alerted. Caught in production
+    within two cycles: 00:20:13 and 00:25:14, same window, same outcome.
+
+    The Phase 3 design rule was already "resets_at is display-only, never
+    branch on it" -- but that was enforced in quota_signal.evaluate(), one layer
+    too shallow. The value still reached a consumer that DOES branch on it.
+    A stale timestamp is dropped here rather than poisoning the episode.
+    """
+    if not raw:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        text = str(raw).strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return str(raw) if parsed > datetime.now(timezone.utc) else ""
+    except Exception:
+        return ""
+
+
 def _emit_quota_findings(snapshot: dict) -> None:
     """Report ai_usage.quota_signal findings as MODEL_RATE_LIMITED alerts.
 
@@ -123,7 +157,7 @@ def _emit_quota_findings(snapshot: dict) -> None:
                 reason="quota_window",
                 detector="usage_poller",
                 outcome=finding["outcome"],
-                resets_at=finding.get("resets_at") or "",
+                resets_at=_future_resets_at(finding.get("resets_at")),
                 # Without this the alert's `source` falls back through
                 # HERMES_CRON_JOB_NAME / HERMES_AGENT_SOURCE to the generic
                 # "agent-loop", which reads as if the agent runtime raised it.

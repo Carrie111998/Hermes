@@ -194,3 +194,55 @@ def test_absent_window_never_recovers_an_open_episode(tmp_path, monkeypatch):
     collect(db_path=str(db), prev=first, fetch_usage=fetch_absent, now=NOW)
 
     assert clear_calls == []
+
+
+class TestStaleResetsAtIsNotForwarded:
+    """Regression for a defect caught IN PRODUCTION within two poll cycles.
+
+    Phase 1's episode reaper forgets any episode whose `resets_at` has passed.
+    That is right for a real rate limit. It is wrong for this detector: on
+    2026-08-18 anthropic reported used_pct 100.0 with resets_at 2026-08-17 -- a
+    day in the past on a still-capped window. Forwarding it got the episode
+    reaped on the next read, so every 5-minute poll re-alerted (observed at
+    00:20:13 and again at 00:25:14 for the same window).
+
+    The design rule "resets_at is display-only" was already in place, but was
+    enforced one layer too shallow -- in evaluate(), not at the boundary where
+    the value reaches a consumer that branches on it.
+    """
+
+    def test_past_resets_at_is_dropped(self):
+        from ai_usage.collector import _future_resets_at
+        assert _future_resets_at("2026-08-17T08:00:00Z") == ""
+
+    def test_future_resets_at_is_preserved(self):
+        from ai_usage.collector import _future_resets_at
+        from datetime import datetime, timedelta, timezone
+        soon = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+        assert _future_resets_at(soon) == soon
+
+    def test_missing_or_garbage_resets_at_is_dropped_not_raised(self):
+        from ai_usage.collector import _future_resets_at
+        assert _future_resets_at(None) == ""
+        assert _future_resets_at("") == ""
+        assert _future_resets_at("not-a-timestamp") == ""
+
+    def test_a_still_capped_window_with_a_past_reset_emits_without_resets_at(self, monkeypatch):
+        """The end-to-end shape of the production defect."""
+        calls = []
+        import events.rate_limit_signal as rls
+        monkeypatch.setattr(rls, "record", lambda **kw: calls.append(kw) or True)
+        from ai_usage.collector import _emit_quota_findings
+        _emit_quota_findings({
+            "providers": [{
+                "key": "anthropic", "mode": "budget",
+                "windows": [{"id": "wk", "label": "Weekly", "used_pct": 100.0,
+                             "resets_at": "2026-08-17T08:00:00Z"}],
+            }]
+        })
+        assert len(calls) == 1
+        assert calls[0]["outcome"] == "chain_exhausted"
+        assert calls[0]["resets_at"] == "", (
+            "a stale reset time must not reach record() -- Phase 1's reaper "
+            "branches on it and would forget the episode every poll"
+        )
