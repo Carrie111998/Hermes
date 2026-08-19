@@ -2214,6 +2214,9 @@ class AIAgent:
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
+                if _row_timestamp is None:
+                    _row_timestamp = time.time()
+                    msg["timestamp"] = _row_timestamp
                 # Store the sidecar only when it actually differs.
                 if _row_api_content == content:
                     _row_api_content = None
