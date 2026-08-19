@@ -119,18 +119,15 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
-def _count_tool_errors(messages) -> int:
-    """Count tool-role results this turn that carry a JSON ``error`` marker.
+def _iter_tool_errors(messages):
+    """Yield ``(tool_name, error_text)`` for tool-role results this turn that
+    carry a JSON ``error`` marker.
 
-    Grounding input for the Layer 0 outcome eval, not a decision input — the
-    mechanical verifiers + file-mutation state are what actually attribute.
-    Counts results whose content parses to a dict with a truthy ``error``
-    key (``tools.registry.tool_error``'s canonical shape).
+    Scans backward and stops at the last ``user`` message: ``messages`` is the
+    full session history, and earlier turns' tool errors must not be counted
+    against this turn (nor re-parsed — tool payloads are routinely large).
+    Yields the tool name (when the row carries one) and the raw error text.
     """
-    count = 0
-    # Scan backward and stop at the last ``user`` message: ``messages`` is the
-    # full session history, and earlier turns' tool errors must not be counted
-    # against this turn (nor re-parsed — tool payloads are routinely large).
     for m in reversed(messages):
         if isinstance(m, dict) and m.get("role") == "user":
             break  # turn boundary — earlier errors belong to prior turns
@@ -144,8 +141,39 @@ def _count_tool_errors(messages) -> int:
         except (ValueError, TypeError):
             continue
         if isinstance(parsed, dict) and parsed.get("error"):
-            count += 1
-    return count
+            yield (m.get("tool_name") or m.get("name") or "", str(parsed.get("error")))
+
+
+def _count_tool_errors(messages) -> int:
+    """Count tool-role results this turn that carry a JSON ``error`` marker.
+
+    Grounding input for the Layer 0 outcome eval, not a decision input — the
+    mechanical verifiers + file-mutation state are what actually attribute.
+    Counts results whose content parses to a dict with a truthy ``error``
+    key (``tools.registry.tool_error``'s canonical shape).
+    """
+    return sum(1 for _ in _iter_tool_errors(messages))
+
+
+def _collect_tool_errors(messages) -> list:
+    """Enumerate tool errors this turn for the Layer 0 evidence catalog.
+
+    Each entry is ``{"tool": name, "error": text}`` so the outcome judge can
+    CITE a specific error (by catalog ID) instead of blaming from a bare
+    count. Best-effort — malformed rows are skipped, error text is bounded so
+    a huge payload can't bloat the judge's prompt.
+    """
+    out = []
+    for tool, error in _iter_tool_errors(messages):
+        out.append({"tool": tool, "error": error[:400]})
+        if len(out) >= _MAX_TOOL_ERROR_EVIDENCE:
+            break
+    # _iter_tool_errors scans backward (current turn's tail first); restore
+    # chronological order so catalog IDs read top-to-bottom like the turn.
+    return list(reversed(out))
+
+
+_MAX_TOOL_ERROR_EVIDENCE = 10
 
 
 def finalize_turn(
@@ -330,6 +358,7 @@ def finalize_turn(
                 file_mutation_state=(
                     getattr(agent, "_turn_failed_file_mutations", None) or {}
                 ),
+                tool_error_evidence=_collect_tool_errors(messages),
                 tool_error_count=_count_tool_errors(messages),
             )
     except Exception as _oc_err:

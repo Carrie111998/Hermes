@@ -29,6 +29,22 @@ Mechanism:
      review is the arbiter, not this recorder.
   4. Best-effort everywhere: any failure here must never break the turn.
 
+Recorder-side rejection (the enumerated-evidence guard): the aux judge blames
+via CITATION, not bare names. ``failure_points`` is now
+``[{"skill": ..., "evidence": [IDs]}]`` pointing at a numbered evidence
+catalog — verifier verdicts, tool errors, and file mutations that happened
+THIS turn — and the recorder refuses to write a hard False a citation can't
+back. A point citing a mechanical verifier FAIL of the exact skill is hard
+(the citation is the evidence, no confidence gate); a point citing only
+tool-error/file-mutation evidence, or carrying no citation at all (legacy
+bare-name blame), is gated (the skill tie is judge-attributed, so the
+confidence floor still applies); a point whose citations are ALL invalid
+(fabricated ID, cited PASS, another skill's FAIL) is a soft suspect —
+recorded NEUTRAL with the judge's reason preserved, never a hard False. This
+closes the "conclusion stored as if it were a fact" gap: nothing downstream
+can tell a verifier's True/False from the judge's guess, and a bare-name
+guess previously landed with the same sidecar status.
+
 Known limitation (future work, not fixed here): the aux judge sees only the
 summarized final response + verdict report — no tool outputs, diffs, or file
 state — so its verdict over unverified residue is a thin signal. The
@@ -47,7 +63,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Union
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +194,7 @@ def _build_prompt(
     verdict_report: str,
     file_previews: str,
     tool_error_count: int,
+    evidence_catalog: str = "",
 ) -> str:
     lines = [
         "Evaluate whether the task Hermes just completed actually held up.",
@@ -192,10 +209,18 @@ def _build_prompt(
     ]
     if file_previews:
         lines.append(f"Failed file mutations: {file_previews}")
+    if evidence_catalog:
+        lines.append(
+            "Evidence catalog (cite by ID — the ONLY support your blame may use):"
+        )
+        lines.append(evidence_catalog)
     lines.append(
         'Reply with strict JSON: {"task_succeeded": bool, "confidence": 0-1, '
-        '"failure_points": [skill names that caused the failure], '
-        '"reason": "short explanation"}.'
+        '"failure_points": [{"skill": "<name>", "evidence": [<IDs>]}], '
+        '"reason": "short explanation"}. '
+        "For every failure point, cite at least one ID from the evidence catalog "
+        "that supports it. If a skill failed but you cannot cite catalog evidence "
+        'for it, omit it from "failure_points" and explain in "reason" instead.'
     )
     return "\n".join(lines)
 
@@ -234,6 +259,204 @@ def _parse_judge_json(content: str) -> Optional[Dict[str, Any]]:
         return parsed if isinstance(parsed, dict) else None
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
+
+
+# ── Enumerated evidence (Layer 0 "conclusion vs. fact" guard) ───────────────
+#
+# The judge previously returned ``failure_points`` as bare skill names, which
+# the recorder wrote with the same sidecar status as a mechanical verifier's
+# True/False — a conclusion stored as if it were a fact, with nothing
+# downstream able to tell them apart. This section turns blame into a
+# CITATION: ``failure_points`` becomes ``[{"skill": ..., "evidence": [IDs]}]``
+# pointing at a numbered catalog of THIS turn's evidence (verifier verdicts,
+# tool errors, file mutations), and the recorder refuses to write a False that
+# can't be backed by a real, matching item.
+#
+# Validation strength per evidence kind:
+#   - verifier: the strongest check — the cited item must be a FAIL of the
+#     EXACT blamed skill. Citing a PASS (or another skill's FAIL) invalidates
+#     the whole point.
+#   - tool_error / file_mutation: existence is the check. The recorder cannot
+#     mechanically tie an error to a skill, so a citation here is judge-
+#     attributed evidence and still passes through the confidence gate below —
+#     the gate is the remaining guarantee for these kinds.
+#   - no citation at all (legacy bare-name blame): gated — stays a candidate
+#     for a hard False but must clear the confidence gate below (the skill tie
+#     is judge-attributed and the gate is the remaining guarantee).
+#   - only invalid citations (fabricated ID, cited PASS, another skill's FAIL):
+#     the point is a suspicion, recorded NEUTRAL with the judge's reason
+#     preserved, never a hard False.
+
+# Cap on catalog size — bounds the judge's prompt cost (mirrors the PR's
+# ``total_verify_budget_seconds`` / ``max_tokens`` budget philosophy).
+_MAX_EVIDENCE_ITEMS = 20
+
+
+def _build_evidence_catalog(
+    verdicts: Mapping[str, tuple[str, str]],
+    tool_errors: Iterable[Mapping[str, Any]],
+    file_mutations: Mapping[str, Any],
+) -> list[Dict[str, Any]]:
+    """Assemble the numbered evidence catalog for this turn.
+
+    Each entry is ``{"eid": int, "kind": str, "skill": str, "verdict":
+    Optional[bool], "text": str}``. Verifier verdicts appear only for
+    ``pass``/``fail`` (a ``skip`` is "no judgment" and can't be cited as
+    evidence of anything). Tool errors and file mutations carry no skill — the
+    judge attributes them. Best-effort: any malformed input is dropped.
+    """
+    catalog: list[Dict[str, Any]] = []
+
+    def _add(
+        kind: str, skill: str, subject: str, verdict: Optional[bool], text: str
+    ) -> None:
+        if len(catalog) >= _MAX_EVIDENCE_ITEMS:
+            return
+        catalog.append(
+            {
+                "eid": len(catalog) + 1,
+                "kind": kind,
+                "skill": skill,
+                "subject": subject,
+                "verdict": verdict,
+                "text": text[:400],
+            }
+        )
+
+    for name, (verdict, reason) in (verdicts or {}).items():
+        if verdict not in ("pass", "fail"):
+            continue
+        verdict_bool = verdict == "pass"
+        tail = f" — {reason}" if reason else ""
+        _add("verifier", str(name), str(name), verdict_bool, f"{verdict.upper()}{tail}")
+
+    for err in tool_errors or ():
+        if not isinstance(err, dict):
+            continue
+        tool = str(err.get("tool") or "?")
+        error = str(err.get("error") or "").strip()
+        if not error:
+            continue
+        _add("tool_error", "", tool, None, error)
+
+    for path, meta in (file_mutations or {}).items():
+        preview = ""
+        if isinstance(meta, dict):
+            preview = str(meta.get("error_preview") or "")
+        _add("file_mutation", "", str(path), None, preview)
+
+    return catalog
+
+
+def _render_evidence_catalog(catalog: Sequence[Mapping[str, Any]]) -> str:
+    """Render the catalog for the judge prompt.
+
+    One line per item, prefixed with its ID so the judge can cite it. Verifier
+    items show the skill + verdict; tool errors / file mutations show their
+    subject (tool name / path) + the error text. Never duplicates the subject
+    (it lives in its own field, not embedded in the text).
+    """
+    if not catalog:
+        return "  (none)"
+    lines = []
+    for e in catalog:
+        if e["kind"] == "verifier":
+            subject = e["skill"]
+        else:
+            subject = e["subject"]
+        lines.append(f"  [{e['eid']}] {e['kind']}({subject}) {e['text']}")
+    return "\n".join(lines)
+
+
+def _normalize_failure_points(fp: Any) -> List[Dict[str, Any]]:
+    """Coerce the judge's ``failure_points`` into a uniform list of dicts.
+
+    Accepts both the new citation schema (``[{"skill": ..., "evidence":
+    [...]}]``) and the legacy bare-name schema (``["skill-a", ...]``), plus
+    ragged variants (dicts missing keys, names wrapped in lists). Never raises.
+    """
+    if not isinstance(fp, (list, tuple)):
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in fp:
+        if isinstance(p, dict):
+            skill = p.get("skill")
+            evidence = p.get("evidence")
+            if isinstance(evidence, (list, tuple)):
+                cleaned: List[int] = []
+                for e in evidence:
+                    if isinstance(e, int):
+                        cleaned.append(e)
+                    elif isinstance(e, str) and e.strip().isdigit():
+                        # Judges frequently stringify IDs ("1", " 2 ").
+                        cleaned.append(int(e.strip()))
+                evidence = cleaned
+            else:
+                evidence = []
+            if not isinstance(skill, str) or not skill:
+                continue
+            out.append({"skill": skill, "evidence": evidence})
+        elif isinstance(p, str) and p.strip():
+            # Legacy schema: a bare name with no citation. Records as a
+            # suspicion (NEUTRAL) unless the confidence gate lets it through —
+            # see _validate_eval_blame.
+            out.append({"skill": p.strip(), "evidence": []})
+    return out
+
+
+def _validate_eval_blame(
+    points: List[Dict[str, Any]],
+    catalog: Sequence[Mapping[str, Any]],
+    used_names: Set[str],
+) -> tuple[List[str], List[str], List[str]]:
+    """Split eval failure points into (hard, gated, soft) skill names.
+
+    A point hard-blames its skill only when it carries a valid citation to a
+    mechanical verifier FAIL of that EXACT skill — the strongest evidence, so
+    it lands as a hard False regardless of the judge's confidence. A point
+    citing only tool-error / file-mutation evidence, or carrying NO citation
+    (legacy bare-name blame), is ``gated``: it stays a candidate for a hard
+    False but must clear the confidence gate below — the citation is
+    existence-only (or absent), so the skill tie is judge-attributed and the
+    gate is the remaining guarantee. A point whose citations are ALL invalid
+    (fabricated ID, cited PASS, another skill's FAIL) is a soft suspect —
+    recorded NEUTRAL, never a hard False.
+    """
+    by_id = {int(e["eid"]): e for e in catalog}
+    hard: List[str] = []
+    gated: List[str] = []
+    soft: List[str] = []
+    for p in points:
+        skill = p.get("skill")
+        if not skill or skill not in used_names:
+            continue
+        evidence = p.get("evidence") or []
+        saw_toolish = False
+        saw_verifier_fail = False
+        for eid in evidence:
+            item = by_id.get(int(eid)) if isinstance(eid, int) else None
+            if item is None:
+                continue  # fabricated/unknown ID — never evidence
+            if item["kind"] == "verifier":
+                # The citation must be a mechanical FAIL of THIS skill. Citing
+                # a PASS (or another skill's FAIL) is not evidence of failure.
+                if item["skill"] == skill and item["verdict"] is False:
+                    saw_verifier_fail = True
+            else:
+                # tool_error / file_mutation: existence is the check.
+                saw_toolish = True
+        if saw_verifier_fail:
+            hard.append(skill)
+        elif saw_toolish or not evidence:
+            # tool/file-cited OR uncited (legacy) blame → confidence-gated.
+            gated.append(skill)
+        else:
+            soft.append(skill)
+    return (
+        list(dict.fromkeys(hard)),
+        list(dict.fromkeys(gated)),
+        list(dict.fromkeys(soft)),
+    )
 
 
 def _default_aux_eval(prompt: str) -> Optional[Dict[str, Any]]:
@@ -337,6 +560,7 @@ def evaluate_turn_outcome(
     exit_reason: Optional[str] = None,
     file_mutation_state: Optional[Mapping[str, Any]] = None,
     tool_error_count: int = 0,
+    tool_error_evidence: Optional[Iterable[Mapping[str, Any]]] = None,
     outcome_config: Optional[Mapping[str, Any]] = None,
     _aux_eval: Optional[Callable[[str], Optional[Mapping[str, Any]]]] = None,
 ) -> Optional[TurnOutcome]:
@@ -412,6 +636,13 @@ def evaluate_turn_outcome(
             return None
 
         # ── Signal-gated aux judgment ───────────────────────────────────────
+        # Numbered evidence catalog: verifier verdicts + tool errors + file
+        # mutations. The judge may only blame via citations into this catalog;
+        # the recorder validates every citation mechanically before writing a
+        # False (see _validate_eval_blame).
+        evidence_catalog = _build_evidence_catalog(
+            verdicts, tool_error_evidence, fm
+        )
         verdict_report = "\n".join(
             f"  - {n}: {v}{f' ({r})' if r else ''}" for n, (v, r) in verdicts.items()
         )
@@ -425,6 +656,7 @@ def evaluate_turn_outcome(
             verdict_report,
             file_previews,
             tool_error_count,
+            evidence_catalog=_render_evidence_catalog(evidence_catalog),
         )
         aux_data: Optional[Mapping[str, Any]] = None
         if _aux_eval is not None:
@@ -438,7 +670,7 @@ def evaluate_turn_outcome(
 
         eval_succeeded: Optional[bool] = None
         eval_confidence: Optional[float] = None
-        eval_points: List[str] = []
+        eval_points: List[Dict[str, Any]] = []
         eval_reason = ""
         if isinstance(aux_data, dict):
             if "task_succeeded" in aux_data:
@@ -452,9 +684,7 @@ def evaluate_turn_outcome(
             conf = aux_data.get("confidence")
             if isinstance(conf, (int, float)):
                 eval_confidence = float(min(max(conf, 0.0), 1.0))
-            fp = aux_data.get("failure_points")
-            if isinstance(fp, (list, tuple)):
-                eval_points = [str(x) for x in fp]
+            eval_points = _normalize_failure_points(aux_data.get("failure_points"))
             eval_reason = str(aux_data.get("reason") or "")
 
         # ── Verdict resolution ──────────────────────────────────────────────
@@ -484,7 +714,19 @@ def evaluate_turn_outcome(
         # recorder must not pin blame (or flip needs_review) on a skill the turn
         # never touched. Mechanical points are already used-skills-only.
         used_names = {name for name, _d in skill_dirs}
-        eval_blamed = [p for p in eval_points if p in used_names]
+        # Recorder-side rejection (enumerated-evidence guard): the judge may
+        # only blame via citations into this turn's evidence catalog. A point
+        # citing a mechanical verifier FAIL of the same skill is hard —
+        # the citation IS the evidence, so it lands regardless of the judge's
+        # confidence. A point citing only tool-error / file-mutation evidence,
+        # or carrying no citation (legacy bare name), is gated: the tie to a
+        # skill is judge-attributed, so the confidence gate below is the
+        # remaining guarantee. A point whose citations are ALL invalid
+        # (fabricated ID, cited PASS, another skill's FAIL) is a soft suspect —
+        # recorded NEUTRAL, never a hard False.
+        hard_blamed, gated_blamed, soft_blamed = _validate_eval_blame(
+            eval_points, evidence_catalog, used_names
+        )
 
         # Confidence gate on judge-only blame. The judge attributes from a
         # summarized account (no diffs / tool state), so a low-confidence blame
@@ -497,10 +739,9 @@ def evaluate_turn_outcome(
         # FAILs stay down-only: this gate never softens a verifier FAIL (and
         # never runs when one exists — eval_points is cleared above).
         if not has_mechanical_fail and confidence < _BLAME_CONFIDENCE_THRESHOLD:
-            soft_blamed = eval_blamed
-            eval_blamed = []
-        else:
-            soft_blamed = []
+            soft_blamed = list(dict.fromkeys(soft_blamed + gated_blamed))
+            gated_blamed = []
+        eval_blamed = list(dict.fromkeys(hard_blamed + gated_blamed))
 
         failure_points = list(dict.fromkeys(mechanical_points + eval_blamed))
         _blamed_set = set(failure_points) | set(soft_blamed)

@@ -19,6 +19,11 @@ Pins the Layer 0 decisions from patch.md to behavior:
     empty ``failure_points`` writes nothing
   - reason corpus: verifier reason and eval reason both surface
   - best-effort: a broken aux call never breaks the turn
+  - enumerated-evidence guard: the judge's ``failure_points`` is now
+    ``[{"skill": ..., "evidence": [IDs]}]`` citing a numbered evidence catalog;
+    a verifier-FAIL citation is hard (no confidence gate), tool-error/file-
+    mutation or uncited legacy blame is confidence-gated, and fabricated/PASS/
+    wrong-skill citations are rejected to NEUTRAL
 
 The verifier path is the REAL one — real SKILL.md frontmatter, real subprocess
 against a temp skill dir. Only the aux model call is injected (a seam); there
@@ -769,6 +774,275 @@ def test_eval_cannot_blame_a_skill_not_used_this_turn(turn_env):
     assert "summarization" not in load_usage()
     # The used skill is not blamed either — the judge gave no reason to.
     assert get_record("real").get("recent_outcomes") == []
+
+
+class TestEnumeratedEvidenceGuard:
+    """Recorder-side rejection: blame must cite real, matching evidence.
+
+    The judge's ``failure_points`` is now ``[{"skill": ..., "evidence":
+    [IDs]}]`` pointing at a numbered catalog of this turn's evidence (verifier
+    verdicts, tool errors, file mutations). The recorder refuses to write a
+    hard False a citation can't back:
+
+      - verifier-FAIL citation of the exact skill → hard, lands regardless of
+        confidence (the citation IS the evidence)
+      - tool-error / file-mutation citation, or NO citation (legacy bare name)
+        → gated: a hard False only when the judge's confidence clears the
+        floor
+      - fabricated ID, cited PASS, or another skill's FAIL → soft NEUTRAL,
+        never a hard False
+
+    These exercise the real verifier path (real SKILL.md, real subprocess)
+    with the aux seam, exactly like the rest of the suite.
+    """
+
+    def test_cited_verifier_fail_lands_regardless_of_confidence(self, turn_env):
+        """A verifier FAIL is foreclosed: the skill lands a hard False even when
+        the judge's confidence is below the floor. The mechanical item — not the
+        judge's self-assessment — is what's being recorded; the eval's citation
+        to it is consistent with the down-only outcome, not the source of it."""
+        from agent.turn_outcome import evaluate_turn_outcome
+        from tools.skill_usage import get_record, set_verify_enabled
+
+        d = _write_skill_with_verify(
+            turn_env / "skills", "vfail", _verify_script(False, "verifier says no")
+        )
+        set_verify_enabled("vfail", True)
+
+        outcome = evaluate_turn_outcome(
+            skills_used_this_turn={"vfail": d},
+            outcome_config={"enabled": True, "run": "always"},
+            _aux_eval=_eval(
+                task_succeeded=False,
+                confidence=0.1,  # below _BLAME_CONFIDENCE_THRESHOLD
+                failure_points=[{"skill": "vfail", "evidence": [1]}],  # [1] is its FAIL
+                reason="the verifier is right",
+            ),
+        )
+        assert outcome is not None
+        assert outcome.failure_points == ["vfail"]
+        assert get_record("vfail")["recent_outcomes"] == [False]
+
+    def test_fabricated_evidence_id_rejected(self, turn_env):
+        """A citation that doesn't exist in the catalog is a suspicion, not a
+        fact: the judge can't invent evidence to justify a blame."""
+        from agent.turn_outcome import evaluate_turn_outcome
+        from tools.skill_usage import get_record
+
+        d = _write_plain_skill(turn_env / "skills", "suspect")
+
+        outcome = evaluate_turn_outcome(
+            skills_used_this_turn={"suspect": d},
+            outcome_config={"enabled": True},
+            _aux_eval=_eval(
+                task_succeeded=False,
+                confidence=0.9,  # confident, but the citation is fabricated
+                failure_points=[{"skill": "suspect", "evidence": [99]}],
+                reason="judge invented a reason",
+            ),
+        )
+        assert outcome is not None
+        assert outcome.task_succeeded is False
+        # No hard blame — the fabricated citation is rejected.
+        assert outcome.failure_points == []
+        # Recorded NEUTRAL with the reason preserved for curator review.
+        assert get_record("suspect")["recent_outcomes"] == [None]
+        assert get_record("suspect")["recent_outcome_reasons"] == [
+            "judge invented a reason"
+        ]
+
+    def test_cited_verifier_pass_is_not_failure_evidence(self, turn_env):
+        """Citing a mechanical PASS as evidence of failure must be rejected —
+        a verifier that PASSED is the opposite of evidence the skill broke."""
+        from agent.turn_outcome import evaluate_turn_outcome
+        from tools.skill_usage import get_record, set_verify_enabled
+
+        d = _write_skill_with_verify(
+            turn_env / "skills", "passer", _verify_script(True, "ok")
+        )
+        set_verify_enabled("passer", True)
+
+        outcome = evaluate_turn_outcome(
+            skills_used_this_turn={"passer": d},
+            outcome_config={"enabled": True, "run": "always"},
+            _aux_eval=_eval(
+                task_succeeded=False,
+                confidence=0.9,
+                failure_points=[{"skill": "passer", "evidence": [1]}],  # [1] is its PASS
+                reason="judge cites a pass as failure evidence",
+            ),
+        )
+        assert outcome is not None
+        assert outcome.task_succeeded is False
+        # The PASS-cited blame is rejected — soft NEUTRAL, and the skill keeps
+        # its mechanical PASS (per-skill evidence is not suppressed by a
+        # rejected citation).
+        assert outcome.failure_points == []
+        assert get_record("passer")["recent_outcomes"] == [True]
+
+    def test_mechanical_fail_forecloses_eval_blame_on_siblings(self, turn_env):
+        """Down-only covers the whole turn: with a mechanical FAIL on the table,
+        the judge's blame on an unrelated sibling is dropped entirely — not even
+        soft. A cited verifier-FAIL of the mechanically-failing skill is the
+        only thing that lands. (The "cite another skill's FAIL" rejection logic
+        itself is pinned at the unit level in test_validate_eval_blame_tiers —
+        through the real flow, any verifier FAIL triggers down-only and clears
+        all eval attribution.)"""
+        from agent.turn_outcome import evaluate_turn_outcome
+        from tools.skill_usage import get_record, set_verify_enabled
+
+        da = _write_plain_skill(turn_env / "skills", "innocent")
+        db = _write_skill_with_verify(
+            turn_env / "skills", "guilty", _verify_script(False, "b broke")
+        )
+        set_verify_enabled("guilty", True)
+
+        outcome = evaluate_turn_outcome(
+            skills_used_this_turn={"innocent": da, "guilty": db},
+            outcome_config={"enabled": True, "run": "always"},
+            _aux_eval=_eval(
+                task_succeeded=False,
+                confidence=0.9,
+                failure_points=[
+                    # innocent cites guilty's FAIL (id 2) as its own evidence.
+                    {"skill": "innocent", "evidence": [2]},
+                    {"skill": "guilty", "evidence": [2]},
+                ],
+                reason="one of them broke it",
+            ),
+        )
+        assert outcome is not None
+        # Down-only: the mechanical FAIL explains the turn; the judge's extra
+        # attribution (even soft) is dropped. Only guilty lands.
+        assert outcome.failure_points == ["guilty"]
+        assert get_record("innocent").get("recent_outcomes") == []
+        assert get_record("guilty")["recent_outcomes"] == [False]
+
+    def test_tool_error_citation_gated_by_confidence(self, turn_env):
+        """A tool-error citation is existence-checked but skill-attributed by
+        the judge — it lands as a hard False only above the confidence floor."""
+        from agent.turn_outcome import evaluate_turn_outcome
+        from tools.skill_usage import get_record
+
+        d = _write_plain_skill(turn_env / "skills", "open")
+
+        outcome = evaluate_turn_outcome(
+            skills_used_this_turn={"open": d},
+            outcome_config={"enabled": True},
+            tool_error_evidence=[{"tool": "terminal", "error": "command not found"}],
+            _aux_eval=_eval(
+                task_succeeded=False,
+                confidence=0.9,
+                failure_points=[{"skill": "open", "evidence": [1]}],  # [1] is the error
+                reason="the command was never there",
+            ),
+        )
+        assert outcome is not None
+        assert outcome.failure_points == ["open"]
+        assert get_record("open")["recent_outcomes"] == [False]
+
+    def test_tool_error_citation_below_floor_is_neutral(self, turn_env):
+        """Same tool-error citation, but low confidence: gated → NEUTRAL."""
+        from agent.turn_outcome import evaluate_turn_outcome
+        from tools.skill_usage import get_record
+
+        d = _write_plain_skill(turn_env / "skills", "open")
+
+        outcome = evaluate_turn_outcome(
+            skills_used_this_turn={"open": d},
+            outcome_config={"enabled": True},
+            tool_error_evidence=[{"tool": "terminal", "error": "command not found"}],
+            _aux_eval=_eval(
+                task_succeeded=False,
+                confidence=0.2,
+                failure_points=[{"skill": "open", "evidence": [1]}],
+                reason="maybe the command was missing",
+            ),
+        )
+        assert outcome is not None
+        assert outcome.failure_points == []
+        assert get_record("open")["recent_outcomes"] == [None]
+
+    def test_legacy_bare_name_still_gated(self, turn_env):
+        """Back-compat: a bare-name failure_points (no evidence) is gated by
+        the confidence floor exactly as before — confident → hard, low →
+        NEUTRAL. The new guard must not silently weaken legacy callers."""
+        from agent.turn_outcome import evaluate_turn_outcome
+        from tools.skill_usage import get_record
+
+        d = _write_plain_skill(turn_env / "skills", "legacy")
+
+        outcome = evaluate_turn_outcome(
+            skills_used_this_turn={"legacy": d},
+            outcome_config={"enabled": True},
+            _aux_eval=_eval(
+                task_succeeded=False,
+                confidence=0.9,
+                failure_points=["legacy"],
+                reason="confident it broke",
+            ),
+        )
+        assert outcome is not None
+        assert outcome.failure_points == ["legacy"]
+        assert get_record("legacy")["recent_outcomes"] == [False]
+
+    def test_prompt_renders_catalog_and_citation_instruction(self, turn_env):
+        """The judge's prompt must expose the numbered catalog and demand
+        cite-by-ID failure points — that's what makes the recorder-side
+        rejection meaningful (it can only reject citations it asked for)."""
+        from agent.turn_outcome import _build_prompt, _render_evidence_catalog
+
+        catalog = [
+            {"eid": 1, "kind": "verifier", "skill": "golden", "subject": "golden",
+             "verdict": True, "text": "PASS — ok"},
+            {"eid": 2, "kind": "tool_error", "skill": "", "subject": "terminal",
+             "verdict": None, "text": "command not found"},
+            {"eid": 3, "kind": "file_mutation", "skill": "", "subject": "marker.txt",
+             "verdict": None, "text": "permission denied"},
+        ]
+        prompt = _build_prompt(
+            "do the thing",
+            "done",
+            "  - golden: pass (ok)",
+            "",
+            1,
+            evidence_catalog=_render_evidence_catalog(catalog),
+        )
+        assert "[1] verifier(golden) PASS — ok" in prompt
+        assert "[2] tool_error(terminal) command not found" in prompt
+        assert "[3] file_mutation(marker.txt) permission denied" in prompt
+        assert '"evidence": [<IDs>]' in prompt
+        assert "cite at least one ID from the evidence catalog" in prompt
+
+    def test_validate_eval_blame_tiers(self):
+        """Unit-level pin of the tier split (used_names filtering included)."""
+        from agent.turn_outcome import _validate_eval_blame
+
+        catalog = [
+            {"eid": 1, "kind": "verifier", "skill": "v", "verdict": False,
+             "text": "FAIL"},
+            {"eid": 2, "kind": "verifier", "skill": "p", "verdict": True,
+             "text": "PASS"},
+            {"eid": 3, "kind": "tool_error", "skill": "", "verdict": None,
+             "text": "(terminal): boom"},
+        ]
+        used = {"v", "p", "u"}
+        hard, gated, soft = _validate_eval_blame(
+            [
+                {"skill": "v", "evidence": [1]},    # verifier FAIL of v → hard
+                {"skill": "p", "evidence": [1]},    # v's FAIL cited for p → soft
+                {"skill": "p", "evidence": [2]},    # p's own PASS cited → soft
+                {"skill": "u", "evidence": [3]},    # tool error → gated
+                {"skill": "u", "evidence": []},     # uncited → gated
+                {"skill": "p", "evidence": [99]},   # fabricated ID → soft
+                {"skill": "ghost", "evidence": [1]},  # not used this turn → dropped
+            ],
+            catalog,
+            used,
+        )
+        assert hard == ["v"]
+        assert gated == ["u"]
+        assert soft == ["p"]
 
 
 class TestParseJudgeJson:

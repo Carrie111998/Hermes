@@ -126,6 +126,23 @@ def _write_skill_with_failing_verifier(home, name):
     return d
 
 
+def _write_plain_skill(home, name):
+    """A curation-eligible skill with no verifier (unverified residue)."""
+    skills_dir = home / "skills"
+    d = skills_dir / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\n"
+        f"name: {name}\n"
+        "description: e2e plain skill\n"
+        "version: 1.0.0\n"
+        "---\n"
+        f"# {name}\n",
+        encoding="utf-8",
+    )
+    return d
+
+
 def _run_turn(agent, *, final_response="all done"):
     messages = [
         {"role": "user", "content": "do a thing"},
@@ -192,6 +209,71 @@ def test_finalize_turn_records_verifier_fail_and_attaches_outcome(
     assert "e2e mechanical fail" in result["outcome"]["reason"]
 
     # The mechanical FAIL landed on the skill's sidecar.
+    assert get_record(skill)["recent_outcomes"] == [False]
+
+
+def test_finalize_turn_feeds_tool_errors_into_evidence_catalog(
+    outcome_home, monkeypatch
+):
+    """The real finalize path enumerates this turn's tool errors into the
+    evidence catalog, and a confident judge citation against them lands as a
+    hard False (gated tier: tool-error existence + confidence floor)."""
+    from tools.skill_usage import get_record
+
+    skill = "e2e_tool"
+    _write_plain_skill(outcome_home, skill)
+
+    monkeypatch.setattr(
+        "agent.turn_outcome._default_outcome_config",
+        lambda: {"enabled": True, "run": "auto"},
+    )
+
+    seen_prompt = {}
+
+    def _aux(prompt):
+        seen_prompt["text"] = prompt
+        # [1] is the tool_error evidence item for this turn's failing tool.
+        return {
+            "task_succeeded": False,
+            "confidence": 0.9,
+            "failure_points": [{"skill": skill, "evidence": [1]}],
+            "reason": "the write failed",
+        }
+
+    monkeypatch.setattr("agent.turn_outcome._default_aux_eval", _aux)
+
+    agent = _StubAgent(used_skills=[skill], failed_file_mutations={})
+    messages = [
+        {"role": "user", "content": "do a thing"},
+        {"role": "assistant", "content": "writing"},
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "name": "write_file",
+            "content": json.dumps({"error": "permission denied"}),
+        },
+        {"role": "assistant", "content": "all done"},
+    ]
+    result = finalize_turn(
+        agent,
+        final_response="all done",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=None,
+        effective_task_id="task-1",
+        turn_id="turn-1",
+        user_message="do a thing",
+        original_user_message="do a thing",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(Done)",
+    )
+
+    # The evidence catalog reached the judge's prompt with the tool error.
+    assert "tool_error(write_file)" in seen_prompt.get("text", "")
+    assert result["outcome"] is not None
+    assert result["outcome"]["failure_points"] == [skill]
     assert get_record(skill)["recent_outcomes"] == [False]
 
 
