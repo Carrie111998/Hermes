@@ -14,7 +14,7 @@ import {
 } from '@/lib/storage'
 import { invalidateCronModelImpactScopeState } from '@/store/cron-model-impact-scope'
 import { $gateway, openGatewayForProfile, prepareGatewayForAgent, prepareGatewayForProfile } from '@/store/gateway'
-import { setConnection } from '@/store/session'
+import { $connection, setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
@@ -507,6 +507,28 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
   showAll ? ALL_PROFILES : normalizeProfileKey(gateway)
 )
 
+function activeProfileConnectionId(): null | string {
+  const connection = $connection.get()
+  const connectionId = String(connection?.connectionId ?? '').trim()
+
+  if (!connectionId) {
+    return null
+  }
+
+  // Explicit registry descriptors are authoritative. The app-managed local
+  // id is also authoritative even on the legacy primary descriptor: "This
+  // device" must never inherit a v1 remote override. Other inferred legacy
+  // ids remain on the v1 profile route until Electron can prove their exact
+  // registry identity (duplicate URL/SSH registrations can be ambiguous).
+  return connection?.registryScoped === true || connectionId === 'local' ? connectionId : null
+}
+
+function activateProfileOnCurrentConnection(target: string): void {
+  void ensureGatewayAgent(activeProfileConnectionId(), target).catch(error => {
+    console.warn('[profile] gateway switch failed', { error, profile: target })
+  })
+}
+
 // Switch the active context to `name`: leave "All profiles" mode, point new
 // chats at it, and swap the single live gateway onto its backend (which moves
 // $activeGatewayProfile → name, so $profileScope follows).
@@ -522,7 +544,7 @@ export function selectProfile(name: string): void {
     requestFreshSession()
   }
 
-  void ensureGatewayProfile(target)
+  activateProfileOnCurrentConnection(target)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
@@ -535,7 +557,7 @@ export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
   $newChatProfile.set(target)
   requestFreshSession()
-  void ensureGatewayProfile(target)
+  activateProfileOnCurrentConnection(target)
 }
 
 export function setShowAllProfiles(value: boolean): void {

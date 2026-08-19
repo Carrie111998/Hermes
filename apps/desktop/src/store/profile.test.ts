@@ -37,8 +37,10 @@ const {
   $profiles,
   ensureGatewayProfile,
   invalidateProfileListFetches,
+  newSessionInProfile,
   prewarmProfileBackend,
-  refreshProfiles
+  refreshProfiles,
+  selectProfile
 } = await import('./profile')
 
 const { $connection } = await import('./session')
@@ -63,17 +65,23 @@ const localConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
 
 const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnection>>()
 
+const getConnectionFor = vi.fn<
+  (payload: { connectionId?: null | string; profile?: null | string }) => Promise<HermesConnection>
+>()
+
 beforeEach(() => {
   getConnection.mockReset()
+  getConnectionFor.mockReset()
   activateGateway.mockClear()
   ensureGatewayForProfile.mockClear()
+  prepareGatewayForAgent.mockClear()
   prepareGatewayForProfile.mockClear()
   openGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
   $profiles.set([])
-  vi.stubGlobal('window', { hermesDesktop: { getConnection } })
+  vi.stubGlobal('window', { hermesDesktop: { getConnection, getConnectionFor } })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
 })
@@ -81,6 +89,68 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals()
   $connection.set(null)
+})
+
+describe('profile rail routing on a registered gateway', () => {
+  it('switches through the active registry connection instead of the legacy profile route', async () => {
+    $connection.set(localConn({ connectionId: 'local', registryScoped: false }))
+    getConnectionFor.mockResolvedValue(
+      localConn({ connectionId: 'local', profile: 'research', registryScoped: true })
+    )
+
+    selectProfile('research')
+
+    await vi.waitFor(() => expect(prepareGatewayForAgent).toHaveBeenCalledWith('local', 'research'))
+    expect(prepareGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('keeps unscoped legacy windows on the legacy profile route', async () => {
+    getConnection.mockResolvedValue(localConn({ profile: 'research' }))
+
+    selectProfile('research')
+
+    await vi.waitFor(() => expect(prepareGatewayForProfile).toHaveBeenCalledWith('research'))
+    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
+  })
+
+  it('does not promote an inferred non-local legacy descriptor into a registry route', async () => {
+    $connection.set(remoteConn({ connectionId: 'inferred-homelab', registryScoped: false }))
+    getConnection.mockResolvedValue(remoteConn({ connectionId: 'inferred-homelab', profile: 'research' }))
+
+    selectProfile('research')
+
+    await vi.waitFor(() => expect(prepareGatewayForProfile).toHaveBeenCalledWith('research'))
+    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
+  })
+
+  it('starts a profile session on the active registered gateway', async () => {
+    $connection.set(remoteConn({ connectionId: 'homelab', registryScoped: true }))
+    getConnectionFor.mockResolvedValue(
+      remoteConn({ connectionId: 'homelab', profile: 'research', registryScoped: true })
+    )
+
+    newSessionInProfile('research')
+
+    await vi.waitFor(() => expect(prepareGatewayForAgent).toHaveBeenCalledWith('homelab', 'research'))
+    expect(prepareGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('contains a registered gateway activation rejection', async () => {
+    const error = new Error('gateway unavailable')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    $connection.set(remoteConn({ connectionId: 'homelab', registryScoped: true }))
+    prepareGatewayForAgent.mockRejectedValueOnce(error)
+
+    try {
+      selectProfile('research')
+
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith('[profile] gateway switch failed', { error, profile: 'research' })
+      )
+    } finally {
+      warn.mockRestore()
+    }
+  })
 })
 
 describe('ensureGatewayProfile → $connection sync (#46651)', () => {
