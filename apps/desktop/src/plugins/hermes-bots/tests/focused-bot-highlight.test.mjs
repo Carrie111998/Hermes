@@ -28,14 +28,17 @@ test('BotRow keys the highlight off the focused profile, not the socket home', (
   assert.match(row, /const isActive = !bot\.remoteSource && bot\.name === focusedProfile/)
 })
 
-test('BotRow keeps turn-busy (work mood) a socket fact', () => {
+test('BotRow keys the work mood off a turn signal that actually fires', () => {
   const rowStart = source.indexOf('function BotRow(')
   const row = source.slice(rowStart, rowStart + 3000)
 
-  // Only the gateway-home profile can actually be mid-turn: the mood must NOT
-  // switch to the focus-keyed identity.
-  assert.match(row, /const isGatewayHome = !bot\.remoteSource && bot\.name === activeProfile/)
-  assert.match(row, /const botMood = \(isGatewayHome && gatewayState === 'busy'\) \|\| activeNow \? 'work' : 'idle'/)
+  // `host.state.gateway` is the SOCKET state ('idle' | 'connecting' | 'open'
+  // | 'closed' | 'error') and is never 'busy' — the old comparison meant the
+  // work pose never fired during a live turn. The mood must read the real
+  // turn signal, host.state.busy, and must never regress to the dead check.
+  assert.match(row, /const turnBusy = useValue\(host\.state\.busy\)/)
+  assert.match(row, /\(isActive && turnBusy\) \|\| activeNow/)
+  assert.ok(!/gatewayState === 'busy'/.test(row), "the never-true gatewayState === 'busy' comparison must not come back")
 })
 
 test('RoutinesPane scopes the Cronjobs tile to the focused chat owner', () => {

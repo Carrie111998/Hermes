@@ -4873,12 +4873,14 @@ function generatedSessionTitle(session, preview) {
 const ACTIVE_WINDOW_S = 90
 
 /** Bots that are working right now: the profile the gateway is running a
- *  turn for (busy), plus any bot whose last message landed inside the
+ *  turn for (turn-busy), plus any bot whose last message landed inside the
  *  liveness window. Pure — output follows the input roster's order, so
- *  presence never reorders or hides the normal list. */
-function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
+ *  presence never reorders or hides the normal list. `turnBusy` is the
+ *  host.state.busy turn signal — `host.state.gateway` is the SOCKET state
+ *  ('idle' | 'connecting' | 'open' | 'closed' | 'error') and is never 'busy'. */
+function activeBots(roster, activeProfile, turnBusy, now = Date.now()) {
   return (roster || []).filter(bot => {
-    const busyTurn = !bot.remoteSource && bot.name === activeProfile && gatewayState === 'busy'
+    const busyTurn = !bot.remoteSource && bot.name === activeProfile && Boolean(turnBusy)
     const last = bot.last_session?.last_active || 0
     const inWindow = Boolean(last && now / 1000 - last < ACTIVE_WINDOW_S)
 
@@ -8024,12 +8026,12 @@ function ProfileSessionsWorkspace({ bot }) {
 // ── roster pane ──────────────────────────────────────────────────────────────
 
 /** "Active now" presence strip above the roster: chips for every bot that is
- *  working right now (the gateway-busy selected profile + bots whose last
+ *  working right now (the turn-busy selected profile + bots whose last
  *  message landed inside the liveness window). Reuses the row avatar; each
  *  chip opens that bot's canonical Bot Chat. Omitted entirely when nothing
  *  is active, and never reorders the roster below it. */
-function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpen }) {
-  const active = activeBots(roster, activeProfile, gatewayState)
+function ActiveNowStrip({ roster, activeProfile, turnBusy, metaByName, onOpen }) {
+  const active = activeBots(roster, activeProfile, turnBusy)
 
   if (!active.length) {
     return null
@@ -9527,6 +9529,9 @@ function BotsPane() {
   const { data, error, isLoading, refetch } = useRoster()
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
+  // Turn-busy for the presence strip: `host.state.gateway` is the SOCKET
+  // state and is never 'busy'; the turn signal lives in host.state.busy.
+  const turnBusy = useValue(host.state.busy)
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
   const [createOpen, setCreateOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
@@ -9729,7 +9734,7 @@ function BotsPane() {
       jsx(ActiveNowStrip, {
         roster: visibleRoster,
         activeProfile,
-        gatewayState,
+        turnBusy,
         metaByName: allMeta,
         onOpen: bot => {
           const generation = ++botOpenGeneration

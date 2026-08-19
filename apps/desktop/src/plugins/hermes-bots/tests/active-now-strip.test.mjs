@@ -31,22 +31,22 @@ const roster = [
   { name: 'analyst', last_session: null }
 ]
 
-test('activeBots includes the gateway-busy selected profile before its first response lands', () => {
+test('activeBots includes the turn-busy selected profile before its first response lands', () => {
   const activeBots = loadActiveBots()
   // analyst has no last_session at all — a busy turn must still show it.
-  const names = activeBots(roster, 'analyst', 'busy', NOW).map(bot => bot.name)
+  const names = activeBots(roster, 'analyst', true, NOW).map(bot => bot.name)
   assert.ok(names.includes('analyst'))
 })
 
 test('activeBots includes bots whose last message is inside the liveness window', () => {
   const activeBots = loadActiveBots()
-  const names = activeBots(roster, 'default', 'open', NOW).map(bot => bot.name)
+  const names = activeBots(roster, 'default', false, NOW).map(bot => bot.name)
   assert.ok(names.includes('researcher'))
 })
 
 test('activeBots excludes stale activity outside the window', () => {
   const activeBots = loadActiveBots()
-  const names = activeBots(roster, 'default', 'open', NOW).map(bot => bot.name)
+  const names = activeBots(roster, 'default', false, NOW).map(bot => bot.name)
   assert.ok(!names.includes('scribe'))
 })
 
@@ -54,7 +54,7 @@ test('activeBots preserves roster order and never hides other bots', () => {
   const activeBots = loadActiveBots()
   // Mixed window: only researcher qualifies, but the output stays in input
   // order and the full roster object is untouched.
-  const active = activeBots(roster, 'default', 'open', NOW)
+  const active = activeBots(roster, 'default', false, NOW)
   assert.deepEqual(active.map(bot => bot.name), ['researcher'])
   assert.equal(roster.length, 3)
 })
@@ -65,13 +65,13 @@ test('activeBots returns an empty list when nothing is active', () => {
     { name: 'scribe', last_session: { last_active: (NOW / 1000) - 400 } },
     { name: 'analyst', last_session: null }
   ]
-  assert.deepEqual(activeBots(quiet, 'default', 'open', NOW), [])
+  assert.deepEqual(activeBots(quiet, 'default', false, NOW), [])
 })
 
 test('roster without profiles never throws', () => {
   const activeBots = loadActiveBots()
-  assert.equal(activeBots(null, 'default', 'open', NOW).length, 0)
-  assert.equal(activeBots([], 'default', 'open', NOW).length, 0)
+  assert.equal(activeBots(null, 'default', false, NOW).length, 0)
+  assert.equal(activeBots([], 'default', false, NOW).length, 0)
 })
 
 test('ActiveNowStrip renders above the roster, is a live region, and is click-accessible', () => {
