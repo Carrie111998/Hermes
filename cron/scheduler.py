@@ -5397,12 +5397,21 @@ def run_job(
                     if fb_api_key:
                         fb_kwargs["explicit_api_key"] = fb_api_key
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    model = fb_model
+                    # #90089: preserve the job's explicit model pin across a
+                    # fallback provider switch.  Previously the fallback chain
+                    # unconditionally overwrote ``model = fb_model``, silently
+                    # discarding a pinned model (e.g. glm-4.5-air) when the
+                    # primary provider (e.g. zai) failed transiently.  Only
+                    # swap the model when the job does NOT have an explicit
+                    # model pin — unpinned jobs should follow the fallback
+                    # entry's model as before.
+                    if not job.get("model"):
+                        model = fb_model
                     logger.info(
                         "Job '%s': fallback resolved to %s model %s",
                         job_id,
                         runtime.get("provider"),
-                        fb_model,
+                        model,
                     )
                     break
                 except Exception as fb_exc:
@@ -6654,6 +6663,41 @@ def _run_one_job_body(
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        # Safety net (#90089): if the execution row is still 'running' or
+        # 'claimed' after _run_one_job_body completes (normal return OR
+        # exception), some code path bypassed the terminal write — e.g. an
+        # exception that escaped before finish_execution was called, or a
+        # logic error in a new branch.  Without this net the row stays
+        # 'running' forever (the dead-owner reaper only fires from the
+        # gateway tick, which may not be running for a manual CLI run).
+        # Mark it 'failed' so the job is unblocked for its next run.
+        # Terminal states (completed/failed/unknown) are never rewritten.
+        try:
+            from cron.executions import latest_execution
+
+            _safety_record = latest_execution(job["id"])
+            if (
+                _safety_record is not None
+                and _safety_record["id"] == execution_id
+                and _safety_record["status"] in ("running", "claimed")
+            ):
+                logger.error(
+                    "Job '%s': execution %s still in '%s' state after "
+                    "run_one_job body completed — safety net marking failed",
+                    job["id"], execution_id, _safety_record["status"],
+                )
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error=(
+                        "Execution was left in a non-terminal state after "
+                        "the job body completed; safety net marked it failed. "
+                        "See #90089."
+                    ),
+                )
+        except Exception:
+            pass
 
 
 def _notify_provider_jobs_changed() -> None:

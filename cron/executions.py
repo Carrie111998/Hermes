@@ -201,7 +201,44 @@ def finish_execution(
 
 
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+    """Mark provably abandoned attempts unknown without scheduling retries.
+
+    Called from the long-lived gateway scheduler tick loop (throttled every
+    300 s).  Only rows owned by a *different* process are considered — this
+    process's own in-flight rows are left alone.  See
+    :func:`reclaim_stale_executions` for a context-agnostic variant.
+    """
+    return _reap_dead_owner_executions(skip_self_owned=True)
+
+
+def reclaim_stale_executions() -> int:
+    """Context-agnostic variant of :func:`recover_interrupted_executions`.
+
+    Identical semantics — mark ``claimed``/``running`` executions whose owner
+    process is provably dead as ``unknown`` — but callable from any context:
+    a one-shot CLI ``hermes cron run`` invocation, a test harness, or any
+    other entry point that does not have the gateway tick loop running.
+
+    This is the self-heal that issue #90089 requires: when a manual cron run
+    spawns a worker that dies silently (segfault, SIGKILL, OOM), the
+    execution row stays ``running`` forever because the dead-owner reaper in
+    the gateway tick never fires without a gateway.  Calling this before
+    dispatching a new run clears zombie records from previous crashed runs.
+    """
+    return _reap_dead_owner_executions(skip_self_owned=False)
+
+
+def _reap_dead_owner_executions(*, skip_self_owned: bool) -> int:
+    """Shared reaper body for :func:`recover_interrupted_executions` and
+    :func:`reclaim_stale_executions`.
+
+    When ``skip_self_owned`` is True, rows owned by this process are skipped
+    (the gateway tick must not reap its own in-flight rows).  When False,
+    even this process's rows are considered — a CLI one-shot invocation
+    calling ``reclaim_stale_executions`` *before* dispatching a new run has
+    no in-flight rows of its own, but if it does (e.g. a re-entrant call),
+    a provably-dead PID check still protects them.
+    """
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
@@ -211,7 +248,7 @@ def recover_interrupted_executions() -> int:
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
-            if row["process_id"] == _PROCESS_ID:
+            if skip_self_owned and row["process_id"] == _PROCESS_ID:
                 continue
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 continue
