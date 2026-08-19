@@ -752,22 +752,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
         # Opt-in conversational splitting (#4445): deliver blank-line-separated
         # paragraphs as separate Telegram bubbles instead of one long message.
-        # Mirrors the WhatsApp adapter's split_outgoing_* extra keys.
-        self._split_outgoing_on_blank_lines: bool = self._coerce_bool_extra(
-            "split_outgoing_on_blank_lines", False
-        )
-        self._split_outgoing_delay_seconds: float = self._coerce_float_extra(
-            "split_outgoing_delay_seconds", 0.6, min_value=0.0
-        )
-        _split_extra = getattr(config, "extra", None) or {}
-        try:
-            self._split_outgoing_max_parts = int(
-                _split_extra.get("split_outgoing_max_parts", 4)
-            )
-        except (TypeError, ValueError):
-            self._split_outgoing_max_parts = 4
-        if self._split_outgoing_max_parts < 1:
-            self._split_outgoing_max_parts = 4
+        # Shared split_outgoing_* extra keys (see BasePlatformAdapter).
+        self._init_conversational_split_config()
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -1904,40 +1890,6 @@ class TelegramAdapter(BasePlatformAdapter):
             if context is not None:
                 stack.append(context)
         return False
-
-    def _coerce_bool_extra(self, key: str, default: bool = False) -> bool:
-        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
-        if value is None:
-            return default
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in {"true", "1", "yes", "on"}:
-                return True
-            if lowered in {"false", "0", "no", "off"}:
-                return False
-            return default
-        return bool(value)
-
-    def _coerce_float_extra(
-        self,
-        key: str,
-        default: float,
-        *,
-        min_value: Optional[float] = None,
-        max_value: Optional[float] = None,
-    ) -> float:
-        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
-        if value is None:
-            return default
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return default
-        if min_value is not None:
-            parsed = max(parsed, min_value)
-        if max_value is not None:
-            parsed = min(parsed, max_value)
-        return parsed
 
     def _link_preview_kwargs(self) -> Dict[str, Any]:
         if not getattr(self, "_disable_link_previews", False):
@@ -5134,46 +5086,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         else:  # "first" (default)
             return chunk_index == 0
-
-    def _outgoing_message_parts(self, formatted: str) -> List[str]:
-        """Split on blank lines outside triple-backtick fenced code blocks."""
-        if not getattr(self, "_split_outgoing_on_blank_lines", False):
-            return [formatted]
-
-        parts: List[str] = []
-        current: List[str] = []
-        in_fence = False
-
-        for line in formatted.split("\n"):
-            stripped = line.lstrip()
-            indent = len(line) - len(stripped)
-
-            if indent <= 3 and re.match(r"```(?!`)", stripped):
-                if in_fence:
-                    if re.fullmatch(r"[ \t]{0,3}```[ \t]*", line):
-                        in_fence = False
-                else:
-                    in_fence = True
-
-            if not line.strip() and not in_fence:
-                part = "\n".join(current).strip()
-                if part:
-                    parts.append(part)
-                current = []
-                continue
-
-            current.append(line)
-
-        final_part = "\n".join(current).strip()
-        if final_part:
-            parts.append(final_part)
-        if len(parts) <= 1:
-            return [formatted]
-
-        max_parts = getattr(self, "_split_outgoing_max_parts", 4)
-        if max_parts > 0 and len(parts) > max_parts:
-            return parts[: max_parts - 1] + ["\n\n".join(parts[max_parts - 1 :])]
-        return parts
 
     async def send(
         self,

@@ -1010,7 +1010,7 @@ gateway:
 
 With this option enabled, `First paragraph.\n\nSecond paragraph.` sends two bubbles. A single newline stays within one bubble. Blank lines inside triple-backtick fenced code blocks do not split the code block.
 
-`split_outgoing_max_parts` limits the number of paragraph-based parts (default `4`); any remaining paragraphs are merged into the final part rather than discarded. `split_outgoing_delay_seconds` controls the delay between sends while this mode is enabled (default `0.6`). Length-based chunking still applies to every resulting part, and each bubble keeps the usual per-chunk handling (MarkdownV2 escaping with plain-text fallback, `reply_to_mode` threading, topic routing).
+`split_outgoing_max_parts` limits the number of paragraph-based parts (default `4`); any remaining paragraphs are merged into the final part rather than discarded. `split_outgoing_delay_seconds` controls the delay between sends while this mode is enabled (default `0.6`). Length-based chunking still applies to every resulting part, and each bubble keeps the usual per-chunk handling (MarkdownV2 escaping with plain-text fallback, `reply_to_mode` threading, topic routing). The same three keys (same defaults) work on WhatsApp and Photon/iMessage.
 
 ## Group Allowlisting
 
