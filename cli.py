@@ -15519,7 +15519,7 @@ def _kanban_model_error_block_reason(result: dict, cli: "HermesCLI") -> str:
     provider = getattr(cli.agent, "provider", None) or result.get("provider") or "unknown"
     status_code = result.get("status_code") or "?"
     error_type = result.get("failure_reason") or result.get("error_type") or "model_client_error"
-    summary = (result.get("error") or "model provider returned a non-retryable client error").replace("\\n", " ")
+    summary = (result.get("error") or "model provider returned a non-retryable client error").replace("\n", " ")
     if len(summary) > 200:
         summary = summary[:197] + "..."
     return f"model-error: {provider} {status_code} {error_type} — {summary}"
