@@ -1996,20 +1996,8 @@ def resolve_characterization_gate(
 ) -> CharacterizationGate:
     """Require the newest report to pass exactly for the installed CLI versions."""
 
-    root = (
-        Path(
-            report_root
-            if report_root is not None
-            else get_hermes_home() / "session-bridge" / "characterization"
-        )
-        .expanduser()
-        .absolute()
-    )
-    _require_safe_report_root(root)
-    latest = max(
-        _read_validated_gate_reports(root),
-        key=lambda candidate: (candidate.created_at, candidate.characterization_id),
-    )
+    root = _gate_report_root(report_root)
+    latest = _newest_validated_gate_report(root)
     if not latest.passed:
         raise CharacterizationGateError("failed", "characterization_report_failed")
     observed_versions = (
@@ -2029,6 +2017,118 @@ def resolve_characterization_gate(
         characterization_id=latest.characterization_id,
         codex_registration_turn_required=latest.codex_registration_turn_required,
     )
+
+
+def _gate_report_root(report_root: Path | None) -> Path:
+    return (
+        Path(
+            report_root
+            if report_root is not None
+            else get_hermes_home() / "session-bridge" / "characterization"
+        )
+        .expanduser()
+        .absolute()
+    )
+
+
+def _newest_validated_gate_report(root: Path) -> _ValidatedGateReport:
+    _require_safe_report_root(root)
+    return max(
+        _read_validated_gate_reports(root),
+        key=lambda candidate: (candidate.created_at, candidate.characterization_id),
+    )
+
+
+def describe_characterization_gate(
+    *,
+    report_root: Path | None = None,
+    current_versions: Mapping[str, str] | None = None,
+) -> tuple[int, str]:
+    """Resolve the gate and describe the outcome for an installer.
+
+    Returns ``(exit_code, message)``.  A passing gate yields ``(0, id)``, matching
+    what installers previously printed.  A rejection yields a non-zero code and an
+    operator-readable reason that names *which* provider drifted: the gate compares
+    the whole ``versions`` map at once, so a one-provider bump is indistinguishable
+    from both drifting unless the failure says so.
+
+    The gate itself is unchanged -- this only describes its verdict.
+    """
+
+    root = _gate_report_root(report_root)
+    try:
+        gate = resolve_characterization_gate(
+            report_root=root,
+            current_versions=current_versions,
+        )
+    except CharacterizationGateError as exc:
+        return 1, _describe_gate_rejection(
+            exc,
+            root=root,
+            current_versions=current_versions,
+        )
+    return 0, gate.characterization_id
+
+
+def _describe_gate_rejection(
+    exc: CharacterizationGateError,
+    *,
+    root: Path,
+    current_versions: Mapping[str, str] | None,
+) -> str:
+    lines = [f"characterization gate rejected: {exc.code} ({exc})"]
+    if exc.code == "version_drift":
+        try:
+            lines.extend(_describe_version_drift(root, current_versions))
+        except Exception:
+            # A diagnostic must never mask the rejection it is describing.
+            pass
+    if exc.code in ("missing", "failed", "version_drift"):
+        lines.append(
+            "refresh with: uv run --no-sync hermes-session-bridge characterize "
+            "--provider all"
+        )
+        lines.append(
+            "note: a refresh creates and then disposes one real session per "
+            "provider -- confirm before running it"
+        )
+    return "\n".join(lines)
+
+
+def _describe_version_drift(
+    root: Path,
+    current_versions: Mapping[str, str] | None,
+) -> list[str]:
+    expected = _expected_gate_versions(root)
+    try:
+        observed = (
+            _current_cli_versions()
+            if current_versions is None
+            else _validated_version_mapping(current_versions, source="current")
+        )
+    except CharacterizationGateError:
+        observed = None
+    if expected is None or observed is None:
+        return []
+    lines: list[str] = []
+    for provider in ("claude", "codex"):
+        report_version = expected[provider]
+        installed_version = observed[provider]
+        if report_version == installed_version:
+            lines.append(f"  {provider}: unchanged at {report_version!r}")
+        else:
+            lines.append(
+                f"  {provider}: report {report_version!r} "
+                f"!= installed {installed_version!r}"
+            )
+    return lines
+
+
+def _expected_gate_versions(root: Path) -> dict[str, str] | None:
+    """Best-effort report versions for a drift diagnostic."""
+
+    latest = _newest_validated_gate_report(root)
+    return _validated_version_mapping(latest.report["versions"], source="report")
 
 
 def _require_safe_report_root(root: Path) -> None:

@@ -11,6 +11,7 @@ from session_bridge.characterize import (
     CharacterizationGateError,
     _cli_version,
     _read_report_safely,
+    describe_characterization_gate,
     load_codex_characterization_origins,
     resolve_characterization_gate,
     run_live_characterization,
@@ -479,6 +480,133 @@ def test_characterization_gate_rejects_current_cli_version_drift(
             current_versions={"claude": "1.2.4", "codex": "4.5.6"},
         )
     assert exc_info.value.code == "version_drift"
+
+
+def test_gate_description_returns_zero_and_the_id_when_the_gate_passes(
+    tmp_path: Path,
+) -> None:
+    versions = {"claude": "1.2.3", "codex": "4.5.6"}
+    characterization_id = "11111111-1111-4111-8111-111111111111"
+    _write_report(tmp_path, characterization_id, mtime_ns=100, versions=versions)
+
+    code, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions=versions,
+    )
+
+    assert code == 0
+    assert message == characterization_id
+
+
+def test_gate_description_names_only_the_drifted_provider(tmp_path: Path) -> None:
+    _write_report(
+        tmp_path,
+        "11111111-1111-4111-8111-111111111111",
+        mtime_ns=100,
+        versions={"claude": "2.1.216 (Claude Code)", "codex": "codex-cli 0.146.0"},
+    )
+
+    code, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={
+            "claude": "2.1.216 (Claude Code)",
+            "codex": "codex-cli 0.147.0",
+        },
+    )
+
+    assert code != 0
+    assert "version_drift" in message
+    # The drifted provider is named with both sides of the comparison, so the
+    # operator can see what to refresh without re-running the gate by hand.
+    codex_line = next(line for line in message.splitlines() if "codex" in line)
+    assert "codex-cli 0.146.0" in codex_line
+    assert "codex-cli 0.147.0" in codex_line
+    # The unchanged provider must not be reported as drifted -- that misdirection
+    # is exactly what made the 2026-08-19 recovery over-broad.
+    claude_line = next(line for line in message.splitlines() if "claude" in line)
+    assert "unchanged" in claude_line
+
+
+def test_gate_description_names_both_providers_when_both_drift(
+    tmp_path: Path,
+) -> None:
+    _write_report(
+        tmp_path,
+        "11111111-1111-4111-8111-111111111111",
+        mtime_ns=100,
+        versions={"claude": "2.1.216", "codex": "codex-cli 0.146.0"},
+    )
+
+    code, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "2.1.219", "codex": "codex-cli 0.147.0"},
+    )
+
+    assert code != 0
+    claude_line = next(line for line in message.splitlines() if "claude" in line)
+    assert "2.1.216" in claude_line and "2.1.219" in claude_line
+    codex_line = next(line for line in message.splitlines() if "codex" in line)
+    assert "codex-cli 0.146.0" in codex_line and "codex-cli 0.147.0" in codex_line
+
+
+def test_gate_description_reports_non_drift_failures_by_code(tmp_path: Path) -> None:
+    versions = {"claude": "1.2.3", "codex": "4.5.6"}
+    _write_report(
+        tmp_path,
+        "11111111-1111-4111-8111-111111111111",
+        mtime_ns=100,
+        versions=versions,
+        codex_passed=False,
+    )
+
+    code, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions=versions,
+    )
+
+    assert code != 0
+    assert "failed" in message
+    assert "characterization_report_failed" in message
+
+
+def test_gate_description_reports_a_missing_report_root(tmp_path: Path) -> None:
+    code, message = describe_characterization_gate(
+        report_root=tmp_path / "absent",
+        current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+    )
+
+    assert code != 0
+    assert "missing" in message
+
+
+def test_gate_description_survives_unreadable_expected_versions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A diagnostic must never mask the rejection it is describing."""
+
+    _write_report(
+        tmp_path,
+        "11111111-1111-4111-8111-111111111111",
+        mtime_ns=100,
+        versions={"claude": "1.2.3", "codex": "4.5.6"},
+    )
+
+    def explode(root: Path) -> None:
+        raise RuntimeError("synthetic diagnostic failure")
+
+    monkeypatch.setattr(
+        "session_bridge.characterize._expected_gate_versions",
+        explode,
+    )
+
+    code, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "9.9.9"},
+    )
+
+    assert code != 0
+    assert "version_drift" in message
 
 
 def test_characterization_gate_rejects_redirected_newest_report(tmp_path: Path) -> None:
