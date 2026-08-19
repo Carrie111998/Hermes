@@ -389,6 +389,79 @@ END;
 """
 
 
+# ── Optional CJK session-metadata index (#128 / fork #26) ────────────────
+# Same external-content raw (title, id, display_name) document keyed by named
+# row_id, but tokenized with the loadable ``cjk_unicode61`` bigram tokenizer.
+# It owns an independent marker pair (``fts_session_cjk_rebuild_*``) and its
+# own stale key (``fts_session_cjk_stale``) so optional tokenizer
+# availability can never gate or corrupt the complete Unicode index. Split
+# table/trigger DDL so a stale optional index can exist while unsafe triggers
+# remain absent.
+SESSIONS_FTS_CJK_TABLE_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_cjk USING fts5(
+    title,
+    id,
+    display_name,
+    content='sessions',
+    content_rowid='row_id',
+    tokenize='cjk_unicode61'
+);
+"""
+
+SESSIONS_FTS_CJK_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_update
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+    INSERT INTO sessions_fts_cjk(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+"""
+
+
+_FTS_SESSION_CJK_TRIGGERS = (
+    "sessions_fts_cjk_insert",
+    "sessions_fts_cjk_delete",
+    "sessions_fts_cjk_update",
+)
+
+
+# Breadcrumb set when a tokenizer-less process had to drop the session-CJK
+# triggers to keep canonical session writes alive: rows written from that
+# moment on are missing from the CJK index, so it must not serve reads until
+# a capable host resets and rebuilds. Distinct from the message
+# ``FTS_CJK_STALE_KEY`` and from the Unicode-session markers.
+FTS_SESSION_CJK_STALE_KEY = "fts_session_cjk_stale"
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL

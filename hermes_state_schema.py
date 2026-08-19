@@ -27,9 +27,13 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
+    FTS_SESSION_CJK_STALE_KEY,
     SESSION_INDEX_SQL_STATEMENTS,
     SESSION_TABLE_REBUILD_SQL,
+    SESSIONS_FTS_CJK_TABLE_SQL,
+    SESSIONS_FTS_CJK_TRIGGER_SQL,
     SESSIONS_FTS_SQL,
+    _FTS_SESSION_CJK_TRIGGERS,
     _ephemeral_child_sql,
 )
 
@@ -1302,6 +1306,7 @@ class SessionSchemaMixin:
         # run only when FTS5 is available; _ensure_fts_schema fails closed.
         if fts5_available:
             self._ensure_sessions_fts_schema(cursor)
+            self._ensure_sessions_fts_cjk_schema(cursor)
 
         self._conn.commit()
 
@@ -1470,6 +1475,113 @@ class SessionSchemaMixin:
         ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
         self._sessions_fts_available = bool(ok)
         return ok
+
+    def _ensure_sessions_fts_cjk_schema(self, cursor) -> None:
+        """Create / repair / self-heal the optional CJK-bigram session
+        metadata index (mirrors the message ``_ensure_fts_cjk_schema``).
+
+        Sets ``self._sessions_cjk_available``. Never raises; every failure
+        mode degrades to "no CJK session index" (Unicode/trigram/LIKE
+        routing keeps working).
+
+        Cases:
+          tokenizer loaded, table absent  -> create. Empty DB: index is
+              complete by construction. Populated DB: set the dedicated
+              ``fts_session_cjk_*`` markers so the id-gated triggers keep
+              NEW rows indexed while old rows await the resumable backfill;
+              the index is not served until that backfill completes.
+          tokenizer loaded, table present -> ensure triggers, honour the
+              stale breadcrumb (serve only when absent and no backfill
+              pending).
+          tokenizer NOT loaded, table present with live triggers -> drop
+              the CJK triggers so canonical session writes don't fail at
+              trigger time, and leave the stale breadcrumb (self-heal).
+        """
+        cjk_present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'sessions_fts_cjk'"
+        ).fetchone())
+
+        if not self._fts_cjk_loaded:
+            if cjk_present:
+                live = [
+                    r[0] for r in cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({','.join('?' for _ in _FTS_SESSION_CJK_TRIGGERS)})",
+                        _FTS_SESSION_CJK_TRIGGERS,
+                    ).fetchall()
+                ]
+                if live:
+                    # Self-heal: this process cannot tokenize, so every
+                    # session INSERT would die inside the CJK trigger.
+                    # Breadcrumb FIRST, then drop.
+                    logger.warning(
+                        "sessions_fts_cjk triggers present but the "
+                        "cjk_unicode61 tokenizer is unavailable (%s) - "
+                        "dropping the CJK session triggers so session writes "
+                        "keep working; run `hermes sessions optimize-storage` "
+                        "on a host with the extension to rebuild.",
+                        fts5_cjk_so_path(),
+                    )
+                    cursor.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                        (FTS_SESSION_CJK_STALE_KEY,),
+                    )
+                    for trig in live:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            self._sessions_cjk_available = False
+            return
+
+        try:
+            cursor.executescript(SESSIONS_FTS_CJK_TABLE_SQL)
+            if not cjk_present:
+                cursor.execute(
+                    "DELETE FROM state_meta WHERE key = ?",
+                    (FTS_SESSION_CJK_STALE_KEY,),
+                )
+                n_sessions = cursor.execute(
+                    "SELECT COUNT(*) FROM sessions"
+                ).fetchone()[0]
+                if n_sessions > 0:
+                    hw = cursor.execute(
+                        "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+                    ).fetchone()[0]
+                    for k, v in (
+                        ("fts_session_cjk_rebuild_high_water", str(hw)),
+                        ("fts_session_cjk_rebuild_progress", "0"),
+                    ):
+                        cursor.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (k, v),
+                        )
+            stale = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?",
+                (FTS_SESSION_CJK_STALE_KEY,),
+            ).fetchone()
+            if stale:
+                # A tokenizer-less process dropped the triggers at some
+                # unknown point - the index has a gap of unknown extent. Do
+                # NOT reinstall triggers (an external-content 'delete' for an
+                # unindexed rowid corrupts the index); the next
+                # optimize-storage run rebuilds from scratch.
+                self._sessions_cjk_available = False
+                return
+            cursor.executescript(SESSIONS_FTS_CJK_TRIGGER_SQL)
+            backfill_pending = cursor.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_session_cjk_rebuild_high_water' LIMIT 1"
+            ).fetchone()
+            self._sessions_cjk_available = not backfill_pending
+        except sqlite3.OperationalError:
+            # Includes "no such tokenizer: cjk_unicode61" if the extension
+            # loaded but registration failed - degrade to Unicode/trigram.
+            logger.warning(
+                "sessions_fts_cjk ensure failed; CJK session search stays on "
+                "Unicode/trigram/LIKE", exc_info=True,
+            )
+            self._sessions_cjk_available = False
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

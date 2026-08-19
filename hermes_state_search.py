@@ -425,6 +425,90 @@ class SessionSearchMixin:
             )
         self._execute_write(_do)
 
+    def fts_session_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """CJK session-metadata index backfill progress, or None when no
+        rebuild is pending."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
+                ("fts_session_cjk_rebuild_high_water",
+                 "fts_session_cjk_rebuild_progress"),
+            ).fetchall()
+        meta = {r["key"]: r["value"] for r in row}
+        high_water = meta.get("fts_session_cjk_rebuild_high_water")
+        if high_water is None:
+            return None
+        progress = int(meta.get("fts_session_cjk_rebuild_progress") or 0)
+        total = int(high_water)
+        if total <= 0:
+            return None
+        pct = min(100, int(100 * progress / total))
+        return {"pending": True, "total": total, "indexed": progress, "percent": pct}
+
+    def fts_session_cjk_rebuild_step(self) -> bool:
+        """Backfill one chunk of the deferred CJK session-metadata rebuild.
+
+        Returns True when more work remains, False when the rebuild is
+        complete (or none pending). Chunks are claimed atomically inside the
+        write transaction. Search-serving availability flips on only after
+        the markers are cleared.
+        """
+        if not self._fts_enabled:
+            return False
+        high_water_raw = self.get_meta("fts_session_cjk_rebuild_high_water")
+        if high_water_raw is None:
+            return False
+        high_water = int(high_water_raw)
+        chunk = self._FTS_REBUILD_CHUNK_ROWS
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_cjk_rebuild_progress'"
+            ).fetchone()
+            if row is None:
+                return False  # finished (or cleared) by another process
+            progress = int(row[0])
+            if progress >= high_water:
+                return False
+            upper = min(progress + chunk, high_water)
+            conn.execute(
+                "INSERT INTO sessions_fts_cjk(rowid, title, id, display_name) "
+                "SELECT row_id, title, id, display_name FROM sessions "
+                "WHERE row_id > ? AND row_id <= ?",
+                (progress, upper),
+            )
+            conn.execute(
+                "UPDATE state_meta SET value = ? "
+                "WHERE key = 'fts_session_cjk_rebuild_progress'",
+                (str(upper),),
+            )
+            return upper < high_water
+
+        try:
+            more = self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            logger.debug("CJK session FTS rebuild chunk failed (will retry): %s", exc)
+            return True  # transient (lock contention) - caller retries
+        if more is False:
+            status = self.fts_session_cjk_rebuild_status()
+            if status is not None and status["indexed"] >= status["total"]:
+                self._clear_session_cjk_rebuild_markers()
+            return False
+        return bool(more)
+
+    def _clear_session_cjk_rebuild_markers(self) -> None:
+        """Remove the CJK session-metadata rebuild H/P markers once the
+        backfill completes and flip search-serving availability on."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_session_cjk_rebuild_high_water', "
+                "'fts_session_cjk_rebuild_progress')"
+            )
+        self._execute_write(_do)
+        self._sessions_cjk_available = True
+
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
         with self._read_ctx() as conn:
@@ -707,6 +791,52 @@ class SessionSearchMixin:
         for k, v in (
             ("fts_session_rebuild_high_water", str(hw)),
             ("fts_session_rebuild_progress", "0"),
+        ):
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (k, v),
+            )
+        return int(hw)
+
+    def _seed_session_cjk_rebuild_markers(
+        self, conn, *, force: bool = False
+    ) -> int:
+        """Seed ``fts_session_cjk_rebuild_high_water`` / ``_progress`` for a
+        full backfill of the CJK session-metadata index. Returns the
+        high-water row_id. Caller must hold the write transaction / lock.
+        """
+        existing_hw = conn.execute(
+            "SELECT value FROM state_meta "
+            "WHERE key = 'fts_session_cjk_rebuild_high_water'"
+        ).fetchone()
+        if existing_hw is not None and not force:
+            hw = int(existing_hw[0])
+            progress = conn.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_cjk_rebuild_progress'"
+            ).fetchone()
+            if progress is None:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES "
+                    "('fts_session_cjk_rebuild_progress', '0') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                )
+            return hw
+
+        hw = conn.execute(
+            "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+        ).fetchone()[0]
+        if int(hw) <= 0:
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_session_cjk_rebuild_high_water', "
+                "'fts_session_cjk_rebuild_progress')"
+            )
+            return 0
+        for k, v in (
+            ("fts_session_cjk_rebuild_high_water", str(hw)),
+            ("fts_session_cjk_rebuild_progress", "0"),
         ):
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
