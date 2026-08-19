@@ -57,7 +57,7 @@ function lastVisibleAssistant(messages: readonly SpokenReplyMessage[]): SpokenRe
 }
 
 /** If a spoken live-tail row vanished and the same assistant slot now has a
- *  durable id, migrate the anchor. Leave durable ids and newer turns alone. */
+ *  durable id, migrate the anchor. Leave durable ids and later turns alone. */
 export function absorbSpokenReplyRewrite(
   spoken: SpokenReplyAnchor | null,
   messages: readonly SpokenReplyMessage[]
