@@ -94,4 +94,14 @@ describe('resolvePinnedSessions', () => {
 
     expect(resolvePinnedSessions([], index, sessions)).toEqual([])
   })
+
+  it('does not re-add a row via the server fallback while its local unpin is unconfirmed (#89700)', () => {
+    // Unpinning removes 'a' from the local set, but the cached row still
+    // carries pinned: true until a fresh page confirms the PATCH. Without
+    // the pending-unpin guard, the fallback below would re-add it instantly.
+    const sessions = [row('a', { pinned: true })]
+    const index = buildSessionByAnyId(sessions, [], [])
+
+    expect(resolvePinnedSessions([], index, sessions, () => true)).toEqual([])
+  })
 })

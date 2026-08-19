@@ -47,11 +47,18 @@ export function buildSessionByAnyId(
  * a session the backend says is pinned is always reachable from the Pinned
  * section, whatever the local cache holds. session-pin-sync then adopts the
  * pin into the local set on its next reconcile, restoring ordering control.
+ *
+ * A session just unpinned locally is the mirror-image case: its cached row
+ * still carries `pinned: true` (session-pin-sync's PATCH ack never rewrites
+ * it) until a fresh list page confirms the flip. Without `isPendingUnpin`,
+ * that stale flag would fall through to the fallback below and re-add the
+ * row immediately after the user cleared it (#89700).
  */
 export function resolvePinnedSessions(
   pinnedSessionIds: readonly string[],
   sessionByAnyId: Map<string, SessionInfo>,
-  allSessions: readonly SessionInfo[]
+  allSessions: readonly SessionInfo[],
+  isPendingUnpin: (pinId: string) => boolean = () => false
 ): SessionInfo[] {
   const seen = new Set<string>()
   const out: SessionInfo[] = []
@@ -66,7 +73,9 @@ export function resolvePinnedSessions(
   }
 
   for (const session of allSessions) {
-    if (session.pinned === true && !seen.has(session.id)) {
+    const pinId = session._lineage_root_id ?? session.id
+
+    if (session.pinned === true && !seen.has(session.id) && !isPendingUnpin(pinId) && !isPendingUnpin(session.id)) {
       seen.add(session.id)
       out.push(session)
     }
