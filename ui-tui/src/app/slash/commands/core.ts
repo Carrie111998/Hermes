@@ -448,11 +448,14 @@ export const coreCommands: SlashCommand[] = [
     help: 'compose your next prompt in $EDITOR (same as Ctrl+G)',
     name: 'prompt',
     run: (arg, ctx) => {
-      // Pass only the text after /prompt. openEditor reads composer state from
-      // the current render; setInput() would not flush before the editor
-      // opened, so `/prompt` itself used to leak into the temp file and
-      // re-dispatch as a slash command after save (#84714).
-      void ctx.composer.openEditor(arg).catch((err: unknown) => {
+      // Pass only the text after /prompt as the seed. An explicit arg
+      // replaces the draft; bare /prompt (empty arg) preserves the
+      // current composer draft, matching Ctrl+G / Alt+G.
+      // openEditor reads composer state from the current render;
+      // setInput() would not flush before the editor opened, so
+      // `/prompt` itself used to leak into the temp file and re-dispatch
+      // as a slash command after save (#84714).
+      void ctx.composer.openEditor(arg || undefined).catch((err: unknown) => {
         ctx.transcript.sys(`editor failed: ${String(err)}`)
       })
     }
