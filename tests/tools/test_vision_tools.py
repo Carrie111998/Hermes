@@ -368,6 +368,40 @@ class TestPublicUrlOnlyMode:
         sent_url = mock_llm.await_args.kwargs["messages"][0]["content"][1]["image_url"]["url"]
         assert sent_url.startswith("data:image/png;base64,")
 
+    @pytest.mark.asyncio
+    async def test_public_url_only_still_enforces_website_policy(self):
+        blocked = {
+            "host": "blocked.test",
+            "rule": "blocked.test",
+            "source": "config",
+            "message": "Blocked by website policy",
+        }
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"auxiliary": {"vision": {"public_url_only": True}}},
+            ),
+            patch(
+                "tools.vision_tools._validate_image_url_async",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch("tools.vision_tools.check_website_access", return_value=blocked),
+            patch(
+                "tools.vision_tools.async_call_llm", new_callable=AsyncMock
+            ) as mock_llm,
+        ):
+            result = json.loads(
+                await vision_analyze_tool(
+                    "https://blocked.test/photo.png", "describe this"
+                )
+            )
+
+        assert result["success"] is False
+        assert "Blocked by website policy" in result["error"]
+        mock_llm.assert_not_awaited()
+
 
 class TestVisionSafetyGuards:
     @pytest.mark.asyncio

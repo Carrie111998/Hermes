@@ -1383,6 +1383,9 @@ async def vision_analyze_tool(
         _crop_offset: dict = {}
         _scale_info: dict = {}
         if public_url_only and region is None and await _validate_image_url_async(image_url):
+            blocked = check_website_access(image_url)
+            if blocked:
+                raise PermissionError(blocked["message"])
             image_data_url = image_url.strip()
             image_size_bytes = 0
             logger.info("Public-image mode: forwarding URL without base64 encoding")
