@@ -10,6 +10,7 @@ import {
   MAX_AUTO_DRAIN_ATTEMPTS,
   type QueuedPromptEntry,
   removeQueuedPrompt,
+  resolveQueuedPromptTransport,
   shouldAutoDrain
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
@@ -116,11 +117,25 @@ export function useBackgroundQueueDrain({
             return true
           }
 
+          const resolved = resolveQueuedPromptTransport(liveEntry)
+
+          if (!resolved.ok) {
+            notify({
+              kind: 'warning',
+              title: t.composer.terminalSelectionMissingTitle,
+              message: t.composer.queuedTerminalSelectionExpiredBody
+            })
+            drainFailuresRef.current.set(liveEntry.id, MAX_AUTO_DRAIN_ATTEMPTS)
+
+            return true
+          }
+
           const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(sessionKey) ?? null
 
           const accepted = await Promise.resolve(
-            submitTextRef.current(liveEntry.text, {
+            submitTextRef.current(resolved.transportText, {
               attachments: liveEntry.attachments,
+              ...(resolved.displayText ? { displayText: resolved.displayText } : {}),
               fromQueue: true,
               sessionId: runtimeSessionId,
               storedSessionId: sessionKey

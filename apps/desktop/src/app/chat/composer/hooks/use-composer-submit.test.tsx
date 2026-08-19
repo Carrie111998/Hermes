@@ -2,7 +2,11 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $clarifyRequests } from '@/store/clarify'
-import type { ComposerAttachment } from '@/store/composer'
+import {
+  clearComposerTerminalSelections,
+  type ComposerAttachment,
+  setComposerTerminalSelection
+} from '@/store/composer'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -77,6 +81,7 @@ describe('useComposerSubmit busy-turn routing', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    clearComposerTerminalSelections()
   })
 
   it('treats a payload mid-turn as send (steer), not stop', async () => {
@@ -179,6 +184,61 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSteer).not.toHaveBeenCalled()
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it('leaves idle @terminal chips for the submit transport freeze (does not expand here)', async () => {
+    setComposerTerminalSelection('zsh:23-58', 'selected terminal lines')
+
+    const { hook, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      text: 'look at @terminal:`zsh:23-58`'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('look at @terminal:`zsh:23-58`', {
+        attachments: [],
+        composerScope: 'stored-session'
+      })
+    )
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+  })
+
+  it('expands @terminal selection chips before steering a busy turn', async () => {
+    setComposerTerminalSelection('zsh:23-58', 'selected terminal lines')
+
+    const { hook, onSteer, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: 'look at @terminal:`zsh:23-58`'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() =>
+      expect(onSteer).toHaveBeenCalledWith('```terminal\nselected terminal lines\n```\n\nlook at')
+    )
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+  })
+
+  it('refuses to steer when a restored @terminal chip has no selection payload', () => {
+    clearComposerTerminalSelections()
+
+    const { hook, onSteer, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: 'look at @terminal:`zsh:23-58`'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
   })
 
   it('threads the loaded composer scope through onSubmit for the #59305 submit-time guard', async () => {

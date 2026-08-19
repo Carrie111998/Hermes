@@ -2,17 +2,122 @@ import { atom } from 'nanostores'
 
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 
-import type { ComposerAttachment } from './composer'
+import { type ComposerAttachment, draftHasTerminalChips } from './composer'
 
 export interface QueuedPromptEntry {
   id: string
   text: string
   /** What the queue panel and the sent bubble show, when it differs from the
    *  text the agent receives. A queued `/skill` invocation carries the whole
-   *  expanded skill body as `text` — the UI shows the invocation instead. */
+   *  expanded skill body as `text` — the UI shows the invocation instead.
+   *  A queued `@terminal:` chip keeps the chip form here (and in `text`); the
+   *  fenced selection payload lives only in the runtime map. */
   displayText?: string
   attachments: ComposerAttachment[]
   queuedAt: number
+}
+
+export interface EnqueueQueuedPromptPayload {
+  text: string
+  attachments: ComposerAttachment[]
+  displayText?: string
+  /** Fenced `@terminal` transport. Runtime-only; never written to localStorage. */
+  frozenTransport?: string
+}
+
+export type ResolvedQueuedPromptTransport =
+  | { ok: true; transportText: string; displayText?: string }
+  | { ok: false; reason: 'missing-terminal-payload' }
+
+/**
+ * Frozen terminal transport for queued entries, keyed by stable `queuedPromptId`.
+ * Memory-only on purpose: persisting selection CONTENTS in
+ * `hermes.desktop.composerQueue.v1` would survive renderer restart as stale
+ * secrets-adjacent terminal output, and label reuse after reload cannot
+ * reconstruct the original pane (#77078).
+ */
+const frozenQueuedTransportById = new Map<string, string>()
+
+export const getFrozenQueuedTransport = (id: string): string | undefined => frozenQueuedTransportById.get(id)
+
+export const setFrozenQueuedTransport = (id: string, transportText: string): void => {
+  const trimmed = transportText.trim()
+
+  if (!trimmed) {
+    frozenQueuedTransportById.delete(id)
+
+    return
+  }
+
+  frozenQueuedTransportById.set(id, trimmed)
+}
+
+export const clearFrozenQueuedTransport = (id: string): void => {
+  frozenQueuedTransportById.delete(id)
+}
+
+export const resetFrozenQueuedTransportsForTests = (): void => {
+  frozenQueuedTransportById.clear()
+}
+
+export const queuedEntryHasTerminalChips = (entry: Pick<QueuedPromptEntry, 'displayText' | 'text'>): boolean =>
+  draftHasTerminalChips(entry.displayText ?? '') || draftHasTerminalChips(entry.text)
+
+export const resolveQueuedPromptTransport = (entry: QueuedPromptEntry): ResolvedQueuedPromptTransport => {
+  if (!queuedEntryHasTerminalChips(entry)) {
+    return {
+      ok: true,
+      transportText: entry.text,
+      ...(entry.displayText ? { displayText: entry.displayText } : {})
+    }
+  }
+
+  const frozen = frozenQueuedTransportById.get(entry.id)?.trim()
+
+  if (!frozen) {
+    return { ok: false, reason: 'missing-terminal-payload' }
+  }
+
+  const chipText = entry.displayText ?? entry.text
+
+  return { ok: true, transportText: frozen, displayText: chipText }
+}
+
+const dropFrozenTransportsRemovedFrom = (previous: QueuedPromptEntry[], next: QueuedPromptEntry[]) => {
+  const nextIds = new Set(next.map(entry => entry.id))
+
+  for (const entry of previous) {
+    if (!nextIds.has(entry.id)) {
+      frozenQueuedTransportById.delete(entry.id)
+    }
+  }
+}
+
+const toPersistedEntry = (entry: QueuedPromptEntry): QueuedPromptEntry => {
+  const frozen = frozenQueuedTransportById.get(entry.id)?.trim()
+  const persisted: QueuedPromptEntry = {
+    id: entry.id,
+    text: entry.text,
+    attachments: entry.attachments,
+    queuedAt: entry.queuedAt,
+    ...(entry.displayText ? { displayText: entry.displayText } : {})
+  }
+
+  if (!frozen) {
+    return persisted
+  }
+
+  // Never write fenced selection CONTENTS into localStorage. Prefer the chip
+  // form already on the entry; if `text` accidentally holds transport, swap it.
+  if (persisted.text === frozen) {
+    persisted.text = persisted.displayText ?? ''
+  }
+
+  if (persisted.displayText === frozen) {
+    delete persisted.displayText
+  }
+
+  return persisted
 }
 
 /** Whether a queued entry can ride a mid-turn redirect: text-only, non-empty,
@@ -43,6 +148,16 @@ const load = (): QueueState => {
   }
 }
 
+const persistableState = (state: QueueState): QueueState => {
+  const out: QueueState = {}
+
+  for (const [sid, queue] of Object.entries(state)) {
+    out[sid] = queue.map(toPersistedEntry)
+  }
+
+  return out
+}
+
 const save = (state: QueueState) => {
   if (typeof window === 'undefined') {
     return
@@ -52,7 +167,7 @@ const save = (state: QueueState) => {
     if (Object.keys(state).length === 0) {
       window.localStorage.removeItem(STORAGE_KEY)
     } else {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistableState(state)))
     }
   } catch {
     // best-effort: storage may be unavailable, queue still works in-memory
@@ -60,6 +175,12 @@ const save = (state: QueueState) => {
 }
 
 export const $queuedPromptsBySession = atom<QueueState>(load())
+
+/** Drop runtime payloads and rehydrate the atom from localStorage (renderer restart). */
+export const simulateComposerQueueReloadForTests = (): void => {
+  frozenQueuedTransportById.clear()
+  $queuedPromptsBySession.set(load())
+}
 
 /**
  * Sessions whose queue the user explicitly halted (Stop button / Esc). A parked
@@ -90,6 +211,7 @@ const setParked = (sid: string, parked: boolean) => {
 
 const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
   const current = $queuedPromptsBySession.get()
+  dropFrozenTransportsRemovedFrom(queueFor(sid), queue)
   const next = { ...current }
 
   if (queue.length === 0) {
@@ -125,7 +247,7 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
 
 export const enqueueQueuedPrompt = (
   key: string | null | undefined,
-  payload: { text: string; attachments: ComposerAttachment[]; displayText?: string }
+  payload: EnqueueQueuedPromptPayload
 ): null | QueuedPromptEntry => {
   const sid = sidOf(key)
 
@@ -139,6 +261,10 @@ export const enqueueQueuedPrompt = (
     ...(payload.displayText ? { displayText: payload.displayText } : {}),
     attachments: cloneAttachments(payload.attachments),
     queuedAt: Date.now()
+  }
+
+  if (payload.frozenTransport?.trim()) {
+    setFrozenQueuedTransport(entry.id, payload.frozenTransport)
   }
 
   writeSession(sid, [...queueFor(sid), entry])
@@ -210,7 +336,13 @@ export const promoteQueuedPrompt = (key: string | null | undefined, id: string):
 export const updateQueuedPrompt = (
   key: string | null | undefined,
   id: string,
-  update: { text: string; attachments?: ComposerAttachment[] }
+  update: {
+    text: string
+    attachments?: ComposerAttachment[]
+    displayText?: string | null
+    /** Replace (`string`), clear (`null`/empty), or leave (`undefined`) runtime transport. */
+    frozenTransport?: string | null
+  }
 ): boolean => {
   const sid = sidOf(key)
 
@@ -228,18 +360,43 @@ export const updateQueuedPrompt = (
 
     const attachments = update.attachments ? cloneAttachments(update.attachments) : entry.attachments
 
-    if (entry.text === update.text && !update.attachments) {
+    const nextDisplay =
+      update.displayText === undefined ? undefined : update.displayText === null ? undefined : update.displayText
+
+    if (
+      entry.text === update.text &&
+      !update.attachments &&
+      (update.displayText === undefined || nextDisplay === entry.displayText) &&
+      update.frozenTransport === undefined
+    ) {
       return entry
     }
 
     changed = true
 
+    if (update.frozenTransport !== undefined) {
+      const nextFrozen = update.frozenTransport?.trim() ?? ''
+
+      if (nextFrozen) {
+        setFrozenQueuedTransport(entry.id, nextFrozen)
+      } else {
+        clearFrozenQueuedTransport(entry.id)
+      }
+    } else if (!queuedEntryHasTerminalChips({ text: update.text, displayText: nextDisplay })) {
+      clearFrozenQueuedTransport(entry.id)
+    }
+
     // The user rewrote the text, so any display projection it carried (a
     // `/skill` invocation standing in for the expanded body) no longer
-    // describes it — what they typed is now what sends.
+    // describes it — unless the caller froze a new chip/display pair.
     const { displayText: _dropped, ...rest } = entry
 
-    return { ...rest, text: update.text, attachments }
+    return {
+      ...rest,
+      text: update.text,
+      attachments,
+      ...(nextDisplay ? { displayText: nextDisplay } : {})
+    }
   })
 
   if (!changed) {

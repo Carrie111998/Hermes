@@ -8,7 +8,8 @@ import {
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
   getQueuedPrompts,
-  parkQueuedPrompts
+  parkQueuedPrompts,
+  resetFrozenQueuedTransportsForTests
 } from '@/store/composer-queue'
 import { $sessions, setSessions } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
@@ -62,6 +63,7 @@ describe('useBackgroundQueueDrain', () => {
   beforeEach(() => {
     vi.useRealTimers()
     clearAllSessionStates()
+    resetFrozenQueuedTransportsForTests()
   })
 
   afterEach(() => {
@@ -70,6 +72,7 @@ describe('useBackgroundQueueDrain', () => {
     vi.useRealTimers()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    resetFrozenQueuedTransportsForTests()
     $sessions.set([])
     clearAllSessionStates()
   })
@@ -93,6 +96,31 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
+  })
+
+  it('forwards queued displayText so frozen @terminal chips render in the bubble', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt('stored-session-a', {
+      text: 'look at @terminal:`zsh:23-58`',
+      displayText: 'look at @terminal:`zsh:23-58`',
+      attachments: [],
+      frozenTransport: '```terminal\nselection A\n```\n\nlook at'
+    })
+    clearAllSessionStates()
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => {
+      expect(submitText).toHaveBeenCalledWith('```terminal\nselection A\n```\n\nlook at', {
+        attachments: [],
+        displayText: 'look at @terminal:`zsh:23-58`',
+        fromQueue: true,
+        sessionId: 'rt-session-a',
+        storedSessionId: 'stored-session-a'
+      })
+    })
   })
 
   it('leaves the selected session queue to the mounted ChatBar drainer', async () => {
