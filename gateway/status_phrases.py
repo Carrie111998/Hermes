@@ -182,6 +182,14 @@ def resolve_status_phrase_catalog(user_config: Mapping[str, Any] | None, platfor
     return catalog
 
 
+def status_phrase_catalog_is_custom(catalog: Mapping[str, list[str]]) -> bool:
+    """Return whether a resolved catalog differs from Hermes' built-in phrases."""
+    return any(
+        list(catalog.get(surface) or []) != list(_DEFAULT_PHRASES.get(surface) or [])
+        for surface in _STATUS_SURFACES
+    )
+
+
 def classify_status_context(
     kind: str,
     *,

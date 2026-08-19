@@ -30,22 +30,49 @@ def _flatten(d, prefix="") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Catalog completeness -- this is the key invariant test.  If someone adds a
-# new key to en.yaml they MUST add it to every other locale, else runtime
-# falls back to English for those users and defeats the feature.
+# Catalog completeness -- this is the key invariant test. If someone adds a
+# new core key to en.yaml they MUST add it to every other locale, else runtime
+# falls back to English for those users and defeats the feature. Explicitly
+# sparse platform surfaces (currently Telegram command-menu descriptions) are
+# exempt: they intentionally fall back to the registry-owned text.
 # ---------------------------------------------------------------------------
 
+_OPTIONAL_SPARSE_PREFIXES = (
+    "telegram_command_descriptions.",
+    "gateway.slash_confirm.",
+    "gateway.destructive_slash.",
+    "gateway.session_info.",
+    "gateway.clarify.",
+    "gateway.working.",
+    "gateway.restart.success",
+    "gateway.restart.online",
+    "gateway.telegram_topics.",
+)
+
+_GERMAN_REQUIRED_PREFIXES = tuple(
+    prefix
+    for prefix in _OPTIONAL_SPARSE_PREFIXES
+    if prefix != "telegram_command_descriptions."
+)
 
 
 @pytest.mark.parametrize("lang", [l for l in i18n.SUPPORTED_LANGUAGES if l != "en"])
 def test_catalog_keys_match_english(lang: str):
-    """Every non-English catalog must have exactly the same key set as English."""
+    """Every non-English catalog has the same required key set as English."""
     en_keys = set(_flatten(_load_raw("en")).keys())
     lang_keys = set(_flatten(_load_raw(lang)).keys())
-    missing = en_keys - lang_keys
-    extra = lang_keys - en_keys
+    missing = {
+        key
+        for key in (en_keys - lang_keys)
+        if not key.startswith(_OPTIONAL_SPARSE_PREFIXES)
+    }
+    extra = {
+        key
+        for key in (lang_keys - en_keys)
+        if not key.startswith(_OPTIONAL_SPARSE_PREFIXES)
+    }
     assert not missing, f"{lang}.yaml missing keys: {sorted(missing)}"
-    assert not extra, f"{lang}.yaml has keys not in en.yaml: {sorted(extra)}"
+    assert not extra, f"{lang}.yaml has unexpected keys: {sorted(extra)}"
 
 
 @pytest.mark.parametrize("lang", list(i18n.SUPPORTED_LANGUAGES))
@@ -61,6 +88,8 @@ def test_catalog_placeholders_match_english(lang: str):
     en_flat = _flatten(_load_raw("en"))
     lang_flat = _flatten(_load_raw(lang))
     for key, en_value in en_flat.items():
+        if key.startswith(_OPTIONAL_SPARSE_PREFIXES) and key not in lang_flat:
+            continue
         en_placeholders = set(placeholder_re.findall(en_value))
         lang_value = lang_flat.get(key, "")
         lang_placeholders = set(placeholder_re.findall(lang_value))
@@ -68,6 +97,16 @@ def test_catalog_placeholders_match_english(lang: str):
             f"{lang}.yaml key={key!r}: placeholders {lang_placeholders} "
             f"don't match English {en_placeholders}"
         )
+
+
+def test_german_contains_every_new_static_ui_key():
+    """German owns the full localized UI surface and must never fall back."""
+    en_keys = set(_flatten(_load_raw("en")))
+    de_keys = set(_flatten(_load_raw("de")))
+    required = {
+        key for key in en_keys if key.startswith(_GERMAN_REQUIRED_PREFIXES)
+    }
+    assert required - de_keys == set()
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +130,33 @@ def test_default_when_nothing_set(monkeypatch):
     i18n.reset_language_cache()
     monkeypatch.setattr(i18n, "_config_language_cached", lambda: None)
     assert i18n.get_language() == "en"
+
+
+def test_config_language_cache_is_scoped_by_profile_home(tmp_path, monkeypatch):
+    """A multiplex gateway must not reuse the first profile's UI language."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.delenv("HERMES_LANGUAGE", raising=False)
+    de_home = tmp_path / "de"
+    en_home = tmp_path / "en"
+    de_home.mkdir()
+    en_home.mkdir()
+    (de_home / "config.yaml").write_text("display:\n  language: de\n", encoding="utf-8")
+    (en_home / "config.yaml").write_text("display:\n  language: en\n", encoding="utf-8")
+    i18n.reset_language_cache()
+
+    de_token = set_hermes_home_override(de_home)
+    try:
+        assert i18n.get_language() == "de"
+    finally:
+        reset_hermes_home_override(de_token)
+
+    en_token = set_hermes_home_override(en_home)
+    try:
+        assert i18n.get_language() == "en"
+    finally:
+        reset_hermes_home_override(en_token)
+        i18n.reset_language_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +183,29 @@ def test_t_missing_key_in_non_english_falls_back_to_english(tmp_path, monkeypatc
     finally:
         # Clear the cache on teardown so subsequent tests don't see the
         # fake "foo: English Foo" catalog instead of the real locales/*.yaml.
+        i18n.reset_language_cache()
+
+
+def test_t_optional_returns_only_explicit_target_translation(tmp_path, monkeypatch):
+    """Sparse platform catalogs may opt in without forcing every locale to copy keys."""
+    fake_locales = tmp_path / "locales"
+    fake_locales.mkdir()
+    (fake_locales / "en.yaml").write_text(
+        "telegram_command_descriptions:\n  new: Start a new session\n",
+        encoding="utf-8",
+    )
+    (fake_locales / "de.yaml").write_text(
+        "telegram_command_descriptions:\n  new: Neue Sitzung starten\n",
+        encoding="utf-8",
+    )
+    (fake_locales / "fr.yaml").write_text("# intentionally sparse\n", encoding="utf-8")
+    monkeypatch.setattr(i18n, "_locales_dir", lambda: fake_locales)
+    i18n.reset_language_cache()
+    try:
+        assert i18n.t_optional("telegram_command_descriptions.new", lang="de") == "Neue Sitzung starten"
+        assert i18n.t_optional("telegram_command_descriptions.new", lang="fr") is None
+        assert i18n.t_optional("telegram_command_descriptions.missing", lang="de") is None
+    finally:
         i18n.reset_language_cache()
 
 

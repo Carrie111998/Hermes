@@ -2,9 +2,10 @@
 
 Scope (thin slice, by design): only the highest-impact static strings shown
 to the user by Hermes itself -- approval prompts, a handful of gateway slash
-command replies, restart-drain notices.  Agent-generated output, log lines,
-error tracebacks, tool outputs, and slash-command descriptions all stay in
-English.
+command replies, restart-drain notices, and optional platform-menu labels.
+Agent-generated output, log lines, error tracebacks, and tool outputs stay in
+English. Platform menus may provide sparse translations and fall back to their
+registry-owned description when no explicit target-language value exists.
 
 Catalog files live under ``locales/<lang>.yaml`` at the repo root.  Each
 catalog is a flat dict keyed by dotted paths (e.g. ``approval.choose`` or
@@ -187,17 +188,18 @@ def _flatten_into(node: Any, prefix: str, out: dict[str, str]) -> None:
     # Non-string, non-dict leaves are ignored -- catalogs are text-only.
 
 
-@lru_cache(maxsize=1)
-def _config_language_cached() -> str | None:
-    """Read ``display.language`` from config.yaml once per process.
+@lru_cache(maxsize=32)
+def _config_language_for_home(home_key: str) -> str | None:
+    """Read ``display.language`` for one resolved Hermes home.
 
-    Cached because ``t()`` is called in hot paths (every approval prompt,
-    every gateway reply) and re-reading YAML each call would be wasteful.
-    ``reset_language_cache()`` clears this when config changes at runtime
-    (e.g. after the setup wizard).
+    ``home_key`` exists to isolate the cache across multiplexed profiles. The
+    active context-local home is already installed before this function runs;
+    the value itself is only the stable cache key.
     """
+    del home_key
     try:
         from hermes_cli.config import load_config_readonly
+
         cfg = load_config_readonly()
         lang = (cfg.get("display") or {}).get("language")
         if lang:
@@ -207,13 +209,24 @@ def _config_language_cached() -> str | None:
     return None
 
 
+def _config_language_cached() -> str | None:
+    """Return the cached language for the current context-local profile home."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        home_key = str(get_hermes_home())
+    except Exception:
+        home_key = "<default>"
+    return _config_language_for_home(home_key)
+
+
 def reset_language_cache() -> None:
     """Invalidate cached language resolution and catalogs.
 
     Call after :func:`hermes_cli.config.save_config` if a running process
     needs to pick up a changed ``display.language`` without restart.
     """
-    _config_language_cached.cache_clear()
+    _config_language_for_home.cache_clear()
     with _catalog_lock:
         _catalog_cache.clear()
 
@@ -273,10 +286,34 @@ def t(key: str, lang: str | None = None, **format_kwargs: Any) -> str:
     return value
 
 
+def t_optional(key: str, lang: str | None = None, **format_kwargs: Any) -> str | None:
+    """Return an explicit target-language value without English fallback.
+
+    This is for sparse, optional surfaces such as Telegram command-menu
+    descriptions. Callers retain their canonical registry text when the
+    active locale has no override instead of mistaking the English fallback
+    for a translated value.
+    """
+    target = _normalize_lang(lang) if lang else get_language()
+    value = _load_catalog(target).get(key)
+    if value is None:
+        return None
+    if format_kwargs:
+        try:
+            return value.format(**format_kwargs)
+        except (KeyError, IndexError, ValueError) as exc:
+            logger.warning(
+                "optional i18n format failed for key=%r lang=%r kwargs=%r: %s",
+                key, target, format_kwargs, exc,
+            )
+    return value
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
     "DEFAULT_LANGUAGE",
     "t",
+    "t_optional",
     "get_language",
     "reset_language_cache",
 ]
