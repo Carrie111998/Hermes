@@ -6,7 +6,8 @@ import { describe, expect, it } from 'vitest'
 import Box from './components/Box.js'
 import Text from './components/Text.js'
 import Ink from './ink.js'
-import { ERASE_SCREEN } from './termio/csi.js'
+import { ERASE_SCREEN, ERASE_SCROLLBACK } from './termio/csi.js'
+import { DISABLE_MOUSE_TRACKING } from './termio/dec.js'
 
 /**
  * Focus-regain recovery (DECSET 1004 focus-in).
@@ -205,7 +206,28 @@ const tall = () =>
 
 const short = () => React.createElement(Box, { flexDirection: 'column' }, React.createElement(Text, null, 'hello'))
 
-async function focusRegain(altScreen: boolean) {
+async function focusRegain(altScreen: boolean, env?: Record<string, string>) {
+  const restore: Array<[string, string | undefined]> = []
+
+  for (const [k, v] of Object.entries(env ?? {})) {
+    restore.push([k, process.env[k]])
+    process.env[k] = v
+  }
+
+  try {
+    return await runFocusRegain(altScreen)
+  } finally {
+    for (const [k, v] of restore) {
+      if (v === undefined) {
+        delete process.env[k]
+      } else {
+        process.env[k] = v
+      }
+    }
+  }
+}
+
+async function runFocusRegain(altScreen: boolean) {
   const stdout = new FakeTty()
   const stdin = new FakeTty()
   const stderr = new FakeTty()
@@ -272,5 +294,27 @@ describe.each([
     expect(eraseChunks).toHaveLength(1)
     // Atomic: clear + content in one write, so no blank frame can be shown.
     expect(eraseChunks[0]).toContain('hello')
+  })
+
+  it('never erases scrollback (CSI 3J) on an ordinary focus regain', async () => {
+    // Apple Terminal opts into a scrollback-deep erase, but only to clear
+    // reflow artifacts after a RESIZE. A tab switch must not take the user's
+    // history with it.
+    const { chunks } = await focusRegain(altScreen, { TERM_PROGRAM: 'Apple_Terminal' })
+
+    expect(chunks.join('')).not.toContain(ERASE_SCROLLBACK)
+  })
+
+  it('re-asserts terminal modes so mouse tracking survives a hidden pane', async () => {
+    // An emulator that dropped the DEC mouse modes while hidden would
+    // otherwise stay dead until the DECRQM watchdog's next probe. Mouse
+    // tracking is alt-screen-scoped (reassertTerminalModes returns early on
+    // main screen, where altScreenMouseTracking is always 'off'), so only
+    // assert the re-arm where tracking exists.
+    const { chunks } = await focusRegain(altScreen)
+
+    if (altScreen) {
+      expect(chunks.join('')).toContain(DISABLE_MOUSE_TRACKING)
+    }
   })
 })
