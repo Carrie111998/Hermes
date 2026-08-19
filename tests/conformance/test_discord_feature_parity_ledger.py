@@ -96,10 +96,17 @@ def test_only_one_authoritative_m3_publication_remains() -> None:
         for publication in m3["publications"]
         if publication["role"] == "superseded"
     ]
-    assert authoritative == [
-        {"kind": "pull_request", "number": 89405, "role": "authoritative"}
-    ]
-    assert {"kind": "pull_request", "number": 86419, "role": "superseded"} in superseded
+    assert len(authoritative) == 1
+    assert authoritative[0]["kind"] == "pull_request"
+    assert authoritative[0]["number"] == 89405
+    assert authoritative[0]["role"] == "authoritative"
+    assert authoritative[0]["state"] == "open"
+    assert any(
+        publication["number"] == 86419
+        and publication["role"] == "superseded"
+        and publication["state"] == "closed"
+        for publication in superseded
+    )
 
 
 def test_status_counts_are_an_explicit_non_completion_receipt() -> None:
@@ -109,4 +116,25 @@ def test_status_counts_are_an_explicit_non_completion_receipt() -> None:
     assert counts["released"] == 0
     assert counts["on_main_unverified"] == 0
     assert counts["candidate_open"] == 0
+    assert counts["candidate_unwired"] == 1
+    assert counts["candidate_blocked"] == 10
+    assert counts["gap"] == 31
     assert sum(counts.values()) == 42
+
+
+def test_closed_packet_authorities_are_historical_not_active() -> None:
+    document = _ledger()
+    closed = set(document["snapshot"]["closed_packet_authority_prs"])
+    for row in document["capabilities"]:
+        for publication in row.get("publications", []):
+            if publication.get("number") in closed:
+                assert publication.get("role") != "authoritative"
+                assert publication.get("state") == "closed"
+
+
+def test_live_successors_own_i4_and_r3() -> None:
+    rows = _by_id(_ledger())
+    i4 = [p for p in rows["I4"]["publications"] if p["role"] == "authoritative"]
+    r3 = [p for p in rows["R3"]["publications"] if p["role"] == "authoritative"]
+    assert i4 == [{"kind": "pull_request", "number": 81388, "role": "authoritative", "state": "open"}]
+    assert r3 == [{"kind": "pull_request", "number": 87700, "role": "authoritative", "state": "open"}]
