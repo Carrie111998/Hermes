@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -984,6 +985,8 @@ _SIDEBAR_REGISTRATION_QUERY_BUDGET = 4
 _SIDEBAR_REGISTRATION_EXAMINED_BUDGET = 40
 _SIDEBAR_REGISTRATION_PAGE_SIZE = 10
 _SIDEBAR_NEWEST_PROBE_SIZE = 30
+_CLAUDE_HOT_STAT_WINDOW_SECONDS = 86_400.0
+_CLAUDE_COLD_STAT_SWEEP_SECONDS = 60.0
 _SIDEBAR_BACKFILL_QUERY_BUDGET = 100
 _SIDEBAR_BACKFILL_EXAMINED_BUDGET = 1000
 _USE_CONFIGURED_BACKFILL = object()
@@ -1058,6 +1061,7 @@ class SessionBridgeCoordinator:
         self._awatch_factory = awatch_factory
         self._scan_batch_size = scan_batch_size
         self._claude_projects_root = claude_projects_root
+        self._claude_stat_cache = _ClaudeStatCache(monotonic=monotonic)
         self._watch_debounce_seconds = float(watch_debounce_seconds)
         self._refresh_timeout = float(refresh_timeout)
         self._sidebar_verifier = sidebar_verifier
@@ -4605,7 +4609,11 @@ class SessionBridgeCoordinator:
         )
         discovered_paths = await self._provider_call(_call, adapter, "discover")
         ordered_paths, unavailable_paths, discovered_fingerprints = (
-            await asyncio.to_thread(_sort_claude_paths, discovered_paths)
+            await asyncio.to_thread(
+                _sort_claude_paths,
+                discovered_paths,
+                self._claude_stat_cache,
+            )
         )
         paths_by_native_id: dict[str, Path] = {}
         current_fingerprints: dict[str, dict[str, int]] = {}
@@ -5676,8 +5684,177 @@ def _load_default_awatch() -> _AWatchFactory:
     return awatch
 
 
+class _ClaudeStatCache:
+    """Stat the hot transcripts every cycle and rotate through the cold ones.
+
+    ``_sort_claude_paths`` statted the WHOLE corpus on every scan cycle: 3,795
+    transcripts here, ~950 ms of syscalls, at the ``catalog_scan_seconds``
+    cadence of 3 s. py-spy measured that at 17.8% of process CPU on the live
+    :7484 worker (2026-08-19), second only to the sidebar candidate query.
+
+    The corpus is heavily skewed -- 3,140 of those 3,795 transcripts (83%) had
+    not been written in over a week. Re-statting them twenty times a minute
+    buys nothing.
+
+    A directory-mtime signature is NOT available as a shortcut here. See
+    ``ClaudeSourceAdapter.discover``, which rejected one because transcripts
+    live at BOTH depth 1 and depth 3 under the projects root, so creating a
+    file in a nested subdirectory leaves the immediate project directory's
+    mtime untouched and the signature silently misses new sessions. This cache
+    takes the same escape ``discover``'s TTL takes: it can only ever DELAY a
+    change, never miss one.
+
+    Three rules make that guarantee hold:
+
+    * a path never seen before is ALWAYS statted, so new transcripts are never
+      deferred;
+    * a path written within ``hot_window_seconds`` of the NEWEST transcript is
+      statted every cycle, so the sessions that actually move stay at full
+      cadence -- the window is anchored to the corpus rather than to the wall
+      clock, so a skewed clock or a wholly archival corpus cannot class the
+      session being written right now as cold;
+    * every remaining path is statted on a rotation that covers the whole cold
+      set within ``sweep_seconds``, resuming from the last key swept rather
+      than a positional index, so a churning corpus cannot starve any entry.
+
+    A cold transcript that unexpectedly gains a write is therefore picked up at
+    its next rotation slot -- late by at most ``sweep_seconds``, never skipped.
+    The rotation slice is sized from the wall time actually elapsed between
+    calls, not from an assumed cadence, so the sweep window holds whatever
+    ``catalog_scan_seconds`` is configured to.
+    """
+
+    def __init__(
+        self,
+        *,
+        hot_window_seconds: float = _CLAUDE_HOT_STAT_WINDOW_SECONDS,
+        sweep_seconds: float = _CLAUDE_COLD_STAT_SWEEP_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not math.isfinite(hot_window_seconds) or hot_window_seconds < 0:
+            raise ValueError("Claude stat hot window must be non-negative")
+        if not math.isfinite(sweep_seconds) or sweep_seconds <= 0:
+            raise ValueError("Claude stat sweep window must be positive")
+        self._hot_window = float(hot_window_seconds)
+        self._sweep = float(sweep_seconds)
+        self._monotonic = monotonic
+        # key -> (mtime_ns, size, mtime_seconds)
+        self._entries: dict[str, tuple[int, int, float]] = {}
+        self._cold_cursor: str | None = None
+        self._pass_size = 0
+        self._swept_at: float | None = None
+
+    def stat_paths(
+        self,
+        paths: Sequence[Path],
+    ) -> tuple[dict[str, tuple[int, int]], list[Path]]:
+        """Return ``key -> (mtime_ns, size)`` plus the paths that went away."""
+
+        keys = [str(path) for path in paths]
+        entries = self._entries
+        live = set(keys)
+        for gone in [key for key in entries if key not in live]:
+            del entries[gone]
+
+        now = self._monotonic()
+        elapsed = self._sweep if self._swept_at is None else max(0.0, now - self._swept_at)
+        self._swept_at = now
+        fraction = 1.0 if elapsed >= self._sweep else elapsed / self._sweep
+
+        # "Recent" is measured against the NEWEST transcript we know of, not
+        # against the wall clock. Anchoring to the corpus keeps the split
+        # meaningful when the two disagree: a clock that is skewed, or a corpus
+        # that is entirely archival, would otherwise class every transcript
+        # cold and defer the very session being written. In production the
+        # newest transcript IS approximately now, so the split is unchanged.
+        newest = max((entry[2] for entry in entries.values()), default=0.0)
+        selected: set[str] = set()
+        cold_keys: list[str] = []
+        for key in keys:
+            entry = entries.get(key)
+            if entry is None or (newest - entry[2]) <= self._hot_window:
+                selected.add(key)
+            else:
+                cold_keys.append(key)
+
+        if cold_keys:
+            cold_keys.sort()
+            if self._cold_cursor is None:
+                self._pass_size = len(cold_keys)
+            # Size the slice against the set as it stood when this pass STARTED.
+            # Sizing it against the CURRENT set decelerates as swept entries
+            # turn hot and drop out of it, which silently stretches the sweep
+            # far past its bound -- 100 changed transcripts took ~46 cycles to
+            # cover under a 20-cycle window before this was pinned by
+            # test_a_cold_transcript_change_is_delayed_but_never_missed.
+            budget = max(self._pass_size, len(cold_keys))
+            take = (
+                len(cold_keys)
+                if fraction >= 1.0
+                else min(len(cold_keys), math.ceil(budget * fraction))
+            )
+            if take:
+                start = (
+                    0
+                    if self._cold_cursor is None
+                    else bisect.bisect_right(cold_keys, self._cold_cursor)
+                )
+                if start >= len(cold_keys):
+                    start = 0
+                    self._pass_size = len(cold_keys)
+                stop = min(start + take, len(cold_keys))
+                for index in range(start, stop):
+                    selected.add(cold_keys[index])
+                # Ending the pass explicitly (rather than wrapping modulo) is
+                # what lets the next one re-measure its budget.
+                self._cold_cursor = (
+                    None if stop >= len(cold_keys) else cold_keys[stop - 1]
+                )
+
+        stats: dict[str, tuple[int, int]] = {}
+        unavailable: list[Path] = []
+        for path, key in zip(paths, keys):
+            entry = entries.get(key)
+            if key in selected:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    entries.pop(key, None)
+                    unavailable.append(path)
+                    continue
+                entry = (
+                    int(stat.st_mtime_ns),
+                    int(stat.st_size),
+                    float(stat.st_mtime),
+                )
+                entries[key] = entry
+            if entry is None:
+                unavailable.append(path)
+                continue
+            stats[key] = (entry[0], entry[1])
+        return stats, unavailable
+
+
+def _stat_claude_paths(
+    paths: Sequence[Path],
+) -> tuple[dict[str, tuple[int, int]], list[Path]]:
+    """Stat every path, with no caching -- used by the full-history rebuild."""
+
+    stats: dict[str, tuple[int, int]] = {}
+    unavailable: list[Path] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            unavailable.append(path)
+            continue
+        stats[str(path)] = (int(stat.st_mtime_ns), int(stat.st_size))
+    return stats, unavailable
+
+
 def _sort_claude_paths(
     paths: object,
+    cache: _ClaudeStatCache | None = None,
 ) -> tuple[list[Path], list[Path], dict[str, dict[str, int]]]:
     """Order transcripts newest-first, and hand back their fingerprints.
 
@@ -5686,25 +5863,28 @@ def _sort_claude_paths(
     worker thread, so folding the fingerprints in here also takes them off the
     event loop -- ``_claude_path_fingerprint`` used to be called inline while
     scanning, statting the whole corpus synchronously under uvicorn.
+
+    With no ``cache`` this stats every path, which is what the full-history
+    rebuild wants. The periodic scan passes a ``_ClaudeStatCache`` so the cold
+    83% of the corpus is statted on a rotation instead of on every cycle.
     """
     try:
         normalized = [Path(path) for path in paths]  # type: ignore[union-attr]
     except TypeError as exc:
         raise RuntimeError("Claude discovery returned no path list") from exc
-    sortable: list[tuple[float, str, str, Path]] = []
-    unavailable: list[Path] = []
+    if cache is None:
+        stats, unavailable = _stat_claude_paths(normalized)
+    else:
+        stats, unavailable = cache.stat_paths(normalized)
+    sortable: list[tuple[int, str, str, Path]] = []
     fingerprints: dict[str, dict[str, int]] = {}
     for path in normalized:
-        try:
-            stat = path.stat()
-        except OSError:
-            unavailable.append(path)
+        entry = stats.get(str(path))
+        if entry is None:
             continue
-        sortable.append((-float(stat.st_mtime), path.stem, str(path), path))
-        fingerprints.setdefault(
-            path.stem,
-            {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)},
-        )
+        mtime_ns, size = entry
+        sortable.append((-mtime_ns, path.stem, str(path), path))
+        fingerprints.setdefault(path.stem, {"mtime_ns": mtime_ns, "size": size})
     sortable.sort()
     return [entry[3] for entry in sortable], unavailable, fingerprints
 

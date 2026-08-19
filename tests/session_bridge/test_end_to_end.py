@@ -1370,6 +1370,388 @@ async def test_scan_stats_each_transcript_at_most_once(
     )
 
 
+@contextmanager
+def _count_statements(conn, needle: str):
+    """Count SQL statements on *conn* whose text contains *needle*.
+
+    sqlite3.Connection.execute is a read-only attribute, so the statements are
+    counted through SQLite's own trace callback rather than by patching.
+    """
+
+    seen: list[str] = []
+
+    def _trace(statement: str) -> None:
+        if needle in statement:
+            seen.append(statement)
+
+    conn.set_trace_callback(_trace)
+    try:
+        yield seen
+    finally:
+        conn.set_trace_callback(None)
+
+
+def test_profile_candidate_scan_is_not_repeated_per_page(
+    tmp_path: Path,
+) -> None:
+    """Paging the sidebar must not re-run the full candidate scan per page.
+
+    last_active is a correlated MAX over messages, so SQLite must compute it
+    for EVERY session before it can order or cut them; LIMIT only truncates the
+    output. The plan is a full SCAN of sessions + a per-row index seek + a TEMP
+    B-TREE sort, measured at ~97 ms per page against the live 1.7 GB main
+    profile (7,075 sessions) on 2026-08-19.
+
+    That was paid per page. Registration runs after every successful scan
+    (catalog_scan_seconds defaults to 3) and spends up to 4 pages; backfill
+    spends up to 100 -- ~9.7 s of CPU to re-walk an unchanged list. py-spy
+    attributed 31.5% of process CPU to _list_profile_sidebar_sources.
+    """
+    root = tmp_path / "state.db"
+    root_db = SessionDB(db_path=root)
+    profiles = tmp_path / "profiles"
+    profile_dir = profiles / "alpha"
+    profile_dir.mkdir(parents=True)
+    profile_path = profile_dir / "state.db"
+    profile_db = SessionDB(db_path=profile_path)
+    for index in range(12):
+        session_id = f"alpha-{index:02d}"
+        profile_db.create_session(session_id=session_id, source="cli")
+        profile_db.append_message(session_id, "user", f"hello {index}")
+    profile_db.close()
+
+    store = SessionBridgeStore(
+        root_db,
+        clock=lambda: 1_000.0,
+        hermes_profile_db_paths=lambda: [("alpha", profile_path)],
+    )
+    try:
+        # Warm the handle so the counter can be attached to the live connection.
+        store.list_sidebar_candidates(after=None, limit=3)
+        with store._native_hermes_databases() as databases:
+            handle = [db for name, db, owned in databases if owned][0]
+        cursor = None
+        pages = 0
+        with _count_statements(handle._conn, "MAX(message.timestamp)") as scans:
+            for _ in range(4):
+                page = store.list_sidebar_candidates(
+                    after=None, limit=3, cursor=cursor
+                )
+                pages += 1
+                if not page.has_more:
+                    break
+                cursor = page.next_cursor
+    finally:
+        store.close_profile_databases()
+        root_db.close()
+
+    assert pages >= 3, f"fixture must actually page (paged {pages} time(s))"
+    assert len(scans) <= 1, (
+        f"{pages} pages triggered {len(scans)} full candidate scans of the "
+        "profile database; an unchanged profile must be scanned once and the "
+        "cutoff/cursor applied to the cached rows"
+    )
+
+
+def test_profile_candidate_rows_are_rescanned_after_a_write(
+    tmp_path: Path,
+) -> None:
+    """A cache hit must mean the file is unchanged -- never merely recent.
+
+    Invalidation is PRAGMA data_version, which SQLite bumps when ANOTHER
+    connection commits. The bridge holds these handles read-only, so it can
+    never be the writer that a same-connection blind spot would hide. This is
+    the positive control for that: without it, a green "no rescans" result
+    above would equally describe a cache that never invalidates at all.
+    """
+    root = tmp_path / "state.db"
+    root_db = SessionDB(db_path=root)
+    profile_dir = tmp_path / "profiles" / "alpha"
+    profile_dir.mkdir(parents=True)
+    profile_path = profile_dir / "state.db"
+    writer = SessionDB(db_path=profile_path)
+    writer.create_session(session_id="alpha-first", source="cli")
+    writer.append_message("alpha-first", "user", "first")
+
+    store = SessionBridgeStore(
+        root_db,
+        clock=lambda: 1_000.0,
+        hermes_profile_db_paths=lambda: [("alpha", profile_path)],
+    )
+    try:
+        before = store.list_sidebar_candidates(after=None, limit=10)
+        assert {s.source_session_id for s in before} == {"alpha-first"}
+
+        writer.create_session(session_id="alpha-second", source="cli")
+        writer.append_message("alpha-second", "user", "second")
+
+        after = store.list_sidebar_candidates(after=None, limit=10)
+    finally:
+        store.close_profile_databases()
+        writer.close()
+        root_db.close()
+
+    assert {s.source_session_id for s in after} == {"alpha-first", "alpha-second"}, (
+        "a session written by another connection did not appear; the "
+        "data_version check must invalidate the cached candidate rows"
+    )
+
+
+def test_blocked_source_lookup_runs_once_not_once_per_profile(
+    tmp_path: Path,
+) -> None:
+    """The blocked-id lookup is a ROOT query -- one per call, not per profile.
+
+    _list_profile_sidebar_sources ran it against the root connection on every
+    iteration of the profile loop: eighteen identical queries per call on the
+    live bridge.
+    """
+    root = tmp_path / "state.db"
+    root_db = SessionDB(db_path=root)
+    paths = []
+    for name in ("alpha", "beta", "gamma", "delta"):
+        profile_dir = tmp_path / "profiles" / name
+        profile_dir.mkdir(parents=True)
+        profile_path = profile_dir / "state.db"
+        profile_db = SessionDB(db_path=profile_path)
+        profile_db.create_session(session_id=f"{name}-one", source="cli")
+        profile_db.append_message(f"{name}-one", "user", "hi")
+        profile_db.close()
+        paths.append((name, profile_path))
+
+    store = SessionBridgeStore(
+        root_db,
+        clock=lambda: 1_000.0,
+        hermes_profile_db_paths=lambda: paths,
+    )
+    try:
+        store.list_sidebar_candidates(after=None, limit=10)
+        # Narrow enough to exclude the root candidate query, which also
+        # mentions session_sidebar_exclusions in a NOT EXISTS clause.
+        with _count_statements(
+            root_db._conn,
+            "UNION SELECT source_session_id FROM session_sidebar_exclusions",
+        ) as blocked_queries:
+            store.list_sidebar_candidates(after=None, limit=10)
+    finally:
+        store.close_profile_databases()
+        root_db.close()
+
+    assert len(blocked_queries) <= 1, (
+        f"one call ran the blocked-source lookup {len(blocked_queries)} times "
+        f"across {len(paths)} profiles; it must be hoisted out of the loop"
+    )
+
+
+def _stat_cache(**kwargs):
+    from session_bridge.coordinator import _ClaudeStatCache
+
+    return _ClaudeStatCache(**kwargs)
+
+
+_WEEK = 604_800.0
+
+
+def _touch(path: Path, *, body: str = "x", age_seconds: float = 0.0) -> None:
+    """Write *path* and back-date it, mirroring a real archival transcript."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    if age_seconds:
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+
+def _aged_corpus(tmp_path: Path, count: int) -> tuple[Path, list[Path]]:
+    """An anchor transcript written now, plus *count* week-old ones.
+
+    The hot window is measured against the NEWEST transcript, so the anchor is
+    what makes the rest genuinely cold -- exactly the live shape, where 3,140
+    of 3,795 transcripts had not been written in over a week while a handful
+    were being appended to right now.
+    """
+
+    anchor = tmp_path / "anchor.jsonl"
+    _touch(anchor)
+    cold = []
+    for index in range(count):
+        path = tmp_path / f"cold-{index:03d}.jsonl"
+        _touch(path, age_seconds=_WEEK)
+        cold.append(path)
+    return anchor, cold
+
+
+def test_cold_transcripts_are_not_restatted_on_every_cycle(tmp_path: Path) -> None:
+    """The cold corpus must be statted on a rotation, not every cycle.
+
+    _sort_claude_paths statted every discovered transcript on EVERY scan cycle.
+    Live bridge 2026-08-19: 3,795 transcripts, ~390 ms of syscalls, at the
+    catalog_scan_seconds cadence of 3 s -- py-spy put 17.8% of process CPU in
+    pathlib.stat under _sort_claude_paths.
+    """
+    anchor, cold = _aged_corpus(tmp_path, 100)
+    paths = [anchor, *cold]
+
+    ticks = iter([0.0, 3.0, 6.0, 9.0])
+    cache = _stat_cache(
+        hot_window_seconds=86_400.0,
+        sweep_seconds=60.0,
+        monotonic=lambda: next(ticks),
+    )
+    cache.stat_paths(paths)  # priming pass: every path is new, so all are statted
+
+    counted: list[int] = []
+    real_stat = Path.stat
+    for _ in range(3):
+        seen = 0
+
+        def _counting_stat(self, *args, **kwargs):
+            nonlocal seen
+            seen += 1
+            return real_stat(self, *args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "stat", _counting_stat)
+            cache.stat_paths(paths)
+        counted.append(seen)
+
+    worst = max(counted)
+    assert worst <= 15, (
+        f"a steady-state cycle statted {worst} of {len(paths)} transcripts "
+        f"(per-cycle counts: {counted}); a 3 s cycle against a 60 s sweep window "
+        "must touch about a twentieth of the cold set, not all of it"
+    )
+    assert min(counted) > 0, "the rotation must keep making progress every cycle"
+
+
+def test_a_cold_transcript_change_is_delayed_but_never_missed(tmp_path: Path) -> None:
+    """The rotation must cover the WHOLE cold set within its sweep window.
+
+    ClaudeSourceAdapter.discover rejected a directory-mtime signature because
+    transcripts live at both depth 1 and depth 3 under the projects root, so a
+    nested write leaves the immediate project directory's mtime untouched and
+    the signature silently MISSES new sessions. Any incremental stat scheme is
+    held to that same bar: it may delay a change, never lose one.
+    """
+    anchor, cold = _aged_corpus(tmp_path, 100)
+    paths = [anchor, *cold]
+
+    clock = {"mono": 0.0}
+    cache = _stat_cache(
+        hot_window_seconds=86_400.0,
+        sweep_seconds=60.0,
+        monotonic=lambda: clock["mono"],
+    )
+    cache.stat_paths(paths)
+
+    # Change EVERY cold transcript. The cache still holds their OLD mtimes, so
+    # they stay classified cold -- which is the point: the rotation, not the
+    # classification, is what has to find them.
+    for path in cold:
+        _touch(path, body="changed body, materially longer than the original")
+    baseline = {str(path): path.stat().st_size for path in cold}
+
+    observed: dict[str, int] = {}
+    for _ in range(20):  # 20 cycles x 3 s == the 60 s sweep window
+        clock["mono"] += 3.0
+        stats, _unavailable = cache.stat_paths(paths)
+        for key, (_mtime_ns, size) in stats.items():
+            if key in baseline and size == baseline[key]:
+                observed[key] = size
+
+    missed = sorted(set(baseline) - set(observed))
+    assert not missed, (
+        f"{len(missed)} cold transcript(s) never reported their new size within "
+        f"the sweep window (e.g. {missed[:3]}); the rotation must cover the "
+        "entire cold set, so a change is only ever delayed"
+    )
+
+
+def test_new_and_recently_written_transcripts_are_never_deferred(
+    tmp_path: Path,
+) -> None:
+    """New paths and hot paths stay at full cadence -- only cold ones rotate."""
+
+    anchor, cold = _aged_corpus(tmp_path, 200)
+    cache = _stat_cache(
+        hot_window_seconds=86_400.0,
+        sweep_seconds=60.0,
+        monotonic=lambda: 0.0,
+    )
+    cache.stat_paths([anchor, *cold])
+
+    fresh = tmp_path / "brand-new.jsonl"
+    _touch(fresh)
+    watched = {str(anchor), str(fresh)}
+
+    for cycle in range(3):
+        statted: set[str] = set()
+        real_stat = Path.stat
+
+        def _counting_stat(self, *args, **kwargs):
+            statted.add(str(self))
+            return real_stat(self, *args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "stat", _counting_stat)
+            cache.stat_paths([anchor, *cold, fresh])
+        assert watched <= statted, (
+            f"cycle {cycle} skipped {sorted(watched - statted)}; a transcript "
+            "that is new or recently written must be statted every cycle"
+        )
+
+
+def test_a_wholly_archival_corpus_still_tracks_its_newest_transcript(
+    tmp_path: Path,
+) -> None:
+    """The hot window follows the corpus, not the wall clock.
+
+    Anchoring "recent" to time.time() classed EVERY transcript cold whenever
+    the whole corpus was older than the window -- including the one being
+    appended to right now. test_coordinator_inventory's synthetic 1970-era
+    mtimes caught this: a changed transcript stopped jumping ahead of the
+    backlog because it sat in the cold rotation instead.
+    """
+    paths = []
+    for index in range(20):
+        path = tmp_path / f"old-{index:02d}.jsonl"
+        _touch(path, age_seconds=_WEEK + index)
+        paths.append(path)
+
+    cache = _stat_cache(
+        hot_window_seconds=86_400.0,
+        sweep_seconds=60.0,
+        monotonic=lambda: 0.0,
+    )
+    cache.stat_paths(paths)
+
+    # The newest of a uniformly week-old corpus is still its own newest, so
+    # every sibling within a day of it stays hot and a change lands at once.
+    newest = paths[0]
+    _touch(newest, body="appended", age_seconds=_WEEK - 1.0)
+    expected = newest.stat().st_size
+    stats, _unavailable = cache.stat_paths(paths)
+    assert stats[str(newest)][1] == expected, (
+        "a write to the newest transcript of an archival corpus was deferred; "
+        "the hot window must be measured against the corpus, not the clock"
+    )
+
+
+def test_a_vanished_transcript_is_reported_unavailable(tmp_path: Path) -> None:
+    """A path that disappears must surface as unavailable, not as a stale hit."""
+
+    path = tmp_path / "gone.jsonl"
+    _touch(path)
+    cache = _stat_cache(monotonic=lambda: 0.0)
+    stats, unavailable = cache.stat_paths([path])
+    assert str(path) in stats and not unavailable
+
+    path.unlink()
+    stats, unavailable = cache.stat_paths([path])
+    assert unavailable == [path], "a deleted transcript must be reported missing"
+    assert str(path) not in stats, "a deleted transcript must not keep a fingerprint"
+
+
 @pytest.mark.asyncio
 async def test_appending_to_a_known_transcript_does_not_rewrite_its_messages(
     tmp_path: Path,

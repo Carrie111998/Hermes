@@ -885,6 +885,12 @@ class SessionBridgeStore:
             str, tuple[SessionDB, tuple[int, int], float]
         ] = {}
         self._profile_db_lock = threading.Lock()
+        # Sidebar candidate rows per profile database, keyed by db path ->
+        # (PRAGMA data_version, rows). See _profile_sidebar_candidate_rows.
+        self._profile_candidate_cache: dict[
+            str, tuple[int, list[dict[str, Any]]]
+        ] = {}
+        self._profile_candidate_lock = threading.Lock()
 
     def enqueue_claude_visibility_job(
         self,
@@ -3223,6 +3229,11 @@ class SessionBridgeStore:
                 # closing it under them raises ProgrammingError. Refcounting
                 # closes the connection once the last user lets go.
                 self._profile_db_cache.pop(key, None)
+                # A VACUUM swap puts a DIFFERENT file behind this path, whose
+                # data_version restarts and so can collide with the retired
+                # file's. Drop the rows with the handle rather than trust it.
+                with self._profile_candidate_lock:
+                    self._profile_candidate_cache.pop(key, None)
             try:
                 database = SessionDB(path, read_only=True)
             except Exception:
@@ -3233,6 +3244,8 @@ class SessionBridgeStore:
 
     def close_profile_databases(self) -> None:
         """Release every cached cross-profile handle. Never raises."""
+        with self._profile_candidate_lock:
+            self._profile_candidate_cache.clear()
         with self._profile_db_lock:
             entries = list(self._profile_db_cache.values())
             self._profile_db_cache.clear()
@@ -3259,9 +3272,9 @@ class SessionBridgeStore:
                 continue
             # The third element is a PROVENANCE marker -- "a foreign profile
             # database, not our own" -- which consumers branch on (e.g.
-            # _list_profile_sidebar_sources skips `not owned`). It is not a
-            # lifetime flag: the cache owns these handles now and this context
-            # manager deliberately no longer closes them.
+            # list_sidebar_candidates keeps only the `owned` entries). It is
+            # not a lifetime flag: the cache owns these handles now and this
+            # context manager deliberately no longer closes them.
             databases.append((profile.strip(), database, True))
         yield databases
 
@@ -4716,15 +4729,25 @@ class SessionBridgeStore:
 
         profile_has_more = False
         with self._native_hermes_databases() as databases:
-            for profile, profile_db, owned in databases:
-                if not owned:
-                    continue
+            owned_databases = [
+                (profile, profile_db)
+                for profile, profile_db, owned in databases
+                if owned
+            ]
+            # Hoisted out of _list_profile_sidebar_sources, which ran this
+            # against the ROOT connection once per profile -- eighteen
+            # identical queries per call on the live bridge.
+            blocked = (
+                self._blocked_sidebar_source_ids() if owned_databases else set()
+            )
+            for profile, profile_db in owned_databases:
                 profile_sources, more = self._list_profile_sidebar_sources(
                     profile_db,
                     profile=profile,
                     after=cutoff,
                     limit=limit,
                     cursor=normalized_cursor,
+                    blocked=blocked,
                 )
                 sources.extend(profile_sources)
                 profile_has_more = profile_has_more or more
@@ -4752,48 +4775,80 @@ class SessionBridgeStore:
             next_cursor=next_cursor,
         )
 
-    def _list_profile_sidebar_sources(
-        self,
-        profile_db: SessionDB,
-        *,
-        profile: str,
-        after: float | None,
-        limit: int,
-        cursor: SidebarCandidateCursor | None,
-    ) -> tuple[list[SidebarSource], bool]:
-        if not self._profile_catalog_compatible(profile_db):
-            return [], False
-        cursor_clause = ""
-        cutoff_clause = ""
-        params: dict[str, Any] = {"query_limit": limit + 1}
-        if after is not None:
-            cutoff_clause = "AND last_active >= :after"
-            params["after"] = after
-        if cursor is not None:
-            cursor_clause = """AND (
-                candidate.last_active < :cursor_activity
-                OR (
-                    candidate.last_active = :cursor_activity
-                    AND candidate.session_id > :cursor_session_id
-                )
-            )"""
-            params.update(cursor_activity=cursor[0], cursor_session_id=cursor[1])
+    def _blocked_sidebar_source_ids(self) -> set[str]:
         with self.db._lock:
             root_conn = self.db._conn
             assert root_conn is not None
-            blocked = {
+            return {
                 row[0]
                 for row in root_conn.execute(
                     """SELECT source_session_id FROM session_sidebar_jobs
                        UNION SELECT source_session_id FROM session_sidebar_exclusions"""
                 ).fetchall()
             }
+
+    def _profile_sidebar_candidate_rows(
+        self,
+        profile_db: SessionDB,
+        *,
+        profile: str,
+    ) -> list[dict[str, Any]]:
+        """Return this profile's candidate rows, newest-first, reusing the scan.
+
+        The scan cannot stop early. ``last_active`` is a correlated MAX over
+        ``messages``, so SQLite has to compute it for EVERY session before it
+        can order or cut them -- the query plan is a full SCAN of ``sessions``
+        plus a per-row index seek plus a TEMP B-TREE sort, and ``LIMIT`` only
+        truncates the output. Measured against the live 1.7 GB main profile on
+        2026-08-19: 7,075 sessions, ~97 ms per page.
+
+        That cost was paid per PAGE. The registration loop runs after every
+        successful scan (``catalog_scan_seconds`` defaults to 3) and spends up
+        to ``_SIDEBAR_REGISTRATION_QUERY_BUDGET`` pages; backfill spends up to
+        ``_SIDEBAR_BACKFILL_QUERY_BUDGET`` -- 100 pages, ~9.7 s of CPU, to walk
+        a list that had not changed. py-spy put 31.5% of process CPU here.
+
+        The cutoff is deliberately NOT part of the query. ``after`` is derived
+        from the wall clock (``registration_time - backfill_days * 86_400``), so
+        it drifts on every call and would make the cache key miss every time.
+        Cutoff and cursor are applied to the cached rows instead.
+
+        Invalidation is ``PRAGMA data_version``, which SQLite bumps whenever
+        ANOTHER connection commits to the file. These handles are opened
+        read-only, so the bridge can never be the writer that this misses, and
+        a cache hit therefore means the file is byte-for-byte what it was when
+        the rows were read -- this trades no freshness away at all. Measured
+        over 45 s on 2026-08-19: zero version changes across all 18 profile
+        databases, so in practice this scan stops repeating entirely. A profile
+        under constant write simply recomputes, exactly as before.
+        """
+
         with profile_db._lock:
             conn = profile_db._conn
             assert conn is not None
-            rows = conn.execute(
-                f"""WITH candidate AS (
-                       SELECT s.id AS session_id, s.source, s.model_config,
+            version = conn.execute("PRAGMA data_version").fetchone()[0]
+            # Same key _profile_db_cache uses, so retiring a handle can evict
+            # the rows that were read through it.
+            key = str(profile_db.db_path.resolve()).casefold()
+            with self._profile_candidate_lock:
+                cached = self._profile_candidate_cache.get(key)
+            if cached is not None and cached[0] == version:
+                return cached[1]
+            rows = [
+                {
+                    "session_id": row["session_id"],
+                    "title": row["title"],
+                    "cwd": row["cwd"],
+                    "started_at": row["started_at"],
+                    "git_branch": row["git_branch"],
+                    "git_repo_root": row["git_repo_root"],
+                    "last_active": row["last_active"],
+                    "automation_only": row["automation_only"],
+                    "subagent_only": row["subagent_only"],
+                }
+                for row in conn.execute(
+                    """WITH candidate AS (
+                       SELECT s.id AS session_id,
                               s.title, s.cwd, s.started_at, s.git_branch,
                               s.git_repo_root,
                               COALESCE(
@@ -4807,7 +4862,7 @@ class SessionBridgeStore:
                                   AS automation_only,
                               CASE
                                   WHEN s.source IN ('subagent', 'tool') THEN 1
-                                  WHEN json_extract(COALESCE(s.model_config, '{{}}'),
+                                  WHEN json_extract(COALESCE(s.model_config, '{}'),
                                                     '$._delegate_from') IS NOT NULL THEN 1
                                   ELSE 0
                               END AS subagent_only
@@ -4823,37 +4878,78 @@ class SessionBridgeStore:
                    )
                    SELECT * FROM candidate
                     WHERE last_active IS NOT NULL
-                      {cutoff_clause}
-                      {cursor_clause}
-                    ORDER BY last_active DESC, session_id
-                    LIMIT :query_limit""",
-                params,
-            ).fetchall()
-            rows = [row for row in rows if row["session_id"] not in blocked]
-            page_rows = rows[:limit]
-            messages: dict[str, list[ProjectedMessage]] = {
-                row["session_id"]: [] for row in page_rows
-            }
-            for session_id in messages:
-                message_rows = conn.execute(
-                    """SELECT id, role, content, timestamp FROM messages
-                        WHERE session_id = ? AND role = 'user'
-                          AND (active = 1 OR compacted = 1)
-                        ORDER BY timestamp, id""",
-                    (session_id,),
+                    ORDER BY last_active DESC, session_id"""
                 ).fetchall()
-                for message in message_rows:
-                    message_id = int(message["id"])
-                    decoded = profile_db._decode_content(message["content"])
-                    messages[session_id].append(
-                        ProjectedMessage(
-                            native_event_id=f"hermes-message:{message_id}",
-                            ordinal=message_id,
-                            role=message["role"],
-                            content=decoded if isinstance(decoded, str) else None,
-                            timestamp=float(message["timestamp"]),
+            ]
+        with self._profile_candidate_lock:
+            self._profile_candidate_cache[key] = (version, rows)
+        return rows
+
+    def _list_profile_sidebar_sources(
+        self,
+        profile_db: SessionDB,
+        *,
+        profile: str,
+        after: float | None,
+        limit: int,
+        cursor: SidebarCandidateCursor | None,
+        blocked: set[str],
+    ) -> tuple[list[SidebarSource], bool]:
+        if not self._profile_catalog_compatible(profile_db):
+            return [], False
+        candidates = self._profile_sidebar_candidate_rows(
+            profile_db,
+            profile=profile,
+        )
+        selected: list[dict[str, Any]] = []
+        for row in candidates:
+            if row["session_id"] in blocked:
+                continue
+            last_active = row["last_active"]
+            if after is not None and last_active < after:
+                continue
+            if cursor is not None and not (
+                last_active < cursor[0]
+                or (last_active == cursor[0] and row["session_id"] > cursor[1])
+            ):
+                continue
+            selected.append(row)
+            if len(selected) > limit:
+                break
+        page_rows = selected[:limit]
+
+        messages: dict[str, list[ProjectedMessage]] = {
+            row["session_id"]: [] for row in page_rows
+        }
+        if page_rows:
+            session_ids = list(messages)
+            with profile_db._lock:
+                conn = profile_db._conn
+                assert conn is not None
+                for start in range(0, len(session_ids), _MESSAGE_KEY_QUERY_CHUNK):
+                    batch = session_ids[start : start + _MESSAGE_KEY_QUERY_CHUNK]
+                    placeholders = ",".join("?" for _ in batch)
+                    message_rows = conn.execute(
+                        f"""SELECT id, session_id, role, content, timestamp
+                              FROM messages
+                             WHERE session_id IN ({placeholders})
+                               AND role = 'user'
+                               AND (active = 1 OR compacted = 1)
+                             ORDER BY session_id, timestamp, id""",
+                        batch,
+                    ).fetchall()
+                    for message in message_rows:
+                        message_id = int(message["id"])
+                        decoded = profile_db._decode_content(message["content"])
+                        messages[message["session_id"]].append(
+                            ProjectedMessage(
+                                native_event_id=f"hermes-message:{message_id}",
+                                ordinal=message_id,
+                                role=message["role"],
+                                content=decoded if isinstance(decoded, str) else None,
+                                timestamp=float(message["timestamp"]),
+                            )
                         )
-                    )
         sources = [
             SidebarSource(
                 source_session_id=row["session_id"],
@@ -4877,7 +4973,7 @@ class SessionBridgeStore:
             )
             for row in page_rows
         ]
-        return sources, len(rows) > limit
+        return sources, len(selected) > limit
 
     def get_session_launch_metadata(
         self, session_id: str
