@@ -52,6 +52,7 @@ from cron.jobs import (
     resume_job,
     update_job,
 )
+from cron.executions import execution_projection
 
 
 def _notify_provider_jobs_changed_safe() -> None:
@@ -64,31 +65,47 @@ def _notify_provider_jobs_changed_safe() -> None:
         pass
 
 
-def _execution_identity_for_job(
-    job_id: str,
-    *,
-    execution_id: Optional[str] = None,
-    fallback_source: str = "direct",
-    fallback_status: str = "unknown",
-) -> Optional[Dict[str, str]]:
-    """Return the stable native execution projection for a job's latest run."""
+def _finish_execution(execution_id: Optional[str], error: str) -> None:
+    if not execution_id:
+        return
     try:
-        from cron.executions import execution_identity, get_execution, latest_execution
-
-        record = get_execution(execution_id) if execution_id else latest_execution(job_id)
-        projected = execution_identity(record)
-        if projected:
-            return projected
+        from cron.executions import finish_execution
+        finish_execution(str(execution_id), success=False, error=error)
     except Exception:
         pass
-    if not execution_id:
-        return None
-    return {
-        "id": str(execution_id),
-        "job_id": str(job_id),
-        "source": fallback_source,
-        "status": fallback_status,
+
+
+def _manual_result(
+    job_id: str, execution_id: Optional[str], *, claimed: bool, error: str,
+    dispatched: Optional[bool] = None,
+) -> Dict[str, Any]:
+    result = {
+        "claimed": claimed,
+        "success": False,
+        "error": error,
+        "execution": execution_projection(execution_id, job_id=job_id, status="failed"),
     }
+    if dispatched is not None:
+        result["dispatched"] = dispatched
+    return result
+
+
+def _claim_manual_execution(job_id: str):
+    from cron.executions import create_execution
+
+    execution_id = create_execution(job_id, source="direct").get("id")
+    try:
+        claimed_job = claim_job_for_fire(job_id, return_job=True)
+    except Exception as exc:
+        _finish_execution(execution_id, f"Manual fire claim failed before dispatch: {type(exc).__name__}: {exc}")
+        return None, execution_id, exc
+    if not isinstance(claimed_job, dict):
+        _finish_execution(execution_id, "Manual fire claim was not acquired.")
+        return None, execution_id, None
+    claimed_job = dict(claimed_job)
+    if execution_id:
+        claimed_job["execution_id"] = execution_id
+    return claimed_job, execution_id, None
 
 
 # ---------------------------------------------------------------------------
@@ -672,14 +689,6 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
-    latest_execution = job.get("latest_execution")
-    if isinstance(latest_execution, dict):
-        result["latest_execution"] = _execution_identity_for_job(
-            job_id,
-            execution_id=latest_execution.get("id"),
-            fallback_source=str(latest_execution.get("source") or ""),
-            fallback_status=str(latest_execution.get("status") or "unknown"),
-        )
     if job.get("script"):
         result["script"] = job["script"]
     if job.get("monitor_script"):
@@ -730,9 +739,12 @@ def _execute_job_now(
     """
     job_id = job["id"]
     claimed_job = None
+    execution_id = None
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        claimed_job, execution_id, claim_error = _claim_manual_execution(job_id)
+        if claim_error is not None:
+            raise claim_error
         if not isinstance(claimed_job, dict):
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
@@ -745,14 +757,14 @@ def _execute_job_now(
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
-            return {"claimed": False, "success": False, "error": reason}
+            return _manual_result(job_id, execution_id, claimed=False, error=reason)
     except Exception as e:
         logger.error("Failed to claim cron job %s for immediate run: %s", job_id, e)
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:
             pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        return _manual_result(job_id, execution_id, claimed=True, error=str(e))
 
     return _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
 
@@ -788,28 +800,11 @@ def _run_claimed_job(
         # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
         if not try_register_running_job(job_id):
             execution_id = job.get("execution_id")
-            if execution_id:
-                try:
-                    from cron.executions import finish_execution
-
-                    finish_execution(
-                        str(execution_id),
-                        success=False,
-                        error="Job is already running; execution was not started.",
-                    )
-                except Exception:
-                    pass
-            return {
-                "claimed": True,
-                "success": False,
-                "error": (
-                    "Job is already running (a scheduler tick or another "
-                    "manual run is executing it); not started again."
-                ),
-                "execution": _execution_identity_for_job(
-                    job_id, execution_id=execution_id, fallback_status="failed"
-                ),
-            }
+            _finish_execution(execution_id, "Job is already running; execution was not started.")
+            return _manual_result(
+                job_id, execution_id, claimed=True,
+                error="Job is already running (a scheduler tick or another manual run is executing it); not started again.",
+            )
         _registered = True
 
         claim = job.get("fire_claim")
@@ -910,7 +905,7 @@ def _run_claimed_job(
             "claimed": True,
             "success": bool(processed and ok),
             "error": refreshed.get("last_error"),
-            "execution": _execution_identity_for_job(job_id, execution_id=job.get("execution_id")),
+            "execution": execution_projection(job.get("execution_id"), job_id=job_id),
         }
 
     except Exception as e:
@@ -926,6 +921,8 @@ def _run_claimed_job(
                 _release(job_id)
             except Exception:
                 pass
+        execution_id = job.get("execution_id")
+        _finish_execution(execution_id, str(e))
         try:
             mark_job_run(
                 job_id,
@@ -935,12 +932,7 @@ def _run_claimed_job(
             )
         except Exception:
             pass
-        return {
-            "claimed": True,
-            "success": False,
-            "error": str(e),
-            "execution": _execution_identity_for_job(job_id, execution_id=job.get("execution_id")),
-        }
+        return _manual_result(job_id, execution_id, claimed=True, error=str(e))
 
 
 def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[str]:
@@ -1091,7 +1083,9 @@ def _try_dispatch_background_run(
 
         # Same snapshot claim as _execute_job_now: carry the owner-bearing
         # record into the run so terminal writes stay fenced by this owner.
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        claimed_job, execution_id, claim_error = _claim_manual_execution(job_id)
+        if claim_error is not None:
+            raise claim_error
         if not isinstance(claimed_job, dict):
             refreshed = get_job(job_id)
             if refreshed is None:
@@ -1100,14 +1094,16 @@ def _try_dispatch_background_run(
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
-            return {"claimed": False, "success": False, "error": reason}
+            return _manual_result(job_id, execution_id, claimed=False, error=reason)
     except Exception as e:
         logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:
             pass
-        return {"claimed": True, "dispatched": False, "success": False, "error": str(e)}
+        return _manual_result(
+            job_id, execution_id, claimed=True, error=str(e), dispatched=False
+        )
 
     origin_ui_session_id = ""
     try:
@@ -1168,33 +1164,34 @@ def _try_dispatch_background_run(
             "status": "completed" if res.get("success") else "error",
             "summary": "\n".join(lines),
             "error": res.get("error"),
-            "execution": res.get("execution") or _execution_identity_for_job(job_id),
+            "execution": res.get("execution") or execution_projection(job_id=job_id),
             "api_calls": 0,
             "duration_seconds": duration,
         }
 
-    dispatch = dispatch_async_delegation(
-        goal=f"Manual run of cron job '{job_name}' ({job_id})",
-        context=(
-            "Triggered via cronjob(action='run'). The job executed in its own "
-            "fresh cron session; this block reports its outcome."
-        ),
-        toolsets=None,
-        role="cron_run",
-        model=job.get("model"),
-        session_key=session_key,
-        parent_session_id=str(session_id) if session_id else None,
-        runner=_runner,
-        origin_ui_session_id=origin_ui_session_id,
-        origin_session_id=origin_session_id,
-        max_async_children=max_async,
-    )
+    try:
+        dispatch = dispatch_async_delegation(
+            goal=f"Manual run of cron job '{job_name}' ({job_id})",
+            context="Triggered via cronjob(action='run'). The job executed in its own fresh cron session; this block reports its outcome.",
+            toolsets=None, role="cron_run", model=job.get("model"),
+            session_key=session_key,
+            parent_session_id=str(session_id) if session_id else None,
+            runner=_runner, origin_ui_session_id=origin_ui_session_id,
+            origin_session_id=origin_session_id, max_async_children=max_async,
+        )
+    except Exception as dispatch_error:
+        execution_id = claimed_job.get("execution_id")
+        _finish_execution(execution_id, f"Background dispatch failed: {dispatch_error}")
+        return _manual_result(job_id, execution_id, claimed=True,
+                              error=str(dispatch_error), dispatched=False)
 
     if dispatch.get("status") == "dispatched":
         return {
             "claimed": True,
             "dispatched": True,
             "delegation_id": dispatch.get("delegation_id"),
+            "execution": execution_projection(claimed_job.get("execution_id"),
+                                                job_id=job_id, status="claimed"),
         }
 
     # Pool at capacity (or submit failure): the claim is already taken and
@@ -1203,7 +1200,7 @@ def _try_dispatch_background_run(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 
@@ -1479,6 +1476,8 @@ def cronjob(
                 result["executed"] = True
                 result["execution_mode"] = "background"
                 result["delegation_id"] = bg.get("delegation_id")
+                if bg.get("execution"):
+                    result["execution"] = bg["execution"]
                 return json.dumps(
                     {
                         "success": True,

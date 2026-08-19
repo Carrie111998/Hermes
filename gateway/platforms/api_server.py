@@ -1144,6 +1144,34 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
 
 
+async def _run_thread_until_terminal(target, *args, abort_event: Optional[threading.Event] = None, **kwargs):
+    worker = asyncio.create_task(asyncio.to_thread(target, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        if abort_event: abort_event.set()
+        try:
+            await worker
+        except BaseException:
+            pass
+        raise
+
+
+def _detach_api_task(adapter, reservation, awaitable):
+    task = asyncio.create_task(awaitable)
+    reservation["detached"] = True
+    task.add_done_callback(lambda _task: _release_pending_api_work(adapter, reservation))
+    adapter._background_tasks.add(task); task.add_done_callback(adapter._background_tasks.discard)
+
+
+def _fire_claim_kwargs(provider, adapters, loop):
+    cancel_event = threading.Event()
+    kwargs = {"adapters": adapters, "loop": loop}
+    from cron.scheduler_provider import provider_supports_fire_cancel
+    if provider_supports_fire_cancel(provider): kwargs["cancel_event"] = cancel_event
+    return kwargs, cancel_event
+
+
 @contextmanager
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits.
@@ -1284,8 +1312,8 @@ _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
         list_jobs as _cron_list,
-        get_job_exact as _cron_get,
-        update_job_exact as _cron_update,
+        get_job as _cron_get,
+        update_job as _cron_update,
         remove_job_exact as _cron_remove,
         pause_job_exact as _cron_pause,
         resume_job_exact as _cron_resume,
@@ -1318,28 +1346,6 @@ def _notify_cron_provider_jobs_changed() -> None:
         pass
 
 
-def _cron_execution_identity(
-    execution_id: Optional[str],
-    *,
-    job_id: str,
-    source: str = "",
-    status: str = "claimed",
-) -> Optional[Dict[str, str]]:
-    if not execution_id:
-        return None
-    try:
-        from cron.executions import execution_identity, get_execution
-        projected = execution_identity(get_execution(str(execution_id)))
-    except Exception:
-        projected = None
-    if projected:
-        return projected
-    return {
-        "id": str(execution_id),
-        "job_id": str(job_id),
-        "source": str(source),
-        "status": str(status),
-    }
 # Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
 # user-supplied prompt for exfiltration/injection payloads at create/update
 # time (tools/cronjob_tools.py).  The REST cron endpoints are authenticated
@@ -5923,7 +5929,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/run — admit and dispatch one native run."""
+        """POST /api/jobs/{job_id}/run — trigger immediate execution."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -5942,86 +5948,48 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not job:
                     return web.json_response({"error": "Job not found"}, status=404)
 
-                from cron.scheduler_provider import resolve_cron_scheduler
+                from cron.executions import execution_projection, latest_execution
+                from cron.scheduler_provider import provider_supports_claim_force, resolve_cron_scheduler
                 provider = resolve_cron_scheduler()
                 provider_source = str(getattr(provider, "name", "provider"))
+                previous_execution = latest_execution(job_id)
+                claim_kwargs = {"force": True} if provider_supports_claim_force(provider) else {}
                 try:
-                    claimed_job = await asyncio.to_thread(
-                        provider.claim_fire, job_id, force=True
-                    )
-                except TypeError:
-                    claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
+                    claimed_job = await asyncio.to_thread(provider.claim_fire, job_id, **claim_kwargs)
                 except Exception as admission_error:
-                    logger.error(
-                        "cron API run admission failed for %s: %s",
-                        job_id,
-                        admission_error,
-                    )
-                    return web.json_response(
-                        {"error": "cron run admission failed", "job_id": job_id},
-                        status=503,
-                    )
-                execution_id = (
-                    claimed_job.get("execution_id") or (claimed_job.get("execution") or {}).get("id")
-                    if isinstance(claimed_job, dict)
-                    else None
-                )
+                    logger.error("cron API run admission failed for %s: %s", job_id, admission_error)
+                    return web.json_response({"error": "cron run admission failed", "job_id": job_id}, status=503)
+                execution_id = (claimed_job.get("execution_id") or
+                                (claimed_job.get("execution") or {}).get("id")) if isinstance(claimed_job, dict) else None
                 if claimed_job is None:
-                    from cron.executions import latest_execution
+                    job = _cron_get(job_id)
+                    if not job:
+                        return web.json_response({"error": "Job not found"}, status=404)
                     latest = latest_execution(job_id)
-                    execution = _cron_execution_identity(
-                        latest.get("id") if latest else None,
+                    previous_id = previous_execution.get("id") if isinstance(previous_execution, dict) else None
+                    fresh_execution = bool(isinstance(latest, dict) and latest.get("id") and latest.get("id") != previous_id)
+                    execution = execution_projection(
+                        latest.get("id") if fresh_execution else None,
                         job_id=job_id,
                         source=provider_source,
                         status=latest.get("status", "unknown") if latest else "unknown",
                     )
                     return web.json_response(
-                        {
-                            "job": job,
-                            "execution": execution,
-                            "session_id": None,
-                            "status": "duplicate" if execution else "not_admitted",
-                        },
-                        status=200,
+                        {"job": job, "execution": execution,
+                         "status": "duplicate" if fresh_execution else "not_admitted"}, status=200,
                     )
 
-                job = _cron_get(job_id) or job
                 loop = asyncio.get_running_loop()
                 runner = self.gateway_runner or request.app.get("gateway_runner")
                 adapters = getattr(runner, "adapters", None) or None
-                task = asyncio.create_task(
-                    asyncio.to_thread(
-                        provider.fire_claimed,
-                        claimed_job,
-                        adapters=adapters,
-                        loop=loop,
-                    )
-                )
-                reservation["detached"] = True
-                task.add_done_callback(
-                    lambda _task: _release_pending_api_work(self, reservation)
-                )
-                try:
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-                except (TypeError, AttributeError):
-                    pass
-                execution = _cron_execution_identity(
-                    execution_id,
-                    job_id=job_id,
-                    source=provider_source,
-                    status="claimed",
-                )
+                fire_kwargs, cancel_event = _fire_claim_kwargs(provider, adapters, loop)
+                _detach_api_task(self, reservation, _run_thread_until_terminal(
+                    provider.fire_claimed, claimed_job, abort_event=cancel_event, **fire_kwargs
+                ))
+                execution = execution_projection(execution_id, job_id=job_id,
+                                                  source=provider_source, status="claimed")
                 return web.json_response(
-                    {
-                        "job": job,
-                        "execution": execution,
-                        "session_id": (
-                            claimed_job.get("session_id")
-                            if isinstance(claimed_job, dict)
-                            else None
-                        ),
-                    },
+                    {"job": job, "execution": execution},
                     status=202,
                 )
             except Exception as e:
@@ -6048,28 +6016,12 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             if not _cron_get(job_id):
                 return web.json_response({"error": "Job not found"}, status=404)
-            from cron.executions import list_executions
-
-            runs = list_executions(
-                job_id=job_id,
-                limit=limit,
-                before_claimed_at=cursor,
-            )
-            next_cursor = (
-                f"{runs[-1].get('claimed_at')}|{runs[-1].get('id')}"
-                if len(runs) >= min(limit, 500)
-                and runs[-1].get("claimed_at") and runs[-1].get("id")
-                else None
-            )
-            return web.json_response(
-                {
-                    "job_id": job_id,
-                    "runs": runs,
-                    "next_before_claimed_at": next_cursor,
-                    "next_cursor": next_cursor,
-                    "has_more": next_cursor is not None,
-                }
-            )
+            from cron.executions import list_execution_page
+            runs, next_cursor, has_more = list_execution_page(job_id, limit=limit, before_claimed_at=cursor)
+            return web.json_response({"job_id": job_id, "runs": runs,
+                                      "next_cursor": next_cursor, "has_more": has_more})
+        except ValueError:
+            return web.json_response({"error": "Malformed execution cursor"}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6164,23 +6116,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # ``fire_due`` hook (custom claim/re-arm/telemetry) but
                 # inherits the base ``claim_fire`` — driving it through the
                 # split claim path would silently bypass that override.
-                task = asyncio.create_task(
-                    asyncio.to_thread(
-                        provider.fire_due,
-                        job_id,
-                        adapters=adapters,
-                        loop=loop,
-                    )
-                )
-                reservation["detached"] = True
-                task.add_done_callback(
-                    lambda _task: _release_pending_api_work(self, reservation)
-                )
-                try:
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-                except (TypeError, AttributeError):
-                    pass
+                _detach_api_task(self, reservation, _run_thread_until_terminal(
+                    provider.fire_due, job_id, adapters=adapters, loop=loop
+                ))
                 return web.json_response(
                     {"status": "accepted", "job_id": job_id}, status=202
                 )
@@ -6201,23 +6139,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=200,
                 )
 
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    provider.fire_claimed,
-                    claimed_job,
-                    adapters=adapters,
-                    loop=loop,
-                )
-            )
-            reservation["detached"] = True
-            task.add_done_callback(
-                lambda _task: _release_pending_api_work(self, reservation)
-            )
-            try:
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-            except (TypeError, AttributeError):
-                pass
+            fire_kwargs, cancel_event = _fire_claim_kwargs(provider, adapters, loop)
+            _detach_api_task(self, reservation, _run_thread_until_terminal(
+                provider.fire_claimed, claimed_job, abort_event=cancel_event, **fire_kwargs
+            ))
 
             return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 

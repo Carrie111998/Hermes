@@ -163,7 +163,21 @@ class TestBackgroundDispatch:
                 res = _try_dispatch_background_run(_job('job-bg-04'))
         assert res["claimed"] is False
         assert "paused/disabled" in res["error"]
+        assert res["execution"]["status"] == "failed"
         m_disp.assert_not_called()
+
+    def test_claim_refusal_closes_pre_dispatch_execution(self):
+        """A refused manual claim leaves no open ledger attempt."""
+        from cron.executions import get_execution
+
+        with _bound_session_key():
+            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
+                 patch("tools.cronjob_tools.get_job", return_value=_job("job-bg-04b")), \
+                 patch("tools.async_delegation.dispatch_async_delegation"):
+                res = _try_dispatch_background_run(_job("job-bg-04b"))
+        assert res["claimed"] is False
+        assert res["execution"]["status"] == "failed"
+        assert get_execution(res["execution"]["id"])["status"] == "failed"
 
 
 class TestSyncFallbacks:
@@ -193,6 +207,21 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
+
+    def test_dispatch_exception_closes_execution(self):
+        with _bound_session_key():
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire",
+                side_effect=lambda jid, **kw: {
+                    **_job(jid), "fire_claim": {"by": "bg-owner"}
+                },
+            ), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                side_effect=RuntimeError("submit failed"),
+            ):
+                result = _try_dispatch_background_run(_job("job-bg-07b"))
+        assert result["dispatched"] is False
+        assert result["execution"]["status"] == "failed"
 
 
 class TestInFlightDedupe:

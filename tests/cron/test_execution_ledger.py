@@ -105,6 +105,15 @@ def test_history_cursor_keeps_same_timestamp_rows(monkeypatch, tmp_path):
     assert not ({row["id"] for row in first} & {row["id"] for row in second})
 
 
+def test_history_cursor_rejects_malformed_compound_values(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    import pytest
+
+    for cursor in ("bad|", "|execution", "not-a-time|execution", "a|b|c"):
+        with pytest.raises(ValueError):
+            executions.list_executions(before_claimed_at=cursor)
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)

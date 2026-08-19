@@ -216,6 +216,16 @@ class TestJobCRUD:
         assert len({job["id"] for job in results}) == 1
         assert len(load_jobs()) == 1
 
+    def test_keyed_create_fails_closed_without_durable_lock(self, tmp_cron_dir, monkeypatch):
+        """A keyed retry must not mint a process-local duplicate."""
+        import cron.jobs as jobs_mod
+
+        monkeypatch.setattr(jobs_mod, "fcntl", None)
+        monkeypatch.setattr(jobs_mod, "msvcrt", None)
+        with pytest.raises(jobs_mod.CronStoreLockUnavailable):
+            create_job(prompt="one", schedule="30m", dedup_key="no-lock")
+        assert load_jobs() == []
+
     def test_create_dedup_key_replays_across_processes_and_profiles(self, tmp_path):
         repo = Path(__file__).resolve().parents[2]
         code = (

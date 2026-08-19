@@ -18,6 +18,7 @@ import time
 import os
 import re
 import uuid
+from functools import partial
 
 # Cross-process advisory file locking for jobs.json critical sections.
 # fcntl is Unix-only; on Windows fall back to msvcrt. Either may be absent,
@@ -118,6 +119,7 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+class CronStoreLockUnavailable(RuntimeError): retryable = True
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -270,7 +272,7 @@ def _jobs_lock_file() -> Path:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
 
     Combines the in-process threading lock (cheap mutual exclusion between
@@ -308,6 +310,10 @@ def _jobs_lock():
         _jobs_lock_state.load_stamp = None
         lock_fd = None
         try:
+            if require_cross_process and not any((callable(getattr(fcntl, "flock", None)), callable(getattr(msvcrt, "locking", None)))):
+                raise CronStoreLockUnavailable(
+                    "durable cron store locking is unavailable; retry the keyed create"
+                )
             try:
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
@@ -334,24 +340,20 @@ def _jobs_lock():
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
-                                logger.error(
-                                    "Timed out after %.0fs waiting for the cron "
-                                    "jobs lock (%s) — another process is holding "
-                                    "it. Proceeding with in-process locking only "
-                                    "so the scheduler stays alive (#60703).",
-                                    _JOBS_LOCK_TIMEOUT_SECONDS,
-                                    _jobs_lock_file(),
-                                )
-                                try:
-                                    lock_fd.close()
-                                except OSError:
-                                    pass
+                                if require_cross_process:
+                                    raise CronStoreLockUnavailable(
+                                        "timed out acquiring the durable cron store lock; "
+                                        "retry the keyed create"
+                                    )
+                                lock_fd.close()
                                 lock_fd = None
                                 break
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
             except (OSError, IOError) as e:
+                if require_cross_process:
+                    raise CronStoreLockUnavailable(f"durable cron store lock unavailable; retry the keyed create: {e}") from e
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
@@ -461,19 +463,7 @@ _IMMUTABLE_JOB_FIELDS = frozenset({"id", "dedup_key"})
 
 
 def _normalize_dedup_key(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _find_job_exact_unlocked(job_id: str) -> Optional[Dict[str, Any]]:
-    if not isinstance(job_id, str) or not job_id:
-        return None
-    for job in load_jobs():
-        if job.get("id") == job_id:
-            return _normalize_job_record(job)
-    return None
+    return str(value).strip() or None if value is not None else None
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1871,9 +1861,6 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
-        dedup_key: Optional profile-local idempotency key. A valid repeated
-                create with the same non-empty key returns the existing job;
-                malformed retries are rejected before idempotent lookup.
 
     Returns:
         The created job dict
@@ -2019,7 +2006,7 @@ def create_job(
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
 
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=normalized_dedup_key is not None):
         jobs = load_jobs()
         if normalized_dedup_key is not None:
             for existing in jobs:
@@ -2033,10 +2020,11 @@ def create_job(
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
-    return _find_job_exact_unlocked(job_id)
-
-
-get_job_exact = get_job
+    jobs = load_jobs()
+    for job in jobs:
+        if job["id"] == job_id:
+            return _normalize_job_record(job)
+    return None
 
 
 class AmbiguousJobReference(LookupError):
@@ -2219,11 +2207,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
-update_job_exact = update_job
-
-
 def _resolve_job_mutation(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
-    return get_job_exact(job_id) if exact else resolve_job_ref(job_id)
+    exact = exact or (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{12}", job_id) is not None)
+    return get_job(job_id) if exact else resolve_job_ref(job_id)
 
 
 def pause_job(
@@ -2242,10 +2228,6 @@ def pause_job(
             "paused_reason": reason,
         },
     )
-
-
-def pause_job_exact(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    return pause_job(job_id, reason, exact=True)
 
 
 def resume_job(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
@@ -2273,10 +2255,6 @@ def resume_job(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
     )
 
 
-def resume_job_exact(job_id: str) -> Optional[Dict[str, Any]]:
-    return resume_job(job_id, exact=True)
-
-
 def trigger_job(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick. Accepts a job ID or name."""
     job = _resolve_job_mutation(job_id, exact=exact)
@@ -2292,10 +2270,6 @@ def trigger_job(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]
             "next_run_at": _hermes_now().isoformat(),
         },
     )
-
-
-def trigger_job_exact(job_id: str) -> Optional[Dict[str, Any]]:
-    return trigger_job(job_id, exact=True)
 
 
 def remove_job(job_id: str, *, exact: bool = False) -> bool:
@@ -2337,10 +2311,10 @@ def remove_job(job_id: str, *, exact: bool = False) -> bool:
     return False
 
 
-def remove_job_exact(job_id: str) -> bool:
-    return remove_job(job_id, exact=True)
-
-
+pause_job_exact = partial(pause_job, exact=True)
+resume_job_exact = partial(resume_job, exact=True)
+trigger_job_exact = partial(trigger_job, exact=True)
+remove_job_exact = partial(remove_job, exact=True)
 def mark_job_run(
     job_id: str,
     success: bool,

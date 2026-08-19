@@ -458,6 +458,21 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     assert claims == [("j1", {"force": True, "return_job": True})]
 
 
+def test_claim_force_capability_is_inspected_before_dispatch():
+    from cron.scheduler_provider import provider_supports_claim_force
+
+    class SupportsForce:
+        def claim_fire(self, job_id, *, force=False):
+            return None
+
+    class Legacy:
+        def claim_fire(self, job_id):
+            return None
+
+    assert provider_supports_claim_force(SupportsForce()) is True
+    assert provider_supports_claim_force(Legacy()) is False
+
+
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
     """If the CAS claim is lost (another machine/retry won), fire_due returns
     False and never runs the job."""

@@ -254,6 +254,17 @@ def provider_supports_force_fire(provider: Any) -> bool:
     )
 
 
+def provider_supports_claim_force(provider: Any) -> bool:
+    try:
+        parameters = inspect.signature(provider.claim_fire).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD or
+               (p.name == "force" and p.kind in (
+                   inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                   inspect.Parameter.KEYWORD_ONLY)) for p in parameters)
+
+
 def provider_supports_split_fire(provider: Any) -> bool:
     """Return whether a provider implements the two-phase fire contract.
 
