@@ -726,6 +726,7 @@ export async function prepareGatewayForAgent(connectionId: null | string, profil
       prepared.wantOpen &&
       g.secondaries.get(scope) === prepared &&
       Boolean(prepared.connection) &&
+      isOpen(prepared.gateway) &&
       applyActive(scope, activationEpoch)
 
     if (activated && prepared.connection) {
@@ -800,7 +801,11 @@ export async function prepareGatewayForProfile(profile: string): Promise<() => b
   // epoch superseded by a newer switch while this one was dialing) must leave
   // every companion store alone.
   return () => {
-    const activated = prepared.wantOpen && g.secondaries.get(key) === prepared && applyActive(key, activationEpoch)
+    const activated =
+      prepared.wantOpen &&
+      g.secondaries.get(key) === prepared &&
+      isOpen(prepared.gateway) &&
+      applyActive(key, activationEpoch)
 
     if (activated && prepared.connection) {
       publishActiveConnection(prepared.connection)

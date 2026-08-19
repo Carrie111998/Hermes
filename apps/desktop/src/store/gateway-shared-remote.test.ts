@@ -41,7 +41,6 @@ const {
   $gateway,
   closeSecondaryGateways,
   configureGatewayRegistry,
-  ensureActiveGatewayOpen,
   ensureGatewayForProfile,
   setPrimaryGateway
 } = await import('./gateway')
@@ -113,7 +112,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     expect($gateway.get()).not.toBe(primary)
   })
 
-  it('refreshes the active connection after a pooled profile reconnect succeeds', async () => {
+  it('declines a pooled profile activation until its socket can connect', async () => {
     const connection = {
       authMode: 'token',
       baseUrl: 'https://worker.invalid',
@@ -123,21 +122,25 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
       wsUrl: 'wss://worker.invalid/api/ws?token=fake-test-token'
     }
 
+    const primary = makePrimary()
     const getConnection = vi.fn(async () => connection)
 
-    setPrimaryGateway(makePrimary() as never, 'default')
+    setPrimaryGateway(primary as never, 'default')
+    await ensureGatewayForProfile('default')
     installDesktop({ getConnection })
-
     gatewayMocks.connect.mockRejectedValueOnce(new Error('temporarily offline')).mockResolvedValueOnce(undefined)
 
-    await ensureGatewayForProfile('worker')
+    const first = await ensureGatewayForProfile('worker')
 
+    expect(first).toBe(false)
+    expect($gateway.get()).toBe(primary)
+    expect(gatewayMocks.setConnection).not.toHaveBeenCalled()
+
+    const retry = await ensureGatewayForProfile('worker')
+
+    expect(retry).toBe(true)
+    expect($gateway.get()).not.toBe(primary)
     expect(gatewayMocks.setConnection).toHaveBeenCalledOnce()
-    expect(gatewayMocks.setConnection).toHaveBeenLastCalledWith(connection)
-
-    await ensureActiveGatewayOpen()
-
-    expect(gatewayMocks.setConnection).toHaveBeenCalledTimes(2)
-    expect(gatewayMocks.setConnection).toHaveBeenLastCalledWith(connection)
+    expect(gatewayMocks.setConnection).toHaveBeenCalledWith(connection)
   })
 })

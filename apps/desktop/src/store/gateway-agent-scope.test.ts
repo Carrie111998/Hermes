@@ -105,6 +105,25 @@ describe('registry-agent scope eviction (activeGateway must never silently hit t
     expect(gatewayMocks.connect).toHaveBeenCalledWith(agentConn.wsUrl)
   })
 
+  it('declines a registry-agent activation until its socket can connect', async () => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+    await ensureGatewayForProfile('default')
+    installAgentDesktop()
+    gatewayMocks.connect.mockRejectedValueOnce(new Error('temporarily offline')).mockResolvedValueOnce(undefined)
+
+    await expect(ensureGatewayForAgent('homelab', 'research')).resolves.toBe(false)
+    expect(isActivePrimary()).toBe(true)
+    expect($gateway.get()).toBe(primary)
+    expect(gatewayMocks.setConnection).not.toHaveBeenCalled()
+
+    await expect(ensureGatewayForAgent('homelab', 'research')).resolves.toBe(true)
+    expect(isActivePrimary()).toBe(false)
+    expect($gateway.get()).not.toBe(primary)
+    expect(gatewayMocks.setConnection).toHaveBeenCalledOnce()
+    expect(gatewayMocks.setConnection).toHaveBeenCalledWith(agentConn)
+  })
+
   it('keeps the primary active when a fresh registry activation cannot resolve', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
