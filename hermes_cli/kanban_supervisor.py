@@ -843,14 +843,18 @@ def _maybe_record_jude_proof(conn: sqlite3.Connection, task_id: str) -> None:
             break
     if not trusted:
         return
+    obj = get_objective_for_root(conn, _root_task_id(conn, task_id))
+    owning = str(obj["id"]) if obj else ""
+    if not owning:
+        return
     proof = {"type": "jude_verdict", "verdict": "pass", "head": live}
     conn.execute(
         """
         UPDATE kanban_objective_units
            SET proof = ?, terminal_predicate = 'jude_verdict_pass'
-         WHERE kind = 'kanban' AND ref = ?
+         WHERE kind = 'kanban' AND ref = ? AND objective_id = ?
         """,
-        (json.dumps(proof, ensure_ascii=False), task_id),
+        (json.dumps(proof, ensure_ascii=False), task_id, owning),
     )
 
 

@@ -1178,3 +1178,31 @@ def test_jude_pass_predicate_fails_closed_without_current_head(kanban_home, monk
             "proof": json.dumps(proof),
         })
         assert not sup.objective_is_complete(conn, oid)
+
+
+def test_jude_proof_mutation_stays_inside_owning_objective(kanban_home, tmp_path):
+    live = _init_git_head(tmp_path / "repo-jude-scope")
+    with kb.connect() as conn:
+        root_a = kb.create_task(conn, title="obj-a", assignee="default")
+        root_b = kb.create_task(conn, title="obj-b", assignee="default")
+        child = kb.create_task(
+            conn, title="shared-ref", assignee="cole", parents=[root_a],
+            workspace_kind="dir", workspace_path=str(tmp_path / "repo-jude-scope"),
+        )
+        oid_a = sup.ensure_objective(conn, root_a)
+        oid_b = sup.ensure_objective(conn, root_b)
+        sup.upsert_unit(conn, objective_id=oid_a, kind="kanban", ref=child, status="pending")
+        sup.upsert_unit(conn, objective_id=oid_b, kind="kanban", ref=child, status="pending")
+        kb.add_comment(
+            conn, child, author="jude",
+            body=f"jude-verdict: pass\nreviewed_head={live}",
+        )
+        sup._maybe_record_jude_proof(conn, child)
+        units_a = {u["ref"]: u for u in sup.list_units(conn, oid_a)}
+        units_b = {u["ref"]: u for u in sup.list_units(conn, oid_b)}
+        proof_a = json.loads(units_a[child]["proof"] or "{}")
+        proof_b = json.loads(units_b[child]["proof"] or "{}") if units_b[child].get("proof") else {}
+        assert proof_a.get("verdict") == "pass"
+        assert proof_a.get("head") == live
+        assert proof_b.get("verdict") != "pass"
+        assert proof_b.get("head") != live

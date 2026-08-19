@@ -38,7 +38,28 @@ def _force_ready(conn, task_id: str) -> None:
         )
 
 
-def _seed_child_proof(conn, oid: str, child_id: str, *, head: str = "a" * 40) -> str:
+def _seed_child_proof(
+    conn, oid: str, child_id: str, *, head: str | None = None, workspace=None,
+) -> str:
+    if workspace is not None:
+        repo = Path(workspace)
+        if (repo / ".git").exists():
+            import subprocess
+
+            live = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+        else:
+            live = _init_git_head(repo)
+        if head is None:
+            head = live
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?",
+            (str(repo), child_id),
+        )
+    if not head:
+        head = "a" * 40
     sup.upsert_unit(
         conn,
         objective_id=oid,
@@ -50,6 +71,19 @@ def _seed_child_proof(conn, oid: str, child_id: str, *, head: str = "a" * 40) ->
     )
     packet = contract.build_canonical_evidence(conn, child_id)
     return contract.canonical_evidence_hash(packet)
+
+
+def _seed_durable_origin(conn, oid: str, task_id: str, *, chat_id: str = "origin-live") -> None:
+    conn.execute(
+        "UPDATE kanban_objectives SET origin_platform=?, origin_chat_id=?, "
+        "origin_session_key=? WHERE id=?",
+        ("webui", chat_id, chat_id, oid),
+    )
+    kb.add_notify_sub(
+        conn, task_id=task_id, platform="webui",
+        chat_id=chat_id, delivery_mode="notify+wake",
+        delivery_metadata={"session_key": chat_id},
+    )
 
 
 def _graph(conn, *, parent_assignee="default", child_assignee="cole"):
@@ -89,7 +123,7 @@ def test_parent_verified_descendant_close(kanban_home, monkeypatch):
         assert contract.is_graph_descendant(conn, mid, leaf)
         assert not contract.is_graph_descendant(conn, leaf, a)
         oid = sup.ensure_objective(conn, a)
-        digest = _seed_child_proof(conn, oid, leaf)
+        digest = _seed_child_proof(conn, oid, leaf, workspace=kanban_home.parent / "repo-leaf")
         issued = contract.issue_descendant_grant(
             conn,
             objective_id=oid,
@@ -292,7 +326,9 @@ def test_same_and_different_profile_parent_child(kanban_home):
             (same_p, same_c, same_oid),
             (diff_p, diff_c, diff_oid),
         ):
-            digest = _seed_child_proof(conn, oid, child)
+            digest = _seed_child_proof(
+                conn, oid, child, workspace=kanban_home.parent / "repo-profiles",
+            )
             issued = contract.issue_descendant_grant(
                 conn,
                 objective_id=oid,
@@ -384,14 +420,14 @@ def test_judge_fail_correction_exact_head_pass(kanban_home):
         assert first["review_cap"] is False
         stale = contract.record_review_verdict(
             conn, task_id=child, verdict="pass", head=old,
-            current_head=new,
+            current_head=new, git_head_fn=lambda _p: new,
         )
         assert stale["invalidated"] is True
         units = {u["ref"]: u for u in sup.list_units(conn, oid)}
         assert units[child]["status"] != "done"
         passed = contract.record_review_verdict(
             conn, task_id=child, verdict="pass", head=new,
-            current_head=new,
+            current_head=new, git_head_fn=lambda _p: new,
         )
         assert passed["verdict"] == "pass"
         units = {u["ref"]: u for u in sup.list_units(conn, oid)}
@@ -406,7 +442,8 @@ def test_judge_fail_correction_exact_head_pass(kanban_home):
 def test_review_cap_one_remoko_then_resume(kanban_home):
     remoko = FakeRemoko()
     with kb.connect() as conn:
-        parent, child, _oid = _graph(conn)
+        parent, child, oid = _graph(conn)
+        _seed_durable_origin(conn, oid, parent)
         last = None
         for i in range(5):
             last = contract.record_review_verdict(
@@ -455,7 +492,9 @@ def test_retries_crash_no_duplicate_child_review_request(kanban_home):
             idempotency_key="obj-supervision-child",
         ) == child
         oid = sup.ensure_objective(conn, parent)
-        digest = _seed_child_proof(conn, oid, child)
+        digest = _seed_child_proof(
+            conn, oid, child, workspace=kanban_home.parent / "repo-retries",
+        )
         first = contract.issue_descendant_grant(
             conn, objective_id=oid, supervisor_task_id=parent,
             descendant_task_id=child, transition="complete",
@@ -680,7 +719,9 @@ def test_abbreviated_head_current_head_pair_fails_closed(kanban_home, tmp_path):
 def test_stale_proof_after_later_failed_run_cannot_issue_or_consume_grant(kanban_home):
     with kb.connect() as conn:
         parent, child, oid = _graph(conn)
-        digest = _seed_child_proof(conn, oid, child)
+        digest = _seed_child_proof(
+            conn, oid, child, workspace=kanban_home.parent / "repo-stale-proof",
+        )
         issued_before = contract.issue_descendant_grant(
             conn, objective_id=oid, supervisor_task_id=parent,
             descendant_task_id=child, transition="complete",
@@ -723,3 +764,96 @@ def test_stale_proof_after_later_failed_run_cannot_issue_or_consume_grant(kanban
         )
         assert closed["ok"] is False
         assert kb.get_task(conn, child).status != "done"
+
+
+def test_descendant_grant_denied_when_live_head_unreadable(kanban_home, tmp_path):
+    missing = tmp_path / "no-such-child-worktree"
+    with kb.connect() as conn:
+        parent, child, oid = _graph(conn)
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?",
+            (str(missing), child),
+        )
+        digest = _seed_child_proof(conn, oid, child, head="a" * 40)
+        issued = contract.issue_descendant_grant(
+            conn, objective_id=oid, supervisor_task_id=parent,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest, caller_task_id=parent,
+        )
+        assert issued["ok"] is False
+        assert "live" in str(issued.get("error") or "").lower()
+        assert kb.get_task(conn, child).status != "done"
+
+
+def test_structured_pass_rejected_when_git_head_fn_is_none(kanban_home):
+    head = "a" * 40
+    with kb.connect() as conn:
+        _parent, child, oid = _graph(conn)
+        denied = contract.record_review_verdict(
+            conn, task_id=child, verdict="pass", head=head, current_head=head,
+            git_head_fn=None,
+        )
+        assert denied.get("ok") is False
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        assert units.get(child, {}).get("status") != "done"
+
+
+def test_review_cap_missing_origin_fails_closed_across_session_replace(
+    kanban_home, monkeypatch,
+):
+    remoko = FakeRemoko()
+    with kb.connect() as conn:
+        parent, child, oid = _graph(conn)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "worker-chat")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "worker-chat")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", child)
+        last = None
+        for i in range(5):
+            last = contract.record_review_verdict(
+                conn, task_id=child, verdict="fail", head=f"h{i}",
+                blockers=["p1"], remoko=remoko,
+            )
+        assert last["review_cap"] is True
+        assert not last.get("request_id")
+        assert last.get("ok") is False
+        assert remoko.calls == []
+        chats = {
+            row["chat_id"]
+            for row in conn.execute("SELECT chat_id FROM kanban_notify_subs").fetchall()
+        }
+        assert "worker-chat" not in chats
+        faults = conn.execute(
+            "SELECT kind, payload FROM kanban_supervisor_events "
+            "WHERE kind = 'lifecycle_fault' AND task_id = ?",
+            (child,),
+        ).fetchall()
+        assert faults
+        payload = json.loads(faults[0]["payload"] or "{}")
+        assert payload.get("reason") == "review_cap_missing_origin"
+        obj = sup.get_objective(conn, oid)
+        assert obj["origin_chat_id"] != "worker-chat"
+        assert obj["remoko_request_id"] in (None, "")
+
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "replacement-chat")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "replacement-chat")
+    kb._INITIALIZED_PATHS.clear()
+    with kb.connect() as conn:
+        again = contract.record_review_verdict(
+            conn, task_id=child, verdict="fail", head="h5",
+            blockers=["p1"], remoko=remoko,
+        )
+        assert again.get("request_id") in (None, "")
+        assert remoko.calls == []
+        chats = {
+            row["chat_id"]
+            for row in conn.execute("SELECT chat_id FROM kanban_notify_subs").fetchall()
+        }
+        assert "worker-chat" not in chats
+        assert "replacement-chat" not in chats
+        faults = conn.execute(
+            "SELECT 1 FROM kanban_supervisor_events "
+            "WHERE kind = 'lifecycle_fault' AND task_id = ?",
+            (child,),
+        ).fetchall()
+        assert faults

@@ -258,11 +258,11 @@ def _grant_head_error(
         return f"{task_id} proof HEAD is not a full 40-character SHA"
     from hermes_cli.kanban_supervisor import _task_git_head
 
-    live = _task_git_head(conn, task_id)
-    if live:
-        live_sha = _full_git_sha(live)
-        if not live_sha or live_sha != submitted_sha:
-            return f"{task_id} proof HEAD does not match live Git HEAD"
+    live_sha = _full_git_sha(_task_git_head(conn, task_id))
+    if not live_sha:
+        return f"{task_id} live Git HEAD could not be established"
+    if live_sha != submitted_sha:
+        return f"{task_id} proof HEAD does not match live Git HEAD"
     return None
 
 
@@ -679,7 +679,6 @@ def record_review_verdict(
     from hermes_cli.kanban_supervisor import (
         _record_supervisor_event,
         _root_task_id,
-        capture_session_origin,
         ensure_objective,
         invalidate_stale_reviews,
         request_owner_blocker,
@@ -695,45 +694,37 @@ def record_review_verdict(
     row = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is not None:
         workspace = row["workspace_path"]
-    if live_head is None and git_head_fn is not None:
-        live_head = git_head_fn(workspace)
+    workspace_live = None
+    if git_head_fn is not None:
+        workspace_live = git_head_fn(workspace)
+    elif workspace:
+        from hermes_cli.kanban_supervisor import git_head as _git_head
+
+        workspace_live = _git_head(workspace)
+    if live_head is None:
+        live_head = workspace_live
     stale = False
     if verdict_n == "pass" and not blockers:
-        submitted = str(head or "").strip()
-        current = str(live_head or "").strip()
-        workspace_live = None
-        if git_head_fn is not None:
-            workspace_live = git_head_fn(workspace)
-        elif workspace:
-            from hermes_cli.kanban_supervisor import git_head as _git_head
-
-            workspace_live = _git_head(workspace)
-        head_error = None
-        if not _full_git_sha(submitted) or not _full_git_sha(current):
-            head_error = "exact-head review requires full 40-character submitted and current HEAD"
-        if head_error:
+        submitted_sha = _full_git_sha(head)
+        current_sha = _full_git_sha(live_head)
+        live_sha = _full_git_sha(workspace_live)
+        if not live_sha:
             return {
                 "ok": False,
-                "error": head_error,
+                "error": "exact-head review requires an independently established live Git HEAD",
                 "verdict": "insufficient_evidence",
                 "head": head,
                 "current_head": live_head,
             }
-        live_sha = _full_git_sha(workspace_live) if workspace_live else None
-        if workspace_live and not live_sha:
+        if not submitted_sha or not current_sha:
             return {
                 "ok": False,
-                "error": "exact-head review requires full 40-character live Git HEAD",
+                "error": "exact-head review requires full 40-character submitted and current HEAD",
                 "verdict": "insufficient_evidence",
                 "head": head,
                 "current_head": live_head,
             }
-        submitted_sha = _full_git_sha(submitted)
-        current_sha = _full_git_sha(current)
-        stale = bool(
-            (submitted_sha and current_sha and submitted_sha != current_sha)
-            or (live_sha and submitted_sha and live_sha != submitted_sha)
-        )
+        stale = bool(submitted_sha != current_sha or live_sha != submitted_sha)
     payload = {
         "verdict": verdict_n,
         "head": head,
@@ -808,9 +799,29 @@ def record_review_verdict(
             "allowance": allowance,
         }
 
-    root = _root_task_id(conn, task_id)
-    origin = resolve_notify_origin(conn, task_id) or capture_session_origin()
-    oid = ensure_objective(conn, root, origin=origin)
+    origin = resolve_notify_origin(conn, task_id)
+    if origin is None or not origin.usable:
+        _record_supervisor_event(
+            conn,
+            event_key=f"lifecycle_fault:{task_id}:review_cap_missing_origin",
+            kind="lifecycle_fault",
+            task_id=task_id,
+            objective_id=oid,
+            payload={
+                "reason": "review_cap_missing_origin",
+                "internal": True,
+                "decision_key": "review_cap",
+            },
+        )
+        return {
+            "ok": False,
+            "error": "review-cap notification requires durable objective or supervisor origin",
+            "verdict": verdict_n,
+            "blocking_count": count,
+            "review_cap": True,
+            "request_id": None,
+            "lifecycle_fault": "review_cap_missing_origin",
+        }
     request_id = request_owner_blocker(
         conn,
         objective_id=oid,
