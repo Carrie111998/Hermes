@@ -876,6 +876,8 @@ export interface Translations {
       appliesDesc: string
       provider: string
       model: string
+      openrouterModelInput: string
+      openrouterModelShapeHint: string
       applying: string
       defaultsLabel: string
       reasoning: string
@@ -891,6 +893,38 @@ export interface Translations {
       fallbackAdd: string
       fallbackEmpty: string
       notInCatalog: string
+      openrouterRouting: {
+        allowFallbacks: string
+        automatic: string
+        blocked: string
+        block: string
+        discoveryFailed: string
+        endpoint: string
+        lock: string
+        manual: string
+        noEndpoints: string
+        notCurrentlyReported: string
+        prefer: string
+        providerTag: string
+        quantization: string
+        refresh: string
+        refreshing: string
+        routingMode: string
+        selected: string
+        subtitle: string
+        title: string
+        undo: string
+        unblock: string
+        summaryAutomatic: string
+        summarySelectedOnly: string
+        summarySelectedPrefer: string
+        summaryBlockedOnly: string
+        summarySelectedPreferBlocked: string
+        summaryEndpointWithQuantization: string
+        summaryBlockedJoinTwo: string
+        summaryBlockedJoinMany: string
+        summaryBlockedListSeparator: string
+      }
       tasks: Record<string, AuxTaskCopy>
     }
     providers: {

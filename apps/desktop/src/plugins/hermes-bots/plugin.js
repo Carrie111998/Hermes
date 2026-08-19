@@ -78,6 +78,18 @@ const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
 // Deterministic blob avatars (name → face). Feature-detected: older SDKs
 // without the export fall back to the legacy math-face shapes below.
 const blobatarSvg = typeof sdk === 'undefined' ? undefined : sdk.blobatarSvg
+// OpenRouter provider/endpoint routing — the SAME reviewed components +
+// boundary helpers Settings > Model and Profiles > New Profile use. Feature-
+// detected so an older desktop without these SDK exports simply omits the
+// routing picker instead of crashing (matches SkillsView/Streamdown above).
+const OpenRouterRoutingField = typeof sdk === 'undefined' ? undefined : sdk.OpenRouterRoutingField
+const OpenRouterModelInput = typeof sdk === 'undefined' ? undefined : sdk.OpenRouterModelInput
+const isOpenRouterProvider = typeof sdk === 'undefined' ? undefined : sdk.isOpenRouterProvider
+const openRouterRoutingDraft = typeof sdk === 'undefined' ? undefined : sdk.openRouterRoutingDraft
+const updateOpenRouterRoutingConfig = typeof sdk === 'undefined' ? undefined : sdk.updateOpenRouterRoutingConfig
+const getOpenRouterEndpoints = typeof sdk === 'undefined' ? undefined : sdk.getOpenRouterEndpoints
+const getHermesConfigRecord = typeof sdk === 'undefined' ? undefined : sdk.getHermesConfigRecord
+const saveHermesConfig = typeof sdk === 'undefined' ? undefined : sdk.saveHermesConfig
 // Budgeted render loop (fps cap + observability pause + dormancy + teardown).
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
@@ -5108,6 +5120,41 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   })
 }
 
+// OpenRouter routing field copy — plain hardcoded English, same as every
+// other string in this file (the plugin doesn't localize; useI18n is not
+// used anywhere here). Mirrors apps/desktop/src/i18n/en.ts's reviewed
+// `settings.model.openrouterRouting` strings so the field reads identically
+// to Settings > Model / Profiles > New Profile.
+const OPENROUTER_ROUTING_COPY = {
+  allowFallbacks: 'Allow fallback providers',
+  automatic: 'Automatic — let OpenRouter choose',
+  blocked: 'Blocked',
+  block: 'Block',
+  discoveryFailed: 'Endpoint discovery failed',
+  endpoint: 'OpenRouter endpoint',
+  manual: 'Enter provider tag manually',
+  noEndpoints: 'No eligible endpoints reported',
+  notCurrentlyReported: 'not currently reported',
+  providerTag: 'Provider tag',
+  quantization: 'Quantization',
+  refresh: 'Refresh endpoints',
+  refreshing: 'Loading endpoints…',
+  selected: 'Selected',
+  subtitle: "Pick a provider to route through, or block ones you don't want.",
+  title: 'OpenRouter route',
+  undo: 'Undo',
+  unblock: 'Unblock',
+  summaryAutomatic: 'OpenRouter chooses the best available provider.',
+  summarySelectedOnly: 'Requests use {endpoint} only.',
+  summarySelectedPrefer: 'Prefers {endpoint}; may use other providers if unavailable.',
+  summaryBlockedOnly: 'OpenRouter chooses any provider except {blocked}.',
+  summarySelectedPreferBlocked: 'Prefers {endpoint}; may fall back to others except {blocked}.',
+  summaryEndpointWithQuantization: '{provider} ({quantization})',
+  summaryBlockedJoinTwo: '{first} and {second}',
+  summaryBlockedJoinMany: '{items}, and {last}',
+  summaryBlockedListSeparator: ', '
+}
+
 // ── model picker (provider/model dropdowns via model.options) ───────────────
 
 function useModelOptions() {
@@ -5122,9 +5169,14 @@ function useModelOptions() {
 /**
  * Provider + model dropdowns from the gateway's configured inventory — the
  * same data the core model picker shows. `value = {provider, model}`;
- * onChange receives the merged patch.
+ * onChange receives the merged patch. `openRouterModel` (opt-in, default
+ * false — existing callers are unaffected) swaps the model field for the
+ * SAME OpenRouterModelInput typeahead Settings > Model and Profiles > New
+ * Profile use whenever the selected provider is OpenRouter, instead of the
+ * plain curated-list Select (which can't express a free-text OpenRouter
+ * model id like `deepseek/deepseek-v4-flash`).
  */
-function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) {
+function ModelPicker({ value, onChange, placeholderModel = 'gateway default', openRouterModel = false }) {
   const { data, isLoading, error } = useModelOptions()
 
   // Hooks are ALWAYS declared up front, before any conditional return.
@@ -5253,22 +5305,29 @@ function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) 
       ),
       labeled(
         'Model',
-        activeProvider && models.length > 0
-          ? jsxs(Select, {
-              value: value.model || (models[0] ?? ''),
-              onValueChange: v => onChange({ model: v }),
-              children: [
-                jsx(SelectTrigger, { className: 'h-8 rounded-md', children: jsx(SelectValue, {}) }),
-                jsx(SelectContent, {
-                  children: models.map(m => jsx(SelectItem, { value: m, children: m }, m))
-                })
-              ]
-            })
-          : jsx(Input, {
-              placeholder: placeholderModel || 'e.g. model name',
+        openRouterModel && isOpenRouterProvider && OpenRouterModelInput && isOpenRouterProvider(value.provider)
+          ? jsx(OpenRouterModelInput, {
               value: value.model,
-              onChange: event => onChange({ model: event.target.value })
+              onChange: v => onChange({ model: v }),
+              options: models,
+              label: 'OpenRouter model'
             })
+          : activeProvider && models.length > 0
+            ? jsxs(Select, {
+                value: value.model || (models[0] ?? ''),
+                onValueChange: v => onChange({ model: v }),
+                children: [
+                  jsx(SelectTrigger, { className: 'h-8 rounded-md', children: jsx(SelectValue, {}) }),
+                  jsx(SelectContent, {
+                    children: models.map(m => jsx(SelectItem, { value: m, children: m }, m))
+                  })
+                ]
+              })
+            : jsx(Input, {
+                placeholder: placeholderModel || 'e.g. model name',
+                value: value.model,
+                onChange: event => onChange({ model: event.target.value })
+              })
       )
     ]
   })
@@ -6140,6 +6199,12 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const [cloneFrom, setCloneFrom] = useState('default')
   const [model, setModel] = useState('')
   const [provider, setProvider] = useState('')
+  const [routingDraft, setRoutingDraft] = useState({ allowFallbacks: false, blockedTags: [], providerTag: '', quantization: '' })
+  const [routingEndpoints, setRoutingEndpoints] = useState([])
+  const [routingError, setRoutingError] = useState('')
+  const [routingLoading, setRoutingLoading] = useState(false)
+  const [routingManual, setRoutingManual] = useState(false)
+  const routingGeneration = useRef(0)
   const [soul, setSoul] = useState('')
   const [noSkills, setNoSkills] = useState(false)
   const [shareAuth, setShareAuth] = useState(true)
@@ -6169,6 +6234,52 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const targetLabel = remoteTarget
     ? (connections || []).find(c => c.id === targetConnection)?.label || targetConnection
     : ''
+
+  // Clear a stale draft (e.g. from a previous provider) when the model
+  // selection changes, same as Settings > Model / Profiles > New Profile.
+  useEffect(() => {
+    setRoutingDraft(prev => (openRouterRoutingDraft ? openRouterRoutingDraft(null, model) : prev))
+    setRoutingManual(false)
+  }, [model])
+
+  // Endpoint discovery for the routing picker — generation-guarded so a slow
+  // response for a since-changed model can't paint stale endpoints (same
+  // pattern as create-profile-dialog.tsx's loadRoutingEndpoints).
+  useEffect(() => {
+    const generation = routingGeneration.current + 1
+    routingGeneration.current = generation
+
+    if (!isOpenRouterProvider || !getOpenRouterEndpoints || !isOpenRouterProvider(provider) || !model) {
+      setRoutingEndpoints([])
+      setRoutingError('')
+      setRoutingLoading(false)
+
+      return
+    }
+
+    setRoutingEndpoints([])
+    setRoutingError('')
+    setRoutingLoading(true)
+
+    getOpenRouterEndpoints(model, { profile: remoteTarget ? null : cloneFrom })
+      .then(result => {
+        if (routingGeneration.current !== generation) {
+          return
+        }
+
+        setRoutingEndpoints(result.endpoints ?? [])
+      })
+      .catch(err => {
+        if (routingGeneration.current === generation) {
+          setRoutingError(err instanceof Error ? err.message : String(err))
+        }
+      })
+      .finally(() => {
+        if (routingGeneration.current === generation) {
+          setRoutingLoading(false)
+        }
+      })
+  }, [cloneFrom, model, provider, remoteTarget])
 
   /** Gateway RPC on the create target: the picked connection's default
    *  backend for remote targets, the active gateway otherwise. */
@@ -6240,6 +6351,10 @@ function CreateAgentDialog({ open, onClose, roster }) {
     setCloneFrom('default')
     setModel('')
     setProvider('')
+    setRoutingDraft({ allowFallbacks: false, blockedTags: [], providerTag: '', quantization: '' })
+    setRoutingEndpoints([])
+    setRoutingError('')
+    setRoutingManual(false)
     setSoul('')
     setNoSkills(false)
     setShareAuth(true)
@@ -6370,6 +6485,33 @@ function CreateAgentDialog({ open, onClose, roster }) {
         }
       } catch {
         /* capability application is best-effort */
+      }
+
+      // Persist the OpenRouter routing override the same way Settings and
+      // Profiles do: re-fetch the AUTHORITATIVE config for the just-created
+      // profile (never the pre-creation snapshot — a stale whole-record PUT
+      // can silently wipe an unrelated field) and apply the delta to that.
+      // REST-only (getHermesConfigRecord/saveHermesConfig talk to the ACTIVE
+      // gateway's backend, unlike requestForTarget's registry-routed RPC), so
+      // this is local-target only for now — a remote create's routing
+      // override is not yet wired through the registry and is skipped.
+      if (
+        !remoteTarget &&
+        isOpenRouterProvider &&
+        isOpenRouterProvider(provider) &&
+        model.trim() &&
+        getHermesConfigRecord &&
+        updateOpenRouterRoutingConfig &&
+        saveHermesConfig
+      ) {
+        try {
+          const authoritativeConfig = await getHermesConfigRecord(slug)
+          const nextConfig = updateOpenRouterRoutingConfig(authoritativeConfig, model.trim(), routingDraft)
+
+          await saveHermesConfig(nextConfig, slug)
+        } catch (err) {
+          host.notifyError(err, 'Agent created; OpenRouter route could not be saved')
+        }
       }
 
       if (remoteTarget) {
@@ -6703,8 +6845,44 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                   setModel(patch.model)
                                 }
                               },
-                              placeholderModel: 'inherited from launch profile'
+                              placeholderModel: 'inherited from launch profile',
+                              openRouterModel: true
                             }),
+                            !remoteTarget && isOpenRouterProvider && OpenRouterRoutingField && isOpenRouterProvider(provider) && model
+                              ? jsx(OpenRouterRoutingField, {
+                                  copy: OPENROUTER_ROUTING_COPY,
+                                  draft: routingDraft,
+                                  endpoints: routingEndpoints,
+                                  error: routingError,
+                                  loading: routingLoading,
+                                  manual: routingManual,
+                                  onDraftChange: setRoutingDraft,
+                                  onManualChange: setRoutingManual,
+                                  onRefresh: () => {
+                                    if (getOpenRouterEndpoints && model) {
+                                      const generation = routingGeneration.current + 1
+                                      routingGeneration.current = generation
+                                      setRoutingLoading(true)
+                                      getOpenRouterEndpoints(model, { profile: remoteTarget ? null : cloneFrom, refresh: true })
+                                        .then(result => {
+                                          if (routingGeneration.current === generation) {
+                                            setRoutingEndpoints(result.endpoints ?? [])
+                                          }
+                                        })
+                                        .catch(err => {
+                                          if (routingGeneration.current === generation) {
+                                            setRoutingError(err instanceof Error ? err.message : String(err))
+                                          }
+                                        })
+                                        .finally(() => {
+                                          if (routingGeneration.current === generation) {
+                                            setRoutingLoading(false)
+                                          }
+                                        })
+                                    }
+                                  }
+                                })
+                              : null,
                             labeled(
                               'SOUL.md (optional — replaces the generated persona)',
                               jsx(Textarea, {

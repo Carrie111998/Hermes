@@ -748,6 +748,20 @@ export {
 
 export { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
 export { type RouteContribution, ROUTES_AREA, SIDEBAR_NAV_AREA, type SidebarNavContribution } from '@/app/routes'
+/** THE OpenRouter model typeahead — searchable free-text combobox over the
+ *  discovered/curated model list, with the same focus-shows-full-list
+ *  affordance as Settings > Model. Pair with `isOpenRouterProvider`. */
+export { OpenRouterModelInput } from '@/app/settings/openrouter-model-input'
+/** THE OpenRouter provider/endpoint routing field — provider selection,
+ *  endpoint discovery, quantization, block/allow, automatic vs manual, all
+ *  wired to the SAME OpenRouterRoutingDraft shape `lib/openrouter-routing`
+ *  reads and writes. Settings > Model and Profiles > New Profile both use
+ *  this exact component; a plugin dialog (e.g. Bot Mode's New Agent) should
+ *  too rather than reimplementing routing UI. Render only when
+ *  `isOpenRouterProvider(provider)` is true and a model is chosen — see
+ *  `openRouterRoutingDraft` / `updateOpenRouterRoutingConfig` below for the
+ *  read/write halves. */
+export { OpenRouterRoutingField } from '@/app/settings/openrouter-routing-field'
 /** THE full per-toolset config panel core Settings renders — provider picker,
  *  env vars / API keys, model catalog picker, and post-setup runners. Route-
  *  decoupled (the "manage keys" deep link is a no-op outside the router); pass
@@ -765,9 +779,9 @@ export {
   ModelMenuCloseContext,
   type ModelMenuController
 } from '@/app/shell/model-catalog-menu'
+
 export type { StatusbarItem } from '@/app/shell/statusbar-controls'
 export type { TitlebarTool } from '@/app/shell/titlebar-controls'
-
 /** THE whole Capabilities surface (Skills / Tools / MCP tabs, installed
  *  lists, full-skill detail pane, embedded hub picker with one-click
  *  installs). For plugin dialogs pass `embedded` (tab state stays local —
@@ -858,10 +872,19 @@ export type {
  *  `ctx.register` stays the door for permanent contributions. Namespace the
  *  id with your plugin slug (`kanban:board-switcher`). */
 export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
+export type { Contribution } from '@/contrib/types'
+/** Discover OpenRouter's live upstream endpoints for a model (provider tag,
+ *  quantization, health) — feeds `OpenRouterRoutingField`'s `endpoints` prop. */
+export { getOpenRouterEndpoints, type OpenRouterEndpoint, type OpenRouterEndpointsResponse } from '@/hermes'
 
 // -- contracts ----------------------------------------------------------------
 
-export type { Contribution } from '@/contrib/types'
+/** Read/write the full config.yaml record for a profile. Used together with
+ *  `updateOpenRouterRoutingConfig`: re-fetch the AUTHORITATIVE record for the
+ *  profile you just created/modified, apply the routing delta to THAT, then
+ *  save — never build the write from a stale pre-creation snapshot (a whole-
+ *  record PUT from stale state can silently wipe an unrelated field). */
+export { getHermesConfigRecord, type HermesConfigRecord, saveHermesConfig } from '@/hermes'
 /** The live gateway instance type — for typing the `gateway` prop `McpTab`
  *  takes; obtain the instance from `host.getGateway()`. */
 export type { HermesGateway } from '@/hermes'
@@ -895,6 +918,19 @@ export type { HermesOpenTarget } from '@/lib/hermes-open-target'
 export * as icons from '@/lib/icons'
 export { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 export { formatModifierToken } from '@/lib/keybinds/combo'
+/** OpenRouter routing boundary helpers — the SAME normalization Settings and
+ *  Profiles use to read/write `provider_routing.model_overrides.openrouter`.
+ *  `isOpenRouterProvider` is the single case/prefix-insensitive predicate for
+ *  "does this provider slug mean OpenRouter routing applies" (excludes
+ *  `custom:`-prefixed user-defined endpoints even when they front
+ *  OpenRouter — the backend gates on the literal provider string). Never
+ *  hand-roll `=== 'openrouter'` or reimplement the draft merge logic. */
+export {
+  isOpenRouterProvider,
+  openRouterRoutingDraft,
+  type OpenRouterRoutingDraft,
+  updateOpenRouterRoutingConfig
+} from '@/lib/openrouter-routing'
 /** The app's deterministic identity color for a name (profiles, assignees,
  *  authors) + its translucent tag fill — so plugin-rendered identities read
  *  the same hue as everywhere else. */

@@ -225,6 +225,11 @@
     --ui-diff-remove-border: var(--ui-red);
     --ui-diff-remove-background: color-mix(in srgb, var(--ui-red) 12%, transparent);
     --ui-diff-remove-foreground: color-mix(in srgb, var(--ui-red) 70%, #000);
+    /* General positive/selected state. Keep feature surfaces out of the
+       diff-specific token namespace while following the same theme palette. */
+    --ui-success-border: var(--ui-green);
+    --ui-success-background: color-mix(in srgb, var(--ui-green) 12%, transparent);
+    --ui-success-foreground: color-mix(in srgb, var(--ui-green) 70%, #000);
 
     /* Overlay ladder. DESIGN.md: app-wide surfaces must not compete through
        ad-hoc z-index literals — pick the rung that describes the surface.
@@ -530,6 +535,7 @@
     --ui-cyan: #6f9ba6;
     --ui-diff-add-foreground: color-mix(in srgb, var(--ui-green) 62%, #fff);
     --ui-diff-remove-foreground: color-mix(in srgb, var(--ui-red) 62%, #fff);
+    --ui-success-foreground: color-mix(in srgb, var(--ui-green) 62%, #fff);
 
     --sidebar-edge-border: color-mix(in srgb, var(--ui-base) 12%, transparent);
     --composer-ring-strength: 1.3;

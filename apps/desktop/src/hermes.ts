@@ -45,6 +45,7 @@ import type {
   OAuthProvidersResponse,
   OAuthStartResponse,
   OAuthSubmitResponse,
+  OpenRouterEndpointsResponse,
   PaginatedSessions,
   PairingResponse,
   PairingUser,
@@ -191,6 +192,9 @@ export type {
   ModelInfoResponse,
   ModelOptionProvider,
   ModelOptionsResponse,
+  OpenRouterEndpoint,
+  OpenRouterEndpointPricing,
+  OpenRouterEndpointsResponse,
   PaginatedSessions,
   PairingResponse,
   PairingUser,
@@ -950,6 +954,22 @@ export function getGlobalModelInfo(profile?: null | string): Promise<ModelInfoRe
     ...profileScoped(profile),
     path: '/api/model/info',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function getOpenRouterEndpoints(
+  model: string,
+  opts?: { profile?: null | string; refresh?: boolean }
+): Promise<OpenRouterEndpointsResponse> {
+  const params = new URLSearchParams({ model })
+
+  if (opts?.refresh) {
+    params.set('refresh', 'true')
+  }
+
+  return window.hermesDesktop.api<OpenRouterEndpointsResponse>({
+    ...profileScoped(opts?.profile),
+    path: `/api/model/openrouter/endpoints?${params.toString()}`
   })
 }
 

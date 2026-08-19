@@ -8,6 +8,19 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    "provider_routing": {
+        # Backward-compatible OpenRouter-wide defaults.
+        "sort": None,
+        "only": [],
+        "ignore": [],
+        "order": [],
+        "require_parameters": False,
+        "data_collection": None,
+        # Endpoint-routing fields supported globally and per exact model.
+        "quantizations": [],
+        "allow_fallbacks": True,
+        "model_overrides": {},
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the

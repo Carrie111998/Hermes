@@ -364,6 +364,37 @@ export interface ModelInfoResponse {
   provider: string
 }
 
+export interface OpenRouterEndpointPricing {
+  completion?: null | number | string
+  discount?: null | number | string
+  image?: null | number | string
+  input_cache_read?: null | number | string
+  input_cache_write?: null | number | string
+  prompt?: null | number | string
+  request?: null | number | string
+}
+
+export interface OpenRouterEndpoint {
+  context_length?: null | number
+  latency?: null | number | string
+  pricing?: null | OpenRouterEndpointPricing
+  provider_name?: string
+  quantization?: null | string
+  status?: null | number | string
+  supported_parameters?: string[]
+  tag?: string
+  throughput?: null | number | string
+  uptime?: null | number | string
+}
+
+export interface OpenRouterEndpointsResponse {
+  cached?: boolean
+  endpoints: OpenRouterEndpoint[]
+  fetched_at?: null | string
+  model: string
+  stale?: boolean
+}
+
 export interface ModelPricing {
   /** Formatted $/Mtok input price, e.g. "$3.00", or "free", or "" if unknown. */
   input: string
