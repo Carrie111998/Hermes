@@ -7,6 +7,7 @@ Diagnoses issues with Hermes Agent setup.
 import os
 import sys
 import subprocess
+import time
 import shutil
 import importlib.util
 from pathlib import Path
@@ -419,14 +420,21 @@ def collect_source_tree_state(project_root: Path = PROJECT_ROOT) -> list[tuple[s
     if not git_dir.exists():
         return []
 
+    # Share one small latency budget across every git probe so a slow or
+    # network-mounted checkout cannot stall the whole doctor command.
+    deadline = time.monotonic() + 3.0
+
     def _git(*args: str) -> str | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
         try:
             proc = subprocess.run(
                 ["git", "-C", str(root), *args],
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=remaining,
             )
         except Exception:
             return None
@@ -475,7 +483,7 @@ def report_source_tree_state(project_root: Path = PROJECT_ROOT) -> None:
         elif level == "warn":
             check_warn(text, detail)
         else:
-            check_info(text, detail)
+            check_info(f"{text} {detail}".strip())
 
 
 def _section(title: str) -> None:
