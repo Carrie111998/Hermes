@@ -24,11 +24,14 @@ import {
   migrateV1ToRegistry,
   normalizeConnectionInput,
   normalizeRegistry,
+  parseRemoteProfileListing,
   REGISTRY_VERSION,
+  rememberSshEnumeration,
   removeConnection,
   resolveRegistryLocalRoute,
   setPrimaryConnection,
   shouldDeferLocalEnumeration,
+  shouldRetrySshInventory,
   uniqueLabel,
   updateEligibility,
   upsertConnection
@@ -204,6 +207,43 @@ test('roster: unique profiles keep bare handles; duplicates get @name-device', (
   assert.equal(roster.length, 4)
 })
 
+test('rememberSshEnumeration: live list wins, cache then seed default', () => {
+  assert.deepEqual(rememberSshEnumeration({ profiles: ['bob', 'kai'] }, ['stale'], 'ssh'), {
+    profiles: ['bob', 'kai']
+  })
+  assert.deepEqual(
+    rememberSshEnumeration({ profiles: null, error: 'connect-on-demand' }, ['bob', 'kai', 'rook'], 'ssh'),
+    { profiles: ['bob', 'kai', 'rook'], error: 'connect-on-demand' }
+  )
+  assert.deepEqual(rememberSshEnumeration({ profiles: null, error: 'connect-on-demand' }, null, 'ssh'), {
+    profiles: ['default'],
+    error: 'connect-on-demand'
+  })
+  assert.deepEqual(rememberSshEnumeration({ profiles: null, error: 'connect-on-demand' }, null, 'remote'), {
+    profiles: null,
+    error: 'connect-on-demand'
+  })
+})
+
+test('shouldRetrySshInventory: first try, cooldown, then retry; cache never retries', () => {
+  assert.equal(shouldRetrySshInventory(false, null, 1_000), true)
+  assert.equal(shouldRetrySshInventory(false, 1_000, 30_000, 60_000), false)
+  assert.equal(shouldRetrySshInventory(false, 1_000, 61_000, 60_000), true)
+  assert.equal(shouldRetrySshInventory(true, 1_000, 120_000, 60_000), false)
+})
+
+test('parseRemoteProfileListing: Mini/Spark dirs become roster names and drop rollbacks', () => {
+  const listed = parseRemoteProfileListing(
+    ['bob', 'dixie', 'goose', 'rambo', 'bob.rollback-old', '.hidden', '', 'not a name'].join('\n')
+  )
+
+  assert.deepEqual(listed, ['default', 'bob', 'dixie', 'goose', 'rambo'])
+})
+
+test('parseRemoteProfileListing: empty listing is still the default agent', () => {
+  assert.deepEqual(parseRemoteProfileListing(''), ['default'])
+})
+
 test('roster: unreachable sources contribute no rows and cannot fake duplicates', () => {
   const local = { id: 'local', kind: 'local' as const, label: 'This device' }
   const dead = { id: 'dead', kind: 'remote' as const, label: 'Dead box', url: 'http://d:1' }
@@ -375,6 +415,58 @@ test('editing an entry does not collide with its own label', () => {
 
   assert.equal(edited.id, entry.id)
   assert.equal(edited.url, 'http://10.0.0.6:9119')
+})
+
+test('duplicate gateway URLs are rejected across remote and cloud kinds', () => {
+  let registry = emptyRegistry()
+  registry = upsertConnection(
+    registry,
+    normalizeConnectionInput({ kind: 'remote', label: 'Homelab', url: 'http://10.0.0.5:9119' }, registry)
+  )
+
+  // Same URL modulo trailing slash → dupe, even as a different kind.
+  assert.throws(
+    () => normalizeConnectionInput({ kind: 'remote', label: 'Twin', url: 'http://10.0.0.5:9119/' }, registry),
+    /already exists/
+  )
+  assert.throws(
+    () => normalizeConnectionInput({ kind: 'cloud', label: 'Cloud twin', url: 'http://10.0.0.5:9119' }, registry),
+    /already exists/
+  )
+  // Editing the entry itself keeps its own URL without self-colliding.
+  const existing = registry.connections.find(c => c.kind === 'remote')!
+
+  const edited = normalizeConnectionInput(
+    { id: existing.id, kind: 'remote', label: 'Homelab', url: 'http://10.0.0.5:9119' },
+    registry
+  )
+
+  assert.equal(edited.id, existing.id)
+})
+
+test('duplicate ssh targets are rejected on user@host:port + remote profile', () => {
+  let registry = emptyRegistry()
+  registry = upsertConnection(
+    registry,
+    normalizeConnectionInput({ kind: 'ssh', label: 'Box', host: 'alice@box:22', remoteProfile: 'work' }, registry)
+  )
+
+  assert.throws(
+    () =>
+      normalizeConnectionInput(
+        { kind: 'ssh', label: 'Box twin', host: 'alice@box:22', remoteProfile: 'work' },
+        registry
+      ),
+    /already exists/
+  )
+
+  // A different remote profile on the same host is a distinct agent source.
+  const otherProfile = normalizeConnectionInput(
+    { kind: 'ssh', label: 'Box other', host: 'alice@box:22', remoteProfile: 'other' },
+    registry
+  )
+
+  assert.equal(otherProfile.kind, 'ssh')
 })
 
 test('remote input normalizes URL and auth mode; cloud keeps org', () => {
