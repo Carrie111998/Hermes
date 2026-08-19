@@ -231,6 +231,22 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("prompt_cache_retention") == "24h"
 
+    def test_build_kwargs_preserves_cache_key_when_stripping_retention(self, transport):
+        """Mitigate cache degradation: stripping unsupported prompt_cache_retention
+        does NOT degrade or drop prompt_cache_key, keeping prefix caching intact (#89897)."""
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="session_123",
+            is_codex_backend=True,
+            base_url="https://chatgpt.com/backend-api/codex",
+            request_overrides={"prompt_cache_retention": "24h"},
+        )
+        assert "prompt_cache_retention" not in kw
+        assert "prompt_cache_key" in kw
+        assert kw["prompt_cache_key"].startswith("pck_")
+
     def test_xai_responses_sends_cache_key_via_extra_body(self, transport):
         """xAI's Responses API documents ``prompt_cache_key`` as the
         body-level cache-routing key (the ``x-grok-conv-id`` header is

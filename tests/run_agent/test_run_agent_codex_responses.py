@@ -633,6 +633,38 @@ def test_run_codex_stream_strips_request_overrides_retention_at_consumer_wire(
     )
 
 
+def test_run_codex_stream_preserves_other_kwargs_and_cache_key(monkeypatch):
+    """Mitigate payload degradation: wire sanitizer drops only retention while
+    preserving tools, prompt_cache_key, and input intact (#89897)."""
+    agent = _build_agent(monkeypatch)
+    captured = {}
+
+    def _fake_create(**kwargs):
+        captured.update(kwargs)
+        return _FakeCreateStream([
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            )
+        ])
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=_fake_create),
+    )
+    request = {
+        **_codex_request_kwargs(),
+        "model": "gpt-5.6-sol",
+        "prompt_cache_key": "pck_test123",
+        "prompt_cache_retention": "24h",
+    }
+
+    agent._run_codex_stream(request)
+
+    assert "prompt_cache_retention" not in captured
+    assert captured["prompt_cache_key"] == "pck_test123"
+    assert captured["model"] == "gpt-5.6-sol"
+
+
 def test_run_codex_stream_returns_collected_items_when_stream_ends_without_terminal(monkeypatch):
     """The event-driven path tolerates streams that end without a terminal frame.
 
