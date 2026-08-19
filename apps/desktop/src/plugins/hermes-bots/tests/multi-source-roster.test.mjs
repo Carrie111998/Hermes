@@ -5,7 +5,7 @@ import vm from 'node:vm'
 
 const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
-function runtime() {
+function runtime(hostOverrides = {}) {
   const atom = value => ({ get: () => value, set: () => undefined })
   const jsx = (type, props = {}) => ({ type, props })
   const context = {
@@ -21,7 +21,8 @@ function runtime() {
         connectionId: { get: () => 'local', listen: () => undefined },
         profile: { get: () => 'ops', listen: () => undefined }
       },
-      request: () => undefined
+      request: () => undefined,
+      ...hostOverrides
     },
     sdk: new Proxy({}, { get: () => undefined })
   }
@@ -32,7 +33,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;'
+      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;\nglobalThis.__remoteBotNotification = remoteBotNotification;\nglobalThis.__notifyRemoteBot = notifyRemoteBot;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -438,6 +439,120 @@ test('merge: previously seen remotes survive a connect-on-demand empty union', (
   assert.ok(bob)
   assert.equal(bob.remoteSource, true)
   assert.equal(out.profiles.filter(p => p.name === 'default').length, 1)
+})
+
+test('merge: a retained remote row carries and clears the source reauth state', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = { profiles: [{ name: 'default' }] }
+  const previous = [
+    { name: 'default' },
+    {
+      name: 'bob',
+      remoteSource: true,
+      sourceScoped: true,
+      connectionId: 'studio',
+      connectionKind: 'remote',
+      connectionLabel: 'Studio',
+      handle: 'bob'
+    }
+  ]
+
+  const expired = merge(
+    local,
+    {
+      agents: [{ connectionId: 'local', connectionKind: 'local', profile: 'default', handle: 'default' }],
+      sources: [
+        { connectionId: 'local', kind: 'local', reachable: true },
+        { connectionId: 'studio', kind: 'remote', reachable: false, authRequired: true, error: '401' }
+      ]
+    },
+    'local',
+    previous
+  )
+  const staleBob = expired.profiles.find(row => row.connectionId === 'studio')
+
+  assert.ok(staleBob)
+  assert.equal(staleBob.connectionAuthRequired, true)
+
+  const recovered = merge(
+    local,
+    {
+      agents: [
+        { connectionId: 'local', connectionKind: 'local', profile: 'default', handle: 'default' },
+        {
+          connectionId: 'studio',
+          connectionKind: 'remote',
+          connectionLabel: 'Studio',
+          profile: 'bob',
+          handle: 'bob'
+        }
+      ],
+      sources: [
+        { connectionId: 'local', kind: 'local', reachable: true },
+        { connectionId: 'studio', kind: 'remote', reachable: true }
+      ]
+    },
+    'local',
+    expired.profiles
+  )
+
+  assert.equal(recovered.profiles.find(row => row.connectionId === 'studio').connectionAuthRequired, false)
+})
+
+test('remoteBotNotification: expired OAuth sources explain the sign-in recovery', () => {
+  const { __remoteBotNotification: notice } = runtime()
+  const notification = notice({
+    name: 'bob',
+    handle: 'bob',
+    connectionAuthRequired: true,
+    connectionId: 'studio',
+    connectionLabel: 'Studio',
+    remoteSource: true
+  })
+
+  assert.equal(notification.kind, 'warning')
+  assert.equal(notification.title, 'Bob')
+  assert.match(notification.message, /login for Studio has expired/)
+  assert.match(notification.message, /Settings > Gateway/)
+  assert.match(notification.message, /@bob/)
+})
+
+test('remoteBotNotification: ordinary remote sources keep the existing guidance', () => {
+  const { __remoteBotNotification: notice } = runtime()
+  const notification = notice({
+    name: 'bob',
+    handle: 'bob',
+    connectionId: 'studio',
+    connectionLabel: 'Studio',
+    remoteSource: true
+  })
+
+  assert.equal(notification.kind, 'info')
+  assert.equal(notification.title, 'Bob')
+  assert.equal(notification.message, 'Stay in this chat and @bob to message them. Gateway stays on this device.')
+})
+
+test('notifyRemoteBot: an expired source links directly to Gateway settings', () => {
+  const notifications = []
+  const navigations = []
+  const { __notifyRemoteBot: notify } = runtime({
+    navigate: path => navigations.push(path),
+    notify: notification => notifications.push(notification)
+  })
+
+  notify({
+    name: 'bob',
+    handle: 'bob',
+    connectionAuthRequired: true,
+    connectionId: 'studio',
+    connectionLabel: 'Studio',
+    remoteSource: true
+  })
+
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].action.label, 'Open Gateway settings')
+  notifications[0].action.onClick()
+  assert.deepEqual(navigations, ['/settings?tab=gateway'])
 })
 
 test('merge: previous remotes from a removed connection do not resurrect', () => {

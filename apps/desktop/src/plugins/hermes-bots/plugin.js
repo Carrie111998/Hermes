@@ -2770,6 +2770,10 @@ function useRoster() {
 function mergeMultiSourceRoster(local, union, activeConnectionId, previous = []) {
   const localProfiles = Array.isArray(local?.profiles) ? local.profiles : []
   const agents = Array.isArray(union?.agents) ? union.agents : []
+  const sources = Array.isArray(union?.sources) ? union.sources : []
+  const sourceById = new Map(
+    sources.map(source => [String(source?.connectionId || '').trim(), source]).filter(([connectionId]) => connectionId)
+  )
   // A live id of null/'' means the window is on the unscoped local backend
   // (legacy hosts reported null for mode:'local'; the SDK now reports
   // 'local'). Do NOT fall back to registry primary when the third argument
@@ -2872,6 +2876,7 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
       connectionId,
       connectionKind: agent.connectionKind,
       connectionLabel: agent.connectionLabel,
+      connectionAuthRequired: Boolean(sourceById.get(connectionId)?.authRequired),
       remoteSource: true,
       sourceScoped: true
     })
@@ -2884,14 +2889,14 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
     const present = new Set(profiles.map(row => `${row.connectionId || ''}::${row.name}`))
     const unionSourceIds = new Set(agents.map(agent => String(agent?.connectionId || '').trim()).filter(Boolean))
     const omitted = new Set(
-      (Array.isArray(union?.sources) ? union.sources : [])
+      sources
         .filter(source => source?.error === 'connect-on-demand' || source?.reachable === false)
         .map(source => String(source.connectionId || '').trim())
         .filter(Boolean)
     )
 
     const registered = new Set(
-      (Array.isArray(union?.sources) ? union.sources : [])
+      sources
         .map(source => String(source?.connectionId || '').trim())
         .filter(Boolean)
     )
@@ -2910,7 +2915,12 @@ function mergeMultiSourceRoster(local, union, activeConnectionId, previous = [])
       }
 
       if (omitted.has(connectionId) || !unionSourceIds.has(connectionId)) {
-        profiles.push({ ...row, remoteSource: true, sourceScoped: true })
+        profiles.push({
+          ...row,
+          connectionAuthRequired: Boolean(sourceById.get(connectionId)?.authRequired),
+          remoteSource: true,
+          sourceScoped: true
+        })
         present.add(key)
       }
     }
@@ -2930,6 +2940,39 @@ function botHandle(name, bot) {
   }
 
   return (name || '').trim().toLowerCase() === 'default' ? 'hermes' : name
+}
+
+function remoteBotNotification(bot) {
+  const handle = botHandle(bot.name, bot)
+
+  if (bot.connectionAuthRequired) {
+    const label = bot.connectionLabel || 'the remote gateway'
+
+    return {
+      kind: 'warning',
+      title: displayName(bot),
+      message: `The login for ${label} has expired. Sign in again under Settings > Gateway before messaging @${handle}.`
+    }
+  }
+
+  return {
+    kind: 'info',
+    title: displayName(bot),
+    message: `Stay in this chat and @${handle} to message them. Gateway stays on this device.`
+  }
+}
+
+function notifyRemoteBot(bot) {
+  const notification = remoteBotNotification(bot)
+
+  if (bot.connectionAuthRequired) {
+    notification.action = {
+      label: 'Open Gateway settings',
+      onClick: () => host.navigate('/settings?tab=gateway')
+    }
+  }
+
+  host.notify?.(notification)
 }
 
 function isActiveRosterBot(bot, active) {
@@ -4851,12 +4894,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     $selectedBot.set(bot.name)
 
     if (bot.remoteSource) {
-      const handle = botHandle(bot.name, bot)
-      host.notify?.({
-        kind: 'info',
-        title: displayName(bot),
-        message: `Stay in this chat and @${handle} to message them. Gateway stays on this device.`
-      })
+      notifyRemoteBot(bot)
       return
     }
 
@@ -9724,12 +9762,7 @@ function BotsPane() {
           $selectedBot.set(bot.name)
 
           if (bot.remoteSource) {
-            const handle = botHandle(bot.name, bot)
-            host.notify?.({
-              kind: 'info',
-              title: displayName(bot),
-              message: `Stay in this chat and @${handle} to message them. Gateway stays on this device.`
-            })
+            notifyRemoteBot(bot)
             return
           }
 
