@@ -335,6 +335,117 @@ def steer_subagent(
             return False
 
 
+def steer_session(
+    session_id: str,
+    text: str,
+    *,
+    resolve_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> bool:
+    """Queue steering text into another live session without stopping it.
+
+    The peer-to-peer mirror of ``steer_subagent``. Live-session resolution is
+    injected via ``resolve_agent(session_id) -> Optional[AIAgent]`` so this
+    module stays free of gateway internals (the gateway passes its own
+    in-process session→agent map). Returns True if the resolved agent queued
+    the text via ``AIAgent.steer``; False for an empty/unknown target, a
+    resolver that found no agent, or a resolver that itself returned None.
+    Authority is the caller's responsibility — the gateway passes the same
+    ``owner_session_*`` triple it uses for subagent steering.
+
+    Reuses the existing steer drain (appends to the target's last tool
+    result), so the message-role invariant is preserved: no new user turn,
+    no role alternation violation (prime-agent peer-steer port).
+    """
+    if not text or not text.strip():
+        return False
+    if session_id is None:
+        return False
+    if not callable(resolve_agent):
+        return False
+    try:
+        agent = resolve_agent(session_id)
+    except Exception as exc:
+        logger.debug("steer_session(%s) resolve failed: %s", session_id, exc)
+        return False
+    if agent is None or not hasattr(agent, "steer"):
+        return False
+    try:
+        return bool(agent.steer(text))
+    except Exception as exc:
+        logger.debug("steer_session(%s) steer failed: %s", session_id, exc)
+        return False
+
+
+def steer_broadcast(
+    text: str,
+    *,
+    resolve_agent: Any = None,
+    exclude_session_id: Optional[str] = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> Dict[str, int]:
+    """Steer every reachable live target (peer sessions + child subagents).
+
+    Combines ``steer_session`` (peer) and ``steer_subagent`` (child) so a
+    single call fans the same correction out to the whole local agent tree.
+    ``exclude_session_id`` (typically the sender) is skipped to avoid
+    self-steering. Returns a count dict ``{"sessions": n, "subagents": m,
+    "failed": k}`` so callers can report partial delivery. Resolution of
+    peer sessions is delegated to ``resolve_agent``; child subagents come
+    from the in-process delegation registry (owner authority required).
+    """
+    result: Dict[str, int] = {"sessions": 0, "subagents": 0, "failed": 0}
+    if not text or not text.strip():
+        return result
+    if callable(resolve_agent):
+        target_ids = []
+        try:
+            candidates = resolve_agent("__list__")
+        except Exception:
+            candidates = None
+        if isinstance(candidates, (list, tuple, set)):
+            for sid in candidates:
+                sid = str(sid)
+                if exclude_session_id is not None and sid == exclude_session_id:
+                    continue
+                try:
+                    ag = resolve_agent(sid)
+                except Exception:
+                    ag = None
+                if ag is None:
+                    continue
+                if steer_session(
+                    sid,
+                    text,
+                    resolve_agent=resolve_agent,
+                    owner_session_id=owner_session_id,
+                    owner_transport=owner_transport,
+                    owner_session_record=owner_session_record,
+                ):
+                    result["sessions"] += 1
+                else:
+                    result["failed"] += 1
+    with _active_subagents_lock:
+        child_ids = list(_active_subagents.keys())
+    for cid in child_ids:
+        ok = steer_subagent(
+            cid,
+            text,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        )
+        if ok:
+            result["subagents"] += 1
+        else:
+            result["failed"] += 1
+    return result
+
+
 def _capture_gateway_steer_authority(
     owner_session_id: Optional[str],
 ) -> tuple[Any, Any]:
