@@ -2625,6 +2625,55 @@ function preferredSessionIds(allMeta) {
   return pins
 }
 
+/** Roster snapshot for imperative readers (mention completions, the mention
+ *  middleware). useRoster keys its query on [...ROSTER_KEY, connectionId] —
+ *  one cache entry per connection the window has been on — so a bare
+ *  getQueryData(ROSTER_KEY) exact-match read misses every entry and the
+ *  readers see an empty roster: completions offer no handles and remote
+ *  @name-device mentions pass through unhandled. Scan the key family
+ *  instead: prefer the active connection's entry, then any other entry (a
+ *  stale roster beats none). Older surfaces that still write the bare key
+ *  are honored by the exact read first. Never throws. */
+function cachedRoster() {
+  try {
+    if (typeof queryClient === 'undefined' || !queryClient || typeof queryClient.getQueryData !== 'function') {
+      return null
+    }
+
+    const exact = queryClient.getQueryData(ROSTER_KEY)
+
+    if (Array.isArray(exact?.profiles)) {
+      return exact
+    }
+
+    if (typeof queryClient.getQueriesData !== 'function') {
+      return null
+    }
+
+    const entries = queryClient.getQueriesData({ queryKey: ROSTER_KEY }) || []
+    const activeConnectionId = String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
+    let fallback = null
+
+    for (const [key, value] of entries) {
+      if (!Array.isArray(value?.profiles)) {
+        continue
+      }
+
+      if (String(key?.[ROSTER_KEY.length] || '') === activeConnectionId) {
+        return value
+      }
+
+      if (!fallback) {
+        fallback = value
+      }
+    }
+
+    return fallback
+  } catch {
+    return null
+  }
+}
+
 function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
 
@@ -9718,7 +9767,7 @@ export default {
       area: COMPOSER_AREAS.atCompletions,
       data: {
         provide: query => {
-          const roster = queryClient.getQueryData(ROSTER_KEY)
+          const roster = cachedRoster()
           const profiles = Array.isArray(roster?.profiles) ? roster.profiles : []
 
           if (!profiles.length) {
@@ -10023,9 +10072,7 @@ export default {
             name: (host.state.profile.get() || 'default').trim() || 'default',
             connectionId: String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
           }
-          const cached = typeof queryClient !== 'undefined' && queryClient && typeof queryClient.getQueryData === 'function'
-            ? queryClient.getQueryData(ROSTER_KEY)
-            : null
+          const cached = cachedRoster()
           const roster = Array.isArray(cached?.profiles) ? cached.profiles : null
           let mentionedBots = roster ? resolveRosterMentions(text, roster, live) : []
 
