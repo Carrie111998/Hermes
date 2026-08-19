@@ -501,14 +501,22 @@ def fire_overdue_jobs(
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
-            threading.Thread(
-                target=provider.fire_claimed,
-                args=(claimed,),
-                kwargs={"adapters": adapters, "loop": loop},
-                daemon=True,
-                name=f"cron-misfire-{job_id[:12]}",
-            ).start()
-            fired += 1
+            def _submit(worker):
+                threading.Thread(
+                    target=worker,
+                    daemon=True,
+                    name=f"cron-misfire-{job_id[:12]}",
+                ).start()
+                return True
+
+            dispatched = provider.dispatch_claimed_fire(
+                claimed,
+                adapters=adapters,
+                loop=loop,
+                submit=_submit,
+            )
+            if dispatched:
+                fired += 1
         except Exception as exc:
             logger.warning(
                 "Misfire catch-up failed for job %s: %s: %s",
@@ -517,17 +525,32 @@ def fire_overdue_jobs(
     return fired
 
 
-def resolve_cron_scheduler() -> "CronScheduler":
+def resolve_cron_scheduler(
+    *, multiplex_profiles: bool | None = None,
+) -> "CronScheduler":
     """Return the active cron scheduler provider.
 
-    Reads ``cron.provider`` from config. Empty/absent → built-in. A named
+    Reads ``cron.provider`` from the active profile config. Empty/absent →
+    built-in. A named
     provider that is missing, fails to load, or reports ``is_available() ==
     False`` falls back to the built-in with a warning — cron must never be left
-    without a trigger.
+    without a trigger. In multiplex mode, the same safe built-in fallback used
+    by gateway startup is applied to every profile-scoped caller, including
+    API routes and manual tools. ``None`` follows the process's active
+    multiplex mode; callers that already own an explicit gateway config may
+    pass it directly.
     """
     import logging
 
     logger = logging.getLogger("cron.scheduler_provider")
+
+    if multiplex_profiles is None:
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            multiplex_profiles = is_multiplex_active()
+        except Exception:
+            multiplex_profiles = False
 
     name = ""
     try:
@@ -548,6 +571,9 @@ def resolve_cron_scheduler() -> "CronScheduler":
         if not provider.is_available():
             logger.warning("cron.provider '%s' not available; using built-in ticker", name)
             return InProcessCronScheduler()
+        provider = scheduler_for_profile_mode(
+            provider, multiplex_profiles=bool(multiplex_profiles)
+        )
         logger.info("Using cron scheduler provider: %s", provider.name)
         return provider
     except Exception as e:

@@ -2242,7 +2242,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 def _resolve_job_mutation(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
-    exact = exact or (isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{12}", job_id) is not None)
     return get_job(job_id) if exact else resolve_job_ref(job_id)
 
 

@@ -708,21 +708,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
 def _execute_job_now(
     job: Dict[str, Any], extra_prompt: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Execute a cron job immediately, outside the scheduler tick.
-
-    Atomically claims the job first via ``claim_job_for_fire`` — the same
-    at-most-once CAS the scheduler/external-provider fire path uses — so a
-    concurrently-running gateway ticker cannot also fire it (the claim both
-    blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).
-    If the claim is lost (another fire is in flight), this is a no-op.
-
-    The actual firing is delegated to ``run_one_job`` — the single shared
-    execute→save→deliver→mark body the ticker and external providers use — so
-    failure delivery, ``[SILENT]`` handling, and live-adapter delivery stay
-    identical across paths and can't drift.
-
-    Returns {"claimed": bool, "success": bool, "error": str|None}.
-    """
+    """Execute a job now through the selected provider's fire contract."""
     job_id = job["id"]
     execution_id = None
     previous_execution_id = None
@@ -734,8 +720,18 @@ def _execute_job_now(
         pass
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        from cron.scheduler_provider import resolve_cron_scheduler
+        from cron.scheduler_provider import (
+            provider_supports_split_fire,
+            resolve_cron_scheduler,
+        )
         provider = resolve_cron_scheduler()
+        if not provider_supports_split_fire(provider):
+            # Providers written against the original single-phase hook own
+            # admission/re-arm/telemetry inside fire_due. Calling the inherited
+            # claim + fire_claimed path would silently bypass that contract.
+            return _run_claimed_job(
+                provider, job, extra_prompt=extra_prompt
+            )
         claimed_job = provider.claim_fire(job_id)
         execution_id = claimed_job.get("execution_id") if isinstance(claimed_job, dict) else None
         if not isinstance(claimed_job, dict):
@@ -763,15 +759,7 @@ def _run_claimed_job(
     provider, job: Optional[Dict[str, Any]] = None,
     extra_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Fire an already-claimed job through the shared ``run_one_job`` body.
-
-    Split out of ``_execute_job_now`` so the background dispatch path
-    (``_try_dispatch_background_run``) can take the claim synchronously — so
-    the tool response can report "paused"/"already firing" immediately — and
-    hand the actual run to a daemon worker.
-
-    Returns {"claimed": True, "success": bool, "error": str|None}.
-    """
+    """Fire one job through the provider seam and return its tool result."""
     if job is None:
         job = provider
         from cron.scheduler_provider import resolve_cron_scheduler
@@ -781,27 +769,10 @@ def _run_claimed_job(
     _heartbeat_stop = threading.Event()
     _heartbeat_thread = None
     try:
-        # run_one_job records last_run_at/last_status via mark_job_run (which
-        # also clears the fire claim) and returns True iff it processed the job.
-        # ``job`` here is the exact claimed snapshot (owner-bearing), so the
-        # shared body fences every terminal write by that owner.
-        #
-        # A manual `run` executes the job synchronously on the caller's thread,
-        # and a cron job is itself a full agent run that routinely takes
-        # minutes. The calling turn emits no tool activity for that entire
-        # window, so the gateway inactivity watchdog concludes the agent is
-        # hung and kills the parent turn (#76502). Fire a heartbeat into the
-        # caller's activity tracker (the same signal tool progress uses) while
-        # the job runs, so the watchdog sees a working tool instead of a
-        # silent one — mirrors the delegate_task heartbeat pattern. Best-effort:
-        # if no activity callback is registered (direct Python callers, tests),
-        # behavior is unchanged.
+        # Keep the parent watchdog alive during long synchronous fires.
         try:
             from tools.environments.base import get_activity_callback
 
-            # Capture on THIS thread: the callback is thread-local (installed
-            # by the tool executor as the calling agent's _touch_activity), so
-            # a freshly spawned thread cannot read it back.
             activity_cb = get_activity_callback()
         except Exception:
             activity_cb = None
@@ -814,8 +785,6 @@ def _run_claimed_job(
                 while not _heartbeat_stop.wait(_CRON_RUN_HEARTBEAT_INTERVAL):
                     elapsed = time.monotonic() - started
                     if elapsed > _CRON_RUN_HEARTBEAT_CEILING:
-                        # Stop masking the gateway watchdog — a run this long
-                        # with an unlimited child watchdog is likely wedged.
                         logger.warning(
                             "cronjob run heartbeat ceiling reached for job "
                             "'%s' (%.0fs) — stopping heartbeat; gateway "
@@ -828,9 +797,6 @@ def _run_claimed_job(
                             f"cronjob: running job '{job_name}' ({int(elapsed)}s elapsed)"
                         )
                     except Exception:
-                        # Never break the job run; keep heartbeating — one
-                        # transient callback error must not silently drop
-                        # watchdog protection for the rest of a long job.
                         continue
 
             _heartbeat_thread = threading.Thread(
@@ -840,19 +806,28 @@ def _run_claimed_job(
             )
             _heartbeat_thread.start()
 
-        # Manual runs invoked from a gateway agent execute outside the scheduler
-        # ticker, but they still share the process with the live platform
-        # adapters. Pass the gateway-owned adapter map and event loop through
-        # to run_one_job so delivery is scheduled on the loop that owns clients
-        # such as Matrix/aiohttp. Calling those clients from run_one_job's
-        # standalone asyncio.run() loop raises errors like "Timeout context
-        # manager should be used inside a task" and can break encrypted Matrix
-        # delivery (#61495 — salvaged from #63586 by @Fly-onlyone).
+        # Reuse the gateway-owned adapters and loop for delivery.
         gateway_module = sys.modules.get("gateway.run")
         runner_ref = getattr(gateway_module, "_gateway_runner_ref", None)
         runner = runner_ref() if callable(runner_ref) else None
         adapters = getattr(runner, "adapters", None) if runner is not None else None
         gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
+
+        from cron.scheduler_provider import provider_supports_split_fire
+
+        if not provider_supports_split_fire(provider):
+            # Legacy providers own their historical single-phase admission.
+            # Keep this call on the same adapter/loop and heartbeat rail.
+            dispatch_started = True
+            processed = provider.fire_due(
+                job_id, adapters=adapters, loop=gateway_loop
+            )
+            return {
+                "claimed": bool(processed),
+                "success": bool(processed),
+                "error": None if processed else "Legacy provider did not process the fire.",
+                "execution": None,
+            }
 
         dispatch = getattr(provider, "dispatch_claimed_fire", None)
         if not callable(dispatch):
@@ -930,41 +905,7 @@ def _try_dispatch_background_run(
     job: Dict[str, Any], session_id: Optional[str] = None,
     extra_prompt: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Claim ``job`` now, then fire it on the async-delegation daemon executor.
-
-    A manual ``cronjob(action='run')`` used to execute the job synchronously
-    on the calling agent's tool thread. A cron job is a full agent run that
-    routinely takes minutes-to-hours, so the parent turn sat inside ONE tool
-    call the whole time: uninterruptible (the interrupt flag is only checked
-    between loop iterations) and serial (a batch of runs executed one by one).
-
-    This dispatches the run like ``delegate_task``'s background mode: the tool
-    returns immediately with a handle, the run executes on the shared async
-    daemon executor, and a ``type="async_delegation"`` completion event
-    re-enters the conversation as a fresh turn when the job finishes — riding
-    the existing completion-queue rail (CLI drain + gateway watcher), which
-    keeps message-role alternation legal and the prompt cache intact.
-
-    The at-most-once claim is taken SYNCHRONOUSLY before dispatch so
-    unrunnable jobs (paused / missing / already firing) report in the tool
-    response immediately instead of as a delayed completion event.
-
-    Returns
-    -------
-    None
-        Background delivery unavailable on this session runtime (one-shot
-        ``hermes -z``, stateless HTTP, Kanban worker, nested cron run).
-        Caller falls back to the synchronous path unchanged.
-    dict
-        ``{"claimed": False, "success": False, "error": ...}`` — claim lost;
-        same shape as ``_execute_job_now`` so the caller's existing response
-        formatting applies.
-        ``{"claimed": True, "dispatched": True, "delegation_id": ...}`` —
-        run is executing in the background.
-        ``{"claimed": True, "dispatched": False, "success": ..., "error": ...}``
-        — dispatch pool was at capacity; the run executed inline (the claim
-        was already taken and must not be stranded).
-    """
+    """Admit a manual run, then dispatch it when the session supports it."""
     # Finite sessions cannot route a detached result back after the turn
     # ends — mirror delegate_task's gate and fall back to sync execution.
     try:
@@ -1044,11 +985,17 @@ def _try_dispatch_background_run(
                     "manual run is executing it); not started again."
                 ),
             }
-        from cron.scheduler_provider import resolve_cron_scheduler
+        from cron.scheduler_provider import (
+            provider_supports_split_fire,
+            resolve_cron_scheduler,
+        )
         provider = resolve_cron_scheduler()
-        claimed_job = provider.claim_fire(job_id)
+        legacy_provider = not provider_supports_split_fire(provider)
+        claimed_job = None
+        if not legacy_provider:
+            claimed_job = provider.claim_fire(job_id)
         execution_id = claimed_job.get("execution_id") if isinstance(claimed_job, dict) else None
-        if not isinstance(claimed_job, dict):
+        if not legacy_provider and not isinstance(claimed_job, dict):
             execution_id = _newest_execution_id(job_id, previous_execution_id)
             refreshed = get_job(job_id)
             if refreshed is None:
@@ -1084,7 +1031,9 @@ def _try_dispatch_background_run(
             "cronjob run: async delegation registry unavailable (%s); "
             "running job '%s' inline.", e, job_name,
         )
-        result = _run_claimed_job(provider, claimed_job, extra_prompt=extra_prompt)
+        result = _run_claimed_job(
+            provider, job if legacy_provider else claimed_job, extra_prompt=extra_prompt
+        )
         result["dispatched"] = False
         return result
 
@@ -1097,9 +1046,10 @@ def _try_dispatch_background_run(
 
     started_at = time.time()
     deliver = job.get("deliver", "local")
+    fire_job = job if legacy_provider else claimed_job
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(provider, claimed_job, extra_prompt=extra_prompt)
+        res = _run_claimed_job(provider, fire_job, extra_prompt=extra_prompt)
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
         lines = [
@@ -1139,9 +1089,11 @@ def _try_dispatch_background_run(
             origin_session_id=origin_session_id, max_async_children=max_async,
         )
     except Exception as dispatch_error:
-        execution_id = claimed_job.get("execution_id")
-        provider.abort_claimed_fire(claimed_job, str(dispatch_error))
-        return _manual_result(job_id, execution_id, claimed=True,
+        if not legacy_provider:
+            execution_id = claimed_job.get("execution_id")
+            provider.abort_claimed_fire(claimed_job, str(dispatch_error))
+        return _manual_result(
+            job_id, execution_id, claimed=not legacy_provider,
                               error=str(dispatch_error), dispatched=False)
 
     if dispatch.get("status") == "dispatched":
@@ -1149,17 +1101,25 @@ def _try_dispatch_background_run(
             "claimed": True,
             "dispatched": True,
             "delegation_id": dispatch.get("delegation_id"),
-            "execution": execution_projection(claimed_job.get("execution_id"),
-                                                job_id=job_id, status="claimed"),
+            "execution": (
+                execution_projection(
+                    claimed_job.get("execution_id"),
+                    job_id=job_id,
+                    status="claimed",
+                )
+                if isinstance(claimed_job, dict)
+                else None
+            ),
         }
 
-    # Pool at capacity (or submit failure): the claim is already taken and
-    # must not be stranded — run inline exactly as the legacy path did.
+    # Pool at capacity (or submit failure): split-aware claims are already
+    # taken and must not be stranded; legacy providers have not admitted a
+    # fire yet. Run either provider path inline.
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(provider, claimed_job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(provider, fire_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 

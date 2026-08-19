@@ -609,6 +609,10 @@ class TestRunJob:
             ("post", f"/api/jobs/{VALID_JOB_ID}/pause"),
             ("post", f"/api/jobs/{VALID_JOB_ID}/resume"),
             ("post", f"/api/jobs/{VALID_JOB_ID}/run"),
+            ("delete", "/api/jobs/deadbeefdead"),
+            ("post", "/api/jobs/deadbeefdead/pause"),
+            ("post", "/api/jobs/deadbeefdead/resume"),
+            ("post", "/api/jobs/deadbeefdead/run"),
         ]
         with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
             "cron.jobs.resolve_job_ref", return_value=SAMPLE_JOB

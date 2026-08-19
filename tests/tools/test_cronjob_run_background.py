@@ -223,6 +223,105 @@ class TestSyncFallbacks:
         assert result["dispatched"] is False
         assert result["execution"]["status"] == "failed"
 
+    def test_legacy_provider_background_uses_fire_due_without_claim(self):
+        """A legacy provider is dispatched through its single-phase hook."""
+        seen = {}
+        adapters = {"relay": object()}
+        gateway_loop = object()
+
+        class LegacyProvider:
+            name = "legacy"
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                seen.update(job_id=job_id, adapters=adapters, loop=loop)
+                return True
+
+        def dispatch(**kwargs):
+            seen["result"] = kwargs["runner"]()
+            return {"status": "dispatched", "delegation_id": "legacy-run-1"}
+
+        runner = type(
+            "Runner",
+            (),
+            {"adapters": adapters, "_gateway_loop": gateway_loop},
+        )()
+        with _bound_session_key():
+            with patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=LegacyProvider(),
+            ), patch("gateway.run._gateway_runner_ref", return_value=runner), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                side_effect=dispatch,
+            ), patch("cron.scheduler.run_one_job") as m_run:
+                result = _try_dispatch_background_run(
+                    _job("job-bg-legacy"), extra_prompt="transient context"
+                )
+
+        assert result == {
+            "claimed": True,
+            "dispatched": True,
+            "delegation_id": "legacy-run-1",
+            "execution": None,
+        }
+        assert seen["job_id"] == "job-bg-legacy"
+        assert seen["adapters"] is adapters
+        assert seen["loop"] is gateway_loop
+        assert seen["result"]["status"] == "completed"
+        assert seen["result"]["error"] is None
+        assert seen["result"]["execution"] is None
+        m_run.assert_not_called()
+
+    def test_legacy_provider_pool_rejection_runs_inline(self):
+        class LegacyProvider:
+            name = "legacy"
+
+            def __init__(self):
+                self.calls = 0
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                self.calls += 1
+                return True
+
+        provider = LegacyProvider()
+        with _bound_session_key():
+            with patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=provider,
+            ), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                return_value={"status": "rejected", "error": "capacity"},
+            ), patch("cron.scheduler.run_one_job") as m_run:
+                result = _try_dispatch_background_run(_job("job-bg-legacy-inline"))
+
+        assert result["claimed"] is True
+        assert result["success"] is True
+        assert result["dispatched"] is False
+        assert result["execution"] is None
+        assert provider.calls == 1
+        m_run.assert_not_called()
+
+    def test_legacy_provider_dispatch_exception_has_no_execution(self):
+        class LegacyProvider:
+            name = "legacy"
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                raise AssertionError("fire_due must not run after dispatch failure")
+
+        with _bound_session_key():
+            with patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=LegacyProvider(),
+            ), patch(
+                "tools.async_delegation.dispatch_async_delegation",
+                side_effect=RuntimeError("legacy submit failed"),
+            ):
+                result = _try_dispatch_background_run(_job("job-bg-legacy-error"))
+
+        assert result["claimed"] is False
+        assert result["dispatched"] is False
+        assert result["execution"] is None
+        assert result["error"] == "legacy submit failed"
+
     def test_setup_exception_after_claim_aborts_once(self):
         """A pre-dispatch setup failure cannot strand the provider claim."""
         from cron.scheduler_provider import InProcessCronScheduler

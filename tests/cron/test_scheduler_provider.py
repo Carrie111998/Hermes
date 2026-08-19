@@ -317,6 +317,31 @@ def test_resolve_available_provider_is_used(monkeypatch):
     assert prov.name == "fake"
 
 
+def test_resolve_available_provider_falls_back_in_active_multiplex(monkeypatch):
+    """Profile-scoped callers share startup's safe multiplex provider choice."""
+    import hermes_cli.config as cfg
+    import plugins.cron_providers as pc
+    from agent.secret_scope import set_multiplex_active
+    from cron import scheduler_provider as sp
+    from cron.scheduler_provider import CronScheduler
+
+    class Fake(CronScheduler):
+        @property
+        def name(self):
+            return "fake"
+
+        def start(self, stop_event, **kw):
+            pass
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"cron": {"provider": "fake"}})
+    monkeypatch.setattr(pc, "load_cron_scheduler", lambda n: Fake())
+    set_multiplex_active(True)
+    try:
+        assert sp.resolve_cron_scheduler().name == "builtin"
+    finally:
+        set_multiplex_active(False)
+
+
 def test_external_provider_falls_back_to_builtin_under_multiplex():
     from cron.scheduler_provider import (
         CronScheduler,

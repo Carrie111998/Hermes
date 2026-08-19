@@ -161,6 +161,86 @@ class TestCronjobRunExecutesImmediately:
             "adapters": None, "loop": None, "extra_prompt": None,
         }
 
+    def test_execute_job_now_preserves_legacy_provider_fire_due(self):
+        """Legacy providers keep ownership of their single-phase fire hook."""
+        seen = {}
+
+        class LegacyProvider:
+            name = "legacy"
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                from cron.scheduler import release_running_job, try_register_running_job
+
+                # Legacy fire_due owns admission. The wrapper must not occupy
+                # the shared running set before this hook gets control.
+                assert try_register_running_job(job_id)
+                try:
+                    seen.update(job_id=job_id, adapters=adapters, loop=loop)
+                    return True
+                finally:
+                    release_running_job(job_id)
+
+        adapters = {"telegram": object()}
+        gateway_loop = object()
+        runner = SimpleNamespace(adapters=adapters, _gateway_loop=gateway_loop)
+        with patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=LegacyProvider(),
+        ), patch("gateway.run._gateway_runner_ref", return_value=runner), patch(
+            "cron.scheduler.run_one_job"
+        ) as m_run:
+            result = _execute_job_now(dict(_JOB), extra_prompt="one-off context")
+
+        assert result == {
+            "claimed": True,
+            "success": True,
+            "error": None,
+            "execution": None,
+        }
+        assert seen == {
+            "job_id": "job-run-1",
+            "adapters": adapters,
+            "loop": gateway_loop,
+        }
+        m_run.assert_not_called()
+
+    def test_execute_job_now_reports_legacy_provider_failure(self):
+        class LegacyProvider:
+            name = "legacy"
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                raise RuntimeError("legacy fire failed")
+
+        with patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=LegacyProvider(),
+        ), patch("cron.scheduler.run_one_job") as m_run:
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["claimed"] is True
+        assert result["success"] is False
+        assert result["error"] == "legacy fire failed"
+        assert result["execution"] is None
+        m_run.assert_not_called()
+
+    def test_execute_job_now_treats_legacy_lost_fire_as_unclaimed(self):
+        class LegacyProvider:
+            name = "legacy"
+
+            def fire_due(self, job_id, *, adapters=None, loop=None):
+                return False
+
+        with patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=LegacyProvider(),
+        ):
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["claimed"] is False
+        assert result["success"] is False
+        assert result["error"] == "Legacy provider did not process the fire."
+        assert result["execution"] is None
+
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}

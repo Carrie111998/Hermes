@@ -25,6 +25,7 @@ from cron.jobs import (
     advance_next_run,
     claim_dispatch,
     claim_job_for_fire,
+    trigger_job,
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
@@ -478,6 +479,15 @@ class TestResolveJobRef:
     def test_cli_mutation_still_resolves_friendly_name(self, tmp_cron_dir):
         job = create_job(prompt="A", schedule="1h", name="friendly")
         assert pause_job("friendly")["id"] == job["id"]
+
+    def test_cli_mutations_resolve_hex_name_without_exact_id(self, tmp_cron_dir):
+        """CLI/tool mutations keep name lookup even for ID-shaped names."""
+        job = create_job(prompt="A", schedule="1h", name="deadbeefdead")
+
+        assert pause_job("deadbeefdead")["id"] == job["id"]
+        assert resume_job("deadbeefdead")["id"] == job["id"]
+        assert trigger_job("deadbeefdead")["id"] == job["id"]
+        assert remove_job("deadbeefdead") is True
 
 
     def test_mutations_refuse_ambiguous_name(self, tmp_cron_dir):
