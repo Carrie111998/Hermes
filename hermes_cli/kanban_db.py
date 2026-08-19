@@ -11701,7 +11701,21 @@ def add_notify_sub(
                 (delivery_mode, task_id, platform, chat_id, thread_id or ""),
             )
         if metadata_json:
-            # Refresh the routing anchor for duplicate subscriptions.
+            # Merge so a later origin-ensure cannot drop inherited routing
+            # keys (issue #73030 / LS-2776). Incoming keys still win.
+            row = conn.execute(
+                """
+                SELECT delivery_metadata FROM kanban_notify_subs
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (task_id, platform, chat_id, thread_id or ""),
+            ).fetchone()
+            if row is not None:
+                merged = _decode_notify_delivery_metadata(row["delivery_metadata"])
+                merged.update(_decode_notify_delivery_metadata(metadata_json))
+                metadata_json = (
+                    _encode_notify_delivery_metadata(merged) or metadata_json
+                )
             conn.execute(
                 """
                 UPDATE kanban_notify_subs

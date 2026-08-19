@@ -247,16 +247,10 @@ def get_objective(conn: sqlite3.Connection, objective_id: str) -> Optional[dict]
     return dict(row) if row else None
 
 
-def resolve_notify_origin(
+def _objective_origin(
     conn: sqlite3.Connection, task_id: str
 ) -> Optional[SessionOrigin]:
-    """Authoritative delivery origin for ``task_id``.
-
-    Prefer the durable objective origin (copied from the human/root session)
-    over the current process session. A worker or auto-decomposer must not
-    replace that origin with its own WebUI chat.
-    """
-    ensure_supervisor_tables(conn)
+    """First-class objective origin, never the live process session."""
     env_obj = os.environ.get("HERMES_OBJECTIVE_ID") or ""
     if env_obj:
         obj = get_objective(conn, env_obj)
@@ -278,23 +272,56 @@ def resolve_notify_origin(
             origin = origin_from_row(obj)
             if origin.usable:
                 return origin
+    return None
+
+
+def _durable_notify_origin(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[SessionOrigin]:
+    """Origin from objective / stored notify rows only — never the live chat."""
+    ensure_supervisor_tables(conn)
+    origin = _objective_origin(conn, task_id)
+    if origin and origin.usable:
+        return origin
+    parent_task = os.environ.get("HERMES_KANBAN_TASK") or ""
+    if parent_task:
+        origin = _origin_from_notify_subs(conn, parent_task)
+        if origin and origin.usable:
+            return origin
+    root = _root_task_id(conn, task_id)
+    for candidate in (task_id, root):
+        origin = _origin_from_notify_subs(conn, candidate)
+        if origin and origin.usable:
+            return origin
+    return None
+
+
+def resolve_notify_origin(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[SessionOrigin]:
+    """Authoritative delivery origin for ``task_id``.
+
+    Prefer the durable objective origin (copied from the human/root session)
+    over the current process session. A worker or auto-decomposer must not
+    replace that origin with its own WebUI chat.
+    """
+    ensure_supervisor_tables(conn)
+    parent_task = os.environ.get("HERMES_KANBAN_TASK") or ""
+    is_child = bool(parent_task or _parents_of(conn, task_id))
+    durable = _durable_notify_origin(conn, task_id)
+    if is_child:
+        # Child / worker create: never invent a live-session origin
+        # (kanban_create from 73c58f750cba must not subscribe 7779276c4c10).
+        return durable if durable and durable.usable else None
+    if durable and durable.usable and _objective_origin(conn, task_id):
+        return durable
     live = capture_session_origin()
     # A leftover notify+wake row is not proof the current chat will wake.
     # Only reuse a stored sub when this process has no live session
     # (dispatcher-spawned worker / supervisor tick).
-    if not live.usable:
-        if parent_task:
-            origin = _origin_from_notify_subs(conn, parent_task)
-            if origin and origin.usable:
-                return origin
-        origin = _origin_from_notify_subs(conn, root)
-        if origin and origin.usable:
-            return origin
-    if parent_task or _parents_of(conn, task_id):
-        # Worker-created child with no inherited origin: do not invent one
-        # from a possibly-stale current chat.
-        return None
-    return live if live.usable else None
+    if live.usable:
+        return live
+    return durable if durable and durable.usable else None
 
 
 def _origin_from_notify_subs(
@@ -343,7 +370,7 @@ def ensure_objective(
     if existing:
         return str(existing["id"])
     now = _now()
-    origin = origin or resolve_notify_origin(conn, root_task_id) or capture_session_origin()
+    origin = origin or _durable_notify_origin(conn, root_task_id) or capture_session_origin()
     profile = (
         delegator_profile
         or origin.profile
@@ -477,7 +504,10 @@ def note_kanban_child(
         if not parent_ids:
             return None
         root = _root_task_id(conn, parent_ids[0])
-        origin = resolve_notify_origin(conn, root) or capture_session_origin()
+        # Child delivery follows the durable parent/objective origin.
+        # Never fall back to the live process chat — that is how
+        # kanban_create from 73c58f750cba subscribed 7779276c4c10.
+        origin = _durable_notify_origin(conn, root)
         oid = ensure_objective(conn, root, origin=origin)
         task = conn.execute(
             "SELECT assignee FROM tasks WHERE id = ?", (child_id,)
@@ -492,8 +522,8 @@ def note_kanban_child(
             terminal_predicate="task_done_with_proof",
             status="pending",
         )
-        _ensure_origin_subscription(conn, child_id, origin)
-        _ensure_origin_subscription(conn, root, origin)
+        if origin and origin.usable:
+            _ensure_origin_subscription(conn, child_id, origin)
         return oid
     except Exception:
         logger.debug("note_kanban_child failed for %s", child_id, exc_info=True)
@@ -506,7 +536,7 @@ def note_delegate_spawn(
     owner_profile: Optional[str] = None,
     goal: str = "",
 ) -> Optional[str]:
-    if not supervisor_context_active() and not os.environ.get("HERMES_OBJECTIVE_ID"):
+    if not subagent_id:
         return None
     try:
         from hermes_cli import kanban_db as kb
@@ -578,8 +608,6 @@ def note_bot_chat_handoff(
     if (title or "").strip() != "Bot Chat":
         return None
     if not session_id:
-        return None
-    if not supervisor_context_active() and not os.environ.get("HERMES_OBJECTIVE_ID"):
         return None
     try:
         from hermes_cli import kanban_db as kb
@@ -1014,8 +1042,13 @@ def _ensure_origin_subscription(
     if not origin.usable:
         return
     try:
-        from hermes_cli.kanban_db import add_notify_sub
+        from hermes_cli.kanban_db import add_notify_sub, list_notify_subs
 
+        existing = list_notify_subs(conn, task_id)
+        if existing:
+            # Inherit already copied parent routing, including
+            # delivery_metadata. Do not add a competing live chat.
+            return
         chat_id = origin.notify_chat_id()
         metadata = {}
         if origin.session_key:
@@ -1133,14 +1166,7 @@ def request_owner_blocker(
     if obj.get("remoko_external_id") == external_id and obj.get("remoko_request_id"):
         return str(obj["remoko_request_id"])
     event_key = f"remoko:{objective_id}:{decision_key}"
-    if not _record_supervisor_event(
-        conn,
-        event_key=event_key,
-        kind="owner_blocker",
-        task_id=task_id,
-        objective_id=objective_id,
-        payload={"external_id": external_id, "decision_key": decision_key},
-    ) and obj.get("remoko_request_id"):
+    if _supervisor_event_seen(conn, event_key) and obj.get("remoko_request_id"):
         return str(obj["remoko_request_id"])
 
     payload = {
@@ -1158,21 +1184,32 @@ def request_owner_blocker(
         payload["choices"] = list(choices)[:4]
 
     client = remoko if remoko is not None else _live_remoko_client()
-    request_id = None
-    if client is not None:
-        try:
-            result = client.request(payload)
-            request_id = str(
-                (result or {}).get("request_id")
-                or (result or {}).get("id")
-                or external_id
-            )
-        except Exception:
-            logger.warning("remoko request failed for %s", external_id, exc_info=True)
-            request_id = external_id
-    else:
-        request_id = external_id
+    if client is None:
+        logger.warning("remoko unavailable; not fabricating request id for %s", external_id)
+        return None
+    try:
+        result = client.request(payload)
+    except Exception:
+        logger.warning("remoko request failed for %s", external_id, exc_info=True)
+        return None
+    request_id = str((result or {}).get("request_id") or (result or {}).get("id") or "")
+    if not request_id or request_id == external_id:
+        logger.warning("remoko returned no real request_id for %s", external_id)
+        return None
 
+    _record_supervisor_event(
+        conn,
+        event_key=event_key,
+        kind="owner_blocker",
+        task_id=task_id,
+        objective_id=objective_id,
+        payload={
+            "external_id": external_id,
+            "decision_key": decision_key,
+            "request_id": request_id,
+            "choices": list(choices or [])[:4],
+        },
+    )
     conn.execute(
         """
         UPDATE kanban_objectives
@@ -1220,13 +1257,45 @@ def revalidate_owner_answer(
     obj = get_objective(conn, objective_id)
     if obj is None:
         return False
+    if not obj.get("remoko_request_id"):
+        return False
     if obj.get("remoko_external_id") != expected_external_id:
         return False
     if expected_head and current_head and expected_head != current_head:
         return False
     if answer in {None, ""}:
         return False
+    choices = _owner_blocker_choices(conn, objective_id, expected_external_id)
+    if choices and str(answer) not in choices:
+        return False
     return True
+
+
+_PARK_ANSWERS = frozenset({
+    "wait", "leave it parked", "stop", "don't", "do not", "park",
+})
+
+
+def _owner_blocker_choices(
+    conn: sqlite3.Connection, objective_id: str, external_id: str
+) -> list[str]:
+    if not _table_exists(conn, "kanban_supervisor_events"):
+        return []
+    rows = conn.execute(
+        "SELECT payload FROM kanban_supervisor_events "
+        "WHERE kind = 'owner_blocker' AND objective_id = ?",
+        (objective_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except Exception:
+            continue
+        if payload.get("external_id") != external_id:
+            continue
+        choices = payload.get("choices") or []
+        return [str(c) for c in choices]
+    return []
 
 
 def resume_after_owner_answer(
@@ -1244,6 +1313,8 @@ def resume_after_owner_answer(
         answer=answer,
         expected_external_id=expected_external_id,
     ):
+        return False
+    if str(answer).strip().lower() in _PARK_ANSWERS:
         return False
     conn.execute(
         """
@@ -1288,22 +1359,24 @@ def objective_is_complete(conn: sqlite3.Connection, objective_id: str) -> bool:
 
 def _unit_satisfies_predicate(conn: sqlite3.Connection, unit: dict) -> bool:
     status = unit.get("status")
-    if status not in {"done", "failed"}:
+    if status != "done":
         return False
     predicate = unit.get("terminal_predicate") or ""
+    proof = {}
+    if unit.get("proof"):
+        try:
+            proof = json.loads(unit["proof"]) if isinstance(unit["proof"], str) else (unit["proof"] or {})
+        except Exception:
+            proof = {}
+    if not proof:
+        return False
     if predicate == "jude_verdict_pass":
-        proof = {}
-        if unit.get("proof"):
-            try:
-                proof = json.loads(unit["proof"])
-            except Exception:
-                proof = {}
         recorded = (proof or {}).get("head")
         if recorded:
             current = _task_git_head(conn, unit["ref"])
             if current and current != recorded:
                 return False
-        return status == "done"
+        return (proof or {}).get("verdict") == "pass"
     if predicate == "task_done_with_proof":
         if unit.get("kind") == "kanban":
             task = conn.execute(
@@ -1312,8 +1385,14 @@ def _unit_satisfies_predicate(conn: sqlite3.Connection, unit: dict) -> bool:
             ).fetchone()
             if task is None or task["status"] not in {"done", "archived"}:
                 return False
-        return status == "done"
-    return status in {"done", "failed"}
+        return True
+    if predicate == "child_completed":
+        return str(proof.get("child_status") or "").lower() in {
+            "completed", "done", "ok", "success",
+        }
+    if predicate == "bot_chat_terminal":
+        return bool(proof.get("terminal") or proof.get("session_id"))
+    return False
 
 
 def reconcile_objective(conn: sqlite3.Connection, objective_id: str) -> str:

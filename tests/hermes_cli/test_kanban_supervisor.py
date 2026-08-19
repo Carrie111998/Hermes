@@ -453,6 +453,11 @@ def test_exact_origin_delivery_prefers_parent_origin(kanban_home, monkeypatch):
         assert origin is not None
         assert origin.notify_chat_id() == "73c58f750cba"
         assert origin.notify_chat_id() != "7779276c4c10"
+        chats = {s["chat_id"] for s in kb.list_notify_subs(conn, child)}
+        assert "73c58f750cba" in chats
+        assert "7779276c4c10" not in chats
+        md = kb.list_notify_subs(conn, child)[0].get("delivery_metadata") or {}
+        assert md.get("session_key") == "73c58f750cba"
 
 
 def test_claim_clears_guard_streak(kanban_home):
@@ -507,3 +512,113 @@ def test_supervisor_schema_present_on_fresh_and_reopen(kanban_home):
             "AND name='kanban_objectives'"
         ).fetchone()
         assert row is not None
+
+
+def test_delegate_and_bot_chat_ledger_without_kanban_env(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_OBJECTIVE_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    oid = sup.note_delegate_spawn(subagent_id="sa-adhoc", owner_profile="cole")
+    assert oid
+    bot = sup.note_bot_chat_handoff(session_id="20260819_adhoc", title="Bot Chat")
+    assert bot
+    with kb.connect() as conn:
+        units = sup.list_units(conn, oid)
+        kinds = {u["kind"] for u in units}
+        assert "delegate_task" in kinds
+        assert "bot_chat" in kinds
+
+
+def test_remoko_failure_does_not_fabricate_request_id(kanban_home):
+    class Boom(sup.RemokoClient):
+        def request(self, payload: dict) -> dict:
+            raise RuntimeError("inbox down")
+
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        oid = sup.ensure_objective(conn, root)
+        rid = sup.request_owner_blocker(
+            conn, objective_id=oid, task_id=root,
+            decision_key="active_pr_starvation",
+            purpose="stuck", remoko=Boom(),
+        )
+        assert rid is None
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert not obj.get("remoko_request_id")
+        assert obj["status"] != "blocked_owner"
+
+
+def test_resume_requires_persisted_request_and_known_choice(kanban_home):
+    remoko = FakeRemoko()
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        oid = sup.ensure_objective(conn, root)
+        assert not sup.resume_after_owner_answer(
+            conn, objective_id=oid, task_id=root,
+            answer="Update existing PR",
+            expected_external_id=f"obj-{oid}-active_pr_starvation",
+        )
+        rid = sup.request_owner_blocker(
+            conn, objective_id=oid, task_id=root,
+            decision_key="active_pr_starvation",
+            purpose="stuck",
+            choices=["Update existing PR", "Open a new PR", "Leave it parked", "Wait"],
+            remoko=remoko,
+        )
+        assert rid
+        ext = remoko.calls[0]["external_id"]
+        assert not sup.revalidate_owner_answer(
+            conn, objective_id=oid, answer="not a choice",
+            expected_external_id=ext,
+        )
+        assert not sup.resume_after_owner_answer(
+            conn, objective_id=oid, task_id=root,
+            answer="Wait", expected_external_id=ext,
+        )
+        assert sup.resume_after_owner_answer(
+            conn, objective_id=oid, task_id=root,
+            answer="Update existing PR", expected_external_id=ext,
+        )
+
+
+def test_failed_unit_does_not_complete_objective(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        oid = sup.ensure_objective(conn, root)
+        sup.upsert_unit(
+            conn, objective_id=oid, kind="delegate_task",
+            ref="sa-fail", status="failed",
+            terminal_predicate="child_completed",
+            proof={"child_status": "failed"},
+        )
+        assert not sup.objective_is_complete(conn, oid)
+        status = sup.reconcile_objective(conn, oid)
+        assert status != "done"
+
+
+def test_task_done_without_proof_is_not_complete(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="child", assignee="cole", parents=[root],
+        )
+        oid = sup.ensure_objective(conn, root)
+        conn.execute(
+            "UPDATE kanban_objective_units SET status='done', proof=NULL "
+            "WHERE kind='kanban' AND ref=?",
+            (child,),
+        )
+        kb.complete_task(conn, child, summary="done")
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        # complete_task writes proof; wipe it again to isolate the predicate.
+        conn.execute(
+            "UPDATE kanban_objective_units SET proof=NULL "
+            "WHERE kind='kanban' AND ref=?",
+            (child,),
+        )
+        assert not sup._unit_satisfies_predicate(conn, {
+            **units[child], "status": "done", "proof": None,
+            "terminal_predicate": "task_done_with_proof",
+        })

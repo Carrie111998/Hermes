@@ -1534,17 +1534,34 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         from gateway.session_context import get_session_env
         from hermes_cli.kanban_supervisor import resolve_notify_origin
 
+        from hermes_cli import kanban_db as _kb
+
+        existing = _kb.list_notify_subs(conn, task_id)
+        if existing:
+            # Parent-create inheritance already routed this child
+            # (issue #73030 / LS-2776). Do not attach the live session.
+            return True
         inherited = None
         try:
             inherited = resolve_notify_origin(conn, task_id)
         except Exception:
             inherited = None
         worker_parent = os.environ.get("HERMES_KANBAN_TASK") or ""
-        if inherited and inherited.usable and worker_parent:
+        has_parents = bool(
+            conn.execute(
+                "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        )
+        if inherited and inherited.usable and (has_parents or worker_parent):
             platform = inherited.platform
             chat_id = inherited.notify_chat_id()
             thread_id = inherited.thread_id or None
             session_key = inherited.session_key
+        elif has_parents:
+            # A child with no durable origin must not inherit the live
+            # worker WebUI chat (7779276c4c10 vs 73c58f750cba).
+            return False
         else:
             platform = get_session_env("HERMES_SESSION_PLATFORM", "")
             chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
