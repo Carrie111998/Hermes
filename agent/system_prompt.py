@@ -36,6 +36,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
+    KNOWLEDGE_FIRST_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
@@ -389,8 +390,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    # Pointer to the hermes-agent skill + docs for user questions about Hermes
+    # itself. The text directs the model to skill_view, so it only belongs in
+    # sessions that actually load the skills tools — embedded deployments with
+    # a pinned minimal toolset shouldn't spend prompt budget on it.
+    if "skill_view" in agent.valid_tool_names:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -484,6 +489,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # existing tools, replies with plans instead of executing).
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+
+    # Knowledge-first ordering for lookup questions. Universal (not gated by the
+    # tool-use-enforcement model list) so it lands on every model, and appended
+    # after the enforcement block for salience — it qualifies the blanket "use
+    # your tools" steer for information lookups while leaving action commands to
+    # call tools normally.
+    if agent.valid_tool_names:
+        stable_parts.append(KNOWLEDGE_FIRST_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:

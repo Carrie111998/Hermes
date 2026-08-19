@@ -13236,14 +13236,6 @@ from hermes_cli.web_routers.mcp import (  # noqa: E402,F401 — legacy re-export
 )
 
 
-
-
-
-
-
-
-
-
 _MCP_DASHBOARD_OAUTH_TTL = 15 * 60
 _MAX_PENDING_MCP_OAUTH_FLOWS = 8
 _mcp_oauth_flows: dict[str, "DashboardOAuthFlow"] = {}
@@ -13329,6 +13321,7 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                         flow.server_name,
                         cfg,
                         connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
+                        truncate_descriptions=False,
                     )
                     if not _oauth_tokens_present(flow.server_name):
                         raise RuntimeError(

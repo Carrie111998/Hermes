@@ -35,7 +35,7 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH,
+    MINIMUM_AGENT_CONTEXT_LENGTH,
     fetch_model_metadata,
     is_local_endpoint,
     query_ollama_num_ctx,
@@ -525,6 +525,7 @@ def init_agent(
     thinking_callback: callable = None,
     reasoning_callback: callable = None,
     clarify_callback: callable = None,
+    clarify_form_callback: callable = None,
     read_terminal_callback: callable = None,
     read_preview_callback: callable = None,
     read_window_below_callback: callable = None,
@@ -820,6 +821,7 @@ def init_agent(
     agent.thinking_callback = thinking_callback
     agent.reasoning_callback = reasoning_callback
     agent.clarify_callback = clarify_callback
+    agent.clarify_form_callback = clarify_form_callback
     agent.read_terminal_callback = read_terminal_callback
     agent.read_preview_callback = read_preview_callback
     agent.read_window_below_callback = read_window_below_callback
@@ -2687,8 +2689,7 @@ def init_agent(
         compression_idle_compact_after_seconds
     )
 
-    # Reject models whose context window is below the minimum required
-    # for reliable tool-calling workflows (64K tokens).
+    # Reject models whose context window is below the configured minimum.
     _ctx = getattr(agent.context_compressor, "context_length", 0)
     _allow_lmstudio_explicit_below_floor = (
         str(getattr(agent, "provider", "") or "").strip().lower() == "lmstudio"
@@ -2696,15 +2697,19 @@ def init_agent(
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
+    if (
+        _ctx
+        and _ctx < MINIMUM_AGENT_CONTEXT_LENGTH
+        and not _allow_lmstudio_explicit_below_floor
+    ):
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
-            f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
+            f"which is below the minimum {MINIMUM_AGENT_CONTEXT_LENGTH:,} required "
             f"by Hermes Agent.  Choose a model with at least "
-            f"{MINIMUM_CONTEXT_LENGTH // 1000}K context.  If your server "
+            f"{MINIMUM_AGENT_CONTEXT_LENGTH // 1000}K context.  If your server "
             f"reports a window smaller than the model's true window, set "
             f"model.context_length in config.yaml to the real value "
-            f"(this must be at least {MINIMUM_CONTEXT_LENGTH // 1000}K)."
+            f"(this must be at least {MINIMUM_AGENT_CONTEXT_LENGTH // 1000}K)."
         )
 
     # Nous Hermes 3/4 are chat models, not tool-call-tuned. The interactive

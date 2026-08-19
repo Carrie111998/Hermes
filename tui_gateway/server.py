@@ -3439,6 +3439,7 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        hermes_user_id = ""
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -3446,6 +3447,7 @@ def _set_session_context(
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
+                    hermes_user_id = str(sess.get("hermes_user_id") or "")
                     break
         return set_session_vars(
             session_key=session_key,
@@ -3454,6 +3456,7 @@ def _set_session_context(
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
+            user_id=hermes_user_id,
         )
     except Exception:
         return []
@@ -6266,6 +6269,9 @@ def _agent_cbs(sid: str) -> dict:
         ),
         "clarify_callback": lambda q, c, multi_select=False, questions=None: (
             _clarify_block(sid, q, c, multi_select=multi_select, questions=questions)
+        ),
+        "clarify_form_callback": lambda questions: _block(
+            "clarify_form.request", sid, {"questions": questions}
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.

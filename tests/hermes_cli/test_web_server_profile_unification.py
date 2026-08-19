@@ -147,7 +147,7 @@ class TestProfileScopedMcp:
         monkeypatch.setattr(
             mcp_config,
             "_probe_single_server",
-            lambda name, config, connect_timeout=30, details=None: [("tool-a", "desc")],
+            lambda name, config, connect_timeout=30, details=None, **kwargs: [("tool-a", "desc")],
         )
         monkeypatch.setattr(mcp_config, "_oauth_tokens_present", lambda name: False)
 
@@ -179,7 +179,7 @@ class TestProfileScopedMcp:
             encoding="utf-8",
         )
 
-        def fake_probe(name, config, connect_timeout=30, details=None):
+        def fake_probe(name, config, connect_timeout=30, details=None, **kwargs):
             if details is not None:
                 details["schema_chars"] = {"tool-a": 420}
             return [("tool-a", "desc-a"), ("tool-b", "desc-b")]
@@ -211,7 +211,7 @@ class TestProfileScopedMcp:
         monkeypatch.setattr(
             mcp_config,
             "_probe_single_server",
-            lambda name, config, connect_timeout=30, details=None: [("tool-a", "desc")],
+            lambda name, config, connect_timeout=30, details=None, **kwargs: [("tool-a", "desc")],
         )
 
         resp = client.post(

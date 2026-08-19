@@ -654,6 +654,7 @@ DEFAULT_CONFIG = {
         "loop_caps": {
             "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
             "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            "max_tool_searches": 20,  # max tool_search (tool-discovery) calls per turn (0 = unlimited)
         },
     },
 
@@ -2659,6 +2660,12 @@ DEFAULT_CONFIG = {
             "search_default_limit": 5,
             # Hard upper bound the model can request via ``limit``. Range 1..50.
             "max_search_limit": 20,
+            # Maximum description characters returned for each search hit.
+            # Full metadata remains available through tool_describe.
+            "max_description_chars": 400,
+            # Cap the top-level description returned by tool_describe. The
+            # parameter schema is preserved so calls remain reliable.
+            "max_schema_description_chars": 1200,
             # Skills-style catalog listing embedded in the tool_search bridge
             # description: every deferred tool's name + first sentence of its
             # description (≤60 chars), grouped by MCP server / toolset. Keeps

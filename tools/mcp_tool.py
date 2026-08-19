@@ -5716,6 +5716,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        from gateway.session_context import get_session_env
+        _uid = get_session_env("HERMES_SESSION_USER_ID")
+        if _uid and server_name == "jarvis-mcp":
+            args = {**args, "user_id": _uid}
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy

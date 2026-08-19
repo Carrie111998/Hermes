@@ -99,7 +99,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "setup_mcp", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "clarify_form", "read_terminal", "read_preview", "read_window_below", "setup_mcp", "delegate_task"}
 )
 
 
@@ -3202,6 +3202,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     multi_select=next_args.get("multi_select", False),
                     questions=next_args.get("questions"),
                     callback=agent.clarify_callback,
+                ),
+                next_args,
+            )
+    elif function_name == "clarify_form":
+        def _execute(next_args: dict) -> Any:
+            from tools.clarify_form_tool import clarify_form_tool as _clarify_form_tool
+            return _finish_agent_tool(
+                _clarify_form_tool(
+                    questions=next_args.get("questions"),
+                    callback=getattr(agent, "clarify_form_callback", None),
                 ),
                 next_args,
             )
