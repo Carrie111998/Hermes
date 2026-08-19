@@ -1,3 +1,4 @@
+# ci-cache-refresh 20260819
 name: CI
 
 # Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
