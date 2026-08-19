@@ -24318,8 +24318,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from agent.vision_prompt import build_vision_prompt
         from tools.vision_tools import vision_analyze_tool
 
+        vision_intent = user_text
+        if user_text.strip() == "(The user sent a message with no text content)":
+            vision_intent = ""
         analysis_prompt = build_vision_prompt(
-            user_text,
+            vision_intent,
             surface="gateway_auto_enrichment",
             concise=True,
         )

@@ -10,7 +10,7 @@ _DEFAULT_INTENT = "Describe the image and identify the most important visible ev
 
 
 def normalize_vision_intent(intent: Any) -> str:
-    """Return a bounded, stable representation of a vision task."""
+    """Return a stable representation of a vision task."""
     if intent is None:
         return _DEFAULT_INTENT
     if not isinstance(intent, str):
@@ -18,7 +18,17 @@ def normalize_vision_intent(intent: Any) -> str:
     normalized = " ".join(intent.split())
     if not normalized:
         return _DEFAULT_INTENT
-    return normalized[:_MAX_INTENT_CHARS]
+    return normalized
+
+
+def _bound_vision_intent(intent: str) -> str:
+    """Bound prompt cost without dropping a task placed after long context."""
+    if len(intent) <= _MAX_INTENT_CHARS:
+        return intent
+    marker = "\n...[vision task truncated]...\n"
+    head_chars = (_MAX_INTENT_CHARS - len(marker)) // 2
+    tail_chars = _MAX_INTENT_CHARS - len(marker) - head_chars
+    return f"{intent[:head_chars]}{marker}{intent[-tail_chars:]}"
 
 
 def build_vision_prompt(
@@ -29,7 +39,7 @@ def build_vision_prompt(
     region: list[int] | None = None,
 ) -> str:
     """Compile a task-grounded visual-evidence contract for auxiliary vision."""
-    task = escape(normalize_vision_intent(intent), quote=True)
+    task = escape(_bound_vision_intent(normalize_vision_intent(intent)), quote=True)
     detail_contract = (
         "Keep the response focused and concise, normally 2-4 sentences, while "
         "including any exact text or values needed to answer the task."
