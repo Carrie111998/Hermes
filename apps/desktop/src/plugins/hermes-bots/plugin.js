@@ -6474,11 +6474,23 @@ function BotsPane() {
             $botUnread.set(next)
           }
 
-          void openBotCanonicalChat(bot.name, allMeta[bot.name]?.chat).catch(() => {
-            if (typeof host.newChat === 'function') {
-              host.newChat(bot.name)
-            }
-          })
+          // "Active now" means the bot has a live session right now, so the
+          // chip should resume THAT session rather than open (or create) the
+          // canonical "Bot Chat". Fall back to the canonical chat only when
+          // there is no live session (e.g. a busy turn before its first reply).
+          const fallback = () =>
+            openBotCanonicalChat(bot.name, allMeta[bot.name]?.chat).catch(() => {
+              if (typeof host.newChat === 'function') {
+                host.newChat(bot.name)
+              }
+            })
+
+          const liveId = bot.last_session?.id
+          if (liveId && typeof host.openSession === 'function') {
+            void host.openSession(liveId, { profile: bot.name }).catch(fallback)
+          } else {
+            void fallback()
+          }
         }
       }),
       roster.length

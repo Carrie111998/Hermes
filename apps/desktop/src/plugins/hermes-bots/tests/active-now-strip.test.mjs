@@ -74,6 +74,17 @@ test('roster without profiles never throws', () => {
   assert.equal(activeBots([], 'default', 'open', NOW).length, 0)
 })
 
+test('ActiveNowStrip chip prefers the bot live session over opening/creating a new chat', () => {
+  const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+  // "Active now" means the bot is mid-conversation, so its chip must resume the
+  // live session (bot.last_session.id) rather than open — or worse, CREATE — the
+  // canonical "Bot Chat" that may not yet exist. The canonical path stays as the
+  // fallback for when there is no live session yet.
+  assert.match(source, /const liveId = bot\.last_session\?\.id/)
+  assert.match(source, /host\.openSession\(liveId, \{ profile: bot\.name \}\)/)
+  assert.match(source, /openBotCanonicalChat\(bot\.name, allMeta\[bot\.name\]\?\.chat\)/)
+})
+
 test('ActiveNowStrip renders above the roster, is a live region, and is click-accessible', () => {
   // Strip is placed between the pane header and the search field.
   const headerEnd = source.indexOf("children: 'Bots'")
