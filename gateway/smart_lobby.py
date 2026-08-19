@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Mapping, Optional, cast
@@ -27,6 +28,16 @@ _EXPLICIT_PROFILE_RE = re.compile(
     r"^\s*(?:\[(?P<bracket>[a-z0-9_-]+)\]|@(?P<mention>[a-z0-9_-]+)|(?P<colon>[a-z0-9_-]+):)\s*",
     re.IGNORECASE,
 )
+
+
+@contextmanager
+def _target_profile_runtime_scope(profile: str):
+    """Enter the same config/secret scope used by a target profile turn."""
+    from gateway.run import _profile_runtime_scope
+    from hermes_cli.profiles import get_profile_dir
+
+    with _profile_runtime_scope(get_profile_dir(profile)):
+        yield
 
 
 @dataclass(frozen=True)
@@ -399,11 +410,12 @@ class GatewaySmartLobbyMixin:
 
         source_adapter = getattr(self, "_adapter_for_source")(source)
         target_auth = getattr(target_adapter, "_is_sender_authorized", None)
-        authorized = (
-            target_auth(source.user_id, "thread", candidate.channel_id)
-            if callable(target_auth)
-            else None
-        )
+        with _target_profile_runtime_scope(decision.profile):
+            authorized = (
+                target_auth(source.user_id, "thread", candidate.channel_id)
+                if callable(target_auth)
+                else None
+            )
         if authorized is not True:
             logger.warning(
                 "Smart lobby target profile rejected sender: profile=%s user=%s",
@@ -499,7 +511,9 @@ class GatewaySmartLobbyMixin:
             guild_id=getattr(source, "guild_id", None),
             parent_chat_id=candidate.channel_id,
             message_id=getattr(source, "message_id", None),
-            role_authorized=getattr(source, "role_authorized", False),
+            # Role authorization is profile-local. Never carry a role decision
+            # made by the lobby/default bot into the target bot's source.
+            role_authorized=False,
         )
         routed_event = dataclasses.replace(event, source=routed_source)
         # The synthetic event preserves the real user turn in Hermes state, but
@@ -515,6 +529,10 @@ class GatewaySmartLobbyMixin:
             )
         except Exception:
             logger.debug("Smart lobby prompt mirror failed", exc_info=True)
+        session_key_fn = getattr(target_adapter, "_batch_session_key_for_event", None)
+        target_session_key = (
+            session_key_fn(routed_event) if callable(session_key_fn) else None
+        )
         try:
             await cast(Awaitable[Any], handle_message(routed_event))
         except Exception:
@@ -538,10 +556,33 @@ class GatewaySmartLobbyMixin:
                 )
             return True
 
+        if target_session_key:
+            processing_task = (
+                getattr(target_adapter, "_session_tasks", {}) or {}
+            ).get(target_session_key)
+            if not isinstance(processing_task, asyncio.Task):
+                await asyncio.to_thread(
+                    store.update,
+                    source_key,
+                    status="failed",
+                    thread_id=str(thread_id),
+                    error_kind="dispatch_start",
+                )
+                if source_adapter is not None:
+                    try:
+                        await source_adapter.send(
+                            source.chat_id,
+                            f"I created <#{thread_id}> for `{decision.profile}`, but its "
+                            "processing task did not start. Please continue in that thread.",
+                        )
+                    except Exception:
+                        logger.debug("Smart lobby dispatch-start notice failed", exc_info=True)
+                return True
+
         await asyncio.to_thread(
             store.update,
             source_key,
-            status="delivered",
+            status="dispatched",
             thread_id=str(thread_id),
         )
         if source_adapter is not None:
