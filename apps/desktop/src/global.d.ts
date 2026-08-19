@@ -252,6 +252,9 @@ declare global {
       /** Main-process fact: this OS can do any translucency at all (not Linux). */
       translucencySupported?: boolean
       setTranslucency?: (payload: TranslucencyState) => void
+      /** Main's current translucency, published at preload so a remounted
+       *  renderer does not hydrate from stale localStorage after a surface recreate. */
+      translucency?: TranslucencyState
       setKeepAwake?: (on: boolean) => void
       setDisableF12?: (blocked: boolean) => void
       setPreviewShortcutActive?: (active: boolean) => void

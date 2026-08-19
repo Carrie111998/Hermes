@@ -259,6 +259,7 @@ import {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  parseSessionWindowUrl,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
@@ -271,13 +272,15 @@ import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {
   backgroundMaterialFor,
+  chatWindowNeedsSurfaceRecreate,
+  chatWindowSurfaceOptions as chatWindowSurfaceOptionsFor,
   glassActive,
   glassSupportedOn,
   normalizeState as normalizeTranslucency,
   translucencySupportedOn,
   vibrancyFor as vibrancyForTranslucency,
-  windowBackingOptions,
-  windowOpacityFor
+  windowOpacityFor,
+  windowsChatWindowTransparent
 } from './translucency'
 import {
   compareApiUrl,
@@ -890,6 +893,13 @@ function writePersistedTranslucency(state) {
 }
 
 let translucencyState = readPersistedTranslucency()
+let replacingChatSurfaces = false
+
+let chatSurfaceBornTransparent = windowsChatWindowTransparent(
+  process.platform,
+  GLASS_SUPPORTED,
+  translucencyState
+)
 
 // Chat windows whose webContents backing follows translucency (primary,
 // instance peers, session windows). The HUD / pet overlay / quick entry /
@@ -973,24 +983,141 @@ function applyWindowTranslucency(win, changed = { backing: true, material: true,
 // toggle can re-apply. The HUD, pet overlay, quick entry and wake indicator
 // are `transparent: true` windows that own their backgrounds and are
 // deliberately not chat windows.
+//
+// On glass-capable Windows, `transparent: true` is only set while glass is
+// actually on. DWM Snap / FancyZones ignore transparent frames, and Electron
+// cannot flip `transparent` after construction, so a Clear↔Glass crossing
+// recreates these windows (see recreateChatWindowsForSurface).
 function chatWindowSurfaceOptions() {
-  return {
-    vibrancy: IS_MAC ? vibrancyForTranslucency(translucencyState) : undefined,
-    // Pin the material to its ACTIVE appearance: several NSVisualEffectView
-    // materials collapse to a shared inactive look when the window blurs
-    // (measured on macOS 26: sidebar, popover and under-window composited
-    // pixel-identically once unfocused), which would quietly erase the
-    // user's frost choice whenever they click elsewhere. Only observable
-    // under glass — everywhere else the page buries the material.
-    visualEffectState: IS_MAC ? ('active' as const) : undefined,
-    // Win11 DWM materials only reach the client area on a transparent window
-    // (electron#49443). Chat windows on glass-capable Windows are born
-    // transparent so a live Clear→Glass toggle doesn't need a recreate; the
-    // opaque themed backgroundColor covers it while glass is off.
-    ...(IS_WINDOWS && GLASS_SUPPORTED ? { transparent: true } : {}),
-    backgroundMaterial: IS_WINDOWS && GLASS_SUPPORTED ? backgroundMaterialFor(translucencyState) : undefined,
-    opacity: windowOpacity(),
-    ...windowBackingOptions(translucencyState, getWindowBackgroundColor())
+  return chatWindowSurfaceOptionsFor({
+    platform: process.platform,
+    glassSupported: GLASS_SUPPORTED,
+    state: translucencyState,
+    themedColor: getWindowBackgroundColor()
+  })
+}
+
+function applyChatWindowGeometry(win, snapshot) {
+  if (!win || win.isDestroyed() || !snapshot) {
+    return
+  }
+
+  if (snapshot.fullScreen && typeof win.setFullScreen === 'function') {
+    win.setFullScreen(true)
+
+    return
+  }
+
+  if (typeof win.unmaximize === 'function' && typeof win.isMaximized === 'function' && win.isMaximized() && !snapshot.maximized) {
+    win.unmaximize()
+  }
+
+  if (snapshot.maximized && typeof win.maximize === 'function') {
+    win.maximize()
+
+    return
+  }
+
+  if (snapshot.bounds && typeof win.setBounds === 'function') {
+    win.setBounds(snapshot.bounds)
+  }
+}
+
+// `transparent` is constructor-only. When glass crosses the active threshold
+// on Win11, destroy and re-birth every chat surface so Snap works while glass
+// is off and DWM materials can paint while it is on. HUD / pet / quick-entry
+// are not chat surfaces and stay put.
+function recreateChatWindowsForSurface() {
+  const snapshots = []
+
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!translucencyBackedWindows.has(win) || win.isDestroyed()) {
+      continue
+    }
+
+    const url = typeof win.webContents?.getURL === 'function' ? win.webContents.getURL() : ''
+    const session = parseSessionWindowUrl(url)
+
+    snapshots.push({
+      kind: win === mainWindow ? 'main' : session ? 'session' : 'instance',
+      bounds: typeof win.getBounds === 'function' ? win.getBounds() : null,
+      maximized: typeof win.isMaximized === 'function' && win.isMaximized(),
+      fullScreen: typeof win.isFullScreen === 'function' && win.isFullScreen(),
+      visible: typeof win.isVisible === 'function' ? win.isVisible() : true,
+      minimized: typeof win.isMinimized === 'function' && win.isMinimized(),
+      focused: typeof win.isFocused === 'function' && win.isFocused(),
+      url,
+      sessionId: session?.sessionId,
+      watch: session?.watch === true
+    })
+  }
+
+  if (snapshots.length === 0) {
+    return
+  }
+
+  replacingChatSurfaces = true
+
+  try {
+    if (translucencyWriteTimer) {
+      clearTimeout(translucencyWriteTimer)
+      translucencyWriteTimer = null
+    }
+
+    writePersistedTranslucency(translucencyState)
+
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (translucencyBackedWindows.has(win) && !win.isDestroyed()) {
+        win.destroy()
+      }
+    }
+
+    for (const snapshot of snapshots) {
+      const startHidden = snapshot.visible === false
+      const startMinimized = snapshot.minimized === true && snapshot.visible !== false
+      const startFocused = snapshot.focused === true
+
+      if (snapshot.kind === 'main') {
+        createWindow({ startHidden, startMinimized, startFocused, applySavedMaximize: false })
+
+        applyChatWindowGeometry(mainWindow, snapshot)
+
+        if (snapshot.url) {
+          loadWindowUrl(mainWindow, snapshot.url, 'Main window')
+        }
+
+        continue
+      }
+
+      if (snapshot.kind === 'session' && snapshot.sessionId) {
+        const next = createSessionWindow(snapshot.sessionId, {
+          watch: snapshot.watch,
+          startHidden,
+          startMinimized,
+          startFocused
+        })
+
+        applyChatWindowGeometry(next, snapshot)
+
+        continue
+      }
+
+      const next = createInstanceWindow({ startHidden, startMinimized, startFocused })
+
+      applyChatWindowGeometry(next, snapshot)
+
+      if (snapshot.url) {
+        loadWindowUrl(next, snapshot.url, 'Instance window')
+      }
+    }
+
+    chatSurfaceBornTransparent = windowsChatWindowTransparent(
+      process.platform,
+      GLASS_SUPPORTED,
+      translucencyState
+    )
+  } finally {
+    replacingChatSurfaces = false
   }
 }
 
@@ -10730,6 +10857,24 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
 // reveal, then fall back a few seconds after the renderer loads. `show` and
 // `onRevealed` carry the caller's reveal action and post-visible work; whichever
 // path wins runs them exactly once.
+function chatWindowRevealShow(win, { startHidden = false, startMinimized = false, startFocused = false } = {}) {
+  if (startHidden) {
+    return () => {}
+  }
+
+  return () => {
+    if (startFocused || typeof win.showInactive !== 'function') {
+      win.show()
+    } else {
+      win.showInactive()
+    }
+
+    if (startMinimized && typeof win.minimize === 'function') {
+      win.minimize()
+    }
+  }
+}
+
 function wireWindowReveal(win, { show, onRevealed }: { show?: () => void; onRevealed?: () => void } = {}) {
   const controller = createWindowRevealController(
     {
@@ -10770,7 +10915,19 @@ function focusWindow(win) {
   win.focus()
 }
 
-function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
+function spawnSecondaryWindow({
+  sessionId,
+  watch,
+  startHidden = false,
+  startMinimized = false,
+  startFocused = true
+}: {
+  sessionId?: string
+  watch?: boolean
+  startHidden?: boolean
+  startMinimized?: boolean
+  startFocused?: boolean
+} = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -10802,7 +10959,9 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
 
-  wireWindowReveal(win)
+  wireWindowReveal(win, {
+    show: chatWindowRevealShow(win, { startHidden, startMinimized, startFocused })
+  })
 
   win.on('enter-full-screen', () => sendWindowStateChanged(true))
   win.on('leave-full-screen', () => sendWindowStateChanged(false))
@@ -10842,8 +11001,13 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+function createSessionWindow(
+  sessionId,
+  { watch = false, startHidden = false, startMinimized = false, startFocused = true } = {}
+) {
+  return sessionWindows.openOrFocus(sessionId, () =>
+    spawnSecondaryWindow({ sessionId, watch, startHidden, startMinimized, startFocused })
+  )
 }
 
 // Additional full "instance" windows — peers of the primary that render the
@@ -10873,7 +11037,7 @@ function nextInstanceBounds() {
 // primary: it never overwrites the mainWindow global, doesn't start the backend
 // (the renderer's getConnection() joins the already-running one), and loads the
 // plain renderer URL so the full app renders.
-function createInstanceWindow() {
+function createInstanceWindow({ startHidden = false, startMinimized = false, startFocused = true } = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -10899,7 +11063,9 @@ function createInstanceWindow() {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
 
-  wireWindowReveal(win)
+  wireWindowReveal(win, {
+    show: chatWindowRevealShow(win, { startHidden, startMinimized, startFocused })
+  })
 
   // Per-window fullscreen chrome: send this window its own titlebar inset so its
   // traffic lights hide/show independently of the primary.
@@ -11729,7 +11895,12 @@ function closeQuickEntryWindow() {
   quickEntryWindow = null
 }
 
-function createWindow() {
+function createWindow({
+  startHidden = false,
+  startMinimized = false,
+  startFocused = true,
+  applySavedMaximize = true
+} = {}) {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
   mainWindow = new BrowserWindow({
@@ -11784,11 +11955,12 @@ function createWindow() {
     }
   }
 
-  if (savedWindowState?.isMaximized) {
+  if (applySavedMaximize && savedWindowState?.isMaximized) {
     mainWindow.maximize()
   }
 
   const revealController = wireWindowReveal(createdMainWindow, {
+    show: chatWindowRevealShow(createdMainWindow, { startHidden, startMinimized, startFocused }),
     onRevealed: () => {
       // Persist geometry as soon as the window is visible so a crash before the
       // first clean resize/move/close still captures the restored bounds (#56726).
@@ -11840,8 +12012,10 @@ function createWindow() {
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   mainWindow.on('closed', () => {
-    closePetOverlay()
-    wakeIndicatorController.close()
+    if (!replacingChatSurfaces) {
+      closePetOverlay()
+      wakeIndicatorController.close()
+    }
 
     if (mainWindow === createdMainWindow) {
       mainWindow = null
@@ -13835,7 +14009,8 @@ ipcMain.on('hermes:native-theme', (_event, mode) => {
 })
 
 // See-through window translucency. Persist + re-apply to every open window at
-// runtime (no recreation, so caching/sessions are untouched).
+// runtime. Crossing glass-on on Windows recreates chat windows because
+// `transparent` is constructor-only (see recreateChatWindowsForSurface).
 //
 // The intensity slider is a HOT path: ~100 updates per drag. Two things make
 // that cheap. Native work is diffed, so an intensity-only change under glass
@@ -13857,9 +14032,41 @@ function scheduleTranslucencyWrite() {
   }, 250)
 }
 
+// The glass lever crosses `glassActive` on the first notch (0→1). Recreating
+// there unmounts Settings and drops the rest of the drag. Wait for the
+// trailing edge — one remount after the hand leaves the slider.
+let chatSurfaceRecreateTimer = null
+
+function scheduleChatSurfaceRecreate() {
+  if (chatSurfaceRecreateTimer) {
+    clearTimeout(chatSurfaceRecreateTimer)
+  }
+
+  chatSurfaceRecreateTimer = setTimeout(() => {
+    chatSurfaceRecreateTimer = null
+
+    const wantTransparent = windowsChatWindowTransparent(
+      process.platform,
+      GLASS_SUPPORTED,
+      translucencyState
+    )
+
+    if (wantTransparent === chatSurfaceBornTransparent) {
+      return
+    }
+
+    recreateChatWindowsForSurface()
+  }, 200)
+}
+
 // Flush a pending write before the process can exit, so a quit landing inside
-// the debounce window doesn't lose the setting.
+// the debounce window doesn't lose the setting. Do not recreate mid-quit.
 app.on('before-quit', () => {
+  if (chatSurfaceRecreateTimer) {
+    clearTimeout(chatSurfaceRecreateTimer)
+    chatSurfaceRecreateTimer = null
+  }
+
   if (translucencyWriteTimer) {
     clearTimeout(translucencyWriteTimer)
     translucencyWriteTimer = null
@@ -13872,6 +14079,10 @@ app.on('before-quit', () => {
 // itself. Registered at module scope, which runs long before any window.
 ipcMain.on('hermes:translucency:support', event => {
   event.returnValue = { glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED }
+})
+
+ipcMain.on('hermes:translucency:current', event => {
+  event.returnValue = translucencyState
 })
 
 ipcMain.on('hermes:translucency', (_event, payload) => {
@@ -13904,8 +14115,20 @@ ipcMain.on('hermes:translucency', (_event, payload) => {
   // The HUD's frost reads the same setting but answers on its own terms (see
   // hudFrostFor) — and it is a transparent window, so it is deliberately not
   // in the chat fan-out below. It self-diffs, so an unrelated change costs
-  // nothing native.
+  // nothing native. Apply even when chat windows remount: the HUD is not in
+  // that recreate set.
   hudIpc.applyHudFrost()
+
+  if (
+    chatWindowNeedsSurfaceRecreate(previous, next, process.platform, GLASS_SUPPORTED) ||
+    chatSurfaceRecreateTimer
+  ) {
+    // Rearm on every later slider tick so the remount waits for pointer-up,
+    // not 200ms after the first 0→1 notch.
+    scheduleChatSurfaceRecreate()
+
+    return
+  }
 
   if (changed.backing || changed.material || changed.opacity) {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -14912,6 +15135,13 @@ app.on('before-quit', event => {
 })
 
 app.on('window-all-closed', () => {
+  // Recreating chat windows for a Windows glass surface swap destroys every
+  // translucency-backed window before the replacements exist. That is not a
+  // user close — do not quit the process in the gap.
+  if (replacingChatSurfaces) {
+    return
+  }
+
   // macOS convention: keep the process alive in the Dock when the user closes
   // the last window. But when we're handing off to a detached updater / swap /
   // uninstall script, the process MUST exit so the script can replace or remove

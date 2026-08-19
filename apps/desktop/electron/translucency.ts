@@ -11,7 +11,14 @@
  * then fail to bundle.
  */
 
-import { glassActive, type TranslucencyState } from '../../shared/src/translucency'
+import {
+  backgroundMaterialFor,
+  glassActive,
+  type TranslucencyState,
+  vibrancyFor,
+  windowOpacityFor,
+  type WindowsBackgroundMaterial
+} from '../../shared/src/translucency'
 
 export {
   backgroundMaterialFor,
@@ -27,6 +34,7 @@ export {
   glassSupportedOn,
   glassSurfaceKeep,
   hudFrostFor,
+  hydrateTranslucencyState,
   normalizeMaterial,
   normalizeMode,
   normalizeScope,
@@ -65,4 +73,62 @@ export {
  */
 export function windowBackingOptions(state: TranslucencyState, themedColor: string): { backgroundColor?: string } {
   return glassActive(state) ? {} : { backgroundColor: themedColor }
+}
+
+/**
+ * Electron only honours `transparent` at BrowserWindow construction. DWM Snap
+ * and FancyZones treat a transparent window as outside normal frame hit-testing,
+ * so a glass-capable Windows chat window must stay opaque until glass is
+ * actually on. Turning glass on later therefore needs a recreate — the live
+ * `setBackgroundMaterial` path cannot add transparency after the fact
+ * (electron#49443).
+ */
+export function windowsChatWindowTransparent(
+  platform: string,
+  glassSupported: boolean,
+  state: TranslucencyState
+): boolean {
+  return platform === 'win32' && glassSupported && glassActive(state)
+}
+
+export function chatWindowNeedsSurfaceRecreate(
+  previous: TranslucencyState,
+  next: TranslucencyState,
+  platform: string,
+  glassSupported: boolean
+): boolean {
+  return (
+    windowsChatWindowTransparent(platform, glassSupported, previous) !==
+    windowsChatWindowTransparent(platform, glassSupported, next)
+  )
+}
+
+export type ChatWindowSurfaceOptions = {
+  vibrancy?: ReturnType<typeof vibrancyFor>
+  visualEffectState?: 'active'
+  transparent?: true
+  backgroundMaterial?: WindowsBackgroundMaterial
+  opacity: number
+  backgroundColor?: string
+}
+
+export function chatWindowSurfaceOptions(input: {
+  platform: string
+  glassSupported: boolean
+  state: TranslucencyState
+  themedColor: string
+}): ChatWindowSurfaceOptions {
+  const { platform, glassSupported, state, themedColor } = input
+  const isMac = platform === 'darwin'
+  const isWindows = platform === 'win32'
+  const transparent = windowsChatWindowTransparent(platform, glassSupported, state)
+
+  return {
+    vibrancy: isMac ? vibrancyFor(state) : undefined,
+    visualEffectState: isMac ? 'active' : undefined,
+    ...(transparent ? { transparent: true as const } : {}),
+    backgroundMaterial: isWindows && glassSupported ? backgroundMaterialFor(state) : undefined,
+    opacity: windowOpacityFor(state),
+    ...windowBackingOptions(state, themedColor)
+  }
 }

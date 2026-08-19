@@ -6,7 +6,8 @@ import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
-  instanceWindowBounds
+  instanceWindowBounds,
+  parseSessionWindowUrl
 } from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
@@ -54,6 +55,24 @@ function makeFakeWindow() {
     calls
   }
 }
+
+test('parseSessionWindowUrl is the inverse of buildSessionWindowUrl', () => {
+  const built = buildSessionWindowUrl('abc123', { devServer: 'http://localhost:5173', watch: true })
+
+  assert.deepEqual(parseSessionWindowUrl(built), { sessionId: 'abc123', watch: true })
+  assert.deepEqual(parseSessionWindowUrl(buildSessionWindowUrl('a b/c', { devServer: 'http://localhost:5173' })), {
+    sessionId: 'a b/c',
+    watch: false
+  })
+  assert.deepEqual(
+    parseSessionWindowUrl(
+      buildSessionWindowUrl('sess-1', { rendererIndexPath: 'C:/Users/app/resources/app.asar/index.html' })
+    ),
+    { sessionId: 'sess-1', watch: false }
+  )
+  assert.equal(parseSessionWindowUrl('http://localhost:5173/#/abc123'), null)
+  assert.equal(parseSessionWindowUrl('not a url'), null)
+})
 
 test('buildSessionWindowUrl puts the secondary flag before the hash route (dev server)', () => {
   const url = buildSessionWindowUrl('abc123', { devServer: 'http://localhost:5173' })

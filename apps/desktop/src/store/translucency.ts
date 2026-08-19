@@ -20,6 +20,7 @@ import {
   glassMaterialsFor,
   type GlassScope,
   glassSurfaceKeep,
+  hydrateTranslucencyState,
   normalizeMaterial,
   normalizeScope,
   normalizeState,
@@ -78,10 +79,16 @@ const KEY = 'hermes.desktop.translucency.v1'
 const read = (): TranslucencyState => {
   const stored = readJson<unknown>(KEY)
 
-  return normalizeState(stored && typeof stored === 'object' ? stored : { intensity: stored }, GLASS_SUPPORTED)
+  return hydrateTranslucencyState(undefined, stored, GLASS_SUPPORTED)
 }
 
-const initial: TranslucencyState = typeof window === 'undefined' ? normalizeState(null, false) : read()
+// Cold start / remount only: prefer main's seed so a Windows glass recreate
+// does not bounce off stale localStorage. Later `storage` events use `read()`
+// so a sibling window's tint still syncs.
+const initial: TranslucencyState =
+  typeof window === 'undefined'
+    ? normalizeState(null, false)
+    : hydrateTranslucencyState(window.hermesDesktop?.translucency, readJson<unknown>(KEY), GLASS_SUPPORTED)
 
 export const $translucency = atom<TranslucencyState>(initial)
 

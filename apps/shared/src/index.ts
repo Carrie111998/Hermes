@@ -82,6 +82,7 @@ export {
   type GlassScope,
   glassSupportedOn,
   glassSurfaceKeep,
+  hydrateTranslucencyState,
   normalizeMaterial,
   normalizeMode,
   normalizeScope,

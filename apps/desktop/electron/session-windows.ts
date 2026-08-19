@@ -77,6 +77,31 @@ function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath
   return `${pathToFileURL(rendererIndexPath).toString()}${query}${route}`
 }
 
+function parseSessionWindowUrl(url: string): { sessionId: string; watch: boolean } | null {
+  if (typeof url !== 'string' || !url) {
+    return null
+  }
+
+  try {
+    const parsed = new URL(url)
+
+    if (parsed.searchParams.get('win') !== 'secondary') {
+      return null
+    }
+
+    const hash = parsed.hash.startsWith('#') ? parsed.hash.slice(1) : parsed.hash
+    const sessionId = decodeURIComponent(hash.replace(/^\/+/, '').split('/')[0] || '')
+
+    if (!sessionId) {
+      return null
+    }
+
+    return { sessionId, watch: parsed.searchParams.get('watch') === '1' }
+  } catch {
+    return null
+  }
+}
+
 // Full "instance" windows (⌘⇧N / the "New Window" command) open a complete app
 // peer, not a compact chat. Cascade each one off its source window's bounds so a
 // new window doesn't land exactly on top of the one it was spawned from. Pure so
@@ -164,6 +189,7 @@ export {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  parseSessionWindowUrl,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 }

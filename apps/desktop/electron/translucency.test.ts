@@ -24,6 +24,7 @@ import {
   glassSupportedOn,
   glassSurfaceKeep,
   hudFrostFor,
+  hydrateTranslucencyState,
   normalizeMaterial,
   normalizeMode,
   normalizeScope,
@@ -448,6 +449,16 @@ describe('normalizeState', () => {
       ...base,
       mode: 'clear'
     })
+  })
+})
+
+describe('hydrateTranslucencyState', () => {
+  it('prefers main seed so a remount does not bounce stale localStorage', () => {
+    const stale = glass(0)
+    const live = glass(60)
+
+    expect(hydrateTranslucencyState(live, stale, true)).toEqual(live)
+    expect(hydrateTranslucencyState(undefined, stale, true)).toEqual(stale)
   })
 })
 

@@ -213,6 +213,24 @@ export function normalizeState(payload: unknown, glassSupported: boolean): Trans
   }
 }
 
+/**
+ * A remounted renderer must prefer main's in-memory state over localStorage.
+ * Windows glass recreate destroys the old webContents before the 120ms
+ * persist debounce (and Electron `destroy()` may skip `pagehide`), so storage
+ * can still hold the pre-toggle value.
+ */
+export function hydrateTranslucencyState(
+  mainPayload: unknown,
+  stored: unknown,
+  glassSupported: boolean
+): TranslucencyState {
+  if (mainPayload && typeof mainPayload === 'object') {
+    return normalizeState(mainPayload, glassSupported)
+  }
+
+  return normalizeState(stored && typeof stored === 'object' ? stored : { intensity: stored }, glassSupported)
+}
+
 /** Lever percent → native window opacity, floored so it stays usable. */
 function opacityRamp(lever: number): number {
   const ratio = clampIntensity(lever) / TRANSLUCENCY_MAX
