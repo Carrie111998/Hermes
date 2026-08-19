@@ -137,9 +137,11 @@ def test_parity_token_memo():
         print(f"  n={n}: OK (equal across 3 iterations + compression + in-place edit + odd types)")
 
 
-def test_parity_persist_bounded_scan():
+def test_parity_persist_bounded_scan(monkeypatch):
     print("=== parity: _flush_messages_to_session_db bounded scan ===")
     import run_agent as ra
+
+    monkeypatch.setattr(ra.time, "time", lambda: 1_700_000_000.0)
 
     class FakeDB:
         def __init__(self):
@@ -268,8 +270,12 @@ def bench():
 
 
 if __name__ == "__main__":
+    class _MonkeyPatch:
+        def setattr(self, target, name, value, raising=True):
+            setattr(target, name, value)
+
     test_parity_sanitize_cursor()
     test_parity_token_memo()
-    test_parity_persist_bounded_scan()
+    test_parity_persist_bounded_scan(_MonkeyPatch())
     bench()
     print("ALL PARITY CHECKS PASSED")
