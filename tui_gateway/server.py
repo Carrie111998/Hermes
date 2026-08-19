@@ -7891,12 +7891,26 @@ def _message_text(msg: Any) -> str:
 def _is_current_turn_user_row(msg: Any, current_prompt: str | None) -> bool:
     if not isinstance(msg, dict) or msg.get("role") != "user":
         return False
+    if _is_compaction_summary_message(msg):
+        return False
     if not current_prompt:
-        return True
+        return False
     text = _message_text(msg)
-    if current_prompt == text or current_prompt in text or (text and text in current_prompt):
+    if text == current_prompt:
         return True
-    return isinstance(msg.get("content"), list)
+    if text.endswith(current_prompt) and (
+        len(text) == len(current_prompt) or text[-(len(current_prompt) + 1)] in "\n "
+    ):
+        return True
+    content = msg.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            part_text = str(part.get("text") or "")
+            if part_text == current_prompt or current_prompt in part_text.splitlines():
+                return True
+    return False
 
 
 def _append_turn_local_tail(live: list, turn_start: list, tail: list) -> list:

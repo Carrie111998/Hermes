@@ -445,6 +445,20 @@ def test_merge_interrupted_history_matrix():
     assert merged[-1]["content"] == "retry me"
     assert {"role": "assistant", "content": "partial stale"} not in merged
 
+    # Short prompt "no" must not match an unrelated user row containing those letters.
+    noisy = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "another note"},
+        {"role": "assistant", "content": "obsolete"},
+    ]
+    assert (
+        server._merge_interrupted_api_history(
+            live, noisy, turn_start_history=turn_start, current_prompt="no"
+        )
+        == live
+    )
+
     # Transformed current-turn user (context-reference / HUD note wrap).
     wrapped = [
         {"role": "user", "content": "a"},
