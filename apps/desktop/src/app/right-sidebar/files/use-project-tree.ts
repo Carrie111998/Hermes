@@ -473,6 +473,28 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
     void loadRoot(cwd, { connectionKey })
   }, [connectionKey, cwd])
 
+  // Re-arm after the store is reset out from under us. `resetProjectTreeState`
+  // fires on gateway boot / connection switch, and can land while a root read
+  // is in flight: the completion above is then correctly abandoned (the store
+  // no longer owns this cwd), but nothing starts a replacement. The effect
+  // above only depends on [connectionKey, cwd], neither of which a reset
+  // changes, and both self-heal effects below are gated on `state.cwd === cwd`
+  // -- the very condition the reset broke. The tree then reports
+  // `rootLoading: Boolean(cwd)` forever, which also disables the Refresh
+  // button, so there is no way back (#90229).
+  //
+  // Keyed on the CLEARED store (`cwd: ''`), not on any mismatch: the atom is
+  // global, so a mismatch against a different non-empty cwd means another
+  // consumer owns it, and re-claiming that would ping-pong. Converges because
+  // `loadRoot` writes its cwd into the store before its first await.
+  useEffect(() => {
+    if (!cwd || state.cwd !== '') {
+      return
+    }
+
+    void loadRoot(cwd)
+  }, [cwd, state.cwd, state.requestId])
+
   // Self-heal: an errored root re-probes every few seconds while the tree is
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the
   // timer; a success clears rootError and stops it.
