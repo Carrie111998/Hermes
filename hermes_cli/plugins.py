@@ -71,6 +71,7 @@ from hermes_cli.plugin_capabilities import (  # noqa: F401 — re-exported
 from hermes_cli.plugin_capabilities import (
     parse_declared_capabilities as _parse_declared_capabilities,
 )
+from hermes_cli.plugin_state_policy import IDENTITY_BOUND_STATE_MARKER
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -1330,6 +1331,21 @@ class PluginState:
     @property
     def quota_bytes(self) -> int:
         return _PLUGIN_STATE_QUOTA_BYTES
+
+    def declare_identity_bound(self) -> None:
+        """Keep this plugin's state namespace out of future ``--clone-all`` copies.
+
+        The declaration is durable and profile-scoped. Plugins should call it
+        before storing credentials or other state bound to this profile's
+        identity. Ordinary plugin state remains clonable by default.
+        """
+        from utils import atomic_write_text
+
+        atomic_write_text(
+            self.data_dir / IDENTITY_BOUND_STATE_MARKER,
+            "identity-bound-v1\n",
+            create_mode=0o600,
+        )
 
     @staticmethod
     def _validate_key(key: str) -> None:
