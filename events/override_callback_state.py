@@ -39,9 +39,25 @@ for this phase.
 
 from __future__ import annotations
 
+import time
 from typing import Dict, Optional
 
-# token -> {"provider", "model", "replacement_provider", "replacement_model"}
+# How long a recorded token stays actionable.
+#
+# Without a bound, a never-tapped alert stays fully tappable for as long as the
+# gateway lives, and a tap on a days-old alert writes a LIVE 6h override for an
+# episode that resolved long ago. `set_override` re-checks whether the TARGET is
+# currently limited, but nothing re-checks whether the ORIGINAL still is -- so a
+# stale tap is a silent, real reroute of healthy traffic.
+#
+# 12h comfortably outlives a genuine outage the operator might act on after a
+# night's sleep, while ensuring a forgotten button cannot act next week.
+# adapter.py::_notify_clarify_expired is the in-repo precedent for expiring a
+# stale prompt.
+_TOKEN_TTL_SECONDS = 12 * 60 * 60
+
+# token -> {"provider", "model", "replacement_provider", "replacement_model",
+#           "recorded_at"}
 _state: Dict[str, Dict[str, str]] = {}
 
 
@@ -66,11 +82,13 @@ def record(
     the overwrite is a harmless default for that hypothetical, not a
     mechanism anything currently relies on.
     """
+    _reap_expired()
     _state[str(token)] = {
         "provider": provider or "",
         "model": model or "",
         "replacement_provider": replacement_provider or "",
         "replacement_model": replacement_model or "",
+        "recorded_at": str(time.monotonic()),
     }
 
 
@@ -81,8 +99,38 @@ def pop(token: str) -> Optional[Dict[str, str]]:
     consumed by a prior tap -- the two cases are indistinguishable on
     purpose, and both must resolve to "already resolved, do nothing" at
     the call site.
+
+    A token older than ``_TOKEN_TTL_SECONDS`` is treated as never-recorded:
+    acting on a stale alert would write a live override for an episode that
+    has almost certainly resolved.
     """
-    return _state.pop(str(token), None)
+    _reap_expired()
+    entry = _state.pop(str(token), None)
+    if entry is None:
+        return None
+    if _is_expired(entry):
+        return None
+    return entry
+
+
+def _is_expired(entry: Dict[str, str]) -> bool:
+    """Whether a recorded entry has aged past the TTL.
+
+    An unparseable or missing ``recorded_at`` counts as EXPIRED rather than
+    fresh: a token we cannot date is one we cannot vouch for, and refusing it
+    costs one re-tap while honouring it could reroute live traffic.
+    """
+    try:
+        recorded_at = float(entry.get("recorded_at", ""))
+    except (TypeError, ValueError):
+        return True
+    return (time.monotonic() - recorded_at) >= _TOKEN_TTL_SECONDS
+
+
+def _reap_expired() -> None:
+    """Drop aged entries so the map cannot grow for the gateway's lifetime."""
+    for token in [t for t, e in _state.items() if _is_expired(e)]:
+        _state.pop(token, None)
 
 
 def reset() -> None:

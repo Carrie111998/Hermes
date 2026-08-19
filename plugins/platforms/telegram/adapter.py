@@ -6232,7 +6232,14 @@ class TelegramAdapter(BasePlatformAdapter):
                             SET_PERSIST_FAILURE_REASON,
                             set_override,
                         )
-                        ok, reason = set_override(
+                        # set_override does blocking disk I/O (_save_store ->
+                        # atomic_replace). This handler runs on the asyncio loop
+                        # that serves ALL Telegram traffic, so a slow or
+                        # contended write would stall every other chat. Offload
+                        # it, matching this file's existing idiom for blocking
+                        # work (see the ffprobe call sites).
+                        ok, reason = await asyncio.to_thread(
+                            set_override,
                             provider=target["provider"],
                             model=target["model"],
                             replacement_provider=target["replacement_provider"],

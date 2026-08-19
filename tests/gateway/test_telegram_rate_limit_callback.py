@@ -598,3 +598,58 @@ class TestRateLimitTransientPersistFailure:
         assert get_override("deepseek", "deepseek-v4-pro") is None
         query.edit_message_text.assert_called_once()
         assert query.edit_message_text.call_args[1]["reply_markup"] is None
+
+
+class TestCallbackTokenTTL:
+    """A never-tapped alert must not stay actionable forever.
+
+    Without a bound, a tap on a days-old alert writes a LIVE 6h override for an
+    episode that resolved long ago. `set_override` re-checks whether the TARGET
+    is currently limited, but nothing re-checks whether the ORIGINAL still is —
+    so a stale tap silently reroutes healthy traffic.
+    """
+
+    def _record(self, token="tok-ttl"):
+        from events import override_callback_state as st
+        st.record(token, provider="deepseek", model="deepseek-v4-pro",
+                  replacement_provider="openai-codex",
+                  replacement_model="gpt-5.6-sol")
+        return token
+
+    def test_a_fresh_token_is_still_usable(self):
+        from events import override_callback_state as st
+        st.reset()
+        t = self._record()
+        assert st.pop(t) is not None
+
+    def test_a_token_older_than_the_ttl_is_refused(self, monkeypatch):
+        from events import override_callback_state as st
+        st.reset()
+        t = self._record()
+        # Jump past the TTL rather than sleeping.
+        real = st.time.monotonic
+        monkeypatch.setattr(st.time, "monotonic",
+                            lambda: real() + st._TOKEN_TTL_SECONDS + 1)
+        assert st.pop(t) is None, "a stale token must not still divert traffic"
+
+    def test_an_undateable_entry_is_treated_as_expired(self):
+        """Fail closed: a token we cannot date is one we cannot vouch for."""
+        from events import override_callback_state as st
+        st.reset()
+        t = self._record()
+        st._state[t].pop("recorded_at", None)
+        assert st.pop(t) is None
+
+    def test_expired_entries_are_reaped_so_the_map_cannot_grow_unbounded(self, monkeypatch):
+        from events import override_callback_state as st
+        st.reset()
+        for i in range(5):
+            self._record(f"tok-{i}")
+        assert len(st._state) == 5
+        real = st.time.monotonic
+        monkeypatch.setattr(st.time, "monotonic",
+                            lambda: real() + st._TOKEN_TTL_SECONDS + 1)
+        self._record("tok-fresh")          # any record() reaps first
+        assert list(st._state) == ["tok-fresh"], (
+            "aged entries must be dropped, not accumulate for the gateway's life"
+        )
