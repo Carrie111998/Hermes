@@ -3487,6 +3487,41 @@ def _clear_session_context(tokens: list) -> None:
         pass
 
 
+@contextlib.contextmanager
+def _completion_session_scope(params: dict | None):
+    """Pin the calling session's cwd for the duration of a completion RPC.
+
+    Completion handlers (``commands.catalog``, ``complete.slash``) enumerate
+    skills, and the skill scan resolves PROJECT skills from the session's
+    working directory. Unlike prompt handlers, these never entered a session
+    context — they ran on the bare backend process, whose cwd is the install
+    tree on Desktop. So the `/` popover listed only global skills, and whichever
+    session scanned first also poisoned the process-wide skill cache for every
+    other session.
+
+    Pinning ``_SESSION_CWD`` (the same contextvar the prompt path sets) makes
+    the scan resolve THIS session's project. Cheap: contextvar set/reset, no
+    session lookup beyond the cwd the handler would resolve anyway.
+    """
+    token = None
+    try:
+        from agent.runtime_cwd import set_session_cwd
+
+        token = set_session_cwd(_completion_cwd(params))
+    except Exception:
+        token = None
+    try:
+        yield
+    finally:
+        if token is not None:
+            try:
+                from agent.runtime_cwd import _SESSION_CWD
+
+                _SESSION_CWD.reset(token)
+            except Exception:
+                pass
+
+
 def _enable_gateway_prompts() -> None:
     """Route approvals through gateway callbacks instead of CLI input()."""
     os.environ["HERMES_GATEWAY_SESSION"] = "1"
