@@ -85,6 +85,17 @@ CREATE TABLE IF NOT EXISTS project_meta (
     value  TEXT
 );
 
+-- Durable identity of the one resident conversation assigned to a project.
+-- The referenced session lives in the profile's state.db, so this intentionally
+-- cannot use a cross-database foreign key. Project deletion still cascades the
+-- binding because project_id is local to this database.
+CREATE TABLE IF NOT EXISTS project_agents (
+    project_id  TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    session_id  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
 -- Git repos found by scanning the filesystem (desktop "repo-first" discovery).
 -- Cached here so the overview is instant after the first scan instead of
 -- re-walking the disk every time the Projects view opens.
@@ -628,6 +639,48 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
     """Hard-delete a project and its folders (cascade)."""
     with write_txn(conn):
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Persistent project-agent binding
+# ---------------------------------------------------------------------------
+
+
+def get_agent_session_id(conn: sqlite3.Connection, project_id: str) -> Optional[str]:
+    """Return the durable resident-agent session assigned to ``project_id``."""
+    row = conn.execute(
+        "SELECT session_id FROM project_agents WHERE project_id = ?", (project_id,)
+    ).fetchone()
+    return str(row["session_id"]) if row else None
+
+
+def set_agent_session_id(
+    conn: sqlite3.Connection, project_id: str, session_id: str
+) -> None:
+    """Assign ``session_id`` as the project's sole resident conversation."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise ValueError("project agent session_id must not be empty")
+    if get_project(conn, project_id) is None:
+        raise ValueError(f"no such project: {project_id}")
+    now = _now()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_agents (project_id, session_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET "
+            "session_id = excluded.session_id, updated_at = excluded.updated_at",
+            (project_id, sid, now, now),
+        )
+
+
+def clear_agent_session_id(conn: sqlite3.Connection, project_id: str) -> bool:
+    """Drop a stale resident-agent binding without deleting its session."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM project_agents WHERE project_id = ?", (project_id,)
+        )
     return cur.rowcount > 0
 
 

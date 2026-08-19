@@ -20,6 +20,7 @@ import { $activeGatewayProfile, $profileScope, ALL_PROFILES, requestFreshSession
 import {
   $selectedStoredSessionId,
   $sessions,
+  requestSessionResume,
   sessionMatchesStoredId,
   setSessions,
   workspaceCwdForNewSession
@@ -195,6 +196,42 @@ export function goToProject(id: string, options?: { newSession?: boolean }): voi
     requestStartWorkSession(cwd, undefined, { openTab: true })
   } else {
     requestFreshSession()
+  }
+}
+
+interface ProjectAgentOpenPayload {
+  stored_session_id: string
+}
+
+// Open the project's durable resident conversation. The backend owns identity
+// and process lifetime; the renderer only requests the binding, then feeds its
+// stable session id through the normal resume pipeline so transcript, routing,
+// and live-session reconciliation remain centralized there.
+export async function openProjectAgent(id: string): Promise<void> {
+  setSidebarAgentsGrouped(true)
+  enterProject(id)
+
+  try {
+    const result = await gatewayRequest<ProjectAgentOpenPayload>('projects.agent.open', {
+      id,
+      omit_messages: true,
+      source: 'desktop'
+    })
+    markProjectsRpcSuccess()
+
+    if (!result.stored_session_id) {
+      throw new Error(translateNow('sidebar.projects.agentOpenFailed'))
+    }
+
+    requestSessionResume(result.stored_session_id)
+  } catch (err) {
+    notify({
+      kind: 'warning',
+      message:
+        isMissingRpcMethod(err) || !(err instanceof Error)
+          ? translateNow('sidebar.projects.agentOpenFailed')
+          : err.message
+    })
   }
 }
 

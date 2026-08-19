@@ -4,7 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
+import {
+  $currentCwd,
+  $selectedStoredSessionId,
+  $sessionResumeRequest,
+  $sessions,
+  applyConfiguredDefaultProjectDir
+} from '@/store/session'
 
 import {
   $activeProjectId,
@@ -21,6 +27,7 @@ import {
   endSessionMutation,
   enterProject,
   exitProjectScope,
+  openProjectAgent,
   openProjectCreate,
   pickProjectFolder,
   projectIdForCwd,
@@ -115,6 +122,45 @@ describe('project scope', () => {
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
     expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+  })
+
+  it('opens the backend-owned project agent through the normal resume pipeline', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.agent.open') {
+        return { stored_session_id: 'project-agent-session' }
+      }
+
+      return { active_id: 'p_123' }
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+    setSidebarAgentsGrouped(false)
+    $sessionResumeRequest.set(null)
+
+    await openProjectAgent('p_123')
+
+    expect(request).toHaveBeenCalledWith(
+      'projects.agent.open',
+      expect.objectContaining({ id: 'p_123', omit_messages: true, source: 'desktop' })
+    )
+    expect($projectScope.get()).toBe('p_123')
+    expect($sidebarAgentsGrouped.get()).toBe(true)
+    expect($sessionResumeRequest.get()?.sessionId).toBe('project-agent-session')
+  })
+
+  it('does not disable existing Projects when only the agent endpoint is missing', async () => {
+    activeGateway.mockReturnValue({
+      connectionState: 'open',
+      request: vi.fn().mockRejectedValue(new Error('unknown method: projects.agent.open'))
+    } as never)
+    $projectsRpcAvailable.set(true)
+
+    await openProjectAgent('p_123')
+
+    expect($projectsRpcAvailable.get()).toBe(true)
+    expect(notify).toHaveBeenCalledWith({
+      kind: 'warning',
+      message: 'sidebar.projects.agentOpenFailed'
+    })
   })
 })
 

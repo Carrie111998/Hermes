@@ -2094,6 +2094,7 @@ export const en: Translations = {
       menuAppearance: 'Appearance',
       noColor: 'No color',
       menuAddFolder: 'Add folder',
+      menuOpenAgent: 'Open project agent',
       menuSetActive: 'Set active',
       menuDelete: 'Delete',
       moveToProject: 'Move to project',
@@ -2105,6 +2106,7 @@ export const en: Translations = {
       copyPath: 'Copy path',
       removeFromSidebar: 'Hide from sidebar',
       createFailed: 'Could not create project',
+      agentOpenFailed: 'Could not open the project agent',
       staleBackend:
         'Update the Hermes backend to create projects — your backend is older than this desktop app (Settings → Updates → Backend).',
       deleteConfirm: 'This removes the saved project from Hermes. Files, git repos, and worktrees stay untouched.',

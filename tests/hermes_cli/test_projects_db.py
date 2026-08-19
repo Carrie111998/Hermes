@@ -55,6 +55,31 @@ def test_create_get_list(conn):
     assert len(pdb.list_projects(conn)) == 1
 
 
+def test_project_agent_binding_is_one_per_project_and_cascades(conn):
+    pid = pdb.create_project(conn, name="Resident", folders=["/tmp/resident"])
+
+    assert pdb.get_agent_session_id(conn, pid) is None
+
+    pdb.set_agent_session_id(conn, pid, "session-one")
+    assert pdb.get_agent_session_id(conn, pid) == "session-one"
+
+    # Reassigning replaces the sole binding rather than creating another row.
+    pdb.set_agent_session_id(conn, pid, "session-two")
+    assert pdb.get_agent_session_id(conn, pid) == "session-two"
+
+    pdb.delete_project(conn, pid)
+    assert pdb.get_agent_session_id(conn, pid) is None
+
+
+def test_project_agent_binding_can_be_cleared_without_deleting_project(conn):
+    pid = pdb.create_project(conn, name="Resident", folders=["/tmp/resident"])
+    pdb.set_agent_session_id(conn, pid, "session-one")
+
+    assert pdb.clear_agent_session_id(conn, pid) is True
+    assert pdb.clear_agent_session_id(conn, pid) is False
+    assert pdb.get_project(conn, pid) is not None
+
+
 
 
 

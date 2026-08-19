@@ -54,6 +54,7 @@ def test_methods_registered():
         "projects.set_primary",
         "projects.archive",
         "projects.set_active",
+        "projects.agent.open",
         "projects.for_cwd",
     ):
         assert m in server._methods
@@ -212,6 +213,105 @@ def test_create_list_roundtrip(tmp_path):
     listing = _call("projects.list")
     assert [p["slug"] for p in listing["projects"]] == ["demo"]
     assert listing["active_id"] == created["project"]["id"]
+
+
+def test_project_agent_open_reuses_live_runtime_and_is_not_reaped(monkeypatch, tmp_path):
+    project = _call(
+        "projects.create", {"name": "Resident", "folders": [str(tmp_path)]}
+    )["project"]
+    # Keep the test hermetic: session.create still registers the complete runtime
+    # record, but no provider/MCP build or background cap timer starts.
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    first = _call("projects.agent.open", {"id": project["id"], "source": "desktop"})
+    sid = first["session_id"]
+    stored = first["stored_session_id"]
+    session = server._sessions[sid]
+    marker_agent = object()
+    session["agent"] = marker_agent
+    session["agent_ready"].set()
+
+    try:
+        assert first["project_agent"] is True
+        assert first["resident_reused"] is False
+        assert session["project_agent_id"] == project["id"]
+        assert server._get_db().get_session(stored)["cwd"] == str(tmp_path)
+
+        # Simulate a desktop disconnect. Ordinary detached sessions are reaped;
+        # resident project agents remain addressable by their durable binding.
+        session["transport"] = server._detached_ws_transport
+        assert server._ws_session_is_orphaned(session) is False
+        # Resident agents still respect the global live-session memory cap;
+        # only ordinary disconnect/idle reapers are bypassed.
+        assert server._session_is_lru_evictable(sid, session) is True
+        assert server._session_is_evictable(sid, session, float("inf")) is False
+
+        second = _call("projects.agent.open", {"id": project["id"], "source": "desktop"})
+        assert second["session_id"] == sid
+        assert second["stored_session_id"] == stored
+        assert second["resident_reused"] is True
+        assert server._sessions[sid]["agent"] is marker_agent
+    finally:
+        server._close_session_by_id(sid, end_reason="test_cleanup")
+
+
+def test_project_agent_open_resumes_same_binding_after_runtime_teardown(monkeypatch, tmp_path):
+    project = _call(
+        "projects.create", {"name": "Restartable", "folders": [str(tmp_path)]}
+    )["project"]
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    first = _call("projects.agent.open", {"id": project["id"]})
+    server._sessions[first["session_id"]]["agent_ready"].set()
+    server._close_session_by_id(first["session_id"], end_reason="test_restart")
+
+    resumed = _call("projects.agent.open", {"id": project["id"]})
+    try:
+        assert resumed["session_id"] != first["session_id"]
+        assert resumed["stored_session_id"] == first["stored_session_id"]
+        assert resumed["resident_reused"] is True
+        assert server._sessions[resumed["session_id"]]["project_agent_id"] == project["id"]
+    finally:
+        server._close_session_by_id(resumed["session_id"], end_reason="test_cleanup")
+
+
+def test_project_agent_open_failure_discards_unbound_resident(monkeypatch, tmp_path):
+    project = _call(
+        "projects.create", {"name": "Unbound", "folders": [str(tmp_path)]}
+    )["project"]
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    before = set(server._sessions)
+
+    response = server._methods["projects.agent.open"](1, {"id": project["id"]})
+
+    assert response["error"]["message"] == "project agent session could not be persisted"
+    assert set(server._sessions) == before
+
+
+def test_delete_project_revokes_live_agent_residency(monkeypatch, tmp_path):
+    project = _call(
+        "projects.create", {"name": "Disposable", "folders": [str(tmp_path)]}
+    )["project"]
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    opened = _call("projects.agent.open", {"id": project["id"]})
+    sid = opened["session_id"]
+    session = server._sessions[sid]
+    session["agent_ready"].set()
+
+    try:
+        _call("projects.delete", {"id": project["id"]})
+        session["transport"] = server._detached_ws_transport
+
+        assert "project_agent_id" not in session
+        assert server._ws_session_is_orphaned(session) is True
+        assert server._session_is_evictable(sid, session, float("inf")) is True
+    finally:
+        server._close_session_by_id(sid, end_reason="test_cleanup")
 
 
 def test_add_folder_and_for_cwd(tmp_path):
