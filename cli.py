@@ -5105,9 +5105,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
         else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-        # Max turns priority: CLI arg > config file > env var > default
+        # Max turns priority: CLI arg > kanban keep-alive env (LS-2777) >
+        # config file > HERMES_MAX_ITERATIONS > default.
+        # HERMES_KANBAN_MAX_ITERATIONS must beat agent.max_turns so a
+        # granted +90 survives restart. HERMES_MAX_ITERATIONS still loses
+        # to config (historical); the kanban-specific env is the lock.
+        from hermes_cli.kanban_budget_keepalive import (
+            effective_kanban_max_iterations,
+        )
+
+        _kanban_iter = effective_kanban_max_iterations()
         if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
+        elif _kanban_iter is not None:
+            self.max_turns = _kanban_iter
         elif CLI_CONFIG["agent"].get("max_turns"):
             self.max_turns = CLI_CONFIG["agent"]["max_turns"]
         elif CLI_CONFIG.get("max_turns"):  # Backwards compat: root-level max_turns

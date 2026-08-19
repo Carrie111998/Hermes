@@ -1514,7 +1514,24 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Iteration-budget Remoko keep-alive (LS-2777). Board-local; not the
+-- LS-2776 objective tables. A burn parks here until one owner tap.
+CREATE TABLE IF NOT EXISTS kanban_budget_decisions (
+    task_id              TEXT PRIMARY KEY,
+    request_id           TEXT,
+    external_id          TEXT,
+    status               TEXT NOT NULL,
+    policy               TEXT,
+    extensions_count     INTEGER NOT NULL DEFAULT 0,
+    extra_turns          INTEGER NOT NULL DEFAULT 0,
+    last_budget_burn_at  INTEGER,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
+CREATE INDEX IF NOT EXISTS idx_budget_decisions_status
+    ON kanban_budget_decisions(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -2833,6 +2850,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
+
+    # LS-2777 keep-alive table. SCHEMA_SQL creates it on fresh DBs;
+    # CREATE TABLE IF NOT EXISTS here covers boards that opened before
+    # the table existed without forcing a full SCHEMA_SQL re-run.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_budget_decisions (
+            task_id              TEXT PRIMARY KEY,
+            request_id           TEXT,
+            external_id          TEXT,
+            status               TEXT NOT NULL,
+            policy               TEXT,
+            extensions_count     INTEGER NOT NULL DEFAULT 0,
+            extra_turns          INTEGER NOT NULL DEFAULT 0,
+            last_budget_burn_at  INTEGER,
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_budget_decisions_status "
+        "ON kanban_budget_decisions(status)"
+    )
 
     _rebuild_drifted_tables(conn)
 
@@ -9970,6 +10011,12 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    try:
+        from hermes_cli.kanban_budget_keepalive import reconcile_budget_keepalive
+
+        reconcile_budget_keepalive(conn)
+    except Exception:
+        _log.warning("kanban dispatch: budget keep-alive reconcile failed", exc_info=True)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -10215,6 +10262,19 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        try:
+            from hermes_cli.kanban_budget_keepalive import (
+                budget_decision_blocks_dispatch,
+            )
+
+            if budget_decision_blocks_dispatch(conn, row["id"]):
+                continue
+        except Exception:
+            _log.debug(
+                "kanban dispatch: budget keep-alive gate failed for %s",
+                row["id"],
+                exc_info=True,
+            )
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -10829,6 +10889,23 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    try:
+        from hermes_cli.kanban_budget_keepalive import (
+            extra_turns_for_task,
+            worker_max_iterations_value,
+        )
+
+        extra = extra_turns_for_task(task.id)
+        env["HERMES_KANBAN_MAX_ITERATIONS"] = str(
+            worker_max_iterations_value(extra, hermes_home=env.get("HERMES_HOME"))
+        )
+    except Exception:
+        _log.debug(
+            "kanban worker: could not resolve HERMES_KANBAN_MAX_ITERATIONS for %s",
+            task.id,
+            exc_info=True,
+        )
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
