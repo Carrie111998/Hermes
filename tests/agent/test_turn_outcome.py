@@ -200,6 +200,69 @@ def test_down_only_blocks_eval_blaming_unverified_sibling(turn_env):
     assert get_record("unverified_sibling").get("recent_outcomes") == []
 
 
+def test_low_confidence_eval_blame_never_lands_false(turn_env):
+    """The misattribution guard: judge-only blame below the confidence floor
+    must never land a hard False on a used skill.
+
+    Two unverified skills ran and the work failed; the judge — working from a
+    summary, not real diffs — names the wrong one at low confidence. The named
+    skill is recorded NEUTRAL (a suspicion carrying the judge's reason), never
+    a False; the unnamed skill records nothing. A coincidental name cannot
+    corrupt either skill's outcome history.
+    """
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record
+
+    da = _write_plain_skill(turn_env / "skills", "real_cause")
+    db = _write_plain_skill(turn_env / "skills", "coincidence")
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"real_cause": da, "coincidence": db},
+        outcome_config={"enabled": True},
+        _aux_eval=_eval(
+            task_succeeded=False,
+            confidence=0.4,
+            failure_points=["coincidence"],  # wrong name, low confidence
+            reason="the deployed change was wrong",
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is False
+    # Not confidently attributable — nobody is blamed.
+    assert outcome.failure_points == []
+    # The coincidentally-named skill records NEUTRAL, not False, and carries
+    # the judge's reason for curator review.
+    assert get_record("coincidence")["recent_outcomes"] == [None]
+    assert get_record("coincidence")["recent_outcome_reasons"] == [
+        "the deployed change was wrong"
+    ]
+    assert get_record("real_cause").get("recent_outcomes") == []
+    assert get_record("coincidence").get("needs_review") is not True
+
+
+def test_confident_eval_blame_still_lands_false(turn_env):
+    """At or above the confidence floor, judge-only blame is a hard False."""
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record
+
+    d = _write_plain_skill(turn_env / "skills", "sure")
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"sure": d},
+        outcome_config={"enabled": True},
+        _aux_eval=_eval(
+            task_succeeded=False,
+            confidence=0.9,
+            failure_points=["sure"],
+            reason="confident it broke",
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is False
+    assert outcome.failure_points == ["sure"]
+    assert get_record("sure")["recent_outcomes"] == [False]
+
+
 def test_pass_is_not_success_when_eval_flags_semantics(turn_env):
     """Verifier PASS never confirms success; the eval's semantic fail is recorded.
 

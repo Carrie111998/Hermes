@@ -107,6 +107,12 @@ def _first_balanced_json_object(text: str) -> Optional[str]:
 # strong per-skill evidence regardless of the eval.
 _PASS_CONFIDENCE_THRESHOLD = 0.6
 
+# Judge-only blame lands a hard False only at or above this confidence. The
+# judge attributes from a summarized account (no diffs / tool state), so below
+# the floor a blamed skill is recorded NEUTRAL — a suspicion for curator
+# review, never a failure that could corrupt the outcome window.
+_BLAME_CONFIDENCE_THRESHOLD = 0.7
+
 
 @dataclass
 class TurnOutcome:
@@ -479,15 +485,34 @@ def evaluate_turn_outcome(
         # never touched. Mechanical points are already used-skills-only.
         used_names = {name for name, _d in skill_dirs}
         eval_blamed = [p for p in eval_points if p in used_names]
+
+        # Confidence gate on judge-only blame. The judge attributes from a
+        # summarized account (no diffs / tool state), so a low-confidence blame
+        # on a skill with no mechanical result is a suspicion, not evidence:
+        # recording it as a hard False would let a coincidental name corrupt
+        # that skill's outcome history. Below the floor, judge blame is
+        # downgraded — an unverified suspect is recorded NEUTRAL, a
+        # mechanically-passed suspect keeps its PASS — with the judge's reason
+        # preserved either way so curator review can still weigh it. Mechanical
+        # FAILs stay down-only: this gate never softens a verifier FAIL (and
+        # never runs when one exists — eval_points is cleared above).
+        if not has_mechanical_fail and confidence < _BLAME_CONFIDENCE_THRESHOLD:
+            soft_blamed = eval_blamed
+            eval_blamed = []
+        else:
+            soft_blamed = []
+
         failure_points = list(dict.fromkeys(mechanical_points + eval_blamed))
-        _blamed_set = set(failure_points)
+        _blamed_set = set(failure_points) | set(soft_blamed)
 
         # An eval-blamed skill that ALSO mechanically PASSed gets the fail, not
         # the pass: a verifier checks one narrow thing (e.g. a commit-message
         # prefix), and the judge's semantic read (e.g. "the wrong change was
         # committed") can be right even when the narrow check passed. Never
-        # double-record one skill twice in the same turn.
-        _suppressed_pass = set(eval_blamed)
+        # double-record one skill twice in the same turn. Downgraded (soft)
+        # judge blame suppresses the pass the same way — the suspect gets its
+        # own record in the soft-blame loop below.
+        _suppressed_pass = set(eval_blamed) | set(soft_blamed)
         effective_pass = [n for n in pass_names if n not in _suppressed_pass]
         _pass_set = set(effective_pass)
 
@@ -508,6 +533,19 @@ def evaluate_turn_outcome(
         # wash out their failure history.
         for n in effective_pass:
             _record(n, True, skill_dir=dir_by_name.get(n))
+
+        # Downgraded judge blame: an unverified suspect is NEUTRAL — a sample
+        # that never claims pass or fail — while a mechanically-passed suspect
+        # keeps its PASS (a verifier is per-skill evidence). The judge's reason
+        # rides along in both cases so curator review can weigh the suspicion
+        # without the sidecar claiming the skill failed.
+        for s in soft_blamed:
+            _record(
+                s,
+                True if s in pass_names else None,
+                eval_reason,
+                skill_dir=dir_by_name.get(s),
+            )
 
         # On a confident eval success, skills that merely ran unverified get a
         # NEUTRAL outcome: a sample that keeps the recovery window sliding but
