@@ -1411,6 +1411,11 @@ def _(rid, params: dict) -> dict:
     action = params.get("action", "status")
 
     if action == "status":
+        from hermes_cli.browser_connect import get_browser_connect_override
+
+        mode, override_url = get_browser_connect_override()
+        if mode == "camofox":
+            return _ok(rid, {"connected": True, "url": override_url, "backend": "camofox"})
         url = _resolve_browser_cdp_url()
         return _ok(rid, {"connected": bool(url), "url": url})
 

@@ -15580,6 +15580,106 @@ def test_browser_manage_disconnect_drops_env_and_cleans(monkeypatch):
     assert cleanup_count["n"] == 2
 
 
+def _camofox_urlopen(url, timeout=2.0):
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            if str(url).endswith("/health"):
+                return json.dumps({"ok": True}).encode()
+            raise OSError("not cdp")
+
+    if str(url).endswith("/json/version"):
+        raise OSError("not cdp")
+    return _Resp()
+
+
+def test_browser_manage_connect_autodetects_camofox(monkeypatch):
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    monkeypatch.delenv("CAMOFOX_URL", raising=False)
+    monkeypatch.delenv("BROWSER_CONNECT_MODE", raising=False)
+    monkeypatch.delenv("BROWSER_PREV_CAMOFOX_URL", raising=False)
+    monkeypatch.delenv("BROWSER_PREV_CAMOFOX_SET", raising=False)
+    fake = types.SimpleNamespace(
+        cleanup_all_browsers=lambda: None,
+        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
+    )
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", _camofox_urlopen)
+    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "browser.manage",
+                "params": {"action": "connect", "url": "localhost:9377"},
+            }
+        )
+
+    assert resp["result"]["connected"] is True
+    assert resp["result"]["url"] == "http://localhost:9377"
+    assert resp["result"]["backend"] == "camofox"
+    assert os.environ.get("CAMOFOX_URL") == "http://localhost:9377"
+    assert os.environ.get("BROWSER_CONNECT_MODE") == "camofox"
+    assert "BROWSER_CDP_URL" not in os.environ
+
+
+def test_browser_manage_status_reports_camofox_override(monkeypatch):
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.setenv("BROWSER_CONNECT_MODE", "camofox")
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "browser.manage", "params": {"action": "status"}}
+    )
+
+    assert resp["result"] == {
+        "connected": True,
+        "url": "http://localhost:9377",
+        "backend": "camofox",
+    }
+
+
+def test_browser_manage_connect_disconnect_preserves_identical_camofox_url(monkeypatch):
+    """Connecting to the already configured Camofox URL must restore it."""
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    monkeypatch.delenv("BROWSER_CONNECT_MODE", raising=False)
+    monkeypatch.delenv("BROWSER_PREV_CAMOFOX_URL", raising=False)
+    monkeypatch.delenv("BROWSER_PREV_CAMOFOX_SET", raising=False)
+    fake = types.SimpleNamespace(
+        cleanup_all_browsers=lambda: None,
+        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
+    )
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", _camofox_urlopen)
+    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
+        connect = server.handle_request(
+            {
+                "id": "1",
+                "method": "browser.manage",
+                "params": {"action": "connect", "url": "http://localhost:9377"},
+            }
+        )
+        assert connect["result"]["backend"] == "camofox"
+        assert os.environ.get("CAMOFOX_URL") == "http://localhost:9377"
+
+        disconnect = server.handle_request(
+            {"id": "2", "method": "browser.manage", "params": {"action": "disconnect"}}
+        )
+
+    assert disconnect["result"] == {"connected": False}
+    assert os.environ.get("CAMOFOX_URL") == "http://localhost:9377"
+    assert "BROWSER_CONNECT_MODE" not in os.environ
+
+
 # ── config.get indicator normalization ───────────────────────────────
 
 

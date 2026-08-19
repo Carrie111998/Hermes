@@ -1,7 +1,13 @@
-"""Shared helpers for attaching Hermes to a local Chromium-family CDP port."""
+"""Shared helpers for attaching Hermes to a local browser backend.
+
+Covers Chromium-family CDP launch/discovery and Camofox autodetection used
+by both the classic CLI ``/browser connect`` path and TUI/Desktop
+``browser.manage``.
+"""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
@@ -11,6 +17,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 
@@ -19,6 +26,157 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BROWSER_CDP_PORT = 9222
 DEFAULT_BROWSER_CDP_URL = f"http://127.0.0.1:{DEFAULT_BROWSER_CDP_PORT}"
+
+# In-process /browser connect override. Camofox snapshots must survive a
+# connect to the already-configured URL so disconnect can restore it.
+BROWSER_CONNECT_MODE_ENV = "BROWSER_CONNECT_MODE"
+BROWSER_PREV_CAMOFOX_URL_ENV = "BROWSER_PREV_CAMOFOX_URL"
+BROWSER_PREV_CAMOFOX_SET_ENV = "BROWSER_PREV_CAMOFOX_SET"
+
+
+def normalize_browser_connect_endpoint(endpoint: str) -> str:
+    """Normalize user-supplied ``/browser connect`` endpoints.
+
+    Schemeless ``host:port`` inputs become ``http://host:port``. Trailing
+    slashes are stripped so later ``/json/version`` and ``/health`` probes
+    do not double up path separators.
+    """
+    raw = (endpoint or "").strip().rstrip("/")
+    if not raw:
+        return raw
+    if "://" in raw:
+        return raw
+    return f"http://{raw}"
+
+
+def _http_json(url: str, timeout: float) -> dict | None:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            if not (200 <= getattr(resp, "status", 200) < 300):
+                return None
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def detect_browser_connect_backend(
+    endpoint: str, *, timeout: float = 2.0
+) -> tuple[str, str]:
+    """Classify a ``/browser connect`` target as ``cdp``, ``camofox``, or ``unknown``.
+
+    CDP is probed first (``/json/version`` ``webSocketDebuggerUrl``) so a
+    Chromium-family browser is never mistaken for Camofox. Camofox is the
+    fallback when that probe fails and ``/health`` returns HTTP 200.
+    """
+    raw = normalize_browser_connect_endpoint(endpoint)
+    if not raw:
+        return "unknown", raw
+
+    parsed = urlparse(raw)
+    if parsed.path.startswith("/devtools/browser/"):
+        return "cdp", raw
+
+    discovery_url = raw
+    if parsed.scheme in {"ws", "wss"}:
+        # Bare ``ws://host:port`` can still be a discovery root. A concrete
+        # DevTools websocket already returned above.
+        if parsed.path and parsed.path != "/":
+            return "cdp", raw
+        discovery_url = raw.replace("wss://", "https://", 1).replace("ws://", "http://", 1)
+
+    version_url = (
+        discovery_url
+        if discovery_url.lower().endswith("/json/version")
+        else f"{discovery_url.rstrip('/')}/json/version"
+    )
+    version = _http_json(version_url, timeout)
+    if str((version or {}).get("webSocketDebuggerUrl") or "").strip():
+        return "cdp", raw
+
+    health_root = discovery_url
+    if health_root.lower().endswith("/json/version"):
+        health_root = health_root[: -len("/json/version")]
+    # Require a JSON object so a generic HTTP 200 (or a CDP probe stub that
+    # only exposes ``status``) is not treated as Camofox.
+    health = _http_json(f"{health_root.rstrip('/')}/health", timeout)
+    if health is not None:
+        return "camofox", raw
+
+    return "unknown", raw
+
+
+def _snapshot_camofox_url() -> None:
+    """Remember the exact current ``CAMOFOX_URL`` env state, including identity."""
+    if "CAMOFOX_URL" in os.environ:
+        os.environ[BROWSER_PREV_CAMOFOX_URL_ENV] = os.environ["CAMOFOX_URL"]
+        os.environ[BROWSER_PREV_CAMOFOX_SET_ENV] = "1"
+        return
+    os.environ.pop(BROWSER_PREV_CAMOFOX_URL_ENV, None)
+    os.environ.pop(BROWSER_PREV_CAMOFOX_SET_ENV, None)
+
+
+def _restore_camofox_url() -> None:
+    """Restore the snapshotted ``CAMOFOX_URL``, or unset it when none existed."""
+    was_set = os.environ.pop(BROWSER_PREV_CAMOFOX_SET_ENV, "")
+    previous = os.environ.pop(BROWSER_PREV_CAMOFOX_URL_ENV, "")
+    if was_set:
+        os.environ["CAMOFOX_URL"] = previous
+        return
+    os.environ.pop("CAMOFOX_URL", None)
+
+
+def apply_browser_backend_override(*, mode: str, url: str) -> None:
+    """Publish a reversible ``/browser connect`` backend override.
+
+    Camofox connects always snapshot the prior ``CAMOFOX_URL`` — even when
+    the new URL is identical — so disconnect can restore that exact state.
+    CDP connects leave ``CAMOFOX_URL`` in place; ``BROWSER_CDP_URL`` already
+    suppresses Camofox routing.
+    """
+    normalized = (url or "").strip().rstrip("/")
+    if mode == "camofox":
+        _snapshot_camofox_url()
+        os.environ["CAMOFOX_URL"] = normalized
+        os.environ[BROWSER_CONNECT_MODE_ENV] = "camofox"
+        os.environ.pop("BROWSER_CDP_URL", None)
+        return
+
+    os.environ["BROWSER_CDP_URL"] = url
+    os.environ[BROWSER_CONNECT_MODE_ENV] = "cdp"
+
+
+def restore_browser_backend_override() -> str:
+    """Clear the connect override and restore any snapshotted Camofox env.
+
+    Returns the mode that was active (``cdp``, ``camofox``, or ``""``).
+    """
+    mode = os.environ.pop(BROWSER_CONNECT_MODE_ENV, "").strip().lower()
+    os.environ.pop("BROWSER_CDP_URL", None)
+    if mode == "camofox" or BROWSER_PREV_CAMOFOX_SET_ENV in os.environ:
+        _restore_camofox_url()
+    else:
+        os.environ.pop(BROWSER_PREV_CAMOFOX_URL_ENV, None)
+        os.environ.pop(BROWSER_PREV_CAMOFOX_SET_ENV, None)
+    return mode
+
+
+def get_browser_connect_override() -> tuple[str, str]:
+    """Return ``(mode, url)`` for the active in-process connect override.
+
+    Does no network I/O. An empty mode means no ``/browser connect`` override
+    is active (configured ``CAMOFOX_URL`` / ``browser.cdp_url`` may still apply).
+    """
+    mode = os.environ.get(BROWSER_CONNECT_MODE_ENV, "").strip().lower()
+    if mode == "camofox":
+        return "camofox", os.environ.get("CAMOFOX_URL", "").strip().rstrip("/")
+    cdp = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if cdp or mode == "cdp":
+        return "cdp", cdp
+    return "", ""
+
 
 _DARWIN_APPS = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",

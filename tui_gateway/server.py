@@ -15320,7 +15320,11 @@ def _failure_messages(url: str, port: int, system: str) -> list[str]:
 def _browser_connect(rid, params: dict) -> dict:
     import platform
 
-    from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL
+    from hermes_cli.browser_connect import (
+        DEFAULT_BROWSER_CDP_URL,
+        apply_browser_backend_override,
+        detect_browser_connect_backend,
+    )
     from tools.browser_tool import cleanup_all_browsers
     from urllib.parse import urlparse
 
@@ -15359,6 +15363,24 @@ def _browser_connect(rid, params: dict) -> dict:
         url = DEFAULT_BROWSER_CDP_URL
         parsed = urlparse(url)
         port = parsed.port or 9222
+
+    detected_mode, detected_url = detect_browser_connect_backend(url)
+    if detected_mode == "camofox":
+        try:
+            cleanup_all_browsers()
+            apply_browser_backend_override(mode="camofox", url=detected_url)
+            cleanup_all_browsers()
+        except Exception as e:
+            return _err(rid, 5031, str(e))
+        announce(f"Camofox detected at {detected_url}")
+        payload: dict[str, object] = {
+            "connected": True,
+            "url": detected_url,
+            "backend": "camofox",
+        }
+        if messages:
+            payload["messages"] = messages
+        return _ok(rid, payload)
 
     try:
         # ws[s]://.../devtools/browser/<id> endpoints (hosted CDP
@@ -15449,7 +15471,7 @@ def _browser_connect(rid, params: dict) -> dict:
         # then again AFTER so the default task's cached supervisor
         # is drained against the new URL.
         cleanup_all_browsers()
-        os.environ["BROWSER_CDP_URL"] = normalized
+        apply_browser_backend_override(mode="cdp", url=normalized)
         cleanup_all_browsers()
     except Exception as e:
         return _err(rid, 5031, str(e))
@@ -15471,8 +15493,10 @@ def _browser_disconnect(rid) -> dict:
         except Exception:
             pass
 
+    from hermes_cli.browser_connect import restore_browser_backend_override
+
     reap()
-    os.environ.pop("BROWSER_CDP_URL", None)
+    restore_browser_backend_override()
     reap()
     return _ok(rid, {"connected": False})
 
