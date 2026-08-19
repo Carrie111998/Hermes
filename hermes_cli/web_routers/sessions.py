@@ -328,9 +328,27 @@ async def search_sessions(
                 sources=source_list or None,
                 exclude_sources=exclude_list or None,
             ):
-            sid, payload = _lineage_row_payload(row)
-            if sid:
-                add_lineage_result(sid, payload)
+                sid = row.get("id")
+                preview = (row.get("preview") or "").strip()
+                snippet = preview or f"Session ID: {sid}"
+                add_lineage_result(
+                    sid,
+                    {
+                        "snippet": snippet,
+                        "role": None,
+                        "source": row.get("source"),
+                        "model": row.get("model"),
+                        "session_started": row.get("started_at"),
+                    },
+                )
+
+            # Whole-store metadata discovery through the shared listing seam
+            # (list_sessions_rich): title / logical id / gateway display_name
+            # matched at the state layer (compression-chain aware), so a
+            # session whose STORED TITLE matches the query but whose message
+            # body does not still surfaces here. Over-fetch so lineage dedup
+            # can still surface `limit` distinct conversations.
+            if len(seen) < safe_limit:
                 meta_rows = db.list_sessions_rich(
                     source=source_filter,
                     sources=source_list or None,
