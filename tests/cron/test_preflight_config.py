@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import cron.jobs as cron_jobs
 from cron.scheduler import run_job
 import cron.scheduler as sched
+from gateway.config import Platform
 
 
 _RUNTIME = {
@@ -340,3 +341,50 @@ class TestDeliveryPlatform:
 
         assert success is True
         assert agent_constructed is True
+
+    def test_live_multiplex_adapter_reaches_preflight(self, tmp_path):
+        """Gateway-fired profile cron accepts its shared live Telegram adapter."""
+        job = _job(deliver="telegram:123456789")
+        gateway_config = MagicMock()
+        gateway_config.get_connected_platforms.return_value = []
+        gateway_config.platforms = {}
+        fake_db = MagicMock()
+        live_adapter = object()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_deliver(_job, _content, adapters=None, loop=None):
+            assert adapters == {Platform.TELEGRAM: live_adapter}
+            assert loop is gateway_loop
+            return None
+
+        gateway_loop = loop
+
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            fresh = cron_jobs.load_jobs()[0]
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state.SessionDB", return_value=fake_db), \
+                 patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+                 patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                       return_value=dict(_RUNTIME)), \
+                 patch("gateway.config.load_gateway_config",
+                       return_value=gateway_config), \
+                 patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
+                 patch("run_agent.AIAgent") as mock_agent_cls:
+                mock_agent_cls.return_value.run_conversation.return_value = {
+                    "final_response": "ok"
+                }
+                assert sched.run_one_job(
+                    fresh,
+                    adapters={Platform.TELEGRAM: live_adapter},
+                    loop=gateway_loop,
+                ) is True
+
+            stored = cron_jobs.load_jobs()[0]
+
+        assert mock_agent_cls.called is True
+        assert stored["last_status"] == "ok"

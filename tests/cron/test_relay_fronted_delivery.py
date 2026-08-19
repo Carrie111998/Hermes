@@ -174,3 +174,42 @@ class TestRelayDeliveryGate:
         result = self._run({}, config)
         assert result is not None
         assert "not configured/enabled" in result
+
+
+class TestNativeMultiplexDeliveryGate:
+    def test_shared_live_native_adapter_bypasses_profile_local_config(self):
+        """A running gateway adapter can deliver for a credential-less profile."""
+        adapter = AsyncMock()
+        adapter.send.return_value = {"success": True, "raw_response": None}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        config = MagicMock()
+        config.platforms = {}
+        config.get_home_channel.return_value = None
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            try:
+                future.set_result(asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "multiplex-native",
+            "name": "Multiplex Native",
+            "deliver": "telegram:123456789",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config",
+                   return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                "Inbox update.",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send.assert_awaited_once()

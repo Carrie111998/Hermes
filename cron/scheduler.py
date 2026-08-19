@@ -2662,7 +2662,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         from gateway.delivery import resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        live_loop_ready = (
+            loop is not None
+            and getattr(loop, "is_running", lambda: False)()
+        )
+        transport = resolve_delivery_transport(
+            platform,
+            config,
+            adapters,
+            allow_live_native_if_disabled=live_loop_ready,
+        )
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -2683,7 +2692,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             if pconfig is None:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(enabled=True)
-        elif not pconfig or not pconfig.enabled:
+        elif (not pconfig or not pconfig.enabled) and not (
+            runtime_adapter is not None and live_loop_ready
+        ):
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
@@ -2701,8 +2712,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # standalone path — which cannot seed the flat session (r3609147550).
         live_adapter_ready = (
             runtime_adapter is not None
-            and loop is not None
-            and getattr(loop, "is_running", lambda: False)()
+            and live_loop_ready
         )
         delivered = False
         target_errors = []
@@ -2883,7 +2893,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(
+                        config,
+                        adapters,
+                        allow_live_native_if_disabled=True,
+                    )
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -4315,7 +4329,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _preflight_check_delivery(job: dict, *, adapters=None, loop=None) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
     ``local``/``origin`` (and the ``all`` routing token) need no gateway
@@ -4323,9 +4337,9 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     gateway-config load. For concrete platform targets, an unknown platform
     always blocks; a known platform additionally blocks when the gateway
     config is loadable and reports it unconnected (enabled + credentials —
-    the same source `cron_delivery_targets` uses). Gateway-config load
-    failures fail OPEN so a transient config hiccup never wedges delivery
-    that would have worked.
+    the same source `cron_delivery_targets` uses) and no supplied live adapter
+    can deliver it. Gateway-config load failures fail OPEN so a transient
+    config hiccup never wedges delivery that would have worked.
     """
     deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
     platform_parts: list[str] = []
@@ -4354,6 +4368,27 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                     p.value for p in gateway_config.get_connected_platforms()
                 }
                 connected |= _relay_fronted_delivery_platforms(connected)
+                live_adapter_ready = (
+                    adapters
+                    and loop is not None
+                    and getattr(loop, "is_running", lambda: False)()
+                )
+                if live_adapter_ready:
+                    from gateway.config import Platform
+                    from gateway.delivery import resolve_delivery_transport
+
+                    for candidate in platform_parts:
+                        try:
+                            platform = Platform(candidate.lower())
+                        except (ValueError, KeyError):
+                            continue
+                        if resolve_delivery_transport(
+                            platform,
+                            gateway_config,
+                            adapters,
+                            allow_live_native_if_disabled=True,
+                        ) is not None:
+                            connected.add(platform.value)
             except Exception:
                 logger.debug(
                     "preflight: gateway config unavailable — skipping "
@@ -4425,7 +4460,9 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(
+    job: dict, cfg: dict, *, adapters=None, loop=None
+) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -4444,7 +4481,10 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        (
+            "delivery",
+            lambda: _preflight_check_delivery(job, adapters=adapters, loop=loop),
+        ),
     ):
         try:
             reason = check()
@@ -4588,6 +4628,8 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    adapters=None,
+    loop=None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5262,7 +5304,9 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(
+                    job, _cfg, adapters=adapters, loop=loop
+                )
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -6290,12 +6334,18 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _adapter_kwargs = {}
+        if adapters is not None:
+            _adapter_kwargs["adapters"] = adapters
+        if loop is not None:
+            _adapter_kwargs["loop"] = loop
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
                     job,
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
+                    **_adapter_kwargs,
                 )
             else:
                 success, output, final_response, error = run_job(
@@ -6303,6 +6353,7 @@ def _run_one_job_body(
                     defer_agent_teardown=_deferred_agents,
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
+                    **_adapter_kwargs,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear

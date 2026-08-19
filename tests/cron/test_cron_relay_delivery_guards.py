@@ -26,6 +26,7 @@ from cron.scheduler import (
     _resolve_single_delivery_target,
     cron_delivery_targets,
 )
+from gateway.config import Platform
 
 
 def _slack_home(monkeypatch, chat_id="D0BJTDCSR7C", thread_id=None):
@@ -146,3 +147,43 @@ class TestPreflightRelayFronted:
             ids = {t["id"] for t in cron_delivery_targets()}
         assert "slack" in ids
         assert "telegram" not in ids
+
+
+class TestPreflightLiveAdapter:
+    def test_profile_without_credential_accepts_shared_live_adapter(self):
+        """A multiplexed profile may deliver through the gateway's live adapter."""
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        with patch("gateway.config.load_gateway_config",
+                   return_value=_gateway_config(set())):
+            assert _preflight_check_delivery(
+                {"deliver": "telegram:123456789"},
+                adapters={Platform.TELEGRAM: object()},
+                loop=loop,
+            ) is None
+
+    def test_live_adapter_without_running_loop_stays_blocked(self):
+        """An adapter map alone cannot prove fire-time delivery is usable."""
+        with patch("gateway.config.load_gateway_config",
+                   return_value=_gateway_config(set())):
+            reason = _preflight_check_delivery(
+                {"deliver": "telegram:123456789"},
+                adapters={Platform.TELEGRAM: object()},
+                loop=None,
+            )
+        assert reason is not None
+        assert "telegram" in reason
+
+    def test_live_adapter_with_stopped_loop_stays_blocked(self):
+        """A present but stopped gateway loop is not a usable live transport."""
+        loop = MagicMock()
+        loop.is_running.return_value = False
+        with patch("gateway.config.load_gateway_config",
+                   return_value=_gateway_config(set())):
+            reason = _preflight_check_delivery(
+                {"deliver": "telegram:123456789"},
+                adapters={Platform.TELEGRAM: object()},
+                loop=loop,
+            )
+        assert reason is not None
+        assert "telegram" in reason
