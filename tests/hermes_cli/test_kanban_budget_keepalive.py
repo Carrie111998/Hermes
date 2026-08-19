@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -498,3 +499,142 @@ def test_blocking_decision_skips_dispatch(kanban_home):
 
 def test_pytest_default_client_does_not_send():
     assert isinstance(keepalive.default_remoko_client(), keepalive.NullRemokoClient)
+
+
+def test_reconcile_consumes_answered_sidecar(kanban_home):
+    client = keepalive.RecordingRemokoClient()
+    subject = "child-sidecar-90"
+    keepalive.save_sidecar(
+        keepalive.BudgetDecision(
+            task_id=subject,
+            request_id="req-sidecar-90",
+            external_id="obj-child-sidecar-90-budget-1",
+            status=keepalive.STATUS_PENDING,
+            extra_turns=0,
+            store="sidecar",
+        )
+    )
+    client.answers["req-sidecar-90"] = "Give 90 more"
+    conn = kb.connect()
+    try:
+        result = keepalive.reconcile_budget_keepalive(conn, remoko_client=client)
+        assert result["sidecar_consumed"] == 1
+        assert result["sidecar_retried"] == 0
+        assert result["consumed"] == 0
+    finally:
+        conn.close()
+    refreshed = keepalive.load_sidecar(subject)
+    assert refreshed is not None
+    assert refreshed.extra_turns == 90
+    assert refreshed.status == "granted"
+    assert client.get_calls
+    assert client.get_calls[0]["request_id"] == "req-sidecar-90"
+
+
+def test_overlapping_kanban_burns_send_one_remoko(kanban_home):
+    conn = kb.connect()
+    try:
+        task = _running_task(conn)
+        tid = task.id
+    finally:
+        conn.close()
+
+    in_ask = threading.Event()
+    release_send = threading.Event()
+
+    class SlowClient(keepalive.RecordingRemokoClient):
+        def ask_question(self, **kwargs):
+            in_ask.set()
+            assert release_send.wait(timeout=5)
+            return super().ask_question(**kwargs)
+
+    client = SlowClient()
+    first_result: list[keepalive.BudgetDecision] = []
+    errors: list[BaseException] = []
+
+    def first_burn():
+        c = kb.connect()
+        try:
+            first_result.append(
+                keepalive.record_kanban_budget_exhausted(
+                    c, tid, budget_used=90, budget_max=90, remoko_client=client
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            c.close()
+
+    worker = threading.Thread(target=first_burn)
+    worker.start()
+    assert in_ask.wait(timeout=5)
+
+    c2 = kb.connect()
+    try:
+        second = keepalive.record_kanban_budget_exhausted(
+            c2, tid, budget_used=90, budget_max=90, remoko_client=client
+        )
+    finally:
+        c2.close()
+
+    release_send.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(client.ask_calls) == 1
+    assert first_result[0].request_id == "req-budget-1"
+    assert second.status == "pending"
+    conn = kb.connect()
+    try:
+        live = keepalive.get_decision(conn, tid)
+        assert live is not None
+        assert live.request_id == "req-budget-1"
+        assert live.status == "pending"
+        assert live.external_id == f"obj-{tid}-budget-1"
+    finally:
+        conn.close()
+
+
+def test_overlapping_sidecar_burns_send_one_remoko(kanban_home):
+    in_ask = threading.Event()
+    release_send = threading.Event()
+
+    class SlowClient(keepalive.RecordingRemokoClient):
+        def ask_question(self, **kwargs):
+            in_ask.set()
+            assert release_send.wait(timeout=5)
+            return super().ask_question(**kwargs)
+
+    client = SlowClient()
+    subject = "child-race-1"
+    first_result: list[keepalive.BudgetDecision] = []
+    errors: list[BaseException] = []
+
+    def first_burn():
+        try:
+            first_result.append(
+                keepalive.record_sidecar_budget_exhausted(
+                    subject, budget_used=50, budget_max=50, remoko_client=client
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=first_burn)
+    worker.start()
+    assert in_ask.wait(timeout=5)
+    second = keepalive.record_sidecar_budget_exhausted(
+        subject, budget_used=50, budget_max=50, remoko_client=client
+    )
+    release_send.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(client.ask_calls) == 1
+    assert first_result[0].request_id == "req-budget-1"
+    assert second.status == "pending"
+    live = keepalive.load_sidecar(subject)
+    assert live is not None
+    assert live.request_id == "req-budget-1"
+    assert live.status == "pending"
+    assert live.external_id == "obj-child-race-1-budget-1"
