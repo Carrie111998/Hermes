@@ -5120,19 +5120,24 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
+    def test_write_path_merges_fts_on_cadence(self, db, monkeypatch):
         """Writes periodically merge FTS segments so they never accumulate
         into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
+        starve competing writers ("database is locked").
+
+        The cadence must drive the BOUNDED merge; see
+        ``test_write_path_fts_maintenance_does_not_rewrite_whole_index`` for
+        why it must not drive a full 'optimize'.
+        """
+        db._FTS_MERGE_EVERY_N_WRITES = 5
         calls = {"n": 0}
-        real_optimize = db.optimize_fts
+        real_merge = db.merge_fts
 
-        def _counting_optimize():
+        def _counting_merge():
             calls["n"] += 1
-            return real_optimize()
+            return real_merge()
 
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
+        monkeypatch.setattr(db, "merge_fts", _counting_merge)
         # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
         db.create_session(session_id="s1", source="cli")
         for i in range(9):
@@ -5141,18 +5146,101 @@ class TestOptimizeFts:
         # The auto-merge is layout-only: search is unaffected.
         assert len(db.search_messages("needle")) == 9
 
-    def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """A failing periodic optimize must not fail the surrounding write."""
-        db._OPTIMIZE_EVERY_N_WRITES = 2
+    def test_write_path_merge_failure_never_breaks_write(self, db, monkeypatch):
+        """A failing periodic merge must not fail the surrounding write."""
+        db._FTS_MERGE_EVERY_N_WRITES = 2
 
         def _boom():
-            raise sqlite3.OperationalError("simulated optimize failure")
+            raise sqlite3.OperationalError("simulated merge failure")
 
-        monkeypatch.setattr(db, "optimize_fts", _boom)
+        monkeypatch.setattr(db, "merge_fts", _boom)
         db.create_session(session_id="s1", source="cli")  # write #1
         # write #2 trips the cadence; the swallowed failure must not propagate.
         db.append_message(session_id="s1", role="user", content="still persists")
         assert len(db.get_messages("s1")) == 1
+
+
+    def _fts_leaf_ids(self, db, tbl="messages_fts_data"):
+        """Row ids of the FTS segment leaf pages currently on disk.
+
+        FTS5 encodes the owning segment in the high bits of the shadow-table
+        rowid (``id = segid<<37 | pgno``), so a leaf that survives a merge
+        keeps its id and one that is rewritten into a new segment gets a new
+        one. Ids <= 100 are the structure/averages records, not leaves.
+        """
+        with db._lock:
+            return {
+                row[0]
+                for row in db._conn.execute(f"SELECT id FROM {tbl} WHERE id > 100")
+            }
+
+    def test_merge_preserves_search_and_snippet(self, db):
+        """Bounded merge is layout-only: MATCH results + snippets unchanged.
+
+        The mirror of ``test_optimize_preserves_search_and_snippet`` for the
+        command that now runs on the write path.
+        """
+        db._FTS_MERGE_EVERY_N_WRITES = 10**9  # only merge when we say so
+        db.create_session(session_id="s1", source="cli")
+        # Kept under search_messages()'s default result limit so the
+        # comparison covers every indexed row.
+        for i in range(20):
+            db.append_message(
+                session_id="s1",
+                role="user",
+                content=f"needle alpha bravo charlie message {i}",
+            )
+        before = db.search_messages("needle")
+        assert len(before) == 20, "fixture must produce hits to compare"
+
+        assert db.merge_fts() >= 1
+
+        after = db.search_messages("needle")
+        assert [r["id"] for r in after] == [r["id"] for r in before]
+        assert [r["snippet"] for r in after] == [r["snippet"] for r in before]
+        assert all(row.get("snippet") for row in after)
+
+    def test_write_path_fts_maintenance_does_not_rewrite_whole_index(self, db):
+        """Write-path FTS maintenance must do BOUNDED work.
+
+        FTS5's 'optimize' collapses the ENTIRE index into one new segment, so
+        every leaf page is rewritten under a new segid -- cost O(total index
+        size) every time it fires. It never reaches its cheap "already
+        merged" path here either, because the very writes that trip the
+        cadence create fresh segments first, so nSeg > 1 always holds.
+
+        Measured on the live session bridge 2026-08-18: 68% of process wall
+        time re-merging a 468 MB index at ~25 MB/s sustained, restarting
+        every ~9s indefinitely. The hot path must instead do a bounded merge
+        that leaves the bulk of existing segments untouched.
+        """
+        db._FTS_MERGE_EVERY_N_WRITES = 10**9  # no maintenance while seeding
+        db.create_session(session_id="s1", source="cli")
+        # Distinct tokens per message -- an FTS index is sized by its term
+        # vocabulary, so repeated words would collapse into a handful of
+        # leaves and leave nothing to measure.
+        for i in range(300):
+            body = " ".join(f"needle{i}x{j} alpha{i}y{j}" for j in range(60))
+            db.append_message(session_id="s1", role="user", content=body)
+
+        before = self._fts_leaf_ids(db)
+        assert len(before) > 20, (
+            f"need a multi-page index to measure against, got {len(before)}"
+        )
+
+        # Arrange for the next write to trip the maintenance cadence exactly.
+        db._FTS_MERGE_EVERY_N_WRITES = 1
+        db._write_count = 0
+        db.append_message(session_id="s1", role="user", content="needle trigger")
+
+        after = self._fts_leaf_ids(db)
+        retained = len(before & after) / len(before)
+        assert retained > 0.5, (
+            f"write-path maintenance rewrote {(1 - retained):.0%} of the FTS "
+            f"index ({len(before)} leaf pages before, {len(before & after)} "
+            "retained) -- that is a full 'optimize', whose cost scales with "
+            "total index size, not with the amount of new data"
+        )
 
 
 class TestAutoMaintenance:

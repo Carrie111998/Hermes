@@ -2382,10 +2382,21 @@ class SessionDB:
     # and every insert pays a growing automerge cost — which lengthens the
     # write-lock hold time and starves competing writers (gateway + cron
     # processes share one state.db), surfacing as "database is locked".
-    # 'optimize' is a no-op once the index is already merged, so an idle DB
-    # pays almost nothing; the cadence is deliberately coarse so the one-off
-    # merge cost is amortised far below the checkpoint cadence.
-    _OPTIMIZE_EVERY_N_WRITES = 1000
+    #
+    # This MUST be the bounded 'merge' command, never 'optimize'. 'optimize'
+    # collapses the whole index into a single segment, so it costs O(total
+    # index size) on every run — and the comment this replaced claimed it was
+    # "a no-op once the index is already merged", which is never true on the
+    # write path: the very writes that trip the cadence create fresh segments
+    # first, so nSeg > 1 always holds when it fires. That made every firing a
+    # full rebuild. Measured on the live session bridge 2026-08-18: a 3.3 GB
+    # state.db with a 468 MB index spent 68% of process wall time re-merging
+    # it at ~25 MB/s, restarting roughly every 9s indefinitely. A full
+    # 'optimize' still runs, but only from vacuum() in offline maintenance.
+    _FTS_MERGE_EVERY_N_WRITES = 1000
+    # Page budget for one bounded merge. FTS5 stops after writing about this
+    # many pages, so the hot-path cost is capped regardless of index size.
+    _FTS_MERGE_PAGES = 16
     # Session imports intentionally use a lower cap than exports: import holds
     # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
     # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
@@ -2742,8 +2753,8 @@ class SessionDB:
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
-                if self._write_count % self._OPTIMIZE_EVERY_N_WRITES == 0:
-                    self._try_optimize_fts()
+                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                    self._try_merge_fts()
                 return result
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
@@ -2919,19 +2930,22 @@ class SessionDB:
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
-    def _try_optimize_fts(self) -> None:
-        """Best-effort FTS5 segment merge. Never raises.
+    def _try_merge_fts(self) -> None:
+        """Best-effort BOUNDED FTS5 segment merge. Never raises.
 
-        Runs on the ``_OPTIMIZE_EVERY_N_WRITES`` cadence from the write hot
-        path (off the lock — ``optimize_fts`` re-acquires ``self._lock``
-        itself, mirroring ``_try_wal_checkpoint``). ``read_only`` connections
-        never reach the write path, so this is implicitly skipped for them.
-        Once the index is merged the 'optimize' command is close to free, so
-        the steady-state cost is negligible; the expensive case is only the
-        first merge of a long-neglected index.
+        Runs on the ``_FTS_MERGE_EVERY_N_WRITES`` cadence from the write hot
+        path (off the lock — ``merge_fts`` re-acquires ``self._lock`` itself,
+        mirroring ``_try_wal_checkpoint``). ``read_only`` connections never
+        reach the write path, so this is implicitly skipped for them.
+
+        Deliberately ``merge_fts`` and not ``optimize_fts``: the bounded
+        command does at most ``_FTS_MERGE_PAGES`` pages of work per firing,
+        so the hot-path cost is constant instead of scaling with the total
+        index size. See ``_FTS_MERGE_EVERY_N_WRITES`` for what the unbounded
+        version cost in production.
         """
         try:
-            self.optimize_fts()
+            self.merge_fts()
         except Exception:
             pass  # Best effort — never fatal.
 
@@ -10139,6 +10153,42 @@ class SessionDB:
             return True
         except sqlite3.OperationalError:
             return False
+
+    def merge_fts(self, pages: int | None = None) -> int:
+        """Do a BOUNDED amount of FTS5 segment merging.
+
+        Unlike :meth:`optimize_fts`, which rewrites every segment into one
+        and therefore costs O(total index size), the ``'merge'`` command
+        stops after roughly *pages* pages have been written. That makes it
+        safe to call repeatedly from the write path: the cost is capped no
+        matter how large the index has grown, while segments are still kept
+        from accumulating into the tens of thousands that slow every MATCH
+        and lengthen the write-lock hold.
+
+        Partial progress is the point — each call advances the merge a
+        little, and FTS5 resumes where it left off on the next call.
+
+        Skips any FTS table that does not exist, so it is safe to call
+        unconditionally. Returns the number of FTS indexes it merged into.
+        """
+        budget = self._FTS_MERGE_PAGES if pages is None else pages
+        merged = 0
+        with self._lock:
+            for tbl in self._FTS_TABLES:
+                if not self._fts_table_exists(tbl):
+                    continue
+                try:
+                    # 'merge' takes its page budget through the `rank`
+                    # column — the plain ``VALUES('merge')`` form of the
+                    # other FTS5 commands does not apply here.
+                    self._conn.execute(
+                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
+                        (budget,),
+                    )
+                    merged += 1
+                except sqlite3.OperationalError as exc:
+                    logger.warning("FTS merge failed for %s: %s", tbl, exc)
+        return merged
 
     def optimize_fts(self) -> int:
         """Merge fragmented FTS5 b-tree segments into one per index.
