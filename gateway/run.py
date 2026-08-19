@@ -2543,6 +2543,7 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.smart_lobby import GatewaySmartLobbyMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -6544,7 +6545,12 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+    GatewaySmartLobbyMixin,
+):
     """
     Main gateway controller.
 
@@ -17003,6 +17009,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # NOTE: self._pending_messages was write-only (never consumed).
             # The actual interrupt message is delivered via adapter._pending_messages
             # which is read by _run_agent. Removed to prevent unbounded growth.
+            return None
+
+        # Optional Discord smart lobby. Authorization, emergency-stop, pending
+        # prompt/approval handling, and busy-session controls have already run;
+        # only a fresh ordinary user turn can be consumed here. The target
+        # profile's own adapter creates the thread and re-enters the normal
+        # adapter pipeline, preserving that profile's auth/session/tool scope.
+        if not is_internal and await self._maybe_route_smart_lobby(event):
             return None
 
         # Check for commands
