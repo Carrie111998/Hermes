@@ -75,6 +75,37 @@ providers:
     )
 
 
+def test_full_constructor_and_rebuild_keep_authenticated_loopback_custom_ollama_headers(
+    tmp_path, monkeypatch
+):
+    base_url = "http://127.0.0.2:11434/v1"
+    _write_ollama_header_config(tmp_path, base_url=base_url)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("run_agent.OpenAI", MagicMock(return_value=MagicMock()))
+
+    agent = AIAgent(
+        api_key="synthetic-authenticated-local-proxy-key",
+        base_url=base_url,
+        provider="custom",
+        requested_provider="custom:ollama",
+        api_mode="chat_completions",
+        model="authenticated-local-model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    expected_headers = {
+        "Authorization": "model-default-header-sentinel",
+        "X-Model-Token": "model-extra-header-sentinel",
+        "X-Provider-Token": "provider-header-sentinel",
+    }
+    assert agent.api_key == "synthetic-authenticated-local-proxy-key"
+    assert agent._client_kwargs["default_headers"] == expected_headers
+    agent._apply_client_headers_for_base_url(base_url)
+    assert agent._client_kwargs["default_headers"] == expected_headers
+
+
 @pytest.mark.parametrize(
     ("provider", "requested_provider"),
     [("custom", "ollama"), ("ollama", None)],

@@ -6,6 +6,34 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import runtime_provider as rp
+from hermes_cli.config import set_config_value
+from utils import atomic_yaml_write
+
+
+def _write_v0204_ollama_provider(
+    monkeypatch, tmp_path, *, base_url, key_env
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv(key_env, "synthetic-env-value")
+    atomic_yaml_write(
+        tmp_path / "config.yaml",
+        {
+            "providers": {
+                "ollama": {
+                    "api_key": "synthetic-inline-value",
+                    "key_env": key_env,
+                    "key_cmd": "synthetic-command-never-run",
+                    "extra_headers": {
+                        "Authorization": "synthetic-provider-header",
+                    },
+                    "extra_body": {"gateway_token": "synthetic-body-value"},
+                    "default_model": "unit3-local-model",
+                }
+            }
+        },
+        sort_keys=False,
+    )
+    set_config_value("providers.ollama.base_url", base_url)
 
 
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
@@ -178,6 +206,105 @@ providers:
 
     assert resolved["api_key"] == "remote-credential-sentinel"
     assert resolved["extra_headers"] == {"Authorization": "remote-header-sentinel"}
+
+
+def test_named_loopback_ollama_does_not_build_key_cmd_token_provider(
+    tmp_path, monkeypatch
+):
+    """Exact named local Ollama suppresses the evolved key_cmd source."""
+    base_url = "http://127.0.0.2:11434/v1"
+    _write_v0204_ollama_provider(
+        monkeypatch,
+        tmp_path,
+        base_url=base_url,
+        key_env="UNIT3_LOCAL_OLLAMA_KEY",
+    )
+    command_calls = []
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *_a, **_k: None)
+
+    def build(command, provider_name):
+        command_calls.append((command, provider_name))
+
+        def token_provider():
+            return "synthetic-command-value"
+
+        return token_provider
+
+    monkeypatch.setattr("agent.command_token_source.build_command_token_provider", build)
+
+    resolved = rp.resolve_runtime_provider(requested="ollama")
+
+    assert resolved["base_url"] == base_url
+    assert resolved["api_key"] == "no-key-required"
+    assert "extra_headers" not in resolved
+    assert "request_overrides" not in resolved
+    assert command_calls == []
+
+
+def test_loopback_custom_ollama_preserves_key_cmd_headers_and_body(
+    tmp_path, monkeypatch
+):
+    """custom:ollama remains an authenticated custom-provider route."""
+    base_url = "http://127.0.0.2:11434/v1"
+    _write_v0204_ollama_provider(
+        monkeypatch,
+        tmp_path,
+        base_url=base_url,
+        key_env="UNIT3_CUSTOM_OLLAMA_KEY",
+    )
+
+    def marker():
+        return "synthetic-command-value"
+
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "agent.command_token_source.build_command_token_provider",
+        lambda *_a, **_k: marker,
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:ollama")
+
+    assert resolved["base_url"] == base_url
+    assert resolved["api_key"] is marker
+    assert resolved["extra_headers"] == {
+        "Authorization": "synthetic-provider-header"
+    }
+    assert resolved["request_overrides"] == {
+        "extra_body": {"gateway_token": "synthetic-body-value"}
+    }
+
+
+def test_named_remote_ollama_preserves_key_cmd_headers_and_body(
+    tmp_path, monkeypatch
+):
+    """Remote named Ollama retains key_cmd and request overrides."""
+    base_url = "https://ollama.remote.example/v1"
+    _write_v0204_ollama_provider(
+        monkeypatch,
+        tmp_path,
+        base_url=base_url,
+        key_env="UNIT3_REMOTE_OLLAMA_KEY",
+    )
+
+    def marker():
+        return "synthetic-command-value"
+
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "agent.command_token_source.build_command_token_provider",
+        lambda *_a, **_k: marker,
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="ollama")
+
+    assert resolved["base_url"] == base_url
+    assert resolved["api_key"] is marker
+    assert resolved["extra_headers"] == {
+        "Authorization": "synthetic-provider-header"
+    }
+    assert resolved["request_overrides"] == {
+        "extra_body": {"gateway_token": "synthetic-body-value"}
+    }
 
 
 def _fake_invoke_jwt(ttl_seconds=3600):
