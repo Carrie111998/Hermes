@@ -739,6 +739,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    incognito = bool(session.get("incognito"))
     history_ready = session.get("resume_history_ready")
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
@@ -767,7 +768,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # failure). Markers persist the genuinely-unflushed tail without duplicating
     # durable rows (including a resumed-but-not-run session's already-in-DB
     # transcript, which stays in ``session["history"]`` only).
-    if agent is not None and hasattr(agent, "_persist_session"):
+    if not incognito and agent is not None and hasattr(agent, "_persist_session"):
         snapshot = getattr(agent, "_session_messages", None)
         if snapshot:
             try:
@@ -781,7 +782,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # persist state, or close connections before the gateway exits.
     # Mirrors cli.py's atexit handler that fires the same hook when
     # the user Ctrl‑C's mid‑turn.
-    if agent is not None:
+    if not incognito and agent is not None:
         try:
             from hermes_cli.lifecycle import invoke_hook
 
@@ -797,7 +798,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         except Exception:
             pass
 
-    if agent is not None and history and hasattr(agent, "commit_memory_session"):
+    if not incognito and agent is not None and history and hasattr(agent, "commit_memory_session"):
         try:
             agent.commit_memory_session(history)
         except Exception:
@@ -805,14 +806,15 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
-    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
+    if not incognito:
+        _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
     # session_key may be stale (the ended parent) while session_id is the live
     # continuation. Fix for #20001.
     _tui_owns_lifecycle = True
-    if session_id:
+    if not incognito and session_id:
         try:
             # End the row in the *session's* profile state.db (app-global
             # remote mode), not the launch profile's shared handle.
@@ -1779,6 +1781,7 @@ def _compute_host_turn_frame(
         **({"display_kind": display_kind} if display_kind else {}),
         "history": history,
         "history_version": history_version,
+        "incognito": bool(session.get("incognito")),
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
         "profile_home": session.get("profile_home") or "",
@@ -2918,6 +2921,8 @@ def _ensure_session_db_row(session: dict) -> None:
       the session with no cwd AND no git_repo_root, so the sidebar could never
       place it under its project.
     """
+    if session.get("incognito"):
+        return
     key = session.get("session_key")
     if not key:
         return
@@ -3045,6 +3050,8 @@ def _persist_branch_seed(session: dict) -> None:
     branch row would resume missing its pre-branch context. Runs once; the row +
     parent link are written by ``_ensure_session_db_row`` just before this.
     """
+    if session.get("incognito"):
+        return
     if not session.get("parent_session_id") or session.get("_branch_seed_persisted"):
         return
     key = session.get("session_key")
@@ -7035,6 +7042,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    incognito: bool | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -7044,6 +7052,9 @@ def _init_session(
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
+            "incognito": bool(
+                incognito if incognito is not None else getattr(agent, "incognito", False)
+            ),
             "inflight_turn": None,
             "created_at": now,
             "last_active": now,
@@ -7071,6 +7082,11 @@ def _init_session(
             "transport": current_transport() or _stdio_transport,
         }
     _init_owns_db = False
+    if incognito is None:
+        incognito = bool(getattr(agent, "incognito", False))
+    if incognito:
+        _register_session_cwd(_sessions[sid])
+        return
     if session_db is not None:
         db = session_db
     elif profile_home:

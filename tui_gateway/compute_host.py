@@ -548,6 +548,7 @@ class ComputeHost:
         profile_home = str(frame.get("profile_home") or "")
         session_db = None
         owns_db = False
+        incognito = bool(frame.get("incognito"))
         home_token = None
         secret_token = None
         try:
@@ -563,8 +564,9 @@ class ComputeHost:
                 # server._sessions[sid] (via _init_session, or the fallback dict
                 # in the except below), so the agent is the right owner; a
                 # _make_agent that RAISES is the one path where nothing takes it.
-                session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-                owns_db = True
+                if not incognito:
+                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    owns_db = True
             agent = server._make_agent(
                 sid,
                 key,
@@ -604,6 +606,7 @@ class ComputeHost:
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    incognito=incognito,
                 )
             finally:
                 reset_transport(token)
@@ -621,6 +624,7 @@ class ComputeHost:
                 "created_at": time.time(),
                 "last_active": time.time(),
                 "running": False,
+                "incognito": incognito,
                 "attached_images": [],
                 "image_counter": 0,
                 "cwd": str(frame.get("cwd") or os.getcwd()),

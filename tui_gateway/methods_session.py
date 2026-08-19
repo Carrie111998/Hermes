@@ -89,6 +89,7 @@ def _(rid, params: dict) -> dict:
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
+            "incognito": is_truthy_value(os.environ.get("HERMES_INCOGNITO")),
             "image_counter": 0,
             "cwd": resolved_cwd,
             "inflight_turn": None,
