@@ -144,6 +144,14 @@ ALLOWED_CATEGORIES = {
     "chrome-profile", "cron-output", "other",
 }
 
+_DURABLE_RUNTIME_TOP_LEVEL = frozenset({
+    # Authored runtime/control-plane trees. The post-tool hook sees paths from
+    # patch/terminal results, not whether a file was newly created; a name such
+    # as scripts/test_guard.py must therefore never make it disposable.
+    "scripts", "hooks", "bin", "guardrails", "services", "state",
+    "kanban", "workspace", "platforms", "gateway", "control-room",
+})
+
 _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "logs", "memories", "sessions", "cron", "cronjobs",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
@@ -151,7 +159,7 @@ _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     # User-authored project trees — never sweep empty directories
     # inside these (#75403).
     "patches", "projects", "skins", "themes", "contributors",
-})
+}) | _DURABLE_RUNTIME_TOP_LEVEL
 
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
     ".git", "node_modules", "venv", ".venv",
@@ -586,7 +594,7 @@ def guess_category(path: Path) -> Optional[str]:
             # tmp_* (#75403, also #32164, #37721).
             "patches", "projects", "skins", "themes", "contributors",
             "profiles", "backups", "optional-skills",
-        }:
+        } | _DURABLE_RUNTIME_TOP_LEVEL:
             return None
         if top == "cron" or top == "cronjobs":
             # Only files under the disposable ``output/`` subtree are

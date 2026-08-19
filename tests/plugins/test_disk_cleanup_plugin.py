@@ -115,6 +115,27 @@ class TestGuessCategory:
         # Even though it matches test_* pattern, logs/ is excluded.
         assert dg.guess_category(p) is None
 
+    @pytest.mark.parametrize(
+        "top",
+        [
+            "scripts", "hooks", "bin", "guardrails", "services", "state",
+            "kanban", "workspace", "platforms", "gateway", "control-room",
+        ],
+    )
+    def test_skips_durable_runtime_trees(self, _isolate_env, top):
+        """Regression: edited, versioned test guards under scripts/ were deleted.
+
+        The cleanup hook sees paths from patch/terminal results, not whether a file was
+        newly created. Durable runtime trees must therefore never be auto-categorised
+        solely because a filename starts with ``test_`` or ``tmp_``.
+        """
+        dg = _load_lib()
+        durable = _isolate_env / top
+        durable.mkdir()
+        p = durable / "test_durable_guard.py"
+        p.write_text("assert True")
+        assert dg.guess_category(p) is None
+
     def test_cron_subtree_categorised(self, _isolate_env):
         dg = _load_lib()
         # Only files under ``cron/output/`` are disposable run artifacts.
@@ -223,6 +244,38 @@ class TestStaleCronEntryMigration:
         summary = dg.quick()
         assert summary["deleted"] == 1, "valid old cron-output should be deleted"
         assert not run_md.exists()
+
+
+class TestDurableRuntimeTreeMigration:
+    def test_quick_does_not_delete_stale_test_entry_under_scripts(self, _isolate_env):
+        """A stale tracker entry must not delete an authored regression test."""
+        dg = _load_lib()
+        scripts = _isolate_env / "scripts"
+        scripts.mkdir()
+        guard = scripts / "test_cron_failure_watch.py"
+        guard.write_text("assert True")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(guard),
+            "category": "test",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "size": guard.stat().st_size,
+        }]))
+
+        summary = dg.quick()
+        assert summary["deleted"] == 0
+        assert guard.exists(), "durable scripts/test_*.py must never be deleted"
+        assert json.loads(tracked_file.read_text()) == []
+
+    def test_quick_preserves_empty_directories_under_scripts(self, _isolate_env):
+        dg = _load_lib()
+        placeholder = _isolate_env / "scripts" / "health"
+        placeholder.mkdir(parents=True)
+
+        summary = dg.quick()
+        assert summary["empty_dirs"] == 0
+        assert placeholder.exists()
 
 
 class TestTrackForgetQuick:
