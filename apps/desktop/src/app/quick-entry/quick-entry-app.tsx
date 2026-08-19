@@ -34,11 +34,6 @@ export function QuickEntryApp() {
   // (hand the payload to the shell, ask to hide) and stores the next state, so
   // the decision stays pure and testable while the effects stay in one place.
   const [state, dispatch] = useReducer((current: QuickComposerState, event: QuickComposerEvent) => {
-    if (event.type === 'target') {
-      // Remember the picker choice so the next summon opens on the same target.
-      persistQuickEntryTarget(event.target)
-    }
-
     const { send, state: next } = quickComposerReducer(current, event)
     const api = window.hermesDesktop?.quickEntry
 
@@ -172,7 +167,14 @@ export function QuickEntryApp() {
             aria-label="Target session"
             disabled={!state.connected}
             id="quick-entry-target"
-            onChange={event => dispatch({ target: event.target.value, type: 'target' })}
+            onChange={event => {
+              const target = event.target.value
+              // Persist the picker choice in the event handler (not the reducer
+              // body) so the reducer stays pure and replayable; the next summon
+              // opens on the same target.
+              persistQuickEntryTarget(target)
+              dispatch({ target, type: 'target' })
+            }}
             onKeyDown={event => {
               if (event.key === 'Escape') {
                 event.preventDefault()
