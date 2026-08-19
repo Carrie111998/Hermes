@@ -46,8 +46,10 @@ import queue
 import re
 import sys
 import threading
+import time
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -546,8 +548,19 @@ def _serialized_replacement(method):
     """Make snapshot → write → lease attachment one atomic transaction."""
     @wraps(method)
     def wrapped(*args, **kwargs):
-        with replacement_coordinator.transaction():
-            return method(*args, **kwargs)
+        owner = args[0]
+        manager = getattr(owner, "_manager", owner)
+        lock = getattr(manager, "_discovery_lock", nullcontext())
+        with lock:
+            if getattr(manager, "_diagnostic_inspection_closed", False):
+                return None
+            if (
+                getattr(manager, "_diagnostic_registry_binding", None) is not None
+                and method.__name__ not in {"register_tool", "register_platform"}
+            ):
+                return None
+            with replacement_coordinator.transaction():
+                return method(*args, **kwargs)
 
     return wrapped
 
@@ -567,6 +580,19 @@ def _env_enabled(name: str) -> bool:
     return env_var_enabled(name)
 
 
+def _load_plugin_config() -> dict:
+    """Use the side-effect-free config snapshot during tool inspection."""
+    from hermes_cli.config import load_config, load_config_for_diagnostics
+    from tools.registry import is_read_only_tool_inspection
+
+    loader = (
+        load_config_for_diagnostics
+        if is_read_only_tool_inspection()
+        else load_config
+    )
+    return loader()
+
+
 def _get_disabled_plugins() -> set:
     """Read the disabled plugins list from config.yaml.
 
@@ -575,8 +601,7 @@ def _get_disabled_plugins() -> set:
     ``plugins.enabled``.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        config = _load_plugin_config()
         disabled = cfg_get(config, "plugins", "disabled", default=[])
         return set(disabled) if isinstance(disabled, list) else set()
     except Exception:
@@ -598,8 +623,7 @@ def _get_enabled_plugins() -> Optional[set]:
     * ``set(...)`` — the concrete allow-list.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        config = _load_plugin_config()
         plugins_cfg = config.get("plugins")
         if not isinstance(plugins_cfg, dict):
             return None
@@ -1360,12 +1384,16 @@ class PluginState:
     def get(self, key: str, default: Any = None) -> Any:
         """Read a JSON value, returning *default* when the key is absent."""
         self._validate_key(key)
+        if os.environ.get("HERMES_TOOLS_DIAGNOSE_READ_ONLY") == "1":
+            return self._read_unlocked().get(key, default)
         with _locked_plugin_state(self.path):
             return self._read_unlocked().get(key, default)
 
     def set(self, key: str, value: Any) -> None:
         """Atomically set one JSON value without dropping concurrent updates."""
         self._validate_key(key)
+        if os.environ.get("HERMES_TOOLS_DIAGNOSE_READ_ONLY") == "1":
+            return
         with _locked_plugin_state(self.path):
             data = self._read_unlocked()
             data[key] = value
@@ -1456,6 +1484,8 @@ class PluginContext:
                 "Rejected config path %r from plugin %s", key, self.plugin_id
             )
             raise
+        if self._manager._diagnostic_registry_binding is not None:
+            return
         from hermes_cli import config as config_mod
 
         if config_mod.is_managed():
@@ -1734,11 +1764,36 @@ class PluginContext:
                 f"in config.yaml to allow this plugin to replace built-in tools."
             )
 
-        from tools.registry import registry
+        from tools.registry import (
+            bind_read_only_tool_inspection_to_current_thread,
+            registry,
+        )
+
+        diagnostic_registry_binding = getattr(
+            self._manager,
+            "_diagnostic_registry_binding",
+            None,
+        )
+        if diagnostic_registry_binding is not None:
+            bind_read_only_tool_inspection_to_current_thread(
+                diagnostic_registry_binding
+            )
+        elif _diagnostic_thread_fallback() is not None:
+            bind_read_only_tool_inspection_to_current_thread()
 
         scope = self._manager.scope_key
         previous = registry.snapshot_registration(name, scope=scope)
         effective = registry.get_entry(name, scope=scope)
+        if (
+            effective is not None
+            and effective.toolset != toolset
+            and not override
+        ):
+            _record_diagnostic_plugin_conflict(
+                name=name,
+                reason="plugin tool conflicts with existing registry tool",
+                source=self.manifest.key or self.manifest.name,
+            )
         if previous is None and effective is not None and not override:
             logger.warning(
                 "Plugin %s tried to shadow global tool %s without override=True",
@@ -1765,6 +1820,12 @@ class PluginContext:
             and registered is not previous
             and registered.handler is handler
         ):
+            if effective is not None:
+                _record_diagnostic_plugin_conflict(
+                    name=name,
+                    reason="plugin tool overrides existing registry tool",
+                    source=self.manifest.key or self.manifest.name,
+                )
             self._manager._plugin_tool_names.add(name)
             def _restore_tool(replacement: Any) -> bool:
                 return registry.restore_registration(
@@ -2255,6 +2316,8 @@ class PluginContext:
         creates ``@issue:...``).  Built-in prefixes (diff, staged, file,
         folder, git, url) are reserved and will be rejected.
         """
+        if self._manager._diagnostic_registry_binding is not None:
+            return
         from agent.context_references import (
             ContextReferenceProvider as _CRP,
             register_context_reference_provider as _register,
@@ -2811,6 +2874,9 @@ class PluginContext:
                 setup_fn=irc_interactive_setup,
             )
         """
+        if self._manager._diagnostic_registry_binding is not None:
+            self._manager._plugin_platform_names.add(str(name))
+            return None
         from gateway.platform_registry import platform_registry, PlatformEntry
 
         entry_kwargs.setdefault("plugin_name", self.manifest.name)
@@ -3088,6 +3154,8 @@ class PluginContext:
 
         Returns the number of patterns accepted.
         """
+        if self._manager._diagnostic_registry_binding is not None:
+            return 0
         from agent.redact import register_redaction_patterns as _register
 
         try:
@@ -3394,6 +3462,8 @@ class PluginManager:
         # original scope.
         self.scope_key = scope_key or hermes_home_key()
         self.home_path = Path(self.scope_key)
+        self._diagnostic_registry_binding: Optional[Any] = None
+        self._diagnostic_inspection_closed = False
         self._discovery_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
@@ -3485,8 +3555,12 @@ class PluginManager:
         registration._on_dispose = lambda disposed: self._forget_registrations(
             [disposed]
         )
-        self._ownership_ledger.setdefault(plugin_key, []).append(registration)
-        self._registration_order.append(registration)
+        with self._discovery_lock:
+            if self._diagnostic_inspection_closed:
+                registration.dispose()
+                return registration
+            self._ownership_ledger.setdefault(plugin_key, []).append(registration)
+            self._registration_order.append(registration)
         return registration
 
     @staticmethod
@@ -3828,6 +3902,15 @@ class PluginManager:
         No-op when only bundled sources exist or none are enabled.
         Fail-open: never raise into discover_and_load.
         """
+        if os.environ.get("HERMES_TOOLS_DIAGNOSE_READ_ONLY") == "1":
+            return
+        try:
+            from tools.registry import is_read_only_tool_inspection
+
+            if is_read_only_tool_inspection():
+                return
+        except Exception:
+            pass
         try:
             from agent.secret_sources.registry import list_plugin_sources
             from hermes_cli.env_loader import load_hermes_dotenv, reset_secret_source_cache
@@ -5546,6 +5629,146 @@ _plugin_manager: Optional[PluginManager] = None
 # imported) instead of rebuilding from scratch every switch.
 _plugin_managers_by_home: Dict[Path, PluginManager] = {}
 _plugin_managers_lock = threading.RLock()
+_diagnostic_plugin_manager: ContextVar[Optional[PluginManager]] = ContextVar(
+    "diagnostic_plugin_manager", default=None
+)
+_diagnostic_plugin_conflicts: ContextVar[
+    Optional[List[Dict[str, str]]]
+] = ContextVar("diagnostic_plugin_conflicts", default=None)
+_diagnostic_plugin_thread_fallback: Optional[
+    tuple[PluginManager, List[Dict[str, str]], frozenset[int]]
+] = None
+
+
+def _diagnostic_thread_fallback():
+    fallback = _diagnostic_plugin_thread_fallback
+    if fallback is None or threading.get_ident() in fallback[2]:
+        return None
+    return fallback
+
+
+def _record_diagnostic_plugin_conflict(
+    *, name: str, reason: str, source: str
+) -> None:
+    conflicts = _diagnostic_plugin_conflicts.get()
+    if conflicts is None:
+        fallback = _diagnostic_thread_fallback()
+        conflicts = fallback[1] if fallback is not None else None
+    if conflicts is None:
+        return
+    record = {"tool": name, "reason": reason, "source": source}
+    if record not in conflicts:
+        conflicts.append(record)
+
+
+def get_diagnostic_plugin_conflicts() -> List[Dict[str, str]]:
+    """Return plugin-name conflicts observed in this diagnostic scope."""
+    return [dict(item) for item in (_diagnostic_plugin_conflicts.get() or [])]
+
+
+def _drain_diagnostic_plugin_threads(
+    existing_thread_ids: frozenset[int],
+    *,
+    timeout: float = 1.0,
+) -> None:
+    """Drain cooperative diagnostic threads while output FDs stay quarantined.
+
+    Process-entry diagnostics emit through saved descriptors and terminate with
+    ``os._exit`` after this bounded grace period, so remaining plugin threads
+    cannot outlive the quarantine or corrupt the machine-readable document.
+    """
+    deadline = time.monotonic() + timeout
+    current = threading.current_thread()
+    while True:
+        threads = [
+            thread
+            for thread in threading.enumerate()
+            if thread is not current
+            and thread.ident is not None
+            and thread.ident not in existing_thread_ids
+            and thread.is_alive()
+        ]
+        if not threads:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                "diagnostic plugin threads still running after output quarantine: %s",
+                ", ".join(thread.name for thread in threads),
+            )
+            return
+        for thread in threads:
+            thread.join(min(remaining, 0.05))
+
+
+@contextmanager
+def diagnostic_plugin_inspection():
+    """Isolate plugin discovery performed while projecting a tool surface.
+
+    A previously discovered manager is already stable and can be read directly.
+    Otherwise discovery runs through a context-local disposable manager whose
+    ledger-backed registrations and imported directory modules are removed on
+    exit. The process-global manager pointer and cache are never published.
+    """
+    with _plugin_managers_lock:
+        current_home = _plugin_home_key()
+        manager_before = _plugin_managers_by_home.get(current_home)
+    disposable = manager_before is None or not manager_before._discovered
+    manager = (
+        PluginManager(scope_key=hermes_home_key(current_home))
+        if disposable
+        else manager_before
+    )
+    assert manager is not None
+    if disposable:
+        from tools.registry import capture_read_only_tool_inspection_binding
+
+        manager._diagnostic_registry_binding = (
+            capture_read_only_tool_inspection_binding()
+        )
+    conflicts: List[Dict[str, str]] = []
+    token = _diagnostic_plugin_manager.set(manager)
+    conflicts_token = _diagnostic_plugin_conflicts.set(conflicts)
+    global _diagnostic_plugin_thread_fallback
+    with _plugin_managers_lock:
+        fallback_before = _diagnostic_plugin_thread_fallback
+        existing_threads = frozenset(
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.ident is not None
+        )
+        _diagnostic_plugin_thread_fallback = (
+            manager,
+            conflicts,
+            existing_threads,
+        )
+
+    try:
+        yield manager
+    finally:
+        try:
+            if disposable:
+                with manager._discovery_lock:
+                    manager._diagnostic_inspection_closed = True
+                    try:
+                        _clear_plugin_submodules(manager)
+                    finally:
+                        try:
+                            manager.unload()
+                        except Exception:
+                            logger.debug(
+                                "diagnostic plugin unload failed", exc_info=True
+                            )
+                _drain_diagnostic_plugin_threads(existing_threads)
+        finally:
+            try:
+                _diagnostic_plugin_manager.reset(token)
+            finally:
+                try:
+                    _diagnostic_plugin_conflicts.reset(conflicts_token)
+                finally:
+                    with _plugin_managers_lock:
+                        _diagnostic_plugin_thread_fallback = fallback_before
 
 
 def _plugin_home_key() -> Path:
@@ -5608,6 +5831,16 @@ def get_plugin_manager() -> PluginManager:
     plugin submodules, instead of silently inheriting another profile's
     context engine or stale relative-import state.
     """
+    diagnostic_manager = _diagnostic_plugin_manager.get()
+    if diagnostic_manager is not None:
+        return diagnostic_manager
+    diagnostic_fallback = _diagnostic_thread_fallback()
+    if diagnostic_fallback is not None:
+        from tools.registry import bind_read_only_tool_inspection_to_current_thread
+
+        bind_read_only_tool_inspection_to_current_thread()
+        return diagnostic_fallback[0]
+
     global _plugin_manager
     current_home = _plugin_home_key()
 
@@ -6514,6 +6747,11 @@ def get_plugin_subscriptions() -> Dict[str, List[Callable]]:
             event: [entry.callback for entry in entries]
             for event, entries in manager._subscriptions.items()
         }
+
+
+def get_plugin_tool_names() -> Set[str]:
+    """Return active tool names registered through the current plugin manager."""
+    return set(get_plugin_manager()._plugin_tool_names)
 
 
 def get_plugin_toolsets() -> List[tuple]:

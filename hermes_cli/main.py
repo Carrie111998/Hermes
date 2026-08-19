@@ -82,6 +82,24 @@ if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast  # noqa: E402
 
+
+def _normalized_tools_diagnose_argv(argv: list[str]) -> list[str] | None:
+    """Return exact diagnose argv after recognized global flags, or None."""
+    from hermes_cli._parser import normalize_tools_diagnose_argv
+
+    return normalize_tools_diagnose_argv(argv)
+
+
+def _is_tools_diagnose_argv(argv: list[str]) -> bool:
+    return _normalized_tools_diagnose_argv(argv) is not None
+
+
+_TOOLS_DIAGNOSE_READ_ONLY = _is_tools_diagnose_argv(sys.argv)
+if _TOOLS_DIAGNOSE_READ_ONLY:
+    os.environ["HERMES_TOOLS_DIAGNOSE_READ_ONLY"] = "1"
+else:
+    os.environ.pop("HERMES_TOOLS_DIAGNOSE_READ_ONLY", None)
+
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
 # files were wiped (#57828 — failed lazy backend refresh), the module-level
@@ -96,10 +114,11 @@ from hermes_cli import _startup_fast  # noqa: E402
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
+if not _TOOLS_DIAGNOSE_READ_ONLY:
+    try:
+        _early_recovery_mod.recover_if_needed()
+    except Exception:
+        pass
 
 
 def _exit_after_oneshot(rc: object) -> None:
@@ -610,14 +629,12 @@ def _apply_profile_override() -> None:
         else:
             i += 1
 
-    # 1b. Reject values that can't be valid profile names (e.g. pytest's
-    # "-p no:xdist" would be misread as profile "no:xdist" otherwise).
-    # Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never call
-    # resolve_profile_env() with a value it must reject + sys.exit on.
-    if profile_name is not None and consume == 2:
-        import re as _re
+    # 1b. Reject values that are not canonical profile identifiers before
+    # importing profile state or changing HERMES_HOME.
+    if profile_name is not None and consume > 0:
+        from hermes_cli.profile_names import is_valid_profile_name
 
-        if not _re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", profile_name):
+        if not is_valid_profile_name(profile_name):
             profile_name = None
             consume = 0
             profile_index = None
@@ -691,6 +708,17 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+_TOOLS_DIAGNOSE_READ_ONLY = (
+    _TOOLS_DIAGNOSE_READ_ONLY
+    or _is_tools_diagnose_argv(sys.argv)
+)
+if _TOOLS_DIAGNOSE_READ_ONLY:
+    # This process renders a pre-startup projection. Config loads must not
+    # bootstrap HERMES_HOME, and child imports inherit the same constraint.
+    os.environ["HERMES_TOOLS_DIAGNOSE_READ_ONLY"] = "1"
+else:
+    os.environ.pop("HERMES_TOOLS_DIAGNOSE_READ_ONLY", None)
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
@@ -705,8 +733,15 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # only external secret fetches are unnecessary for installation maintenance.
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
-    load_external_secrets=sys.argv[1:2] != ["update"],
+    load_external_secrets=(
+        sys.argv[1:2] != ["update"] and not _TOOLS_DIAGNOSE_READ_ONLY
+    ),
+    read_only=_TOOLS_DIAGNOSE_READ_ONLY,
 )
+if _TOOLS_DIAGNOSE_READ_ONLY:
+    os.environ["HERMES_TOOLS_DIAGNOSE_READ_ONLY"] = "1"
+else:
+    os.environ.pop("HERMES_TOOLS_DIAGNOSE_READ_ONLY", None)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -718,57 +753,59 @@ load_hermes_dotenv(
 # separate config.yaml reads (saves ~17ms on every CLI startup — the second
 # `load_config()` was doing a full deep-merge for one boolean lookup).
 _FORCE_IPV4_EARLY = False
-try:
-    # Reuse read_raw_config()'s (mtime, size)-keyed cache instead of a bespoke
-    # yaml.load — the SAME parse then serves hermes_logging's
-    # _read_logging_config and any later raw reads in this process, collapsing
-    # 3-4 config.yaml parses per invocation into one.
-    from hermes_cli.config import read_raw_config as _read_raw_early
+if not _TOOLS_DIAGNOSE_READ_ONLY:
+    try:
+        # Reuse read_raw_config()'s (mtime, size)-keyed cache instead of a bespoke
+        # yaml.load — the SAME parse then serves hermes_logging's
+        # _read_logging_config and any later raw reads in this process, collapsing
+        # 3-4 config.yaml parses per invocation into one.
+        from hermes_cli.config import read_raw_config as _read_raw_early
 
-    _cfg_path = get_hermes_home() / "config.yaml"
-    if _cfg_path.exists():
-        _early_cfg_raw = _read_raw_early() or {}
-        # Managed scope: overlay administrator-pinned values so a managed
-        # security.redact_secrets / network.force_ipv4 wins here too. This early
-        # bridge reads config.yaml directly (before load_config is usable), so
-        # without the overlay a managed redact_secrets toggle would be ignored.
-        # Fail-open via the shared helper.
-        try:
-            from hermes_cli import managed_scope
-            _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
-        except Exception:
-            pass
-        if "HERMES_REDACT_SECRETS" not in os.environ:
-            _early_sec_cfg = _early_cfg_raw.get("security", {})
-            if isinstance(_early_sec_cfg, dict):
-                _early_redact = _early_sec_cfg.get("redact_secrets")
-                if _early_redact is not None:
-                    os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
-        _early_net_cfg = _early_cfg_raw.get("network", {})
-        if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
-            _FORCE_IPV4_EARLY = True
-        del _early_cfg_raw
-    del _cfg_path
-except Exception:
-    pass  # best-effort — redaction stays at default (enabled) on config errors
+        _cfg_path = get_hermes_home() / "config.yaml"
+        if _cfg_path.exists():
+            _early_cfg_raw = _read_raw_early() or {}
+            # Managed scope: overlay administrator-pinned values so a managed
+            # security.redact_secrets / network.force_ipv4 wins here too. This early
+            # bridge reads config.yaml directly (before load_config is usable), so
+            # without the overlay a managed redact_secrets toggle would be ignored.
+            # Fail-open via the shared helper.
+            try:
+                from hermes_cli import managed_scope
+                _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
+            except Exception:
+                pass
+            if "HERMES_REDACT_SECRETS" not in os.environ:
+                _early_sec_cfg = _early_cfg_raw.get("security", {})
+                if isinstance(_early_sec_cfg, dict):
+                    _early_redact = _early_sec_cfg.get("redact_secrets")
+                    if _early_redact is not None:
+                        os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
+            _early_net_cfg = _early_cfg_raw.get("network", {})
+            if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
+                _FORCE_IPV4_EARLY = True
+            del _early_cfg_raw
+        del _cfg_path
+    except Exception:
+        pass  # best-effort — redaction stays at default (enabled) on config errors
 
-# Initialize centralized file logging early — all `hermes` subcommands
-# (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
+# Initialize centralized file logging early for stateful `hermes` subcommands.
+# `tools diagnose` is a zero-write projection and intentionally skips it.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-try:
-    from hermes_logging import setup_logging as _setup_logging
+if not _TOOLS_DIAGNOSE_READ_ONLY:
+    try:
+        from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
-except Exception:
-    pass  # best-effort — don't crash the CLI if logging setup fails
+    except Exception:
+        pass  # best-effort — don't crash the CLI if logging setup fails
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -780,6 +817,28 @@ if _FORCE_IPV4_EARLY:
         _apply_ipv4(force=True)
     except Exception:
         pass  # best-effort — don't crash if hermes_constants not importable yet
+
+if _TOOLS_DIAGNOSE_READ_ONLY:
+    import argparse as _argparse
+
+    from hermes_cli.subcommands.tools import build_tools_parser as _build_tools_parser
+
+    def _run_tools_diagnose_early(args):
+        from hermes_cli.tools_config import tools_diagnose_command
+
+        return tools_diagnose_command(args)
+
+    _early_parser = _argparse.ArgumentParser(prog="hermes")
+    _early_subparsers = _early_parser.add_subparsers(dest="command")
+    _build_tools_parser(
+        _early_subparsers,
+        cmd_tools=_run_tools_diagnose_early,
+    )
+    _diagnose_argv = _normalized_tools_diagnose_argv(sys.argv)
+    if _diagnose_argv is None:
+        raise RuntimeError("tools diagnose bootstrap route lost its command argv")
+    _early_args = _early_parser.parse_args(_diagnose_argv)
+    raise SystemExit(_early_args.func(_early_args))
 
 import logging
 import threading
@@ -12018,6 +12077,10 @@ def cmd_tools(args):
         from hermes_cli.tools_config import tools_disable_enable_command
 
         tools_disable_enable_command(args)
+    elif action == "diagnose":
+        from hermes_cli.tools_config import tools_diagnose_command
+
+        return tools_diagnose_command(args)
     elif action == "post-setup":
         from hermes_cli.tools_config import run_post_setup_command
 

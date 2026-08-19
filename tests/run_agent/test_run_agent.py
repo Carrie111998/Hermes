@@ -201,6 +201,40 @@ def agent_with_memory_tool():
         return a
 
 
+def test_agent_init_refresh_failure_uses_complete_surface_fallback():
+    from agent import tool_surface
+
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("web_search"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch(
+            "tools.mcp_tool.refresh_agent_mcp_tools",
+            side_effect=RuntimeError("transient refresh failure"),
+        ),
+        patch(
+            "agent.tool_surface.assemble_agent_tool_surface",
+            wraps=tool_surface.assemble_agent_tool_surface,
+        ) as assemble_surface,
+    ):
+        initialized = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assemble_surface.assert_called_once()
+    snapshot = tool_surface.get_agent_tool_surface(initialized)
+    assert snapshot.valid_tool_names == frozenset({"web_search"})
+    assert snapshot.catalog_tool_defs
+    assert getattr(initialized, "valid_tool_names") == {"web_search"}
+
+
 def test_aiagent_reuses_existing_errors_log_handler():
     """Repeated AIAgent init should not accumulate duplicate errors.log handlers."""
     root_logger = logging.getLogger()
@@ -1965,6 +1999,9 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
+        from agent.tool_surface import get_agent_tool_surface
+
+        surface = get_agent_tool_surface(agent)
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
@@ -1978,9 +2015,461 @@ class TestConcurrentToolExecution:
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                catalog_tool_defs=list(surface.catalog_tool_defs),
+                expected_registry_entries=dict(surface.registry_entries),
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
+
+    def test_memory_manager_cannot_shadow_registry_tool_without_snapshot_ownership(
+        self, agent
+    ):
+        from agent.tool_surface import publish_agent_tool_surface
+
+        manager = MagicMock()
+        manager.has_tool.return_value = True
+        manager.handle_tool_call.return_value = "memory-result"
+        agent._memory_manager = manager
+        surface = publish_agent_tool_surface(
+            agent,
+            agent.tools,
+            catalog_tool_defs=agent.tools,
+            memory_provider_tool_names=set(),
+            context_engine_tool_names=set(),
+            registry_generation=1,
+            selection_revision=0,
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+        )
+
+        with patch(
+            "run_agent.handle_function_call", return_value="registry-result"
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "web_search", {}, "task-1", tool_surface=surface
+            )
+
+        assert result == "registry-result"
+        dispatch.assert_called_once()
+        manager.handle_tool_call.assert_not_called()
+
+    def test_sequential_dispatch_uses_snapshot_memory_ownership(self, agent):
+        from agent.tool_surface import publish_agent_tool_surface
+
+        manager = MagicMock()
+        manager.has_tool.return_value = True
+        agent._memory_manager = manager
+        surface = publish_agent_tool_surface(
+            agent,
+            agent.tools,
+            catalog_tool_defs=agent.tools,
+            memory_provider_tool_names=set(),
+            context_engine_tool_names=set(),
+            registry_generation=1,
+            selection_revision=0,
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+        )
+        message = _mock_assistant_msg(
+            content="",
+            tool_calls=[_mock_tool_call(name="web_search", call_id="c1")],
+        )
+
+        with patch(
+            "run_agent.handle_function_call", return_value="registry-result"
+        ) as dispatch:
+            agent._execute_tool_calls_sequential(
+                message, [], "task-1", tool_surface=surface
+            )
+
+        dispatch.assert_called_once()
+        manager.handle_tool_call.assert_not_called()
+
+    def test_request_snapshot_pins_memory_owner_and_manager(self, agent):
+        from agent.tool_surface import publish_agent_tool_surface
+
+        memory_tool = {
+            "type": "function",
+            "function": {
+                "name": "external_memory_test",
+                "description": "test",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        old_manager = MagicMock()
+        old_manager.handle_tool_call.return_value = "old-memory"
+        agent._memory_manager = old_manager
+        old_surface = publish_agent_tool_surface(
+            agent,
+            [memory_tool],
+            catalog_tool_defs=[memory_tool],
+            memory_provider_tool_names={"external_memory_test"},
+            context_engine_tool_names=set(),
+            registry_generation=1,
+            selection_revision=0,
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+        )
+
+        new_manager = MagicMock()
+        agent._memory_manager = new_manager
+        publish_agent_tool_surface(
+            agent,
+            agent.tools,
+            memory_provider_tool_names=set(),
+            context_engine_tool_names=set(),
+            registry_generation=2,
+            selection_revision=0,
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+        )
+
+        result = agent._invoke_tool(
+            "external_memory_test", {}, "task-1", tool_surface=old_surface
+        )
+
+        assert result == "old-memory"
+        old_manager.handle_tool_call.assert_called_once_with(
+            "external_memory_test", {}
+        )
+        new_manager.handle_tool_call.assert_not_called()
+
+    def test_request_snapshot_pins_builtin_memory_write_mirror(self, agent):
+        from agent.tool_surface import publish_agent_tool_surface
+
+        memory_tool = {
+            "type": "function",
+            "function": {
+                "name": "memory",
+                "description": "test",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        old_manager = MagicMock()
+        agent._memory_manager = old_manager
+        old_surface = publish_agent_tool_surface(
+            agent,
+            [memory_tool],
+            catalog_tool_defs=[memory_tool],
+            context_engine_tool_names=set(),
+            registry_generation=1,
+            selection_revision=0,
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+        )
+
+        new_manager = MagicMock()
+        agent._memory_manager = new_manager
+        publish_agent_tool_surface(
+            agent,
+            [memory_tool],
+            catalog_tool_defs=[memory_tool],
+            context_engine_tool_names=set(),
+            registry_generation=2,
+            selection_revision=0,
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+        )
+        message = _mock_assistant_msg(
+            content="",
+            tool_calls=[
+                _mock_tool_call(
+                    name="memory",
+                    arguments=json.dumps(
+                        {"action": "add", "target": "memory", "content": "fact"}
+                    ),
+                )
+            ],
+        )
+
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps({"success": True}),
+        ):
+            agent._execute_tool_calls_sequential(
+                message, [], "task-1", tool_surface=old_surface
+            )
+
+        old_manager.notify_memory_tool_write.assert_called_once()
+        new_manager.notify_memory_tool_write.assert_not_called()
+
+    def test_request_snapshot_rejects_replaced_registry_entry(self, agent):
+        from agent.tool_surface import publish_agent_tool_surface
+        from tools.registry import registry
+
+        name = "snapshot_registry_identity_test"
+        old_handler = MagicMock(return_value="old")
+        new_handler = MagicMock(return_value="new")
+        schema = {
+            "name": name,
+            "description": "test",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        tool_def = {"type": "function", "function": schema}
+        registry.register(
+            name=name,
+            handler=old_handler,
+            schema=schema,
+            toolset="snapshot-test",
+        )
+        try:
+            surface = publish_agent_tool_surface(
+                agent,
+                [tool_def],
+                catalog_tool_defs=[tool_def],
+                context_engine_tool_names=set(),
+                registry_generation=registry._generation,
+                selection_revision=0,
+                enabled_toolsets=["snapshot-test"],
+                disabled_toolsets=None,
+            )
+            registry.deregister(name)
+            registry.register(
+                name=name,
+                handler=new_handler,
+                schema=schema,
+                toolset="snapshot-test",
+            )
+
+            with (
+                patch(
+                    "hermes_cli.middleware.apply_tool_request_middleware"
+                ) as request_middleware,
+                patch(
+                    "hermes_cli.plugins._dispatch_pre_tool_call_hooks"
+                ) as pre_tool_hook,
+                patch(
+                    "hermes_cli.middleware.run_tool_execution_middleware"
+                ) as execution_middleware,
+            ):
+                result = agent._invoke_tool(
+                    name, {}, "task-1", tool_surface=surface
+                )
+        finally:
+            registry.deregister(name)
+
+        assert "registration changed during the request" in result
+        request_middleware.assert_not_called()
+        pre_tool_hook.assert_not_called()
+        execution_middleware.assert_not_called()
+        old_handler.assert_not_called()
+        new_handler.assert_not_called()
+
+    def test_request_snapshot_rejects_replaced_direct_delegate_before_middleware(
+        self, agent
+    ):
+        from agent.tool_surface import publish_agent_tool_surface
+        from tools.registry import registry
+
+        delegate_def = {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "description": "test",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        expected_entry = object()
+        surface = publish_agent_tool_surface(
+            agent,
+            [delegate_def],
+            catalog_tool_defs=[delegate_def],
+            context_engine_tool_names=set(),
+            registry_entries=[("delegate_task", expected_entry)],
+            registry_generation=1,
+            selection_revision=0,
+            enabled_toolsets=["delegation"],
+            disabled_toolsets=None,
+        )
+
+        replacement_entry = object()
+        original_get_entry = registry.get_entry
+
+        def replaced_get_entry(name, *, scope=None):
+            if name == "delegate_task":
+                return replacement_entry
+            return original_get_entry(name, scope=scope)
+
+        with (
+            patch.object(registry, "get_entry", side_effect=replaced_get_entry),
+            patch.object(agent, "_dispatch_delegate_task") as dispatch_delegate,
+            patch(
+                "hermes_cli.middleware.apply_tool_request_middleware"
+            ) as request_middleware,
+            patch(
+                "hermes_cli.plugins._dispatch_pre_tool_call_hooks"
+            ) as pre_tool_hook,
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware"
+            ) as execution_middleware,
+        ):
+            result = agent._invoke_tool(
+                "delegate_task",
+                {"goal": "must not run"},
+                "task-1",
+                tool_surface=surface,
+            )
+
+        assert "registration changed during the request" in result
+        dispatch_delegate.assert_not_called()
+        request_middleware.assert_not_called()
+        pre_tool_hook.assert_not_called()
+        execution_middleware.assert_not_called()
+
+    def test_unowned_provider_name_cannot_fall_through_to_live_registry(
+        self, agent
+    ):
+        from agent.tool_surface import publish_agent_tool_surface
+        from tools.registry import registry
+
+        name = "provider_registry_fallback_probe"
+        live_handler = MagicMock(return_value="live-registry")
+        schema = {
+            "name": name,
+            "description": "test",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        tool_def = {"type": "function", "function": schema}
+        registry.register(
+            name=name,
+            handler=live_handler,
+            schema=schema,
+            toolset="provider-fallback-test",
+        )
+        try:
+            surface = publish_agent_tool_surface(
+                agent,
+                [tool_def],
+                catalog_tool_defs=[tool_def],
+                memory_provider_tool_names=set(),
+                context_engine_tool_names=set(),
+                registry_entries=[],
+                registry_generation=registry._generation,
+                selection_revision=0,
+                enabled_toolsets=["provider-fallback-test"],
+                disabled_toolsets=None,
+            )
+            result = agent._invoke_tool(
+                name,
+                {},
+                "task-1",
+                tool_surface=surface,
+            )
+            assert "registration is unavailable for this request" in result
+            live_handler.assert_not_called()
+
+            agent._tool_surface_memory_manager_ceiling = None
+            classified_surface = publish_agent_tool_surface(
+                agent,
+                [tool_def],
+                catalog_tool_defs=[tool_def],
+                memory_provider_tool_names={name},
+                context_engine_tool_names=set(),
+                deferred_tool_names=set(),
+                registry_entries=[],
+                registry_generation=registry._generation,
+                selection_revision=43,
+                enabled_toolsets=None,
+                disabled_toolsets=None,
+            )
+            classified_result = agent._invoke_tool(
+                name,
+                {},
+                "task-1",
+                "call-1",
+                tool_surface=classified_surface,
+            )
+            assert (
+                "provider is unavailable for this request snapshot"
+                in classified_result
+            )
+            live_handler.assert_not_called()
+        finally:
+            registry.deregister(name)
+
+    def test_sequential_rejects_replaced_direct_delegate_before_middleware(
+        self, agent
+    ):
+        from agent.tool_surface import publish_agent_tool_surface
+        from tools.registry import registry
+
+        delegate_def = {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "description": "test",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        expected_entry = object()
+        surface = publish_agent_tool_surface(
+            agent,
+            [delegate_def],
+            catalog_tool_defs=[delegate_def],
+            context_engine_tool_names=set(),
+            registry_entries=[("delegate_task", expected_entry)],
+            registry_generation=1,
+            selection_revision=0,
+            enabled_toolsets=["delegation"],
+            disabled_toolsets=None,
+        )
+        message = _mock_assistant_msg(
+            content="",
+            tool_calls=[
+                _mock_tool_call(
+                    name="delegate_task",
+                    arguments='{"goal":"must not run"}',
+                    call_id="c1",
+                )
+            ],
+        )
+        messages = []
+
+        replacement_entry = SimpleNamespace(max_result_size_chars=None)
+        with (
+            patch.object(registry, "get_entry", return_value=replacement_entry),
+            patch.object(agent, "_dispatch_delegate_task") as dispatch_delegate,
+            patch(
+                "hermes_cli.middleware.apply_tool_request_middleware"
+            ) as request_middleware,
+            patch(
+                "hermes_cli.plugins._dispatch_pre_tool_call_hooks"
+            ) as pre_tool_hook,
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware"
+            ) as execution_middleware,
+        ):
+            agent._execute_tool_calls_sequential(
+                message,
+                messages,
+                "task-1",
+                tool_surface=surface,
+            )
+
+        assert "registration changed during the request" in messages[-1]["content"]
+        dispatch_delegate.assert_not_called()
+        request_middleware.assert_not_called()
+        pre_tool_hook.assert_not_called()
+        execution_middleware.assert_not_called()
+
+    def test_execute_tool_calls_forwards_request_snapshot(self, agent):
+        surface = object()
+        message = _mock_assistant_msg(
+            content="",
+            tool_calls=[_mock_tool_call(name="web_search")],
+        )
+        with patch.object(agent, "_execute_tool_calls_sequential") as execute:
+            agent._execute_tool_calls(
+                message, [], "task-1", tool_surface=surface
+            )
+
+        execute.assert_called_once_with(
+            message,
+            [],
+            "task-1",
+            0,
+            tool_surface=surface,
+        )
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
@@ -2373,7 +2862,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             agent,
             "_dispatch_delegate_task",
-            lambda args: '{"ok":true}',
+            lambda args, **kwargs: '{"ok":true}',
         )
         agent._memory_manager = None
 
@@ -4003,7 +4492,7 @@ class TestRunConversation:
         agent.max_tokens = None
         requested_caps = []
 
-        def _fake_build_api_kwargs(api_messages):
+        def _fake_build_api_kwargs(api_messages, tools_for_api=None):
             ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
             if ephemeral is not None:
                 agent._ephemeral_max_output_tokens = None

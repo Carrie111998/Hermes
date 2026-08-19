@@ -882,11 +882,13 @@ def run_codex_app_server_turn(
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
+    from agent.tool_surface import get_agent_tool_surface
+
     should_review_skills = False
     if (
         agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
+        and "skill_manage" in get_agent_tool_surface(agent).valid_tool_names
     ):
         should_review_skills = True
         agent._iters_since_skill = 0

@@ -10,12 +10,14 @@ from unittest.mock import patch
 
 from model_tools import (
     coerce_tool_args,
+    handle_function_call,
     _coerce_value,
     _coerce_number,
     _coerce_boolean,
     _schema_accepts_kind,
     _normalize_json_strings_for_schema,
 )
+from tools.registry import registry
 
 
 # ── Low-level coercion helpers ────────────────────────────────────────────
@@ -157,6 +159,61 @@ class TestCoerceToolArgs:
         assert isinstance(result["offset"], int)
         assert result["limit"] == 100
         assert isinstance(result["limit"], int)
+
+    def test_same_name_replacement_is_rejected_before_coercion(self):
+        name = "coercion_snapshot_race_tool"
+        integer_schema = self._mock_schema({"limit": {"type": "integer"}})
+        integer_schema["name"] = name
+        string_schema = self._mock_schema({"limit": {"type": "string"}})
+        string_schema["name"] = name
+
+        registry.register(
+            name=name,
+            toolset="mcp-coercion-race",
+            schema=integer_schema,
+            handler=lambda args, **kwargs: "{}",
+        )
+        pinned_entry = registry.get_entry(name)
+        assert pinned_entry is not None
+        registry.register(
+            name=name,
+            toolset="mcp-coercion-race",
+            schema=string_schema,
+            handler=lambda args, **kwargs: "{}",
+        )
+
+        captured = {}
+
+        def _dispatch(_name, args, **kwargs):
+            captured.update(args)
+            assert kwargs["expected_entry"] is pinned_entry
+            return "{}"
+
+        try:
+            with (
+                patch.object(registry, "dispatch", side_effect=_dispatch),
+                patch(
+                    "hermes_cli.middleware.apply_tool_request_middleware"
+                ) as request_middleware,
+                patch(
+                    "hermes_cli.plugins._dispatch_pre_tool_call_hooks"
+                ) as pre_tool_hook,
+                patch(
+                    "hermes_cli.middleware.run_tool_execution_middleware"
+                ) as execution_middleware,
+            ):
+                handle_function_call(
+                    name,
+                    {"limit": "10"},
+                    expected_registry_entries={name: pinned_entry},
+                )
+        finally:
+            registry.deregister(name)
+
+        assert captured == {}
+        request_middleware.assert_not_called()
+        pre_tool_hook.assert_not_called()
+        execution_middleware.assert_not_called()
 
 
 # ── Schema-guided nested JSON-string normalization (cline/cline#11803) ─────

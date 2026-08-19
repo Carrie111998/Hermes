@@ -1825,7 +1825,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
-        tools_for_api = agent.tools
+        import copy as _copy
+
+        from agent.tool_surface import get_agent_tool_surface
+
+        tools_for_api = _copy.deepcopy(
+            list(get_agent_tool_surface(agent).tool_defs)
+        )
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1911,14 +1917,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # like ``Qwen/Qwen3.5-0.8B`` shipped by MCP servers) — same 400 with
         # the same opaque message; strip those enums too.
         #
-        # Deep-copy ``tools_for_api`` before sanitizing: the sanitizers
+        # Deep-copy ``tools_for_api`` before sanitizing because the sanitizers
         # mutate in place (documented contract on ``strip_slash_enum`` /
-        # ``strip_pattern_and_format``), and ``tools_for_api`` is a direct
-        # reference to ``agent.tools``.  Without the copy, the first xAI
-        # request permanently strips constraints from the shared per-agent
-        # tool registry — every subsequent non-xAI call from the same
-        # agent (auxiliary task routed to Anthropic, OpenRouter fallback,
-        # main-model swap) sees the already-stripped schema.  See #27907.
+        # ``strip_pattern_and_format``). Keep provider transformations on a
+        # request-local copy so the atomically published surface stays stable.
+        # See #27907.
         if is_xai_responses:
             try:
                 import copy as _copy

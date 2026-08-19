@@ -64,3 +64,29 @@ def test_mcp_and_acp_accept_hooks_flag():
     # acp takes --accept-hooks at top level
     ns = parser.parse_args(["acp", "--accept-hooks"])
     assert ns.accept_hooks is True
+
+
+def test_tools_diagnose_accepts_platform_and_json_flags():
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    handler = _h("tools")
+    build_tools_parser(sub, cmd_tools=handler)
+
+    ns = parser.parse_args(["tools", "diagnose", "--platform", "telegram", "--json"])
+
+    assert ns.command == "tools"
+    assert ns.tools_action == "diagnose"
+    assert ns.platform == "telegram"
+    assert ns.json is True
+    assert ns.func is handler
+
+
+def test_cmd_tools_propagates_diagnose_status(monkeypatch):
+    from hermes_cli.main import cmd_tools
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.tools_diagnose_command",
+        lambda args: 2,
+    )
+
+    assert cmd_tools(argparse.Namespace(tools_action="diagnose")) == 2

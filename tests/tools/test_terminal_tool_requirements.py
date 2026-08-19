@@ -134,6 +134,42 @@ class TestCheckFnTransientFailureSuppression:
         t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
         assert reg._check_fn_cached(probe) is False
 
+    def test_readonly_probe_does_not_populate_caches(self):
+        import tools.registry as reg
+
+        calls = {"n": 0}
+
+        def probe():
+            calls["n"] += 1
+            return True
+
+        assert reg._check_fn_readonly(probe) is True
+        assert calls["n"] == 1
+        assert reg._check_fn_cache == {}
+        assert reg._check_fn_last_good == {}
+
+    def test_readonly_probe_preserves_expired_cache_and_last_good(
+        self, monkeypatch
+    ):
+        import tools.registry as reg
+
+        state = {"ok": True}
+
+        def probe():
+            return state["ok"]
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: clock["now"])
+        assert reg._check_fn_cached(probe) is True
+        cached_before = dict(reg._check_fn_cache)
+        last_good_before = dict(reg._check_fn_last_good)
+
+        state["ok"] = False
+        clock["now"] += reg._CHECK_FN_TTL_SECONDS + 1
+        assert reg._check_fn_readonly(probe) is True
+        assert reg._check_fn_cache == cached_before
+        assert reg._check_fn_last_good == last_good_before
+
     def test_profile_scoped_availability_does_not_cross_multiplex_profiles(
         self, tmp_path
     ):

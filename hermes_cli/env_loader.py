@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import contextlib
 import io
 import os
 import sys
@@ -360,6 +361,24 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     _sanitize_loaded_credentials()
 
 
+def _load_dotenv_for_mode(
+    path: Path, *, override: bool, read_only: bool
+) -> None:
+    """Load dotenv, rolling back malformed-file effects during inspection."""
+    if not read_only:
+        _load_dotenv_with_fallback(path, override=override)
+        return
+
+    env_before = dict(os.environ)
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            _load_dotenv_with_fallback(path, override=override)
+    except Exception:
+        os.environ.clear()
+        os.environ.update(env_before)
+
+
 def _sanitize_env_file_if_needed(path: Path) -> None:
     """Pre-sanitize a .env file before python-dotenv reads it.
 
@@ -472,6 +491,7 @@ def load_hermes_dotenv(
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
     load_external_secrets: bool = True,
+    read_only: bool = False,
 ) -> list[Path]:
     """Load Hermes environment files with user config taking precedence.
 
@@ -483,6 +503,8 @@ def load_hermes_dotenv(
     - callers that only maintain the installation can set
       ``load_external_secrets=False`` to avoid loading optional secret-manager
       dependencies into the process that replaces that same environment.
+    - diagnostic callers can set ``read_only=True`` to suppress file repair,
+      external secret resolution, and the config-to-env terminal bridge.
     """
     loaded: list[Path] = []
 
@@ -491,17 +513,34 @@ def load_hermes_dotenv(
     project_env_path = Path(project_env) if project_env else None
 
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
-    if user_env.exists():
+    if user_env.exists() and not read_only:
         _sanitize_env_file_if_needed(user_env)
-    if project_env_path and project_env_path.exists():
+    if project_env_path and project_env_path.exists() and not read_only:
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
+        _load_dotenv_for_mode(
+            user_env,
+            override=True,
+            read_only=read_only,
+        )
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.
-        _clear_known_keys_missing_from_dotenv(user_env)
+        if read_only:
+            env_before = dict(os.environ)
+            sink = io.StringIO()
+            try:
+                with (
+                    contextlib.redirect_stdout(sink),
+                    contextlib.redirect_stderr(sink),
+                ):
+                    _clear_known_keys_missing_from_dotenv(user_env)
+            except Exception:
+                os.environ.clear()
+                os.environ.update(env_before)
+        else:
+            _clear_known_keys_missing_from_dotenv(user_env)
 
     # Load .op.env AFTER .env so that .env values win, but the bootstrap
     # token (OP_SERVICE_ACCOUNT_TOKEN) becomes available for
@@ -515,10 +554,18 @@ def load_hermes_dotenv(
     # ensures .op.env never clobbers a token already in the environment).
     op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+        _load_dotenv_for_mode(
+            op_env,
+            override=False,
+            read_only=read_only,
+        )
 
     if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        _load_dotenv_for_mode(
+            project_env_path,
+            override=not loaded,
+            read_only=read_only,
+        )
         loaded.append(project_env_path)
 
     # External secret sources are skipped in two updater situations:
@@ -534,9 +581,13 @@ def load_hermes_dotenv(
     # resolution is unnecessary for the updater.
     from hermes_cli import _early_recovery
 
-    if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
+    if (
+        load_external_secrets
+        and not read_only
+        and not _early_recovery._should_skip_external_secret_sources()
+    ):
         _apply_external_secret_sources(home_path)
-    _apply_managed_env()
+    _apply_managed_env(read_only=read_only)
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
@@ -550,7 +601,8 @@ def load_hermes_dotenv(
     # the documented config path always wins. Runs after _apply_managed_env()
     # so the merged config (which already carries the managed overlay) is
     # what lands in the env.
-    _reapply_terminal_config_bridge(home_path)
+    if not read_only:
+        _reapply_terminal_config_bridge(home_path)
 
     return loaded
 
@@ -582,7 +634,7 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
         pass
 
 
-def _apply_managed_env() -> None:
+def _apply_managed_env(*, read_only: bool = False) -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell.
 
     Managed scope is machine-global (independent of HERMES_HOME / profile). v1
@@ -610,8 +662,13 @@ def _apply_managed_env() -> None:
     managed_env = managed_dir / ".env"
     if not managed_env.exists():
         return
-    _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True)
+    if not read_only:
+        _sanitize_env_file_if_needed(managed_env)
+    _load_dotenv_for_mode(
+        managed_env,
+        override=True,
+        read_only=read_only,
+    )
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:

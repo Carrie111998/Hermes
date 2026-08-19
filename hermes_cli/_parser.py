@@ -12,6 +12,8 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 
 import argparse
 
+from hermes_cli.profile_names import is_valid_profile_name
+
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
 # argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
@@ -34,7 +36,58 @@ def _inherited_flag(parser, *args, **kwargs):
     """
     action = parser.add_argument(*args, **kwargs)
     action.inherit_on_relaunch = True
+    setattr(action, "safe_before_tools_diagnose", True)
     return action
+
+
+def normalize_tools_diagnose_argv(argv: list[str]) -> list[str] | None:
+    """Return exact diagnose argv after parser-declared safe global flags."""
+    parser, _, _ = build_top_level_parser()
+    preparse_options = dict(PRE_ARGPARSE_INHERITED_FLAGS)
+    args = list(argv[1:])
+    while args:
+        if args[:2] == ["tools", "diagnose"]:
+            return args
+        raw = args[0]
+        profile_option = False
+        if raw in preparse_options:
+            takes_value = preparse_options[raw]
+            explicit_value = None
+            profile_option = raw in {"--profile", "-p"}
+        elif raw.startswith("--profile="):
+            takes_value = True
+            explicit_value = raw.partition("=")[2]
+            profile_option = True
+        else:
+            if not raw.startswith("-"):
+                return None
+            option_tuples = parser._get_option_tuples(raw)
+            if len(option_tuples) != 1:
+                return None
+            option_tuple = option_tuples[0]
+            action = option_tuple[0]
+            explicit_value = (
+                None if raw in action.option_strings else option_tuple[-1]
+            )
+            if not getattr(action, "safe_before_tools_diagnose", False):
+                return None
+            takes_value = action.nargs != 0
+            profile_option = action.dest == "profile"
+        if explicit_value is not None:
+            if not takes_value:
+                return None
+            if profile_option and not is_valid_profile_name(explicit_value):
+                return None
+            args = args[1:]
+        elif takes_value:
+            if len(args) < 2 or parser._parse_optional(args[1]) is not None:
+                return None
+            if profile_option and not is_valid_profile_name(args[1]):
+                return None
+            args = args[2:]
+        else:
+            args = args[1:]
+    return None
 
 
 _EPILOGUE = """
@@ -161,12 +214,13 @@ def build_top_level_parser():
             "(or per-model under agent.reasoning_overrides)."
         ),
     )
-    parser.add_argument(
+    toolsets_action = parser.add_argument(
         "-t",
         "--toolsets",
         default=None,
         help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.",
     )
+    setattr(toolsets_action, "safe_before_tools_diagnose", True)
     parser.add_argument(
         "--resume",
         "-r",

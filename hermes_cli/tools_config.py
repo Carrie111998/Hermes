@@ -9,19 +9,28 @@ Saves per-platform tool configuration to ~/.hermes/config.yaml under
 the `platform_toolsets` key.
 """
 
+import contextlib
+import io
 import json as _json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
+from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 
 from hermes_cli.config import (
     cfg_get,
-    load_config, save_config, get_env_value, save_env_value,
+    diagnostic_config_inspection,
+    get_env_value,
+    load_config,
+    load_config_for_diagnostics,
+    save_config,
+    save_env_value,
 )
 from hermes_cli.colors import Colors, color
 from hermes_cli.nous_subscription import (
@@ -35,6 +44,19 @@ from tools.tool_backend_helpers import fal_key_is_configured
 from utils import base_url_hostname, is_truthy_value
 
 logger = logging.getLogger(__name__)
+_diagnostic_output_lock = threading.RLock()
+
+
+@contextlib.contextmanager
+def _diagnostic_tool_module_inspection():
+    """Rollback tool modules imported only to project a diagnostic surface."""
+    modules_before = set(sys.modules)
+    try:
+        yield
+    finally:
+        for name in set(sys.modules) - modules_before:
+            if name == "model_tools" or name.startswith("tools."):
+                sys.modules.pop(name, None)
 
 
 def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
@@ -178,8 +200,9 @@ def _xai_credentials_present() -> bool:
     """
     try:
         from hermes_cli.auth import _read_xai_oauth_tokens
+        from tools.registry import is_read_only_tool_inspection
 
-        _read_xai_oauth_tokens()
+        _read_xai_oauth_tokens(_lock=not is_read_only_tool_inspection())
         return True
     except Exception:
         pass
@@ -5732,16 +5755,578 @@ def _known_tool_platforms() -> set[str]:
     """
     known = set(PLATFORMS)
     try:
-        from hermes_cli.plugins import discover_plugins
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
         from gateway.platform_registry import platform_registry
 
         discover_plugins()  # idempotent
+        known.update(get_plugin_manager()._plugin_platform_names)
         known.update(platform_registry.registered_names())
     except Exception:
         # Plugin discovery is optional. Preserve the built-in CLI path when a
         # third-party plugin is malformed or its dependencies are unavailable.
         pass
     return known
+
+
+def _diagnostic_memory_provider(
+    config: dict,
+) -> tuple[str, List[Dict[str, Any]], Optional[str]]:
+    """Load configured external memory schemas without initializing a session."""
+    memory_cfg = config.get("memory") or {}
+    provider_name = ""
+    if isinstance(memory_cfg, dict):
+        provider_name = str(memory_cfg.get("provider") or "").strip()
+    if not provider_name:
+        return "built_in", [], None
+
+    try:
+        from agent.memory_manager import MemoryManager
+        from plugins.memory import load_memory_provider
+
+        provider = load_memory_provider(provider_name, register_skills=False)
+        if provider is None:
+            return provider_name, [], "provider not found"
+        if not provider.is_available():
+            return provider_name, [], "provider unavailable"
+        manager = MemoryManager()
+        manager.add_provider(provider)
+        return provider_name, manager.get_all_tool_schemas(), None
+    except Exception:
+        logger.debug("Memory provider diagnostics failed", exc_info=True)
+        return provider_name, [], "provider inspection failed"
+
+
+def _diagnostic_context_engine(
+    config: dict,
+) -> tuple[str, List[Dict[str, Any]], Optional[str]]:
+    """Load configured context-engine schemas without model/session mutation."""
+    context_cfg = config.get("context") or {}
+    engine_name = "compressor"
+    if isinstance(context_cfg, dict):
+        engine_name = str(context_cfg.get("engine") or engine_name).strip()
+    if not engine_name or engine_name == "compressor":
+        return "compressor", [], None
+
+    try:
+        from plugins.context_engine import load_context_engine
+
+        engine = load_context_engine(engine_name, register_commands=False)
+        if engine is None:
+            import copy
+
+            from hermes_cli.plugins import get_plugin_context_engine
+
+            candidate = get_plugin_context_engine()
+            if candidate is not None and getattr(candidate, "name", None) == engine_name:
+                try:
+                    engine = copy.deepcopy(candidate)
+                except Exception:
+                    logger.debug(
+                        "Context-engine diagnostic copy failed", exc_info=True
+                    )
+                    return engine_name, [], "engine cannot be copied safely"
+        if engine is None:
+            return engine_name, [], "engine not found"
+        get_schemas = getattr(engine, "get_tool_schemas", None)
+        if not callable(get_schemas):
+            return engine_name, [], "engine exposes no tool schemas"
+        schemas = get_schemas()
+        if not isinstance(schemas, (list, tuple)):
+            return engine_name, [], "engine returned invalid tool schemas"
+        return engine_name, list(schemas), None
+    except Exception:
+        logger.debug("Context-engine diagnostics failed", exc_info=True)
+        return engine_name, [], "engine inspection failed"
+
+
+def _disabled_toolsets_for_diagnostics(
+    enabled_toolsets: Set[str], platform: str
+) -> List[str]:
+    """Return configurable toolsets disabled for ``platform``."""
+    all_toolsets = {
+        toolset
+        for toolset, _, _ in _get_effective_configurable_toolsets()
+        if _toolset_allowed_for_platform(toolset, platform)
+    }
+    return sorted(all_toolsets - enabled_toolsets)
+
+
+def build_tools_diagnostics(config: dict, platform: str) -> Dict[str, Any]:
+    """Return a pre-startup projection of the platform's tool surface."""
+    from agent.skill_utils import parse_config_string_list
+    from agent.tool_surface import assemble_full_tool_surface
+    from model_tools import (
+        _resolve_active_context_length,
+        get_tool_definitions,
+        resolve_disabled_tool_names,
+    )
+    from toolsets import resolve_toolset
+    from tools.registry import registry
+    from tools.tool_search import ToolSearchConfig
+
+    enabled_toolsets = _get_platform_tools(config, platform)
+    enabled_list = sorted(enabled_toolsets)
+    platform_toolsets = config.get("platform_toolsets") or {}
+    explicit_platform_config = (
+        isinstance(platform_toolsets, dict)
+        and isinstance(platform_toolsets.get(platform), list)
+    )
+    agent_cfg = config.get("agent") or {}
+    disabled_raw = (
+        agent_cfg.get("disabled_toolsets") or []
+        if isinstance(agent_cfg, dict)
+        else []
+    )
+    disabled_list = sorted(
+        {
+            name.strip()
+            for name in parse_config_string_list(disabled_raw)
+            if name.strip()
+        }
+    )
+    disabled_tool_names = resolve_disabled_tool_names(disabled_list)
+    default_toolset = PLATFORMS.get(platform, {}).get(
+        "default_toolset", f"hermes-{platform}"
+    )
+    config_sources = {
+        "toolset_selection": (
+            f"platform_toolsets.{platform}"
+            if explicit_platform_config
+            else f"platform default ({default_toolset})"
+        ),
+        "global_disabled_toolsets": disabled_list,
+    }
+
+    base_tool_defs = get_tool_definitions(
+        enabled_toolsets=enabled_list,
+        disabled_toolsets=disabled_list,
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+        record_resolved_names=False,
+        cache_result=False,
+        cache_availability_checks=False,
+    )
+    memory_provider, memory_schemas, memory_error = _diagnostic_memory_provider(
+        config
+    )
+    context_provider, context_schemas, context_error = _diagnostic_context_engine(
+        config
+    )
+
+    tools_cfg = config.get("tools") or {}
+    if not isinstance(tools_cfg, dict):
+        tools_cfg = {}
+    tool_search_config = ToolSearchConfig.from_raw(tools_cfg.get("tool_search"))
+    context_length = None
+    if tool_search_config.enabled != "off":
+        context_length = _resolve_active_context_length(config)
+
+    surface = assemble_full_tool_surface(
+        base_tool_defs,
+        enabled_toolsets=enabled_list,
+        disabled_toolsets=disabled_list,
+        memory_tool_schemas=memory_schemas,
+        context_engine_tool_schemas=context_schemas,
+        context_length=context_length,
+        tool_search_config=tool_search_config,
+    )
+    tools_visible = sorted(
+        name
+        for tool in surface.tool_defs
+        if (name := tool.get("function", {}).get("name"))
+    )
+    visible_set = set(tools_visible)
+    pre_assembly_names = {
+        name
+        for tool in surface.pre_assembly_tool_defs
+        if (name := tool.get("function", {}).get("name"))
+    }
+    deferred_set = set(surface.deferred_names)
+
+    all_tool_names = registry.get_all_tool_names()
+    tools_by_toolset: Dict[str, List[str]] = {}
+    filtered = []
+    for tool_name in all_tool_names:
+        toolset = registry.get_toolset_for_tool(tool_name) or ""
+        tools_by_toolset.setdefault(toolset, []).append(tool_name)
+        if tool_name in visible_set:
+            continue
+        if tool_name in deferred_set:
+            reason = "deferred by tool search"
+        elif tool_name not in pre_assembly_names:
+            reason = (
+                "toolset disabled"
+                if toolset not in enabled_toolsets
+                or tool_name in disabled_tool_names
+                else "availability check failed"
+            )
+        else:
+            reason = "not model-visible"
+        filtered.append(
+            {"tool": tool_name, "toolset": toolset, "reason": reason}
+        )
+
+    registered = set(all_tool_names)
+    for toolset in enabled_list:
+        for tool_name in sorted(resolve_toolset(toolset)):
+            if tool_name not in registered:
+                filtered.append(
+                    {
+                        "tool": tool_name,
+                        "toolset": toolset,
+                        "reason": "not registered",
+                    }
+                )
+
+    def _external_status(
+        family: str,
+        provider: str,
+        schemas: List[Dict[str, Any]],
+        inspection_error: Optional[str],
+    ) -> Dict[str, Any]:
+        injected_names = surface.injected_names[family]
+        skipped = surface.skipped[family]
+        skipped_reason = inspection_error
+        if skipped_reason is None and skipped:
+            skipped_reason = skipped[0]["reason"]
+        return {
+            "provider": provider,
+            "schemas": len(schemas),
+            "injected": len(set(injected_names) & visible_set),
+            "skipped_reason": skipped_reason,
+            "skipped": skipped,
+        }
+
+    provider_tools: Dict[str, Dict[str, Any]] = {
+        "memory": _external_status(
+            "memory", memory_provider, memory_schemas, memory_error
+        ),
+        "context_engine": _external_status(
+            "context_engine", context_provider, context_schemas, context_error
+        ),
+    }
+
+    mcp_names = {
+        name
+        for toolset, names in tools_by_toolset.items()
+        if toolset.startswith("mcp-")
+        for name in names
+    }
+    mcp_servers = config.get("mcp_servers") or {}
+    configured_servers = (
+        sorted(str(name) for name in mcp_servers)
+        if isinstance(mcp_servers, dict)
+        else []
+    )
+    provider_tools["mcp"] = {
+        "provider": "mcp",
+        "schemas": len(mcp_names),
+        "injected": len(mcp_names & visible_set),
+        "deferred": len(mcp_names & deferred_set),
+        "configured_servers": configured_servers,
+        "skipped_reason": (
+            "no MCP tools registered in this process"
+            if configured_servers and not mcp_names
+            else None
+        ),
+    }
+
+    try:
+        from hermes_cli.plugins import get_plugin_tool_names
+
+        plugin_names = set(get_plugin_tool_names()) & registered
+    except Exception:
+        logger.debug("Plugin tool ownership inspection failed", exc_info=True)
+        plugin_names = set()
+    plugin_toolsets = sorted(
+        {
+            toolset
+            for name in plugin_names
+            if (toolset := registry.get_toolset_for_tool(name))
+        }
+    )
+    provider_tools["plugins"] = {
+        "provider": "plugins",
+        "schemas": len(plugin_names),
+        "injected": len(plugin_names & visible_set),
+        "deferred": len(plugin_names & deferred_set),
+        "toolsets": plugin_toolsets,
+        "skipped_reason": None,
+    }
+
+    seen_names: set[str] = set()
+    duplicate_names: set[str] = set()
+    for name in tools_visible:
+        if name in seen_names:
+            duplicate_names.add(name)
+        seen_names.add(name)
+
+    conflicts = [
+        {
+            "tool": item.get("tool", ""),
+            "reason": item.get("reason", "external schema conflict"),
+            "source": family,
+        }
+        for family in ("memory", "context_engine")
+        for item in surface.skipped[family]
+    ]
+    conflicts.extend(
+        {"tool": name, "reason": "duplicate visible tool name"}
+        for name in sorted(duplicate_names)
+    )
+    try:
+        from hermes_cli.plugins import get_diagnostic_plugin_conflicts
+
+        conflicts.extend(get_diagnostic_plugin_conflicts())
+    except Exception:
+        logger.debug("Plugin conflict inspection failed", exc_info=True)
+
+    return {
+        "platform": platform,
+        "resolution": {
+            "phase": "pre_startup",
+            "detail": (
+                "Projects the startup surface; MCP tools must already be "
+                "registered in this process."
+            ),
+        },
+        "enabled_toolsets": enabled_list,
+        "disabled_toolsets": _disabled_toolsets_for_diagnostics(
+            enabled_toolsets, platform
+        ),
+        "config_sources": config_sources,
+        "tools_visible": tools_visible,
+        "tool_search": {
+            "activated": surface.tool_search_activated,
+            "deferred": len(surface.deferred_names),
+            "deferred_tokens": surface.deferred_tokens,
+            "threshold_tokens": surface.threshold_tokens,
+            "tier": surface.tool_search_tier,
+            "listing_form": surface.tool_search_listing_form,
+        },
+        "provider_tools": provider_tools,
+        "filtered": sorted(
+            filtered,
+            key=lambda item: (item["reason"], item["toolset"], item["tool"]),
+        ),
+        "conflicts": conflicts,
+    }
+
+
+def _terminal_safe_text(value: Any) -> str:
+    """Escape terminal controls while preserving printable Unicode."""
+    text = str(value)
+    return "".join(
+        char if char.isprintable() else repr(char)[1:-1]
+        for char in text
+    )
+
+
+def _print_tools_diagnostics(diag: Dict[str, Any]) -> None:
+    """Render diagnostics in a low-noise human-readable format."""
+    safe = _terminal_safe_text
+    print(f"Tool diagnostics ({safe(diag['platform'])}):")
+    resolution = diag.get("resolution") or {}
+    if resolution:
+        print(
+            f"  Resolution: {safe(resolution.get('phase', '-'))}; "
+            f"{safe(resolution.get('detail', '-'))}"
+        )
+    enabled = ", ".join(safe(value) for value in diag["enabled_toolsets"]) or "-"
+    visible = ", ".join(safe(value) for value in diag["tools_visible"]) or "-"
+    print(f"  Enabled toolsets ({len(diag['enabled_toolsets'])}): {enabled}")
+    config_sources = diag.get("config_sources") or {}
+    if config_sources:
+        print(
+            "  Config source: "
+            f"{safe(config_sources.get('toolset_selection', '-'))}"
+        )
+        disabled = config_sources.get("global_disabled_toolsets") or []
+        if disabled:
+            print(
+                "  Globally disabled: "
+                + ", ".join(safe(value) for value in disabled)
+            )
+    print(f"  Visible tools ({len(diag['tools_visible'])}): {visible}")
+    tool_search = diag.get("tool_search") or {}
+    if tool_search:
+        state = "active" if tool_search.get("activated") else "inactive"
+        print(
+            f"  Tool search: {state}; deferred={tool_search.get('deferred', 0)} "
+            f"tokens~{tool_search.get('deferred_tokens', 0)} "
+            f"tier={tool_search.get('tier', 0)} "
+            f"listing={safe(tool_search.get('listing_form', 'none'))}"
+        )
+
+    provider_tools = diag.get("provider_tools") or {}
+    if provider_tools:
+        print("  Provider tools:")
+        for name, info in provider_tools.items():
+            status = safe(info.get("skipped_reason") or "ok")
+            extra = ""
+            if name == "mcp" and info.get("configured_servers"):
+                extra = " servers=" + ",".join(
+                    safe(value) for value in info["configured_servers"]
+                )
+            elif name == "plugins" and info.get("toolsets"):
+                extra = " toolsets=" + ",".join(
+                    safe(value) for value in info["toolsets"]
+                )
+            print(
+                f"    {safe(name)}: provider={safe(info.get('provider'))} "
+                f"schemas={info.get('schemas', 0)} "
+                f"injected={info.get('injected', 0)} "
+                f"status={status}{extra}"
+            )
+
+    filtered = diag.get("filtered") or []
+    print(f"  Filtered tools ({len(filtered)}):")
+    for item in filtered[:50]:
+        print(
+            f"    {safe(item['tool'])} ({safe(item['toolset'])}): "
+            f"{safe(item['reason'])}"
+        )
+    if len(filtered) > 50:
+        print(f"    ... {len(filtered) - 50} more; use --json for full output")
+
+    conflicts = diag.get("conflicts") or []
+    print(f"  Conflicts ({len(conflicts)}):")
+    for item in conflicts:
+        print(f"    {safe(item['tool'])}: {safe(item['reason'])}")
+
+
+@contextlib.contextmanager
+def _suppress_diagnostic_output():
+    """Discard provider output and expose a safe original-FD emitter."""
+    with _diagnostic_output_lock, open(os.devnull, "w", encoding="utf-8") as sink:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+        saved_fds = {}
+        try:
+            for fd in (1, 2):
+                saved_fds[fd] = os.dup(fd)
+            for fd in (1, 2):
+                os.dup2(sink.fileno(), fd)
+        except OSError as exc:
+            for fd, saved_fd in saved_fds.items():
+                try:
+                    os.dup2(saved_fd, fd)
+                except OSError:
+                    pass
+            for saved_fd in saved_fds.values():
+                try:
+                    os.close(saved_fd)
+                except OSError:
+                    pass
+            raise RuntimeError("could not quarantine diagnostic output") from exc
+
+        def emit(stdout_text: str = "", stderr_text: str = "") -> None:
+            for fd, text in ((1, stdout_text), (2, stderr_text)):
+                if not text:
+                    continue
+                pending = memoryview(text.encode("utf-8", errors="replace"))
+                while pending:
+                    try:
+                        written = os.write(saved_fds[fd], pending)
+                    except InterruptedError:
+                        continue
+                    pending = pending[written:]
+
+        try:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                yield emit
+        finally:
+            try:
+                sink.flush()
+            except Exception:
+                pass
+            for fd, saved_fd in saved_fds.items():
+                try:
+                    os.dup2(saved_fd, fd)
+                except OSError:
+                    pass
+            for saved_fd in saved_fds.values():
+                try:
+                    os.close(saved_fd)
+                except OSError:
+                    pass
+
+
+def _render_tools_diagnose_result(diag, platform, json_mode, valid_platforms):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        if diag is not None:
+            if json_mode:
+                print(_json.dumps(diag, indent=2, sort_keys=True))
+            else:
+                _print_tools_diagnostics(diag)
+            return stdout.getvalue(), stderr.getvalue(), 0
+
+        valid = sorted(valid_platforms)
+        message = f"Unknown platform '{platform}'. Valid: {', '.join(valid)}"
+        if json_mode:
+            print(
+                _json.dumps(
+                    {
+                        "error": {
+                            "code": "unknown_platform",
+                            "message": message,
+                            "platform": platform,
+                            "valid_platforms": valid,
+                        }
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"✗ {_terminal_safe_text(message)}", file=sys.stderr)
+    return stdout.getvalue(), stderr.getvalue(), 2
+
+
+def tools_diagnose_command(args):
+    """Print a pre-startup projection of one platform's tool surface."""
+    platform = getattr(args, "platform", "cli")
+    json_mode = bool(getattr(args, "json", False))
+
+    from hermes_cli.plugins import diagnostic_plugin_inspection
+    from tools.registry import read_only_tool_inspection
+
+    with _suppress_diagnostic_output() as emit:
+        with (
+            diagnostic_config_inspection(),
+            _diagnostic_tool_module_inspection(),
+            read_only_tool_inspection(),
+            diagnostic_plugin_inspection(),
+        ):
+            config = load_config_for_diagnostics()
+            from tools.registry import discover_builtin_tools
+
+            discover_builtin_tools()
+            valid_platforms = _known_tool_platforms()
+            diag = (
+                build_tools_diagnostics(config, platform)
+                if platform in valid_platforms
+                else None
+            )
+        stdout_text, stderr_text, result = _render_tools_diagnose_result(
+            diag,
+            platform,
+            json_mode,
+            valid_platforms,
+        )
+        if os.environ.get("HERMES_TOOLS_DIAGNOSE_READ_ONLY") == "1":
+            emit(stdout_text, stderr_text)
+            os._exit(result)
+
+    sys.stdout.write(stdout_text)
+    sys.stderr.write(stderr_text)
+    return result
 
 
 def tools_disable_enable_command(args):

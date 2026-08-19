@@ -31,6 +31,14 @@ def managed_nous_tools_enabled(*, force_fresh: bool = False) -> bool:
     reflect a just-purchased subscription, credits, or pool grant immediately.
     """
     try:
+        from tools.registry import is_read_only_tool_inspection
+
+        if is_read_only_tool_inspection():
+            return False
+    except Exception:
+        pass
+
+    try:
         from hermes_cli.nous_account import get_nous_portal_account_info
 
         if force_fresh:

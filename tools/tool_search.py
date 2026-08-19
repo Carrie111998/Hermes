@@ -47,7 +47,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from tools.registry import tool_error
 
@@ -385,7 +385,26 @@ def _classify_source(name: str) -> Tuple[str, str]:
         return ("other", "")
 
 
-def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
+def deferred_sources_from_registry_entries(
+    entries: Mapping[str, Any],
+) -> Dict[str, Tuple[str, str]]:
+    """Derive deferred source labels from request-pinned registry entries."""
+    core_names = _core_tool_names()
+    sources: Dict[str, Tuple[str, str]] = {}
+    for name, entry in entries.items():
+        if name in core_names or name in BRIDGE_TOOL_NAMES:
+            continue
+        toolset = str(getattr(entry, "toolset", "") or "")
+        source = "mcp" if toolset.startswith("mcp-") else "plugin"
+        sources[name] = (source, toolset)
+    return sources
+
+
+def build_catalog(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    deferred_sources: Optional[Mapping[str, Tuple[str, str]]] = None,
+) -> List[CatalogEntry]:
     """Build the deferred-tool catalog from a tool-defs list.
 
     Caller is expected to pass only the deferrable subset (``classify_tools``
@@ -398,7 +417,10 @@ def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
         if not name:
             continue
         desc = fn.get("description", "") or ""
-        source, source_name = _classify_source(name)
+        if deferred_sources is None:
+            source, source_name = _classify_source(name)
+        else:
+            source, source_name = deferred_sources.get(name, ("other", ""))
         entry = CatalogEntry(
             name=name,
             description=desc,
@@ -894,10 +916,13 @@ def _available_source_summary(catalog: List[CatalogEntry]) -> List[Dict[str, Any
     ]
 
 
-def dispatch_tool_search(args: Dict[str, Any],
-                         *,
-                         current_tool_defs: List[Dict[str, Any]],
-                         config: Optional[ToolSearchConfig] = None) -> str:
+def dispatch_tool_search(
+    args: Dict[str, Any],
+    *,
+    current_tool_defs: List[Dict[str, Any]],
+    config: Optional[ToolSearchConfig] = None,
+    deferred_sources: Optional[Mapping[str, Tuple[str, str]]] = None,
+) -> str:
     """Execute the ``tool_search`` bridge tool. Returns a JSON string."""
     if config is None:
         config = load_config()
@@ -911,8 +936,15 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
-    catalog = build_catalog(deferrable)
+    if deferred_sources is None:
+        _, deferrable = classify_tools(current_tool_defs)
+    else:
+        deferrable = [
+            td
+            for td in current_tool_defs
+            if (td.get("function") or {}).get("name") in deferred_sources
+        ]
+    catalog = build_catalog(deferrable, deferred_sources=deferred_sources)
     hits = search_catalog(catalog, query, limit=limit)
     result: Dict[str, Any] = {
         "query": query,
@@ -930,19 +962,34 @@ def dispatch_tool_search(args: Dict[str, Any],
     return json.dumps(result, ensure_ascii=False)
 
 
-def dispatch_tool_describe(args: Dict[str, Any],
-                           *,
-                           current_tool_defs: List[Dict[str, Any]]) -> str:
+def dispatch_tool_describe(
+    args: Dict[str, Any],
+    *,
+    current_tool_defs: List[Dict[str, Any]],
+    deferred_sources: Optional[Mapping[str, Tuple[str, str]]] = None,
+) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     name = str(args.get("name") or "").strip()
     if not name:
         return tool_error("name is required")
-    if not is_deferrable_tool_name(name):
+    is_deferred = (
+        is_deferrable_tool_name(name)
+        if deferred_sources is None
+        else name in deferred_sources
+    )
+    if not is_deferred:
         return tool_error(
             f"'{name}' is not a deferrable tool. If you see it in the tools list "
             "already, call it directly; otherwise check the spelling against tool_search."
         )
-    _, deferrable = classify_tools(current_tool_defs)
+    if deferred_sources is None:
+        _, deferrable = classify_tools(current_tool_defs)
+    else:
+        deferrable = [
+            td
+            for td in current_tool_defs
+            if (td.get("function") or {}).get("name") in deferred_sources
+        ]
     for td in deferrable:
         fn = td.get("function") or {}
         if fn.get("name") == name:
@@ -976,7 +1023,11 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     return frozenset(names)
 
 
-def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
+def validate_deferred_call_args(
+    name: str,
+    args: Dict[str, Any],
+    tool_defs: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
     """Probe-validate ``tool_call`` arguments against the deferred tool's schema.
 
     A deferred tool's parameter schema is invisible to the model until it
@@ -999,8 +1050,19 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
     call should dispatch.
     """
     try:
-        from tools.registry import registry as _registry
-        schema = _registry.get_schema(name)
+        if tool_defs is None:
+            from tools.registry import registry as _registry
+
+            schema = _registry.get_schema(name)
+        else:
+            schema = next(
+                (
+                    tool
+                    for tool in tool_defs
+                    if (tool.get("function") or {}).get("name") == name
+                ),
+                None,
+            )
         if not isinstance(schema, dict):
             return None
         fn = schema.get("function") if schema.get("type") == "function" else schema
@@ -1029,7 +1091,10 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(
+    args: Dict[str, Any],
+    allowed_names=None,
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:
@@ -1054,7 +1119,11 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
-    if not is_deferrable_tool_name(name):
+    if (
+        name not in allowed_names
+        if allowed_names is not None
+        else not is_deferrable_tool_name(name)
+    ):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
