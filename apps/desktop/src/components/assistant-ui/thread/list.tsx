@@ -18,7 +18,7 @@ import {
 import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 
 import {
-  type TranscriptIdentity,
+  transcriptIdentityFromRuntimeExtras,
   TranscriptIdentityProvider
 } from '@/components/assistant-ui/thread/transcript-identity'
 import { usePaneLifecycle } from '@/components/pane-shell/pane-visibility'
@@ -177,33 +177,6 @@ interface ThreadMessageListProps {
   emptyPlaceholder?: ReactNode
   loadingIndicator?: ReactNode
   sessionKey?: string | null
-  transcriptIdentity: TranscriptIdentity
-}
-
-export interface TranscriptIdentitySnapshot {
-  identity: TranscriptIdentity
-  signature: string
-}
-
-export function nextTranscriptIdentitySnapshot(
-  previous: TranscriptIdentitySnapshot,
-  signature: string,
-  candidate: TranscriptIdentity
-): TranscriptIdentitySnapshot {
-  const sameSignature = previous.signature === signature
-  const sameSession = previous.identity.runtimeId === candidate.runtimeId
-
-  // During navigation the destination identity can publish before assistant-ui
-  // replaces the outgoing rows. Keep those rows owned by their source session.
-  if (sameSignature && !sameSession) {
-    return previous
-  }
-
-  if (sameSignature && previous.identity.cwd === candidate.cwd) {
-    return previous
-  }
-
-  return { identity: candidate, signature }
 }
 
 // Group each user message with the assistant turn(s) that follow it so the
@@ -392,8 +365,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   components,
   emptyPlaceholder,
   loadingIndicator,
-  sessionKey,
-  transcriptIdentity
+  sessionKey
 }) => {
   // TWO signatures, deliberately split. The STRUCTURAL one (ids/roles/count)
   // changes only when messages are added/removed/swapped — it keys the error
@@ -407,16 +379,12 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     s.thread.messages.map((message, index) => `${index}:${message.id}:${message.role}`).join('\n')
   )
 
-  const [identitySnapshot, setIdentitySnapshot] = useState<TranscriptIdentitySnapshot>(() => ({
-    identity: transcriptIdentity,
-    signature: structuralSignature
-  }))
-
-  const nextIdentitySnapshot = nextTranscriptIdentitySnapshot(identitySnapshot, structuralSignature, transcriptIdentity)
-
-  if (nextIdentitySnapshot !== identitySnapshot) {
-    setIdentitySnapshot(nextIdentitySnapshot)
-  }
+  // The runtime extras are adopted in the same adapter update as the message
+  // repository. That is the authoritative transcript boundary: unlike a
+  // structural message signature, it distinguishes branch-equivalent sessions
+  // while still leaving outgoing rows under their source identity during the
+  // intermediate navigation commit.
+  const transcriptIdentity = useAuiState(s => transcriptIdentityFromRuntimeExtras(s.thread.extras))
 
   const weightSignature = useAuiState(s =>
     s.thread.messages.map(message => messagePaintWeight(message.content)).join(',')
@@ -826,7 +794,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
                 {t.assistant.thread.showEarlier}
               </button>
             )}
-            <TranscriptIdentityProvider value={identitySnapshot.identity}>{rows}</TranscriptIdentityProvider>
+            <TranscriptIdentityProvider value={transcriptIdentity}>{rows}</TranscriptIdentityProvider>
             {loadingIndicator}
             {clampToComposer && (
               <div
