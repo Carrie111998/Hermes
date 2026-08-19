@@ -382,6 +382,40 @@ class TestRunJob:
         assert fired == ["exec-native"]
 
     @pytest.mark.asyncio
+    async def test_run_job_setup_failure_aborts_claim_once(self, adapter):
+        app = _create_app(adapter)
+        claimed = {
+            "id": VALID_JOB_ID,
+            "fire_claim": {"by": "api-owner"},
+            "execution_id": "exec-api-failure",
+        }
+        aborted = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                return dict(claimed)
+
+            def dispatch_claimed_fire(self, job, **kwargs):
+                raise RuntimeError("api dispatch setup failed")
+
+            def abort_claimed_fire(self, job, error):
+                aborted.append((job, error))
+
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch(
+            "cron.scheduler_provider.resolve_cron_scheduler",
+            return_value=Provider(),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+
+        assert response.status == 500
+        assert aborted == [(claimed, "api dispatch setup failed")]
+
+    @pytest.mark.asyncio
     async def test_run_job_claim_loss_rechecks_deleted_job(self, adapter):
         app = _create_app(adapter)
 

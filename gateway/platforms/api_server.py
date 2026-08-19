@@ -1172,6 +1172,29 @@ def _fire_claim_kwargs(provider, adapters, loop):
     return kwargs, cancel_event
 
 
+def _dispatch_claimed_api_fire(provider, claimed_job, adapter, reservation, adapters, loop):
+    fire_kwargs, cancel_event = _fire_claim_kwargs(provider, adapters, loop)
+
+    def submit(worker):
+        _detach_api_task(
+            adapter,
+            reservation,
+            _run_thread_until_terminal(worker, abort_event=cancel_event),
+        )
+
+    dispatch = getattr(provider, "dispatch_claimed_fire", None)
+    if callable(dispatch):
+        return dispatch(claimed_job, **fire_kwargs, submit=submit)
+    submit(lambda: provider.fire_claimed(claimed_job, **fire_kwargs))
+    return True
+
+
+def _abort_claimed_api_fire(provider, claimed_job, error):
+    abort = getattr(provider, "abort_claimed_fire", None)
+    if callable(abort):
+        abort(claimed_job, error)
+
+
 @contextmanager
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits.
@@ -5979,13 +6002,24 @@ class APIServerAdapter(BasePlatformAdapter):
                          "status": "duplicate" if fresh_execution else "not_admitted"}, status=200,
                     )
 
-                loop = asyncio.get_running_loop()
-                runner = self.gateway_runner or request.app.get("gateway_runner")
-                adapters = getattr(runner, "adapters", None) or None
-                fire_kwargs, cancel_event = _fire_claim_kwargs(provider, adapters, loop)
-                _detach_api_task(self, reservation, _run_thread_until_terminal(
-                    provider.fire_claimed, claimed_job, abort_event=cancel_event, **fire_kwargs
-                ))
+                try:
+                    loop = asyncio.get_running_loop()
+                    runner = self.gateway_runner or request.app.get("gateway_runner")
+                    adapters = getattr(runner, "adapters", None) or None
+                    dispatched = _dispatch_claimed_api_fire(
+                        provider, claimed_job, self, reservation, adapters, loop
+                    )
+                except BaseException as setup_error:
+                    _abort_claimed_api_fire(
+                        provider,
+                        claimed_job, str(setup_error) or type(setup_error).__name__
+                    )
+                    raise
+                if not dispatched:
+                    return web.json_response(
+                        {"error": "cron run dispatch failed", "job_id": job_id},
+                        status=503,
+                    )
                 execution = execution_projection(execution_id, job_id=job_id,
                                                   source=provider_source, status="claimed")
                 return web.json_response(
@@ -6139,10 +6173,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=200,
                 )
 
-            fire_kwargs, cancel_event = _fire_claim_kwargs(provider, adapters, loop)
-            _detach_api_task(self, reservation, _run_thread_until_terminal(
-                provider.fire_claimed, claimed_job, abort_event=cancel_event, **fire_kwargs
-            ))
+            try:
+                dispatched = _dispatch_claimed_api_fire(
+                    provider, claimed_job, self, reservation, adapters, loop
+                )
+            except BaseException as dispatch_error:
+                _abort_claimed_api_fire(
+                    provider,
+                    claimed_job, str(dispatch_error) or type(dispatch_error).__name__
+                )
+                if not isinstance(dispatch_error, Exception):
+                    raise
+                logger.error("cron fire dispatch failed for %s: %s", job_id, dispatch_error)
+                return web.json_response(
+                    {"error": "cron fire dispatch failed", "job_id": job_id},
+                    status=503,
+                )
+            if not dispatched:
+                return web.json_response(
+                    {"error": "cron fire dispatch failed", "job_id": job_id},
+                    status=503,
+                )
 
             return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 

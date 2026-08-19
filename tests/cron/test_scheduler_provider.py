@@ -20,6 +20,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -420,6 +422,88 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     assert claimed["execution_id"] == "exec-1"
     assert provider.fire_claimed(claimed) is True
     assert events == ["ledger", "claim", ("run", "exec-1")]
+
+
+def test_dispatch_claimed_fire_aborts_provider_exception(monkeypatch):
+    """A provider failure after admission closes both durable records."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    marked = []
+    finished = []
+    monkeypatch.setattr(
+        jobs,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        executions,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)) or {},
+    )
+
+    provider = InProcessCronScheduler()
+
+    def fail_fire(_job, **_kwargs):
+        raise RuntimeError("provider fire failed")
+
+    monkeypatch.setattr(provider, "fire_claimed", fail_fire)
+    claimed = {
+        "id": "provider-failure",
+        "fire_claim": {"by": "owner-1"},
+        "execution_id": "execution-1",
+    }
+
+    assert provider.dispatch_claimed_fire(claimed) is False
+    assert marked == [
+        (
+            ("provider-failure", False, "provider fire failed"),
+            {"expected_fire_owner": "owner-1"},
+        )
+    ]
+    assert finished == [
+        (
+            ("execution-1",),
+            {"success": False, "error": "provider fire failed"},
+        )
+    ]
+
+
+def test_dispatch_claimed_fire_aborts_process_control_and_reraises(monkeypatch):
+    """Control-flow interrupts close the attempt before propagating."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    marked = []
+    finished = []
+    monkeypatch.setattr(
+        jobs,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        executions,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)) or {},
+    )
+    provider = InProcessCronScheduler()
+
+    def stop_fire(_job, **_kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(provider, "fire_claimed", stop_fire)
+    claimed = {
+        "id": "provider-interrupt",
+        "fire_claim": {"by": "owner-2"},
+        "execution_id": "execution-2",
+    }
+
+    with pytest.raises(KeyboardInterrupt):
+        provider.dispatch_claimed_fire(claimed)
+    assert marked and marked[0][0] == ("provider-interrupt", False, "KeyboardInterrupt")
+    assert finished and finished[0][0] == ("execution-2",)
 
 
 def test_claim_fire_replay_does_not_dispatch_twice():

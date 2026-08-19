@@ -341,10 +341,24 @@ def _jobs_lock(*, require_cross_process: bool = False):
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
                                 if require_cross_process:
+                                    logger.error(
+                                        "Timed out after %.0fs waiting for the cron "
+                                        "jobs lock (%s) — durable keyed create "
+                                        "fails closed",
+                                        _JOBS_LOCK_TIMEOUT_SECONDS,
+                                        _jobs_lock_file(),
+                                    )
                                     raise CronStoreLockUnavailable(
                                         "timed out acquiring the durable cron store lock; "
                                         "retry the keyed create"
                                     )
+                                logger.error(
+                                    "Timed out after %.0fs waiting for the cron "
+                                    "jobs lock (%s) — proceeding with "
+                                    "in-process locking only",
+                                    _JOBS_LOCK_TIMEOUT_SECONDS,
+                                    _jobs_lock_file(),
+                                )
                                 lock_fd.close()
                                 lock_fd = None
                                 break
@@ -371,7 +385,14 @@ def _jobs_lock(*, require_cross_process: bool = False):
                         pass
                     finally:
                         lock_fd.close()
+                        lock_fd = None
         finally:
+            if lock_fd is not None and require_cross_process:
+                try:
+                    lock_fd.close()
+                except OSError:
+                    pass
+                lock_fd = None
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
 
@@ -1783,7 +1804,7 @@ def _validate_job_mode_invariants(
         )
 
 
-def create_job(
+def _create_job(
     prompt: Optional[str],
     schedule: str,
     name: Optional[str] = None,
@@ -1804,7 +1825,8 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     dedup_key: Optional[str] = None,
-) -> Dict[str, Any]:
+    _return_creation: bool = False,
+) -> Union[Dict[str, Any], Tuple[Dict[str, Any], bool]]:
     """
     Create a new cron job.
 
@@ -2006,16 +2028,28 @@ def create_job(
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
 
-    with _jobs_lock(require_cross_process=normalized_dedup_key is not None):
+    lock = (
+        _jobs_lock(require_cross_process=True)
+        if normalized_dedup_key is not None
+        else _jobs_lock()
+    )
+    with lock:
         jobs = load_jobs()
         if normalized_dedup_key is not None:
             for existing in jobs:
                 if _normalize_dedup_key(existing.get("dedup_key")) == normalized_dedup_key:
-                    return _normalize_job_record(existing)
+                    replay = _normalize_job_record(existing)
+                    return (replay, False) if _return_creation else replay
         jobs.append(job)
         save_jobs(jobs)
 
-    return job
+    return (job, True) if _return_creation else job
+
+
+def create_job(*args, **kwargs) -> Dict[str, Any]:
+    """Create one job and always return its public dict record."""
+    kwargs.pop("_return_creation", None)
+    return _create_job(*args, **kwargs)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:

@@ -31,7 +31,7 @@ class TestCronjobRunExecutesImmediately:
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
-             patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed) as m_claim, \
+             patch("cron.jobs.claim_job_for_fire", return_value=claimed) as m_claim, \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=ran):
             out = json.loads(cronjob(action="run", job_id="job-run-1"))
@@ -40,7 +40,9 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-run-1", return_job=True)
-        m_run.assert_called_once_with(claimed, adapters=None, loop=None, extra_prompt=None)
+        m_run.assert_called_once_with(
+            claimed, adapters=None, loop=None, extra_prompt=None,
+        )
 
     def test_run_reconciles_external_provider_after_claimed_execution(self):
         """A direct run must re-arm Chronos after it advances next_run_at.
@@ -53,7 +55,7 @@ class TestCronjobRunExecutesImmediately:
         ran = {"id": "job-run-1", "last_status": "ok", "last_error": None}
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
-             patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
+             patch("cron.jobs.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job",
                    side_effect=lambda *a, **kw: order.append("run") or True), \
              patch("tools.cronjob_tools.get_job", return_value=ran), \
@@ -73,9 +75,8 @@ class TestCronjobRunExecutesImmediately:
         failed = {"id": "job-run-1", "last_status": "error", "last_error": "provider 500"}
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
-             patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
+             patch("cron.jobs.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job", side_effect=RuntimeError("boom")), \
-             patch("tools.cronjob_tools.mark_job_run"), \
              patch("tools.cronjob_tools.get_job", return_value=failed), \
              patch("tools.cronjob_tools._notify_provider_jobs_changed_safe") as m_notify:
             out = json.loads(cronjob(action="run", job_id="job-run-1"))
@@ -87,7 +88,7 @@ class TestCronjobRunExecutesImmediately:
     def test_run_skips_when_claim_lost(self):
         """If the scheduler already holds the fire claim, do NOT double-run."""
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
-             patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
+             patch("cron.jobs.claim_job_for_fire", return_value=False), \
              patch("cron.scheduler.run_one_job") as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)), \
              patch("tools.cronjob_tools._notify_provider_jobs_changed_safe") as m_notify:
@@ -105,7 +106,7 @@ class TestCronjobRunExecutesImmediately:
         failed = {"id": "job-run-1", "last_status": "error", "last_error": "provider 500"}
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
-             patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
+             patch("cron.jobs.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job", return_value=True), \
              patch("tools.cronjob_tools.get_job", return_value=failed):
             out = json.loads(cronjob(action="run", job_id="job-run-1"))
@@ -116,7 +117,7 @@ class TestCronjobRunExecutesImmediately:
 
     def test_execute_job_now_bails_without_claim(self):
         """_execute_job_now never calls run_one_job when the claim is lost."""
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
+        with patch("cron.jobs.claim_job_for_fire", return_value=False), \
              patch("cron.scheduler.run_one_job") as m_run:
             res = _execute_job_now(dict(_JOB))
         assert res["claimed"] is False
@@ -130,45 +131,45 @@ class TestCronjobRunExecutesImmediately:
         runner = SimpleNamespace(adapters=adapters, _gateway_loop=gateway_loop)
         completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
 
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+        with patch("cron.jobs.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
              patch("gateway.run._gateway_runner_ref", return_value=runner), \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=completed):
             res = _execute_job_now(dict(_JOB))
 
         assert res["success"] is True
-        m_run.assert_called_once_with(
-            {**_JOB, "fire_claim": {"by": "manual-owner"}},
-            adapters=adapters,
-            loop=gateway_loop,
-            extra_prompt=None,
-        )
+        m_run.assert_called_once()
+        assert m_run.call_args.args[0]["fire_claim"] == {"by": "manual-owner"}
+        assert m_run.call_args.kwargs == {
+            "adapters": adapters, "loop": gateway_loop, "extra_prompt": None,
+        }
 
     def test_execute_job_now_remains_standalone_without_gateway(self):
         """CLI-only runs retain the standalone delivery path."""
         completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
 
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+        with patch("cron.jobs.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
              patch.dict(sys.modules, {"gateway.run": None}), \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=completed):
             res = _execute_job_now(dict(_JOB))
 
         assert res["success"] is True
-        m_run.assert_called_once_with(
-            {**_JOB, "fire_claim": {"by": "manual-owner"}},
-            adapters=None,
-            loop=None,
-            extra_prompt=None,
-        )
+        m_run.assert_called_once()
+        assert m_run.call_args.args[0]["fire_claim"] == {"by": "manual-owner"}
+        assert m_run.call_args.kwargs == {
+            "adapters": None, "loop": None, "extra_prompt": None,
+        }
 
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
+        with patch("cron.jobs.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job", side_effect=RuntimeError("boom")), \
-             patch("tools.cronjob_tools.mark_job_run") as m_mark, \
-             patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
+             patch("cron.jobs.mark_job_run") as m_mark, \
+             patch("tools.cronjob_tools.get_job", return_value={
+                 **_JOB, "last_status": "error", "last_error": "boom",
+             }):
             res = _execute_job_now(dict(_JOB))
         assert res["claimed"] is True
         assert res["success"] is False
@@ -199,7 +200,7 @@ class TestCronjobRunExecutesImmediately:
                 assert heartbeat_seen.wait(timeout=5.0), "no heartbeat within 5s"
                 return True
 
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
                  patch("tools.cronjob_tools._CRON_RUN_HEARTBEAT_INTERVAL", 0.05), \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run) as m_run, \
                  patch("tools.cronjob_tools.get_job",
@@ -217,7 +218,7 @@ class TestCronjobRunExecutesImmediately:
         heartbeat thread is never started and behavior is unchanged."""
         set_activity_callback(None)
         try:
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}), \
@@ -248,7 +249,7 @@ class TestCronjobRunExecutesImmediately:
                 time.sleep(0.2)
                 return True
 
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
                  patch("tools.cronjob_tools._CRON_RUN_HEARTBEAT_INTERVAL", 0.05), \
                  patch("tools.cronjob_tools._CRON_RUN_HEARTBEAT_CEILING", 0.0), \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run), \
@@ -281,7 +282,7 @@ class TestCronjobRunExecutesImmediately:
                     "heartbeat stopped after one callback exception"
                 return True
 
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
                  patch("tools.cronjob_tools._CRON_RUN_HEARTBEAT_INTERVAL", 0.05), \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run), \
                  patch("tools.cronjob_tools.get_job",
