@@ -610,10 +610,15 @@ export default class Ink {
     // if we continue with the pre-blur virtual cursor/backbuffer, only the
     // next small dirty region may repaint and stale status/progress rows can
     // remain visible. Defer one tick so TerminalFocusProvider subscribers
-    // observe the new focus state first, then repaint from a blank virtual
-    // frame. Do not clear the physical screen or re-assert terminal modes:
-    // focus reporting is already active, and those writes cause visible
-    // flicker while resending unnecessary DECRESET sequences.
+    // observe the new focus state first, then reset the virtual frames and
+    // repaint from scratch.
+    //
+    // The clear is required (a row that is BLANK in the new frame is skipped
+    // by the diff, so a stale row survives a buffer-only reset), but it is
+    // queued via needsEraseBeforePaint rather than written directly: that
+    // folds it into this frame's patch list so clear+paint reach the terminal
+    // in ONE write. forceRedraw()'s separate stdout.write(ERASE_SCREEN) is
+    // what makes an ordinary tab switch flash a blank screen.
     queueMicrotask(() => {
       if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
         return
@@ -626,6 +631,7 @@ export default class Ink {
         this.invalidatePrevFrame()
       }
 
+      this.needsEraseBeforePaint = true
       this.onRender()
     })
   }
@@ -1040,6 +1046,23 @@ export default class Ink {
       }
 
       optimized.push(this.altScreenParkPatch)
+    } else if (this.needsEraseBeforePaint) {
+      // Main screen (INLINE_MODE / Termux). Same atomicity contract as the
+      // alt-screen branch above: fold the clear into this frame's patch list
+      // so clear+paint land in one write instead of a bare
+      // stdout.write(ERASE_SCREEN) followed by the frame. No cursor park —
+      // main-screen cursor position is meaningful (it's the prompt row) and
+      // log-update already restores it. No CSI 3J: scrollback is the user's
+      // history here, not a resize artifact.
+      //
+      // Always consume the flag, but only emit the clear when this frame
+      // actually repaints: a queued erase riding a later incremental frame
+      // (spinner tick) would wipe content that frame doesn't redraw.
+      this.needsEraseBeforePaint = false
+
+      if (hasDiff) {
+        optimized.unshift(ERASE_THEN_HOME_PATCH)
+      }
     }
 
     // Native cursor positioning: park the terminal cursor at the declared
