@@ -1317,7 +1317,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             try:
                 def _execute(next_args: dict[str, Any]) -> Any:
-                    return agent._invoke_tool(
+                    from tools.foreground_wait import track_foreground_wait
+
+                    with track_foreground_wait(
+                        agent, str(tool_call.id), function_name, next_args
+                    ):
+                        return agent._invoke_tool(
                         function_name,
                         next_args,
                         effective_task_id,
@@ -2348,7 +2353,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                        from tools.foreground_wait import track_foreground_wait
+
+                        with track_foreground_wait(
+                            agent, str(tool_call.id), function_name, next_args
+                        ):
+                            return _ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
@@ -2430,7 +2440,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
+                        from tools.foreground_wait import track_foreground_wait
+
+                        with track_foreground_wait(
+                            agent, str(tool_call.id), function_name, next_args
+                        ):
+                            return _ra().handle_function_call(
                             function_name,
                             next_args,
                             effective_task_id,
