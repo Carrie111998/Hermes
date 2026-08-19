@@ -182,6 +182,9 @@ export interface NativeNotificationInput {
   activate?: string
   /** Renderer-side handle so click/action can invoke registered callbacks. */
   notifyId?: string
+  /** Approval correlation id — echoed back on action/body-click so the
+   *  renderer can resolve the exact pending approval (not just FIFO). */
+  requestId?: string
 }
 
 /** Returns true when the notification passed every guard and was handed to the
@@ -213,6 +216,7 @@ export function dispatchNativeNotification(input: NativeNotificationInput): bool
     icon: input.icon,
     kind: input.kind,
     notifyId: input.notifyId,
+    requestId: input.requestId,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,
     tag: input.tag,
@@ -345,7 +349,13 @@ export function dispatchPluginNativeNotification(pluginId: string, input: Plugin
 
 // Resolve a pending approval from a notification button, mirroring the in-app
 // Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+// `requestId` (when present) pins the response to the exact pending approval
+// instead of the FIFO fallback, matching the in-app bar's correlation contract.
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  requestId?: null | string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
@@ -359,7 +369,11 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
+    await gateway.request('approval.respond', {
+      choice,
+      request_id: requestId || undefined,
+      session_id: sessionId ?? undefined
+    })
     clearApprovalRequest(sessionId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.

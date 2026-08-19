@@ -13697,6 +13697,21 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
       mainWindow.webContents.send('hermes:focus-session', payload.sessionId)
     }
 
+    // Windows (and Linux) drop notification action buttons — only signed macOS
+    // builds render them. For an approval toast the body click is the only
+    // affordance, so treat it as an explicit Approve (once) instead of a
+    // no-op that strands the agent until the approval timeout (#89111). The
+    // renderer still clears the parked prompt and the in-app bar stands down.
+    if (payload?.kind === 'approval' && payload?.sessionId && !payload?.notifyId && !payload?.activate) {
+      mainWindow.webContents.send('hermes:notification-action', {
+        actionId: 'approve',
+        requestId: payload?.requestId,
+        sessionId: payload.sessionId
+      })
+
+      return
+    }
+
     // Plugin / session-less activation — serializable path (+ optional notifyId
     // for renderer callbacks). Same vocabulary as hermes://index-network/….
     if (payload?.activate || payload?.notifyId) {
@@ -13720,7 +13735,11 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
 
     // Approvals keep the existing session-scoped channel.
     if (payload?.sessionId && !payload?.notifyId && !payload?.activate) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload.sessionId, actionId: action.id })
+      mainWindow.webContents.send('hermes:notification-action', {
+        actionId: action.id,
+        requestId: payload?.requestId,
+        sessionId: payload.sessionId
+      })
 
       return
     }

@@ -1348,6 +1348,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           ],
           body: command || description,
           kind: 'approval',
+          requestId: typeof payload?.request_id === 'string' ? payload.request_id : undefined,
           sessionId,
           title: translateNow('notifications.native.approvalTitle')
         })

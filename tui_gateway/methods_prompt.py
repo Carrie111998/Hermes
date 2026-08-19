@@ -6,7 +6,10 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 
 from .method_ctx import HandlerRegistry
 
+import logging
 import types
+
+logger = logging.getLogger(__name__)
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -1497,10 +1500,27 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
+        # Diagnostic (#89111): an approval.respond that cannot resolve its
+        # session is the #89206 routing class — the click landed on a backend
+        # that never heard of the session. Log it loudly.
+        logger.warning(
+            "APPROVAL_RESPOND session lookup failed: params=%s err=%s",
+            {k: v for k, v in (params or {}).items() if k != "choice"},
+            err,
+        )
         return err
     try:
         from tools.approval import resolve_gateway_approval
 
+        # Diagnostic (#89111): log the resolution attempt with the session key
+        # and request id so a wrong-key / empty-queue miss is visible.
+        logger.info(
+            "APPROVAL_RESPOND session_key=%s choice=%s request_id=%s resolve_all=%s",
+            session.get("session_key"),
+            params.get("choice", "deny"),
+            params.get("request_id"),
+            params.get("all", False),
+        )
         return _ok(
             rid,
             {

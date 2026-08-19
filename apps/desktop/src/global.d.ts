@@ -398,7 +398,7 @@ declare global {
       }) => Promise<{ ok: boolean; pluginName?: string; path?: string; error?: string }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
-      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      onNotificationAction?: (callback: (payload: { actionId: string; requestId?: string; sessionId?: string }) => void) => () => void
       /** Plugin (and other session-less) notification body/action activation. */
       onNotificationActivate?: (
         callback: (payload: { actionId?: string; activate?: string; notifyId?: string; tag?: string }) => void
@@ -1109,6 +1109,9 @@ export interface HermesNotification {
   activate?: string
   /** Renderer handle for onActivate / onAction callbacks. */
   notifyId?: string
+  /** Approval correlation id — echoed back on action/body-click so the
+   *  renderer can resolve the exact pending approval (not just FIFO). */
+  requestId?: string
   actions?: { id: string; text: string; activate?: string }[]
 }
 

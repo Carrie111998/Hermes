@@ -324,6 +324,26 @@ describe('respondToApprovalAction', () => {
     expect($approvalRequest.get()).toBeNull()
   })
 
+  it('threads request_id through to approval.respond when provided', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', requestId: 'r-123', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'approve', 'r-123')
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'r-123',
+      session_id: 'bg'
+    })
+    expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('omits request_id when absent (legacy FIFO path)', async () => {
+    await respondToApprovalAction('bg', 'approve', null)
+
+    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+  })
+
   it('rejects via approval.respond {choice: "deny"}', async () => {
     await respondToApprovalAction('bg', 'reject')
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
