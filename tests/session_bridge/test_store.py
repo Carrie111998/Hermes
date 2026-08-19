@@ -64,6 +64,7 @@ from session_bridge.store import (
     SIDEBAR_RETRYABLE_ERRORS,
     LocalSessionOwnsCanonicalId,
     SessionBridgeStore,
+    _external_activity_state_key,
     sidebar_precreate_terminal_evidence_digest,
     sidebar_terminal_evidence_digest,
     sidebar_unbound_terminal_evidence_digest,
@@ -14242,3 +14243,85 @@ def test_claude_visibility_new_ambiguity_invalidates_prior_absence(
     assert required_again.launch_permitted is False
     assert required_again.attempt_ordinal == 2
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 2
+
+
+def test_sidebar_candidate_query_uses_the_activity_expression_index(db) -> None:
+    """Pin the plan, not just the answer.
+
+    ``last_active`` for a Claude row is a json_extract over
+    ``session_bridge_state``.  Computing it per candidate -- and then sorting
+    the whole set before LIMIT can cut it -- made this query the scan loop's
+    largest remaining frame.  ``idx_session_bridge_state_activity`` indexes the
+    extracted value so the key lookup is covering, but SQLite only substitutes
+    the precomputed REAL when the query repeats the indexed expression
+    verbatim.  A reformat of either copy silently un-optimises the query while
+    every correctness test still passes, so assert the plan directly.
+    """
+    _sidebar_candidate(db, native_id="planned", eligible_at=100.0)
+    store = SessionBridgeStore(db)
+    store.list_sidebar_candidates(after=0.0, limit=10)
+
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' AND tbl_name = 'session_bridge_state'"
+            )
+        }
+
+    assert "idx_session_bridge_state_activity" in indexes
+
+
+def test_session_bridge_state_still_accepts_non_json_values(db) -> None:
+    """Arm the ``json_valid`` guard on the indexed expression.
+
+    Indexing ``json_extract(value_json, ...)`` makes SQLite evaluate it on
+    every write to ``session_bridge_state`` -- a table with ten unrelated
+    writers.  Without the guard this INSERT fails with "malformed JSON",
+    so an index added for the sidebar query would break callers that never
+    touch the sidebar.  Drop the guard and this test fails.
+    """
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            "INSERT INTO session_bridge_state (key, value_json, updated_at) "
+            "VALUES ('session-bridge:probe:not-json', 'plainly not json', 1.0)",
+        )
+        conn.commit()
+        stored = conn.execute(
+            "SELECT value_json FROM session_bridge_state "
+            "WHERE key = 'session-bridge:probe:not-json'"
+        ).fetchone()
+
+    assert stored["value_json"] == "plainly not json"
+
+
+def test_sidebar_candidate_with_malformed_activity_json_is_skipped(db) -> None:
+    """A corrupt activity row drops that candidate instead of failing the page.
+
+    The guarded expression yields NULL for unparseable state, which the
+    ``last_active IS NOT NULL`` filter already discards -- the same treatment
+    a Claude row with no activity record gets.  Unguarded, json_extract raises
+    and blanks the entire enumeration.
+    """
+    healthy = _sidebar_candidate(db, native_id="healthy", eligible_at=200.0)
+    corrupt = _sidebar_candidate(db, native_id="corrupt", eligible_at=100.0)
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            "UPDATE session_bridge_state SET value_json = 'not json at all' "
+            "WHERE key = ?",
+            (_external_activity_state_key(corrupt.source_session_id),),
+        )
+        conn.commit()
+
+    page = SessionBridgeStore(db).list_sidebar_candidates(after=0.0, limit=10)
+
+    assert [candidate.source_session_id for candidate in page] == [
+        healthy.source_session_id
+    ]

@@ -4559,9 +4559,13 @@ class SessionBridgeStore:
                               e.last_indexed_at, e.parser_version, e.origin_kind,
                               e.origin_bridge_id,
                               CASE
-                                  WHEN e.provider = :claude THEN CAST(json_extract(
-                                      activity.value_json, '$.last_active'
-                                  ) AS REAL)
+                                  WHEN e.provider = :claude THEN CASE
+                                      WHEN json_valid(activity.value_json) THEN CAST(
+                                          json_extract(
+                                              activity.value_json, '$.last_active'
+                                          ) AS REAL
+                                      )
+                                  END
                                   ELSE COALESCE(
                                       (SELECT MAX(message.timestamp)
                                          FROM messages AS message
@@ -4587,6 +4591,7 @@ class SessionBridgeStore:
                          LEFT JOIN external_sessions AS e
                            ON e.session_id = s.id
                          LEFT JOIN session_bridge_state AS activity
+                           INDEXED BY idx_session_bridge_state_activity
                            ON activity.key = :activity_prefix || s.id
                         WHERE (
                             (
