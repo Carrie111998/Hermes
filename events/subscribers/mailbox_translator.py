@@ -240,6 +240,62 @@ class MailboxTranslator(BaseSubscriber):
         except Exception:
             return {}
 
+    def _backfill_company_title(
+        self, payload: Dict[str, Any], *job_refs: Optional[str]
+    ) -> Dict[str, Any]:
+        """Fill missing title/company from pipeline state. Mutates and returns.
+
+        Best-effort by construction: `_pipeline_metadata` swallows every error,
+        and a producer-supplied value is never overwritten.
+        """
+        if payload.get("title") and payload.get("company"):
+            return payload
+        for ref in job_refs:
+            meta = self._pipeline_metadata(ref)
+            for k in ("title", "company"):
+                if not payload.get(k) and meta.get(k):
+                    payload[k] = meta[k]
+            if payload.get("title") and payload.get("company"):
+                break
+        return payload
+
+    def _identified_payload(
+        self, inner: Dict[str, Any], fields: List[str]
+    ) -> Dict[str, Any]:
+        """`_copy_fields` plus the aliases the mailbox producers actually speak.
+
+        The agents say `job_id`/`api_job_id` and `files`/`screenshots`; these
+        contracts ask for `job_key` and `artifacts`, and `_copy_fields` drops
+        anything absent. That vocabulary gap is why `application_ready` and
+        `followup_due` landed as `{}` and `tailor_completed` carried only
+        company/title on the live bus.
+
+        `job_key` matters beyond rendering: `handle` keys the bus `job_id`
+        column off it, so without it an event cannot be correlated to its job.
+
+        Anything the producer supplies wins; this only fills gaps.
+        """
+        payload = _copy_fields(inner, fields)
+
+        if "job_key" in fields and not payload.get("job_key"):
+            job_ref = inner.get("job_id") or inner.get("api_job_id")
+            if job_ref:
+                payload["job_key"] = job_ref
+
+        if "artifacts" in fields and not payload.get("artifacts"):
+            evidence = inner.get("files") or inner.get("screenshots")
+            if evidence:
+                payload["artifacts"] = evidence
+
+        if "company" in fields or "title" in fields:
+            self._backfill_company_title(
+                payload,
+                payload.get("job_key"),
+                inner.get("job_id"),
+                inner.get("api_job_id"),
+            )
+        return payload
+
     def _blocked_question_payload(self, inner: Dict[str, Any]) -> Dict[str, Any]:
         """APPLICATION_BLOCKED payload, tolerant of the applier's envelope.
 
@@ -255,12 +311,8 @@ class MailboxTranslator(BaseSubscriber):
         Anything the producer supplies wins; this only fills the gaps, so a
         fixed producer passes through untouched.
         """
-        payload = _copy_fields(inner, ["company", "title", "job_key", "question"])
-
-        if not payload.get("job_key"):
-            job_ref = inner.get("job_id") or inner.get("api_job_id")
-            if job_ref:
-                payload["job_key"] = job_ref
+        payload = self._identified_payload(
+            inner, ["company", "title", "job_key", "question"])
 
         # Always present: both the WhatsApp CRITICAL page and
         # MailboxWatcher._summarize key on `question`, and a missing key is what
@@ -268,16 +320,43 @@ class MailboxTranslator(BaseSubscriber):
         if not payload.get("question"):
             payload["question"] = _blocked_question_text(inner)
 
-        if not payload.get("title") or not payload.get("company"):
-            for ref in (payload.get("job_key"), inner.get("api_job_id")):
-                meta = self._pipeline_metadata(ref)
-                for k in ("title", "company"):
-                    if not payload.get(k) and meta.get(k):
-                        payload[k] = meta[k]
-                if payload.get("title") and payload.get("company"):
-                    break
-
         return payload
+
+    def _followup_emissions(
+        self, inner: Dict[str, Any]
+    ) -> List[Tuple[EventType, Dict[str, Any], None]]:
+        """Fan a FOLLOWUP_ALERT batch out into one FOLLOWUP_DUE per job.
+
+        Unlike the other contract mismatches this one is STRUCTURAL: the
+        tracker sends a `jobs` (2026-08-07, 08-09) or `candidates` (08-08) list
+        plus a count, while the branch expected one job per message. Aliasing
+        cannot fix that — every key was dropped and a single
+        "Follow-up due for ? — 14+ days" page was emitted per SCAN instead of
+        one per job.
+        """
+        batch: Any = inner.get("jobs")
+        if not isinstance(batch, list):
+            batch = inner.get("candidates")
+        threshold = inner.get("threshold_days") or inner.get("cutoff_days")
+
+        if not isinstance(batch, list):
+            # A producer speaking neither key: keep the single-event behaviour
+            # rather than going silent on a shape nobody has audited.
+            payload = self._identified_payload(
+                inner, ["company", "title", "job_key", "days_since_application"])
+            _apply_followup_days(payload, inner, threshold)
+            return [(EventType.FOLLOWUP_DUE, payload, None)]
+
+        emissions = []
+        for job in batch:
+            if not isinstance(job, dict):
+                continue
+            payload = self._identified_payload(
+                job, ["company", "title", "job_key", "days_since_application"])
+            _apply_followup_days(payload, job, threshold)
+            emissions.append((EventType.FOLLOWUP_DUE, payload, None))
+        # An explicitly empty batch means nothing is due — do not page.
+        return emissions
 
     def handle(self, event: Event) -> None:
         payload = event.payload or {}
@@ -429,11 +508,11 @@ class MailboxTranslator(BaseSubscriber):
                 results.append((EventType.JOB_DISCOVERED, p, None))
 
         elif message_type == "TAILOR_COMPLETE":
-            results.append((EventType.TAILOR_COMPLETED, _copy_fields(
+            results.append((EventType.TAILOR_COMPLETED, self._identified_payload(
                 inner, ["company", "title", "job_key", "artifacts"]), None))
 
         elif message_type in ("SUBMIT_REQUEST", "DRY_RUN_COMPLETE"):
-            results.append((EventType.APPLICATION_READY, _copy_fields(
+            results.append((EventType.APPLICATION_READY, self._identified_payload(
                 inner, ["company", "title", "job_key", "artifacts"]), None))
 
         elif message_type == "SUBMIT_CONFIRM":
@@ -464,8 +543,7 @@ class MailboxTranslator(BaseSubscriber):
                 results.append((EventType.STAGE_TRANSITION, transition, None))
 
         elif message_type == "FOLLOWUP_ALERT":
-            results.append((EventType.FOLLOWUP_DUE, _copy_fields(
-                inner, ["company", "title", "job_key", "days_since_application"]), None))
+            results.extend(self._followup_emissions(inner))
 
         elif message_type == "VIP_DISCOVERY":
             p = _job_payload(inner)
@@ -519,6 +597,47 @@ def _job_payload(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def _copy_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
     return {f: d.get(f) for f in fields if d.get(f) is not None}
+
+
+# Every real FOLLOWUP_ALERT on the bus counts days under a DIFFERENT key:
+# days_since (2026-08-07), days_inactive (08-08), days_since_stage (08-09).
+_FOLLOWUP_DAY_FIELDS = (
+    "days_since_application",
+    "days_since_stage",
+    "days_since",
+    "days_inactive",
+    "days_since_last_contact",
+    "days",
+)
+
+
+def _followup_days(d: Dict[str, Any]) -> Optional[float]:
+    for field in _FOLLOWUP_DAY_FIELDS:
+        value = d.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _apply_followup_days(
+    payload: Dict[str, Any], source: Dict[str, Any], threshold: Any
+) -> Dict[str, Any]:
+    """Populate `days` — the key BOTH renderers actually read.
+
+    whatsapp_escalator.py:393 and digest_composer.py:312 read
+    `payload["days"]`, NOT the `days_since_application` this branch's contract
+    copied, so even a producer honouring that contract rendered the bare
+    default 14. Carry both.
+    """
+    days = _followup_days(source)
+    if days is None and isinstance(threshold, (int, float)) and not isinstance(
+        threshold, bool
+    ):
+        days = threshold
+    if days is not None:
+        payload["days"] = days
+        payload.setdefault("days_since_application", days)
+    return payload
 
 
 # Wording mirrors `blockedQuestionText` in jobflow-platform

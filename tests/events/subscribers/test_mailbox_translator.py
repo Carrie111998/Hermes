@@ -842,3 +842,363 @@ class TestBlockedQuestionLegacyEnvelopeBackstop:
         # "needs your input" default that stood in for a month.
         assert "needs your input" not in text
         assert "First Name*" in text
+
+
+# ---------------------------------------------------------------------------
+# The BLOCKED_QUESTION empty-payload defect was one instance of a family: every
+# mailbox producer speaks job_id / files / questions, while the translator's
+# _copy_fields contracts ask for job_key / artifacts / question, and _copy_fields
+# drops any key whose value is None. Measured on the live bus 2026-08-19:
+#   application_ready   6 events, ALL payload {}
+#   followup_due        3 events, ALL payload {}
+#   tailor_completed   97 events, payload ['company','title'] only
+# ---------------------------------------------------------------------------
+
+_PIPELINE = {"jobs": [
+    {"job_id": "8446590b", "title": "Reporting Director", "company": "Deloitte"},
+    {"job_id": "8de4877d", "title": "Director of Strategic Finance", "company": "Tala"},
+]}
+
+
+@pytest.fixture
+def pipeline_state(tmp_path, monkeypatch):
+    import events.subscribers.mailbox_translator as mt
+    path = tmp_path / "pipeline.json"
+    path.write_text(json.dumps(_PIPELINE), encoding="utf-8")
+    monkeypatch.setattr(mt, "PIPELINE_PATH", path)
+    return path
+
+
+class TestApplicationReadyIdentity:
+    """SUBMIT_REQUEST carries only job_id/materials_path/mode, so all four
+    contract keys were dropped and the HIGH "approve?" page read
+    "Dry-run complete for ? . Approve submission? Reply YES or NO."
+    (whatsapp_escalator.py:383) -- Diego asked to approve an UNNAMED job.
+    """
+
+    def _ready(self, bus):
+        return next(p for et, p in _recent_domain_events(bus)
+                    if et == EventType.APPLICATION_READY)
+
+    def test_job_key_is_aliased_from_job_id(self, bus, pipeline_state):
+        _mailbox_event(bus, "SUBMIT_REQUEST", {
+            "job_id": "8446590b", "materials_path": "C:/x", "mode": "dry-run"})
+        _translate(bus)
+        assert self._ready(bus)["job_key"] == "8446590b"
+
+    def test_company_and_title_backfilled_from_pipeline_state(self, bus, pipeline_state):
+        _mailbox_event(bus, "SUBMIT_REQUEST", {"job_id": "8446590b"})
+        _translate(bus)
+        out = self._ready(bus)
+        assert out["company"] == "Deloitte"
+        assert out["title"] == "Reporting Director"
+
+    def test_dry_run_complete_aliases_screenshots_to_artifacts(self, bus, pipeline_state):
+        """The applier's DRY_RUN_COMPLETE has no `files`; its evidence is
+        `screenshots` plus an already-correct `artifacts`."""
+        _mailbox_event(bus, "DRY_RUN_COMPLETE", {
+            "job_id": "8de4877d", "api_job_id": "api-1",
+            "screenshots": ["04_landing.png"], "review_url": "https://x"})
+        _translate(bus)
+        assert self._ready(bus)["artifacts"] == ["04_landing.png"]
+
+    def test_producer_artifacts_win_over_the_alias(self, bus, pipeline_state):
+        _mailbox_event(bus, "DRY_RUN_COMPLETE", {
+            "job_id": "8de4877d", "artifacts": [{"type": "trace"}],
+            "screenshots": ["shot.png"]})
+        _translate(bus)
+        assert self._ready(bus)["artifacts"] == [{"type": "trace"}]
+
+    def test_job_key_falls_back_to_api_job_id(self, bus, pipeline_state):
+        _mailbox_event(bus, "DRY_RUN_COMPLETE", {"api_job_id": "api-only-7"})
+        _translate(bus)
+        assert self._ready(bus)["job_key"] == "api-only-7"
+
+    def test_the_rendered_approval_page_names_the_job(self, bus, pipeline_state):
+        """Mirrors whatsapp_escalator.py:383 exactly."""
+        _mailbox_event(bus, "SUBMIT_REQUEST", {"job_id": "8de4877d"})
+        _translate(bus)
+        p = self._ready(bus)
+        text = (f"Dry-run complete for {p.get('company', '?')} "
+                f"{p.get('title', '')}. Approve submission? Reply YES or NO.")
+        assert text.startswith(
+            "Dry-run complete for Tala Director of Strategic Finance.")
+
+
+class TestFollowupDueFanOut:
+    """FOLLOWUP_ALERT is a BATCH -- a `jobs` (or `candidates`) list plus a
+    count -- while the translator expected one job per message, so every key
+    was dropped and one useless "Follow-up due for ? -- 14+ days" page was
+    emitted per SCAN rather than one per job.
+
+    Aliasing alone cannot fix this; it needs fan-out. All three real shapes
+    seen on the bus use a DIFFERENT per-job day key: days_since (2026-08-07),
+    days_inactive (08-08), days_since_stage (08-09).
+    """
+
+    def _due(self, bus):
+        return [p for et, p in _recent_domain_events(bus)
+                if et == EventType.FOLLOWUP_DUE]
+
+    def test_a_batch_emits_one_event_per_job(self, bus):
+        _mailbox_event(bus, "FOLLOWUP_ALERT", {
+            "checked_at": "2026-08-07T14:06:06Z", "cutoff_days": 14,
+            "jobs": [
+                {"job_id": "j1", "company": "JPMorganChase", "title": "TMO",
+                 "days_since": 120},
+                {"job_id": "j2", "company": "Affirm", "title": "VP Treasury",
+                 "days_since": 120},
+                {"job_id": "j3", "company": "Raptor", "title": "VP FP&A",
+                 "days_since": 122},
+            ]})
+        _translate(bus)
+        assert len(self._due(bus)) == 3
+
+    def test_each_fanned_out_event_identifies_its_own_job(self, bus):
+        _mailbox_event(bus, "FOLLOWUP_ALERT", {"jobs": [
+            {"job_id": "j1", "company": "JPMorganChase", "title": "TMO",
+             "days_since": 120},
+            {"job_id": "j2", "company": "Affirm", "title": "VP Treasury",
+             "days_since": 99},
+        ]})
+        _translate(bus)
+        by_company = {p["company"]: p for p in self._due(bus)}
+        assert by_company["Affirm"]["job_key"] == "j2"
+        assert by_company["Affirm"]["title"] == "VP Treasury"
+        assert by_company["JPMorganChase"]["job_key"] == "j1"
+
+    def test_the_candidates_key_fans_out_too(self, bus):
+        """The 2026-08-08 tracker shape uses `candidates`, not `jobs`."""
+        _mailbox_event(bus, "FOLLOWUP_ALERT", {
+            "total_candidates": 2, "threshold_days": 14,
+            "candidates": [
+                {"job_id": "c1", "company": "StoneX Group Inc.",
+                 "title": "Head of Cash", "days_inactive": 26},
+                {"job_id": "c2", "company": "Morgan Stanley",
+                 "title": "Lending Lead", "days_inactive": 24},
+            ]})
+        _translate(bus)
+        assert {p["company"] for p in self._due(bus)} == {
+            "StoneX Group Inc.", "Morgan Stanley"}
+
+    @pytest.mark.parametrize("key", [
+        "days_since", "days_inactive", "days_since_stage",
+        "days_since_application"])
+    def test_days_is_populated_from_every_real_day_key(self, bus, key):
+        """BOTH renderers read payload['days'] (whatsapp_escalator.py:393,
+        digest_composer.py:312), NOT days_since_application -- so even a
+        producer honouring the old contract rendered the bare default 14."""
+        _mailbox_event(bus, "FOLLOWUP_ALERT", {"jobs": [
+            {"job_id": "j1", "company": "Tala", "title": "Dir", key: 21}]})
+        _translate(bus)
+        assert self._due(bus)[0]["days"] == 21
+
+    def test_days_falls_back_to_the_batch_threshold(self, bus):
+        _mailbox_event(bus, "FOLLOWUP_ALERT", {
+            "threshold_days": 30,
+            "jobs": [{"job_id": "j1", "company": "Tala", "title": "Dir"}]})
+        _translate(bus)
+        assert self._due(bus)[0]["days"] == 30
+
+    def test_an_empty_batch_emits_nothing(self, bus):
+        """A scan that found nothing due must not page. The old code emitted
+        one payload-{} event for it."""
+        _mailbox_event(bus, "FOLLOWUP_ALERT",
+                       {"checked_at": "2026-08-09T14:10:00Z",
+                        "due_count": 0, "jobs": []})
+        _translate(bus)
+        assert self._due(bus) == []
+
+    def test_a_batchless_envelope_still_emits_one_event(self, bus):
+        """Back-compat: a producer with neither `jobs` nor `candidates` keeps
+        the single-event behaviour rather than going silent."""
+        _mailbox_event(bus, "FOLLOWUP_ALERT",
+                       {"job_key": "j9", "company": "Tala",
+                        "days_since_application": 15})
+        _translate(bus)
+        due = self._due(bus)
+        assert len(due) == 1
+        assert due[0]["company"] == "Tala"
+
+    def test_company_and_title_backfilled_per_job(self, bus, pipeline_state):
+        _mailbox_event(bus, "FOLLOWUP_ALERT",
+                       {"jobs": [{"job_id": "8de4877d", "days_since": 20}]})
+        _translate(bus)
+        out = self._due(bus)[0]
+        assert out["company"] == "Tala"
+        assert out["title"] == "Director of Strategic Finance"
+
+    def test_the_rendered_followup_page_names_job_and_days(self, bus):
+        """Mirrors whatsapp_escalator.py:393 exactly."""
+        _mailbox_event(bus, "FOLLOWUP_ALERT", {"jobs": [
+            {"job_id": "j1", "company": "Deloitte", "title": "Dir",
+             "days_since": 120}]})
+        _translate(bus)
+        p = self._due(bus)[0]
+        text = (f"Follow-up due for {p.get('company', '?')} "
+                f"\u2014 {p.get('days', 14)}+ days no response")
+        assert text == "Follow-up due for Deloitte \u2014 120+ days no response"
+
+
+class TestTailorCompletedIdentity:
+    """97 tailor_completed events carry company/title but no job_key and no
+    artifacts: TAILOR_COMPLETE speaks `job_id` and `files`. Without job_key the
+    bus `job_id` column is NULL, so the event cannot be correlated to its job.
+    """
+
+    def _tailored(self, bus):
+        return next(p for et, p in _recent_domain_events(bus)
+                    if et == EventType.TAILOR_COMPLETED)
+
+    def _envelope(self):
+        return {
+            "job_id": "c0207191", "company": "VirtualVocations",
+            "title": "Deputy Chief Data Scientist",
+            "materials_path": "C:/x/c0207191",
+            "files": ["resume.pdf", "cover-letter.pdf", "metadata.json"],
+            "submission_authorized": False,
+        }
+
+    def test_job_key_is_aliased_from_job_id(self, bus):
+        _mailbox_event(bus, "TAILOR_COMPLETE", self._envelope())
+        _translate(bus)
+        assert self._tailored(bus)["job_key"] == "c0207191"
+
+    def test_artifacts_are_aliased_from_files(self, bus):
+        _mailbox_event(bus, "TAILOR_COMPLETE", self._envelope())
+        _translate(bus)
+        assert self._tailored(bus)["artifacts"] == [
+            "resume.pdf", "cover-letter.pdf", "metadata.json"]
+
+    def test_producer_company_and_title_are_not_overwritten(self, bus, pipeline_state):
+        """The tailor DOES send company/title; pipeline state must not win."""
+        env = self._envelope()
+        env["job_id"] = "8de4877d"  # resolves to Tala in pipeline_state
+        _mailbox_event(bus, "TAILOR_COMPLETE", env)
+        _translate(bus)
+        out = self._tailored(bus)
+        assert out["company"] == "VirtualVocations"
+        assert out["title"] == "Deputy Chief Data Scientist"
+
+    def test_the_bus_job_id_column_is_populated(self, bus):
+        """emit() keys the job_id column off job_key -- that is what makes the
+        event correlatable at all."""
+        _mailbox_event(bus, "TAILOR_COMPLETE", self._envelope())
+        _translate(bus)
+        row = next(e for e in bus.query()
+                   if e.event_type == EventType.TAILOR_COMPLETED)
+        assert row.job_id == "c0207191"
+
+
+class TestSubmitRequestIsNotAnApprovalPrompt:
+    """SUBMIT_REQUEST is a COMMAND (main -> applier), not an outcome.
+
+    Its payload is a dry-run *request* -- `mode: dry_run`,
+    `submission_authorized: false`, and an `applier-dry-run:` idempotency key
+    (jobflow_dispatch/contracts.py:50-53). Mapping it to APPLICATION_READY
+    fired the HIGH ACT/ACTION_REQUIRED page
+    "Dry-run complete for X. Approve submission? Reply YES or NO."
+    (whatsapp_escalator.py:383) at the moment the dry run was REQUESTED --
+    before the applier had run anything. Repairing the payload only made that
+    claim well-named instead of anonymous; the claim itself is false.
+
+    APPLICATION_READY is a _PENDING_EVENT_TYPE (events/outcomes.py:77) meaning
+    "waiting on Diego". A just-issued SUBMIT_REQUEST is waiting on the APPLIER.
+    The applier's own DRY_RUN_COMPLETE is the truthful producer, and it is
+    already mirrored (mailbox_watcher.py MIRRORED_MESSAGE_TYPES) and already
+    handled by the same branch.
+    """
+
+    def test_submit_request_emits_no_domain_event(self, bus, pipeline_state):
+        _mailbox_event(bus, "SUBMIT_REQUEST", {
+            "job_id": "8446590b", "materials_path": "C:/x",
+            "mode": "dry_run", "submission_authorized": False})
+        _translate(bus)
+        assert _recent_domain_events(bus) == []
+
+    def test_the_applier_dry_run_still_pages_for_approval(self, bus, pipeline_state):
+        """Removing the command must not silence the real approval prompt."""
+        _mailbox_event(bus, "DRY_RUN_COMPLETE", {
+            "job_id": "8446590b", "status": "review_reached",
+            "approval_required": True})
+        _translate(bus)
+        ready = [p for et, p in _recent_domain_events(bus)
+                 if et == EventType.APPLICATION_READY]
+        assert len(ready) == 1
+        assert ready[0]["company"] == "Deloitte"
+
+
+class TestSubmitResultIsTranslated:
+    """The applier reports every real submission as SUBMIT_RESULT
+    (tmp_ready_sweep_cron.py:811,834) and the translator had no branch for it,
+    so the only `application_submitted` event ever on the bus was a synthetic
+    Mission-Control drill. SUBMIT_CONFIRM -- the branch that DID exist -- is
+    Diego's go-ahead, not an outcome.
+
+    APPLICATION_SUBMITTED is a _SUCCESS_EVENT_TYPE and APPLICATION_FAILED a
+    CRITICAL failure (events/outcomes.py), so the two SUBMIT_RESULT statuses
+    must not collapse into one event type.
+    """
+
+    def _only(self, bus):
+        events = _recent_domain_events(bus)
+        assert len(events) == 1, events
+        return events[0]
+
+    def _submitted(self):
+        return {
+            "job_id": "8de4877d", "api_job_id": "api-9",
+            "status": "submitted", "confirmation_id": "CONF-123",
+            "error": None, "attempt_id": "att-1",
+            "screenshots": ["09_confirmation.png"],
+            "artifacts": ["09_confirmation.png", "dom.html"],
+        }
+
+    def test_a_successful_submit_emits_application_submitted(self, bus):
+        _mailbox_event(bus, "SUBMIT_RESULT", self._submitted())
+        et, _ = self._only(bus)
+        assert et == EventType.APPLICATION_SUBMITTED
+
+    def test_the_confirmation_id_becomes_the_submission_id(self, bus):
+        _mailbox_event(bus, "SUBMIT_RESULT", self._submitted())
+        assert self._only(bus)[1]["submission_id"] == "CONF-123"
+
+    def test_it_carries_job_identity_and_artifacts(self, bus):
+        _mailbox_event(bus, "SUBMIT_RESULT", self._submitted())
+        p = self._only(bus)[1]
+        assert p["job_key"] == "8de4877d"
+        assert p["artifacts"] == ["09_confirmation.png", "dom.html"]
+
+    def test_company_and_title_are_backfilled(self, bus, pipeline_state):
+        _mailbox_event(bus, "SUBMIT_RESULT", self._submitted())
+        p = self._only(bus)[1]
+        assert p["company"] == "Tala"
+        assert p["title"] == "Director of Strategic Finance"
+
+    def test_a_failed_submit_emits_application_failed_not_submitted(self, bus):
+        """Success and failure share the message type; only `status` differs.
+        Treating both as APPLICATION_SUBMITTED would book a failure as a
+        _SUCCESS_EVENT_TYPE."""
+        _mailbox_event(bus, "SUBMIT_RESULT", {
+            "job_id": "8de4877d", "status": "failed",
+            "error": "Browser submit failed", "failureCode": "SUBMIT_FAILED",
+            "confirmation_id": None})
+        et, p = self._only(bus)
+        assert et == EventType.APPLICATION_FAILED
+        assert p["error"] == "Browser submit failed"
+
+    def test_the_rendered_failure_page_names_job_and_reason(self, bus, pipeline_state):
+        """Mirrors whatsapp_escalator.py:381 exactly."""
+        _mailbox_event(bus, "SUBMIT_RESULT", {
+            "job_id": "8de4877d", "status": "failed",
+            "error": "Browser submit failed"})
+        p = self._only(bus)[1]
+        text = (f"Application failed for {p.get('company', '?')}: "
+                f"{p.get('error', 'unknown error')}")
+        assert text == "Application failed for Tala: Browser submit failed"
+
+    def test_the_bus_job_id_column_is_populated(self, bus):
+        _mailbox_event(bus, "SUBMIT_RESULT", self._submitted())
+        row = next(e for e in bus.query()
+                   if e.event_type == EventType.APPLICATION_SUBMITTED)
+        assert row.job_id == "8de4877d"
