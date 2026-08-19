@@ -21,6 +21,9 @@ them and driving the execution loop through the `terminal` tool. It does not
 cover planning a project from scratch, which the `fest-planning` skill in the
 Festival tap handles.
 
+This skill file is MIT like the rest of this repository; the `fest` and `camp`
+binaries it points at are Apache-2.0.
+
 ## When to Use
 
 Use this skill when:
