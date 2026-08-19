@@ -130,7 +130,8 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     try:
         # Trip the breaker by setting the count at/above threshold and
         # stamping the open-time to "now".
-        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        _, threshold, cooldown = mcp_tool._get_circuit_breaker_config()
+        mcp_tool._server_error_counts["srv"] = threshold
         fake_now = [1000.0]
 
         def _fake_monotonic():
@@ -143,7 +144,6 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
         # required for this state to be tracked at all).
         if hasattr(mcp_tool, "_server_breaker_opened_at"):
             mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
-        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
 
         handler = _make_tool_handler("srv", "tool1", 10.0)
 
@@ -190,7 +190,8 @@ def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
     mcp_tool._ensure_mcp_loop()
 
     try:
-        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        _, threshold, cooldown = mcp_tool._get_circuit_breaker_config()
+        mcp_tool._server_error_counts["srv"] = threshold
         fake_now = [1000.0]
 
         def _fake_monotonic():
@@ -199,7 +200,6 @@ def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
         monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
         if hasattr(mcp_tool, "_server_breaker_opened_at"):
             mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
-        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
 
         handler = _make_tool_handler("srv", "tool1", 10.0)
 
@@ -244,7 +244,8 @@ def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_pat
     monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
 
     try:
-        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        _, threshold, cooldown = mcp_tool._get_circuit_breaker_config()
+        mcp_tool._server_error_counts["srv"] = threshold
         fake_now = [1000.0]
 
         def _fake_monotonic():
@@ -252,7 +253,6 @@ def test_half_open_probe_on_dead_session_requests_reconnect(monkeypatch, tmp_pat
 
         monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
         mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
-        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
 
         # Advance past cooldown → next call is a half-open probe.
         fake_now[0] += cooldown + 1.0
@@ -293,11 +293,11 @@ def test_half_open_dead_session_recovers_after_reconnect(monkeypatch, tmp_path):
     mcp_tool._ensure_mcp_loop()
 
     try:
-        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        _, threshold, cooldown = mcp_tool._get_circuit_breaker_config()
+        mcp_tool._server_error_counts["srv"] = threshold
         fake_now = [1000.0]
         monkeypatch.setattr(mcp_tool.time, "monotonic", lambda: fake_now[0])
         mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
-        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
         fake_now[0] += cooldown + 1.0
 
         handler = _make_tool_handler("srv", "tool1", 10.0)
@@ -350,7 +350,8 @@ def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
 
     # Open the breaker well above threshold, with a recent open-time so
     # it would short-circuit everything without a reset.
-    mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 2
+    _, threshold, _ = mcp_tool._get_circuit_breaker_config()
+    mcp_tool._server_error_counts["srv"] = threshold + 2
     if hasattr(mcp_tool, "_server_breaker_opened_at"):
         import time as _time
 
@@ -389,9 +390,9 @@ def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
         # Post-reconnect count was reset to 0, then the failing retry
         # bumped it to exactly 1 — well below threshold.
         count = mcp_tool._server_error_counts.get("srv", 0)
-        assert count < mcp_tool._CIRCUIT_BREAKER_THRESHOLD, (
+        assert count < threshold, (
             f"successful reconnect must reset the breaker below threshold; "
-            f"got count={count}, threshold={mcp_tool._CIRCUIT_BREAKER_THRESHOLD}"
+            f"got count={count}, threshold={threshold}"
         )
     finally:
         _cleanup(mcp_tool, "srv")
@@ -719,7 +720,7 @@ def test_circuit_breaker_custom_threshold_applied(monkeypatch, tmp_path_factory)
         result = handler({})
 
         # Should short-circuit without calling the server
-        assert call_count["n"] == 4, "call should be short-circuited, not reach server"
+        assert call_count["n"] == 0, "call should be short-circuited, not reach server"
         assert "unreachable" in result.lower()
     finally:
         _cleanup(mcp_tool, "srv")
