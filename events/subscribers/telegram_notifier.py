@@ -792,6 +792,20 @@ class TelegramNotifier(BaseSubscriber):
         in which case this method's behavior is unchanged from before this
         parameter existed.
         """
+        # Rendered-text observability (2026-08-19). The bytes handed to
+        # Telegram existed NOWHERE on disk: audit.jsonl carries the event
+        # PAYLOAD, RepeatGuard keeps only a sha of the normalized text and
+        # dies with the process, no message_id is persisted, and
+        # TelegramMirror was retired 2026-04-28. So the UNKNOWN AGENT_NOTE
+        # header (fixed in bdc736bd37) rendered wrong on EVERY delivery
+        # while 759 tests, an 83/83 coverage gate and three clean delivery
+        # receipts all passed -- nothing observed the formatter output.
+        # This is the single choke point for both the _send_fn (test) and
+        # _deliver_result (production) paths. repr() keeps a multi-line
+        # message to ONE greppable line and shows the exact glyphs.
+        logger.info(
+            "TelegramNotifier sending to %s/%s: %r", chat_id, thread_id, message
+        )
         t0 = time.monotonic()
         try:
             if self._send_fn:
