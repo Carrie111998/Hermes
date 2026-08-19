@@ -279,7 +279,12 @@ async def send_and_capture(adapter, text: str, platform: Platform, **event_kwarg
     event = make_event(platform, text, **event_kwargs)
     adapter.send.reset_mock()
     await adapter.handle_message(event)
-    for _ in range(40):  # up to ~2s; returns as soon as the send lands
+    # Poll up to ~6s for the send rather than waiting a fixed delay: handler
+    # DB work hops to worker threads (AsyncSessionDB) and the first telegram
+    # parametrization pays cold plugin-discovery/config cost on slow runners,
+    # so completion latency varies (flaked at the old ~2s window in
+    # runs 28856659216 and 32251425067). Returns as soon as the send lands.
+    for _ in range(120):  # up to ~6s
         if adapter.send.called:
             break
         await asyncio.sleep(0.05)
