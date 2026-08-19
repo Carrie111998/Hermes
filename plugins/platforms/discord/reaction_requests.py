@@ -9,9 +9,10 @@ from urllib.parse import quote
 
 
 MAX_REACTION_PAGE = 100
-_CUSTOM_EMOJI_RE = re.compile(r"^[A-Za-z0-9_]{2,32}:[0-9]{15,20}$")
+_CUSTOM_EMOJI_RE = re.compile(r"^[A-Za-z0-9_]{2,32}:[1-9][0-9]{14,19}$")
 _KEYCAP_EMOJI_RE = re.compile(r"^[0-9#*]\ufe0f?\u20e3$")
 _FORBIDDEN = re.compile(r"[\s/@#]|@everyone|@here")
+_SNOWFLAKE_RE = re.compile(r"^[1-9][0-9]*$")
 
 
 class ReactionError(ValueError):
@@ -45,9 +46,9 @@ def encode_emoji_path(emoji: str) -> str:
 
 
 def _base_path(channel_id: str, message_id: str) -> str:
-    if not str(channel_id).isdigit():
+    if not _SNOWFLAKE_RE.fullmatch(str(channel_id)):
         raise ReactionError(f"channel_id must be a snowflake, got {channel_id!r}")
-    if not str(message_id).isdigit():
+    if not _SNOWFLAKE_RE.fullmatch(str(message_id)):
         raise ReactionError(f"message_id must be a snowflake, got {message_id!r}")
     return f"/channels/{channel_id}/messages/{message_id}"
 
@@ -70,12 +71,17 @@ def remove_user_reaction_request(
     channel_id: str, message_id: str, emoji: str, user_id: str
 ) -> dict[str, Any]:
     """Build the request to remove another user's reaction."""
-    if not str(user_id).isdigit():
+    if not _SNOWFLAKE_RE.fullmatch(str(user_id)):
         raise ReactionError(f"user_id must be a snowflake, got {user_id!r}")
     return _request(
         "DELETE",
         f"{_base_path(channel_id, message_id)}/reactions/{encode_emoji_path(emoji)}/{user_id}",
     )
+
+
+def remove_all_reactions_request(channel_id: str, message_id: str) -> dict[str, Any]:
+    """Build the request to remove all reactions from a message."""
+    return _request("DELETE", f"{_base_path(channel_id, message_id)}/reactions")
 
 
 def list_reactions_request(
