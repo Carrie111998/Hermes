@@ -389,6 +389,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    if getattr(agent, "incognito", False):
+        stable_parts.append(
+            "Incognito mode is active for this session. Do not read or write "
+            "persistent memory, and do not attempt to persist conversation "
+            "history. Treat all information from this session as temporary."
+        )
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 

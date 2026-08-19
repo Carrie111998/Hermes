@@ -2933,6 +2933,15 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
+    if getattr(args, "incognito", False):
+        if getattr(args, "resume", None) or getattr(args, "continue_last", None):
+            print("Error: incognito sessions cannot be resumed.", file=sys.stderr)
+            sys.exit(1)
+        print(
+            "Incognito mode: this session will not be saved and no memory "
+            "will be read or written."
+        )
+
     # --in DIR: run in DIR. Must happen before any session resolution so the
     # workspace-scoped "latest"/-c lookups key off DIR, and it pins the
     # session there — an explicit --in wins over a resumed session's
@@ -3150,6 +3159,12 @@ def cmd_chat(args):
     if getattr(args, "ignore_rules", False):
         os.environ["HERMES_IGNORE_RULES"] = "1"
 
+    # --incognito: disable persistent memory and conversation persistence.
+    # The agent receives the explicit flag below; the environment marker also
+    # lets relaunch/TUI paths preserve the invocation-level mode.
+    if getattr(args, "incognito", False):
+        os.environ["HERMES_INCOGNITO"] = "1"
+
     # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
@@ -3196,6 +3211,7 @@ def cmd_chat(args):
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
+        "incognito": getattr(args, "incognito", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
     }

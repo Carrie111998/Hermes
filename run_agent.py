@@ -498,6 +498,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        incognito: bool = False,
         skip_background_review: bool = False,
         session_db=None,
         parent_session_id: str = None,
@@ -586,6 +587,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            incognito=incognito,
             skip_background_review=skip_background_review,
             session_db=session_db,
             parent_session_id=parent_session_id,
@@ -1933,6 +1935,8 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        if getattr(self, "_persist_disabled", False):
+            return
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the

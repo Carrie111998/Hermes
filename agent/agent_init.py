@@ -555,6 +555,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    incognito: bool = False,
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -647,6 +648,7 @@ def init_agent(
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent.incognito = bool(incognito)
     # Background review (memory/skill) opt-out switch. When True, skips the
     # _spawn_background_review fork at end-of-turn -- avoids ~30K tokens /
     # event of extra LLM cost on cron-style sessions where review forks
@@ -906,7 +908,9 @@ def init_agent(
 
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
-    agent.disabled_toolsets = disabled_toolsets
+    agent.disabled_toolsets = list(disabled_toolsets or [])
+    if agent.incognito and "memory" not in agent.disabled_toolsets:
+        agent.disabled_toolsets.append("memory")
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -1681,7 +1685,7 @@ def init_agent(
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    agent._persist_disabled = bool(agent.incognito)
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1770,7 +1774,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    if not skip_memory or (_memory_toolset_requested and not agent.incognito):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)

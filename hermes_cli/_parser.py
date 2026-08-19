@@ -262,6 +262,16 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--incognito",
+        action="store_true",
+        default=False,
+        help=(
+            "Run in incognito mode: memory is not read or written, and the "
+            "session is not persisted."
+        ),
+    )
+    _inherited_flag(
+        parser,
         "--safe-mode",
         action="store_true",
         default=False,
@@ -475,6 +485,16 @@ def build_top_level_parser():
         action="store_true",
         default=argparse.SUPPRESS,
         help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--incognito",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Run in incognito mode: memory is not read or written, and the "
+            "session is not persisted."
+        ),
     )
     _inherited_flag(
         chat_parser,

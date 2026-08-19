@@ -1307,6 +1307,9 @@ class CLICommandsMixin:
         Inspired by Claude Code's /branch command.
         """
         from cli import _cprint, _sync_process_session_id
+        if getattr(self, "incognito", False):
+            _cprint("  Incognito sessions cannot be branched or persisted.")
+            return
         if not self.conversation_history:
             _cprint("  No conversation to branch — send a message first.")
             return

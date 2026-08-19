@@ -4864,6 +4864,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        incognito: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -5155,6 +5156,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        self.incognito = incognito or os.environ.get("HERMES_INCOGNITO") == "1"
         
         # Ephemeral system prompt: env var takes precedence, then
         # display.personality / agent.system_prompt from config.
@@ -5283,7 +5285,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # min_interval_hours, tracked via state_meta in state.db itself so
         # it's shared across all Hermes processes for this HERMES_HOME.
         # Never blocks startup on failure.
-        _run_state_db_auto_maintenance(self._session_db)
+        if self.incognito:
+            if self._session_db is not None:
+                try:
+                    self._session_db.close()
+                except Exception:
+                    pass
+                self._session_db = None
+        else:
+            _run_state_db_auto_maintenance(self._session_db)
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
@@ -9624,7 +9634,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
-            if self._session_db:
+            if self._session_db and not self.incognito:
                 try:
                     self.agent._session_db_created = False
                     self._session_db.create_session(
@@ -12560,6 +12570,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         tip. Best-effort — never raises, no-op without a terminal identity
         or when session.terminal_continue is false.
         """
+        if getattr(self, "incognito", False):
+            return
         try:
             from hermes_cli.terminal_breadcrumbs import write_breadcrumb
 
@@ -16284,6 +16296,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         agent's live ``_session_messages`` before ``end_session()`` so resume,
         session_search, and state.db do not lose the interrupted turn.
         """
+        if getattr(self, "incognito", False):
+            db = getattr(self, "_session_db", None)
+            if db is not None:
+                try:
+                    from hermes_constants import get_hermes_home
+
+                    db.delete_session(
+                        self.session_id,
+                        sessions_dir=get_hermes_home() / "sessions",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not remove incognito session row before close",
+                        exc_info=True,
+                    )
+            return
+
         agent = getattr(self, "agent", None)
         if not agent or not hasattr(agent, "_persist_session"):
             return
@@ -19820,6 +19849,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    incognito: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -20009,6 +20039,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        incognito=incognito,
     )
 
     if parsed_skills:
