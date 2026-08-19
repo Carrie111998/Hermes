@@ -904,14 +904,20 @@ export const zh: Translations = {
       set: '设置',
       clear: '清除'
     },
-    // v2 多连接注册表：设置 → 连接。
+    // v2 多连接注册表：设置 → 网关。
     connections: {
-      title: '连接',
-      intro: '注册你的智能体所在的每个位置——本机、局域网中的远程网关、Hermes Cloud 实例——全部保存在这里。',
-      stagedNote: '聊天和智能体列表会跟随你选择的来源；应用管理的窗口后端仍在“设置 → 网关”中选择。',
+      title: '已注册网关',
+      intro: '管理本机以及通过远程、SSH 或 Hermes Cloud 连接可访问的每个 Hermes 网关。',
+      stagedNote:
+        '可在“会话”侧边栏切换网关。配置档案、聊天、消息和定时任务归属于各自网关；其他网关上的工作会继续运行。',
+      launchModeTitle: '启动时返回上次使用网关的会话视图',
+      launchModeDesc: '关闭时，会话将在主网关上打开。',
+      searchPlaceholder: '搜索网关…',
+      noSearchResults: '没有与搜索匹配的网关。',
       loadFailed: '无法加载连接',
+      currentPill: '当前',
       primaryPill: '主连接',
-      managedPill: '本机',
+      managedPill: '应用管理',
       addConnection: '添加连接',
       editConnection: '编辑',
       removeConnection: '移除',
@@ -1957,8 +1963,10 @@ export const zh: Translations = {
     allProfiles: '全部配置档案',
     showAllProfiles: '显示全部配置档案',
     switchToProfile: name => `切换到 ${name}`,
+    switchToConnection: name => `切换到 ${name}`,
+    switchConnectionFailed: name => `无法连接到 ${name}`,
     manageProfiles: '管理配置档案…',
-    connectGateway: '连接另一个 Hermes 网关…',
+    connectGateway: '管理网关…',
     actions: '操作',
     color: '颜色…',
     colorFor: '颜色',
@@ -3133,6 +3141,11 @@ export const zh: Translations = {
   zones: {
     showHeader: '显示标题栏',
     hideHeader: '隐藏标题栏',
+    showStripTab: title => `显示 ${title}`,
+    hideStripTab: title => `隐藏 ${title}`,
+    lastTabKeptTitle: '保留最后一个标签',
+    lastTabKeptBody: '该区域至少需要一个可见标签。请先显示另一个标签，或折叠整个侧边栏。',
+    toggleStripTab: title => `切换 ${title} 标签`,
     minimize: '最小化',
     restore: '还原',
     closeRunningTitle: '关闭正在运行的标签？',
@@ -3170,6 +3183,30 @@ export const zh: Translations = {
     notExpressible: '此排列互相咬合（风车形）——暂无法表示为嵌套拆分',
     zoneCount: count => `${count} 个区域`,
     tabCount: count => `${count} 个标签页`
+  },
+
+  contextMenu: {
+    link: {
+      openInApp: '在应用内浏览器中打开',
+      openExternal: '在外部浏览器中打开',
+      copyUrl: '复制 URL',
+      copyResolvedUrl: '复制解析后的 URL'
+    },
+    image: {
+      copyImage: '复制图片',
+      copyImageAddress: '复制图片地址',
+      saveImageAs: '图片另存为…'
+    },
+    edit: {
+      cut: '剪切',
+      paste: '粘贴',
+      selectAll: '全选',
+      addToDictionary: '添加到词典'
+    },
+    page: {
+      copyPageUrl: '复制页面 URL',
+      inspectElement: '检查元素'
+    }
   },
 
   assistant: {
@@ -3238,6 +3275,9 @@ export const zh: Translations = {
       skip: '跳过',
       skipped: '已跳过',
       continueLabel: '继续',
+      confirmAndContinueLabel: '确认并继续',
+      answeredBadge: '已回答',
+      questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
       lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
       lateAnswerTip: '将此回答起草为后续消息',
       lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。'
