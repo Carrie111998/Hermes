@@ -138,6 +138,15 @@ _MAX_BACKFILL_CREATE = 10
 _BACKFILL_PAGE_SIZE = 1_000
 _MAX_PLANNED_SESSIONS = 10_000
 _CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+
+# A scoped refresh re-proves one CLI without creating a real session for the
+# provider that did not drift.  "all" stays the default: install still requires
+# both providers to resolve.
+_CHARACTERIZATION_PROVIDER_SELECTIONS: dict[str, tuple[str, ...]] = {
+    "all": ("claude", "codex"),
+    "claude": ("claude",),
+    "codex": ("codex",),
+}
 _CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.216"
 _CLAUDE_VISIBILITY_VERSION_OUTPUTS = frozenset({
     _CLAUDE_VISIBILITY_PINNED_VERSION,
@@ -2891,14 +2900,16 @@ class ProductionBackend:
         return tuple(sources)
 
     def characterize(self, *, provider: str) -> Mapping[str, Any]:
-        if provider != "all":
-            raise ConfigurationFailure("characterization_requires_all_providers")
+        selected = _CHARACTERIZATION_PROVIDER_SELECTIONS.get(provider)
+        if selected is None:
+            raise ConfigurationFailure("characterization_provider_invalid")
         try:
             marker_key = resolve_marker_key()
             report_path = run_live_characterization(
                 claude_projects_root=_CLAUDE_PROJECTS_ROOT,
                 provenance_secret=marker_key,
                 live_tests_enabled=True,
+                providers=selected,
             )
             gate = resolve_characterization_gate()
         except LiveCharacterizationError as exc:
@@ -3712,7 +3723,15 @@ def build_parser() -> argparse.ArgumentParser:
     characterize = commands.add_parser(
         "characterize", help="run the disposable live provider gate"
     )
-    characterize.add_argument("--provider", choices=("all",), default="all")
+    characterize.add_argument(
+        "--provider",
+        choices=tuple(_CHARACTERIZATION_PROVIDER_SELECTIONS),
+        default="all",
+        help=(
+            "which provider to re-prove; a scoped refresh creates one real "
+            "session instead of two"
+        ),
+    )
 
     backfill = commands.add_parser(
         "backfill", help="plan or apply a bounded recent mirror batch"

@@ -1958,13 +1958,108 @@ class LiveCharacterizationError(RuntimeError):
         )
 
 
+# ---------------------------------------------------------------------------
+# bridge_revision -- which bridge code a characterization proof was made against
+# ---------------------------------------------------------------------------
+#
+# A characterization report proves that the *installed CLI versions* drive *this
+# bridge*.  Until now only the first half was recorded, so a report could age
+# past the code it was proving without any signal.  ``bridge_revision`` records
+# the second half: a digest, per provider, of the bridge modules that implement
+# how the bridge drives and reads that provider.
+#
+# The manifest is deliberately narrower than the import closure.  ``store``,
+# ``context_pack`` and the ``sidebar`` modules are the catalog/mirroring surface;
+# live characterization never opens a store, builds a context pack or places a
+# sidebar -- it creates a placeholder, discovers the native session file, reads
+# it, resumes it and disposes of it.  They enter the closure only as type and
+# helper imports, and they are the highest-churn files in the package, so
+# tracking them would invalidate every proof for changes it never measured.
+BRIDGE_REVISION_EXCLUDED_MODULES = frozenset({
+    "context_pack",
+    "sidebar",
+    "sidebar_placement",
+    "sidebar_reconciliation",
+    "store",
+})
+
+# The adapter modules each provider's characterization actually drives.  The
+# manifest below is their import closure; a test re-derives it so a new import
+# cannot silently escape the digest.
+BRIDGE_REVISION_ROOT_MODULES: Mapping[str, tuple[str, ...]] = {
+    "claude": ("claude_adapter", "claude_registrar", "claude_visibility"),
+    "codex": ("codex_adapter",),
+}
+
+# ``characterize`` is in both manifests: it is the harness, so it defines what
+# the proof measured.  Its own top-level imports are not walked -- it imports
+# both providers' adapters, which would collapse the per-provider split.
+BRIDGE_REVISION_MODULES: Mapping[str, tuple[str, ...]] = {
+    "claude": (
+        "characterize",
+        "claude_adapter",
+        "claude_registrar",
+        "claude_visibility",
+        "claude_visibility_codes",
+        "models",
+    ),
+    "codex": (
+        "characterize",
+        "claude_adapter",
+        "codex_adapter",
+        "models",
+    ),
+}
+
+
+def current_bridge_revisions(
+    *,
+    package_root: Path | None = None,
+    providers: Sequence[str] = ("claude", "codex"),
+) -> dict[str, str]:
+    """Digest the installed bridge modules that each provider's proof depends on.
+
+    Content-addressed rather than git-derived on purpose: an editable install
+    runs the working tree, so a commit id would call an uncommitted change
+    unchanged.  Line endings are normalised so a checkout with different EOL
+    settings is not mistaken for a behaviour change.
+    """
+
+    root = (
+        Path(package_root)
+        if package_root is not None
+        else Path(__file__).resolve().parent
+    )
+    revisions: dict[str, str] = {}
+    for provider in providers:
+        modules = BRIDGE_REVISION_MODULES.get(provider)
+        if modules is None:
+            raise CharacterizationGateError(
+                "invalid", "characterization_bridge_revision_unavailable"
+            )
+        digest = hashlib.sha256()
+        for module in sorted(modules):
+            try:
+                payload = (root / f"{module}.py").read_bytes()
+            except OSError:
+                raise CharacterizationGateError(
+                    "invalid", "characterization_bridge_revision_unavailable"
+                ) from None
+            payload = payload.replace(b"\r\n", b"\n")
+            digest.update(f"{module}\n{len(payload)}\n".encode("utf-8"))
+            digest.update(payload)
+        revisions[provider] = f"sha256:{digest.hexdigest()}"
+    return revisions
+
+
 @dataclass(frozen=True)
 class CharacterizationGate:
-    """A passing newest characterization report for the installed CLIs."""
+    """A passing characterization proof, per provider, for the installed CLIs."""
 
     report_path: Path
     characterization_id: str
     codex_registration_turn_required: bool
+    provider_characterization_ids: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -1974,13 +2069,22 @@ class _ValidatedGateReport:
     created_at: datetime
     characterization_id: str
     codex_registration_turn_required: bool
-    passed: bool
+    providers: frozenset[str]
+    provider_passed: Mapping[str, bool]
+    versions: Mapping[str, str]
+    bridge_revision: Mapping[str, str] | None
 
 
 class CharacterizationGateError(RuntimeError):
     """Stable failure from the fail-closed live-characterization gate."""
 
-    _CODES = frozenset({"missing", "invalid", "failed", "version_drift"})
+    _CODES = frozenset({
+        "missing",
+        "invalid",
+        "failed",
+        "version_drift",
+        "revision_drift",
+    })
 
     def __init__(self, code: str, detail: str) -> None:
         if code not in self._CODES:
@@ -1993,30 +2097,94 @@ def resolve_characterization_gate(
     *,
     report_root: Path | None = None,
     current_versions: Mapping[str, str] | None = None,
+    current_bridge_revision: Mapping[str, str] | None = None,
 ) -> CharacterizationGate:
-    """Require the newest report to pass exactly for the installed CLI versions."""
+    """Require each provider's newest report to pass for its installed CLI.
+
+    Providers resolve independently, so a provider-scoped refresh leaves the
+    other provider's standing proof in force rather than forcing a second live
+    session.  "Newest recording the provider" is evaluated *before* the pass
+    check, so a later failing run still buries an earlier passing one.
+
+    A proof that is not the newest report on disk -- the only way scoping ever
+    reuses an older one -- must additionally have been made against the
+    installed bridge revision.  That closes the hole scoping would otherwise
+    open: reusing a Claude proof taken against bridge code that has since
+    changed in the Claude-handling path.  The newest report is deliberately
+    exempt; holding it to the same rule would demand a live run per bridge
+    commit, which this package's churn cannot pay for, and it would newly block
+    what the pair-report gate always allowed.
+    """
 
     root = _gate_report_root(report_root)
-    latest = _newest_validated_gate_report(root)
-    if not latest.passed:
-        raise CharacterizationGateError("failed", "characterization_report_failed")
+    _require_safe_report_root(root)
+    reports = _read_validated_gate_reports(root)
+    newest = max(reports, key=_gate_report_order)
     observed_versions = (
         _current_cli_versions()
         if current_versions is None
         else _validated_version_mapping(current_versions, source="current")
     )
-    report_versions = _validated_version_mapping(
-        latest.report["versions"], source="report"
-    )
-    if report_versions != observed_versions:
-        raise CharacterizationGateError(
-            "version_drift", "characterization_version_mismatch"
-        )
+    resolved: dict[str, _ValidatedGateReport] = {}
+    for provider in ("claude", "codex"):
+        candidates = [report for report in reports if provider in report.providers]
+        if not candidates:
+            raise CharacterizationGateError(
+                "missing", "characterization_report_missing"
+            )
+        latest = max(candidates, key=_gate_report_order)
+        if not latest.provider_passed[provider]:
+            raise CharacterizationGateError("failed", "characterization_report_failed")
+        if latest.versions[provider] != observed_versions[provider]:
+            raise CharacterizationGateError(
+                "version_drift", "characterization_version_mismatch"
+            )
+        if latest is not newest:
+            _require_current_bridge_revision(
+                latest,
+                provider=provider,
+                current_bridge_revision=current_bridge_revision,
+            )
+        resolved[provider] = latest
+    winner = max(resolved.values(), key=_gate_report_order)
     return CharacterizationGate(
-        report_path=latest.path,
-        characterization_id=latest.characterization_id,
-        codex_registration_turn_required=latest.codex_registration_turn_required,
+        report_path=winner.path,
+        characterization_id=winner.characterization_id,
+        codex_registration_turn_required=(
+            resolved["codex"].codex_registration_turn_required
+        ),
+        provider_characterization_ids={
+            provider: report.characterization_id
+            for provider, report in sorted(resolved.items())
+        },
     )
+
+
+def _gate_report_order(report: _ValidatedGateReport) -> tuple[datetime, str]:
+    return (report.created_at, report.characterization_id)
+
+
+def _require_current_bridge_revision(
+    report: _ValidatedGateReport,
+    *,
+    provider: str,
+    current_bridge_revision: Mapping[str, str] | None,
+) -> None:
+    recorded = (
+        None
+        if report.bridge_revision is None
+        else report.bridge_revision.get(provider)
+    )
+    installed = (
+        current_bridge_revisions(providers=(provider,))
+        if current_bridge_revision is None
+        else current_bridge_revision
+    )
+    expected = installed.get(provider)
+    if recorded is None or expected is None or recorded != expected:
+        raise CharacterizationGateError(
+            "revision_drift", "characterization_bridge_revision_mismatch"
+        )
 
 
 def _gate_report_root(report_root: Path | None) -> Path:
@@ -2043,6 +2211,7 @@ def describe_characterization_gate(
     *,
     report_root: Path | None = None,
     current_versions: Mapping[str, str] | None = None,
+    current_bridge_revision: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
     """Resolve the gate and describe the outcome for an installer.
 
@@ -2060,12 +2229,14 @@ def describe_characterization_gate(
         gate = resolve_characterization_gate(
             report_root=root,
             current_versions=current_versions,
+            current_bridge_revision=current_bridge_revision,
         )
     except CharacterizationGateError as exc:
         return 1, _describe_gate_rejection(
             exc,
             root=root,
             current_versions=current_versions,
+            current_bridge_revision=current_bridge_revision,
         )
     return 0, gate.characterization_id
 
@@ -2075,18 +2246,37 @@ def _describe_gate_rejection(
     *,
     root: Path,
     current_versions: Mapping[str, str] | None,
+    current_bridge_revision: Mapping[str, str] | None = None,
 ) -> str:
     lines = [f"characterization gate rejected: {exc.code} ({exc})"]
+    refresh_provider = "all"
     if exc.code == "version_drift":
         try:
-            lines.extend(_describe_version_drift(root, current_versions))
+            drift_lines, drifted = _describe_version_drift(root, current_versions)
+            lines.extend(drift_lines)
+            # Only one CLI moved -- offer the one-session refresh, but only if
+            # it would actually clear the gate.  A scoped refresh demotes the
+            # current report, so the other provider's half of it then faces the
+            # bridge-revision check; if that half could not survive it, the
+            # operator would pay a session and still be sent to a full refresh.
+            if len(drifted) == 1 and _scoped_refresh_would_suffice(
+                root,
+                refreshed=drifted[0],
+                current_bridge_revision=current_bridge_revision,
+            ):
+                refresh_provider = drifted[0]
         except Exception:
             # A diagnostic must never mask the rejection it is describing.
             pass
-    if exc.code in ("missing", "failed", "version_drift"):
+    if exc.code == "revision_drift":
+        try:
+            lines.extend(_describe_revision_drift(root, current_bridge_revision))
+        except Exception:
+            pass
+    if exc.code in ("missing", "failed", "version_drift", "revision_drift"):
         lines.append(
             "refresh with: uv run --no-sync hermes-session-bridge characterize "
-            "--provider all"
+            f"--provider {refresh_provider}"
         )
         lines.append(
             "note: a refresh creates and then disposes one real session per "
@@ -2095,10 +2285,40 @@ def _describe_gate_rejection(
     return "\n".join(lines)
 
 
+def _scoped_refresh_would_suffice(
+    root: Path,
+    *,
+    refreshed: str,
+    current_bridge_revision: Mapping[str, str] | None,
+) -> bool:
+    reports = _gate_provider_reports(root)
+    for provider in ("claude", "codex"):
+        if provider == refreshed:
+            continue
+        report = reports.get(provider)
+        if report is None:
+            return False
+        recorded = (
+            None
+            if report.bridge_revision is None
+            else report.bridge_revision.get(provider)
+        )
+        installed = (
+            current_bridge_revisions(providers=(provider,))
+            if current_bridge_revision is None
+            else current_bridge_revision
+        ).get(provider)
+        if recorded is None or installed is None or recorded != installed:
+            return False
+    return True
+
+
 def _describe_version_drift(
     root: Path,
     current_versions: Mapping[str, str] | None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Per-provider version comparison plus the providers that actually drifted."""
+
     expected = _expected_gate_versions(root)
     try:
         observed = (
@@ -2109,26 +2329,88 @@ def _describe_version_drift(
     except CharacterizationGateError:
         observed = None
     if expected is None or observed is None:
-        return []
+        return [], []
     lines: list[str] = []
+    drifted: list[str] = []
     for provider in ("claude", "codex"):
-        report_version = expected[provider]
+        report_version = expected.get(provider)
         installed_version = observed[provider]
-        if report_version == installed_version:
+        if report_version is None:
+            lines.append(f"  {provider}: no report records this provider")
+            drifted.append(provider)
+        elif report_version == installed_version:
             lines.append(f"  {provider}: unchanged at {report_version!r}")
         else:
             lines.append(
                 f"  {provider}: report {report_version!r} "
                 f"!= installed {installed_version!r}"
             )
+            drifted.append(provider)
+    return lines, drifted
+
+
+def _describe_revision_drift(
+    root: Path,
+    current_bridge_revision: Mapping[str, str] | None,
+) -> list[str]:
+    """Name the providers whose standing proof predates the installed bridge."""
+
+    reports = _gate_provider_reports(root)
+    newest = _newest_validated_gate_report(root)
+    lines: list[str] = []
+    for provider in ("claude", "codex"):
+        report = reports.get(provider)
+        if report is None or report is newest:
+            continue
+        recorded = (
+            None
+            if report.bridge_revision is None
+            else report.bridge_revision.get(provider)
+        )
+        installed = (
+            current_bridge_revisions(providers=(provider,))
+            if current_bridge_revision is None
+            else current_bridge_revision
+        ).get(provider)
+        if recorded == installed and recorded is not None:
+            continue
+        source = "not recorded" if recorded is None else recorded
+        lines.append(
+            f"  {provider}: proof {report.characterization_id} was made against "
+            f"bridge revision {source}, installed is {installed}"
+        )
+    if lines:
+        lines.insert(
+            0,
+            "a standing proof predates the installed bridge code; scoped reuse "
+            "is refused",
+        )
     return lines
 
 
-def _expected_gate_versions(root: Path) -> dict[str, str] | None:
-    """Best-effort report versions for a drift diagnostic."""
+def _gate_provider_reports(root: Path) -> dict[str, _ValidatedGateReport]:
+    """The newest report recording each provider, for diagnostics."""
 
-    latest = _newest_validated_gate_report(root)
-    return _validated_version_mapping(latest.report["versions"], source="report")
+    reports = _read_validated_gate_reports(root)
+    resolved: dict[str, _ValidatedGateReport] = {}
+    for provider in ("claude", "codex"):
+        candidates = [report for report in reports if provider in report.providers]
+        if candidates:
+            resolved[provider] = max(candidates, key=_gate_report_order)
+    return resolved
+
+
+def _expected_gate_versions(root: Path) -> dict[str, str] | None:
+    """Best-effort report versions for a drift diagnostic.
+
+    Each provider is described from the report that would actually satisfy it,
+    which under provider scoping need not be the same report.
+    """
+
+    return {
+        provider: report.versions[provider]
+        for provider, report in _gate_provider_reports(root).items()
+    }
 
 
 def _require_safe_report_root(root: Path) -> None:
@@ -2208,7 +2490,11 @@ def load_codex_characterization_origins(
     reports_by_id: dict[str, _ValidatedGateReport] = {}
     for report in reports:
         reports_by_id[report.characterization_id] = report
-        provider = report.report["providers"]["codex"]
+        provider = report.report["providers"].get("codex")
+        if provider is None:
+            # A Claude-only refresh records no Codex thread, so it contributes
+            # nothing to the ledger -- but it is still a valid report.
+            continue
         native_id = provider.get("native_id")
         if native_id is None:
             continue
@@ -2229,9 +2515,14 @@ def load_codex_characterization_origins(
                 "failed", "characterization_codex_origin_unresolved"
             )
         if report is not None:
-            reported_native_id = report.report["providers"]["codex"].get(
-                "native_id"
-            )
+            codex_status = report.report["providers"].get("codex")
+            if codex_status is None:
+                # A guard without a Codex block in its own report is
+                # unexplainable provenance: fail closed.
+                raise CharacterizationGateError(
+                    "failed", "characterization_codex_origin_unresolved"
+                )
+            reported_native_id = codex_status.get("native_id")
             if (
                 native_id is not None
                 and reported_native_id is not None
@@ -2505,7 +2796,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _validate_gate_report(
     report: dict[str, Any], *, report_path: Path
 ) -> _ValidatedGateReport:
-    expected_keys = {
+    base_keys = {
         "schema_version",
         "characterization_id",
         "created_at",
@@ -2513,10 +2804,20 @@ def _validate_gate_report(
         "versions",
         "providers",
     }
-    if set(report) != expected_keys or type(report["schema_version"]) is not int:
+    if type(report.get("schema_version")) is not int:
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    schema_version = report["schema_version"]
+    # v1 reports predate provider scoping: they record both providers and no
+    # bridge revision.  They stay valid so an existing report root is not
+    # invalidated wholesale -- one malformed file fails the whole gate closed.
+    if schema_version == 1:
+        expected_keys = base_keys
+    elif schema_version == 2:
+        expected_keys = base_keys | {"bridge_revision"}
+    else:
         raise CharacterizationGateError("invalid", "characterization_report_malformed")
     if (
-        report["schema_version"] != 1
+        set(report) != expected_keys
         or report["automatic_mirroring_enabled"] is not False
     ):
         raise CharacterizationGateError("invalid", "characterization_report_malformed")
@@ -2537,26 +2838,61 @@ def _validate_gate_report(
         ) from None
     if created.tzinfo is None or created.utcoffset() is None:
         raise CharacterizationGateError("invalid", "characterization_report_malformed")
-    _validated_version_mapping(report["versions"], source="report")
     providers = report["providers"]
-    if not isinstance(providers, dict) or set(providers) != {"claude", "codex"}:
+    if not isinstance(providers, dict):
         raise CharacterizationGateError("invalid", "characterization_report_malformed")
-    claude_registration, claude_passed = _validate_provider_status(
-        providers["claude"], provider="claude"
-    )
-    codex_registration, codex_passed = _validate_provider_status(
-        providers["codex"], provider="codex"
-    )
-    if claude_registration:
+    provider_names = set(providers)
+    if schema_version == 1:
+        if provider_names != {"claude", "codex"}:
+            raise CharacterizationGateError(
+                "invalid", "characterization_report_malformed"
+            )
+    elif not provider_names or not provider_names.issubset({"claude", "codex"}):
         raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    versions = _validated_version_mapping(
+        report["versions"], source="report", expected=provider_names
+    )
+    bridge_revision = (
+        None
+        if schema_version == 1
+        else _validated_revision_mapping(
+            report["bridge_revision"], expected=provider_names
+        )
+    )
+    provider_passed: dict[str, bool] = {}
+    codex_registration = False
+    for name in sorted(provider_names):
+        used_registration_turn, passed = _validate_provider_status(
+            providers[name], provider=name
+        )
+        if name == "claude" and used_registration_turn:
+            raise CharacterizationGateError(
+                "invalid", "characterization_report_malformed"
+            )
+        if name == "codex":
+            codex_registration = used_registration_turn
+        provider_passed[name] = passed
     return _ValidatedGateReport(
         path=report_path,
         report=report,
         created_at=created.astimezone(timezone.utc),
         characterization_id=characterization_id,
         codex_registration_turn_required=codex_registration,
-        passed=claude_passed and codex_passed,
+        providers=frozenset(provider_names),
+        provider_passed=provider_passed,
+        versions=versions,
+        bridge_revision=bridge_revision,
     )
+
+
+def _validated_revision_mapping(value: Any, *, expected: set[str]) -> dict[str, str]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected
+        or not all(isinstance(value[key], str) and value[key] for key in value)
+    ):
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    return {key: value[key] for key in sorted(value)}
 
 
 def _validate_provider_status(value: Any, *, provider: str) -> tuple[bool, bool]:
@@ -2627,10 +2963,13 @@ def _validate_provider_status(value: Any, *, provider: str) -> tuple[bool, bool]
     return value["used_registration_turn"], passed
 
 
-def _validated_version_mapping(value: Any, *, source: str) -> dict[str, str]:
+def _validated_version_mapping(
+    value: Any, *, source: str, expected: set[str] | None = None
+) -> dict[str, str]:
+    required = {"claude", "codex"} if expected is None else expected
     if (
         not isinstance(value, Mapping)
-        or set(value) != {"claude", "codex"}
+        or set(value) != required
         or not all(isinstance(value[key], str) and value[key] for key in value)
     ):
         code = "invalid" if source == "report" else "version_drift"
@@ -2640,7 +2979,7 @@ def _validated_version_mapping(value: Any, *, source: str) -> dict[str, str]:
             else "characterization_version_unavailable"
         )
         raise CharacterizationGateError(code, detail)
-    return {key: value[key] for key in ("claude", "codex")}
+    return {key: value[key] for key in sorted(required)}
 
 
 def _current_cli_versions() -> dict[str, str]:
@@ -2835,17 +3174,41 @@ def run_live_characterization(
     cwd: Path | None = None,
     provenance_secret: bytes | None = None,
     live_tests_enabled: bool = False,
+    providers: Sequence[str] = ("claude", "codex"),
 ) -> Path:
+    """Characterize the selected providers, each in its own real session.
+
+    ``providers`` exists so a single drifted CLI can be re-proven without
+    creating and disposing a session for the provider that did not move.  The
+    two providers are characterized independently -- separate adapters,
+    separate failure capture, no shared mutable state -- so a scoped run is the
+    same measurement, not a weaker one.
+    """
+
     if not live_tests_enabled:
         raise RuntimeError("live_characterization_not_enabled")
-    claude_command = resolve_cli_executable(claude_executable)
-    codex_command = resolve_cli_executable(codex_executable)
-    claude_version = _cli_version([*claude_command, "--version"])
-    codex_version = _cli_version([*codex_command, "--version"])
-    if claude_version is None:
-        raise RuntimeError("claude_cli_preflight_failed")
-    if codex_version is None:
-        raise RuntimeError("codex_cli_preflight_failed")
+    selected = tuple(providers)
+    if (
+        not selected
+        or len(set(selected)) != len(selected)
+        or not set(selected).issubset({"claude", "codex"})
+    ):
+        raise RuntimeError("characterization_provider_invalid")
+    versions: dict[str, str] = {}
+    claude_command: tuple[str, ...] | None = None
+    codex_command: tuple[str, ...] | None = None
+    if "claude" in selected:
+        claude_command = resolve_cli_executable(claude_executable)
+        claude_version = _cli_version([*claude_command, "--version"])
+        if claude_version is None:
+            raise RuntimeError("claude_cli_preflight_failed")
+        versions["claude"] = claude_version
+    if "codex" in selected:
+        codex_command = resolve_cli_executable(codex_executable)
+        codex_version = _cli_version([*codex_command, "--version"])
+        if codex_version is None:
+            raise RuntimeError("codex_cli_preflight_failed")
+        versions["codex"] = codex_version
     characterization_id = str(uuid.uuid4())
     if provenance_secret is None:
         from .mcp_server import resolve_marker_key
@@ -2860,86 +3223,90 @@ def run_live_characterization(
     title = f"[Hermes Bridge Characterization] {characterization_id}"
     marker_secret = secrets.token_bytes(32)
     working_directory = Path(cwd or Path.cwd()).resolve()
+    ordered = tuple(sorted(selected))
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "characterization_id": characterization_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "automatic_mirroring_enabled": False,
-        "versions": {
-            "claude": claude_version,
-            "codex": codex_version,
-        },
-        "providers": {
-            "claude": _provider_report(),
-            "codex": _provider_report(),
-        },
+        "versions": {provider: versions[provider] for provider in ordered},
+        # Records which bridge code proved this, so a later scoped reuse of the
+        # report can tell whether that code has since moved.
+        "bridge_revision": current_bridge_revisions(providers=ordered),
+        "providers": {provider: _provider_report() for provider in ordered},
     }
     failures: list[str] = []
-    try:
-        _characterize_claude(
-            report["providers"]["claude"],
-            characterization_id=characterization_id,
-            title=title,
-            marker_secret=marker_secret,
-            projects_root=Path(claude_projects_root),
-            report_root=resolved_report_root,
-            executable=claude_command,
-            cwd=working_directory,
-        )
-    except Exception as exc:
-        code = _safe_error_code("claude", exc)
-        report["providers"]["claude"]["error_code"] = code
-        if isinstance(exc, PlaceholderCreationError):
-            _record_claude_failure_diagnostics(report["providers"]["claude"], exc)
-        failures.append(code)
-    codex_origin_guard = _prepare_codex_origin_guard(
-        resolved_report_root,
-        characterization_id=characterization_id,
-        marker_secret=provenance_secret,
-    )
+    if "claude" in selected:
+        try:
+            _characterize_claude(
+                report["providers"]["claude"],
+                characterization_id=characterization_id,
+                title=title,
+                marker_secret=marker_secret,
+                projects_root=Path(claude_projects_root),
+                report_root=resolved_report_root,
+                executable=claude_command,
+                cwd=working_directory,
+            )
+        except Exception as exc:
+            code = _safe_error_code("claude", exc)
+            report["providers"]["claude"]["error_code"] = code
+            if isinstance(exc, PlaceholderCreationError):
+                _record_claude_failure_diagnostics(report["providers"]["claude"], exc)
+            failures.append(code)
 
-    def record_codex_native_id(native_id: str) -> None:
-        _bind_codex_origin_guard(
-            codex_origin_guard,
-            native_id=native_id,
+    codex_origin_guard: Path | None = None
+    if "codex" in selected:
+        codex_origin_guard = _prepare_codex_origin_guard(
+            resolved_report_root,
+            characterization_id=characterization_id,
             marker_secret=provenance_secret,
         )
+        guard_path = codex_origin_guard
 
-    try:
-        _characterize_codex(
-            report["providers"]["codex"],
-            characterization_id=characterization_id,
-            title=title,
-            marker_secret=marker_secret,
-            executable=codex_command,
-            cwd=working_directory,
-            record_native_id=record_codex_native_id,
-        )
-    except Exception as exc:
-        code = _safe_error_code("codex", exc)
-        report["providers"]["codex"]["error_code"] = code
-        failures.append(code)
-    else:
+        def record_codex_native_id(native_id: str) -> None:
+            _bind_codex_origin_guard(
+                guard_path,
+                native_id=native_id,
+                marker_secret=provenance_secret,
+            )
+
         try:
-            _canonical_uuid(report["providers"]["codex"].get("native_id"))
-        except ValueError:
-            code = "codex_characterization_identity_missing"
+            _characterize_codex(
+                report["providers"]["codex"],
+                characterization_id=characterization_id,
+                title=title,
+                marker_secret=marker_secret,
+                executable=codex_command,
+                cwd=working_directory,
+                record_native_id=record_codex_native_id,
+            )
+        except Exception as exc:
+            code = _safe_error_code("codex", exc)
             report["providers"]["codex"]["error_code"] = code
             failures.append(code)
+        else:
+            try:
+                _canonical_uuid(report["providers"]["codex"].get("native_id"))
+            except ValueError:
+                code = "codex_characterization_identity_missing"
+                report["providers"]["codex"]["error_code"] = code
+                failures.append(code)
 
     report_path = write_characterization_report(
         report,
         report_root=resolved_report_root,
         characterization_id=characterization_id,
     )
-    codex_native_id = report["providers"]["codex"].get("native_id")
-    if codex_native_id is not None:
-        _retire_codex_origin_guard(
-            codex_origin_guard,
-            marker_secret=provenance_secret,
-            expected_native_id=codex_native_id,
-            expected_bridge_id=f"characterization-{characterization_id}-codex",
-        )
+    if codex_origin_guard is not None:
+        codex_native_id = report["providers"]["codex"].get("native_id")
+        if codex_native_id is not None:
+            _retire_codex_origin_guard(
+                codex_origin_guard,
+                marker_secret=provenance_secret,
+                expected_native_id=codex_native_id,
+                expected_bridge_id=f"characterization-{characterization_id}-codex",
+            )
     if failures:
         raise LiveCharacterizationError(report_path, failures)
     return report_path

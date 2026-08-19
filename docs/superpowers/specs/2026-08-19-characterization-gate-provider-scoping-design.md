@@ -1,7 +1,8 @@
 # Characterization gate: version tolerance and provider scoping
 
 **Date:** 2026-08-19
-**Status:** analysis complete; patch tolerance REJECTED; provider scoping DESIGNED, not built
+**Status:** patch tolerance REJECTED (unchanged); provider scoping BUILT 2026-08-19,
+together with the `bridge_revision` field its §6 recommendation made a precondition -- see §7 onward
 **Code touched by this document:** none of the gate's comparison logic
 
 ## 1. What prompted this
@@ -146,3 +147,147 @@ and that a real install is still blocked with the diagnostic attached.
 Leave the exact-equality comparison alone. Build provider scoping only alongside a
 `bridge_revision` field; scoping on its own trades a two-session refresh for a proof that can
 silently age past the code it was proving.
+
+---
+
+# Implementation, 2026-08-19
+
+**Status of this document:** §3 (patch tolerance REJECTED) stands unchanged. §6's
+condition — build scoping *only* alongside `bridge_revision` — was met: both landed
+together, `bridge_revision` first.
+
+## 7. What `bridge_revision` records
+
+`current_bridge_revisions()` (`session_bridge/characterize.py`) returns, per provider,
+a `sha256:` digest of the bridge modules that implement how the bridge drives and reads
+that provider. Content-addressed, not git-derived: an editable install runs the working
+tree, so a commit id would call an uncommitted change unchanged. Line endings are
+normalised, so a checkout with different EOL settings is not read as a behaviour change.
+
+The manifest (`BRIDGE_REVISION_MODULES`) is the transitive top-level intra-package import
+closure of each provider's adapter modules (`BRIDGE_REVISION_ROOT_MODULES`), stopping at
+`BRIDGE_REVISION_EXCLUDED_MODULES`, plus `characterize` itself as the shared harness:
+
+| provider | modules |
+| --- | --- |
+| claude | `characterize`, `claude_adapter`, `claude_registrar`, `claude_visibility`, `claude_visibility_codes`, `models` |
+| codex | `characterize`, `claude_adapter`, `codex_adapter`, `models` |
+
+Excluded: `store`, `context_pack`, `sidebar`, `sidebar_placement`,
+`sidebar_reconciliation` — the catalog/mirroring surface. Live characterization never
+opens a store, builds a context pack or places a sidebar; it creates a placeholder,
+discovers the native session file, reads it, resumes it and disposes of it. They enter
+the closure only as type and helper imports, and `store.py` alone took 109 commits in
+the seven weeks from 2026-07-01, so tracking it would invalidate every proof for changes
+it never measured.
+`test_bridge_revision_manifest_covers_the_characterization_import_closure` re-derives the
+closure from the installed source, so a new import into an adapter fails the suite until
+it is either tracked or deliberately excluded.
+
+## 8. The mismatch policy, and why it is two-tier
+
+A digest mismatch is fatal **only for a proof that is not the newest report on disk** —
+which, before scoping, could never happen. The newest report is exempt.
+
+The evidence that forced this shape, measured over `git log --since=2026-07-01`:
+
+| module | commits in 7 weeks |
+| --- | --- |
+| `claude_registrar` | 47 |
+| `codex_adapter` | 49 |
+| `characterize` | 25 |
+| `claude_adapter` | 17 |
+| `claude_visibility` | 16 |
+| whole `session_bridge/` package | 389 |
+
+A `bridge_revision` checked absolutely — report digest must equal installed digest, for
+every proof — would reject the gate roughly twice a day on the Claude manifest alone.
+Each rejection demands a live run that creates and disposes real provider sessions. That
+is not a gate anyone pays; it is a gate everyone bypasses. It would also newly block
+what the pair-report gate has always allowed: reusing yesterday's proof against today's
+bridge.
+
+So the check is applied exactly where scoping creates new exposure:
+
+- **Tier 1 — the newest report.** Not revision-checked. This is the pre-existing,
+  accepted risk: a proof taken at one revision and reused as the bridge moves forward.
+  Unchanged from the status quo, by design.
+- **Tier 2 — any older report a scoped resolution falls back to.** Revision-checked, and
+  fatal on mismatch (`CharacterizationGateError("revision_drift", …)`). This is the hole
+  §4.4 identified: a Claude proof left standing by a Codex-only refresh, asserted over
+  Claude-handling code that has since changed.
+
+The result is the bar §6 set — scoping is **strictly safer** than the status quo, never
+laxer: every configuration the old gate accepted is still accepted, and the one new
+configuration scoping introduces carries a check the old gate had no way to make.
+
+A v1 report carries no `bridge_revision`, so it can satisfy Tier 1 but never Tier 2:
+scoped reuse of a pre-schema-v2 proof fails closed.
+
+**Practical consequence, stated plainly:** given the churn above, a Claude proof is often
+already revision-stale by the time Codex drifts, so a scoped refresh will frequently be
+refused with `revision_drift` and a full refresh demanded anyway. That is the honest
+answer, not a defect — the alternative is asserting Claude compatibility over bridge code
+that changed underneath it. The saving is real when the drifting week's commits landed
+outside the other provider's manifest.
+
+## 9. Schema v2
+
+```json
+{
+  "schema_version": 2,
+  "characterization_id": "…",
+  "created_at": "…+00:00",
+  "automatic_mirroring_enabled": false,
+  "versions":        {"codex": "codex-cli 0.147.0"},
+  "bridge_revision": {"codex": "sha256:…"},
+  "providers":       {"codex": {…}}
+}
+```
+
+`versions`, `bridge_revision` and `providers` must carry **identical, non-empty** key
+sets, a subset of `{claude, codex}`. v1 reports stay valid and keep their old rules
+(both providers, no `bridge_revision`) — one malformed file fails the whole gate closed,
+so re-versioning the existing report root would have bricked it.
+
+## 10. Gate resolution
+
+For each provider P: the newest valid report **recording** P must pass for P, at P's
+installed CLI version, and — if it is not the newest report on disk — at the installed
+bridge revision for P. Both providers must resolve. "Newest recording P" is evaluated
+before the pass check, so a later failing run still buries an earlier passing one
+(§4.3). `created_at` remains the ordering key; malformed or redirected files still fail
+the whole gate, not just the provider they mention.
+
+`CharacterizationGate` gained `provider_characterization_ids`;
+`codex_registration_turn_required` now comes from the report that actually proved Codex.
+
+## 11. Surface changes
+
+- `characterize --provider {all,claude,codex}` (`all` remains the default), threaded to
+  `run_live_characterization(providers=…)`, which preflights, characterizes, and records
+  only the selected providers. A Claude-only run prepares no Codex origin guard.
+- `load_codex_characterization_origins` tolerates reports with no Codex block and still
+  counts every valid report's native ID. A Codex origin guard naming a report that
+  records no Codex block is unexplainable provenance and fails closed.
+- `describe_characterization_gate()` accepts `current_bridge_revision`, describes each
+  provider from the report that would satisfy it, names the providers whose standing
+  proof predates the installed bridge, and offers the **scoped** refresh command when
+  exactly one CLI drifted *and that scoped refresh would actually clear the gate*.
+  The second condition matters: a scoped refresh demotes the current report, so the
+  other provider's half of it then faces the Tier-2 revision check. If that half could
+  not survive it -- a stale digest, or a v1 report with no digest at all, which is every
+  report on this machine today -- the diagnostic keeps recommending `--provider all`
+  rather than spending a real session to arrive at the same place.
+  `scripts/install_session_bridge.ps1` (in `~/.hermes`) needed no change: it prints
+  whatever the diagnostic returns.
+- New stable error code `revision_drift`, surfaced by `characterization_status()` and as
+  `RolloutGateBlocked("characterization_revision_drift")`.
+
+## 12. Verification
+
+Written test-first; 70 pass in `tests/session_bridge/test_live_characterization.py`,
+including the two skipped live-only cases. **No live characterization was run** —
+the scoped-run tests replace every seam that reaches a provider CLI
+(`resolve_cli_executable`, `_cli_version`, `_characterize_claude`, `_characterize_codex`)
+and assert which provider paths were entered.

@@ -7,10 +7,15 @@ from types import SimpleNamespace
 
 import pytest
 
+import session_bridge.characterize
 from session_bridge.characterize import (
+    BRIDGE_REVISION_EXCLUDED_MODULES,
+    BRIDGE_REVISION_MODULES,
+    BRIDGE_REVISION_ROOT_MODULES,
     CharacterizationGateError,
     _cli_version,
     _read_report_safely,
+    current_bridge_revisions,
     describe_characterization_gate,
     load_codex_characterization_origins,
     resolve_characterization_gate,
@@ -734,3 +739,883 @@ def test_real_claude_and_codex_create_discover_read_and_resume() -> None:
         "Codex registration turn required: "
         f"{report['providers']['codex']['used_registration_turn']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# bridge_revision: what code was this proof made against?
+# ---------------------------------------------------------------------------
+
+
+def _fake_package_root(tmp_path: Path) -> Path:
+    """A stand-in session_bridge directory holding every revision-tracked file.
+
+    The digest only ever reads the manifest's modules, so a handful of stub
+    files exercises it exactly as the real package does -- and lets a test
+    mutate one module without touching the installed checkout.
+    """
+
+    root = tmp_path / "package"
+    root.mkdir()
+    tracked = {
+        module for modules in BRIDGE_REVISION_MODULES.values() for module in modules
+    }
+    for module in sorted(tracked):
+        (root / f"{module}.py").write_text(f"# {module}\n", encoding="utf-8")
+    (root / "store.py").write_text("# untracked by the manifest\n", encoding="utf-8")
+    return root
+
+
+def test_bridge_revision_digests_are_per_provider_and_reproducible(
+    tmp_path: Path,
+) -> None:
+    root = _fake_package_root(tmp_path)
+
+    revisions = current_bridge_revisions(package_root=root)
+
+    assert set(revisions) == {"claude", "codex"}
+    assert all(value.startswith("sha256:") for value in revisions.values())
+    assert revisions["claude"] != revisions["codex"]
+    assert revisions == current_bridge_revisions(package_root=root)
+
+
+def test_bridge_revision_moves_only_for_the_provider_whose_module_changed(
+    tmp_path: Path,
+) -> None:
+    root = _fake_package_root(tmp_path)
+    before = current_bridge_revisions(package_root=root)
+
+    (root / "claude_registrar.py").write_text("# changed\n", encoding="utf-8")
+    after = current_bridge_revisions(package_root=root)
+
+    assert after["claude"] != before["claude"]
+    assert after["codex"] == before["codex"]
+
+
+def test_bridge_revision_moves_for_both_when_the_harness_changes(
+    tmp_path: Path,
+) -> None:
+    root = _fake_package_root(tmp_path)
+    before = current_bridge_revisions(package_root=root)
+
+    (root / "characterize.py").write_text("# changed harness\n", encoding="utf-8")
+    after = current_bridge_revisions(package_root=root)
+
+    assert after["claude"] != before["claude"]
+    assert after["codex"] != before["codex"]
+
+
+def test_bridge_revision_ignores_modules_outside_the_manifest(tmp_path: Path) -> None:
+    root = _fake_package_root(tmp_path)
+    before = current_bridge_revisions(package_root=root)
+
+    (root / "store.py").write_text("# catalog churn\n", encoding="utf-8")
+
+    assert current_bridge_revisions(package_root=root) == before
+
+
+def test_bridge_revision_ignores_line_ending_translation(tmp_path: Path) -> None:
+    root = _fake_package_root(tmp_path)
+    (root / "models.py").write_bytes(b"one\ntwo\n")
+    before = current_bridge_revisions(package_root=root)
+
+    (root / "models.py").write_bytes(b"one\r\ntwo\r\n")
+
+    assert current_bridge_revisions(package_root=root) == before
+
+
+def test_bridge_revision_fails_closed_when_a_tracked_module_is_missing(
+    tmp_path: Path,
+) -> None:
+    root = _fake_package_root(tmp_path)
+    (root / "models.py").unlink()
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        current_bridge_revisions(package_root=root)
+
+    assert excinfo.value.code == "invalid"
+
+
+def test_bridge_revision_manifest_covers_the_characterization_import_closure() -> None:
+    """The manifest must not silently fall behind a new intra-package import.
+
+    Each provider's manifest is the transitive top-level ``session_bridge``
+    import closure of that provider's adapter modules -- stopping at the
+    documented catalog/mirroring exclusions -- plus the shared harness.  Adding
+    an import to an adapter therefore fails this test until the new module is
+    either tracked or deliberately excluded.
+    """
+
+    import ast
+
+    package_root = Path(session_bridge.characterize.__file__).parent
+
+    def top_level_imports(module: str) -> set[str]:
+        tree = ast.parse(
+            (package_root / f"{module}.py").read_text(encoding="utf-8"),
+            filename=f"{module}.py",
+        )
+        return {
+            node.module
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module
+        }
+
+    for provider, roots in BRIDGE_REVISION_ROOT_MODULES.items():
+        seen: set[str] = set()
+        pending = list(roots)
+        while pending:
+            module = pending.pop()
+            if module in seen or module in BRIDGE_REVISION_EXCLUDED_MODULES:
+                continue
+            seen.add(module)
+            pending.extend(
+                candidate
+                for candidate in top_level_imports(module)
+                if (package_root / f"{candidate}.py").exists()
+            )
+        assert set(BRIDGE_REVISION_MODULES[provider]) == seen | {"characterize"}
+
+
+# ---------------------------------------------------------------------------
+# schema v2: provider-scoped reports carrying a bridge_revision
+# ---------------------------------------------------------------------------
+
+
+_CURRENT_REVISION = {
+    "claude": "sha256:" + "a" * 64,
+    "codex": "sha256:" + "b" * 64,
+}
+_STALE_REVISION = {
+    "claude": "sha256:" + "c" * 64,
+    "codex": "sha256:" + "d" * 64,
+}
+
+
+def _v2_report(
+    characterization_id: str,
+    *,
+    providers: tuple[str, ...] = ("claude", "codex"),
+    versions: dict[str, str] | None = None,
+    bridge_revision: dict[str, str] | None = None,
+    created_at: str = "2026-07-14T12:00:00+00:00",
+    passed: bool = True,
+    registration_turn: bool = False,
+    codex_native_id: str | None = None,
+) -> dict[str, object]:
+    all_versions = {"claude": "1.2.3", "codex": "4.5.6"}
+    if versions is not None:
+        all_versions.update(versions)
+    revisions = dict(_CURRENT_REVISION)
+    if bridge_revision is not None:
+        revisions.update(bridge_revision)
+
+    def provider(name: str) -> dict[str, object]:
+        status: dict[str, object] = {
+            "create": passed,
+            "discover": passed,
+            "read": passed,
+            "resume": passed,
+            "used_registration_turn": (registration_turn if name == "codex" else False),
+            "cleanup": "archived" if name == "codex" else "quarantined",
+            "error_code": None if passed else "synthetic_characterization_failure",
+        }
+        if name == "codex" and codex_native_id is not None:
+            status["native_id"] = codex_native_id
+        return status
+
+    return {
+        "schema_version": 2,
+        "characterization_id": characterization_id,
+        "created_at": created_at,
+        "automatic_mirroring_enabled": False,
+        "versions": {name: all_versions[name] for name in providers},
+        "bridge_revision": {name: revisions[name] for name in providers},
+        "providers": {name: provider(name) for name in providers},
+    }
+
+
+def _write_v2(root: Path, characterization_id: str, **overrides: object) -> Path:
+    return write_characterization_report(
+        _v2_report(characterization_id, **overrides),
+        report_root=root,
+        characterization_id=characterization_id,
+    )
+
+
+_ID_A = "11111111-1111-4111-8111-111111111111"
+_ID_B = "22222222-2222-4222-8222-222222222222"
+
+
+def test_gate_accepts_a_version_2_report_recording_both_providers(
+    tmp_path: Path,
+) -> None:
+    path = _write_v2(tmp_path, _ID_A)
+
+    gate = resolve_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert gate.report_path == path
+    assert gate.provider_characterization_ids == {"claude": _ID_A, "codex": _ID_A}
+
+
+def test_version_2_report_without_a_bridge_revision_is_malformed(
+    tmp_path: Path,
+) -> None:
+    report = _v2_report(_ID_A)
+    del report["bridge_revision"]
+    write_characterization_report(
+        report, report_root=tmp_path, characterization_id=_ID_A
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "invalid"
+
+
+def test_version_2_report_key_sets_must_agree_across_the_three_maps(
+    tmp_path: Path,
+) -> None:
+    report = _v2_report(_ID_A, providers=("codex",))
+    report["bridge_revision"] = dict(_CURRENT_REVISION)
+    write_characterization_report(
+        report, report_root=tmp_path, characterization_id=_ID_A
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "invalid"
+
+
+def test_version_2_report_rejects_an_empty_provider_set(tmp_path: Path) -> None:
+    report = _v2_report(_ID_A, providers=())
+    write_characterization_report(
+        report, report_root=tmp_path, characterization_id=_ID_A
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "invalid"
+
+
+def test_version_1_report_may_not_record_a_single_provider(tmp_path: Path) -> None:
+    report = _report(_ID_A)
+    report["providers"] = {"codex": report["providers"]["codex"]}
+    write_characterization_report(
+        report, report_root=tmp_path, characterization_id=_ID_A
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "invalid"
+
+
+def test_version_1_report_may_not_carry_a_bridge_revision(tmp_path: Path) -> None:
+    report = _report(_ID_A)
+    report["bridge_revision"] = dict(_CURRENT_REVISION)
+    write_characterization_report(
+        report, report_root=tmp_path, characterization_id=_ID_A
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "invalid"
+
+
+def test_version_2_bridge_revision_values_must_be_non_empty_strings(
+    tmp_path: Path,
+) -> None:
+    report = _v2_report(_ID_A)
+    report["bridge_revision"]["claude"] = ""
+    write_characterization_report(
+        report, report_root=tmp_path, characterization_id=_ID_A
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# per-provider gate resolution
+# ---------------------------------------------------------------------------
+
+
+def test_gate_resolves_each_provider_from_its_own_newest_report(
+    tmp_path: Path,
+) -> None:
+    """A Codex-only refresh leaves the standing Claude proof in force."""
+
+    _write_v2(tmp_path, _ID_A, created_at="2026-07-14T12:00:00+00:00")
+    newest = _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("codex",),
+        versions={"codex": "4.5.7"},
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    gate = resolve_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "4.5.7"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert gate.provider_characterization_ids == {"claude": _ID_A, "codex": _ID_B}
+    assert gate.report_path == newest
+
+
+def test_reused_proof_must_match_the_installed_bridge_revision(
+    tmp_path: Path,
+) -> None:
+    """The hole scoping opens: a standing proof made against older bridge code."""
+
+    _write_v2(
+        tmp_path,
+        _ID_A,
+        bridge_revision={"claude": _STALE_REVISION["claude"]},
+        created_at="2026-07-14T12:00:00+00:00",
+    )
+    _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("codex",),
+        versions={"codex": "4.5.7"},
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.7"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "revision_drift"
+
+
+def test_the_newest_report_is_not_held_to_the_installed_bridge_revision(
+    tmp_path: Path,
+) -> None:
+    """Status quo preserved: a fresh pair proof ages with the bridge as before.
+
+    Blocking this would demand a live run per bridge commit -- the
+    characterization path took over a hundred commits in seven weeks -- and an
+    unaffordable gate is a bypassed gate.
+    """
+
+    _write_v2(tmp_path, _ID_A, bridge_revision=_STALE_REVISION)
+
+    gate = resolve_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert gate.characterization_id == _ID_A
+
+
+def test_a_version_1_proof_cannot_be_reused_under_scoping(tmp_path: Path) -> None:
+    """A v1 report records no revision, so a scoped reuse of it fails closed."""
+
+    _write_report(tmp_path, _ID_A, mtime_ns=100, created_at="2026-07-14T12:00:00+00:00")
+    _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("codex",),
+        versions={"codex": "4.5.7"},
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.7"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "revision_drift"
+
+
+def test_newest_report_recording_a_provider_blocks_it_despite_an_older_pass(
+    tmp_path: Path,
+) -> None:
+    _write_v2(tmp_path, _ID_A, created_at="2026-07-14T12:00:00+00:00")
+    _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("codex",),
+        passed=False,
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "failed"
+
+
+def test_gate_is_missing_when_no_report_records_a_provider(tmp_path: Path) -> None:
+    _write_v2(tmp_path, _ID_A, providers=("claude",))
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "missing"
+
+
+def test_version_drift_is_evaluated_per_provider(tmp_path: Path) -> None:
+    _write_v2(tmp_path, _ID_A, created_at="2026-07-14T12:00:00+00:00")
+    _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("codex",),
+        versions={"codex": "4.5.7"},
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    with pytest.raises(CharacterizationGateError) as excinfo:
+        resolve_characterization_gate(
+            report_root=tmp_path,
+            current_versions={"claude": "1.2.3", "codex": "4.5.9"},
+            current_bridge_revision=_CURRENT_REVISION,
+        )
+
+    assert excinfo.value.code == "version_drift"
+
+
+def test_codex_registration_flag_comes_from_the_report_that_proved_codex(
+    tmp_path: Path,
+) -> None:
+    _write_v2(
+        tmp_path,
+        _ID_A,
+        registration_turn=False,
+        created_at="2026-07-14T12:00:00+00:00",
+    )
+    _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("codex",),
+        registration_turn=True,
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    gate = resolve_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "4.5.6"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert gate.codex_registration_turn_required is True
+
+
+# ---------------------------------------------------------------------------
+# Codex origin provenance survives Claude-only reports
+# ---------------------------------------------------------------------------
+
+
+def test_codex_origins_count_reports_that_record_no_codex_block(
+    tmp_path: Path,
+) -> None:
+    """A Claude-only report carries no native Codex ID -- and must not raise.
+
+    Every valid report still counts: an ID recorded by any report must never be
+    mistaken for native user work, and a scoped Claude refresh must not disturb
+    that ledger.
+    """
+
+    native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    _write_v2(
+        tmp_path,
+        _ID_A,
+        codex_native_id=native_id,
+        created_at="2026-07-14T12:00:00+00:00",
+    )
+    _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("claude",),
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    assert load_codex_characterization_origins(report_root=tmp_path) == {
+        native_id: f"characterization-{_ID_A}-codex",
+    }
+
+
+def test_codex_origin_guard_naming_a_claude_only_report_fails_closed(
+    tmp_path: Path,
+) -> None:
+    marker_secret = b"x" * 32
+    _write_v2(tmp_path, _ID_A, providers=("claude",))
+    session_bridge.characterize._prepare_codex_origin_guard(
+        tmp_path,
+        characterization_id=_ID_A,
+        marker_secret=marker_secret,
+    )
+
+    with pytest.raises(
+        CharacterizationGateError,
+        match="characterization_codex_origin_unresolved",
+    ):
+        load_codex_characterization_origins(
+            report_root=tmp_path,
+            marker_secret=marker_secret,
+        )
+
+
+# ---------------------------------------------------------------------------
+# operator diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_gate_description_names_the_provider_whose_bridge_revision_drifted(
+    tmp_path: Path,
+) -> None:
+    _write_v2(
+        tmp_path,
+        _ID_A,
+        bridge_revision={"claude": _STALE_REVISION["claude"]},
+        created_at="2026-07-14T12:00:00+00:00",
+    )
+    _write_v2(
+        tmp_path,
+        _ID_B,
+        providers=("codex",),
+        versions={"codex": "4.5.7"},
+        created_at="2026-08-19T12:00:00+00:00",
+    )
+
+    exit_code, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "4.5.7"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert exit_code == 1
+    assert "revision_drift" in message
+    assert "claude" in message
+    assert "--provider all" in message
+
+
+def test_gate_description_offers_a_scoped_refresh_for_one_drifted_provider(
+    tmp_path: Path,
+) -> None:
+    _write_v2(tmp_path, _ID_A)
+
+    exit_code, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "4.5.7"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert exit_code == 1
+    assert "--provider codex" in message
+    assert "claude: unchanged" in message
+
+
+def test_gate_description_keeps_the_full_refresh_when_both_providers_drift(
+    tmp_path: Path,
+) -> None:
+    _write_v2(tmp_path, _ID_A)
+
+    _, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.4", "codex": "4.5.7"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert "--provider all" in message
+    assert "--provider codex" not in message
+
+
+# ---------------------------------------------------------------------------
+# provider-scoped live characterization
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stubbed_characterization(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Drive run_live_characterization without spawning either real CLI.
+
+    Every seam that would reach a provider is replaced, so this fixture can
+    never create a quota-consuming session; the calls list records which
+    provider paths were entered.
+    """
+
+    calls: dict[str, list[str]] = {"version": [], "characterized": []}
+
+    def fake_resolve(executable: str, **kwargs: object) -> tuple[str, ...]:
+        return (executable,)
+
+    def fake_version(command: list[str]) -> str:
+        name = command[0]
+        calls["version"].append(name)
+        return f"{name}-9.9.9"
+
+    def fake_claude(status: dict[str, object], **kwargs: object) -> None:
+        calls["characterized"].append("claude")
+        status.update({
+            "create": True,
+            "discover": True,
+            "read": True,
+            "resume": True,
+            "cleanup": "quarantined",
+            "native_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        })
+
+    def fake_codex(status: dict[str, object], **kwargs: object) -> None:
+        calls["characterized"].append("codex")
+        native_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        status.update({
+            "create": True,
+            "discover": True,
+            "read": True,
+            "resume": True,
+            "cleanup": "archived",
+            "native_id": native_id,
+        })
+        record = kwargs["record_native_id"]
+        record(native_id)
+
+    monkeypatch.setattr(
+        "session_bridge.characterize.resolve_cli_executable", fake_resolve
+    )
+    monkeypatch.setattr("session_bridge.characterize._cli_version", fake_version)
+    monkeypatch.setattr("session_bridge.characterize._characterize_claude", fake_claude)
+    monkeypatch.setattr("session_bridge.characterize._characterize_codex", fake_codex)
+    return calls
+
+
+def test_scoped_run_records_only_the_requested_provider(
+    tmp_path: Path,
+    stubbed_characterization: dict[str, list[str]],
+) -> None:
+    report_path = run_live_characterization(
+        report_root=tmp_path,
+        cwd=tmp_path,
+        provenance_secret=b"z" * 32,
+        live_tests_enabled=True,
+        providers=("codex",),
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == 2
+    assert set(report["providers"]) == {"codex"}
+    assert set(report["versions"]) == {"codex"}
+    assert set(report["bridge_revision"]) == {"codex"}
+    assert (
+        report["bridge_revision"]["codex"]
+        == current_bridge_revisions(providers=("codex",))["codex"]
+    )
+    assert stubbed_characterization["characterized"] == ["codex"]
+    assert stubbed_characterization["version"] == ["codex"]
+
+
+def test_scoped_claude_run_creates_no_codex_origin_guard(
+    tmp_path: Path,
+    stubbed_characterization: dict[str, list[str]],
+) -> None:
+    run_live_characterization(
+        report_root=tmp_path,
+        cwd=tmp_path,
+        provenance_secret=b"z" * 32,
+        live_tests_enabled=True,
+        providers=("claude",),
+    )
+
+    assert stubbed_characterization["characterized"] == ["claude"]
+    assert not (tmp_path / ".codex-origin-guards").exists()
+
+
+def test_default_run_still_records_both_providers(
+    tmp_path: Path,
+    stubbed_characterization: dict[str, list[str]],
+) -> None:
+    report_path = run_live_characterization(
+        report_root=tmp_path,
+        cwd=tmp_path,
+        provenance_secret=b"z" * 32,
+        live_tests_enabled=True,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert set(report["providers"]) == {"claude", "codex"}
+    assert set(report["bridge_revision"]) == {"claude", "codex"}
+    assert sorted(stubbed_characterization["characterized"]) == ["claude", "codex"]
+
+
+def test_run_rejects_an_unknown_provider_selection(
+    tmp_path: Path,
+    stubbed_characterization: dict[str, list[str]],
+) -> None:
+    with pytest.raises(RuntimeError, match="characterization_provider_invalid"):
+        run_live_characterization(
+            report_root=tmp_path,
+            cwd=tmp_path,
+            provenance_secret=b"z" * 32,
+            live_tests_enabled=True,
+            providers=("gemini",),
+        )
+
+    assert stubbed_characterization["characterized"] == []
+
+
+def test_run_rejects_an_empty_provider_selection(
+    tmp_path: Path,
+    stubbed_characterization: dict[str, list[str]],
+) -> None:
+    with pytest.raises(RuntimeError, match="characterization_provider_invalid"):
+        run_live_characterization(
+            report_root=tmp_path,
+            cwd=tmp_path,
+            provenance_secret=b"z" * 32,
+            live_tests_enabled=True,
+            providers=(),
+        )
+
+    assert stubbed_characterization["characterized"] == []
+
+
+# ---------------------------------------------------------------------------
+# CLI: a scoped refresh is reachable
+# ---------------------------------------------------------------------------
+
+
+def test_backend_characterize_threads_a_scoped_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(**kwargs: object) -> Path:
+        seen.update(kwargs)
+        return tmp_path / "report.json"
+
+    monkeypatch.setattr("session_bridge.cli.run_live_characterization", fake_run)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_characterization_gate",
+        lambda: SimpleNamespace(
+            characterization_id="cid",
+            codex_registration_turn_required=False,
+        ),
+    )
+
+    payload = ProductionBackend(BridgeConfig()).characterize(provider="codex")
+
+    assert seen["providers"] == ("codex",)
+    assert payload["passed"] is True
+
+
+def test_backend_characterize_still_rejects_an_unknown_provider() -> None:
+    with pytest.raises(ConfigurationFailure, match="characterization_provider"):
+        ProductionBackend(BridgeConfig()).characterize(provider="gemini")
+
+
+def test_characterize_command_accepts_a_scoped_provider_argument(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: dict[str, object] = {}
+    backend = SimpleNamespace(
+        characterize=lambda *, provider: (
+            seen.update(provider=provider) or {"passed": True}
+        ),
+        close=lambda: None,
+    )
+
+    exit_code = main(
+        ["characterize", "--provider", "codex"],
+        config_loader=lambda: BridgeConfig.load(path=tmp_path / "missing.toml"),
+        backend_factory=lambda config: backend,
+    )
+
+    assert exit_code == 0
+    assert seen["provider"] == "codex"
+    assert json.loads(capsys.readouterr().out) == {"passed": True}
+
+
+def test_scoped_refresh_is_not_offered_when_it_would_strand_the_other_proof(
+    tmp_path: Path,
+) -> None:
+    """Suggesting a doomed scoped refresh costs a real session for nothing.
+
+    Refreshing Codex alone makes this report non-newest, at which point Claude's
+    half of it faces the bridge-revision check -- and fails it.  The operator
+    would pay one session and still be told to pay two.
+    """
+
+    _write_v2(tmp_path, _ID_A, bridge_revision={"claude": _STALE_REVISION["claude"]})
+
+    _, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "1.2.3", "codex": "4.5.7"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert "--provider all" in message
+    assert "--provider codex" not in message
+
+
+def test_scoped_refresh_is_not_offered_against_a_version_1_report(
+    tmp_path: Path,
+) -> None:
+    """A v1 proof records no revision, so it can never survive scoped reuse."""
+
+    _write_report(
+        tmp_path,
+        _ID_A,
+        mtime_ns=100,
+        versions={"claude": "2.1.216", "codex": "codex-cli 0.146.0"},
+    )
+
+    _, message = describe_characterization_gate(
+        report_root=tmp_path,
+        current_versions={"claude": "2.1.216", "codex": "codex-cli 0.147.0"},
+        current_bridge_revision=_CURRENT_REVISION,
+    )
+
+    assert "--provider all" in message
+    assert "--provider codex" not in message
