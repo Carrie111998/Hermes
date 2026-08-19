@@ -355,11 +355,12 @@ const ComposerPane = memo(function ComposerPane({
       )}
 
       {status.showStickyPrompt ? (
-        <Text color={ui.theme.color.muted} wrap="truncate-end">
-          <Text color={ui.theme.color.label}>↳ </Text>
-
-          {status.stickyPrompt}
-        </Text>
+        <Box borderStyle="single" borderColor={ui.theme.color.muted} paddingX={1} marginBottom={0}>
+          <Text color={ui.theme.color.accent} bold>📌 [Prompt] </Text>
+          <Text color={ui.theme.color.text} wrap="truncate-end">
+            {status.stickyPrompt}
+          </Text>
+        </Box>
       ) : (
         <Box height={1} onMouseDown={captureInputDrag} onMouseDrag={dragFromSpacer} onMouseUp={endInputDrag} />
       )}

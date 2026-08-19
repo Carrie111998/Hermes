@@ -6155,6 +6155,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        # CWD & Branch detection for status bar
+        try:
+            cwd_str = str(getattr(self, 'cwd', None) or os.getcwd())
+            home_dir = str(Path.home())
+            if cwd_str.startswith(home_dir):
+                display_cwd = "~" + cwd_str[len(home_dir):]
+            else:
+                display_cwd = cwd_str
+            if len(display_cwd) > 28:
+                display_cwd = f"~.../{Path(cwd_str).name}"
+            
+            branch_str = ""
+            try:
+                import subprocess
+                res = subprocess.run(["git", "branch", "--show-current"], cwd=cwd_str, capture_output=True, text=True, timeout=1)
+                if res.returncode == 0 and res.stdout.strip():
+                    branch_str = f" (🌿 {res.stdout.strip()})"
+            except Exception:
+                pass
+            snapshot["cwd_label"] = f"📂 {display_cwd}{branch_str}"
+        except Exception:
+            snapshot["cwd_label"] = ""
+
         return snapshot
 
     def _get_status_bar_session_title(self) -> str:
@@ -7017,6 +7040,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    if snapshot.get("cwd_label"):
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", snapshot["cwd_label"]))
                     frags.append(("class:status-bar", " "))
 
             # Stash indicator (📌 N) — appended after all width tiers so the
