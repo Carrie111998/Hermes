@@ -7808,10 +7808,12 @@ def _resolve_worktree_workspace(
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        # The linked checkout is not owned by a surrounding checkout, so it is
+        # itself the requested repo-root anchor. Materialize the task worktree
+        # below that exact linked root instead of silently reusing its branch.
+        target = requested_resolved / ".worktrees" / task.id
+        _ensure_git_worktree(requested_resolved, target, branch_name)
+        return target, branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
