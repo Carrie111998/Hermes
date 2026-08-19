@@ -38,7 +38,14 @@ toolsets:
 
 ```bash
 hermes tools                            # curses UI to enable/disable per platform
+hermes tools list --platform cli        # show saved enabled/disabled toolsets
+hermes tools diagnose --platform cli    # project the pre-startup tool surface
+hermes tools diagnose --json            # machine-readable diagnostics
 ```
+
+`diagnose` is a read-only pre-startup projection. MCP schemas appear only when
+those tools are already registered in the current process; it does not start or
+connect configured MCP servers.
 
 Or in-session:
 

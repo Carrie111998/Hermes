@@ -14,6 +14,7 @@ This module provides:
 - hermes config wizard   - Re-run setup wizard
 """
 
+import contextlib
 import copy
 import json
 import logging
@@ -28,6 +29,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -41,6 +43,28 @@ logger = logging.getLogger(__name__)
 # so concurrent CLI/gateway loads of a broken config.yaml don't spam stderr
 # every time. Cleared automatically when the file changes (different mtime).
 _CONFIG_PARSE_WARNED: set = set()
+
+_DIAGNOSTIC_CONFIG_INSPECTION: ContextVar[bool] = ContextVar(
+    "diagnostic_config_inspection", default=False
+)
+
+
+@contextlib.contextmanager
+def diagnostic_config_inspection():
+    """Make every config read in this context cache- and write-free."""
+    token = _DIAGNOSTIC_CONFIG_INSPECTION.set(True)
+    try:
+        yield
+    finally:
+        _DIAGNOSTIC_CONFIG_INSPECTION.reset(token)
+
+
+def _diagnostic_config_inspection_active() -> bool:
+    """Cover both scoped calls and exact diagnostic-process child threads."""
+    return (
+        _DIAGNOSTIC_CONFIG_INSPECTION.get()
+        or os.environ.get("HERMES_TOOLS_DIAGNOSE_READ_ONLY") == "1"
+    )
 
 
 def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
@@ -3176,6 +3200,12 @@ def read_raw_config() -> Dict[str, Any]:
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
     """
+    if _diagnostic_config_inspection_active():
+        try:
+            return read_user_config_raw()
+        except Exception:
+            return {}
+
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -3266,6 +3296,12 @@ def read_raw_config_readonly() -> Dict[str, Any]:
     Same (mtime_ns, size) freshness key as ``read_raw_config()`` — an edited
     config.yaml is picked up on the next call.
     """
+    if _diagnostic_config_inspection_active():
+        try:
+            return read_user_config_raw()
+        except Exception:
+            return {}
+
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -3346,6 +3382,11 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
+def _tools_diagnose_read_only() -> bool:
+    """Whether config loads must avoid bootstrapping the Hermes home tree."""
+    return _diagnostic_config_inspection_active()
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
@@ -3360,7 +3401,10 @@ def load_config() -> Dict[str, Any]:
     defensive deepcopy — that path matters in agent-loop hot spots like
     ``get_provider_request_timeout`` which is called once per API turn.
     """
-    return _load_config_impl(want_deepcopy=True)
+    return _load_config_impl(
+        want_deepcopy=True,
+        side_effect_free=_diagnostic_config_inspection_active(),
+    )
 
 
 def load_config_readonly() -> Dict[str, Any]:
@@ -3383,7 +3427,15 @@ def load_config_readonly() -> Dict[str, Any]:
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
     """
-    return _load_config_impl(want_deepcopy=False)
+    return _load_config_impl(
+        want_deepcopy=False,
+        side_effect_free=_diagnostic_config_inspection_active(),
+    )
+
+
+def load_config_for_diagnostics() -> Dict[str, Any]:
+    """Load an effective config snapshot without writes or cache mutation."""
+    return _load_config_impl(want_deepcopy=False, side_effect_free=True)
 
 
 def write_platform_config_field(
@@ -3538,9 +3590,12 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *, want_deepcopy: bool, side_effect_free: bool = False
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
+        if not side_effect_free:
+            ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 
@@ -3577,7 +3632,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         else:
             cache_sig = None
 
-        cached = _LOAD_CONFIG_CACHE.get(path_key)
+        cached = None if side_effect_free else _LOAD_CONFIG_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
@@ -3616,12 +3671,19 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # loaded config — keep serving it until the file is fixed.
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
-                lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
-                _warn_config_parse_failure(
-                    config_path,
-                    e,
-                    fallback="last-known-good" if lkg is not None else "defaults",
+                lkg = (
+                    None
+                    if side_effect_free
+                    else _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
                 )
+                if not side_effect_free:
+                    _warn_config_parse_failure(
+                        config_path,
+                        e,
+                        fallback=(
+                            "last-known-good" if lkg is not None else "defaults"
+                        ),
+                    )
                 if lkg is not None:
                     # save_config() stores the pre-expansion normalized dict
                     # (env-ref templates preserved); the load path stores the
@@ -3651,7 +3713,23 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        managed_config: Dict[str, Any]
+        if side_effect_free:
+            if managed_cfg_path is None:
+                managed_config = {}
+            else:
+                try:
+                    with open(managed_cfg_path, encoding="utf-8") as f:
+                        raw_managed_config = fast_safe_load(f) or {}
+                    managed_config = (
+                        raw_managed_config
+                        if isinstance(raw_managed_config, dict)
+                        else {}
+                    )
+                except Exception:
+                    managed_config = {}
+        else:
+            managed_config = managed_scope.load_managed_config()
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
             # the user config BEFORE merging (parity with
@@ -3666,6 +3744,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 managed_normalized["model"] = {"default": managed_normalized["model"]}
             managed_expanded = _expand_env_vars(managed_normalized)
             expanded = _deep_merge(expanded, managed_expanded)
+        if side_effect_free:
+            return copy.deepcopy(expanded) if want_deepcopy else expanded
+
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -5826,8 +5907,11 @@ def _inject_profile_env_vars() -> None:
         pass
 
 
-# Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
-_inject_profile_env_vars()
+# Provider discovery may import enabled third-party entry points. Diagnostics
+# defer that work until their guarded assembly path rather than running plugin
+# code while config.py itself is still importing.
+if not _tools_diagnose_read_only():
+    _inject_profile_env_vars()
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────

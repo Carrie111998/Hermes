@@ -76,7 +76,11 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     return results
 
 
-def load_context_engine(name: str) -> Optional["ContextEngine"]:
+def load_context_engine(
+    name: str,
+    *,
+    register_commands: bool = True,
+) -> Optional["ContextEngine"]:
     """Load and return a ContextEngine instance by name.
 
     Returns None if the engine is not found or fails to load.
@@ -87,7 +91,10 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
         return None
 
     try:
-        engine = _load_engine_from_dir(engine_dir)
+        engine = _load_engine_from_dir(
+            engine_dir,
+            register_commands=register_commands,
+        )
         if engine:
             return engine
         logger.warning("Context engine '%s' loaded but no engine instance found", name)
@@ -97,7 +104,11 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
         return None
 
 
-def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
+def _load_engine_from_dir(
+    engine_dir: Path,
+    *,
+    register_commands: bool = True,
+) -> Optional["ContextEngine"]:
     """Import an engine module and extract the ContextEngine instance.
 
     The module must have either:
@@ -174,7 +185,10 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
 
     # Try register(ctx) pattern first (how plugins are written)
     if hasattr(mod, "register"):
-        collector = _EngineCollector(engine_name=name)
+        collector = _EngineCollector(
+            engine_name=name,
+            register_commands=register_commands,
+        )
         try:
             mod.register(collector)
             if collector.engine:
@@ -205,9 +219,15 @@ class _EngineCollector:
     behave identically to commands registered by normal plugins.
     """
 
-    def __init__(self, engine_name: str = ""):
+    def __init__(
+        self,
+        engine_name: str = "",
+        *,
+        register_commands: bool = True,
+    ):
         self.engine = None
         self._engine_name = engine_name or "context_engine"
+        self._register_commands = register_commands
         self._registered_commands: list[str] = []
 
     def register_context_engine(self, engine):
@@ -221,6 +241,8 @@ class _EngineCollector:
         args_hint: str = "",
     ) -> None:
         """Forward to the global plugin command registry."""
+        if not self._register_commands:
+            return
         clean = (name or "").lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning(

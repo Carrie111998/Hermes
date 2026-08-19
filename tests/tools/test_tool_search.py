@@ -318,6 +318,82 @@ class TestBridgeDispatch:
         assert "remain available" in result["hint"]
         assert "before concluding" in result["hint"]
 
+    def test_search_and_describe_use_request_pinned_catalog_metadata(
+        self, monkeypatch
+    ):
+        import model_tools
+        from tools.registry import registry
+
+        name = "mcp_pinned_catalog_race_probe"
+        toolset = "mcp-pinned-race"
+        tool_def = _td(name, "Pinned catalog race probe")
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: "{}",
+            schema=tool_def["function"],
+            toolset=toolset,
+        )
+        pinned_entry = registry.get_entry(name)
+        assert pinned_entry is not None
+        registry.deregister(name)
+
+        common = {
+            "catalog_tool_defs": [tool_def],
+            "expected_registry_entries": {name: pinned_entry},
+            "skip_pre_tool_call_hook": True,
+            "skip_tool_request_middleware": True,
+            "skip_tool_execution_middleware": True,
+        }
+        search = json.loads(
+            model_tools.handle_function_call(
+                "tool_search",
+                {"query": "pinned catalog race"},
+                **common,
+            )
+        )
+        describe = json.loads(
+            model_tools.handle_function_call(
+                "tool_describe",
+                {"name": name},
+                **common,
+            )
+        )
+        dispatched = {}
+
+        def _dispatch(call_name, call_args, **kwargs):
+            dispatched.update(
+                name=call_name,
+                arguments=call_args,
+                expected_entry=kwargs.get("expected_entry"),
+            )
+            return json.dumps({"dispatched": True})
+
+        monkeypatch.setattr(registry, "dispatch", _dispatch)
+        call_result = json.loads(
+            model_tools.handle_function_call(
+                "tool_call",
+                {"name": name, "arguments": {}},
+                **common,
+            )
+        )
+
+        assert search["total_available"] == 1
+        assert search["matches"] == [
+            {
+                "name": name,
+                "source": "mcp",
+                "source_name": toolset,
+                "description": "Pinned catalog race probe",
+            }
+        ]
+        assert describe == {
+            "name": name,
+            "description": "Pinned catalog race probe",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        assert "registration changed during the request" in call_result["error"]
+        assert dispatched == {}
+
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
@@ -327,6 +403,21 @@ class TestBridgeDispatch:
         })
         # Will fail classification because unknown_xxx isn't deferrable.
         assert err is not None
+
+    def test_resolve_underlying_call_uses_request_allowed_names(self):
+        from tools.tool_search import resolve_underlying_call
+
+        name, args, err = resolve_underlying_call(
+            {
+                "name": "removed_after_request_tool",
+                "arguments": {"foo": "bar"},
+            },
+            allowed_names={"removed_after_request_tool"},
+        )
+
+        assert err is None
+        assert name == "removed_after_request_tool"
+        assert args == {"foo": "bar"}
 
 
     def test_resolve_underlying_call_rejects_recursion(self):
@@ -656,6 +747,31 @@ class TestDeferredCallSchemaProbe:
         assert "NOT invoked" in parsed["error"]
         assert parsed["parameters"]["required"] == ["document_id"]
         assert "document_id" in parsed["parameters"]["properties"]
+
+    def test_validator_uses_request_catalog_after_registry_change(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        catalog = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "removed_after_request_tool",
+                    "description": "test",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"request_id": {"type": "string"}},
+                        "required": ["request_id"],
+                    },
+                },
+            }
+        ]
+
+        err = validate_deferred_call_args(
+            "removed_after_request_tool", {}, catalog
+        )
+
+        assert err is not None
+        assert json.loads(err)["parameters"]["required"] == ["request_id"]
 
 
     def test_validator_never_blocks_unvalidatable_tools(self):

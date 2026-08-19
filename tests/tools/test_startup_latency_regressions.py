@@ -82,6 +82,29 @@ class TestAuxProbeMode:
         assert client is stub
         assert model == "m"
 
+    def test_read_only_tool_probe_does_not_refresh_nous_credentials(self):
+        import agent.auxiliary_client as aux
+        from tools.registry import read_only_tool_inspection
+
+        provider = {
+            "refresh_token": "secret-refresh-token",
+            "inference_base_url": "https://inference.example/v1",
+        }
+        with (
+            patch.object(aux, "_read_nous_auth", return_value=provider),
+            patch.object(aux, "_resolve_nous_pool_runtime_api") as pool_resolver,
+            patch(
+                "hermes_cli.auth.resolve_nous_runtime_credentials"
+            ) as runtime_resolver,
+            aux.aux_probe_mode(),
+            read_only_tool_inspection(),
+        ):
+            api = aux._resolve_nous_runtime_api()
+
+        assert api == ("<read-only-probe>", "https://inference.example/v1")
+        pool_resolver.assert_not_called()
+        runtime_resolver.assert_not_called()
+
 
 class TestVisionCheckUsesProbeMode:
     def test_check_vision_requirements_enters_probe_mode(self):

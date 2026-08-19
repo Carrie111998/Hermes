@@ -1017,6 +1017,9 @@ def _run_review_in_thread(
                     _pref_val = getattr(agent, _pref_attr, None)
                     if _pref_val:
                         _fork_kwargs[_pref_attr] = _pref_val
+            from agent.tool_surface import get_agent_tool_surface
+
+            tool_surface = get_agent_tool_surface(agent)
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
                 max_iterations=_REVIEW_MAX_ITERATIONS,
@@ -1029,8 +1032,16 @@ def _run_review_in_thread(
                 credential_pool=_rt.get("credential_pool"),
                 request_overrides=_rt.get("request_overrides") or {},
                 parent_session_id=agent.session_id,
-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                enabled_toolsets=(
+                    list(tool_surface.enabled_toolsets)
+                    if tool_surface.enabled_toolsets is not None
+                    else None
+                ),
+                disabled_toolsets=(
+                    list(tool_surface.disabled_toolsets)
+                    if tool_surface.disabled_toolsets is not None
+                    else None
+                ),
                 skip_memory=True,
                 **_fork_kwargs,
             )

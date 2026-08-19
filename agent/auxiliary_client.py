@@ -2442,12 +2442,104 @@ def _maybe_wrap_anthropic(
     )
 
 
+def _load_auth_store_snapshot(path: Optional[Path]) -> Dict[str, Any]:
+    """Read one auth store without migration, locking, or persistence."""
+    if path is None or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _nous_singleton_from_snapshot(store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    providers = store.get("providers")
+    if isinstance(providers, dict):
+        provider = providers.get("nous")
+        if isinstance(provider, dict):
+            return dict(provider)
+    systems = store.get("systems")
+    if isinstance(systems, dict):
+        provider = systems.get("nous_portal")
+        if isinstance(provider, dict):
+            return dict(provider)
+    return None
+
+
+def _nous_auth_has_runtime_material(provider: Dict[str, Any]) -> bool:
+    return any(
+        isinstance(provider.get(key), str) and provider[key].strip()
+        for key in ("agent_key", "access_token", "refresh_token")
+    )
+
+
+def _read_nous_auth_snapshot() -> Optional[Dict[str, Any]]:
+    """Project persisted Nous credentials without changing auth state."""
+    try:
+        from hermes_cli.auth import _auth_file_path, _global_auth_file_path
+
+        local_store = _load_auth_store_snapshot(_auth_file_path())
+        global_store = _load_auth_store_snapshot(_global_auth_file_path())
+    except Exception:
+        local_store = _load_auth_store_snapshot(get_hermes_home() / "auth.json")
+        global_store = {}
+
+    local_pool_store = local_store.get("credential_pool")
+    global_pool_store = global_store.get("credential_pool")
+    local_pool = (
+        local_pool_store.get("nous", [])
+        if isinstance(local_pool_store, dict)
+        else []
+    )
+    global_pool = (
+        global_pool_store.get("nous", [])
+        if isinstance(global_pool_store, dict)
+        else []
+    )
+    pool_entries = local_pool if isinstance(local_pool, list) and local_pool else global_pool
+    if isinstance(pool_entries, list):
+        indexed_entries = [
+            (index, entry)
+            for index, entry in enumerate(pool_entries)
+            if isinstance(entry, dict)
+        ]
+
+        def _priority(item: Tuple[int, Dict[str, Any]]) -> Tuple[int, int]:
+            index, entry = item
+            try:
+                return int(entry.get("priority", index)), index
+            except (TypeError, ValueError):
+                return index, index
+
+        for _, entry in sorted(indexed_entries, key=_priority):
+            if str(entry.get("last_status") or "").lower() == "dead":
+                continue
+            provider = dict(entry)
+            if _nous_auth_has_runtime_material(provider):
+                return provider
+
+    for store in (local_store, global_store):
+        provider = _nous_singleton_from_snapshot(store)
+        if provider is not None and _nous_auth_has_runtime_material(provider):
+            return provider
+    return None
+
+
 def _read_nous_auth() -> Optional[dict]:
     """Read and validate ~/.hermes/auth.json for an active Nous provider.
 
     Returns the provider state dict if Nous is active with tokens,
     otherwise None.
     """
+    try:
+        from tools.registry import is_read_only_tool_inspection
+
+        if is_read_only_tool_inspection():
+            return _read_nous_auth_snapshot()
+    except Exception:
+        pass
+
     pool_present, entry = _select_pool_entry("nous")
     if pool_present:
         if entry is None:
@@ -2564,6 +2656,28 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
     relying only on whatever raw tokens happen to be sitting in auth.json
     or the credential pool.
     """
+    if _aux_probe_active():
+        try:
+            from tools.registry import is_read_only_tool_inspection
+
+            read_only_probe = is_read_only_tool_inspection()
+        except Exception:
+            read_only_probe = False
+        if read_only_probe:
+            provider = _read_nous_auth()
+            if provider is None:
+                return None
+            has_runtime_material = bool(
+                _nous_api_key(provider)
+                or str(provider.get("refresh_token") or "").strip()
+            )
+            base_url = str(
+                provider.get("inference_base_url") or _nous_base_url()
+            ).strip().rstrip("/")
+            if not has_runtime_material or not base_url:
+                return None
+            return "<read-only-probe>", base_url
+
     pooled = _resolve_nous_pool_runtime_api(force_refresh=force_refresh)
     if pooled is not None:
         return pooled

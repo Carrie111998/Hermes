@@ -1825,6 +1825,398 @@ class TestPluginCommands:
             reset_hermes_home_override(token_a2)
         assert manager_a2 is manager_a
 
+    def test_diagnostic_thread_drain_completes_before_output_restore(self, capfd):
+        import os
+        import threading
+
+        from hermes_cli.plugins import _drain_diagnostic_plugin_threads
+        from hermes_cli.tools_config import _suppress_diagnostic_output
+
+        existing = frozenset(
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.ident is not None
+        )
+        release = threading.Event()
+
+        def delayed_output() -> None:
+            assert release.wait(timeout=1)
+            os.write(1, b"delayed-diagnostic-stdout\n")
+            os.write(2, b"delayed-diagnostic-stderr\n")
+
+        with _suppress_diagnostic_output():
+            thread = threading.Thread(target=delayed_output)
+            thread.start()
+            release.set()
+            _drain_diagnostic_plugin_threads(existing)
+
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        captured = capfd.readouterr()
+        assert "delayed-diagnostic" not in captured.out
+        assert "delayed-diagnostic" not in captured.err
+
+    def test_process_entry_diagnose_terminates_noncooperative_plugin_threads(
+        self, tmp_path
+    ):
+        import os
+        import subprocess
+
+        home = tmp_path / "diagnostic-home"
+        plugin_dir = home / "plugins" / "long_delay_probe"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "long_delay_probe",
+                    "version": "1.0.0",
+                    "description": "Delayed output probe",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            """
+import os
+import threading
+import time
+
+
+def _late():
+    time.sleep(3.0)
+    os.write(1, b"LONG_DELAY_STDOUT_CANARY\\n")
+    os.write(2, b"LONG_DELAY_STDERR_CANARY\\n")
+
+
+def _handler(args, **kwargs):
+    return "{}"
+
+
+def register(ctx):
+    ctx.register_tool(
+        name="long_delay_probe_tool",
+        toolset="long_delay_probe",
+        schema={
+            "name": "long_delay_probe_tool",
+            "description": "probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=_handler,
+    )
+    ctx.register_platform(
+        "long-delay-probe-platform",
+        "Long Delay Probe",
+        lambda **kwargs: object(),
+        lambda cfg: True,
+    )
+    threading.Thread(
+        target=_late,
+        name="long-delay-probe-writer",
+        daemon=False,
+    ).start()
+""",
+            encoding="utf-8",
+        )
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "plugins": {"enabled": ["long_delay_probe"]},
+                    "platform_toolsets": {
+                        "long-delay-probe-platform": ["long_delay_probe"]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        repo_root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "tools",
+                "diagnose",
+                "--platform",
+                "long-delay-probe-platform",
+                "--json",
+            ],
+            cwd=repo_root,
+            env={
+                **os.environ,
+                "HOME": str(tmp_path / "home"),
+                "HERMES_HOME": str(home),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        names = {
+            item.get("tool")
+            for key in ("visible", "filtered")
+            for item in payload.get(key, [])
+            if isinstance(item, dict)
+        }
+        assert payload["platform"] == "long-delay-probe-platform"
+        assert "long_delay_probe_tool" in names
+        assert result.stderr == ""
+        assert "LONG_DELAY" not in result.stdout
+        assert "LONG_DELAY" not in result.stderr
+
+    def test_diagnostic_plugin_manager_is_context_local(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+
+        import hermes_cli.plugins as plugins_mod
+        from gateway.platform_registry import platform_registry
+        from tools.registry import read_only_tool_inspection, registry
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "diagnostic-home"))
+        monkeypatch.setenv("HERMES_TOOLS_DIAGNOSE_READ_ONLY", "1")
+        existing = PluginManager(scope_key="existing")
+        tool_name = "diagnostic_child_thread_tool"
+        platform_name = "diagnostic_child_thread_platform"
+        generation_before = registry._generation
+
+        with (
+            patch.object(plugins_mod, "_plugin_manager", existing),
+            patch.dict(plugins_mod._plugin_managers_by_home, {}, clear=True),
+        ):
+            observed = {}
+            delayed_observed = {}
+            delayed_started = threading.Event()
+            release_delayed = threading.Event()
+            with read_only_tool_inspection(), plugins_mod.diagnostic_plugin_inspection() as diagnostic:
+                assert diagnostic is not existing
+                assert plugins_mod.get_plugin_manager() is diagnostic
+
+                def observe_globals() -> None:
+                    observed["pointer"] = plugins_mod._plugin_manager
+                    observed["managers"] = dict(
+                        plugins_mod._plugin_managers_by_home
+                    )
+                    observed["manager"] = plugins_mod.get_plugin_manager()
+                    registry.register(
+                        name=tool_name,
+                        toolset="diagnostic-child",
+                        schema={
+                            "type": "function",
+                            "function": {"name": tool_name, "parameters": {}},
+                        },
+                        handler=lambda **kwargs: kwargs,
+                        scope=diagnostic.scope_key,
+                    )
+                    observed["registered"] = (
+                        registry.get_entry(tool_name, scope=diagnostic.scope_key)
+                        is not None
+                    )
+
+                thread = threading.Thread(target=observe_globals)
+                thread.start()
+                thread.join(timeout=1)
+                assert not thread.is_alive()
+
+                assert observed == {
+                    "pointer": existing,
+                    "managers": {},
+                    "manager": diagnostic,
+                    "registered": True,
+                }
+
+                active_context = PluginContext(
+                    PluginManifest(name="active-diagnostic", source="bundled"),
+                    diagnostic,
+                )
+                assert active_context.register_platform(
+                    name=platform_name,
+                    label="Diagnostic child thread",
+                    adapter_factory=lambda config: config,
+                    check_fn=lambda: True,
+                ) is None
+                assert platform_name in diagnostic._plugin_platform_names
+                assert platform_registry.snapshot_registration(
+                    platform_name,
+                    scope=diagnostic.scope_key,
+                ) == (None, None)
+                assert active_context.register_context_reference(object()) is None
+                assert (
+                    active_context.register_redaction_patterns([r"diag-[a-z]+"]) == 0
+                )
+                active_context.set_config("probe", True)
+                assert active_context.state.get("probe") is None
+                active_context.state.set("probe", True)
+                assert not active_context.state.path.exists()
+
+                delayed_context = PluginContext(
+                    PluginManifest(name="delayed-diagnostic", source="bundled"),
+                    diagnostic,
+                )
+
+                def register_after_scope() -> None:
+                    delayed_started.set()
+                    assert release_delayed.wait(timeout=2)
+                    delayed_observed["handle"] = delayed_context.register_tool(
+                        name=f"{tool_name}_delayed",
+                        toolset="diagnostic-child",
+                        schema={
+                            "type": "function",
+                            "function": {
+                                "name": f"{tool_name}_delayed",
+                                "parameters": {},
+                            },
+                        },
+                        handler=lambda **kwargs: kwargs,
+                    )
+                    delayed_observed["registered"] = (
+                        registry.get_entry(
+                            f"{tool_name}_delayed",
+                            scope=diagnostic.scope_key,
+                        )
+                        is not None
+                    )
+                    delayed_observed["platform_handle"] = (
+                        delayed_context.register_platform(
+                            name=platform_name,
+                            label="Diagnostic child thread",
+                            adapter_factory=lambda config: config,
+                            check_fn=lambda: True,
+                        )
+                    )
+                    delayed_observed["platform_registration"] = (
+                        platform_registry.snapshot_registration(
+                            platform_name,
+                            scope=diagnostic.scope_key,
+                        )
+                    )
+
+                delayed_thread = threading.Thread(target=register_after_scope)
+                delayed_thread.start()
+                assert delayed_started.wait(timeout=1)
+
+            assert plugins_mod._plugin_manager is existing
+            assert plugins_mod._plugin_managers_by_home == {}
+            release_delayed.set()
+            delayed_thread.join(timeout=2)
+            assert not delayed_thread.is_alive()
+            assert delayed_observed["handle"] is None
+            assert delayed_observed["registered"] is False
+            assert delayed_observed["platform_handle"] is None
+            assert delayed_observed["platform_registration"] == (None, None)
+            assert registry._generation == generation_before
+            assert registry.get_entry(tool_name, scope=diagnostic.scope_key) is None
+            assert (
+                registry.get_entry(
+                    f"{tool_name}_delayed",
+                    scope=diagnostic.scope_key,
+                )
+                is None
+            )
+            assert platform_registry.snapshot_registration(
+                platform_name,
+                scope=diagnostic.scope_key,
+            ) == (None, None)
+
+    def test_diagnostic_discovery_does_not_reapply_secret_sources(
+        self, monkeypatch
+    ):
+        from tools.registry import read_only_tool_inspection
+
+        manager = PluginManager()
+        source = MagicMock(name="diagnostic-secret-source")
+        source.name = "diagnostic-secret-source"
+        source.is_enabled.return_value = True
+
+        with patch(
+            "agent.secret_sources.registry.list_plugin_sources",
+            return_value=[source],
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "secrets": {"diagnostic-secret-source": {"enabled": True}}
+            },
+        ), patch(
+            "hermes_cli.env_loader.reset_secret_source_cache"
+        ) as reset_cache, patch(
+            "hermes_cli.env_loader.load_hermes_dotenv"
+        ) as load_dotenv, read_only_tool_inspection():
+            manager._refresh_secret_sources_after_discovery()
+
+        reset_cache.assert_not_called()
+        load_dotenv.assert_not_called()
+
+    def test_diagnostic_plugin_override_records_pre_dedup_conflict(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins_mod
+        from tools.registry import registry
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        name = "diagnostic_plugin_conflict_target"
+        registry.register(
+            name=name,
+            toolset="file",
+            schema={"name": name, "parameters": {"type": "object"}},
+            handler=lambda args, **kwargs: "built-in",
+        )
+        try:
+            with plugins_mod.diagnostic_plugin_inspection() as manager:
+                context = PluginContext(
+                    PluginManifest(name="conflict-plugin", source="bundled"),
+                    manager,
+                )
+                context.register_tool(
+                    name=name,
+                    toolset="plugin-conflict",
+                    schema={"name": name, "parameters": {"type": "object"}},
+                    handler=lambda args, **kwargs: "plugin",
+                    override=True,
+                )
+
+                assert {
+                    "tool": name,
+                    "reason": "plugin tool overrides existing registry tool",
+                    "source": "conflict-plugin",
+                } in plugins_mod.get_diagnostic_plugin_conflicts()
+        finally:
+            registry.deregister(name)
+
+    def test_diagnostic_rejected_plugin_collision_records_conflict(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        name = "diagnostic_plugin_rejected_conflict"
+        with plugins_mod.diagnostic_plugin_inspection() as manager:
+            first = PluginContext(
+                PluginManifest(name="first-plugin", source="bundled"), manager
+            )
+            second = PluginContext(
+                PluginManifest(name="second-plugin", source="bundled"), manager
+            )
+            first.register_tool(
+                name=name,
+                toolset="first-toolset",
+                schema={"name": name, "parameters": {"type": "object"}},
+                handler=lambda args, **kwargs: "first",
+            )
+            assert second.register_tool(
+                name=name,
+                toolset="second-toolset",
+                schema={"name": name, "parameters": {"type": "object"}},
+                handler=lambda args, **kwargs: "second",
+            ) is None
+
+            assert {
+                "tool": name,
+                "reason": "plugin tool conflicts with existing registry tool",
+                "source": "second-plugin",
+            } in plugins_mod.get_diagnostic_plugin_conflicts()
+
     def test_relative_import_not_leaked_across_home_switch(self, tmp_path):
         """A same-slug plugin's relative import must not reuse the prior home's submodule.
 

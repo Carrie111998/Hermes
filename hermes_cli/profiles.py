@@ -34,10 +34,14 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli.profile_names import (
+    PROFILE_ID_RE as _PROFILE_ID_RE,
+    RESERVED_PROFILE_NAMES as _RESERVED_NAMES,
+    validate_profile_name,
+)
 
 logger = logging.getLogger(__name__)
 
-_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _WARNED_MISSING_ALLOWLIST_ENTRIES: set[tuple[str, ...]] = set()
 
 # Directories bootstrapped inside every new profile
@@ -250,11 +254,6 @@ _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     "plugins", "memories", "knowledge", "preferences",
 })
 
-# Names that cannot be used as profile aliases
-_RESERVED_NAMES = frozenset({
-    "hermes", "default", "test", "tmp", "root", "sudo",
-})
-
 # Hermes subcommands that cannot be used as profile names/aliases
 _HERMES_SUBCOMMANDS = frozenset({
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
@@ -323,36 +322,6 @@ def normalize_profile_name(name: str) -> str:
     if stripped.casefold() == "default":
         return "default"
     return stripped.lower()
-
-
-def validate_profile_name(name: str) -> None:
-    """Raise ``ValueError`` if *name* is not a valid profile identifier.
-
-    Validates the input as-given — strict lowercase match. Callers that accept
-    mixed-case or title-cased input from users (dashboard UI, CLI args) should
-    call :func:`normalize_profile_name` first. This separation keeps validate
-    honest about what the on-disk directory name must look like, while
-    ingress-point normalization handles UX flexibility (see #18498).
-
-    Also rejects names in :data:`_RESERVED_NAMES` (``hermes``, ``test``,
-    ``tmp``, ``root``, ``sudo``) that would create confusing on-disk
-    collisions (a ``hermes`` profile inside ``~/.hermes/``) or get refused
-    at alias-creation time anyway. ``default`` is a special pass-through —
-    it's a valid alias for the built-in root profile.
-    """
-    if name == "default":
-        return  # special alias for ~/.hermes
-    if not _PROFILE_ID_RE.match(name):
-        raise ValueError(
-            f"Invalid profile name {name!r}. Must match "
-            f"[a-z0-9][a-z0-9_-]{{0,63}}"
-        )
-    if name in _RESERVED_NAMES:
-        raise ValueError(
-            f"Profile name {name!r} is reserved — it collides with either "
-            f"the Hermes installation itself or a common system binary.  "
-            f"Pick a different name."
-        )
 
 
 def validate_alias_name(name: str) -> None:

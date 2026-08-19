@@ -99,6 +99,135 @@ def test_broken_dotenv_crashes_main_import_without_repair(tmp_path):
     assert "wiped mid-install" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hermes", "tools", "diagnose", "--json"],
+        ["hermes", "--profile=default", "tools", "diagnose", "--json"],
+        ["hermes", "--profile", "default", "tools", "diagnose", "--json"],
+        ["hermes", "-p", "default", "tools", "diagnose", "--json"],
+        ["hermes", "--yolo", "tools", "diagnose", "--json"],
+        ["hermes", "--safe-mode", "tools", "diagnose", "--json"],
+        ["hermes", "--model", "openai/test", "tools", "diagnose", "--json"],
+        ["hermes", "-mopenai/test", "tools", "diagnose", "--json"],
+        ["hermes", "--m=openai/test", "tools", "diagnose", "--json"],
+        ["hermes", "--reasoning=high", "tools", "diagnose", "--json"],
+        ["hermes", "-t", "file,web", "tools", "diagnose", "--json"],
+        ["hermes", "-tfile,web", "tools", "diagnose", "--json"],
+        ["hermes", "--model", "-1", "tools", "diagnose", "--json"],
+        ["hermes", "--provider", "-1", "tools", "diagnose", "--json"],
+        ["hermes", "--reasoning", "-1", "tools", "diagnose", "--json"],
+        ["hermes", "-t", "-1", "tools", "diagnose", "--json"],
+        [
+            "hermes",
+            "--profile=default",
+            "--yolo",
+            "tools",
+            "diagnose",
+            "--json",
+        ],
+        [
+            "hermes",
+            "--yolo",
+            "--profile",
+            "default",
+            "tools",
+            "diagnose",
+            "--json",
+        ],
+    ],
+)
+def test_tools_diagnose_skips_import_time_recovery(tmp_path, argv):
+    script = tmp_path / "diagnose_no_recovery.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+            import hermes_cli._early_recovery as er
+
+            marker = Path({marker!r})
+            er.recover_if_needed = lambda *args, **kwargs: marker.write_text("called")
+            sys.argv = {argv!r}
+            import hermes_cli.main  # noqa: F401
+            """.format(
+                marker=str(tmp_path / "recovery-called"),
+                argv=argv,
+            )
+        ),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(REPO_ROOT),
+        "HOME": str(tmp_path),
+        "HERMES_HOME": str(tmp_path / "missing-home"),
+    }
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env=env,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "recovery-called").exists()
+    assert not (tmp_path / "missing-home").exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hermes", "--version", "tools", "diagnose"],
+        ["hermes", "--model", "--safe-mode", "tools", "diagnose"],
+        ["hermes", "--p=probe", "tools", "diagnose"],
+        ["hermes", "--profile=", "tools", "diagnose", "--json"],
+        ["hermes", "--prof=", "tools", "diagnose", "--json"],
+        ["hermes", "--profile", "", "tools", "diagnose", "--json"],
+        ["hermes", "--profile=--yolo", "tools", "diagnose", "--json"],
+        ["hermes", "--profile=bad/name", "tools", "diagnose", "--json"],
+        ["hermes", "--profile=Upper", "tools", "diagnose", "--json"],
+        ["hermes", "--profile=test", "tools", "diagnose", "--json"],
+        ["hermes", "--profile", "Upper", "tools", "diagnose", "--json"],
+    ],
+)
+def test_tools_diagnose_detector_does_not_consume_command_changing_flags(
+    tmp_path, argv
+):
+    script = tmp_path / "nonexact_diagnose_route.py"
+    marker = tmp_path / "recovery-called"
+    script.write_text(
+        textwrap.dedent(
+            f"""
+            import sys
+            from pathlib import Path
+            import hermes_cli._early_recovery as er
+
+            marker = Path({str(marker)!r})
+            er.recover_if_needed = lambda *args, **kwargs: marker.write_text("called")
+            sys.argv = {argv!r}
+            try:
+                import hermes_cli.main  # noqa: F401
+            except SystemExit:
+                pass
+            """
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "called"
+
 
 
 def test_early_recovery_module_is_stdlib_only(tmp_path):

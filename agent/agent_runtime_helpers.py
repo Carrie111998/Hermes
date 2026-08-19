@@ -107,7 +107,9 @@ def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
     """Return True when an agent-level tool path emits its own post hook."""
     if function_name in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES:
         return True
-    if getattr(agent, "_context_engine_tool_names", None) and function_name in agent._context_engine_tool_names:
+    from agent.tool_surface import get_agent_tool_surface
+
+    if function_name in get_agent_tool_surface(agent).context_engine_tool_names:
         return True
     memory_manager = getattr(agent, "_memory_manager", None)
     return bool(memory_manager and memory_manager.has_tool(function_name))
@@ -3040,15 +3042,29 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
                  tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
-                 skip_tool_execution_middleware: bool = False) -> str:
+                 skip_tool_execution_middleware: bool = False,
+                 tool_surface=None) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    from agent.tool_surface import (
+        get_agent_tool_surface,
+        tool_surface_registration_error,
+    )
+
+    execution_surface = tool_surface or get_agent_tool_surface(agent)
     if not isinstance(function_args, dict):
         function_args = {}
+
+    registration_error = tool_surface_registration_error(
+        execution_surface,
+        function_name,
+    )
+    if registration_error is not None:
+        return json.dumps({"error": registration_error}, ensure_ascii=False)
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
@@ -3179,8 +3195,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
             # (MemoryManager.notify_memory_tool_write).
-            if agent._memory_manager:
-                agent._memory_manager.notify_memory_tool_write(
+            if execution_surface.memory_manager:
+                execution_surface.memory_manager.notify_memory_tool_write(
                     result,
                     next_args,
                     build_metadata=lambda: agent._build_memory_write_metadata(
@@ -3189,9 +3205,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     ),
                 )
             return _finish_agent_tool(result, next_args)
-    elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
+    elif (
+        execution_surface.memory_manager
+        and function_name in execution_surface.memory_provider_tool_names
+    ):
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+            return _finish_agent_tool(
+                execution_surface.memory_manager.handle_tool_call(
+                    function_name, next_args
+                ),
+                next_args,
+            )
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
             from tools.clarify_tool import clarify_tool as _clarify_tool
@@ -3267,19 +3291,38 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+            return _finish_agent_tool(
+                agent._dispatch_delegate_task(
+                    next_args, tool_surface=execution_surface
+                ),
+                next_args,
+            )
     else:
         def _execute(next_args: dict) -> Any:
-            dispatch_kwargs = dict(
+            dispatch_kwargs: Dict[str, Any] = dict(
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                enabled_tools=(
+                    list(execution_surface.valid_tool_names)
+                    if execution_surface.valid_tool_names
+                    else None
+                ),
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                enabled_toolsets=(
+                    list(execution_surface.enabled_toolsets)
+                    if execution_surface.enabled_toolsets is not None
+                    else None
+                ),
+                disabled_toolsets=(
+                    list(execution_surface.disabled_toolsets)
+                    if execution_surface.disabled_toolsets is not None
+                    else None
+                ),
+                catalog_tool_defs=list(execution_surface.catalog_tool_defs),
+                expected_registry_entries=dict(execution_surface.registry_entries),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
             if skip_tool_execution_middleware:
@@ -3310,7 +3353,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
 
 
-def repair_tool_call(agent, tool_name: str) -> str | None:
+def repair_tool_call(
+    agent,
+    tool_name: str,
+    valid_tool_names=None,
+) -> str | None:
     """Attempt to repair a mismatched tool name before aborting.
 
     Models sometimes emit variants of a tool name that differ only
@@ -3333,6 +3380,11 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     """
     import re
     from difflib import get_close_matches
+
+    if valid_tool_names is None:
+        from agent.tool_surface import get_agent_tool_surface
+
+        valid_tool_names = get_agent_tool_surface(agent).valid_tool_names
 
     if not tool_name:
         return None
@@ -3373,10 +3425,10 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
     # Cheap fast-paths first — these cover the common case.
     lowered = tool_name.lower()
-    if lowered in agent.valid_tool_names:
+    if lowered in valid_tool_names:
         return lowered
     normalized = _norm(tool_name)
-    if normalized in agent.valid_tool_names:
+    if normalized in valid_tool_names:
         return normalized
 
     # Build the full candidate set for class-like emissions.
@@ -3393,11 +3445,11 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
         cands |= extra
 
     for c in cands:
-        if c and c in agent.valid_tool_names:
+        if c and c in valid_tool_names:
             return c
 
     # Fuzzy match as last resort.
-    matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
+    matches = get_close_matches(lowered, valid_tool_names, n=1, cutoff=0.7)
     if matches:
         return matches[0]
 

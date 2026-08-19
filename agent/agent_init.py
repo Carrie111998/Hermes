@@ -989,6 +989,8 @@ def init_agent(
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
     agent._tool_snapshot_generation = 0
+    agent._tool_selection_revision = 0
+    agent._tool_surface_snapshot = None
     # Rate limit tracking — updated from x-ratelimit-* response headers
     # after each API call.  Accessed by /usage slash command.
     agent._rate_limit_state: Optional["RateLimitState"] = None
@@ -1516,26 +1518,21 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
+    _base_tool_defs = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=True,
+        record_resolved_names=False,
     )
+    agent.tools = list(_base_tool_defs)
     
-    # Show tool configuration and store valid tool names for validation
+    # Keep the pre-assembly names available during initialization. The final
+    # model-facing snapshot and user-visible status are published below after
+    # external provider/context schemas are ready.
     agent.valid_tool_names = set()
     if agent.tools:
         agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
-        tool_names = sorted(agent.valid_tool_names)
-        if not agent.quiet_mode:
-            print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")
-            # Show filtering info if applied
-            if enabled_toolsets:
-                print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
-            if disabled_toolsets:
-                print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
-    elif not agent.quiet_mode:
-        print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
     # Kanban worker/orchestrator lifecycle guidance is session-static:
     # the dispatcher decides at spawn time whether this process is a kanban
@@ -1543,18 +1540,8 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    agent._kanban_worker_guidance = ""
 
-    # Check tool requirements
-    if agent.tools and not agent.quiet_mode:
-        requirements = _ra().check_toolset_requirements()
-        missing_reqs = [name for name, available in requirements.items() if not available]
-        if missing_reqs:
-            print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
-    
     # Show trajectory saving status
     if agent.save_trajectories and not agent.quiet_mode:
         print("📝 Trajectory saving enabled")
@@ -1873,9 +1860,6 @@ def init_agent(
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
-
-    from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
-    _inject_memory_provider_tools(agent)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -2736,56 +2720,86 @@ def init_agent(
         except Exception:
             pass
 
-    # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand).
-    # Skip names that are already present — the _ra().get_tool_definitions()
-    # quiet_mode cache returned a shared list pre-#17335, so a stray
-    # mutation here would poison subsequent agent inits in the same
-    # Gateway process and trip provider-side 'duplicate tool name'
-    # errors. Even with the cache fix, dedup is the right defense
-    # against plugin paths that may register the same schemas via
-    # ctx.register_tool(). Mirrors the memory tools dedup above.
-    #
-    # Respect the platform's enabled_toolsets configuration (#5544):
-    # context engine tools follow the same gating pattern as memory
-    # provider tools — without the gate, `platform_toolsets: telegram: []`
-    # would still leak lcm_* tools into the tool surface and incur the
-    # same local-model latency penalty.
-    agent._context_engine_tool_names: set = set()
-    if (
-        hasattr(agent, "context_compressor")
-        and agent.context_compressor
-        and agent.tools is not None
-        and (
-            agent.enabled_toolsets is None
-            or "context_engine" in agent.enabled_toolsets
+    # Finalize registry + external memory/context schemas through one shared
+    # path, then publish the complete model-facing snapshot.
+    agent._memory_provider_tool_names = set()
+    agent._context_engine_tool_names = set()
+    try:
+        from tools.mcp_tool import refresh_agent_mcp_tools
+
+        refresh_agent_mcp_tools(
+            agent,
+            quiet_mode=agent.quiet_mode,
+            get_tool_definitions_fn=_ra().get_tool_definitions,
         )
+    except Exception as _surface_error:
+        _ra().logger.warning(
+            "Fresh tool-surface resolution failed; using the startup catalog: %s",
+            _surface_error,
+        )
+        from agent.tool_surface import (
+            AgentToolSurfaceSnapshot,
+            assemble_agent_tool_surface,
+            publish_agent_tool_surface_for_generation,
+        )
+
+        _fallback_surface = assemble_agent_tool_surface(
+            agent,
+            _base_tool_defs,
+            quiet_mode=agent.quiet_mode,
+            toolset_selection=(enabled_toolsets, disabled_toolsets),
+        )
+        _published_fallback = publish_agent_tool_surface_for_generation(
+            agent,
+            _fallback_surface.tool_defs,
+            memory_provider_tool_names=_fallback_surface.injected_names["memory"],
+            context_engine_tool_names=_fallback_surface.injected_names[
+                "context_engine"
+            ],
+            catalog_tool_defs=_fallback_surface.pre_assembly_tool_defs,
+            deferred_tool_names=_fallback_surface.deferred_names,
+            expected_registry_generation=agent._tool_snapshot_generation,
+            selection_revision=agent._tool_selection_revision,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+        )
+        if _published_fallback is None:
+            raise RuntimeError(
+                "Tool registry changed while recovering agent initialization"
+            ) from _surface_error
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from agent.tool_surface import AgentToolSurfaceSnapshot
+
+    if not isinstance(
+        getattr(agent, "_tool_surface_snapshot", None),
+        AgentToolSurfaceSnapshot,
     ):
-        _existing_tool_names = {
-            t.get("function", {}).get("name")
-            for t in agent.tools
-            if isinstance(t, dict)
-        }
-        from agent.memory_manager import normalize_tool_schema as _normalize_tool_schema
-        for _raw_schema in agent.context_compressor.get_tool_schemas():
-            _schema = _normalize_tool_schema(_raw_schema)
-            if _schema is None:
-                # A schema with no resolvable name (e.g. an already-wrapped
-                # entry) would append a nameless tool that strict providers
-                # 400 on, disabling the whole toolset (#47707). Skip it.
-                _ra().logger.warning(
-                    "Context engine returned a tool schema with no resolvable "
-                    "name; skipping to avoid poisoning the request (%r)",
-                    _raw_schema,
+        raise RuntimeError(
+            "Tool registry changed continuously during agent initialization"
+        )
+    agent._kanban_worker_guidance = (
+        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    )
+
+    if not agent.quiet_mode:
+        if agent.tools:
+            tool_names = sorted(agent.valid_tool_names)
+            print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")
+            if enabled_toolsets:
+                print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
+            if disabled_toolsets:
+                print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
+            requirements = _ra().check_toolset_requirements()
+            missing_reqs = [
+                name for name, available in requirements.items() if not available
+            ]
+            if missing_reqs:
+                print(
+                    "⚠️  Some tools may not work due to missing requirements: "
+                    f"{missing_reqs}"
                 )
-                continue
-            _tname = _schema["name"]
-            if _tname in _existing_tool_names:
-                continue  # already registered via plugin/cache path
-            _wrapped = {"type": "function", "function": _schema}
-            agent.tools.append(_wrapped)
-            agent.valid_tool_names.add(_tname)
-            agent._context_engine_tool_names.add(_tname)
-            _existing_tool_names.add(_tname)
+        else:
+            print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

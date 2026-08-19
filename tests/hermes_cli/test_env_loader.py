@@ -6,6 +6,44 @@ import sys
 from hermes_cli.env_loader import load_hermes_dotenv
 
 
+def test_read_only_load_preserves_user_and_managed_env_files(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.env_loader as env_loader
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    user_env = home / ".env"
+    user_env.write_text("READ_ONLY_USER_ENV=loaded\n")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    managed_env = managed / ".env"
+    managed_env.write_text("READ_ONLY_MANAGED_ENV=loaded\n")
+    before = {
+        user_env: (user_env.read_bytes(), user_env.stat().st_mtime_ns),
+        managed_env: (managed_env.read_bytes(), managed_env.stat().st_mtime_ns),
+    }
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.delenv("READ_ONLY_USER_ENV", raising=False)
+    monkeypatch.delenv("READ_ONLY_MANAGED_ENV", raising=False)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("read-only dotenv load invoked a mutating hook")
+
+    monkeypatch.setattr(env_loader, "_sanitize_env_file_if_needed", unexpected)
+    monkeypatch.setattr(env_loader, "_apply_external_secret_sources", unexpected)
+    monkeypatch.setattr(env_loader, "_reapply_terminal_config_bridge", unexpected)
+
+    loaded = load_hermes_dotenv(hermes_home=home, read_only=True)
+
+    assert loaded == [user_env]
+    assert os.environ["READ_ONLY_USER_ENV"] == "loaded"
+    assert os.environ["READ_ONLY_MANAGED_ENV"] == "loaded"
+    for path, (contents, mtime_ns) in before.items():
+        assert path.read_bytes() == contents
+        assert path.stat().st_mtime_ns == mtime_ns
+
+
 def test_recovered_update_retry_skips_external_secret_sources(tmp_path, monkeypatch):
     """The post-recovery updater must not remap native vault dependencies."""
     import hermes_cli.env_loader as env_loader

@@ -76,10 +76,19 @@ class TestMcpRegistrationE2E:
             return ["mcp_test_fs_read", "mcp_test_fs_write", "mcp_test_api_search"]
 
         fake_tools = [
-            {"function": {"name": "mcp_test_fs_read"}},
-            {"function": {"name": "mcp_test_fs_write"}},
-            {"function": {"name": "mcp_test_api_search"}},
-            {"function": {"name": "terminal"}},
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in (
+                "mcp_test_fs_read",
+                "mcp_test_fs_write",
+                "mcp_test_api_search",
+                "terminal",
+            )
         ]
 
         with patch("tools.mcp_tool.register_mcp_servers", side_effect=mock_register), \

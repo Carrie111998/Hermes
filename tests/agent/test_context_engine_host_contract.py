@@ -191,3 +191,21 @@ def test_engine_collector_forwards_register_command_to_plugin_manager():
         manager._plugin_commands.pop("my-lcm-test-cmd", None)
 
 
+def test_engine_collector_can_disable_global_command_registration():
+    """Read-only probes collect schemas without mutating plugin commands."""
+    from plugins.context_engine import _EngineCollector
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    before = dict(manager._plugin_commands)
+    collector = _EngineCollector(
+        engine_name="diagnostic",
+        register_commands=False,
+    )
+
+    collector.register_command("diagnostic-only", lambda _args: "ignored")
+
+    assert manager._plugin_commands == before
+    assert collector._registered_commands == []
+
+

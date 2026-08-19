@@ -329,54 +329,12 @@ def _emit_cancelled_terminal_post_tool_call(
     return result
 
 
-def _tool_search_scoped_names(agent) -> frozenset:
-    """Return the deferrable tool names the session may invoke via tool_call.
+def _tool_search_scoped_names(agent, tool_surface=None) -> frozenset:
+    """Return deferrable names from the request's pinned catalog."""
+    from agent.tool_surface import get_agent_tool_surface
 
-    The Tool Search unwrap dispatches the underlying tool directly, bypassing
-    the bridge branch (and its scope check) in
-    ``model_tools.handle_function_call``. To keep a restricted-toolset session
-    (subagent, kanban worker, curated gateway session) from reaching tools it
-    was never granted, the unwrap validates the underlying name against this
-    set: the deferrable subset of the session's own enabled/disabled toolset
-    scope.
-
-    Result is cached on the agent and refreshed when the tool registry's
-    generation changes (e.g. an MCP server reconnects), so the common case is
-    a dict lookup, not a full tool-defs rebuild on every tool call.
-    """
-    try:
-        import model_tools
-        from tools import tool_search as _ts
-        from tools.registry import registry as _registry
-    except Exception:
-        return frozenset()
-
-    enabled = getattr(agent, "enabled_toolsets", None)
-    disabled = getattr(agent, "disabled_toolsets", None)
-    cache_key = (
-        _registry.current_scope_key(),
-        getattr(_registry, "_generation", 0),
-        frozenset(enabled) if enabled is not None else None,
-        frozenset(disabled) if disabled is not None else None,
-    )
-    cached = getattr(agent, "_tool_search_scope_cache", None)
-    if cached is not None and cached[0] == cache_key:
-        return cached[1]
-    try:
-        scoped_defs = model_tools.get_tool_definitions(
-            enabled_toolsets=enabled,
-            disabled_toolsets=disabled,
-            quiet_mode=True,
-            skip_tool_search_assembly=True,
-        ) or []
-        names = _ts.scoped_deferrable_names(scoped_defs)
-    except Exception:
-        names = frozenset()
-    try:
-        agent._tool_search_scope_cache = (cache_key, names)
-    except Exception:
-        pass
-    return names
+    surface = tool_surface or get_agent_tool_surface(agent)
+    return surface.deferred_tool_names
 
 
 @dataclass
@@ -552,6 +510,15 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    if scope_block is not None:
+        return _ManagedToolResult(
+            result=json.dumps({"error": scope_block}, ensure_ascii=False),
+            args=function_args,
+            middleware_trace=list(middleware_trace or []),
+            blocked=True,
+            dispatched=False,
+        )
+
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -1045,7 +1012,7 @@ def _begin_tool_execution(
             pass
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True, tool_surface=None) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -1057,6 +1024,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+    from agent.tool_surface import get_agent_tool_surface
+
+    _execution_tool_surface = tool_surface or get_agent_tool_surface(agent)
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
@@ -1138,13 +1108,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    allowed_names=_tool_search_scoped_names(
+                        agent, _execution_tool_surface
+                    ),
+                )
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying in _tool_search_scoped_names(agent, _execution_tool_surface):
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
+                        _probe_err = _ts.validate_deferred_call_args(
+                            _underlying,
+                            _underlying_args,
+                            list(_execution_tool_surface.catalog_tool_defs),
+                        )
                         if _probe_err is not None:
                             _ts_scope_block = _probe_err
                         else:
@@ -1157,6 +1136,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+
+        if _ts_scope_block is None:
+            from agent.tool_surface import tool_surface_registration_error
+
+            _ts_scope_block = tool_surface_registration_error(
+                _execution_tool_surface,
+                function_name,
+            )
 
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
@@ -1327,6 +1314,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
+                        tool_surface=_execution_tool_surface,
                     )
 
                 managed = _run_agent_tool_execution_middleware(
@@ -1890,7 +1878,7 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True, tool_surface=None) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1899,6 +1887,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    from agent.tool_surface import get_agent_tool_surface
+
+    _execution_tool_surface = tool_surface or get_agent_tool_surface(agent)
+    _memory_provider_tool_names = (
+        _execution_tool_surface.memory_provider_tool_names
+    )
+    _context_engine_tool_names = _execution_tool_surface.context_engine_tool_names
+    _valid_tool_names = _execution_tool_surface.valid_tool_names
+    _enabled_toolsets = (
+        list(_execution_tool_surface.enabled_toolsets)
+        if _execution_tool_surface.enabled_toolsets is not None
+        else None
+    )
+    _disabled_toolsets = (
+        list(_execution_tool_surface.disabled_toolsets)
+        if _execution_tool_surface.disabled_toolsets is not None
+        else None
+    )
 
     # Keep every runtime-tool branch on one bounded execution funnel without
     # duplicating timeout policy across the branch-specific callbacks below.
@@ -1985,13 +1991,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args,
+                    allowed_names=_tool_search_scoped_names(
+                        agent, _execution_tool_surface
+                    ),
+                )
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying in _tool_search_scoped_names(agent, _execution_tool_surface):
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
+                        _probe_err = _ts.validate_deferred_call_args(
+                            _underlying,
+                            _underlying_args,
+                            list(_execution_tool_surface.catalog_tool_defs),
+                        )
                         if _probe_err is not None:
                             # This path wraps _block_msg in {"error": ...} —
                             # flatten the probe payload to one plain string.
@@ -2014,6 +2029,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+
+        if _ts_scope_block is None:
+            from agent.tool_surface import tool_surface_registration_error
+
+            _ts_scope_block = tool_surface_registration_error(
+                _execution_tool_surface,
+                function_name,
+            )
 
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False
@@ -2090,8 +2113,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager
                 # interface (MemoryManager.notify_memory_tool_write).
-                if agent._memory_manager:
-                    agent._memory_manager.notify_memory_tool_write(
+                if _execution_tool_surface.memory_manager:
+                    _execution_tool_surface.memory_manager.notify_memory_tool_write(
                         result,
                         next_args,
                         build_metadata=lambda: agent._build_memory_write_metadata(
@@ -2269,7 +2292,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _delegate_result = None
             try:
                 def _execute(next_args: dict) -> Any:
-                    return agent._dispatch_delegate_task(next_args)
+                    return agent._dispatch_delegate_task(
+                        next_args, tool_surface=_execution_tool_surface
+                    )
                 function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                     agent,
                     function_name=function_name,
@@ -2289,7 +2314,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
-        elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
+        elif (
+            _execution_tool_surface.context_engine
+            and function_name in _context_engine_tool_names
+        ):
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None
             if agent._should_emit_quiet_tool_messages():
@@ -2302,7 +2330,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _ce_result = None
             try:
                 def _execute(next_args: dict) -> Any:
-                    return agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)
+                    return _execution_tool_surface.context_engine.handle_tool_call(
+                        function_name, next_args, messages=messages
+                    )
                 function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                     agent,
                     function_name=function_name,
@@ -2324,7 +2354,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
-        elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
+        elif (
+            _execution_tool_surface.memory_manager
+            and function_name in _memory_provider_tool_names
+        ):
             # Memory provider tools (hindsight_retain, honcho_search, etc.)
             # These are not in the tool registry — route through MemoryManager.
             spinner = None
@@ -2338,7 +2371,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _mem_result = None
             try:
                 def _execute(next_args: dict) -> Any:
-                    return agent._memory_manager.handle_tool_call(function_name, next_args)
+                    return _execution_tool_surface.memory_manager.handle_tool_call(
+                        function_name, next_args
+                    )
                 function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                     agent,
                     function_name=function_name,
@@ -2385,16 +2420,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
                             enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
+                                list(_valid_tool_names)
+                                if _valid_tool_names
                                 else None
                             ),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,
                             tool_request_middleware_trace=list(middleware_trace),
-                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            enabled_toolsets=_enabled_toolsets,
+                            disabled_toolsets=_disabled_toolsets,
+                            catalog_tool_defs=list(
+                                _execution_tool_surface.catalog_tool_defs
+                            ),
+                            expected_registry_entries=dict(
+                                _execution_tool_surface.registry_entries
+                            ),
                         )
 
                 (
@@ -2467,16 +2508,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
                             enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
+                                list(_valid_tool_names)
+                                if _valid_tool_names
                                 else None
                             ),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,
                             tool_request_middleware_trace=list(middleware_trace),
-                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            enabled_toolsets=_enabled_toolsets,
+                            disabled_toolsets=_disabled_toolsets,
+                            catalog_tool_defs=list(
+                                _execution_tool_surface.catalog_tool_defs
+                            ),
+                            expected_registry_entries=dict(
+                                _execution_tool_surface.registry_entries
+                            ),
                         )
 
                 (
@@ -2723,7 +2770,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None, *, tool_surface=None) -> None:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
@@ -2761,11 +2808,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                tool_surface=tool_surface,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                tool_surface=tool_surface,
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):

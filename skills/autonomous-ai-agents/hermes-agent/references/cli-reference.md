@@ -52,7 +52,7 @@ hermes status [--all]       Component status
 ### Tools & Skills
 
 ```
-hermes tools [list|enable NAME|disable NAME]   Per-platform toolsets (curses UI with no args)
+hermes tools [list|diagnose|enable NAME|disable NAME]   Per-platform toolsets (curses UI with no args)
 
 hermes skills list|browse|search QUERY|inspect ID
 hermes skills install ID    Hub identifier OR a direct https://…/SKILL.md URL

@@ -50,6 +50,14 @@ class TestExistingBehaviorStillWorks:
     def test_lowercase_already_matches(self, repair):
         assert repair("browser_click") == "browser_click"
 
+    def test_request_snapshot_names_override_legacy_agent_names(self):
+        from run_agent import AIAgent
+
+        stub = SimpleNamespace(valid_tool_names={"legacy_only"})
+        repair = AIAgent._repair_tool_call.__get__(stub, AIAgent)
+
+        assert repair("SnapshotOnly", frozenset({"snapshot_only"})) == "snapshot_only"
+
 
 
 

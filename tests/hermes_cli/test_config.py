@@ -1,6 +1,7 @@
 """Tests for hermes_cli configuration management."""
 
 import os
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ import yaml
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     check_config_version,
+    diagnostic_config_inspection,
     get_hermes_home,
     ensure_hermes_home,
     get_compatible_custom_providers,
@@ -17,9 +19,11 @@ from hermes_cli.config import (
     _normalize_max_turns_config,
     is_provider_enabled,
     load_config,
+    load_config_for_diagnostics,
     load_env,
     migrate_config,
     read_raw_config,
+    read_raw_config_readonly,
     remove_env_value,
     save_config,
     save_env_value,
@@ -84,6 +88,101 @@ class TestLoadConfigDefaults:
             config = load_config()
             assert config["agent"]["max_turns"] == 42
             assert "max_turns" not in config
+
+
+class TestLoadConfigForDiagnostics:
+    def test_effective_snapshot_does_not_mutate_files_or_caches(self, tmp_path):
+        from hermes_cli import config as config_mod
+        from hermes_cli import managed_scope
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("agent:\n  max_turns: 7\n")
+        managed_home = tmp_path / "managed"
+        managed_home.mkdir()
+        (managed_home / "config.yaml").write_text("agent:\n  max_turns: 9\n")
+        tree_before = {
+            str(path.relative_to(tmp_path)): (
+                path.read_bytes() if path.is_file() else None
+            )
+            for path in tmp_path.rglob("*")
+        }
+        caches_before = (
+            deepcopy(config_mod._LOAD_CONFIG_CACHE),
+            deepcopy(config_mod._RAW_CONFIG_CACHE),
+            deepcopy(config_mod._LAST_EXPANDED_CONFIG_BY_PATH),
+            deepcopy(config_mod._CONFIG_PARSE_WARNED),
+            deepcopy(managed_scope._CONFIG_CACHE),
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(hermes_home),
+                "HERMES_MANAGED_DIR": str(managed_home),
+            },
+        ), patch.object(
+            config_mod,
+            "ensure_hermes_home",
+            side_effect=AssertionError("diagnostic load bootstrapped HERMES_HOME"),
+        ):
+            config = load_config_for_diagnostics()
+            with diagnostic_config_inspection():
+                scoped_config = load_config()
+                scoped_raw = read_raw_config()
+                scoped_raw_readonly = read_raw_config_readonly()
+
+        tree_after = {
+            str(path.relative_to(tmp_path)): (
+                path.read_bytes() if path.is_file() else None
+            )
+            for path in tmp_path.rglob("*")
+        }
+        assert config["agent"]["max_turns"] == 9
+        assert scoped_config["agent"]["max_turns"] == 9
+        assert scoped_raw["agent"]["max_turns"] == 7
+        assert scoped_raw_readonly["agent"]["max_turns"] == 7
+        assert tree_after == tree_before
+        assert config_mod._LOAD_CONFIG_CACHE == caches_before[0]
+        assert config_mod._RAW_CONFIG_CACHE == caches_before[1]
+        assert config_mod._LAST_EXPANDED_CONFIG_BY_PATH == caches_before[2]
+        assert config_mod._CONFIG_PARSE_WARNED == caches_before[3]
+        assert managed_scope._CONFIG_CACHE == caches_before[4]
+
+    def test_process_marker_covers_child_thread_config_reads(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+
+        from hermes_cli import config as config_mod
+
+        hermes_home = tmp_path / "missing-hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_TOOLS_DIAGNOSE_READ_ONLY", "1")
+        results = []
+        errors = []
+
+        def load_in_thread():
+            try:
+                results.append(config_mod.load_config())
+                results.append(config_mod.read_raw_config())
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(
+            config_mod,
+            "ensure_hermes_home",
+            side_effect=AssertionError("child thread bootstrapped HERMES_HOME"),
+        ):
+            thread = threading.Thread(target=load_in_thread)
+            thread.start()
+            thread.join(timeout=10)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert results[0]["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
+        assert results[1] == {}
+        assert not hermes_home.exists()
 
 
 class TestLoadConfigParseFailure:

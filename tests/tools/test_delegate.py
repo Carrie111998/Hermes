@@ -210,6 +210,373 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertTrue(names & {"terminal", "read_file", "web_search"})
         self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
 
+    def test_child_inherits_request_pinned_surface_not_live_parent(self):
+        from agent.tool_surface import (
+            AgentToolSurfaceSnapshot,
+            publish_agent_tool_surface,
+        )
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["browser"]
+        parent.disabled_toolsets = ["terminal"]
+        pinned_tool = {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"properties": {"snapshot": {"const": "A"}}},
+            },
+        }
+        live_replacement_tool = {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"properties": {"snapshot": {"const": "B"}}},
+            },
+        }
+        live_tool = {
+            "type": "function",
+            "function": {"name": "live_file_extra", "parameters": {}},
+        }
+        pinned_entry = object()
+        live_entry = object()
+        surface = types.SimpleNamespace(
+            tool_defs=(pinned_tool,),
+            catalog_tool_defs=(pinned_tool,),
+            valid_tool_names=frozenset({"read_file"}),
+            memory_provider_tool_names=frozenset(),
+            context_engine_tool_names=frozenset(),
+            deferred_tool_names=frozenset(),
+            registry_entries=(("read_file", pinned_entry),),
+            registry_generation=3,
+            selection_revision=7,
+            enabled_toolsets=("file",),
+            disabled_toolsets=("web",),
+        )
+        child = types.SimpleNamespace(
+            tools=[live_replacement_tool, live_tool],
+            valid_tool_names={"read_file", "live_file_extra"},
+            _memory_provider_tool_names=set(),
+            _context_engine_tool_names=set(),
+            _tool_snapshot_generation=4,
+            _tool_selection_revision=8,
+            enabled_toolsets=["file"],
+            disabled_toolsets=["web"],
+            _memory_manager=None,
+            context_compressor=None,
+        )
+        child._tool_surface_snapshot = AgentToolSurfaceSnapshot(
+            tool_defs=(live_replacement_tool, live_tool),
+            catalog_tool_defs=(live_replacement_tool, live_tool),
+            valid_tool_names=frozenset({"read_file", "live_file_extra"}),
+            memory_provider_tool_names=frozenset(),
+            context_engine_tool_names=frozenset(),
+            deferred_tool_names=frozenset(),
+            registry_entries=(
+                ("read_file", live_entry),
+                ("live_file_extra", object()),
+            ),
+            memory_manager=None,
+            context_engine=None,
+            registry_generation=4,
+            selection_revision=8,
+            enabled_toolsets=("file",),
+            disabled_toolsets=("web",),
+        )
+        child._tool_surface_legacy_tools_id = id(child.tools)
+
+        with patch("run_agent.AIAgent", return_value=child) as MockAgent:
+            result = _build_child_agent(
+                task_index=0,
+                goal="Inspect pinned tools",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                parent_tool_surface=surface,
+                task_count=1,
+                role="leaf",
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
+        self.assertIn("web", kwargs["disabled_toolsets"])
+        self.assertNotIn("terminal", kwargs["disabled_toolsets"])
+        self.assertIs(result, child)
+        self.assertEqual(child.valid_tool_names, {"read_file"})
+        self.assertEqual(child.tools, [pinned_tool])
+        self.assertIs(
+            dict(child._tool_surface_snapshot.registry_entries)["read_file"],
+            pinned_entry,
+        )
+
+        child._memory_manager = object()
+        child.context_compressor = object()
+        publish_agent_tool_surface(
+            child,
+            [live_replacement_tool, live_tool],
+            catalog_tool_defs=[live_replacement_tool, live_tool],
+            memory_provider_tool_names=("read_file",),
+            context_engine_tool_names=("read_file",),
+            registry_entries=(("read_file", live_entry),),
+            registry_generation=5,
+            selection_revision=9,
+            enabled_toolsets=("file",),
+            disabled_toolsets=("web",),
+        )
+        self.assertEqual(child.valid_tool_names, {"read_file"})
+        self.assertEqual(child.tools, [pinned_tool])
+        self.assertIs(
+            dict(child._tool_surface_snapshot.registry_entries)["read_file"],
+            pinned_entry,
+        )
+        self.assertEqual(
+            child._tool_surface_snapshot.memory_provider_tool_names,
+            frozenset(),
+        )
+        self.assertEqual(
+            child._tool_surface_snapshot.context_engine_tool_names,
+            frozenset(),
+        )
+        self.assertIsNone(child._tool_surface_snapshot.memory_manager)
+        self.assertIsNone(child._tool_surface_snapshot.context_engine)
+
+    def test_child_drops_external_provider_when_handler_identity_differs(self):
+        from agent.tool_surface import (
+            AgentToolSurfaceSnapshot,
+            publish_agent_tool_surface,
+        )
+        from tools.delegate_tool import _restrict_child_to_parent_surface
+
+        provider_tool = {
+            "type": "function",
+            "function": {"name": "memory_lookup", "parameters": {}},
+        }
+        manager_a = object()
+        manager_b = object()
+        parent_surface = AgentToolSurfaceSnapshot(
+            tool_defs=(provider_tool,),
+            catalog_tool_defs=(provider_tool,),
+            valid_tool_names=frozenset({"memory_lookup"}),
+            memory_provider_tool_names=frozenset({"memory_lookup"}),
+            context_engine_tool_names=frozenset(),
+            deferred_tool_names=frozenset(),
+            registry_entries=(),
+            memory_manager=manager_a,
+            context_engine=None,
+            registry_generation=3,
+            selection_revision=7,
+            enabled_toolsets=("memory",),
+            disabled_toolsets=(),
+        )
+
+        def make_child(manager):
+            child = types.SimpleNamespace(
+                tools=[provider_tool],
+                valid_tool_names={"memory_lookup"},
+                _memory_provider_tool_names={"memory_lookup"},
+                _context_engine_tool_names=set(),
+                _memory_manager=manager,
+                context_compressor=None,
+                _tool_snapshot_generation=4,
+                _tool_selection_revision=8,
+                enabled_toolsets=["memory"],
+                disabled_toolsets=[],
+            )
+            child._tool_surface_snapshot = AgentToolSurfaceSnapshot(
+                tool_defs=(provider_tool,),
+                catalog_tool_defs=(provider_tool,),
+                valid_tool_names=frozenset({"memory_lookup"}),
+                memory_provider_tool_names=frozenset({"memory_lookup"}),
+                context_engine_tool_names=frozenset(),
+                deferred_tool_names=frozenset(),
+                registry_entries=(),
+                memory_manager=manager,
+                context_engine=None,
+                registry_generation=4,
+                selection_revision=8,
+                enabled_toolsets=("memory",),
+                disabled_toolsets=(),
+            )
+            child._tool_surface_legacy_tools_id = id(child.tools)
+            return child
+
+        mismatch_child = make_child(manager_b)
+        _restrict_child_to_parent_surface(
+            mismatch_child,
+            parent_surface,
+            allow_delegation=False,
+        )
+        self.assertEqual(mismatch_child.tools, [])
+        self.assertEqual(mismatch_child.valid_tool_names, set())
+        self.assertEqual(
+            mismatch_child._tool_surface_snapshot.memory_provider_tool_names,
+            frozenset(),
+        )
+
+        pinned_child = make_child(manager_a)
+        _restrict_child_to_parent_surface(
+            pinned_child,
+            parent_surface,
+            allow_delegation=False,
+        )
+        self.assertIs(pinned_child._tool_surface_snapshot.memory_manager, manager_a)
+        pinned_child._memory_manager = manager_b
+        publish_agent_tool_surface(
+            pinned_child,
+            [provider_tool],
+            catalog_tool_defs=[provider_tool],
+            memory_provider_tool_names=("memory_lookup",),
+            context_engine_tool_names=(),
+            registry_entries=(),
+            registry_generation=5,
+            selection_revision=9,
+            enabled_toolsets=("memory",),
+            disabled_toolsets=(),
+        )
+        self.assertEqual(pinned_child.valid_tool_names, {"memory_lookup"})
+        self.assertIs(pinned_child._tool_surface_snapshot.memory_manager, manager_a)
+
+    def test_child_context_engine_uses_stable_implementation_provenance(self):
+        from agent.tool_surface import (
+            AgentToolSurfaceSnapshot,
+            publish_agent_tool_surface,
+        )
+        from tools.delegate_tool import _restrict_child_to_parent_surface
+
+        context_tool = {
+            "type": "function",
+            "function": {"name": "context_lookup", "parameters": {}},
+        }
+
+        class Engine:
+            name = "test-context"
+
+            def __init__(self, label):
+                self.label = label
+
+            def get_tool_schemas(self):
+                return [context_tool["function"]]
+
+            def handle_tool_call(self, _name, _args, **_kwargs):
+                return self.label
+
+        class OtherEngine(Engine):
+            pass
+
+        def surface(engine, generation):
+            return AgentToolSurfaceSnapshot(
+                tool_defs=(context_tool,),
+                catalog_tool_defs=(context_tool,),
+                valid_tool_names=frozenset({"context_lookup"}),
+                memory_provider_tool_names=frozenset(),
+                context_engine_tool_names=frozenset({"context_lookup"}),
+                deferred_tool_names=frozenset(),
+                registry_entries=(),
+                memory_manager=None,
+                context_engine=engine,
+                registry_generation=generation,
+                selection_revision=7,
+                enabled_toolsets=("context_engine",),
+                disabled_toolsets=(),
+            )
+
+        parent_engine = Engine("parent")
+        child_engine = Engine("child")
+        parent_surface = surface(parent_engine, 3)
+        child = types.SimpleNamespace(
+            tools=[context_tool],
+            valid_tool_names={"context_lookup"},
+            _memory_provider_tool_names=set(),
+            _context_engine_tool_names={"context_lookup"},
+            _memory_manager=None,
+            context_compressor=child_engine,
+            _tool_snapshot_generation=4,
+            _tool_selection_revision=8,
+            enabled_toolsets=["context_engine"],
+            disabled_toolsets=[],
+        )
+        child._tool_surface_snapshot = surface(child_engine, 4)
+        child._tool_surface_legacy_tools_id = id(child.tools)
+
+        _restrict_child_to_parent_surface(
+            child,
+            parent_surface,
+            allow_delegation=False,
+        )
+
+        self.assertEqual(child.valid_tool_names, {"context_lookup"})
+        self.assertIs(child._tool_surface_snapshot.context_engine, child_engine)
+        self.assertEqual(
+            child._tool_surface_snapshot.context_engine.handle_tool_call(
+                "context_lookup", {}
+            ),
+            "child",
+        )
+
+        replacement = Engine("replacement")
+        child.context_compressor = replacement
+        publish_agent_tool_surface(
+            child,
+            [context_tool],
+            catalog_tool_defs=[context_tool],
+            memory_provider_tool_names=(),
+            context_engine_tool_names=("context_lookup",),
+            registry_entries=(),
+            registry_generation=5,
+            selection_revision=9,
+            enabled_toolsets=("context_engine",),
+            disabled_toolsets=(),
+        )
+        self.assertIs(child._tool_surface_snapshot.context_engine, child_engine)
+
+        mismatch_engine = OtherEngine("other")
+        mismatch_child = types.SimpleNamespace(
+            tools=[context_tool],
+            valid_tool_names={"context_lookup"},
+            _memory_provider_tool_names=set(),
+            _context_engine_tool_names={"context_lookup"},
+            _memory_manager=None,
+            context_compressor=mismatch_engine,
+            _tool_snapshot_generation=4,
+            _tool_selection_revision=8,
+            enabled_toolsets=["context_engine"],
+            disabled_toolsets=[],
+        )
+        mismatch_child._tool_surface_snapshot = surface(mismatch_engine, 4)
+        mismatch_child._tool_surface_legacy_tools_id = id(mismatch_child.tools)
+        _restrict_child_to_parent_surface(
+            mismatch_child,
+            parent_surface,
+            allow_delegation=False,
+        )
+        self.assertEqual(mismatch_child.valid_tool_names, set())
+        self.assertIsNone(mismatch_child._tool_surface_snapshot.context_engine)
+
+        spoofed_engine = Engine("spoofed")
+        spoofed_engine.handle_tool_call = lambda *_args, **_kwargs: "spoofed"
+        spoofed_child = types.SimpleNamespace(
+            tools=[context_tool],
+            valid_tool_names={"context_lookup"},
+            _memory_provider_tool_names=set(),
+            _context_engine_tool_names={"context_lookup"},
+            _memory_manager=None,
+            context_compressor=spoofed_engine,
+            _tool_snapshot_generation=4,
+            _tool_selection_revision=8,
+            enabled_toolsets=["context_engine"],
+            disabled_toolsets=[],
+        )
+        spoofed_child._tool_surface_snapshot = surface(spoofed_engine, 4)
+        spoofed_child._tool_surface_legacy_tools_id = id(spoofed_child.tools)
+        _restrict_child_to_parent_surface(
+            spoofed_child,
+            parent_surface,
+            allow_delegation=False,
+        )
+        self.assertEqual(spoofed_child.valid_tool_names, set())
+        self.assertIsNone(spoofed_child._tool_surface_snapshot.context_engine)
+
     def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools
 
@@ -1383,6 +1750,26 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_request_pinned_surface_is_forwarded(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        surface = object()
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "test"},
+                tool_surface=surface,
+            )
+
+        self.assertIs(captured["parent_tool_surface"], surface)
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

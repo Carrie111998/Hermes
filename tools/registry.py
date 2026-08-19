@@ -15,6 +15,7 @@ Import chain (circular-import safe):
 """
 
 import ast
+import contextlib
 import functools
 import importlib
 import json
@@ -22,12 +23,85 @@ import logging
 import sys
 import threading
 import time
+import weakref
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
+
+_read_only_tool_inspection: ContextVar[bool] = ContextVar(
+    "read_only_tool_inspection", default=False
+)
+_registry_inspection_state: ContextVar[Optional[Any]] = ContextVar(
+    "registry_inspection_state", default=None
+)
+_registry_inspection_binding_lock = threading.RLock()
+_registry_inspection_binding_state: Optional[Any] = None
+_registry_inspection_bound_threads: weakref.WeakKeyDictionary = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _active_registry_inspection_state():
+    state = _registry_inspection_state.get()
+    if state is not None:
+        return state
+    with _registry_inspection_binding_lock:
+        return _registry_inspection_bound_threads.get(threading.current_thread())
+
+
+def capture_read_only_tool_inspection_binding():
+    """Return the current isolated registry state as an opaque binding token."""
+    return _active_registry_inspection_state()
+
+
+def bind_read_only_tool_inspection_to_current_thread(state=None) -> bool:
+    """Bind a diagnostic plugin child thread to the isolated registry clone."""
+    active_state = _registry_inspection_state.get()
+    with _registry_inspection_binding_lock:
+        binding_state = (
+            state if state is not None else _registry_inspection_binding_state
+        )
+        if binding_state is None:
+            return False
+        if active_state is binding_state:
+            return True
+        _registry_inspection_bound_threads[threading.current_thread()] = binding_state
+        return True
+
+
+@contextlib.contextmanager
+def read_only_tool_inspection():
+    """Prevent tool discovery from persisting runtime state in this context."""
+    global _registry_inspection_binding_state
+    token = _read_only_tool_inspection.set(True)
+    state_token = None
+    binding_state_before = None
+    if _registry_inspection_state.get() is None:
+        state = registry._copy_inspection_state()
+        state_token = _registry_inspection_state.set(state)
+        with _registry_inspection_binding_lock:
+            binding_state_before = _registry_inspection_binding_state
+            _registry_inspection_binding_state = state
+    try:
+        yield
+    finally:
+        if state_token is not None:
+            with _registry_inspection_binding_lock:
+                _registry_inspection_binding_state = binding_state_before
+            _registry_inspection_state.reset(state_token)
+        _read_only_tool_inspection.reset(token)
+
+
+def is_read_only_tool_inspection() -> bool:
+    return (
+        _read_only_tool_inspection.get()
+        or _active_registry_inspection_state() is not None
+    )
+
 
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
@@ -149,7 +223,9 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
             module_names.append(f"tools.{path.stem}")
 
     # Drop entries for files that no longer exist; rewrite only when changed.
-    if cache_dirty or set(fresh_cache) != set(cache):
+    if (
+        cache_dirty or set(fresh_cache) != set(cache)
+    ) and not is_read_only_tool_inspection():
         _save_discovery_cache(fresh_cache)
 
     imported: List[str] = []
@@ -391,6 +467,58 @@ def _check_fn_cached(fn: Callable) -> bool:
         return False
 
 
+def _check_fn_readonly(fn: Callable) -> bool:
+    """Mirror availability semantics without mutating either TTL cache."""
+    now = time.monotonic()
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "check_fn %s raised during read-only inspection; "
+                "dependent tools will be reported unavailable",
+                getattr(fn, "__qualname__", fn),
+                exc_info=True,
+            )
+            return False
+
+    cache_key = (fn, scope)
+    with _check_fn_cache_lock:
+        cached = _check_fn_cache.get(cache_key)
+        last_good = _check_fn_last_good.get(cache_key)
+    if cached is not None:
+        timestamp, value = cached
+        if now - timestamp < _CHECK_FN_TTL_SECONDS:
+            return value
+
+    raised = False
+    try:
+        value = bool(fn())
+    except Exception:
+        value = False
+        raised = True
+    if value:
+        return True
+    if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
+        logger.warning(
+            "check_fn %s failed (%s) within %.0fs of last success during "
+            "read-only inspection; keeping tool(s) available",
+            getattr(fn, "__qualname__", fn),
+            "raised" if raised else "returned False",
+            _CHECK_FN_FAILURE_GRACE_SECONDS,
+        )
+        return True
+
+    logger.warning(
+        "check_fn %s %s during read-only inspection; dependent tools will "
+        "be reported unavailable",
+        getattr(fn, "__qualname__", fn),
+        "raised" if raised else "returned False",
+    )
+    return False
+
+
 def invalidate_check_fn_cache() -> None:
     """Drop all cached ``check_fn`` results. Call after config changes that
     affect tool availability (e.g. ``hermes tools enable``)."""
@@ -428,21 +556,21 @@ class ToolRegistry:
 
     def __init__(self):
         # Built-in and other process-global registrations.
-        self._tools: Dict[str, ToolEntry] = {}
+        self._base_tools: Dict[str, ToolEntry] = {}
         # Plugin registrations are overlays keyed by resolved HERMES_HOME. A
         # profile sees its own overlay first and then the global built-ins.
-        self._scoped_tools: Dict[str, Dict[str, ToolEntry]] = {}
+        self._base_scoped_tools: Dict[str, Dict[str, ToolEntry]] = {}
         # Plugin module namespace -> operator opt-in for built-in override.
         # Authorization records are lifecycle-managed; the separate scope map
         # remains durable so delayed callbacks stay profile-confined.
-        self._plugin_override_policy: Dict[
+        self._base_plugin_override_policy: Dict[
             tuple[Optional[str], str], _PluginOverridePolicy
         ] = {}
         # Scope attribution stays durable after policy removal so delayed code
         # remains confined to the profile where its module was loaded.
-        self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
-        self._toolset_checks: Dict[str, Callable] = {}
-        self._toolset_aliases: Dict[str, str] = {}
+        self._base_plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
+        self._base_toolset_checks: Dict[str, Callable] = {}
+        self._base_toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -452,7 +580,131 @@ class ToolRegistry:
         # refresh). External callers (e.g. get_tool_definitions) can memoize
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
-        self._generation: int = 0
+        self._base_generation: int = 0
+
+    def _inspection_state(self):
+        state = _active_registry_inspection_state()
+        return state if state is not None and state["owner"] is self else None
+
+    def _copy_inspection_state(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "owner": self,
+                "tools": dict(self._base_tools),
+                "scoped_tools": {
+                    scope: dict(entries)
+                    for scope, entries in self._base_scoped_tools.items()
+                },
+                "plugin_override_policy": dict(
+                    self._base_plugin_override_policy
+                ),
+                "plugin_module_scopes": {
+                    module: set(scopes)
+                    for module, scopes in self._base_plugin_module_scopes.items()
+                },
+                "toolset_checks": dict(self._base_toolset_checks),
+                "toolset_aliases": dict(self._base_toolset_aliases),
+                "generation": self._base_generation,
+            }
+
+    @property
+    def _tools(self) -> Dict[str, ToolEntry]:
+        state = self._inspection_state()
+        return state["tools"] if state is not None else self._base_tools
+
+    @_tools.setter
+    def _tools(self, value: Dict[str, ToolEntry]) -> None:
+        state = self._inspection_state()
+        if state is not None:
+            state["tools"] = value
+        else:
+            self._base_tools = value
+
+    @property
+    def _scoped_tools(self) -> Dict[str, Dict[str, ToolEntry]]:
+        state = self._inspection_state()
+        return state["scoped_tools"] if state is not None else self._base_scoped_tools
+
+    @_scoped_tools.setter
+    def _scoped_tools(self, value: Dict[str, Dict[str, ToolEntry]]) -> None:
+        state = self._inspection_state()
+        if state is not None:
+            state["scoped_tools"] = value
+        else:
+            self._base_scoped_tools = value
+
+    @property
+    def _plugin_override_policy(self):
+        state = self._inspection_state()
+        return (
+            state["plugin_override_policy"]
+            if state is not None
+            else self._base_plugin_override_policy
+        )
+
+    @_plugin_override_policy.setter
+    def _plugin_override_policy(self, value) -> None:
+        state = self._inspection_state()
+        if state is not None:
+            state["plugin_override_policy"] = value
+        else:
+            self._base_plugin_override_policy = value
+
+    @property
+    def _plugin_module_scopes(self):
+        state = self._inspection_state()
+        return (
+            state["plugin_module_scopes"]
+            if state is not None
+            else self._base_plugin_module_scopes
+        )
+
+    @_plugin_module_scopes.setter
+    def _plugin_module_scopes(self, value) -> None:
+        state = self._inspection_state()
+        if state is not None:
+            state["plugin_module_scopes"] = value
+        else:
+            self._base_plugin_module_scopes = value
+
+    @property
+    def _toolset_checks(self) -> Dict[str, Callable]:
+        state = self._inspection_state()
+        return state["toolset_checks"] if state is not None else self._base_toolset_checks
+
+    @_toolset_checks.setter
+    def _toolset_checks(self, value: Dict[str, Callable]) -> None:
+        state = self._inspection_state()
+        if state is not None:
+            state["toolset_checks"] = value
+        else:
+            self._base_toolset_checks = value
+
+    @property
+    def _toolset_aliases(self) -> Dict[str, str]:
+        state = self._inspection_state()
+        return state["toolset_aliases"] if state is not None else self._base_toolset_aliases
+
+    @_toolset_aliases.setter
+    def _toolset_aliases(self, value: Dict[str, str]) -> None:
+        state = self._inspection_state()
+        if state is not None:
+            state["toolset_aliases"] = value
+        else:
+            self._base_toolset_aliases = value
+
+    @property
+    def _generation(self) -> int:
+        state = self._inspection_state()
+        return state["generation"] if state is not None else self._base_generation
+
+    @_generation.setter
+    def _generation(self, value: int) -> None:
+        state = self._inspection_state()
+        if state is not None:
+            state["generation"] = value
+        else:
+            self._base_generation = value
 
     @staticmethod
     def current_scope_key() -> str:
@@ -527,6 +779,48 @@ class ToolRegistry:
         with self._lock:
             target = self._tools if scope is None else self._scoped_tools.get(scope, {})
             return target.get(name)
+
+    def snapshot_entries_by_name(
+        self,
+        names: Iterable[str],
+        *,
+        expected_generation: Optional[int] = None,
+        scope: Optional[str] = None,
+    ) -> Optional[tuple[int, tuple[tuple[str, ToolEntry], ...]]]:
+        """Atomically capture named entries, optionally as a generation CAS."""
+        with self._lock:
+            if (
+                expected_generation is not None
+                and self._generation != expected_generation
+            ):
+                return None
+            merged = self._merged_tools(scope)
+            entries = tuple(
+                (name, entry)
+                for name in names
+                if (entry := merged.get(name)) is not None
+            )
+            return self._generation, entries
+
+    def run_with_entries_snapshot_by_name(
+        self,
+        names: Iterable[str],
+        callback: Callable[[int, tuple[tuple[str, ToolEntry], ...]], Any],
+        *,
+        expected_generation: int,
+        scope: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Run a short publication callback while a generation snapshot is leased."""
+        with self._lock:
+            if self._generation != expected_generation:
+                return None
+            merged = self._merged_tools(scope)
+            entries = tuple(
+                (name, entry)
+                for name in names
+                if (entry := merged.get(name)) is not None
+            )
+            return callback(self._generation, entries)
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -1015,7 +1309,13 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self,
+        tool_names: Set[str],
+        quiet: bool = False,
+        *,
+        cache_checks: bool = True,
+    ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
         Only tools whose ``check_fn()`` returns True (or have no check_fn)
@@ -1024,13 +1324,16 @@ class ToolRegistry:
         requirements probes modal/docker, browser checks probe playwright,
         etc.); TTL chosen so env-var changes (``hermes tools enable foo``)
         still take effect in near-real-time without forcing a full cache
-        flush on every call.
+        flush on every call. Read-only diagnostic callers can pass
+        ``cache_checks=False`` to preserve the same cached/last-good semantics
+        without publishing fresh probe results.
         """
         result = []
         # Per-call cache on top of the 30 s TTL — handles repeat probes of the
         # same check_fn within one definitions pass without re-reading the
         # TTL clock.
         check_results: Dict[Callable, bool] = {}
+        check = _check_fn_cached if cache_checks else _check_fn_readonly
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
@@ -1038,7 +1341,7 @@ class ToolRegistry:
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
-                    check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                    check_results[entry.check_fn] = check(entry.check_fn)
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
@@ -1105,6 +1408,7 @@ class ToolRegistry:
         args: dict,
         *,
         scope: Optional[str] = None,
+        expected_entry: Optional[ToolEntry] = None,
         **kwargs,
     ) -> str | dict:
         """Execute a tool handler by name.
@@ -1118,6 +1422,10 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        if expected_entry is not None and entry is not expected_entry:
+            return tool_error(
+                f"Tool registration changed during the request: {name}. Retry the request."
+            )
         try:
             if entry.is_async:
                 from model_tools import _run_async
@@ -1140,6 +1448,19 @@ class ToolRegistry:
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
             return tool_error(sanitized)
+
+    def expected_entry_error(
+        self,
+        name: str,
+        expected_entry: ToolEntry,
+        *,
+        scope: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return an error when a request-pinned registration is no longer live."""
+        entry = self.get_entry(name, scope=scope)
+        if entry is expected_entry:
+            return None
+        return f"Tool registration changed during the request: {name}. Retry the request."
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

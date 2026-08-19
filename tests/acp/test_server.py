@@ -665,7 +665,11 @@ class TestRegisterSessionMcpServers:
         state.agent._cached_system_prompt = "old prompt"
         state.agent._memory_manager = SimpleNamespace(
             get_all_tool_schemas=lambda: [
-                {"name": "hindsight_recall", "description": "Recall", "parameters": {}}
+                {
+                    "name": "hindsight_recall",
+                    "description": "Recall",
+                    "parameters": {"type": "object", "properties": {}},
+                }
             ]
         )
 
@@ -677,9 +681,14 @@ class TestRegisterSessionMcpServers:
         )
 
         fake_tools = [
-            {"function": {"name": "mcp_srv_search"}},
-            {"function": {"name": "memory"}},
-            {"function": {"name": "terminal"}},
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in ("mcp_srv_search", "memory", "terminal")
         ]
 
         with patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp_srv_search"]), \
@@ -690,15 +699,17 @@ class TestRegisterSessionMcpServers:
             enabled_toolsets=["hermes-acp", "mcp-srv"],
             disabled_toolsets=None,
             quiet_mode=True,
+            skip_tool_search_assembly=True,
+            record_resolved_names=False,
         )
         assert state.agent.enabled_toolsets == ["hermes-acp", "mcp-srv"]
-        assert state.agent.tools is fake_tools
+        assert state.agent.tools[:3] == fake_tools
         assert state.agent.tools[-1] == {
             "type": "function",
             "function": {
                 "name": "hindsight_recall",
                 "description": "Recall",
-                "parameters": {},
+                "parameters": {"type": "object", "properties": {}},
             },
         }
         assert state.agent.valid_tool_names == {

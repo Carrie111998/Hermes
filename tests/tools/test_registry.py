@@ -92,6 +92,48 @@ class TestRegisterAndDispatch:
             for record in caplog.records
         )
 
+    def test_entry_snapshot_lease_blocks_mutation_until_publication(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="leased",
+            toolset="core",
+            schema=_make_schema("leased"),
+            handler=_dummy_handler,
+        )
+        original_entry = reg.get_entry("leased")
+        generation = reg._generation
+        mutation_started = threading.Event()
+        mutation_finished = threading.Event()
+        mutation_thread = None
+
+        def _publish(captured_generation, entries):
+            nonlocal mutation_thread
+
+            def _mutate():
+                mutation_started.set()
+                reg.deregister("leased")
+                mutation_finished.set()
+
+            mutation_thread = threading.Thread(target=_mutate)
+            mutation_thread.start()
+            assert mutation_started.wait(timeout=1)
+            assert not mutation_finished.wait(timeout=0.05)
+            assert captured_generation == generation
+            assert entries == (("leased", original_entry),)
+            return entries
+
+        captured = reg.run_with_entries_snapshot_by_name(
+            ["leased"],
+            _publish,
+            expected_generation=generation,
+        )
+
+        assert mutation_thread is not None
+        mutation_thread.join(timeout=1)
+        assert not mutation_thread.is_alive()
+        assert mutation_finished.is_set()
+        assert captured == (("leased", original_entry),)
+
 class TestGetDefinitions:
     def test_returns_openai_format(self):
         reg = ToolRegistry()

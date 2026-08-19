@@ -1117,10 +1117,11 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires the SQLite state database."""
+    """Require the SQLite state capability, not a startup-created directory."""
     try:
         from hermes_state import _default_db_path
-        return _default_db_path().parent.exists()
+
+        return callable(_default_db_path)
     except ImportError:
         return False
 

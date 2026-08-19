@@ -1575,6 +1575,151 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _surface_tool_name(tool: Dict[str, Any]) -> str:
+    function = tool.get("function") if isinstance(tool, dict) else None
+    if not isinstance(function, dict):
+        return ""
+    name = function.get("name")
+    return name if isinstance(name, str) else ""
+
+
+def _restrict_child_to_parent_surface(
+    child,
+    parent_surface,
+    *,
+    allow_delegation: bool,
+) -> None:
+    """Prevent child construction from widening a request-pinned surface."""
+    from agent.tool_surface import (
+        context_engine_provenance,
+        get_agent_tool_surface,
+        publish_agent_tool_surface,
+    )
+
+    child_surface = get_agent_tool_surface(child)
+    child_visible_defs = {
+        name: tool
+        for tool in child_surface.tool_defs
+        if (name := _surface_tool_name(tool))
+    }
+    child_catalog_defs = {
+        name: tool
+        for tool in child_surface.catalog_tool_defs
+        if (name := _surface_tool_name(tool))
+    }
+    parent_visible_defs = {
+        name: tool
+        for tool in parent_surface.tool_defs
+        if (name := _surface_tool_name(tool))
+    }
+    parent_catalog_defs = {
+        name: tool
+        for tool in parent_surface.catalog_tool_defs
+        if (name := _surface_tool_name(tool))
+    }
+    parent_memory_manager = getattr(parent_surface, "memory_manager", None)
+    parent_context_engine = getattr(parent_surface, "context_engine", None)
+    parent_context_provenance = getattr(
+        parent_surface,
+        "context_engine_provenance",
+        None,
+    ) or context_engine_provenance(parent_context_engine)
+    child_context_provenance = getattr(
+        child_surface,
+        "context_engine_provenance",
+        None,
+    ) or context_engine_provenance(child_surface.context_engine)
+    context_engine_matches = (
+        child_surface.context_engine is parent_context_engine
+        or (
+            parent_context_provenance is not None
+            and child_context_provenance == parent_context_provenance
+        )
+    )
+    authorized_child_context_engine = (
+        child_surface.context_engine if context_engine_matches else None
+    )
+    unavailable_external_names = set()
+    if child_surface.memory_manager is not parent_memory_manager:
+        unavailable_external_names.update(parent_surface.memory_provider_tool_names)
+    if not context_engine_matches:
+        unavailable_external_names.update(parent_surface.context_engine_tool_names)
+    visible_definition_ceiling = {
+        name: tool
+        for name, tool in parent_visible_defs.items()
+        if name in child_visible_defs and name not in unavailable_external_names
+    }
+    catalog_definition_ceiling = {
+        name: tool
+        for name, tool in parent_catalog_defs.items()
+        if name in child_catalog_defs and name not in unavailable_external_names
+    }
+    if allow_delegation and "delegate_task" in child_visible_defs:
+        visible_definition_ceiling["delegate_task"] = child_visible_defs[
+            "delegate_task"
+        ]
+        catalog_definition_ceiling["delegate_task"] = child_catalog_defs.get(
+            "delegate_task",
+            child_visible_defs["delegate_task"],
+        )
+    allowed_visible = set(visible_definition_ceiling)
+    allowed_catalog = set(catalog_definition_ceiling) | allowed_visible
+    child._tool_surface_valid_name_ceiling = frozenset(allowed_visible)
+    child._tool_surface_catalog_name_ceiling = frozenset(allowed_catalog)
+    child._tool_surface_visible_definition_ceiling = visible_definition_ceiling
+    child._tool_surface_catalog_definition_ceiling = catalog_definition_ceiling
+    child._tool_surface_memory_provider_name_ceiling = frozenset(
+        parent_surface.memory_provider_tool_names & allowed_visible
+    )
+    child._tool_surface_context_engine_name_ceiling = frozenset(
+        parent_surface.context_engine_tool_names & allowed_visible
+    )
+    child._tool_surface_memory_manager_ceiling = parent_memory_manager
+    child._tool_surface_context_engine_ceiling = authorized_child_context_engine
+    child._tool_surface_context_engine_provenance_ceiling = (
+        parent_context_provenance if context_engine_matches else None
+    )
+    parent_entries = dict(parent_surface.registry_entries)
+    child_entries = dict(child_surface.registry_entries)
+    registry_entry_ceiling = {
+        name: entry
+        for name, entry in parent_entries.items()
+        if name in allowed_visible or name in allowed_catalog
+    }
+    if allow_delegation and "delegate_task" in child_entries:
+        registry_entry_ceiling["delegate_task"] = child_entries["delegate_task"]
+    child._tool_surface_registry_entry_ceiling = registry_entry_ceiling
+    tool_defs = list(visible_definition_ceiling.values())
+    catalog_tool_defs = list(catalog_definition_ceiling.values())
+    visible_names = {
+        name for tool in tool_defs if (name := _surface_tool_name(tool))
+    }
+    catalog_names = {
+        name
+        for tool in catalog_tool_defs
+        if (name := _surface_tool_name(tool))
+    }
+    publish_agent_tool_surface(
+        child,
+        tool_defs,
+        catalog_tool_defs=catalog_tool_defs,
+        memory_provider_tool_names=(
+            parent_surface.memory_provider_tool_names & visible_names
+        ),
+        context_engine_tool_names=(
+            parent_surface.context_engine_tool_names & visible_names
+        ),
+        deferred_tool_names=(
+            parent_surface.deferred_tool_names & catalog_names
+        ),
+        registry_entries=registry_entry_ceiling.items(),
+        registry_generation=child_surface.registry_generation,
+        selection_revision=child_surface.selection_revision,
+        enabled_toolsets=child_surface.enabled_toolsets,
+        disabled_toolsets=child_surface.disabled_toolsets,
+    )
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1584,6 +1729,7 @@ def _build_child_agent(
     max_iterations: int,
     task_count: int,
     parent_agent,
+    parent_tool_surface=None,
     # Credential overrides from delegation config (provider:model resolution)
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
@@ -1637,9 +1783,21 @@ def _build_child_agent(
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
     # so we must derive effective toolsets from the parent's loaded tools.
-    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    parent_enabled = (
+        parent_tool_surface.enabled_toolsets
+        if parent_tool_surface is not None
+        else getattr(parent_agent, "enabled_toolsets", None)
+    )
     if parent_enabled is not None:
         parent_toolsets = set(parent_enabled)
+    elif parent_tool_surface is not None:
+        import model_tools
+
+        parent_toolsets = {
+            ts
+            for name in parent_tool_surface.valid_tool_names
+            if (ts := model_tools.get_toolset_for_tool(name)) is not None
+        }
     elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
         # enabled_toolsets is None (all tools) — derive from loaded tool names
         import model_tools
@@ -1675,7 +1833,11 @@ def _build_child_agent(
     # carry useful tools too. Pass exact one-tool deny toolsets through to the
     # child so model_tools subtracts the blocked names AFTER composite
     # expansion, and the restriction survives later registry/MCP refreshes.
-    raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
+    raw_parent_disabled = (
+        parent_tool_surface.disabled_toolsets
+        if parent_tool_surface is not None
+        else getattr(parent_agent, "disabled_toolsets", None)
+    )
     if isinstance(raw_parent_disabled, (list, tuple, set)):
         inherited_disabled = [str(name) for name in raw_parent_disabled]
     else:
@@ -1985,6 +2147,12 @@ def _build_child_agent(
                 except Exception:
                     pass
             raise
+        if parent_tool_surface is not None:
+            _restrict_child_to_parent_surface(
+                child,
+                parent_tool_surface,
+                allow_delegation=effective_role == "orchestrator",
+            )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
@@ -3606,6 +3774,7 @@ def delegate_task(
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
+    parent_tool_surface=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3849,6 +4018,7 @@ def delegate_task(
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
+                parent_tool_surface=parent_tool_surface,
                 override_provider=creds["provider"],
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],

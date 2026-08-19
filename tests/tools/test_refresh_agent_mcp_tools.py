@@ -44,6 +44,31 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_respects_inherited_exact_name_ceiling(monkeypatch):
+    agent = _agent(["review_pin_anchor"], enabled=["file"])
+    agent._tool_surface_valid_name_ceiling = frozenset({"review_pin_anchor"})
+    agent._tool_surface_catalog_name_ceiling = frozenset({"review_pin_anchor"})
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [
+            _tool("review_pin_anchor"),
+            _tool("review_live_b_extra"),
+        ],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.valid_tool_names == {"review_pin_anchor"}
+    assert [tool["function"]["name"] for tool in agent.tools] == [
+        "review_pin_anchor"
+    ]
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 
@@ -185,10 +210,11 @@ def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
         try:
             for _ in range(50):
                 mcp_tool.refresh_agent_mcp_tools(agent)
-                # Coherence invariant: the name set must match the tool list
-                # at every observation, never a torn cross-attribute state.
-                names = {t["function"]["name"] for t in agent.tools}
-                assert agent.valid_tool_names == names
+                from agent.tool_surface import get_agent_tool_surface
+
+                snapshot = get_agent_tool_surface(agent)
+                names = {t["function"]["name"] for t in snapshot.tool_defs}
+                assert snapshot.valid_tool_names == names
                 assert names in ({"a", "b"}, {"a", "c"})
         except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
@@ -201,6 +227,167 @@ def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
 
     assert not errors
     assert agent.valid_tool_names in ({"a", "b"}, {"a", "c"})
+
+
+def test_explicit_selection_wins_over_inflight_automatic_refresh(monkeypatch):
+    """A stale automatic rebuild cannot overwrite a newer explicit selection."""
+    agent = _agent(["read_file", "terminal"], enabled=["all"])
+    automatic_started = threading.Event()
+    release_automatic = threading.Event()
+
+    def _gtd(*, enabled_toolsets=None, **kwargs):
+        if enabled_toolsets == ["all"]:
+            automatic_started.set()
+            assert release_automatic.wait(timeout=5)
+            return [_tool("read_file"), _tool("terminal")]
+        assert enabled_toolsets == ["file"]
+        return [_tool("read_file")]
+
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+
+    automatic = threading.Thread(
+        target=mcp_tool.refresh_agent_mcp_tools,
+        args=(agent,),
+    )
+    automatic.start()
+    assert automatic_started.wait(timeout=5)
+
+    mcp_tool.refresh_agent_mcp_tools(agent, enabled_override=["file"])
+    release_automatic.set()
+    automatic.join(timeout=5)
+
+    assert not automatic.is_alive()
+    assert agent.enabled_toolsets == ["file"]
+    assert agent.valid_tool_names == {"read_file"}
+    assert [tool["function"]["name"] for tool in agent.tools] == ["read_file"]
+
+
+def test_refresh_retries_when_registry_generation_changes_during_assembly(monkeypatch):
+    """A generation change discards the staged surface instead of publishing it."""
+    from tools.registry import registry
+
+    agent = _agent(["read_file"])
+    calls = 0
+    original_generation = registry._generation
+    monkeypatch.setattr(registry, "_generation", original_generation)
+
+    def _gtd(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            registry._generation += 1
+            return [_tool("stale_tool")]
+        return [_tool("fresh_tool")]
+
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert calls == 2
+    assert added == {"fresh_tool"}
+    assert agent.valid_tool_names == {"fresh_tool"}
+    assert agent._tool_surface_snapshot.registry_generation == original_generation + 1
+
+
+def test_refresh_does_not_publish_under_continuous_registry_churn(monkeypatch):
+    """Bounded retries leave the prior coherent surface intact under churn."""
+    from tools.registry import registry
+
+    agent = _agent(["read_file"])
+    calls = 0
+    original_generation = registry._generation
+    monkeypatch.setattr(registry, "_generation", original_generation)
+
+    def _gtd(**_kwargs):
+        nonlocal calls
+        calls += 1
+        registry._generation += 1
+        return [_tool(f"unstable_{calls}")]
+
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+
+    assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+    assert calls == 3
+    assert agent.valid_tool_names == {"read_file"}
+    assert [tool["function"]["name"] for tool in agent.tools] == ["read_file"]
+
+
+def test_refresh_retries_when_generation_changes_at_entry_capture(monkeypatch):
+    """The final schema/handler capture is a registry-generation CAS."""
+    from tools.registry import registry
+
+    agent = _agent(["read_file"])
+    build_calls = 0
+    cas_calls = 0
+    original_generation = registry._generation
+    original_run = registry.run_with_entries_snapshot_by_name
+    monkeypatch.setattr(registry, "_generation", original_generation)
+
+    def _gtd(**_kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return [_tool(f"surface_{build_calls}")]
+
+    def _run(names, callback, *, expected_generation, scope=None):
+        nonlocal cas_calls
+        cas_calls += 1
+        if cas_calls == 1:
+            registry._generation += 1
+        return original_run(
+            names,
+            callback,
+            expected_generation=expected_generation,
+            scope=scope,
+        )
+
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+    monkeypatch.setattr(registry, "run_with_entries_snapshot_by_name", _run)
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert build_calls == 2
+    assert cas_calls == 2
+    assert added == {"surface_2"}
+    assert agent.valid_tool_names == {"surface_2"}
+    assert agent._tool_surface_snapshot.registry_generation == original_generation + 1
+
+
+def test_equal_name_refresh_publishes_schema_and_routing_together(monkeypatch):
+    """Equal names can still carry a changed schema or routing owner."""
+    agent = _agent(["lcm_grep"])
+    agent.tools[0]["function"]["description"] = "old"
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: [
+            {
+                "name": "lcm_grep",
+                "description": "new",
+                "parameters": {},
+            }
+        ]
+    )
+    agent._context_engine_tool_names = set()
+
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kwargs: [])
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    from agent.tool_surface import get_agent_tool_surface
+
+    snapshot = get_agent_tool_surface(agent)
+    assert added == set()
+    assert snapshot.context_engine_tool_names == frozenset({"lcm_grep"})
+    assert snapshot.tool_defs[0]["function"]["description"] == "new"
+    assert agent.tools[0]["function"]["description"] == "new"
 
 
 # ── discovery-wait bound (mcp_discovery_timeout config) ──────────────────────

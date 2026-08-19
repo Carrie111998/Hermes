@@ -517,10 +517,9 @@ def build_turn_context(
     # snapshot.  This is cache-safe by construction: it runs in the per-turn
     # prologue, before this turn's first API call assembles ``tools=``, so it
     # only ever extends a fresh request prefix — it never mutates the cached
-    # prefix of an in-flight turn.  No-op when no MCP servers are registered
-    # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
-    # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
-    # name and leaves the snapshot untouched on no-change).
+    # prefix of an in-flight turn. The common no-MCP case is gated by the cheap
+    # ``has_registered_mcp_tools`` check; equivalent rebuilds report no added
+    # names and produce no user notification.
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
             # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
@@ -538,6 +537,10 @@ def build_turn_context(
                     refresh_agent_mcp_tools(agent, quiet_mode=True)
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
+
+    from agent.tool_surface import get_agent_tool_surface
+
+    tool_surface = get_agent_tool_surface(agent)
 
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):
@@ -703,7 +706,7 @@ def build_turn_context(
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
     if (agent._memory_nudge_interval > 0
-            and "memory" in agent.valid_tool_names
+            and "memory" in tool_surface.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
         if agent._turns_since_memory >= agent._memory_nudge_interval:
@@ -787,7 +790,7 @@ def build_turn_context(
             _idle_tokens = estimate_request_tokens_rough(
                 messages,
                 system_prompt=active_system_prompt or "",
-                tools=agent.tools or None,
+                tools=list(tool_surface.tool_defs) or None,
             )
             # Post-compression target size: don't summarise a thread already
             # below what compaction would reduce it to.
@@ -866,7 +869,7 @@ def build_turn_context(
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
-            tools=agent.tools or None,
+            tools=list(tool_surface.tool_defs) or None,
         )
         _compressor = agent.context_compressor
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
@@ -1030,7 +1033,7 @@ def build_turn_context(
                 _preflight_tokens = estimate_request_tokens_rough(
                     messages,
                     system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
+                    tools=list(tool_surface.tool_defs) or None,
                 )
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens

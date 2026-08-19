@@ -17,12 +17,14 @@ resolved through :func:`_ra` so those patches keep working.
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import os
 import random
 import re
 import ssl
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -482,6 +484,22 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _executor_supports_tool_surface(executor: Any) -> bool:
+    """Preserve legacy/test overrides while pinning native request dispatch."""
+    candidate = getattr(executor, "side_effect", None)
+    if not callable(candidate):
+        candidate = executor
+    try:
+        parameters = inspect.signature(candidate).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == "tool_surface"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _nous_entitlement_message(capability: str) -> str:
@@ -1986,8 +2004,10 @@ def run_conversation(
 
         # Track tool-calling iterations for skill nudge.
         # Counter resets whenever skill_manage is actually used.
+        from agent.tool_surface import get_agent_tool_surface
+
         if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
+                and "skill_manage" in get_agent_tool_surface(agent).valid_tool_names):
             agent._iters_since_skill += 1
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
@@ -2415,7 +2435,12 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        _request_tool_surface = get_agent_tool_surface(agent)
+        tools_for_api = deepcopy(list(_request_tool_surface.tool_defs))
+        if getattr(agent, "_strip_tool_schema_patterns", False):
+            from tools.schema_sanitizer import strip_pattern_and_format
+
+            tools_for_api, _ = strip_pattern_and_format(tools_for_api)
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2469,7 +2494,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -2705,7 +2730,7 @@ def run_conversation(
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
-            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
+            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(tools_for_api or [])}")
         else:
             # Animated thinking spinner in quiet mode
             face = random.choice(KawaiiSpinner.get_thinking_faces())
@@ -2723,7 +2748,7 @@ def run_conversation(
         
         # Log request details if verbose
         if agent.verbose_logging:
-            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}")
+            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(tools_for_api or [])}")
             logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
@@ -2813,13 +2838,10 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
-                else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
+                api_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    tools_for_api=tools_for_api,
+                )
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -2925,7 +2947,7 @@ def run_conversation(
                             else [],
                             system_prompt=system_prompt_for_hooks,
                             message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
+                            tool_count=len(tools_for_api or []),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
@@ -4379,8 +4401,8 @@ def run_conversation(
                             _prefill_sanitized = _sanitize_messages_non_ascii(agent.prefill_messages)
 
                         _tools_sanitized = False
-                        if isinstance(getattr(agent, "tools", None), list):
-                            _tools_sanitized = _sanitize_tools_non_ascii(agent.tools)
+                        if isinstance(tools_for_api, list):
+                            _tools_sanitized = _sanitize_tools_non_ascii(tools_for_api)
 
                         _system_sanitized = False
                         if isinstance(active_system_prompt, str):
@@ -4958,8 +4980,9 @@ def run_conversation(
                 # regex escape classes (``\d``, ``\w``, ``\s``) and most
                 # ``format`` values in tool schemas.  MCP servers emit
                 # these routinely for date/phone/email params.  Recovery:
-                # strip ``pattern``/``format`` from ``agent.tools`` and
-                # retry once.  We keep the keywords by default so cloud
+                # strip ``pattern``/``format`` from this request's tools and
+                # retain that provider-compatibility mode for the session. We
+                # keep the keywords by default so cloud
                 # providers get the full prompting hints; this branch
                 # fires only for users on llama.cpp's OAI server.
                 if (
@@ -4969,7 +4992,9 @@ def run_conversation(
                     _retry.llama_cpp_grammar_retry_attempted = True
                     try:
                         from tools.schema_sanitizer import strip_pattern_and_format
-                        _, _stripped = strip_pattern_and_format(agent.tools)
+                        tools_for_api, _stripped = strip_pattern_and_format(
+                            tools_for_api
+                        )
                     except Exception as _strip_exc:  # pragma: no cover — defensive
                         logger.warning(
                             "%sllama.cpp grammar recovery: strip helper failed: %s",
@@ -4977,6 +5002,7 @@ def run_conversation(
                         )
                         _stripped = 0
                     if _stripped:
+                        agent._strip_tool_schema_patterns = True
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  llama.cpp rejected tool schema grammar — "
                             f"stripped {_stripped} pattern/format keyword(s), retrying...",
@@ -5208,7 +5234,7 @@ def run_conversation(
                         # the true request (msgs + tools + system), not the tool-blind message count.
                         messages, active_system_prompt = agent._compress_context(
                             messages, system_message,
-                            approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                            approx_tokens=estimate_request_tokens_rough(api_messages, tools=tools_for_api or None),
                             task_id=effective_task_id,
                         )
                         conversation_history = conversation_history_after_compression(
@@ -5477,7 +5503,7 @@ def run_conversation(
                     # true request (msgs + tools + system), not the tool-blind message count.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=tools_for_api or None),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -5574,7 +5600,7 @@ def run_conversation(
                         # messages.  Use the smaller budget and apply a small
                         # safety margin.  Do not alter context_length.
                         request_input_estimate = estimate_request_tokens_rough(
-                            api_messages, tools=agent.tools or None,
+                            api_messages, tools=tools_for_api or None,
                         )
                         local_available_out = old_ctx - request_input_estimate
                         if local_available_out > 0:
@@ -5778,7 +5804,7 @@ def run_conversation(
                     # _should_force_overflow_recovery. (approx_tokens stays for the status display.)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=tools_for_api or None),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -6837,15 +6863,19 @@ def run_conversation(
 
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
+                _valid_tool_names = _request_tool_surface.valid_tool_names
                 for tc in assistant_message.tool_calls:
-                    if tc.function.name not in agent.valid_tool_names:
-                        repaired = agent._repair_tool_call(tc.function.name)
+                    if tc.function.name not in _valid_tool_names:
+                        repaired = agent._repair_tool_call(
+                            tc.function.name,
+                            _valid_tool_names,
+                        )
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
-                    if tc.function.name not in agent.valid_tool_names
+                    if tc.function.name not in _valid_tool_names
                 ]
                 # Mixed batch: at least one valid call alongside the invalid
                 # one(s). Degrading models (observed with gpt-5.6 at very
@@ -6859,7 +6889,7 @@ def run_conversation(
                 # model still halts at 3 while a mostly-coherent one keeps
                 # working.
                 _mixed_invalid_batch = bool(invalid_tool_calls) and any(
-                    tc.function.name in agent.valid_tool_names
+                    tc.function.name in _valid_tool_names
                     for tc in assistant_message.tool_calls
                 )
                 if _mixed_invalid_batch:
@@ -6868,7 +6898,7 @@ def run_conversation(
                     invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
                     _n_valid = sum(
                         1 for tc in assistant_message.tool_calls
-                        if tc.function.name in agent.valid_tool_names
+                        if tc.function.name in _valid_tool_names
                     )
                     agent._buffer_vprint(
                         f"⚠️  Unknown tool '{invalid_preview}' in batch — erroring that call, "
@@ -6907,11 +6937,11 @@ def run_conversation(
                     append_message(messages, assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
-                        if _tc_name not in agent.valid_tool_names:
+                        if _tc_name not in _valid_tool_names:
                             # See _invalid_tool_name_error_content for the
                             # blank-name anti-priming rationale (#47967).
                             content = _invalid_tool_name_error_content(
-                                _tc_name, agent.valid_tool_names
+                                _tc_name, _valid_tool_names
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
@@ -6945,7 +6975,7 @@ def run_conversation(
                     except json.JSONDecodeError as e:
                         if (
                             _mixed_invalid_batch
-                            and tc.function.name not in agent.valid_tool_names
+                            and tc.function.name not in _valid_tool_names
                         ):
                             # This call never executes — it gets an
                             # invalid-name error result below. Don't let its
@@ -7047,7 +7077,7 @@ def run_conversation(
                 if _mixed_invalid_batch:
                     _invalid_batch_calls = [
                         tc for tc in assistant_message.tool_calls
-                        if tc.function.name not in agent.valid_tool_names
+                        if tc.function.name not in _valid_tool_names
                     ]
 
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
@@ -7172,12 +7202,12 @@ def run_conversation(
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
                             "content": _invalid_tool_name_error_content(
-                                tc.function.name, agent.valid_tool_names
+                                tc.function.name, _valid_tool_names
                             ),
                         })
                     assistant_message.tool_calls = [
                         tc for tc in assistant_message.tool_calls
-                        if tc.function.name in agent.valid_tool_names
+                        if tc.function.name in _valid_tool_names
                     ]
 
                 _tool_turn_persisted = None
@@ -7234,7 +7264,22 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                _execute_tool_calls = agent._execute_tool_calls
+                if _executor_supports_tool_surface(_execute_tool_calls):
+                    _execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                        tool_surface=_request_tool_surface,
+                    )
+                else:
+                    _execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7321,7 +7366,7 @@ def run_conversation(
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
                     _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        messages, tools=tools_for_api or None
                     )
 
                 if (
@@ -7869,7 +7914,7 @@ def run_conversation(
                 _ack_mode = intent_ack_continuation_mode(agent)
                 if (
                     _ack_mode != "off"
-                    and agent.valid_tool_names
+                    and _request_tool_surface.valid_tool_names
                     and codex_ack_continuations < 2
                     and agent._looks_like_codex_intermediate_ack(
                         user_message=user_message,
