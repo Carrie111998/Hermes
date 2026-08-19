@@ -1,6 +1,7 @@
 """Tests for events.subscribers.whatsapp_escalator — WhatsApp escalation with quiet hours."""
 
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -1300,3 +1301,59 @@ class TestResourcePressurePaging:
             escalator.handle(self._event(change="band_change"))
         assert len(escalator._throttle_buffer) == 1
         assert "IMMINENT" in escalator._throttle_buffer[0].upper()
+class TestRenderedMessageObservability:
+    """The formatter needs a witness. A delivery receipt proves DELIVERY,
+    never that the delivered TEXT is right -- which is how the UNKNOWN
+    AGENT_NOTE header rendered wrong on every Telegram delivery while 759
+    tests and three clean receipts passed. _deliver logs the header line so
+    the formatter's output exists somewhere on disk.
+
+    The narrowing is the load-bearing half: the body is CALLER CONTENT and
+    must never reach a log file, so the negative assertion below is the
+    point of this class. Reading the header back only proves the header is
+    logged; it proves nothing about what else leaked alongside it.
+    """
+
+    _MARKER = "zq-body-marker-must-not-be-logged-7431"
+
+    def _escalator(self, bus, quiet_config, queue_path):
+        return WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: None,
+        )
+
+    def test_header_is_logged_and_body_is_not(
+        self, bus, quiet_config, queue_path, caplog,
+    ):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        message = (
+            "🚨 URGENT - Acme - 12:00 UTC\n\n"
+            + self._MARKER + "\nmore body"
+        )
+
+        with caplog.at_level(
+            logging.INFO, logger="events.subscribers.whatsapp_escalator",
+        ):
+            assert escalator._deliver(message) is True
+
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert "WhatsAppEscalator sending:" in blob
+        assert "URGENT - Acme - 12:00 UTC" in blob
+        # The negative: no part of the body reached any log record.
+        assert self._MARKER not in blob
+        assert "more body" not in blob
+        # A length, never content -- enough to catch truncation.
+        header = message.splitlines()[0]
+        assert "(+" + str(len(message) - len(header)) + " body chars)" in blob
+
+    def test_empty_message_does_not_raise(
+        self, bus, quiet_config, queue_path, caplog,
+    ):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        with caplog.at_level(
+            logging.INFO, logger="events.subscribers.whatsapp_escalator",
+        ):
+            assert escalator._deliver("") is True
+        assert "WhatsAppEscalator sending:" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )

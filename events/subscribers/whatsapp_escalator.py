@@ -605,6 +605,37 @@ class WhatsAppEscalator(BaseSubscriber):
         bus volume). Spec at
         docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
         """
+        # Formatter observability (2026-08-19), mirroring the Telegram lane
+        # (e3ffba1eaa / e1bd6b1c74). The rendered escalation existed NOWHERE
+        # on disk: audit.jsonl carries the event PAYLOAD, the RepeatGuards
+        # keep only a sha of the normalized text and die with the process,
+        # and no message id is persisted. That is exactly how the UNKNOWN
+        # AGENT_NOTE header rendered wrong on EVERY Telegram delivery while
+        # 759 tests, an 83/83 coverage gate and three clean delivery
+        # receipts all passed -- a receipt proves DELIVERY, never that the
+        # delivered TEXT is right. This method is the single choke point
+        # for all three send paths (handle, throttle flush, queue flush)
+        # and for both the _send_fn (test) and _deliver_result (production)
+        # branches; _telegram_fallback is reached only from here, so it is
+        # covered too.
+        #
+        # HEADER LINE ONLY, deliberately. The header carries everything the
+        # formatter decides -- priority marker, label, icon, type, source,
+        # timestamp -- which is the whole surface this exists to watch. The
+        # body is CALLER CONTENT and may be sensitive, so it must not be
+        # written to a log file. body_chars is a length, never content, and
+        # is enough to catch truncation. Do not widen this back to the full
+        # message.
+        #
+        # Uses splitlines() rather than a newline-literal split: no
+        # backslash escape, so the line cannot be corrupted by a shell
+        # heredoc eating an escape level -- which is exactly how the first
+        # attempt at this edit produced an unterminated string literal.
+        header = message.splitlines()[0] if message else ""
+        logger.info(
+            "WhatsAppEscalator sending: %r (+%d body chars)",
+            header, len(message) - len(header),
+        )
         t0 = time.monotonic()
         ok = False
         exc: Optional[Exception] = None
