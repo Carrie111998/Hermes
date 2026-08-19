@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -17,6 +18,16 @@ from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
+    #: Optional ``threading.Event`` a test can bind so a fake agent can wait
+    #: for the FIRST progress bubble to actually exist instead of sleeping a
+    #: fixed interval.  ``None`` (the default) makes ``_note_send`` a no-op, so
+    #: no other test is affected.
+    first_send_seen = None
+
+    def _note_send(self):
+        if self.first_send_seen is not None:
+            self.first_send_seen.set()
+
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
@@ -30,6 +41,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._note_send()
         self.sent.append(
             {
                 "chat_id": chat_id,
@@ -76,6 +88,7 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         return f"progress-{self._next_id}"
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._note_send()
         if len(content) > self.MAX_MESSAGE_LENGTH:
             self.oversized_sends.append(content)
         self.sent.append(
@@ -188,13 +201,32 @@ class LongPreviewAgent:
 
 
 class DelayedProgressAgent:
+    #: Set by the test's ``adapter.send`` hook once the run generation has
+    #: actually been invalidated.  The agent WAITS on this instead of sleeping
+    #: a fixed interval.
+    #:
+    #: What is under test is an ORDERING property -- progress emitted after an
+    #: invalidation must be dropped -- and a wall-clock sleep turned that into a
+    #: bet that the event loop would run the progress task inside the window.
+    #: The bet was lost under parallel-harness load: the file takes ~36s alone
+    #: and ~68s under 12 workers, and the nightly gate went RED on it 2026-08-19
+    #: while the same test passed solo every time.  Waiting on the real event
+    #: makes the ordering hold at any speed.
+    invalidated = None
+
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         self.tool_progress_callback("tool.started", "terminal", "first command", {})
-        time.sleep(0.45)
+        assert self.invalidated is not None, (
+            "the test must bind DelayedProgressAgent.invalidated to a threading.Event"
+        )
+        # Generous: this BOUNDS a hang, it does not pace the test.  The test
+        # asserts the flag was really set, so broken wiring fails loudly rather
+        # than silently degrading back into the old race.
+        self.invalidated.wait(timeout=30)
         self.tool_progress_callback("tool.started", "terminal", "second command", {})
         time.sleep(0.1)
         return {
@@ -207,6 +239,10 @@ class DelayedProgressAgent:
 class ManyProgressLinesAgent:
     """Emits enough tool-progress lines to exceed a single platform bubble."""
 
+    #: Bound by the test; set by the adapter on its first send.  See the wait
+    #: in ``run_conversation`` for why this is not a sleep.
+    first_bubble = None
+
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
@@ -215,10 +251,19 @@ class ManyProgressLinesAgent:
         cb = self.tool_progress_callback
         assert cb is not None
         cb("tool.started", "terminal", "first-short", {})
-        # Let the progress task create the first editable bubble, then enqueue
-        # the rest quickly.  The cancellation drain must roll them into fresh
-        # editable bubbles instead of trying to edit the first one past limit.
-        time.sleep(0.35)
+        # Wait for the progress task to actually create the first editable
+        # bubble, then enqueue the rest quickly.  The cancellation drain must
+        # roll them into fresh editable bubbles instead of trying to edit the
+        # first one past limit.
+        #
+        # This was a 0.35s sleep, i.e. a bet that the event loop would get to
+        # the progress task inside the window.  Under the 12-worker harness the
+        # file runs ~1.9x slower and the bet is lost: this test flaked in the
+        # 2026-08-19 gate runs (failed attempt 1, passed on retry).
+        assert self.first_bubble is not None, (
+            "the test must bind ManyProgressLinesAgent.first_bubble to a threading.Event"
+        )
+        self.first_bubble.wait(timeout=30)
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
         time.sleep(0.1)
@@ -847,6 +892,12 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     Telegram adapter then split-and-sent a fresh continuation on every update,
     causing a noisy trail of one-line messages instead of a new editable bubble.
     """
+    # One event, both ends: the adapter sets it on its first send, the agent
+    # waits on it before enqueueing the overflow lines.
+    first_bubble = threading.Event()
+    monkeypatch.setattr(ManyProgressLinesAgent, "first_bubble", first_bubble)
+    monkeypatch.setattr(SmallLimitProgressAdapter, "first_send_seen", first_bubble)
+
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -863,6 +914,9 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     )
 
     assert result["final_response"] == "done"
+    # Guard the guard: unset means the agent's wait() timed out and the
+    # rollover assertions below would be back to passing on timing.
+    assert first_bubble.is_set()
     assert isinstance(adapter, SmallLimitProgressAdapter)
     assert len(adapter.sent) >= 2, "expected a fresh progress bubble after the first filled"
     assert adapter.oversized_sends == []
@@ -1330,12 +1384,17 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
     original_send = adapter.send
     invalidated = {"done": False}
+    # Handed to the agent so it emits "second command" strictly AFTER the
+    # invalidation has committed, instead of racing a fixed sleep against it.
+    invalidation_committed = threading.Event()
+    monkeypatch.setattr(DelayedProgressAgent, "invalidated", invalidation_committed)
 
     async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
         result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
         if "first command" in content and not invalidated["done"]:
             invalidated["done"] = True
             runner._invalidate_session_run_generation(session_key, reason="test_stop")
+            invalidation_committed.set()
         return result
 
     adapter.send = send_and_invalidate
@@ -1353,6 +1412,9 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     all_progress_text = " ".join(call["content"] for call in adapter.sent)
     all_progress_text += " ".join(call["content"] for call in adapter.edits)
     assert result["final_response"] == "done"
+    # Guard the guard: if this is unset the agent's wait() timed out and the
+    # "second command" assertion below would be passing on timing again.
+    assert invalidation_committed.is_set()
     assert 'first command' in all_progress_text
     assert 'second command' not in all_progress_text
 
