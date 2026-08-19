@@ -159,13 +159,21 @@ class TestUnreadableConfigFailsClosed:
         with pytest.raises(RuntimeError, match="could not be read or parsed"):
             profile_selects_postgres(name)
 
-    def test_non_mapping_config_raises(self, tmp_path, monkeypatch):
+    def test_non_mapping_config_is_treated_as_no_selection(
+        self, tmp_path, monkeypatch
+    ):
+        """A non-mapping top level reads as "nothing selected" -> SQLite.
+
+        ``read_user_config_raw()`` normalizes a non-mapping YAML root to
+        ``{}``, so by the time the seam sees it there is no selection to
+        honour. The load-bearing case — unparseable YAML, where the operator's
+        intent is unknown — still raises (covered above).
+        """
         from hermes_state_postgres import profile_selects_postgres
 
         name = self._make_profile(tmp_path, monkeypatch, "- just\n- a\n- list\n")
 
-        with pytest.raises(RuntimeError, match="not a mapping"):
-            profile_selects_postgres(name)
+        assert profile_selects_postgres(name) is False
 
     def test_empty_config_is_a_legitimate_sqlite_selection(
         self, tmp_path, monkeypatch

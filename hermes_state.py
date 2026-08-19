@@ -3358,8 +3358,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Optional PostgreSQL state backend. Engaged only when configured
             # (sessions.state_backend = "postgres"); the import is lazy so a
             # default install without the 'postgres' extra never loads it.
-            # Read-only attaches and explicit db_path callers stay on SQLite.
-            if not read_only and db_path is None:
+            #
+            # ``read_only`` is deliberately NOT a gate here. It is a SQLite
+            # *attach mode* (a URI open that takes no write lock), not a
+            # statement about which physical store owns the data. Gating on it
+            # made every read-only caller — the dashboard's status/session
+            # listing, cron history, usage analytics, and resume lookup — open
+            # the local ``state.db`` while the live write path was on Postgres,
+            # which is exactly the dual-truth split this seam exists to prevent.
+            # Postgres reads are served by the same adapter; the caller simply
+            # issues no writes.
+            #
+            # An explicit ``db_path`` still stays on SQLite: that names a
+            # specific file, so honouring it is the caller's whole intent.
+            if db_path is None:
                 # Detect whether the operator has explicitly selected the
                 # Postgres backend via an env var BEFORE attempting the import.
                 # An import-time failure (bad psycopg install, ABI mismatch,

@@ -1536,6 +1536,12 @@ class _PostgresConnection:
     def __init__(self, conn: Any, dsn: Optional[str] = None):
         self._conn = conn
         self._dsn = dsn
+        # True between a successful BEGIN and the commit/rollback that ends it.
+        # While set, transparent reconnect is forbidden: a replacement
+        # connection cannot carry the open transaction or its
+        # transaction-scoped advisory locks, so silently swapping one in lets a
+        # partially applied write be reported as a success.
+        self._in_transaction = False
 
     # ------------------------------------------------------------------
     # Reconnect helpers
@@ -1590,7 +1596,21 @@ class _PostgresConnection:
         operation. If it raises and the exception looks like a dropped
         connection, we reconnect once and retry. Any other exception (or a
         second drop in a row) propagates.
+
+        **Never reconnects while a transaction is open.** ``_reconnect()``
+        builds the replacement with ``autocommit=True``, so a statement issued
+        on it does not belong to the ``BEGIN`` the caller opened: it
+        self-commits, without the transaction-scoped advisory locks the
+        original connection held, and a later ``commit()`` on the replacement
+        succeeds vacuously — letting ``_execute_write`` report success over a
+        partially applied transaction. Once ``BEGIN`` has succeeded, connection
+        loss must fail closed so the caller can abort the whole write.
         """
+        if self._in_transaction:
+            # Surface the drop rather than papering over it. The caller's
+            # transaction is already unrecoverable on this connection.
+            self._ensure_live_in_transaction()
+            return fn()
         self._ensure_live()
         try:
             return fn()
@@ -1601,6 +1621,21 @@ class _PostgresConnection:
             # or the call itself surfaced the drop. Reconnect and retry once.
             self._reconnect()
             return fn()
+
+    def _ensure_live_in_transaction(self) -> None:
+        """Assert the connection is still usable inside an open transaction.
+
+        Mirrors ``_ensure_live`` but refuses to repair: a replacement
+        connection cannot carry the open transaction, so a dead handle here is
+        a terminal condition for the caller's write.
+        """
+        if getattr(self._conn, "closed", False):
+            raise RuntimeError(
+                "PostgreSQL connection was lost inside an open transaction; "
+                "NOT reconnecting, because a fresh connection cannot carry the "
+                "in-flight BEGIN or its transaction-scoped advisory locks. "
+                "Failing closed so the write is not reported as successful."
+            )
 
     # ------------------------------------------------------------------
     # sqlite3.Connection-shaped surface
@@ -1613,7 +1648,17 @@ class _PostgresConnection:
         )
 
     def execute(self, sql: str, params: Any = ()) -> _PostgresCursor:
-        return self.cursor().execute(sql, params)
+        cur = self.cursor().execute(sql, params)
+        # Track transaction lifetime so _call_with_retry can refuse to swap the
+        # connection out from under an open BEGIN. _translate_sql rewrites
+        # SQLite's "BEGIN IMMEDIATE" to "BEGIN", so match on the translated
+        # form's leading keyword rather than the caller's dialect.
+        head = sql.strip().upper()
+        if head.startswith("BEGIN") or head.startswith("START TRANSACTION"):
+            self._in_transaction = True
+        elif head.startswith("COMMIT") or head.startswith("ROLLBACK"):
+            self._in_transaction = False
+        return cur
 
     def executemany(self, sql: str, seq_of_params) -> _PostgresCursor:
         return self.cursor().executemany(sql, seq_of_params)
@@ -1639,6 +1684,11 @@ class _PostgresConnection:
                     "reporting synthetic success over an unknown write"
                 ) from exc
             raise
+        finally:
+            # The transaction is over either way: on success it committed, on
+            # failure the caller must abort. Clearing here re-enables
+            # transparent reconnect for the next independent operation.
+            self._in_transaction = False
 
     def rollback(self):
         # Rollback on a dead connection is a no-op (the server already rolled
@@ -1650,10 +1700,13 @@ class _PostgresConnection:
             if _is_connection_broken_error(exc):
                 return None
             raise
+        finally:
+            self._in_transaction = False
 
     def close(self):
         # Close is best-effort and never reconnects — the caller is shutting
         # down. Swallow OperationalError on an already-dead handle.
+        self._in_transaction = False
         try:
             return self._conn.close()
         except Exception:
@@ -1740,6 +1793,17 @@ def resolve_postgres_dsn(config: Optional[Dict[str, Any]] = None) -> Optional[st
         env_backend = "postgres"
 
     if config is None:
+        # The backend selector is load-bearing: if this file is the only place
+        # Postgres is selected, silently reading defaults out of a malformed
+        # file routes the process to SQLite and splits history.
+        #
+        # ``load_config()`` deliberately degrades a broken config.yaml to
+        # DEFAULT_CONFIG (or last-known-good) rather than raising — correct for
+        # its own callers, wrong here, because the degraded value is
+        # indistinguishable from a genuine "sqlite" selection. So validate the
+        # file with a strict raw parse FIRST, then use the normal loader for
+        # the merged values.
+        _assert_active_config_parseable()
         try:
             from hermes_cli.config import load_config
 
@@ -1781,6 +1845,100 @@ def resolve_postgres_dsn(config: Optional[Dict[str, Any]] = None) -> Optional[st
     return dsn
 
 
+def _dsn_from_profile_env(profile_dir: Any) -> str:
+    """Read a Postgres DSN out of a specific profile's own ``.env`` file.
+
+    Parses the file directly rather than loading it into ``os.environ``: the
+    caller wants the TARGET profile's credential, and mutating process-global
+    state would let a concurrent ``SessionDB()`` on another thread observe it
+    and open the wrong physical store.
+
+    Only the two documented DSN keys are read, in the same precedence
+    ``resolve_postgres_dsn`` uses. Returns "" when the file is absent or holds
+    neither key. A malformed line is skipped rather than raising: unlike the
+    backend *selector*, an unparseable line here cannot silently redirect the
+    store — a missing DSN raises at the call site.
+    """
+    from pathlib import Path
+
+    env_path = Path(profile_dir) / ".env"
+    if not env_path.is_file():
+        return ""
+
+    found: Dict[str, str] = {}
+    try:
+        with open(env_path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key not in _ENV_DSN_KEYS:
+                    continue
+                value = value.strip()
+                # Strip one layer of matching quotes, the common .env shape.
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                if value:
+                    found[key] = value
+    except OSError:
+        return ""
+
+    for key in _ENV_DSN_KEYS:
+        if found.get(key):
+            return found[key]
+    return ""
+
+
+def _assert_active_config_parseable() -> None:
+    """Raise if the ACTIVE profile's config.yaml exists but cannot be parsed.
+
+    ``hermes_cli.config.load_config()`` deliberately degrades a malformed
+    config.yaml to DEFAULT_CONFIG (or the last-known-good value) instead of
+    raising, so that a mid-edit file cannot wipe out security-critical
+    overrides in a long-running process. That is right for its own callers and
+    wrong for backend selection: the degraded config reports
+    ``state_backend: sqlite``, which is indistinguishable from an operator who
+    genuinely chose SQLite. If the file was the only place Postgres was
+    selected, the process silently opens the wrong physical store.
+
+    An ABSENT or EMPTY file legitimately means "no selection" -> SQLite.
+    An EXISTING file that cannot be read or parsed cannot safely mean anything,
+    so fail closed and let the operator fix it.
+    """
+    try:
+        from hermes_cli.config import read_user_config_raw
+        from hermes_constants import get_hermes_home
+    except Exception:
+        return  # config layer unavailable; nothing to validate
+
+    config_path = get_hermes_home() / "config.yaml"
+    if not config_path.is_file():
+        return  # absent is a legitimate "no selection"
+
+    # read_user_config_raw() is the sanctioned raw reader: it returns the file
+    # exactly as written (no DEFAULT_CONFIG merge) and RAISES on unparseable
+    # YAML, which is the distinction load_config() deliberately erases. This is
+    # a raw-file diagnostic — an explicitly legal call site for it.
+    try:
+        loaded = read_user_config_raw(config_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"config.yaml at {config_path} exists but could not be read or "
+            f"parsed ({exc}); refusing to resolve the session state backend "
+            f"from degraded defaults, because this file may be the only source "
+            f"selecting PostgreSQL. Fix or remove the file."
+        ) from exc
+
+    if loaded is not None and not isinstance(loaded, dict):
+        raise RuntimeError(
+            f"config.yaml at {config_path} has a {type(loaded).__name__} at its "
+            f"top level, not a mapping; refusing to resolve the session state "
+            f"backend from an unusable config."
+        )
+
+
 def maybe_open_postgres(
     read_only: bool,
     schema_version: int,
@@ -1789,10 +1947,16 @@ def maybe_open_postgres(
 ) -> Optional[_PostgresConnection]:
     """Open the PostgreSQL backend if it is configured, else return None.
 
-    Returns None (so the caller proceeds with SQLite) when:
-      * the configured backend is not "postgres", or
-      * ``read_only`` is requested — the read-only cross-profile attach path is
-        SQLite-specific and intentionally not served by this backend.
+    Returns None (so the caller proceeds with SQLite) when the configured
+    backend is not "postgres".
+
+    ``read_only`` is accepted for signature compatibility with the SQLite path
+    but is deliberately NOT a gate. It describes a SQLite *attach mode* (a URI
+    open that takes no write lock), not which physical store owns the data.
+    Refusing Postgres for read-only callers sent every dashboard/helper reader
+    to the local ``state.db`` while the live write path was on Postgres — the
+    dual-truth split this backend exists to prevent. A read-only caller simply
+    issues no writes; the adapter serves its SELECTs from the same store.
 
     ``dsn_override`` pins the target explicitly, bypassing env/config
     resolution entirely. The backend-aware profile seam uses it so opening
@@ -1802,12 +1966,12 @@ def maybe_open_postgres(
     Otherwise opens the adapter connection, initializes the schema, and returns
     the live connection. Raises if the DSN is missing or psycopg is absent.
     """
-    if read_only:
-        return None
     dsn = dsn_override or resolve_postgres_dsn(config)
     if not dsn:
         return None
     conn = connect_postgres(dsn)
+    # Schema init is idempotent (every statement is IF NOT EXISTS-guarded) and
+    # a read-only caller may legitimately be the first to touch a fresh store.
     init_postgres_schema(conn, schema_version)
     return conn
 
@@ -1869,10 +2033,9 @@ def open_store_for_profile(
     config_path = profile_dir / "config.yaml"
     if config_path.is_file():
         try:
-            import yaml as _yaml  # PyYAML — always present in the runtime env
+            from hermes_cli.config import read_user_config_raw
 
-            with open(config_path, encoding="utf-8") as _f:
-                loaded = _yaml.safe_load(_f)
+            loaded = read_user_config_raw(config_path)
         except Exception as _cfg_exc:
             raise RuntimeError(
                 f"profile {canon!r} has a config.yaml at {config_path} that "
@@ -1895,14 +2058,27 @@ def open_store_for_profile(
         backend = "postgres"
 
     if backend == "postgres":
-        # Resolve DSN from the target profile's config only.  Env vars are
-        # intentionally skipped here — they name the ACTIVE process's DB, not
-        # the target profile's.
-        dsn = (sessions_cfg.get("postgres_dsn") or "").strip()
+        # Resolve the DSN from the TARGET profile's own sources, in the same
+        # precedence the active process uses: its .env first, then its
+        # config.yaml. The active process's environment is still deliberately
+        # ignored — those vars name the ACTIVE profile's database, not this one.
+        #
+        # Reading the target's .env matters because the public configuration
+        # contract calls the YAML DSN a local-development convenience and
+        # directs real deployments to put the credential-bearing DSN in
+        # HERMES_STATE_DATABASE_URL / HERMES_STATE_POSTGRES_DSN. Profiles carry
+        # their own .env, so a profile configured in exactly the recommended
+        # shape — backend in config.yaml, DSN only in .env — would otherwise be
+        # unreadable by any cross-profile reader.
+        dsn = _dsn_from_profile_env(profile_dir)
+        if not dsn:
+            dsn = (sessions_cfg.get("postgres_dsn") or "").strip()
         if not dsn:
             raise RuntimeError(
                 f"profile '{canon}' has sessions.state_backend = 'postgres' "
-                f"but sessions.postgres_dsn is not set in its config.yaml; "
+                f"but no DSN was found in its .env "
+                f"(HERMES_STATE_DATABASE_URL / HERMES_STATE_POSTGRES_DSN) "
+                f"or in sessions.postgres_dsn in its config.yaml; "
                 f"cannot open the store for that profile"
             )
         # Build the SessionDB through its real ``__init__`` rather than
@@ -1968,10 +2144,9 @@ def profile_selects_postgres(profile_name: str) -> bool:
     # "not Postgres": it may be the only source selecting Postgres, and a False
     # here routes the caller to SQLite, splitting history. Fail closed.
     try:
-        import yaml as _yaml
+        from hermes_cli.config import read_user_config_raw
 
-        with open(config_path, encoding="utf-8") as _f:
-            loaded = _yaml.safe_load(_f)
+        loaded = read_user_config_raw(config_path)
     except Exception as _cfg_exc:
         raise RuntimeError(
             f"profile {canon!r} has a config.yaml at {config_path} that could "
