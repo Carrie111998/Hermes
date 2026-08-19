@@ -41,6 +41,7 @@ import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
 import { translateNow } from '@/i18n'
 import { NEW_SESSION_TITLE, sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
+import { shouldUseDraftTabTitle } from '@/lib/draft-title'
 import { Download, FileText, LayoutDashboard, PanelBottom, Terminal, Upload, Zap } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { TRANSCRIPT_DIRECTIVE_AREA, type TranscriptDirectiveContribution } from '@/lib/transcript-directives'
@@ -60,7 +61,14 @@ import {
 } from '@/store/layout'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
 import { $reviewOpen, closeReview, openReview, REVIEW_PANE_ID } from '@/store/review'
-import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
+import {
+  $currentCwd,
+  $messagesEmpty,
+  $selectedStoredSessionId,
+  $sessions,
+  $yoloActive,
+  sessionMatchesStoredId
+} from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { watchUnreadWriteGuard } from '@/store/session-unread-remote'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
@@ -73,6 +81,7 @@ import { startSessionDrag } from '../chat/session-drag'
 import {
   SessionTileCloseConfirm,
   stackSessionTilesIntoMain,
+  tileStoredRow,
   watchSessionTiles,
   WorkspaceTabMenu
 } from '../chat/session-tile'
@@ -458,14 +467,23 @@ watchUnreadWriteGuard()
 // above, so the pane content never remounts.
 const syncWorkspaceTitle = () => {
   const selected = $selectedStoredSessionId.get()
-  const stored = selected ? $sessions.get().find(s => sessionMatchesStoredId(s, selected)) : null
+  // Same resolver as tiles: recents first, then the project tree. A selected
+  // chat older than the recents page (or a compression tip matched by lineage)
+  // is not a draft — looking only at `$sessions` made typing rename the tab.
+  const stored = selected ? (tileStoredRow(selected) ?? null) : null
+  const hasMessages = Boolean(selected) && !$messagesEmpty.get()
+  const useDraft = shouldUseDraftTabTitle({
+    hasMessages,
+    listedRow: stored,
+    storedSessionId: selected
+  })
 
   registry.register({
     id: 'workspace',
     area: 'panes',
     // The placeholder, not the draft's live name — `tabTitle` below renders
     // that. Keeping it here would re-register the pane on every keystroke.
-    title: stored ? storedSessionTitle(stored) : NEW_SESSION_TITLE,
+    title: stored ? storedSessionTitle(stored) : hasMessages ? 'Untitled session' : NEW_SESSION_TITLE,
     data: {
       // The tab's status dot — the SAME primitive the sidebar row and session
       // tiles render, so the main tab never disagrees with its sidebar row. A
@@ -474,8 +492,9 @@ const syncWorkspaceTitle = () => {
       tabLead: () => <SessionStatusDot session={stored} storedSessionId={selected} />,
       // A draft's name lives in its composer, not in any session row, so the
       // label subscribes to it directly — typing renames the tab without
-      // re-registering the pane.
-      tabTitle: stored ? undefined : () => <SessionDraftTitle scope={selected} />,
+      // re-registering the pane. Persisted chats (listed, titled, or already
+      // holding a transcript) must never take this path.
+      tabTitle: useDraft ? () => <SessionDraftTitle scope={selected} /> : undefined,
       // Pages aren't tab-able: the main zone's bar stands down while one shows.
       headerVeto: $workspaceIsPage.get(),
       placement: 'main',
@@ -490,6 +509,7 @@ const syncWorkspaceTitle = () => {
 
 $selectedStoredSessionId.listen(syncWorkspaceTitle)
 $sessions.listen(syncWorkspaceTitle)
+$messagesEmpty.listen(syncWorkspaceTitle)
 $workspaceIsPage.listen(syncWorkspaceTitle)
 
 // Layout reset collapses every session tile into main as a tab (after the
