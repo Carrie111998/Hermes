@@ -41,7 +41,7 @@ from acp_adapter.server import (
     HermesACPAgent,
     HERMES_VERSION,
 )
-from acp_adapter.session import SessionManager
+from acp_adapter.session import ACP_TOOL_PROFILE_DECISION_ONLY, SessionManager
 from hermes_state import SessionDB
 
 
@@ -69,6 +69,24 @@ async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(ag
         ("accept_edits", "Accept Edits"),
         ("dont_ask", "Don't Ask"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_new_session_applies_decision_only_profile_from_hermes_meta(agent):
+    resp = await agent.new_session(
+        cwd="/tmp",
+        hermes={"toolProfile": ACP_TOOL_PROFILE_DECISION_ONLY},
+    )
+    state = agent.session_manager.get_session(resp.session_id)
+
+    assert state is not None
+    assert state.tool_profile == ACP_TOOL_PROFILE_DECISION_ONLY
+
+
+@pytest.mark.asyncio
+async def test_new_session_rejects_unknown_hermes_tool_profile(agent):
+    with pytest.raises(ValueError, match="unsupported Hermes ACP tool profile"):
+        await agent.new_session(cwd="/tmp", hermes={"toolProfile": "full-access"})
 
 
 @pytest.mark.asyncio
@@ -709,6 +727,35 @@ class TestRegisterSessionMcpServers:
         }
         # _invalidate_system_prompt should have been called
         state.agent._invalidate_system_prompt.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_decision_only_session_adds_only_explicit_mcp_toolset(
+        self, agent, mock_manager
+    ):
+        from acp.schema import McpServerStdio
+
+        state = mock_manager.create_session(
+            cwd="/tmp", tool_profile=ACP_TOOL_PROFILE_DECISION_ONLY
+        )
+        state.agent.enabled_toolsets = []
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+        server = McpServerStdio(
+            name="buzz-dev-mcp", command="buzz-dev-mcp", args=[], env=[]
+        )
+
+        with patch("tools.mcp_tool.register_mcp_servers", return_value=["read_file"]), \
+             patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+            await agent._register_session_mcp_servers(state, [server])
+
+        mock_defs.assert_called_once_with(
+            enabled_toolsets=["mcp-buzz-dev-mcp"],
+            disabled_toolsets=None,
+            quiet_mode=True,
+        )
+        assert state.agent.enabled_toolsets == ["mcp-buzz-dev-mcp"]
+        assert "hermes-acp" not in state.agent.enabled_toolsets
 
     @pytest.mark.asyncio
     async def test_register_failure_logs_warning(self, agent, mock_manager):
