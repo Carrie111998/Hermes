@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -183,5 +184,32 @@ async def test_multiplex_claimed_turn_completion_stays_in_routed_scope(
 
     assert result == {"final_response": "", "messages": []}
     assert observed == ["agent", "post-turn", "cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_multiplex_scope_entry_failure_releases_claimed_turn(
+    tmp_path, monkeypatch
+):
+    from gateway import run as run_mod
+
+    runner, _adapter = _make_runner()
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = (
+        lambda _source: tmp_path / "profiles" / "fitness"
+    )
+    event = _make_event("hello")
+    event.source.profile = "fitness"
+
+    @contextmanager
+    def _failing_scope(_profile_home):
+        raise RuntimeError("scope setup failed")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(run_mod, "_profile_runtime_scope", _failing_scope)
+
+    with pytest.raises(RuntimeError, match="scope setup failed"):
+        await runner._handle_message(event)
+
+    assert runner._running_agents == {}
 
 
