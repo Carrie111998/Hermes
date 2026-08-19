@@ -4672,9 +4672,27 @@ class SessionBridgeCoordinator:
                 current_fingerprints[native_id] = fingerprint
                 parsed = await self._provider_call(_call, adapter, "parse", path)
                 projection = _projection_from_parse(parsed)
+                committed_fingerprint = committed_fingerprints.get(native_id)
+                # Rebuild only when the transcript was REWRITTEN, not merely
+                # appended to. This was `native_id in committed_fingerprints`
+                # -- a membership test, true for every session ever scanned,
+                # and redundant besides: staging above only promotes ids whose
+                # fingerprint already CHANGED, so every id reaching this loop
+                # tripped it. upsert_projection's rebuild branch DELETEs every
+                # message for the session and re-INSERTs the whole projection,
+                # so each cycle rewrote entire transcripts. Live bridge on
+                # 2026-08-18: 101.2M lifetime inserts against 1.02M live rows,
+                # 6,563 inserts/min for a net +20, feeding the FTS merge.
+                # A shrunken file is the rewrite signal that still matters:
+                # the non-rebuild path only ADDS rows missing from
+                # external_message_map, so records dropped by a compaction or
+                # rewind would otherwise linger forever.
                 should_rebuild = bool(
                     getattr(parsed, "rebuild", False)
-                    or native_id in committed_fingerprints
+                    or (
+                        committed_fingerprint is not None
+                        and fingerprint["size"] < committed_fingerprint.get("size", 0)
+                    )
                 )
                 result = await asyncio.to_thread(
                     _upsert,

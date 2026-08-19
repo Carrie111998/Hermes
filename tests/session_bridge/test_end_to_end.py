@@ -1006,6 +1006,28 @@ def _projection(
     )
 
 
+def _append_claude_record(
+    path: Path,
+    *,
+    native_id: str,
+    uuid: str,
+    content: str,
+    cwd: str | None = "C:/synthetic/claude",
+) -> None:
+    """Append one user record, leaving every existing byte untouched."""
+    record = {
+        "type": "user",
+        "sessionId": native_id,
+        "uuid": uuid,
+        "timestamp": "2026-07-13T10:00:02Z",
+        "cwd": cwd,
+        "isSidechain": False,
+        "message": {"role": "user", "content": content},
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+
 def _write_claude_transcript(
     path: Path,
     *,
@@ -1223,6 +1245,138 @@ async def test_restart_mid_import_resumes_without_duplicate_catalog_rows(
         assert sum(row["message_count"] for row in rows) == 4
     finally:
         restarted_db.close()
+
+
+@pytest.mark.asyncio
+async def test_appending_to_a_known_transcript_does_not_rewrite_its_messages(
+    tmp_path: Path,
+) -> None:
+    """An append-only transcript update must insert only its NEW rows.
+
+    ``_scan_claude_persistent`` forced ``should_rebuild`` whenever it already
+    held a committed fingerprint for a native_id -- a MEMBERSHIP test, true
+    for every session ever scanned. It is also redundant: staging only
+    promotes ids whose fingerprint CHANGED, so everything reaching the scan
+    loop trips it. ``upsert_projection``'s rebuild branch DELETEs every
+    message for the session and re-INSERTs the whole projection, so every
+    cycle rewrote whole transcripts end to end.
+
+    Measured on the live bridge 2026-08-18: 101.2M lifetime inserts against
+    1.02M live rows, 6,563 inserts/min for a net +20 rows, 88.6% of them
+    re-inserting content over an hour old -- one 4-day-old session had 1,243
+    rows rewritten in 45s. That write volume is what kept the FTS merge busy.
+    """
+    claude_root = tmp_path / "synthetic-claude-projects"
+    transcript = claude_root / "project" / "grow.jsonl"
+    _write_claude_transcript(transcript, native_id="grow", content="grow needle one")
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        coordinator = SessionBridgeCoordinator(
+            config=BridgeConfig(),
+            store=SessionBridgeStore(db, clock=lambda: 1_000.0),
+            adapters={
+                Provider.CLAUDE: ClaudeSourceAdapter(
+                    claude_root,
+                    marker_secret=_MARKER_SECRET,
+                )
+            },
+            scan_batch_size=8,
+        )
+        await coordinator.scan_once(Provider.CLAUDE)
+        before = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT id FROM messages WHERE session_id = 'claude:grow'"
+            )
+        }
+        assert len(before) == 2, "fixture must land rows to compare against"
+
+        _append_claude_record(
+            transcript,
+            native_id="grow",
+            uuid="event-grow-appended",
+            content="grow needle two",
+        )
+
+        summary = await coordinator.scan_once(Provider.CLAUDE)
+
+        after = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT id FROM messages WHERE session_id = 'claude:grow'"
+            )
+        }
+        assert summary.rebuilt == 0, "a pure append must not be serviced as a rebuild"
+        assert before <= after, (
+            f"{len(before - after)} of {len(before)} pre-existing message rows were "
+            "deleted and re-inserted for an append-only change"
+        )
+        assert len(after) == 3, "the one appended record must be indexed"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rewritten_transcript_still_rebuilds_and_drops_stale_rows(
+    tmp_path: Path,
+) -> None:
+    """A transcript that SHRANK was rewritten, so its rows must be rebuilt.
+
+    This is the case the blanket rebuild was protecting: without it, records
+    removed by a compaction/rewind would linger forever, because the
+    non-rebuild path only ever ADDS rows missing from external_message_map.
+    """
+    claude_root = tmp_path / "synthetic-claude-projects"
+    transcript = claude_root / "project" / "shrink.jsonl"
+    _write_claude_transcript(
+        transcript, native_id="shrink", content="shrink needle one"
+    )
+    _append_claude_record(
+        transcript,
+        native_id="shrink",
+        uuid="event-shrink-doomed",
+        content="doomed record",
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        coordinator = SessionBridgeCoordinator(
+            config=BridgeConfig(),
+            store=SessionBridgeStore(db, clock=lambda: 1_000.0),
+            adapters={
+                Provider.CLAUDE: ClaudeSourceAdapter(
+                    claude_root,
+                    marker_secret=_MARKER_SECRET,
+                )
+            },
+            scan_batch_size=8,
+        )
+        await coordinator.scan_once(Provider.CLAUDE)
+        assert (
+            db._conn.execute(
+                "SELECT count(*) FROM messages WHERE session_id = 'claude:shrink'"
+            ).fetchone()[0]
+            == 3
+        )
+
+        # Rewrite it shorter -- the doomed record is gone from the source.
+        _write_claude_transcript(
+            transcript, native_id="shrink", content="shrink needle one"
+        )
+
+        summary = await coordinator.scan_once(Provider.CLAUDE)
+
+        assert summary.rebuilt == 1, "a shrunken transcript must rebuild"
+        contents = [
+            row[0]
+            for row in db._conn.execute(
+                "SELECT content FROM messages WHERE session_id = 'claude:shrink'"
+            )
+        ]
+        assert not any("doomed" in (c or "") for c in contents), (
+            "the removed record must not survive the rebuild"
+        )
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
