@@ -9,6 +9,7 @@ rather than re-testing only the leaf routing-identity module.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -24,6 +25,7 @@ from gateway.routing_identity import (
     attach_identity_to_source,
     current_routing_identity,
     identity_from_source,
+    routing_identity_entrypoint,
     routing_identity_scope,
 )
 from gateway.run import GatewayRunner
@@ -136,7 +138,14 @@ def test_secondary_credential_owner_is_stamped_before_adapter_batch_keying():
     adapter._multiplex_profile_name = "career-ops"
     source = adapter.build_source(chat_id="chat", chat_type="dm", user_id="user")
 
+    # Main now resolves credential ownership at session-keying time
+    # (BasePlatformAdapter.set_owner_profile/_session_key_profile, #89860)
+    # instead of stamping it into build_source's SessionSource.  The
+    # routing-identity entrypoint resolves the owner and attaches the
+    # identity explicitly; replicate that attach here so the ownership
+    # contract under test (owner -> session-key namespace) still holds.
     identity = identity_from_source(source, credential_owner="career-ops")
+    attach_identity_to_source(source, identity)
     assert source.profile == "career-ops"
     assert identity == RoutingIdentity("career-ops", "career-ops", "career-ops")
     assert build_session_key(source).startswith("agent:career-ops:")
@@ -211,7 +220,17 @@ def test_turn_context_captures_identity_for_callbacks_and_worker_threads():
 
 
 @pytest.mark.asyncio
-async def test_adapter_handle_message_scopes_identity_before_session_keying():
+async def test_runner_entrypoint_scopes_identity_before_session_keying():
+    """The surviving runner ingress (routing_identity_entrypoint) resolves
+    and scopes the canonical identity before session-keying work.
+
+    The adapter-local decorator that previously stamped identity inside
+    ``BasePlatformAdapter.handle_message`` is superseded on main (#89860
+    resolves adapter ownership at keying time via set_owner_profile/
+    _session_key_profile).  The routing-identity half that remains scopes
+    the shared gateway ingress instead — exercised here through the real
+    decorated wrapper with the same minimal runner fixture.
+    """
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner.config.multiplex_profile_allowlist = ["finance"]
@@ -224,25 +243,23 @@ async def test_adapter_handle_message_scopes_identity_before_session_keying():
 
     adapter = _adapter(Platform.TELEGRAM, runner)
     runner.adapters = {Platform.TELEGRAM: adapter}
-    adapter.config = GatewayConfig(multiplex_profiles=True)
-    adapter.config.extra = {}
-    adapter._message_handler = object()
-    adapter._topic_recovery_fn = None
-    adapter._session_store = None
-    adapter._active_sessions = {}
 
     captured = {}
 
-    def start_processing(event, session_key):
+    @routing_identity_entrypoint
+    async def ingress(runner, event):
         captured["identity"] = current_routing_identity()
         captured["profile"] = event.source.profile
-        captured["session_key"] = session_key
+        captured["session_key"] = build_session_key(event.source)
         return True
 
-    adapter._start_session_processing = start_processing
     source = SessionSource(
         platform=Platform.TELEGRAM, chat_id="route-chat", chat_type="dm"
     )
+    # build_source retains the receiving adapter as in-process provenance so
+    # the owner resolution can find the live credential (mirrors real
+    # adapter-intake sources; see _registered_transport_adapter).
+    source._transport_adapter_ref = weakref.ref(adapter)
     event = MessageEvent(text="hello", source=source)
 
     @contextmanager
@@ -259,8 +276,9 @@ async def test_adapter_handle_message_scopes_identity_before_session_keying():
         ),
         patch("gateway.run._profile_runtime_scope", fake_profile_scope),
     ):
-        await adapter.handle_message(event)
+        result = await ingress(runner, event)
 
+    assert result is True
     assert captured == {
         "identity": RoutingIdentity("default", "finance", "finance"),
         "profile": "finance",
