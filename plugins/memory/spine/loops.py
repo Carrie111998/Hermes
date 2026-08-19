@@ -134,7 +134,7 @@ def run_observer(messages: List[Dict[str, Any]], config: SpineConfig) -> None:
 # Loop 2: Consolidation (nightly cron)
 # ═══════════════════════════════════════════════════════════════════════
 
-def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
+def run_consolidation(config: SpineConfig, profile: str = "") -> Dict[str, Any]:
     """Run all five consolidation passes and return a report.
 
     Called by nightly cron. Passes:
@@ -144,6 +144,13 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
     4. Promote — auto-promote extracted+high-confidence or type=correction
     5. Demote — push stale hot-core entries back to spine
     """
+    # Every pass below is scoped to ONE profile. Before this, decay, merge,
+    # promote, demote and contradiction-detection all ran globally, so importing
+    # a second profile (agent:claude-code) would have decayed its curated
+    # entries, auto-promoted them into Hermes's own MEMORY.md hot core, and
+    # contradiction-scanned them against agent:main.
+    profile = profile or CONSOLIDATION_PROFILE
+
     from .index import MemoryIndex
     from .jsonl_writer import JSONLWriter
     import os
@@ -162,7 +169,9 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
     decayed = 0
     archived = 0
     rows = idx.conn.execute(
-        "SELECT id, confidence, last_confirmed, last_retrieved FROM observations WHERE status='active'"
+        "SELECT id, confidence, last_confirmed, last_retrieved FROM observations"
+        " WHERE status='active' AND profile = ?",
+        (profile,),
     ).fetchall()
     for row in rows:
         obs_id, conf, last_confirmed, last_retrieved = row
@@ -196,7 +205,9 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
 
     # ── Pass 2: Merge near-duplicates ────────────────────────────────
     active_rows = idx.conn.execute(
-        "SELECT id, profile, type, content, confirmations FROM observations WHERE status='active' ORDER BY profile, type"
+        "SELECT id, profile, type, content, confirmations FROM observations"
+        " WHERE status='active' AND profile = ? ORDER BY type",
+        (profile,),
     ).fetchall()
 
     merged = 0
@@ -221,7 +232,7 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
     # ── Pass 2.5: Semantic merge (cosine >0.88 clustering — spec §5.2.1) ────
     if embedder_available():
         try:
-            semantic_merged = _semantic_merge(idx, config)
+            semantic_merged = _semantic_merge(idx, config, profile)
             merged += semantic_merged
             report["passes"]["semantic_merge"] = f"semantically merged {semantic_merged} near-duplicates (cosine >0.88)"
         except Exception as e:
@@ -230,7 +241,7 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
         report["passes"]["semantic_merge"] = "skipped — embedder unavailable"
 
     # ── Pass 2.6: Contradict detection — flag, never resolve (spec §5.2.2) ────
-    contradictions = _detect_contradictions(idx)
+    contradictions = _detect_contradictions(idx, profile)
     report["passes"]["contradict"] = (
         f"detected {len(contradictions)} potential contradictions"
         if contradictions else "no contradictions detected"
@@ -246,9 +257,10 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
     auto_candidates = idx.conn.execute(
         """SELECT id, content, type, epistemic, confidence
            FROM observations WHERE status='active'
+           AND profile = ?
            AND confidence >= ?
            ORDER BY confidence DESC""",
-        (config.promote_auto_min_confidence,),
+        (profile, config.promote_auto_min_confidence),
     ).fetchall()
 
     for row in auto_candidates:
@@ -262,10 +274,11 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
     correction_candidates = idx.conn.execute(
         """SELECT id, content, type, epistemic, confidence
            FROM observations WHERE status='active'
+           AND profile = ?
            AND type = 'correction'
            AND confidence < ?
            AND id NOT IN (SELECT id FROM observations WHERE status='promoted')""",
-        (config.promote_auto_min_confidence,),
+        (profile, config.promote_auto_min_confidence),
     ).fetchall()
 
     for row in correction_candidates:
@@ -302,7 +315,9 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
         # eligible for promotion again on the very next run.
         stale = idx.conn.execute(
             """SELECT id, content, type FROM observations WHERE status='promoted'
-               ORDER BY last_confirmed ASC"""
+               AND profile = ?
+               ORDER BY last_confirmed ASC""",
+            (profile,),
         ).fetchall()
 
         blocks = _read_hotcore_blocks(mem_path)
@@ -355,6 +370,8 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
 
     return report
 
+
+CONSOLIDATION_PROFILE = "agent:main"
 
 HOTCORE_PATH = "~/.hermes/memories/MEMORY.md"
 
@@ -505,7 +522,7 @@ def build_activation_manifest(config: SpineConfig) -> Dict[str, Any]:
     return manifest
 
 
-def _semantic_merge(idx: MemoryIndex, config: SpineConfig) -> int:
+def _semantic_merge(idx: MemoryIndex, config: SpineConfig, profile: str) -> int:
     """Semantic near-duplicate merge via cosine clustering + LLM.
 
     Clusters active observations by profile, merging paraphrases
@@ -521,7 +538,9 @@ def _semantic_merge(idx: MemoryIndex, config: SpineConfig) -> int:
     rows = idx.conn.execute(
         """SELECT id, profile, type, content, confidence, confirmations,
                   epistemic, evidence, embedding
-           FROM observations WHERE status='active' AND embedding IS NOT NULL"""
+           FROM observations WHERE status='active' AND embedding IS NOT NULL
+             AND profile = ?""",
+        (profile,),
     ).fetchall()
 
     if len(rows) < 2:
@@ -659,7 +678,7 @@ def _shared_context(a_topics: str, b_topics: str, a_lower: str, b_lower: str) ->
     return bool(tok_a & tok_b)
 
 
-def _detect_contradictions(idx: MemoryIndex) -> List[Dict[str, Any]]:
+def _detect_contradictions(idx: MemoryIndex, profile: str) -> List[Dict[str, Any]]:
     """Detect potential contradictions between active observations (spec §5.2.2).
 
     Lightweight keyword-based detection — flags opposition pairs (e.g., "prefers"
@@ -690,7 +709,8 @@ def _detect_contradictions(idx: MemoryIndex) -> List[Dict[str, Any]]:
 
     rows = idx.conn.execute(
         """SELECT id, type, content, confidence, last_confirmed, topics FROM observations
-           WHERE status='active' ORDER BY type"""
+           WHERE status='active' AND profile = ? ORDER BY type""",
+        (profile,),
     ).fetchall()
 
     if len(rows) < 2:

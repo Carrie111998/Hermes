@@ -413,11 +413,31 @@ class MemoryIndex:
 
     # ── Read operations ────────────────────────────────────────────────
 
+    @staticmethod
+    def _profile_scope(profile: str) -> List[str]:
+        """Profiles a search spans. '*' means every profile in the store.
+
+        'shared' is the magic label wiki chunks are surfaced under, so it is
+        always included: it is the corpus both agents draw on.
+        """
+        if profile in ("*", "all"):
+            return ["*"]
+        return [profile, "shared"]
+
+    def _profile_sql(self, profile: str, column: str = "profile") -> Tuple[str, List[str]]:
+        """SQL fragment + params restricting a query to the profile scope."""
+        scope = self._profile_scope(profile)
+        if scope == ["*"]:
+            return "", []
+        return f" AND {column} IN ({','.join('?' * len(scope))})", scope
+
     def search_fts(self, query: str, profile: str = "agent:main", limit: int = 20) -> List[Dict[str, Any]]:
         """FTS5 full-text search over observations AND wiki chunks."""
         fts_query = _fts5_safe_query(query)
         if not fts_query:
             return []
+
+        profile_sql, profile_params = self._profile_sql(profile, "o.profile")
 
         # Observations
         obs_rows = self.conn.execute(
@@ -425,10 +445,10 @@ class MemoryIndex:
                JOIN observations_fts fts ON o.rowid = fts.rowid
                WHERE observations_fts MATCH ?
                  AND o.status IN ({_STATUS_PLACEHOLDERS})
-                 AND o.profile IN (?, 'shared')
+                 {profile_sql}
                ORDER BY rank
                LIMIT ?""",
-            (fts_query, *SEARCHABLE_STATUSES, profile, limit),
+            (fts_query, *SEARCHABLE_STATUSES, *profile_params, limit),
         ).fetchall()
 
         # Wiki chunks
@@ -548,6 +568,7 @@ class MemoryIndex:
     def _vector_search(self, embedding: List[float], profile: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Brute-force cosine similarity over observations AND wiki chunks."""
         results: List[Tuple[float, Dict[str, Any]]] = []
+        profile_sql, profile_params = self._profile_sql(profile)
 
         # Observations
         obs_rows = self.conn.execute(
@@ -556,9 +577,9 @@ class MemoryIndex:
                       last_retrieved, embedding
                FROM observations
                WHERE status IN ({_STATUS_PLACEHOLDERS})
-                 AND profile IN (?, 'shared')
+                 {profile_sql}
                  AND embedding IS NOT NULL""",
-            (*SEARCHABLE_STATUSES, profile),
+            (*SEARCHABLE_STATUSES, *profile_params),
         ).fetchall()
 
         if obs_rows:

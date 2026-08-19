@@ -292,7 +292,10 @@ def handle_remember(args: Dict[str, Any], config: SpineConfig) -> str:
 def handle_recall(args: Dict[str, Any], config: SpineConfig) -> str:
     """recall() — hybrid retrieval with auto-degradation (§4.2)."""
     query = args["query"]
-    profile = args.get("profile", "agent:main")
+    # Read paths span EVERY profile by default: the whole point of importing
+    # agent:claude-code was that one recall should reach both stores. Writes
+    # and consolidation stay pinned to a single profile.
+    profile = args.get("profile", "*")
     k = min(args.get("k", 6), 25)
 
     idx = _get_index(config)
@@ -351,7 +354,10 @@ def handle_reflect(args: Dict[str, Any], config: SpineConfig) -> str:
     synthesis citing specific observation IDs.
     """
     query = args["question"]
-    profile = args.get("profile", "agent:main")
+    # Read paths span EVERY profile by default: the whole point of importing
+    # agent:claude-code was that one recall should reach both stores. Writes
+    # and consolidation stay pinned to a single profile.
+    profile = args.get("profile", "*")
 
     idx = _get_index(config)
 
