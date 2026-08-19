@@ -11,6 +11,43 @@ import pytest
 from tools.approval import detect_dangerous_command, detect_hardline_command
 
 
+def _sort_is_gnu_coreutils() -> bool:
+    """Detect whether the `sort` binary actually on PATH is GNU coreutils.
+
+    Some distros (e.g. newer Ubuntu) ship `uutils-coreutils` (a Rust
+    rewrite) as `/usr/bin/sort` instead of GNU coreutils. uutils rejects
+    the `--compress-program -payload-marker` flag shape outright rather
+    than reparsing the leading-dash operand as a positional program name,
+    so the GNU-sort flag-smuggling exploit this test proves does not
+    reproduce there — a real environment difference, not a bug in either
+    tool. Detect the actual binary's own reported identity instead of
+    hardcoding an OS/host check, so this behaves correctly on any machine
+    running either variant.
+    """
+    sort_path = shutil.which("sort")
+    if sort_path is None:
+        return False
+    try:
+        result = subprocess.run(
+            [sort_path, "--version"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "GNU coreutils" in result.stdout
+
+
+_requires_gnu_sort = pytest.mark.skipif(
+    not _sort_is_gnu_coreutils(),
+    reason=(
+        "sort on PATH is not GNU coreutils (e.g. uutils-coreutils, a Rust "
+        "rewrite); it rejects `--compress-program -payload-marker` outright "
+        "instead of reparsing the leading-dash operand as a positional "
+        "program name, so this GNU-sort flag-smuggling exploit path does "
+        "not reproduce on this binary"
+    ),
+)
+
+
 @pytest.mark.parametrize(
     ("argv", "stdin", "expected_returncode", "expected_output"),
     [
@@ -37,7 +74,13 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     [
         ("rg", ["--pre", "-payload-marker", "needle", "{input}"], None, False),
         ("rg", ["--hostname-bin=-payload-marker", "needle", "{input}"], None, False),
-        ("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False),
+        pytest.param(
+            "sort",
+            ["--buffer-size=1K", "--compress-program", "-payload-marker"],
+            "{bulk}",
+            False,
+            marks=_requires_gnu_sort,
+        ),
         ("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True),
         ("man", ["--pager", "-payload-marker", "ls"], None, True),
         ("man", ["-P", "-payload-marker", "ls"], None, True),
