@@ -15,6 +15,11 @@ const config: Config = {
 
   onBrokenLinks: 'warn',
 
+  // The local search page answers queries only via JS; it has no indexable
+  // content and only wastes crawl budget and dilutes SERP quality signals.
+  // The sitemap plugin honors noIndex automatically.
+  noIndex: ['/search'],
+
   markdown: {
     mermaid: true,
     hooks: {
