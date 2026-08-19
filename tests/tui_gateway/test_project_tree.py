@@ -668,36 +668,26 @@ def test_colliding_repo_basenames_disambiguate_labels():
     assert labels == ["x/proj", "y/proj"]
 
 
-def test_non_git_folder_uses_branch_lane_id():
-    """#53329: _place_by_heuristic must use _branch_lane_id for non-git folders.
+def test_non_git_folder_keeps_path_lane_identity():
+    """A plain directory is not a branch target.
 
-    Before the fix, non-git folders got a lane key equal to the raw path,
-    while the desktop overlay expected ::branch::main. This caused duplicate
-    lanes (one from backend, one from overlay).
+    Its stable raw-path lane id lets the Desktop distinguish it from a Git
+    ``::branch::main`` lane and avoid attempting a meaningless branch switch
+    before creating a chat.
     """
     result = pt._place_by_heuristic("/home/user/my-project")
     assert result is not None
-    assert result["lane_key"] == pt._branch_lane_id(
-        "/home/user/my-project", pt.DEFAULT_BRANCH_LABEL
-    ), (
-        f"Expected lane_key to use _branch_lane_id scheme but got "
-        f"{result['lane_key']!r}"
-    )
-    # The label should still be the folder basename
+    assert result["lane_key"] == "/home/user/my-project"
     assert result["lane_label"] == "my-project"
-    # Must be marked as main lane
     assert result["is_main"] is True
+    assert result["git_kind"] == "directory"
 
 
-def test_non_git_folder_lane_matches_overlay_scheme():
-    """#53329: verify the lane key format matches what the overlay expects."""
+def test_non_git_folder_never_claims_a_branch_lane_id():
     result = pt._place_by_heuristic("/data/work/folder-x")
     assert result is not None
-    # Overlay expects: <path>::branch::main
-    expected = "/data/work/folder-x::branch::main"
-    assert result["lane_key"] == expected, (
-        f"Expected lane_key={expected!r} but got {result['lane_key']!r}"
-    )
+    assert result["lane_key"] == "/data/work/folder-x"
+    assert result["lane_key"] != "/data/work/folder-x::branch::main"
 
 
 def test_heuristic_lane_ids_for_kanban_and_wt_suffix_are_unchanged():
