@@ -145,6 +145,7 @@ export interface ConfigMtimeResponse {
 }
 
 export interface ConfigGetValueResponse {
+  command_scope?: string
   display?: string
   home?: string
   value?: string

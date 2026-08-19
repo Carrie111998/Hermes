@@ -404,6 +404,32 @@ class TestParseReasoningEffort:
         assert documented.issubset(set(VALID_REASONING_EFFORTS))
 
 
+class TestReasoningCommandScope:
+    def test_parser_returns_value_and_explicit_scope(self):
+        from hermes_constants import parse_reasoning_command_args
+
+        assert parse_reasoning_command_args("high") == ("high", None)
+        assert parse_reasoning_command_args("—session xhigh") == ("xhigh", "session")
+        assert parse_reasoning_command_args("low --session --global") == ("low", "global")
+
+    def test_config_default_and_explicit_flags_resolve_in_order(self):
+        from hermes_constants import resolve_reasoning_command_scope
+
+        cfg = {"agent": {"reasoning_command_scope": "global"}}
+        assert resolve_reasoning_command_scope(cfg) == "global"
+        assert resolve_reasoning_command_scope(cfg, "session") == "session"
+        assert resolve_reasoning_command_scope({}, "global") == "global"
+
+    def test_invalid_config_fails_back_to_session(self):
+        from hermes_constants import resolve_reasoning_command_scope
+
+        assert resolve_reasoning_command_scope(None) == "session"
+        assert resolve_reasoning_command_scope({"agent": "bad"}) == "session"
+        assert resolve_reasoning_command_scope(
+            {"agent": {"reasoning_command_scope": "forever"}}
+        ) == "session"
+
+
 class TestResolvePerModelReasoningEffort:
     """Tests for resolve_per_model_reasoning_effort() — spelling-tolerant
     per-model override lookup from agent.reasoning_overrides dict.
@@ -514,6 +540,11 @@ class TestReasoningOverridesDefaultConfig:
         from hermes_cli.config import DEFAULT_CONFIG
         assert "reasoning_overrides" in DEFAULT_CONFIG["agent"]
         assert DEFAULT_CONFIG["agent"]["reasoning_overrides"] == {}
+
+    def test_default_reasoning_command_scope_is_session(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["agent"]["reasoning_command_scope"] == "session"
 
 
     def test_spelling_tolerant_lookup_works_with_user_config(self):

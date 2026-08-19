@@ -67,8 +67,57 @@ class TestReasoningCommand:
 
 
     def test_parse_reasoning_command_args_accepts_ascii_and_smart_global_flags(self):
-        assert gateway_run.GatewayRunner._parse_reasoning_command_args("high --global") == ("high", True)
-        assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global xhigh") == ("xhigh", True)
+        assert gateway_run.GatewayRunner._parse_reasoning_command_args("high --global") == ("high", "global")
+        assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global xhigh") == ("xhigh", "global")
+
+    @pytest.mark.asyncio
+    async def test_configured_global_default_persists_plain_effort(self, monkeypatch):
+        runner = _make_runner()
+        runner._save_gateway_config_key = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_runtime_config",
+            lambda: {"agent": {"reasoning_command_scope": "global"}},
+        )
+
+        await runner._handle_reasoning_command(_make_event("/reasoning high"))
+
+        runner._save_gateway_config_key.assert_called_once_with(
+            "agent.reasoning_effort", "high"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_session_overrides_configured_global_default(self, monkeypatch):
+        runner = _make_runner()
+        runner._save_gateway_config_key = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_runtime_config",
+            lambda: {"agent": {"reasoning_command_scope": "global"}},
+        )
+        event = _make_event("/reasoning high --session")
+        session_key = runner._session_key_for_source(event.source)
+
+        await runner._handle_reasoning_command(event)
+
+        runner._save_gateway_config_key.assert_not_called()
+        assert runner._session_reasoning_overrides[session_key] == {
+            "enabled": True,
+            "effort": "high",
+        }
+
+    @pytest.mark.asyncio
+    async def test_status_reports_configured_command_default(self, monkeypatch):
+        runner = _make_runner()
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_runtime_config",
+            lambda: {"agent": {"reasoning_command_scope": "global"}},
+        )
+
+        result = await runner._handle_reasoning_command(_make_event("/reasoning"))
+
+        assert "**Scope:** global config" in result
 
     @pytest.mark.asyncio
     async def test_reasoning_command_reloads_current_state_from_config(self, tmp_path, monkeypatch):

@@ -333,14 +333,22 @@ describe('createSlashHandler', () => {
     })
   })
 
-  it('reads /reasoning status for the active session', () => {
+  it('reads /reasoning status and reports the command default scope', async () => {
     patchUiState({ sid: 'sid-abc' })
-    const ctx = buildCtx()
+    const rpc = vi.fn(() =>
+      Promise.resolve({ command_scope: 'global', display: 'show', value: 'high' })
+    )
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
 
     expect(createSlashHandler(ctx)('/reasoning')).toBe(true)
-    expect(ctx.gateway.rpc).toHaveBeenCalledWith('config.get', {
+    expect(rpc).toHaveBeenCalledWith('config.get', {
       key: 'reasoning',
       session_id: 'sid-abc'
+    })
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(
+        'reasoning: high · display show · command default global'
+      )
     })
   })
 

@@ -3446,6 +3446,7 @@ class CLICommandsMixin:
             /reasoning clamp        Collapse long thinking to the first 10 lines
         """
         from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, _parse_reasoning_config, save_config_value
+        from hermes_constants import parse_reasoning_command_args, resolve_reasoning_command_scope
         parts = cmd.strip().split(maxsplit=1)
 
         if len(parts) < 2:
@@ -3459,22 +3460,14 @@ class CLICommandsMixin:
                 level = rc.get("effort", "medium")
             display_state = "on ✓" if self.show_reasoning else "off"
             full_state = "full" if getattr(self, "reasoning_full", False) else "clamped to 10 lines"
+            command_scope = resolve_reasoning_command_scope(CLI_CONFIG)
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state} ({full_state}){_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|ultra|show|hide|full|clamp> [--global]{_RST}")
+            _cprint(f"  {_ACCENT}Command default:   {command_scope}{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|ultra|show|hide|full|clamp> [--session|--global]{_RST}")
             return
 
-        arg = parts[1].strip().lower()
-        arg_tokens = arg.split()
-        # Session scope is the default; --global opts into persisting to
-        # config.yaml. --session is accepted as an explicit no-op for parity
-        # with /model and the gateway /reasoning handler.
-        explicit_global = "--global" in arg_tokens
-        if explicit_global or "--session" in arg_tokens:
-            arg = " ".join(
-                token for token in arg_tokens
-                if token not in ("--global", "--session")
-            )
+        arg, explicit_scope = parse_reasoning_command_args(parts[1])
 
         # Display toggle
         if arg in {"show", "on"}:
@@ -3520,14 +3513,15 @@ class CLICommandsMixin:
         self.reasoning_config = parsed
         self.agent = None  # Force agent re-init with new reasoning config
 
-        if explicit_global and save_config_value("agent.reasoning_effort", arg):
+        persist_global = resolve_reasoning_command_scope(CLI_CONFIG, explicit_scope) == "global"
+        if persist_global and save_config_value("agent.reasoning_effort", arg):
             agent_cfg = CLI_CONFIG.get("agent")
             if not isinstance(agent_cfg, dict):
                 agent_cfg = {}
                 CLI_CONFIG["agent"] = agent_cfg
             agent_cfg["reasoning_effort"] = arg
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (saved to config){_RST}")
-        elif explicit_global:
+        elif persist_global:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only; config save failed){_RST}")
         else:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (this session — use --global to persist){_RST}")

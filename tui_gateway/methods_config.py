@@ -219,6 +219,8 @@ def _(rid, params: dict) -> dict:
         )
     if key == "reasoning":
         cfg = _load_cfg()
+        from hermes_constants import resolve_reasoning_command_scope
+
         session = _sessions.get(params.get("session_id", ""))
         reasoning_config = None
         if session is not None:
@@ -248,7 +250,14 @@ def _(rid, params: dict) -> dict:
             if bool((cfg.get("display") or {}).get("show_reasoning", True))
             else "hide"
         )
-        return _ok(rid, {"value": effort, "display": display})
+        return _ok(
+            rid,
+            {
+                "value": effort,
+                "display": display,
+                "command_scope": resolve_reasoning_command_scope(cfg),
+            },
+        )
     if key == "fast":
         # Prefer the session's live/pinned value — `config.set fast` is
         # session-scoped, so the global key may not reflect this chat. A

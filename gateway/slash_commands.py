@@ -3564,7 +3564,7 @@ class GatewaySlashCommandsMixin:
         session_key: str,
         platform_key: str,
         value: str,
-        persist_global: bool = False,
+        persist_global: Optional[bool] = None,
     ) -> str:
         """Apply a /reasoning argument (typed or picked) and return the reply.
 
@@ -3591,7 +3591,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.reasoning.display_set_off", platform=platform_key)
 
         if value == "reset":
-            if persist_global:
+            if persist_global is True:
                 return t("gateway.reasoning.reset_global_unsupported")
             self._set_session_reasoning_override(session_key, None)
             self._reasoning_config = self._load_reasoning_config()
@@ -3603,6 +3603,13 @@ class GatewaySlashCommandsMixin:
             return t("gateway.reasoning.unknown_arg", arg=value)
 
         self._reasoning_config = parsed
+        if persist_global is None:
+            from gateway.run import _load_gateway_runtime_config
+            from hermes_constants import resolve_reasoning_command_scope
+
+            persist_global = (
+                resolve_reasoning_command_scope(_load_gateway_runtime_config()) == "global"
+            )
         if persist_global:
             if self._save_gateway_config_key("agent.reasoning_effort", value):
                 self._set_session_reasoning_override(session_key, None)
@@ -3696,7 +3703,7 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _platform_config_key
 
         raw_args = event.get_command_args().strip()
-        args, persist_global = self._parse_reasoning_command_args(raw_args)
+        args, explicit_scope = self._parse_reasoning_command_args(raw_args)
         # Normalize the source (Telegram DM topic recovery) before deriving
         # the override key so storage matches the key the next message turn
         # reads — same fix as /model (#30479).
@@ -3731,10 +3738,15 @@ class GatewaySlashCommandsMixin:
                 if self._show_reasoning
                 else t("gateway.reasoning.display_off")
             )
-            has_session_override = session_key in (getattr(self, "_session_reasoning_overrides", {}) or {})
+            from gateway.run import _load_gateway_runtime_config
+            from hermes_constants import resolve_reasoning_command_scope
+
+            command_scope = resolve_reasoning_command_scope(
+                _load_gateway_runtime_config()
+            )
             scope = (
                 t("gateway.reasoning.scope_session")
-                if has_session_override
+                if command_scope == "session"
                 else t("gateway.reasoning.scope_global")
             )
 
@@ -3771,6 +3783,11 @@ class GatewaySlashCommandsMixin:
 
         # Typed argument path — same applier the picker uses.
         platform_key = _platform_config_key(event.source.platform)
+        persist_global = (
+            True if explicit_scope == "global"
+            else False if explicit_scope == "session"
+            else None
+        )
         return self._apply_reasoning_selection(
             session_key, platform_key, args, persist_global=persist_global
         )
@@ -3889,7 +3906,8 @@ class GatewaySlashCommandsMixin:
         raw_args = event.get_command_args().strip().lower()
         # Reuse the /reasoning arg parser: strips --global (any position),
         # normalizes unicode dashes.
-        args, persist_global = self._parse_reasoning_command_args(raw_args)
+        args, explicit_scope = self._parse_reasoning_command_args(raw_args)
+        persist_global = explicit_scope == "global"
         session_key = self._session_key_for_source(event.source)
         self._service_tier = self._resolve_session_service_tier(
             session_key=session_key
