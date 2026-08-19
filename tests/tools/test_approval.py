@@ -108,7 +108,23 @@ class TestDetectDangerousRm:
                     None,
                 )
 
-    def test_symlinked_temp_dir_only_exempts_canonical_target(self, tmp_path):
+    def test_symlinked_temp_dir_only_exempts_canonical_target(self, tmp_path, monkeypatch):
+        # This test relies on the leading-`/` `(delete in root path)` pattern
+        # matching an absolute tmp_path. But tools.approval folds any absolute
+        # path under the current user's $HOME into `~/...` before pattern
+        # matching (_rewrite_resolved_user_home), and on some machines
+        # tmp_path resolves to somewhere under $HOME (e.g. a TMPDIR override
+        # pointed at a directory under the home dir) which would silently
+        # fold these paths and break the assertions below. Pin HOME/
+        # expanduser to a fixed location outside tmp_path for the duration of
+        # this test so home-folding is a no-op regardless of where tmp_path
+        # physically resolves on this run.
+        fake_home = "/nonexistent-hermes-test-home"
+        monkeypatch.setenv("HOME", fake_home)
+        monkeypatch.setattr(
+            os.path, "expanduser", lambda p: fake_home if p == "~" else p
+        )
+
         real_temp = tmp_path / "real-temp"
         real_temp.mkdir()
         linked_temp = tmp_path / "linked-temp"
