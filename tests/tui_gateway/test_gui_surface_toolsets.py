@@ -23,7 +23,10 @@ GUI_TOOLS = {
     "open_preview",
     "read_preview",
     "read_terminal",
+    "read_window_below",
     "react_to_message",
+    "setup_mcp",
+    "tour",
 }
 
 
