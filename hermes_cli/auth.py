@@ -1345,11 +1345,6 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         except FileNotFoundError:
             owner_stat = os.stat(auth_file.parent)
         owner = (owner_stat.st_uid, owner_stat.st_gid)
-        # The replacement inode is already created as this process. Avoid an
-        # unnecessary fchown (which some network filesystems reject) when the
-        # intended owner is exactly the current process identity.
-        if owner == (os.getuid(), os.getgid()):
-            owner = None
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
@@ -1366,7 +1361,13 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
-            if owner is not None:
+            # Compare the temp inode itself, not process uid/gid: the latter
+            # are unavailable on Windows and need not describe a filesystem's
+            # ownership mapping.  Avoid a needless fchown on filesystems that
+            # reject it when the replacement inode already has the owner we
+            # must preserve.
+            temp_stat = os.fstat(handle.fileno())
+            if owner is not None and (temp_stat.st_uid, temp_stat.st_gid) != owner:
                 os.fchown(handle.fileno(), *owner)
             handle.flush()
             os.fsync(handle.fileno())
