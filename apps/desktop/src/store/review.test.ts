@@ -14,6 +14,8 @@ import {
   $reviewOpen,
   $reviewRevertTarget,
   $reviewScopeCwd,
+  $reviewScopeSurfaceId,
+  $reviewScopeTarget,
   $reviewSelectedPath,
   $reviewShipBusy,
   $reviewShipInfo,
@@ -30,9 +32,11 @@ import {
   refreshReview,
   refreshShipInfo,
   requestRevert,
+  revealReview,
   revertReviewFile,
   selectReviewFile,
   stageReviewFile,
+  toggleReview,
   toggleReviewTreeMode,
   unstageReviewFile
 } from './review'
@@ -96,6 +100,8 @@ beforeEach(() => {
   $reviewCommitMsgBusy.set(false)
   $reviewRevertTarget.set(undefined)
   $reviewScopeCwd.set(null)
+  $reviewScopeSurfaceId.set(null)
+  $reviewScopeTarget.set('main')
   $currentCwd.set('/repo')
 })
 
@@ -263,6 +269,48 @@ describe('view state', () => {
     expect(review.list).toHaveBeenCalledWith('/tile-worktree', 'uncommitted', null)
   })
 
+  it('openReview remembers the tile composer that owns the scoped worktree', () => {
+    stubReview()
+
+    openReview('/tile-worktree', 'tile:project-b', 'surface-project-b')
+
+    expect($reviewScopeCwd.get()).toBe('/tile-worktree')
+    expect($reviewScopeTarget.get()).toBe('tile:project-b')
+    expect($reviewScopeSurfaceId.get()).toBe('surface-project-b')
+  })
+
+  it('revealReview re-homes the exact origin when the repo stays the same', () => {
+    stubReview()
+    openReview('/tile-worktree', 'tile:project-a', 'surface-project-a')
+
+    revealReview('/tile-worktree', 'tile:project-b', 'surface-project-b')
+
+    expect($reviewScopeTarget.get()).toBe('tile:project-b')
+    expect($reviewScopeSurfaceId.get()).toBe('surface-project-b')
+  })
+
+  it('narrow toggle re-homes the origin before showing the overlay', () => {
+    const originalMatchMedia = window.matchMedia
+
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({ matches: true }))
+    })
+
+    try {
+      stubReview()
+      openReview('/project-a', 'tile:project-a', 'surface-project-a')
+
+      toggleReview('/project-b', 'tile:project-b', 'surface-project-b')
+
+      expect($reviewScopeCwd.get()).toBe('/project-b')
+      expect($reviewScopeTarget.get()).toBe('tile:project-b')
+      expect($reviewScopeSurfaceId.get()).toBe('surface-project-b')
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
+    }
+  })
+
   it('closeReview closes the pane, clears selection, and drops scope', () => {
     stubReview()
     $reviewOpen.set(true)
@@ -274,6 +322,8 @@ describe('view state', () => {
 
     expect($reviewOpen.get()).toBe(false)
     expect($reviewScopeCwd.get()).toBeNull()
+    expect($reviewScopeSurfaceId.get()).toBeNull()
+    expect($reviewScopeTarget.get()).toBe('main')
     expect($reviewSelectedPath.get()).toBeNull()
     expect($reviewDiff.get()).toBeNull()
   })

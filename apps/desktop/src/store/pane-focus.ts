@@ -1,3 +1,4 @@
+import { getVisibleComposerSurfaceId } from '@/app/chat/composer/focus'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
 import { isLayoutNode, type LayoutNode } from '@/components/pane-shell/tree/model'
 import { applyLayoutPreset, LAYOUTS_AREA } from '@/components/pane-shell/tree/presets'
@@ -14,7 +15,7 @@ import { openReview } from './review'
 const PANE_REVEALERS: Record<string, () => void> = {
   chat: () => revealTreePane('workspace'),
   files: () => setFileBrowserOpen(true),
-  review: () => openReview(),
+  review: () => openReview(null, 'main', getVisibleComposerSurfaceId('main')),
   sessions: () => setSidebarOpen(true),
   terminal: () => setTerminalTakeover(true)
 }
