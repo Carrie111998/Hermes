@@ -767,6 +767,18 @@ class DelegationRepository:
             ).rowcount
             if changed != 1:
                 return {"status": "stale"}
+            conn.execute(
+                "UPDATE async_delegations SET completed_at=?,event_json=?,result_json=?,"
+                "state=?,updated_at=? WHERE delegation_id=?",
+                (
+                    completed_at,
+                    _dump(event),
+                    _dump(result),
+                    _attempt_state(event.get("status")),
+                    completed_at,
+                    run[0],
+                ),
+            )
             attempts = conn.execute(
                 "SELECT a.attempt_id,a.metadata_json,l.root_ordinal\n                   FROM delegation_attempts a JOIN delegation_logical_subagents l\n                     ON l.logical_id=a.logical_id WHERE a.run_id=?\n                   ORDER BY l.root_ordinal IS NULL,l.root_ordinal,a.attempt_number",
                 (run_id,),

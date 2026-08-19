@@ -38,11 +38,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -100,6 +102,83 @@ def _notify_state_change() -> None:
 
 def _db_path():
     return get_hermes_home() / "state.db"
+
+
+def _connect() -> sqlite3.Connection:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10)
+    try:
+        _initialize_schema(conn)
+    except Exception:
+        # A PRAGMA/DDL failure after a successful connect() must not leak the
+        # just-opened connection back to the caller.
+        conn.close()
+        raise
+    return conn
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_state import apply_wal_with_fallback
+
+    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT NOT NULL,
+            origin_ui_session_id TEXT NOT NULL DEFAULT '',
+            parent_session_id TEXT,
+            state TEXT NOT NULL,
+            dispatched_at REAL NOT NULL,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            event_json TEXT,
+            result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            task_json TEXT,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL,
+            origin_session_id TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
+    for name, sql_type in (
+        ("owner_pid", "INTEGER"),
+        ("owner_started_at", "INTEGER"),
+        ("task_json", "TEXT"),
+        ("delivery_claim", "TEXT"),
+        ("delivery_claimed_at", "REAL"),
+        # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
+        # request — the wake self-post target. Without persisting it,
+        # completions recovered after a process restart are unroutable on
+        # api_server (the in-memory record that carried it is gone).
+        ("origin_session_id", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+
+
+@contextmanager
+def _transaction() -> Iterator[sqlite3.Connection]:
+    """Open a connection, commit/rollback on exit, and ALWAYS close it.
+
+    ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the
+    transaction; they do not close the connection. Using ``with _connect()``
+    alone therefore leaks a connection — and its WAL/SHM file descriptors — on
+    every durable dispatch, completion, and delivery-claim, deferring the close
+    to the garbage collector. On a long-running gateway that exhausts
+    ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was #69567 / PR #69594).
+    """
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _repository() -> DelegationRepository:
