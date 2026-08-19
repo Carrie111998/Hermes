@@ -356,6 +356,33 @@ class _DropTransport:
     """Detached WS sink: keep sessions resumable without writing stale frames."""
 
     def write(self, obj: dict) -> bool:
+        # Diagnostic (#89111): a high-stakes interactive prompt (approval /
+        # clarify / sudo / secret) dropped here means the user never saw it —
+        # the agent will block until its approval timeout. Log the drop with
+        # enough correlation to find the session and the event.
+        try:
+            if isinstance(obj, dict) and obj.get("method") == "event":
+                params = obj.get("params") or {}
+                etype = params.get("type") or ""
+                if etype in {
+                    "approval.request",
+                    "clarify.request",
+                    "sudo.request",
+                    "secret.request",
+                    "mcp.setup.request",
+                }:
+                    sid = params.get("session_id") or ""
+                    payload = params.get("payload") or {}
+                    rid = payload.get("request_id") if isinstance(payload, dict) else None
+                    logger.warning(
+                        "DROP_TRANSPORT interactive prompt %s dropped (session=%s request_id=%s) — "
+                        "client transport detached; agent will block until approval timeout",
+                        etype,
+                        sid,
+                        rid,
+                    )
+        except Exception:
+            pass
         return False
 
     def close(self) -> None:
@@ -1987,6 +2014,23 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
     seam so all approval transports redact consistently."""
     payload = _approval_request_payload(data)
+    # Diagnostic (#89111): record which transport the approval event is routed
+    # to so a dropped/detached delivery is visible in the logs. The session's
+    # stored transport is what write_json() will use (see write_json).
+    try:
+        sess = _sessions.get(sid) or {}
+        t = sess.get("transport")
+        tname = type(t).__name__ if t is not None else "none"
+        rid = payload.get("request_id") if isinstance(payload, dict) else None
+        logger.info(
+            "APPROVAL_EMIT session=%s request_id=%s transport=%s payload_keys=%s",
+            sid,
+            rid,
+            tname,
+            sorted(payload.keys()) if isinstance(payload, dict) else [],
+        )
+    except Exception:
+        pass
     _emit("approval.request", sid, payload)
 
 
