@@ -20,6 +20,7 @@ import {
   $activeGatewayProfile,
   $gatewaySwapTarget,
   $newChatProfile,
+  $profiles,
   ensureGatewayAgent,
   ensureGatewayProfile,
   normalizeProfileKey
@@ -1717,7 +1718,19 @@ export function useSessionActions({
 
       const listed = findListedSession(storedSessionId)
       const removed = listed?.session
-      const profile = removed?.profile?.trim() || (await resolveSessionProfile(storedSessionId))
+      const stampedProfile = removed?.profile?.trim()
+      const profile = stampedProfile || (await resolveSessionProfile(storedSessionId))
+      // Listed profile-less row + multiple profiles + unresolved owner:
+      // never fall through to the primary backend (fake already_absent).
+      if (
+        listed &&
+        !stampedProfile &&
+        !profile?.trim() &&
+        $profiles.get().filter(item => item.name.trim()).length > 1
+      ) {
+        notifyError(new Error('Session ownership could not be resolved'), copy.deleteFailed)
+        return
+      }
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
@@ -1825,7 +1838,17 @@ export function useSessionActions({
 
       const listed = findListedSession(storedSessionId)
       const archived = listed?.session
-      const profile = archived?.profile?.trim() || (await resolveSessionProfile(storedSessionId))
+      const stampedProfile = archived?.profile?.trim()
+      const profile = stampedProfile || (await resolveSessionProfile(storedSessionId))
+      if (
+        listed &&
+        !stampedProfile &&
+        !profile?.trim() &&
+        $profiles.get().filter(item => item.name.trim()).length > 1
+      ) {
+        notifyError(new Error('Session ownership could not be resolved'), copy.archiveFailed)
+        return
+      }
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
