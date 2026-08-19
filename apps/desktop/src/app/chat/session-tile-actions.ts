@@ -49,7 +49,8 @@ import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
 import {
   markSessionRecentlyInterrupted,
   shouldInterruptBeforeRewind,
-  type SubmitTextOptions
+  type SubmitTextOptions,
+  withSessionNotFoundResume
 } from '../session/hooks/use-prompt-actions/utils'
 import { upsertOptimisticSession } from '../session/hooks/use-session-actions/utils'
 
@@ -301,7 +302,17 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     clearClarifyRequest(undefined, sessionId)
 
     try {
-      await requestGateway('session.interrupt', { session_id: sessionId })
+      await withSessionNotFoundResume(
+        sessionId,
+        storedIdRef.current,
+        liveId => requestGateway('session.interrupt', { session_id: liveId }),
+        {
+          requestGateway,
+          onRecovered: recoveredId => {
+            runtimeIdRef.current = recoveredId
+          }
+        }
+      )
     } catch (err) {
       notifyError(err, copy.stopFailed)
     }
@@ -352,10 +363,17 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         })
 
       try {
-        const result = await requestGateway<{ status?: string }>('session.redirect', {
-          session_id: sessionId,
-          text
-        })
+        const { result } = await withSessionNotFoundResume(
+          sessionId,
+          storedIdRef.current,
+          liveId => requestGateway<{ status?: string }>('session.redirect', { session_id: liveId, text }),
+          {
+            requestGateway,
+            onRecovered: recoveredId => {
+              runtimeIdRef.current = recoveredId
+            }
+          }
+        )
 
         if (result?.status === 'redirected') {
           triggerHaptic('submit')
@@ -446,11 +464,21 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       update(current => applyReloadOptimistic(current, plan))
 
       try {
+        // Recovery for a dead runtime id rides inside submitRewind →
+        // runRewindSubmit (withSessionNotFoundResume + runtime rebind), so the
+        // PR-era inline prompt.submit wrapper is superseded on current main.
         applySurvivorRowIds(
-          await submitRewind(plan.text, plan.truncateOrdinal, false, plan.truncateMessageId, plan.truncateRowId, plan.sourceText)
+          await submitRewind(
+            plan.text,
+            plan.truncateOrdinal,
+            false,
+            plan.truncateMessageId,
+            plan.truncateRowId,
+            plan.sourceText
+          )
         )
       } catch (err) {
-        update(current => ({ ...current, busy: false, awaitingResponse: false }))
+        update(current => ({ ...current, busy: false, awaitingResponse: false, turnLive: false, turnStartedAt: null }))
         notifyError(err, copy.regenerateFailed)
       }
     },
@@ -486,7 +514,14 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
           )
         )
       } catch (err) {
-        update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
+        update(state => ({
+          ...state,
+          busy: false,
+          awaitingResponse: false,
+          turnLive: false,
+          turnStartedAt: null,
+          messages
+        }))
         throw err
       }
     },
@@ -527,7 +562,14 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
           )
         )
       } catch (err) {
-        update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
+        update(state => ({
+          ...state,
+          busy: false,
+          awaitingResponse: false,
+          turnLive: false,
+          turnStartedAt: null,
+          messages
+        }))
         notifyError(err, copy.editFailed)
       }
     },
