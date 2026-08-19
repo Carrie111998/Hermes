@@ -8,44 +8,80 @@ import type {
 
 import { hermesApi, STARTUP_REQUEST_TIMEOUT_MS } from './client'
 
-export function getProfiles(): Promise<ProfilesResponse> {
+
+/** Explicit connection override for the profile-admin endpoints.
+ *
+ *  Every other helper is AMBIENT: `hermesApi` spreads `connectionScoped()`, so a
+ *  request follows whichever gateway is live. That is right for these too — the
+ *  Profiles panel of a window pointed at one machine should describe that
+ *  machine.
+ *
+ *  Manage Profiles is the exception: it lists EVERY registered gateway at once,
+ *  so each row has to address the box it came from rather than the one that
+ *  happens to be live. Passing the id overrides the ambient scope for that one
+ *  call; passing nothing keeps the byte-identical ambient request every other
+ *  caller makes. */
+function profileAdminScope(connectionId?: null | string): { connectionId?: string } {
+  const id = (connectionId ?? '').trim()
+
+  return id ? { connectionId: id } : {}
+}
+
+export function getProfiles(connectionId?: null | string): Promise<ProfilesResponse> {
   return hermesApi<ProfilesResponse>({
+    ...profileAdminScope(connectionId),
     path: '/api/profiles',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
-export function createProfile(body: ProfileCreatePayload): Promise<{ name: string; ok: boolean; path: string }> {
+export function createProfile(
+  body: ProfileCreatePayload,
+  connectionId?: null | string
+): Promise<{ name: string; ok: boolean; path: string }> {
   return hermesApi<{ name: string; ok: boolean; path: string }>({
+    ...profileAdminScope(connectionId),
     path: '/api/profiles',
     method: 'POST',
     body
   })
 }
 
-export function renameProfile(name: string, newName: string): Promise<{ name: string; ok: boolean; path: string }> {
+export function renameProfile(
+  name: string,
+  newName: string,
+  connectionId?: null | string
+): Promise<{ name: string; ok: boolean; path: string }> {
   return hermesApi<{ name: string; ok: boolean; path: string }>({
+    ...profileAdminScope(connectionId),
     path: `/api/profiles/${encodeURIComponent(name)}`,
     method: 'PATCH',
     body: { new_name: newName }
   })
 }
 
-export function deleteProfile(name: string): Promise<{ ok: boolean; path: string }> {
+export function deleteProfile(name: string, connectionId?: null | string): Promise<{ ok: boolean; path: string }> {
   return hermesApi<{ ok: boolean; path: string }>({
+    ...profileAdminScope(connectionId),
     path: `/api/profiles/${encodeURIComponent(name)}`,
     method: 'DELETE'
   })
 }
 
-export function getProfileSoul(name: string): Promise<ProfileSoul> {
+export function getProfileSoul(name: string, connectionId?: null | string): Promise<ProfileSoul> {
   return hermesApi<ProfileSoul>({
+    ...profileAdminScope(connectionId),
     path: `/api/profiles/${encodeURIComponent(name)}/soul`
   })
 }
 
-export function updateProfileSoul(name: string, content: string): Promise<{ ok: boolean }> {
+export function updateProfileSoul(
+  name: string,
+  content: string,
+  connectionId?: null | string
+): Promise<{ ok: boolean }> {
   return hermesApi<{ ok: boolean }>({
+    ...profileAdminScope(connectionId),
     path: `/api/profiles/${encodeURIComponent(name)}/soul`,
     method: 'PUT',
     body: { content }

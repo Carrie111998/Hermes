@@ -16,7 +16,7 @@ import { renameProfile } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
 import { slug } from '@/lib/sanitize'
-import { retireLocalProfileGateways } from '@/store/gateway'
+import { retireAgentGateways } from '@/store/gateway'
 
 import { isValidProfileName } from './create-profile-dialog'
 
@@ -92,7 +92,11 @@ export function RenameProfileDialog({
       // old-name backend whose ensure_hermes_home() recreates the directory
       // the rename just moved (same class as the delete path, #88638).
       if (!isDefault) {
-        retireLocalProfileGateways(currentName)
+        // Scoped to the agent being renamed. The local-only seam retires the
+        // bare and `local::` scopes, so renaming a secondary's profile used to
+        // tear down the same-named LOCAL one and leave the secondary's own
+        // socket redialing the old name (#88638).
+        retireAgentGateways(connectionId ?? null, currentName)
       }
 
       // Pass the owning machine ONLY when there is one, so a

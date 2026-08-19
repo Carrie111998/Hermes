@@ -83,14 +83,17 @@ const hpDescriptor = (profile: string) => ({
   wsUrl: `ws://192.168.1.218:9119/api/ws?token=fake-test-token`
 })
 
-const dellDescriptor = {
+// Per-profile, because the Dell now serves a NAMED profile the HP also serves.
+// A descriptor mock that answers the same object for every profile cannot tell
+// `appdev@HP` from `appdev@Dell`, which is precisely the confusion under test.
+const dellDescriptor = (profile: string) => ({
   authMode: 'token',
   baseUrl: DELL_URL,
   mode: 'remote',
-  profile: 'default',
+  profile,
   token: 'fake-test-token',
   wsUrl: 'ws://192.168.1.204:9120/api/ws?token=fake-test-token'
-}
+})
 
 const REGISTRY = {
   primary: HP,
@@ -112,7 +115,15 @@ const ROSTER = {
       handle: profile,
       profile
     })),
-    { connectionId: DELL, connectionLabel: 'MechaHome Hermes (Dell)', handle: 'default', profile: 'default' }
+    // Both machines serve `default` AND `appdev`. The overlap is the point:
+    // every defect below is invisible on a topology where the second gateway
+    // only has `default`, because a bare name is still unambiguous there.
+    ...['default', 'appdev'].map(profile => ({
+      connectionId: DELL,
+      connectionLabel: 'MechaHome Hermes (Dell)',
+      handle: `${profile}-dell`,
+      profile
+    }))
   ]
 }
 
@@ -124,7 +135,7 @@ function installDesktop(): void {
     // Descriptors are per (connection, profile) — the mock has to answer for
     // BOTH machines, or a test cannot tell a trip home from staying put.
     getConnectionFor: vi.fn(async ({ connectionId, profile }: { connectionId: string; profile?: string }) =>
-      connectionId === DELL ? dellDescriptor : hpDescriptor(normalizeProfileKey(profile))
+      connectionId === DELL ? dellDescriptor(normalizeProfileKey(profile)) : hpDescriptor(normalizeProfileKey(profile))
     )
   }
 }
@@ -233,11 +244,14 @@ describe('rail squares on the primary', () => {
 })
 
 describe('rail squares after a cross-gateway hop', () => {
-  it('comes back to a NAMED primary profile from the Dell agent', async () => {
+  it('comes back to a NAMED primary profile through its foreign square', async () => {
     await hopToDell()
     expect($attachedConnectionId.get()).toBe(DELL)
 
-    selectPrimaryAgent('appdev')
+    // From the Dell, the HP's agents are FOREIGN squares — the rail's own
+    // squares describe the machine it is attached to. `appdev` exists on both,
+    // so only the (connection, profile) door can say which one is meant.
+    await hopHome('appdev')
     await settle()
 
     expect($activeGatewayProfile.get()).toBe('appdev')
@@ -263,7 +277,7 @@ describe('rail squares after a cross-gateway hop', () => {
 
   it("sends the primary's own descriptor, not the Dell's, when a named square comes home", async () => {
     await hopToDell()
-    selectPrimaryAgent('appdev')
+    await hopHome('appdev')
     await settle()
 
     expect(gatewayMocks.setConnection).toHaveBeenLastCalledWith(
@@ -276,7 +290,7 @@ describe('rail split (the rail may not draw an agent twice)', () => {
   const keys = () => $foreignAgents.get().map(a => `${a.connectionId}:${a.profile}`)
 
   it("treats the other machine's agents as foreign while attached to the primary", () => {
-    expect(keys()).toEqual([`${DELL}:default`])
+    expect(keys()).toEqual([`${DELL}:default`, `${DELL}:appdev`])
   })
 
   it('re-derives the split the moment the live gateway lands on the Dell', async () => {
@@ -287,7 +301,9 @@ describe('rail split (the rail may not draw an agent twice)', () => {
     // split pinned to the primary instead drew the Dell's `default` twice:
     // once as a native square, once as a foreign one.
     expect(keys()).not.toContain(`${DELL}:default`)
+    expect(keys()).not.toContain(`${DELL}:appdev`)
     expect(keys()).toContain(`${HP}:default`)
+    expect(keys()).toContain(`${HP}:appdev`)
     expect(keys()).toHaveLength(5)
   })
 
@@ -303,7 +319,7 @@ describe('rail split (the rail may not draw an agent twice)', () => {
     // refetch went out while the API layer's ambient connection was still the
     // Dell — it re-fetched the Dell's rows and relabelled them as the primary's.
     // The split follows the activation that actually landed.
-    expect(keys()).toEqual([`${DELL}:default`])
+    expect(keys()).toEqual([`${DELL}:default`, `${DELL}:appdev`])
   })
 })
 
@@ -363,5 +379,58 @@ describe('one activation per click', () => {
     await settle()
 
     expect($activeGatewayProfile.get()).toBe('codertom')
+  })
+})
+
+
+describe('ownership: a native square belongs to the machine it is drawn from', () => {
+  it('activates the ATTACHED gateway\'s named profile, not the primary\'s same-named one', async () => {
+    await hopToDell()
+    expect($attachedConnectionId.get()).toBe(DELL)
+
+    gatewayMocks.setConnection.mockClear()
+
+    // `appdev` exists on BOTH machines. The rail's own squares are drawn from
+    // $profiles, which describes the ATTACHED machine, so this square is the
+    // Dell's — and it must resolve through the (connection, profile) door.
+    // Routing it by bare name reaches the profile-only pool, which is anchored
+    // to the primary, and silently activates appdev@HP instead (#88880/#89466).
+    selectPrimaryAgent('appdev')
+    await settle()
+
+    expect($activeGatewayProfile.get()).toBe('appdev')
+    expect($attachedConnectionId.get()).toBe(DELL)
+    expect(gatewayMocks.setConnection).toHaveBeenLastCalledWith(
+      expect.objectContaining({ baseUrl: DELL_URL, profile: 'appdev' })
+    )
+  })
+
+  it('resolves the descriptor through the OWNING connection', async () => {
+    await hopToDell()
+
+    const desktop = (window as unknown as { hermesDesktop: { getConnectionFor: ReturnType<typeof vi.fn> } })
+      .hermesDesktop
+
+    desktop.getConnectionFor.mockClear()
+    selectPrimaryAgent('appdev')
+    await settle()
+
+    // getConnectionFor is the (connection, profile) door; the profile-only pool
+    // goes through getConnection instead and cannot express which machine.
+    expect(desktop.getConnectionFor).toHaveBeenCalledWith(expect.objectContaining({ connectionId: DELL }))
+  })
+
+  it('still takes the legacy profile path while attached to the primary', async () => {
+    // Single-gateway installs and every on-primary click must stay byte
+    // identical to upstream: no registry door, no behaviour change.
+    const desktop = (window as unknown as { hermesDesktop: { getConnectionFor: ReturnType<typeof vi.fn> } })
+      .hermesDesktop
+
+    desktop.getConnectionFor.mockClear()
+    selectPrimaryAgent('codertom')
+    await settle()
+
+    expect($activeGatewayProfile.get()).toBe('codertom')
+    expect(desktop.getConnectionFor).not.toHaveBeenCalled()
   })
 })

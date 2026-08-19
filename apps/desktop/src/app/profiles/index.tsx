@@ -76,16 +76,27 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
   const connectionLabels = useStore($connectionLabels)
   const primaryConnectionId = useStore($primaryConnectionId)
 
+  // The primary carries its REAL registry id, never ''.
+  //
+  // An omitted connection means "whichever gateway is ambient", NOT "the
+  // registry primary" — `hermesApi` spreads `connectionScoped()`. Encoding the
+  // primary as '' therefore made the section LABELLED with the primary's name
+  // read, and write to, whatever machine happened to be attached: open Manage
+  // Profiles from a secondary and the primary's section listed the secondary's
+  // profiles, while create/rename/delete under that heading hit the secondary
+  // too. Addressing every source explicitly is what keeps a row's machine and
+  // its label the same machine.
+  const primaryId = (primaryConnectionId || LOCAL_CONNECTION_ID).trim()
+
   const sources = useMemo(() => {
-    const primary = primaryConnectionId || LOCAL_CONNECTION_ID
-    const primaryLabel = connectionLabels[primary] || ''
-    const rest = Object.keys(connectionLabels).filter(id => id !== primary && id !== LOCAL_CONNECTION_ID)
+    const primaryLabel = connectionLabels[primaryId] || ''
+    const rest = Object.keys(connectionLabels).filter(id => id !== primaryId && id !== LOCAL_CONNECTION_ID)
 
     return [
-      { connectionId: '', label: primaryLabel },
+      { connectionId: primaryId, label: primaryLabel },
       ...rest.map(id => ({ connectionId: id, label: connectionLabels[id] || id }))
     ]
-  }, [connectionLabels, primaryConnectionId])
+  }, [connectionLabels, primaryId])
 
   const refresh = useCallback(async () => {
     // Best-effort per source: an unreachable machine contributes nothing rather
@@ -93,7 +104,10 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
     const perSource = await Promise.all(
       sources.map(async source => {
         try {
-          const list = source.connectionId ? (await getProfiles(source.connectionId)).profiles : await refreshProfiles()
+          // Explicit id for every source once a second gateway exists. A
+          // single-gateway install keeps upstream's exact ambient call, so
+          // nothing changes for it.
+          const list = multiGateway ? (await getProfiles(source.connectionId)).profiles : await refreshProfiles()
 
           return list.map(profile => ({
             connectionId: source.connectionId,
@@ -104,7 +118,7 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
           // Only the primary failing is worth interrupting the user for; a
           // secondary gateway being down is expected and already visible as an
           // absent section.
-          if (!source.connectionId) {
+          if (source.connectionId === primaryId) {
             notifyError(err, p.failedLoad)
           }
 
@@ -120,11 +134,17 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
         return current
       }
 
-      const fallback = flat.find(entry => !entry.connectionId && entry.profile.is_default) ?? flat[0]
+      const fallback = flat.find(entry => entry.connectionId === primaryId && entry.profile.is_default) ?? flat[0]
 
       return fallback ? entryKey(fallback) : null
     })
-  }, [p, sources])
+
+    // The rail's own cache is ambient by design (it describes the attached
+    // machine), so keep it current alongside the explicit per-source reads.
+    if (multiGateway) {
+      void refreshProfiles().catch(() => undefined)
+    }
+  }, [multiGateway, p, primaryId, sources])
 
   useRefreshHotkey(refresh)
 
@@ -164,9 +184,14 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
           ...source,
           rows: visibleEntries.filter(entry => entry.connectionId === source.connectionId)
         }))
-        .filter(section => section.rows.length > 0 || !section.connectionId),
-    [sources, visibleEntries]
+        .filter(section => section.rows.length > 0 || section.connectionId === primaryId),
+    [primaryId, sources, visibleEntries]
   )
+
+  // Internally every source carries its real id, so a row's machine and its
+  // label can never drift. On the WIRE, a single-gateway install must still
+  // issue upstream's byte-identical ambient call — '' means "no override".
+  const scopeFor = (id?: null | string): string => (multiGateway ? ((id ?? '').trim() || primaryId) : '')
 
   // The shared Create/Rename dialogs own the createProfile / renameProfile /
   // updateProfileSoul calls; the panel just selects the resulting profile and
@@ -220,7 +245,7 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
               searchValue={query}
             >
               {sections.map(section => (
-                <Fragment key={section.connectionId || 'primary'}>
+                <Fragment key={section.connectionId}>
                   {multiGateway && section.label ? <PanelSectionLabel>{section.label}</PanelSectionLabel> : null}
                   {section.rows.map(entry => (
                     <ProfileRow
@@ -239,7 +264,7 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
 
             {selected ? (
               <ProfileDetail
-                connectionId={selected.connectionId}
+                connectionId={scopeFor(selected.connectionId)}
                 connectionLabel={multiGateway ? selected.connectionLabel : ''}
                 key={entryKey(selected)}
                 profile={selected.profile}
@@ -252,24 +277,24 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
       )}
 
       <RenameProfileDialog
-        connectionId={pendingRename?.connectionId}
+        connectionId={scopeFor(pendingRename?.connectionId)}
         currentName={pendingRename?.profile.name ?? ''}
         isDefault={pendingRename?.profile.is_default ?? false}
         onClose={() => setPendingRename(null)}
-        onRenamed={name => selectAndRefresh(pendingRename?.connectionId ?? '', name)}
+        onRenamed={name => selectAndRefresh(pendingRename?.connectionId ?? primaryId, name)}
         open={pendingRename !== null}
       />
 
       <CreateProfileDialog
-        connectionId={createOn}
+        connectionId={scopeFor(createOn)}
         onClose={() => setCreateOn(null)}
-        onCreated={name => selectAndRefresh(createOn ?? '', name)}
+        onCreated={name => selectAndRefresh(createOn ?? primaryId, name)}
         open={createOn !== null}
-        profiles={(entries ?? []).filter(entry => entry.connectionId === (createOn ?? '')).map(entry => entry.profile)}
+        profiles={(entries ?? []).filter(entry => entry.connectionId === (createOn ?? primaryId)).map(entry => entry.profile)}
       />
 
       <DeleteProfileDialog
-        connectionId={pendingDelete?.connectionId}
+        connectionId={scopeFor(pendingDelete?.connectionId)}
         onClose={() => setPendingDelete(null)}
         onDeleted={async () => {
           setSelectedKey(null)

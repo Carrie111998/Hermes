@@ -191,16 +191,27 @@ export async function refreshGatewaySeparation(): Promise<void> {
  *  connection-scoped activation path (`ensureGatewayAgent`), not a same-named
  *  local profile. Imported lazily to keep this module out of the profile
  *  store's import cycle. */
-export async function selectForeignAgent(agent: RosterAgent): Promise<void> {
-  const { $newChatProfile, ensureGatewayAgent, requestFreshSession } = await import('./profile')
+/** Activate a specific (connection, profile) agent and move the chat scope onto
+ *  it — the cross-machine analogue of upstream's `selectProfile`.
+ *
+ *  Everything here addresses the agent by its OWNING TUPLE. A bare profile name
+ *  resolves through the legacy profile-only pool, which is anchored to the
+ *  primary/local runtime, so a named profile on a secondary would activate the
+ *  same-named profile on the WRONG machine (#88880 / #89466). */
+async function activateAgent(connectionId: string, profile: string, collapseAllProfiles: boolean): Promise<void> {
+  const { $newChatProfile, ensureGatewayAgent, requestFreshSession, setShowAllProfiles } = await import('./profile')
 
-  await ensureGatewayAgent(agent.connectionId, agent.profile)
+  if (collapseAllProfiles) {
+    setShowAllProfiles(false)
+  }
+
+  await ensureGatewayAgent(connectionId, profile)
 
   // Point new chats at THIS agent's profile. `desktopSessionCreateParams` reads
   // `$newChatProfile` and calls `ensureGatewayProfile` on it before creating the
   // session; left pointing at a profile this machine does not serve, that call
   // swaps the live gateway away from here and the message lands on the primary.
-  $newChatProfile.set(agent.profile)
+  $newChatProfile.set(profile)
 
   // Attachment is NOT written here: it is derived from the live gateway that
   // `ensureGatewayAgent` just published, so a rejected activation cannot leave
@@ -212,6 +223,11 @@ export async function selectForeignAgent(agent: RosterAgent): Promise<void> {
   // staring at the previous machine's open chat while the composer had already
   // moved to the new one.
   requestFreshSession()
+}
+
+/** Pick an agent that lives on a DIFFERENT gateway than the live one. */
+export async function selectForeignAgent(agent: RosterAgent): Promise<void> {
+  await activateAgent(agent.connectionId, agent.profile, false)
 }
 
 /** Per-backend caches are invalidated on a change of profile NAME, which a hop
@@ -273,18 +289,28 @@ async function reseedWorkspaceForConnection(): Promise<void> {
   }
 }
 
-/** Pick one of the rail's own agents — a profile served by the machine the live
- *  gateway is already attached to.
+/** Pick one of the rail's own squares.
  *
- *  Thin on purpose: upstream's `selectProfile` already does the right thing for
- *  a same-machine switch. It exists so the rail has ONE door per square kind,
- *  with `selectForeignAgent` as its cross-machine twin, rather than the switcher
- *  branching on connection identity inline.
+ *  Those squares are drawn from `$profiles`, which describes whichever machine
+ *  the live gateway is ATTACHED to — `refreshProfiles` goes through `hermesApi`,
+ *  which carries the ambient connection. So "the rail's own agent" is only the
+ *  primary's while we are actually on the primary.
  *
- *  Attachment is not written here. It is derived from the live gateway, so the
- *  square lights when the swap actually lands rather than the instant it is
- *  clicked — an optimistic write raced the sidebar's reseed and refetched the
- *  PREVIOUS machine's rows. */
+ *  That makes the owning connection load-bearing rather than decorative. Handing
+ *  the bare name to `selectProfile` sends it through `ensureGatewayProfile`, the
+ *  profile-only pool anchored to the primary/local runtime: while attached to a
+ *  secondary, clicking its `appdev` square would activate the PRIMARY's `appdev`
+ *  and point the next chat at the wrong machine. Only a null owner — the
+ *  primary's own route, and every single-gateway install — may take the legacy
+ *  path, where it stays byte-identical to upstream. */
 export function selectPrimaryAgent(profile: string): void {
-  selectProfileImpl(profile)
+  const owner = (activeGatewayConnectionId() ?? '').trim()
+
+  if (!owner) {
+    selectProfileImpl(profile)
+
+    return
+  }
+
+  void activateAgent(owner, profile, true)
 }
