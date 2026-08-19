@@ -90,21 +90,39 @@ export function useDesktopIntegrations({
   }, [])
 
   const restoredRef = useRef(false)
+  const rememberedRestoreKey = `hermes.desktop.remembered-route-restored.${activeProfile}`
 
   // Wait until boot has adopted the primary profile, then restore that profile's
   // navigation exactly once. The same effect owns subsequent writes so the
   // initial `/` cannot overwrite remembered history before it is read.
   // This ref is a one-time lifecycle latch, not a mirror of reactive atom state.
-  // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
     if (!profileReady || isHudWindow()) {
       return
     }
 
+    const rememberedRestoreAlreadyDone = () => {
+      try {
+        return window.sessionStorage.getItem(rememberedRestoreKey) === '1'
+      } catch {
+        return false
+      }
+    }
+
+    const markRememberedRestoreDone = () => {
+      try {
+        window.sessionStorage.setItem(rememberedRestoreKey, '1')
+      } catch {
+        // Storage can be unavailable in restricted/browser test contexts.
+      }
+    }
+
     if (!restoredRef.current) {
-      // Only cold-start navigation at the default route is replaceable; a deep
-      // link or hidden-then-shown window keeps its explicit destination.
-      if (locationPathname === NEW_CHAT_ROUTE) {
+      if (rememberedRestoreAlreadyDone()) {
+        restoredRef.current = true
+      } else if (locationPathname === NEW_CHAT_ROUTE) {
+        // Only cold-start navigation at the default route is replaceable; a deep
+        // link or hidden-then-shown window keeps its explicit destination.
         const route = getRememberedRoute(activeProfile)
         const routeSession = route ? routeSessionId(route) : null
         const last = getRememberedSessionId(activeProfile)
@@ -121,6 +139,7 @@ export function useDesktopIntegrations({
         }
 
         restoredRef.current = true
+        markRememberedRestoreDone()
 
         if (
           route &&
@@ -150,6 +169,7 @@ export function useDesktopIntegrations({
         }
       } else {
         restoredRef.current = true
+        markRememberedRestoreDone()
       }
     }
 
@@ -163,7 +183,7 @@ export function useDesktopIntegrations({
     } else if (!routedSessionId && !isOverlayView(appViewForPath(locationPathname))) {
       setRememberedRoute(locationPathname, activeProfile)
     }
-  }, [activeProfile, locationPathname, navigate, profileReady, routedSessionId, sessions])
+  }, [activeProfile, locationPathname, navigate, profileReady, rememberedRestoreKey, routedSessionId, sessions])
 
   useEffect(() => {
     if (!profileReady || !resumeExhaustedSessionId) {
