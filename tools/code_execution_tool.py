@@ -306,6 +306,7 @@ def check_sandbox_requirements() -> bool:
 
     try:
         from tools.terminal_tool import (
+            _check_e2b_requirements,
             _check_vercel_sandbox_requirements,
             _get_env_config,
         )
@@ -317,6 +318,8 @@ def check_sandbox_requirements() -> bool:
 
     if config.get("env_type") == "vercel_sandbox":
         return _check_vercel_sandbox_requirements(config)
+    if config.get("env_type") == "e2b":
+        return _check_e2b_requirements(config)
 
     return True
 
@@ -841,6 +844,8 @@ def _get_or_create_env(task_id: str):
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
                 "container_persistent": config.get("container_persistent", True),
+                "lifetime_seconds": config.get("lifetime_seconds", 300),
+                "e2b_template": config.get("e2b_template", "base"),
                 "vercel_runtime": config.get("vercel_runtime", ""),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
