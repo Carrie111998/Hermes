@@ -8853,6 +8853,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
                 )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
+            # Two-phase page: phase 1 ranks every listable root by its
+            # effective (chain-max) last activity and picks the LIMIT/OFFSET
+            # page using the cheap columns only. Phase 2 re-fetches just the
+            # page's rows, which is where the expensive _preview_raw
+            # subquery runs (REPLACE over full message content per session).
+            # Inlining it in a single query made SQLite evaluate previews for
+            # every listable root (thousands) to return a 50-row page; the
+            # split bounds that work to the page size.
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
                     SELECT s.id, s.id FROM sessions s {where_sql}
@@ -8873,19 +8881,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM chain
                     GROUP BY root_id
                 )
-                SELECT {_sel}{prompt_select},
-                    COALESCE(
-                        (SELECT {_PREVIEW_RAW_SELECT}
-                         FROM messages m
-                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                         ORDER BY m.timestamp, m.id LIMIT 1),
-                        ''
-                    ) AS _preview_raw,
+                SELECT s.id,
                     {_sql_session_last_active("s")} AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
-                {prompt_join}
                 {outer_where}
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
                 LIMIT ? OFFSET ?
@@ -8915,6 +8915,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             cursor = conn.execute(query, params)
             rows = cursor.fetchall()
+        if order_by_last_active:
+            page_ids = [row["id"] for row in rows]
+            if page_ids:
+                # Phase 2: re-fetch just the page's rows (full columns + the
+                # expensive _preview_raw subquery). Phase 1 already ordered and
+                # filtered these ids, so no CTE, join, or re-filtering here —
+                # the id list is the page. A row deleted between phases is
+                # simply dropped, matching the single-query behaviour.
+                id_placeholders = ",".join("?" for _ in page_ids)
+                detail_where = (
+                    f"{where_sql} AND s.id IN ({id_placeholders})"
+                    if where_sql
+                    else f"WHERE s.id IN ({id_placeholders})"
+                )
+                detail_query = f"""
+                    SELECT {_sel}{prompt_select},
+                        COALESCE(
+                            (SELECT {_PREVIEW_RAW_SELECT}
+                             FROM messages m
+                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                             ORDER BY m.timestamp, m.id LIMIT 1),
+                            ''
+                        ) AS _preview_raw,
+                        {_sql_session_last_active("s")} AS last_active
+                    FROM sessions s
+                    {prompt_join}
+                    {detail_where}
+                """
+                with self._read_ctx() as conn:
+                    detail_cursor = conn.execute(
+                        detail_query, list(base_where_params) + list(page_ids)
+                    )
+                    detail_rows = detail_cursor.fetchall()
+                rows = {row["id"]: row for row in detail_rows}
+                rows = [rows[row_id] for row_id in page_ids if row_id in rows]
+            else:
+                rows = []
         sessions = []
         for row in rows:
             s = self._session_row_dict(row)

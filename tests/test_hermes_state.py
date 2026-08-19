@@ -2069,6 +2069,68 @@ class TestListSessionsRich:
 
 
 
+    def test_rich_list_order_by_last_active_two_phase_keeps_order_and_previews(self, db):
+        # The order_by_last_active path is two-phase: phase 1 selects the page
+        # by effective last-active, phase 2 re-fetches full rows + previews for
+        # just those ids. This guards a phase 2 that silently reorders, drops
+        # rows, or empties the previews.
+        db.create_session("a", "cli")
+        db.create_session("b", "cli")
+        db.create_session("c", "cli")
+        db.append_message("a", "user", "alpha first user line")
+        db.append_message("b", "user", "beta first user line")
+        db.append_message("c", "user", "gamma first user line")
+        # Deterministic last-active ordering: c > b > a.
+        base = 1_700_000_000.0
+        with db._lock:
+            for sid, ts in (("a", base + 10.0), ("b", base + 20.0), ("c", base + 30.0)):
+                db._conn.execute(
+                    "UPDATE messages SET timestamp=? WHERE session_id=?",
+                    (ts, sid),
+                )
+                db._conn.execute(
+                    "UPDATE sessions SET last_activity_at=? WHERE id=?",
+                    (ts, sid),
+                )
+            db._conn.commit()
+
+        rows = db.list_sessions_rich(order_by_last_active=True, limit=2)
+
+        # Page order follows last-active, not creation order.
+        assert [r["id"] for r in rows] == ["c", "b"]
+        # Phase 2 still populates the first-user-message previews.
+        assert rows[0]["preview"].startswith("gamma")
+        assert rows[1]["preview"].startswith("beta")
+        # The paged-out session is absent.
+        assert all(r["id"] != "a" for r in rows)
+
+    def test_rich_list_order_by_last_active_two_phase_offset_page(self, db):
+        # offset must still skip correctly through the two-phase path.
+        for sid in ("a", "b", "c", "d"):
+            db.create_session(sid, "cli")
+            db.append_message(sid, "user", f"{sid} first user line")
+        base = 1_700_000_000.0
+        with db._lock:
+            for i, sid in enumerate(("a", "b", "c", "d")):
+                ts = base + float(i * 10.0)
+                db._conn.execute(
+                    "UPDATE messages SET timestamp=? WHERE session_id=?",
+                    (ts, sid),
+                )
+                db._conn.execute(
+                    "UPDATE sessions SET last_activity_at=? WHERE id=?",
+                    (ts, sid),
+                )
+            db._conn.commit()
+
+        page = db.list_sessions_rich(
+            order_by_last_active=True, limit=2, offset=1
+        )
+        # full order is d,c,b,a; offset=1 limit=2 -> c,b
+        assert [r["id"] for r in page] == ["c", "b"]
+        assert page[0]["preview"].startswith("c")
+        assert page[1]["preview"].startswith("b")
+
     def test_rich_list_session_key_filter_precedes_limit(self, db):
         lane_key = "agent:main:telegram:dm:lane"
         db.create_session(
