@@ -16,6 +16,7 @@ from agent.credential_pool import (
     PooledCredential,
     credential_pool_matches_provider,
     get_custom_provider_pool_key,
+    get_env_prefer_dotenv,
     load_pool,
 )
 from agent.secret_scope import get_secret as _get_secret
@@ -566,7 +567,7 @@ def _resolve_runtime_from_pool_entry(
         entry_source = str(getattr(entry, "source", "") or "")
         explicit_env_url = ""
         if pconfig and pconfig.base_url_env_var:
-            explicit_env_url = _getenv(pconfig.base_url_env_var, "").strip()
+            explicit_env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip()
         config_may_override_pool_url = pool_url_is_default or (
             entry_source.startswith("env:") and not explicit_env_url
         )
