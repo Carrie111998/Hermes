@@ -158,6 +158,27 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     return record  # type: ignore[return-value]
 
 
+def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(execution_id, str) or not execution_id:
+        return None
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    return _record(row)
+
+
+def execution_identity(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not record:
+        return None
+    return {
+        "id": str(record.get("id") or ""),
+        "job_id": str(record.get("job_id") or ""),
+        "source": str(record.get("source") or ""),
+        "status": str(record.get("status") or "unknown"),
+    }
+
+
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
@@ -248,8 +269,13 @@ def list_executions(
         clauses.append("job_id=?")
         params.append(str(job_id))
     if before_claimed_at is not None:
-        clauses.append("claimed_at < ?")
-        params.append(str(before_claimed_at))
+        if "|" in str(before_claimed_at):
+            claimed_at, execution_id = str(before_claimed_at).rsplit("|", 1)
+            clauses.append("(claimed_at < ? OR (claimed_at = ? AND id < ?))")
+            params.extend((claimed_at, claimed_at, execution_id))
+        else:
+            clauses.append("claimed_at < ?")
+            params.append(str(before_claimed_at))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     params.append(max(1, min(int(limit), 500)))
     with _transaction() as conn:

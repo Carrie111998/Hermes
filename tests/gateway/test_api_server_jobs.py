@@ -10,6 +10,7 @@ Covers:
 - Cron module unavailability (501 when _CRON_AVAILABLE is False)
 """
 
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -63,6 +64,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/jobs/{job_id}/pause", adapter._handle_pause_job)
     app.router.add_post("/api/jobs/{job_id}/resume", adapter._handle_resume_job)
     app.router.add_post("/api/jobs/{job_id}/run", adapter._handle_run_job)
+    app.router.add_get("/api/jobs/{job_id}/runs", adapter._handle_list_job_runs)
     return app
 
 
@@ -325,18 +327,131 @@ class TestRunJob:
         """POST /api/jobs/{id}/run returns triggered job."""
         app = _create_app(adapter)
         triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
-        mock_trigger = MagicMock(return_value=triggered_job)
+        mock_get = MagicMock(return_value=triggered_job)
         async with TestClient(TestServer(app)) as cli:
             with patch(
                 f"{_MOD}._CRON_AVAILABLE", True
             ), patch(
-                f"{_MOD}._cron_trigger", mock_trigger
+                f"{_MOD}._cron_get", mock_get
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == triggered_job
-                mock_trigger.assert_called_once_with(VALID_JOB_ID)
+                mock_get.assert_called_once_with(VALID_JOB_ID)
+
+    @pytest.mark.asyncio
+    async def test_run_job_admits_native_execution(self, adapter):
+        app = _create_app(adapter)
+        fired = []
+
+        class Provider:
+            name = "builtin"
+
+            def claim_fire(self, job_id, *, force=False):
+                return {"id": job_id, "execution_id": "exec-native"}
+
+            def fire_claimed(self, job, *, adapters=None, loop=None):
+                fired.append(job["execution_id"])
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+            ), patch(
+                "cron.scheduler_provider.resolve_cron_scheduler",
+                return_value=Provider(),
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["execution"] == {
+                    "id": "exec-native",
+                    "job_id": VALID_JOB_ID,
+                    "source": "builtin",
+                    "status": "claimed",
+                }
+        for _ in range(50):
+            if fired:
+                break
+            await asyncio.sleep(0.01)
+        assert fired == ["exec-native"]
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_uses_exact_id_and_cursor(self, adapter):
+        app = _create_app(adapter)
+        rows = [{
+            "id": "exec-1", "job_id": VALID_JOB_ID,
+            "claimed_at": "2026-08-20T00:00:00+00:00", "status": "completed",
+        }]
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch("cron.executions.list_executions", return_value=rows) as listed:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    f"/api/jobs/{VALID_JOB_ID}/runs?limit=1&before_claimed_at=cursor"
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["runs"] == rows
+                assert data["next_cursor"] == "2026-08-20T00:00:00+00:00|exec-1"
+        listed.assert_called_once_with(
+            job_id=VALID_JOB_ID, limit=1, before_claimed_at="cursor"
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_rejects_unbounded_or_invalid_limit(self, adapter):
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                for query in ("limit=0", "limit=nope"):
+                    response = await cli.get(
+                        f"/api/jobs/{VALID_JOB_ID}/runs?{query}"
+                    )
+                    assert response.status == 400
+
+    @pytest.mark.asyncio
+    async def test_list_job_runs_requires_api_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get(f"/api/jobs/{VALID_JOB_ID}/runs")
+                assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_gateway_lifecycle_ids_never_fall_back_to_names(self, adapter):
+        app = _create_app(adapter)
+        routes = [
+            ("delete", f"/api/jobs/{VALID_JOB_ID}"),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/pause"),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/resume"),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/run"),
+        ]
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            "cron.jobs.resolve_job_ref", return_value=SAMPLE_JOB
+        ) as resolver:
+            async with TestClient(TestServer(app)) as cli:
+                for method, path in routes:
+                    response = await getattr(cli, method)(path)
+                    assert response.status == 404
+        resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gateway_lifecycle_malformed_ids_are_400(self, adapter):
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True):
+            async with TestClient(TestServer(app)) as cli:
+                for path in (
+                    "/api/jobs/not-an-id",
+                    "/api/jobs/not-an-id/pause",
+                    "/api/jobs/not-an-id/resume",
+                    "/api/jobs/not-an-id/run",
+                    "/api/jobs/not-an-id/runs",
+                ):
+                    method = cli.get if path.endswith("runs") else cli.post
+                    if path == "/api/jobs/not-an-id":
+                        method = cli.delete
+                    response = await method(path)
+                    assert response.status == 400
 
 
 # ---------------------------------------------------------------------------
@@ -497,4 +612,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-

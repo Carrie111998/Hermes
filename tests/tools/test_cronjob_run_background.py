@@ -237,6 +237,24 @@ class TestInFlightDedupe:
         assert seen_during_run["registered"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
 
+    def test_manual_projection_carries_native_execution_identity(self):
+        from cron.executions import create_execution
+        from tools.cronjob_tools import _run_claimed_job
+
+        row = create_execution("job-bg-identity", source="direct")
+        job = {**_job("job-bg-identity"), "execution_id": row["id"]}
+        with patch("cron.scheduler.run_one_job", return_value=True), patch(
+            "tools.cronjob_tools.get_job",
+            return_value={"last_status": "ok", "last_error": None},
+        ):
+            result = _run_claimed_job(job)
+        assert result["execution"] == {
+            "id": row["id"],
+            "job_id": "job-bg-identity",
+            "source": "direct",
+            "status": "claimed",
+        }
+
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job
         reports in the tool response, not as a delayed completion event."""

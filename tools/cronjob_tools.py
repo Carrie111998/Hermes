@@ -64,6 +64,33 @@ def _notify_provider_jobs_changed_safe() -> None:
         pass
 
 
+def _execution_identity_for_job(
+    job_id: str,
+    *,
+    execution_id: Optional[str] = None,
+    fallback_source: str = "direct",
+    fallback_status: str = "unknown",
+) -> Optional[Dict[str, str]]:
+    """Return the stable native execution projection for a job's latest run."""
+    try:
+        from cron.executions import execution_identity, get_execution, latest_execution
+
+        record = get_execution(execution_id) if execution_id else latest_execution(job_id)
+        projected = execution_identity(record)
+        if projected:
+            return projected
+    except Exception:
+        pass
+    if not execution_id:
+        return None
+    return {
+        "id": str(execution_id),
+        "job_id": str(job_id),
+        "source": fallback_source,
+        "status": fallback_status,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Cron prompt scanning
 # ---------------------------------------------------------------------------
@@ -645,6 +672,14 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    latest_execution = job.get("latest_execution")
+    if isinstance(latest_execution, dict):
+        result["latest_execution"] = _execution_identity_for_job(
+            job_id,
+            execution_id=latest_execution.get("id"),
+            fallback_source=str(latest_execution.get("source") or ""),
+            fallback_status=str(latest_execution.get("status") or "unknown"),
+        )
     if job.get("script"):
         result["script"] = job["script"]
     if job.get("monitor_script"):
@@ -659,6 +694,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("dedup_key"):
+        result["dedup_key"] = job["dedup_key"]
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]
@@ -750,12 +787,27 @@ def _run_claimed_job(
         # makes this run visible to the gateway shutdown drain
         # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
         if not try_register_running_job(job_id):
+            execution_id = job.get("execution_id")
+            if execution_id:
+                try:
+                    from cron.executions import finish_execution
+
+                    finish_execution(
+                        str(execution_id),
+                        success=False,
+                        error="Job is already running; execution was not started.",
+                    )
+                except Exception:
+                    pass
             return {
                 "claimed": True,
                 "success": False,
                 "error": (
                     "Job is already running (a scheduler tick or another "
                     "manual run is executing it); not started again."
+                ),
+                "execution": _execution_identity_for_job(
+                    job_id, execution_id=execution_id, fallback_status="failed"
                 ),
             }
         _registered = True
@@ -858,6 +910,7 @@ def _run_claimed_job(
             "claimed": True,
             "success": bool(processed and ok),
             "error": refreshed.get("last_error"),
+            "execution": _execution_identity_for_job(job_id, execution_id=job.get("execution_id")),
         }
 
     except Exception as e:
@@ -886,6 +939,7 @@ def _run_claimed_job(
             "claimed": True,
             "success": False,
             "error": str(e),
+            "execution": _execution_identity_for_job(job_id, execution_id=job.get("execution_id")),
         }
 
 
@@ -1114,6 +1168,7 @@ def _try_dispatch_background_run(
             "status": "completed" if res.get("success") else "error",
             "summary": "\n".join(lines),
             "error": res.get("error"),
+            "execution": res.get("execution") or _execution_identity_for_job(job_id),
             "api_calls": 0,
             "duration_seconds": duration,
         }
@@ -1201,6 +1256,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    dedup_key: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1301,6 +1357,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    dedup_key=_normalize_optional_job_value(dedup_key),
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1452,6 +1509,8 @@ def cronjob(
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
+            if exec_result.get("execution"):
+                result["execution"] = exec_result["execution"]
             if not exec_result.get("claimed", False):
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."

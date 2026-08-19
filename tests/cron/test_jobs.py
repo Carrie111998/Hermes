@@ -1,6 +1,10 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
 import threading
+import os
+import subprocess
+import sys
+from pathlib import Path
 import pytest
 from datetime import datetime, timedelta, timezone
 
@@ -190,6 +194,62 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_create_dedup_key_returns_existing_job(self, tmp_cron_dir):
+        first = create_job(prompt="one", schedule="30m", dedup_key="routine-1")
+        with pytest.raises(ValueError):
+            create_job(prompt="changed", schedule="not-a-schedule", dedup_key="routine-1")
+        second = create_job(prompt="changed", schedule="30m", dedup_key="routine-1")
+        assert second["id"] == first["id"]
+        assert len(load_jobs()) == 1
+
+    def test_create_dedup_key_is_atomic_across_threads(self, tmp_cron_dir):
+        results = []
+
+        def create():
+            results.append(create_job(prompt="one", schedule="30m", dedup_key="routine-race"))
+
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len({job["id"] for job in results}) == 1
+        assert len(load_jobs()) == 1
+
+    def test_create_dedup_key_replays_across_processes_and_profiles(self, tmp_path):
+        repo = Path(__file__).resolve().parents[2]
+        code = (
+            "from cron.jobs import create_job; "
+            "print(create_job(prompt='one', schedule='every 5m', "
+            "dedup_key='process-key')['id'])"
+        )
+
+        def child(home, *, capture=True):
+            env = os.environ.copy()
+            env["HERMES_HOME"] = str(home)
+            env["PYTHONPATH"] = str(repo)
+            return subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=capture,
+                check=True,
+            )
+
+        first_home = tmp_path / "first"
+        second_home = tmp_path / "second"
+        first = child(first_home).stdout.strip()
+        # Simulate a successful create whose response was lost before the
+        # caller observed it; the retry must return the durable same ID.
+        child(first_home, capture=False)
+        replay = child(first_home).stdout.strip()
+        other_profile = child(second_home).stdout.strip()
+        assert replay == first
+        assert other_profile != first
+        assert len(__import__("json").loads((first_home / "cron" / "jobs.json").read_text())["jobs"]) == 1
+        assert len(__import__("json").loads((second_home / "cron" / "jobs.json").read_text())["jobs"]) == 1
+
     def test_cjk_and_emoji_round_trip_readable_in_jobs_json(self, tmp_cron_dir):
         """CJK/emoji job text must round-trip AND stay human-readable on disk.
 
@@ -405,6 +465,10 @@ class TestResolveJobRef:
         job = create_job(prompt="A", schedule="1h", name="alpha")
         assert resolve_job_ref(job["id"])["id"] == job["id"]
 
+    def test_cli_mutation_still_resolves_friendly_name(self, tmp_cron_dir):
+        job = create_job(prompt="A", schedule="1h", name="friendly")
+        assert pause_job("friendly")["id"] == job["id"]
+
 
     def test_mutations_refuse_ambiguous_name(self, tmp_cron_dir):
         """pause/resume/trigger/remove must refuse to act on an ambiguous name."""
@@ -417,6 +481,14 @@ class TestResolveJobRef:
                 fn("dup")
         with pytest.raises(AmbiguousJobReference):
             remove_job("dup")
+
+    def test_exact_lifecycle_helpers_do_not_resolve_names(self, tmp_cron_dir):
+        from cron.jobs import pause_job_exact, trigger_job_exact
+
+        job = create_job(prompt="A", schedule="1h", name="friendly")
+        assert pause_job_exact("friendly") is None
+        assert trigger_job_exact("friendly") is None
+        assert pause_job_exact(job["id"])["id"] == job["id"]
 
 
 class TestMarkJobRun:

@@ -1284,12 +1284,11 @@ _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
         list_jobs as _cron_list,
-        get_job as _cron_get,
-        update_job as _cron_update,
-        remove_job as _cron_remove,
-        pause_job as _cron_pause,
-        resume_job as _cron_resume,
-        trigger_job as _cron_trigger,
+        get_job_exact as _cron_get,
+        update_job_exact as _cron_update,
+        remove_job_exact as _cron_remove,
+        pause_job_exact as _cron_pause,
+        resume_job_exact as _cron_resume,
     )
     from cron.scheduler import (
         CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
@@ -1304,7 +1303,6 @@ except ImportError:
     _cron_remove = None
     _cron_pause = None
     _cron_resume = None
-    _cron_trigger = None
 
     class _CronSchedulerRegistrationError(RuntimeError):
         pass
@@ -1319,6 +1317,29 @@ def _notify_cron_provider_jobs_changed() -> None:
     except Exception:
         pass
 
+
+def _cron_execution_identity(
+    execution_id: Optional[str],
+    *,
+    job_id: str,
+    source: str = "",
+    status: str = "claimed",
+) -> Optional[Dict[str, str]]:
+    if not execution_id:
+        return None
+    try:
+        from cron.executions import execution_identity, get_execution
+        projected = execution_identity(get_execution(str(execution_id)))
+    except Exception:
+        projected = None
+    if projected:
+        return projected
+    return {
+        "id": str(execution_id),
+        "job_id": str(job_id),
+        "source": str(source),
+        "status": str(status),
+    }
 # Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
 # user-supplied prompt for exfiltration/injection payloads at create/update
 # time (tools/cronjob_tools.py).  The REST cron endpoints are authenticated
@@ -2091,6 +2112,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/api/jobs/{job_id}/runs", self._handle_list_job_runs),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -5742,6 +5764,7 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            dedup_key = body.get("dedup_key")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -5761,7 +5784,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
-
             kwargs = {
                 "prompt": prompt,
                 "schedule": schedule,
@@ -5773,6 +5795,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if dedup_key is not None:
+                kwargs["dedup_key"] = str(dedup_key).strip()
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
@@ -5899,7 +5923,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/run — trigger immediate execution."""
+        """POST /api/jobs/{job_id}/run — admit and dispatch one native run."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -5912,11 +5936,140 @@ class APIServerAdapter(BasePlatformAdapter):
         job_id, id_err = self._check_job_id(request)
         if id_err:
             return id_err
+        with _reserve_pending_api_work(self) as reservation:
+            try:
+                job = _cron_get(job_id)
+                if not job:
+                    return web.json_response({"error": "Job not found"}, status=404)
+
+                from cron.scheduler_provider import resolve_cron_scheduler
+                provider = resolve_cron_scheduler()
+                provider_source = str(getattr(provider, "name", "provider"))
+                try:
+                    claimed_job = await asyncio.to_thread(
+                        provider.claim_fire, job_id, force=True
+                    )
+                except TypeError:
+                    claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
+                except Exception as admission_error:
+                    logger.error(
+                        "cron API run admission failed for %s: %s",
+                        job_id,
+                        admission_error,
+                    )
+                    return web.json_response(
+                        {"error": "cron run admission failed", "job_id": job_id},
+                        status=503,
+                    )
+                execution_id = (
+                    claimed_job.get("execution_id") or (claimed_job.get("execution") or {}).get("id")
+                    if isinstance(claimed_job, dict)
+                    else None
+                )
+                if claimed_job is None:
+                    from cron.executions import latest_execution
+                    latest = latest_execution(job_id)
+                    execution = _cron_execution_identity(
+                        latest.get("id") if latest else None,
+                        job_id=job_id,
+                        source=provider_source,
+                        status=latest.get("status", "unknown") if latest else "unknown",
+                    )
+                    return web.json_response(
+                        {
+                            "job": job,
+                            "execution": execution,
+                            "session_id": None,
+                            "status": "duplicate" if execution else "not_admitted",
+                        },
+                        status=200,
+                    )
+
+                job = _cron_get(job_id) or job
+                loop = asyncio.get_running_loop()
+                runner = self.gateway_runner or request.app.get("gateway_runner")
+                adapters = getattr(runner, "adapters", None) or None
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        provider.fire_claimed,
+                        claimed_job,
+                        adapters=adapters,
+                        loop=loop,
+                    )
+                )
+                reservation["detached"] = True
+                task.add_done_callback(
+                    lambda _task: _release_pending_api_work(self, reservation)
+                )
+                try:
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                except (TypeError, AttributeError):
+                    pass
+                execution = _cron_execution_identity(
+                    execution_id,
+                    job_id=job_id,
+                    source=provider_source,
+                    status="claimed",
+                )
+                return web.json_response(
+                    {
+                        "job": job,
+                        "execution": execution,
+                        "session_id": (
+                            claimed_job.get("session_id")
+                            if isinstance(claimed_job, dict)
+                            else None
+                        ),
+                    },
+                    status=202,
+                )
+            except Exception as e:
+                return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_list_job_runs(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        raw_limit = request.query.get("limit", "50")
         try:
-            job = _cron_trigger(job_id)
-            if not job:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "limit must be an integer"}, status=400)
+        if limit < 1:
+            return web.json_response({"error": "limit must be positive"}, status=400)
+        cursor = request.query.get("before_claimed_at") or None
+        try:
+            if not _cron_get(job_id):
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            from cron.executions import list_executions
+
+            runs = list_executions(
+                job_id=job_id,
+                limit=limit,
+                before_claimed_at=cursor,
+            )
+            next_cursor = (
+                f"{runs[-1].get('claimed_at')}|{runs[-1].get('id')}"
+                if len(runs) >= min(limit, 500)
+                and runs[-1].get("claimed_at") and runs[-1].get("id")
+                else None
+            )
+            return web.json_response(
+                {
+                    "job_id": job_id,
+                    "runs": runs,
+                    "next_before_claimed_at": next_cursor,
+                    "next_cursor": next_cursor,
+                    "has_more": next_cursor is not None,
+                }
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

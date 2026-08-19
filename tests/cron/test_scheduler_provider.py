@@ -422,6 +422,24 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     assert events == ["ledger", "claim", ("run", "exec-1")]
 
 
+def test_claim_fire_replay_does_not_dispatch_twice():
+    from cron.executions import list_executions
+    from cron.jobs import create_job
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    job = create_job(prompt="x", schedule="every 1h")
+    provider = InProcessCronScheduler()
+    first = provider.claim_fire(job["id"])
+    replay = provider.claim_fire(job["id"])
+    assert first and first["execution_id"]
+    assert replay is None
+    rows = list_executions(job_id=job["id"])
+    assert len(rows) == 2
+    assert rows[0]["status"] == "failed"
+    assert rows[1]["status"] == "claimed"
+    assert {row["source"] for row in rows} == {"builtin"}
+
+
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     import cron.jobs as jobs
     import cron.scheduler as sched
@@ -638,5 +656,3 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
-

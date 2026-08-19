@@ -457,7 +457,23 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "dedup_key"})
+
+
+def _normalize_dedup_key(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _find_job_exact_unlocked(job_id: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(job_id, str) or not job_id:
+        return None
+    for job in load_jobs():
+        if job.get("id") == job_id:
+            return _normalize_job_record(job)
+    return None
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1797,6 +1813,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    dedup_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1854,10 +1871,14 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        dedup_key: Optional profile-local idempotency key. A valid repeated
+                create with the same non-empty key returns the existing job;
+                malformed retries are rejected before idempotent lookup.
 
     Returns:
         The created job dict
     """
+    normalized_dedup_key = _normalize_dedup_key(dedup_key)
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -1990,6 +2011,8 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_dedup_key is not None:
+        job["dedup_key"] = normalized_dedup_key
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1998,6 +2021,10 @@ def create_job(
 
     with _jobs_lock():
         jobs = load_jobs()
+        if normalized_dedup_key is not None:
+            for existing in jobs:
+                if _normalize_dedup_key(existing.get("dedup_key")) == normalized_dedup_key:
+                    return _normalize_job_record(existing)
         jobs.append(job)
         save_jobs(jobs)
 
@@ -2006,11 +2033,10 @@ def create_job(
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
-    jobs = load_jobs()
-    for job in jobs:
-        if job["id"] == job_id:
-            return _normalize_job_record(job)
-    return None
+    return _find_job_exact_unlocked(job_id)
+
+
+get_job_exact = get_job
 
 
 class AmbiguousJobReference(LookupError):
@@ -2193,9 +2219,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+update_job_exact = update_job
+
+
+def _resolve_job_mutation(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
+    return get_job_exact(job_id) if exact else resolve_job_ref(job_id)
+
+
+def pause_job(
+    job_id: str, reason: Optional[str] = None, *, exact: bool = False
+) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
+    job = _resolve_job_mutation(job_id, exact=exact)
     if not job:
         return None
     return update_job(
@@ -2209,9 +2244,13 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     )
 
 
-def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
+def pause_job_exact(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    return pause_job(job_id, reason, exact=True)
+
+
+def resume_job(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
+    job = _resolve_job_mutation(job_id, exact=exact)
     if not job:
         return None
 
@@ -2234,9 +2273,13 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
+def resume_job_exact(job_id: str) -> Optional[Dict[str, Any]]:
+    return resume_job(job_id, exact=True)
+
+
+def trigger_job(job_id: str, *, exact: bool = False) -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
+    job = _resolve_job_mutation(job_id, exact=exact)
     if not job:
         return None
     return update_job(
@@ -2251,9 +2294,13 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def remove_job(job_id: str) -> bool:
+def trigger_job_exact(job_id: str) -> Optional[Dict[str, Any]]:
+    return trigger_job(job_id, exact=True)
+
+
+def remove_job(job_id: str, *, exact: bool = False) -> bool:
     """Remove a job by ID or name."""
-    job = resolve_job_ref(job_id)
+    job = _resolve_job_mutation(job_id, exact=exact)
     if not job:
         return False
     canonical_id = job["id"]
@@ -2288,6 +2335,10 @@ def remove_job(job_id: str) -> bool:
                 _fire_fence_locks.pop(_fence_key, None)
             return True
     return False
+
+
+def remove_job_exact(job_id: str) -> bool:
+    return remove_job(job_id, exact=True)
 
 
 def mark_job_run(
