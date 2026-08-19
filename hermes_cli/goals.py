@@ -1146,6 +1146,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1177,6 +1178,10 @@ def judge_goal(
     — a contract, subgoals, and a background-process list can coexist in one
     judge prompt; when none are set, behavior is identical to the original
     free-form judge.
+
+    ``main_runtime`` is the session's live provider/model runtime; when set it
+    is forwarded to ``call_llm`` so the judge's ``auto`` auxiliary resolution
+    follows the session's current route instead of a process-global snapshot.
 
     This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
     — the ``transport_failed=True`` flag lets callers track and auto-pause after
@@ -1251,6 +1256,7 @@ def judge_goal(
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
+            main_runtime=main_runtime,
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
@@ -1290,7 +1296,12 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
-def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
+def draft_contract(
+    objective: str,
+    *,
+    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
     Uses the ``goal_judge`` auxiliary task (main-model-first, cache-safe — it
@@ -1321,6 +1332,7 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
+            main_runtime=main_runtime,
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)
@@ -1831,6 +1843,7 @@ class GoalManager:
         *,
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        main_runtime: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1842,6 +1855,11 @@ class GoalManager:
         snapshot for this session. It's handed to the judge so it can decide
         to WAIT on an in-flight process (CI poller, build, ...) instead of
         re-poking the agent — the automatic counterpart to ``/goal wait``.
+
+        ``main_runtime`` is the session's live provider/model runtime; the
+        gateway passes it so the judge's ``auto`` auxiliary resolution follows
+        the session's current route (e.g. after a mid-session preset swap)
+        rather than a process-global snapshot.
 
         Decision keys:
           - ``status``: current goal status after update
@@ -1917,6 +1935,7 @@ class GoalManager:
             subgoals=state.subgoals or None,
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
+            main_runtime=main_runtime,
         )
         state.last_verdict = verdict
         state.last_reason = reason

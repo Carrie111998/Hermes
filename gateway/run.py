@@ -21296,6 +21296,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
+        # Resolve the session's CURRENT runtime (fresh per-turn config read +
+        # session overrides) so the goal judge's `auto` auxiliary resolution
+        # follows a mid-session preset swap instead of a process-global
+        # snapshot from another session or from before the swap. This mirrors
+        # the runtime the next conversation turn would use (#goal judge
+        # RateLimitError loop after preset switches — 2026-08-04).
+        _main_runtime = None
+        try:
+            _turn_model, _turn_runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=self._session_key_for_source(source) if source else None,
+            )
+            if _turn_model:
+                _main_runtime = dict(_turn_runtime or {})
+                _main_runtime["model"] = _turn_model
+        except Exception:
+            logger.debug("goal continuation: session runtime resolution failed", exc_info=True)
+
         # evaluate_after_turn calls judge_goal() which makes a synchronous
         # HTTP request to the auxiliary LLM.  Running it on the event-loop
         # thread would block Discord heartbeats for 10-40 s and cause
@@ -21310,6 +21328,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 final_response or "",
                 user_initiated=True,
                 background_processes=_bg_procs,
+                main_runtime=_main_runtime,
             ),
         )
         msg = decision.get("message") or ""
