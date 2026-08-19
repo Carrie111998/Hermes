@@ -24,6 +24,7 @@ import pytest
 # returns False when pywinpty isn't usable.  Importing the module itself
 # must never raise, otherwise the web_server import branch becomes a trap.
 from hermes_cli.win_pty_bridge import PtyUnavailableError, WinPtyBridge
+from tests.timeout_budget import scaled
 
 windows_only = pytest.mark.skipif(
     not sys.platform.startswith("win"),
@@ -31,12 +32,14 @@ windows_only = pytest.mark.skipif(
 )
 
 
-def _read_until(bridge: WinPtyBridge, needle: bytes, timeout: float = 10.0) -> bytes:
+def _read_until(bridge: WinPtyBridge, needle: bytes, timeout: float | None = None) -> bytes:
     """Accumulate PTY output until we see ``needle`` or time out.
 
     Mirrors the helper in test_pty_bridge.py so failures look familiar.
     """
-    deadline = time.monotonic() + timeout
+    # Incidental safety net around a spawned child, not an assertion:
+    # scaled per rule 2 of tests/timeout_budget.py.
+    deadline = time.monotonic() + (scaled(30.0) if timeout is None else timeout)
     buf = bytearray()
     while time.monotonic() < deadline:
         chunk = bridge.read(timeout=0.2)
@@ -112,14 +115,25 @@ class TestWinPtyBridgeIO:
     def test_write_sends_to_child_stdin(self):
         # python -c reads stdin, echoes a marker, exits.  More reliable than
         # ``cat`` (not on Windows) and doesn't depend on a particular shell.
+        #
+        # The child announces READY *before* it reads, and we wait for that.
+        # Writing as soon as ``spawn()`` returns is a race: the interpreter may
+        # not have attached stdin yet. The observed failure mode is ConPTY
+        # echoing ``hello-pty`` back while the child never emits ``GOT:`` at
+        # all -- it cost one spurious failure in a full tests/hermes_cli run on
+        # 2026-08-18. That is a RACE, not a short deadline: no amount of extra
+        # read timeout can fix a write that was delivered too early.
         script = (
             "import sys; "
+            "sys.stdout.write('READY\\n'); "
+            "sys.stdout.flush(); "
             "line = sys.stdin.readline().strip(); "
             "sys.stdout.write('GOT:' + line + '\\n'); "
             "sys.stdout.flush()"
         )
         bridge = WinPtyBridge.spawn([sys.executable, "-c", script])
         try:
+            assert b"READY" in _read_until(bridge, b"READY"), "child never started"
             bridge.write(b"hello-pty\r\n")
             output = _read_until(bridge, b"GOT:hello-pty")
             assert b"GOT:hello-pty" in output
