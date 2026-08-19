@@ -17,6 +17,10 @@ import {
 } from 'react'
 import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 
+import {
+  type TranscriptIdentity,
+  TranscriptIdentityProvider
+} from '@/components/assistant-ui/thread/transcript-identity'
 import { usePaneLifecycle } from '@/components/pane-shell/pane-visibility'
 import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
@@ -173,6 +177,33 @@ interface ThreadMessageListProps {
   emptyPlaceholder?: ReactNode
   loadingIndicator?: ReactNode
   sessionKey?: string | null
+  transcriptIdentity: TranscriptIdentity
+}
+
+export interface TranscriptIdentitySnapshot {
+  identity: TranscriptIdentity
+  signature: string
+}
+
+export function nextTranscriptIdentitySnapshot(
+  previous: TranscriptIdentitySnapshot,
+  signature: string,
+  candidate: TranscriptIdentity
+): TranscriptIdentitySnapshot {
+  const sameSignature = previous.signature === signature
+  const sameSession = previous.identity.runtimeId === candidate.runtimeId
+
+  // During navigation the destination identity can publish before assistant-ui
+  // replaces the outgoing rows. Keep those rows owned by their source session.
+  if (sameSignature && !sameSession) {
+    return previous
+  }
+
+  if (sameSignature && previous.identity.cwd === candidate.cwd) {
+    return previous
+  }
+
+  return { identity: candidate, signature }
 }
 
 // Group each user message with the assistant turn(s) that follow it so the
@@ -361,7 +392,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   components,
   emptyPlaceholder,
   loadingIndicator,
-  sessionKey
+  sessionKey,
+  transcriptIdentity
 }) => {
   // TWO signatures, deliberately split. The STRUCTURAL one (ids/roles/count)
   // changes only when messages are added/removed/swapped — it keys the error
@@ -374,6 +406,17 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const structuralSignature = useAuiState(s =>
     s.thread.messages.map((message, index) => `${index}:${message.id}:${message.role}`).join('\n')
   )
+
+  const [identitySnapshot, setIdentitySnapshot] = useState<TranscriptIdentitySnapshot>(() => ({
+    identity: transcriptIdentity,
+    signature: structuralSignature
+  }))
+
+  const nextIdentitySnapshot = nextTranscriptIdentitySnapshot(identitySnapshot, structuralSignature, transcriptIdentity)
+
+  if (nextIdentitySnapshot !== identitySnapshot) {
+    setIdentitySnapshot(nextIdentitySnapshot)
+  }
 
   const weightSignature = useAuiState(s =>
     s.thread.messages.map(message => messagePaintWeight(message.content)).join(',')
@@ -783,7 +826,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
                 {t.assistant.thread.showEarlier}
               </button>
             )}
-            {rows}
+            <TranscriptIdentityProvider value={identitySnapshot.identity}>{rows}</TranscriptIdentityProvider>
             {loadingIndicator}
             {clampToComposer && (
               <div

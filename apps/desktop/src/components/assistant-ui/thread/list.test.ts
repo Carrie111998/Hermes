@@ -8,6 +8,7 @@ import {
   LIVE_TAIL_PARTS,
   liveTailStart,
   type MessageGroup,
+  nextTranscriptIdentitySnapshot,
   resolveThreadScrollTarget,
   subscribeToThreadForeground,
   transcriptPaneBudget
@@ -95,6 +96,49 @@ describe('transcriptPaneBudget', () => {
     expect(transcriptPaneBudget(1, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
     expect(transcriptPaneBudget(4, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
     expect(transcriptPaneBudget(1, false)).toBeGreaterThan(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
+  })
+})
+
+describe('nextTranscriptIdentitySnapshot', () => {
+  it('keeps outgoing transcript ownership until the rendered messages change', () => {
+    const source = {
+      identity: { cwd: '/project-a', runtimeId: 'session-a' },
+      signature: 'a-message'
+    }
+
+    expect(
+      nextTranscriptIdentitySnapshot(source, 'a-message', {
+        cwd: '/project-b',
+        runtimeId: 'session-b'
+      })
+    ).toBe(source)
+
+    expect(
+      nextTranscriptIdentitySnapshot(source, 'b-message', {
+        cwd: '/project-b',
+        runtimeId: 'session-b'
+      })
+    ).toEqual({
+      identity: { cwd: '/project-b', runtimeId: 'session-b' },
+      signature: 'b-message'
+    })
+  })
+
+  it('refreshes cwd inside the same transcript session', () => {
+    const source = {
+      identity: { cwd: '/project-a/old', runtimeId: 'session-a' },
+      signature: 'a-message'
+    }
+
+    expect(
+      nextTranscriptIdentitySnapshot(source, 'a-message', {
+        cwd: '/project-a/new',
+        runtimeId: 'session-a'
+      })
+    ).toEqual({
+      identity: { cwd: '/project-a/new', runtimeId: 'session-a' },
+      signature: 'a-message'
+    })
   })
 })
 

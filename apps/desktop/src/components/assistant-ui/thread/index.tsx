@@ -5,6 +5,7 @@ import { ThreadMessageList } from '@/components/assistant-ui/thread/list'
 import { BackgroundResumeNotice, CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
 import { SystemMessage } from '@/components/assistant-ui/thread/system-message'
 import { ThreadTimeline } from '@/components/assistant-ui/thread/timeline'
+import type { TranscriptIdentity } from '@/components/assistant-ui/thread/transcript-identity'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { UserEditComposer } from '@/components/assistant-ui/thread/user-edit-composer'
 import { UserMessage } from '@/components/assistant-ui/thread/user-message'
@@ -116,6 +117,11 @@ export const Thread = memo(function Thread({
   // re-renders for unrelated reasons never re-render the composer.
   const editContext = useMemo(() => ({ cwd, gateway, sessionId }), [cwd, gateway, sessionId])
 
+  const transcriptIdentity = useMemo<TranscriptIdentity>(
+    () => ({ cwd: cwd ?? '', runtimeId: sessionId }),
+    [cwd, sessionId]
+  )
+
   const hasBranchInNewChat = Boolean(onBranchInNewChat)
   const hasCancel = Boolean(onCancel)
   const hasDismissError = Boolean(onDismissError)
@@ -169,6 +175,7 @@ export const Thread = memo(function Thread({
           emptyPlaceholder={emptyPlaceholder}
           loadingIndicator={loadingIndicator}
           sessionKey={sessionKey}
+          transcriptIdentity={transcriptIdentity}
         />
         {loading === 'session' && <CenteredThreadSpinner />}
         <ThreadTimeline />
