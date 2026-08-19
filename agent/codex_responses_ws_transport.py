@@ -33,17 +33,13 @@ _TERMINAL_EVENT_TYPES = frozenset(
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15.0
 DEFAULT_RECV_POLL_SECONDS = 1.0
 DEFAULT_IDLE_TIMEOUT_SECONDS = 180.0
-# Mirror the outer API retry budget for transport-level reconnects. Each
-# attempt opens a *new* WebSocket and issues a fresh response.create.
+# Retry only failures that occur before ``response.create`` reaches the
+# WebSocket send boundary. A later retry would issue a new request whose first
+# request may already have executed remotely.
 DEFAULT_WS_MAX_ATTEMPTS = 3
-# Lifecycle frames alone do not commit user-visible/tool-affecting output, so
-# a subsequent transport drop is still safe to retry or fall back from.
-_LIFECYCLE_ONLY_EVENT_TYPES = frozenset(
-    {
-        "response.created",
-        "response.in_progress",
-    }
-)
+# Used only for event classification/observability. These lifecycle frames do
+# not alter the stricter rule that any failure after send is non-retryable.
+_LIFECYCLE_ONLY_EVENT_TYPES = frozenset({"response.created", "response.in_progress"})
 _TRANSIENT_WS_FAILURE_MARKERS = (
     "1011",
     "1013",
@@ -84,10 +80,9 @@ class GenericWsNotStartedError(RuntimeError):
 class GenericWsStartedError(RuntimeError):
     """The request crossed the send boundary.
 
-    ``retryable=True`` means no committed model/tool output was delivered yet,
-    so a *new* attempt (fresh WS / outer API retry / auto→SSE) is safe.
-    ``retryable=False`` means partial output may already have been observed and
-    must not be replayed.
+    A send is ambiguous: even if no local output was observed, the remote
+    endpoint may have accepted or executed the request. Started failures are
+    therefore never retryable or eligible for automatic fallback.
     """
 
     def __init__(
@@ -376,10 +371,9 @@ def is_transient_ws_failure(exc: BaseException) -> bool:
 
 
 def _classify_started_retryable(*, output_committed: bool, exc: BaseException) -> bool:
-    """After send, only retry when no committed output has been observed."""
-    if output_committed:
-        return False
-    return is_transient_ws_failure(exc)
+    """Never retry after send: no local observation proves remote non-execution."""
+    del output_committed, exc
+    return False
 
 
 def run_generic_codex_ws_stream(
@@ -406,8 +400,8 @@ def run_generic_codex_ws_stream(
     ``collect_events`` owns all Responses event semantics; this module only
     converts the wire frames and enforces the no-replay boundary at ``send``.
 
-    Transport-level retries open a *new* WebSocket for each attempt and only
-    continue when the previous attempt was clean (no committed output).
+    Transport-level retries open a *new* WebSocket only when the previous
+    attempt failed before ``response.create`` was sent.
     """
     del session_id  # Generic providers do not share a session header contract.
     normalized_transport = normalize_responses_transport(transport)
@@ -512,12 +506,10 @@ def run_generic_codex_ws_stream(
                                 _server_error_message(event),
                                 status_code=_server_error_status(event),
                                 body=event,
-                                retryable=bool(
-                                    _server_error_status(event) in {408, 409, 425, 429}
-                                    or is_transient_ws_failure(
-                                        Exception(_server_error_message(event))
-                                    )
-                                ),
+                                # This frame arrives only after response.create
+                                # was sent; a rejection does not prove the request
+                                # was not processed, so never replay automatically.
+                                retryable=False,
                             )
                         if is_output_committed_event(event):
                             output_committed = True

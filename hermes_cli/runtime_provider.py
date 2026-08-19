@@ -816,7 +816,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     if api_mode:
                         result["api_mode"] = api_mode
                     _lift_responses_ws_transport(
-                        entry, result, identity=f"custom:{name_norm}",
+                        entry, result, identity=f"custom:{_normalize_custom_provider_name(display_name or ep_name)}",
                     )
                     _lift_max_output_tokens(entry, result)
                     return result
@@ -866,7 +866,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         _lift_responses_ws_transport(
             entry,
             result,
-            identity=provider_menu_key or menu_key,
+            identity=f"custom:{_normalize_custom_provider_name(name)}",
         )
         model_name = str(entry.get("model", "") or "").strip()
         if model_name:

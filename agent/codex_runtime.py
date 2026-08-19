@@ -1463,9 +1463,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 api_kwargs.get("model", "unknown"),
             )
         except GenericWsRejectedError as exc:
-            # Explicit server rejection after start: never replay via SSE unless
-            # the rejection itself is marked retryable *and* transport=auto with
-            # no committed output (handled by retryable flag + outer loop).
+            # A server rejection arrives after response.create was sent. It is
+            # not proof of non-execution, so never replay it automatically.
             logger.warning(
                 "Generic Codex Responses WebSocket rejected by server "
                 "(status=%s retryable=%s): %s",
@@ -1475,26 +1474,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             raise
         except GenericWsStartedError as exc:
-            # Clean after-start failures (no committed output) may fall back to
-            # SSE under auto, matching pre-start recovery. Partial-output
-            # failures stay hard-fail to avoid double delivery.
-            if transport == "auto" and getattr(exc, "retryable", False):
-                agent._generic_ws_auto_disabled_for = ws_identity
-                logger.warning(
-                    "Generic Codex Responses WebSocket failed after request start "
-                    "with no committed output; falling back to SSE for this "
-                    "runtime (model=%s): %s",
-                    api_kwargs.get("model", "unknown"),
-                    exc,
-                )
-            else:
-                logger.warning(
-                    "Generic Codex Responses WebSocket failed after request start "
-                    "(no SSE replay, retryable=%s): %s",
-                    getattr(exc, "retryable", False),
-                    exc,
-                )
-                raise
+            # Any failure after response.create crosses an ambiguous execution
+            # boundary. Do not retry or fall back to SSE, even when no output
+            # was observed locally; the remote request may already be running.
+            logger.warning(
+                "Generic Codex Responses WebSocket failed after request start "
+                "(no automatic replay): %s",
+                exc,
+            )
+            raise
         finally:
             if getattr(agent, "_active_request_abort", None) is registered_abort["callback"]:
                 agent._active_request_abort = None

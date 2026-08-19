@@ -229,7 +229,7 @@ def test_generic_ws_stream_sends_response_create_and_reuses_event_consumer(monke
     assert result.output_text == "hello"
 
 
-def test_ws_failure_after_send_is_retryable_when_no_output(monkeypatch):
+def test_ws_failure_after_send_is_not_retryable_even_without_output(monkeypatch):
     import agent.codex_responses_ws_transport as transport
 
     sockets = []
@@ -257,16 +257,17 @@ def test_ws_failure_after_send_is_retryable_when_no_output(monkeypatch):
             interrupted=lambda: False,
             max_attempts=3,
         )
-    assert excinfo.value.retryable is True
-    assert len(sockets) == 3
+    # send() is an ambiguous execution boundary: the proxy may have forwarded
+    # response.create even though no output was observed locally.
+    assert excinfo.value.retryable is False
+    assert len(sockets) == 1
     assert all(socket.sent for socket in sockets)
 
 
-def test_ws_retries_then_succeeds_on_clean_after_start_failure(monkeypatch):
+def test_ws_retries_then_succeeds_on_pre_send_connection_failure(monkeypatch):
     import agent.codex_responses_ws_transport as transport
 
     sockets = [
-        _FakeSocket(send_error=OSError("received 1011 (internal error) upstream websocket proxy failed")),
         _FakeSocket(
             [
                 json.dumps({"type": "response.created"}),
@@ -280,7 +281,9 @@ def test_ws_retries_then_succeeds_on_clean_after_start_failure(monkeypatch):
     def connect(*_args, **_kwargs):
         idx = connect_calls["n"]
         connect_calls["n"] += 1
-        return sockets[idx]
+        if idx == 0:
+            raise OSError("connection reset before WebSocket request start")
+        return sockets[idx - 1]
 
     monkeypatch.setattr(transport, "_connect_websocket", connect)
     collected = []
@@ -608,30 +611,26 @@ def test_error_classifier_handles_generic_ws_errors():
     assert not_started.retryable is True
     assert not_started.should_fallback is True
 
-    started_clean = classify_api_error(
+    started = classify_api_error(
         GenericWsStartedError(
             "received 1011 (internal error) upstream websocket proxy failed",
             retryable=True,
         )
     )
-    assert started_clean.retryable is True
-    assert started_clean.should_fallback is True
-    assert started_clean.reason == FailoverReason.timeout
-
-    started_partial = classify_api_error(GenericWsStartedError("after send", retryable=False))
-    assert started_partial.retryable is False
-    assert started_partial.should_fallback is True
-    assert started_partial.reason == FailoverReason.server_error
+    assert started.retryable is False
+    assert started.should_fallback is False
+    assert started.reason == FailoverReason.server_error
 
     rejected = classify_api_error(
-        GenericWsRejectedError("bad request", status_code=400)
+        GenericWsRejectedError("bad request", status_code=400, retryable=True)
     )
     assert rejected.status_code == 400
-    assert rejected.should_fallback is True
+    assert rejected.retryable is False
+    assert rejected.should_fallback is False
 
 
-def test_run_codex_stream_auto_falls_back_to_sse_on_clean_started_error(monkeypatch):
-    """auto mode should SSE-fallback after clean after-start WS failures."""
+def test_run_codex_stream_auto_does_not_fallback_to_sse_after_started_error(monkeypatch):
+    """auto mode must not replay an ambiguously sent request through SSE."""
     import agent.codex_responses_ws_transport as transport
     from agent.codex_runtime import run_codex_stream
 
@@ -703,8 +702,8 @@ def test_run_codex_stream_auto_falls_back_to_sse_on_clean_started_error(monkeypa
     monkeypatch.setattr(ws_mod, "run_generic_codex_ws_stream", fake_ws)
 
     client = SimpleNamespace(responses=SimpleNamespace(create=create))
-    result = run_codex_stream(agent, {"model": "gpt-5", "input": "hello"}, client=client)
-    assert result.output == [output_item]
+    with pytest.raises(transport.GenericWsStartedError):
+        run_codex_stream(agent, {"model": "gpt-5", "input": "hello"}, client=client)
     assert ws_calls["n"] == 1
-    assert sse_calls["n"] == 1
-    assert agent._generic_ws_auto_disabled_for is not None
+    assert sse_calls["n"] == 0
+    assert agent._generic_ws_auto_disabled_for is None
