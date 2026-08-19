@@ -858,6 +858,66 @@ def test_minimax_config_base_url_overrides_hardcoded_default(monkeypatch):
     assert resolved["api_mode"] == "anthropic_messages"
 
 
+def test_zai_config_base_url_overrides_auto_detected_env_pool_route(monkeypatch):
+    """An auto-detected pool route must not override explicit model config."""
+    entry = SimpleNamespace(
+        access_token="glm-key",
+        runtime_api_key="glm-key",
+        source="env:GLM_API_KEY",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        runtime_base_url=None,
+    )
+    monkeypatch.delenv("GLM_BASE_URL", raising=False)
+
+    resolved = rp._resolve_runtime_from_pool_entry(
+        provider="zai",
+        entry=entry,
+        requested_provider="zai",
+        model_cfg={
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/paas/v4",
+        },
+    )
+
+    assert resolved["base_url"] == "https://api.z.ai/api/paas/v4"
+
+
+@pytest.mark.parametrize(
+    ("source", "env_base_url"),
+    [
+        ("env:GLM_API_KEY", "https://api.z.ai/api/coding/paas/v4"),
+        ("manual:account-1", ""),
+    ],
+)
+def test_zai_explicit_pool_routes_override_model_config(
+    monkeypatch, source, env_base_url
+):
+    """Explicit env and manual-account routes retain their existing precedence."""
+    entry = SimpleNamespace(
+        access_token="glm-key",
+        runtime_api_key="glm-key",
+        source=source,
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        runtime_base_url=None,
+    )
+    if env_base_url:
+        monkeypatch.setenv("GLM_BASE_URL", env_base_url)
+    else:
+        monkeypatch.delenv("GLM_BASE_URL", raising=False)
+
+    resolved = rp._resolve_runtime_from_pool_entry(
+        provider="zai",
+        entry=entry,
+        requested_provider="zai",
+        model_cfg={
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/paas/v4",
+        },
+    )
+
+    assert resolved["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+
+
 def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch):
     """opencode-zen/go re-derive api_mode from the effective model on every
     resolve, ignoring any persisted ``api_mode`` in config. Refs #16878 /
