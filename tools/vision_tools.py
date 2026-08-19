@@ -660,6 +660,28 @@ def _is_image_size_error(error: Exception) -> bool:
     ))
 
 
+def _is_public_image_fetch_error(error: Exception) -> bool:
+    """Return whether a provider rejected or could not fetch an image URL."""
+    err_str = str(error).lower()
+    if any(hint in err_str for hint in (
+        "could not fetch image",
+        "couldn't fetch image",
+        "failed to fetch image",
+        "unable to fetch image",
+        "image download failed",
+        "failed to download image",
+        "unable to download image",
+        "could not download image",
+        "failed to load image",
+    )):
+        return True
+    return (
+        "image_url" in err_str or "image url" in err_str
+    ) and any(hint in err_str for hint in (
+        "invalid", "unsupported", "not support", "reject",
+    ))
+
+
 def _image_exceeds_dimension(image_path: Path, max_dimension: int) -> bool:
     """True if the image's longest side exceeds ``max_dimension`` px.
 
@@ -1470,6 +1492,7 @@ async def vision_analyze_tool(
             if region is None and _image_url_shape_ok(image_url)
             else None
         )
+        used_inline_image = public_image_url is None
 
         # Prepare the message. The inline payload remains available as a
         # fallback for providers that cannot fetch the public URL themselves.
@@ -1548,16 +1571,19 @@ async def vision_analyze_tool(
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
-            if public_image_url:
+            if public_image_url and _is_public_image_fetch_error(_api_err):
                 logger.info(
                     "Vision provider could not use the public image URL; "
                     "retrying with inline image bytes"
                 )
+                used_inline_image = True
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
                 try:
                     response = await async_call_llm(**call_kwargs)
                 except Exception as _inline_err:
                     response = await _retry_with_resized_inline(_inline_err)
+            elif public_image_url:
+                raise
             else:
                 response = await _retry_with_resized_inline(_api_err)
         
@@ -1577,7 +1603,8 @@ async def vision_analyze_tool(
         # Prepare successful response
         analysis = analysis or "There was a problem with the request and the image could not be analyzed."
         scale_note = _build_scale_note(
-            _scale_info or None, _crop_offset or None,
+            (_scale_info or None) if used_inline_image else None,
+            _crop_offset or None,
         )
         result = {
             "success": True,

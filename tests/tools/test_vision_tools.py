@@ -374,6 +374,81 @@ class TestPublicImageUrlPassthrough:
         assert sent_urls == [public_url, inline_url]
 
     @pytest.mark.asyncio
+    async def test_non_fetch_error_does_not_retry_inline(self):
+        public_url = "https://images.example.com/cat.png"
+        resolved = MagicMock(
+            data=b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+            mime="image/png",
+        )
+
+        with (
+            patch(
+                "tools.image_source.resolve_image_source",
+                new_callable=AsyncMock,
+                return_value=resolved,
+            ),
+            patch(
+                "tools.vision_tools._image_to_base64_data_url",
+                return_value="data:image/png;base64,abc",
+            ),
+            patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("rate limit exceeded"),
+            ) as mock_llm,
+        ):
+            result = json.loads(
+                await vision_analyze_tool(public_url, "describe this", "test/model")
+            )
+
+        assert result["success"] is False
+        assert "rate limit exceeded" in result["error"]
+        mock_llm.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_public_url_success_omits_inline_resize_note(self):
+        public_url = "https://images.example.com/large.png"
+        resolved = MagicMock(
+            data=b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+            mime="image/png",
+        )
+
+        def fake_resize(*args, scale_out=None, **kwargs):
+            scale_out.update(
+                orig_width=4000,
+                orig_height=2000,
+                new_width=1000,
+                new_height=500,
+            )
+            return "data:small"
+
+        with (
+            patch(
+                "tools.image_source.resolve_image_source",
+                new_callable=AsyncMock,
+                return_value=resolved,
+            ),
+            patch(
+                "tools.vision_tools._image_to_base64_data_url",
+                return_value="data:image/png;base64,oversized",
+            ),
+            patch("tools.vision_tools._MAX_BASE64_BYTES", 10),
+            patch("tools.vision_tools._resize_image_for_vision", side_effect=fake_resize),
+            patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                return_value=self._response(),
+            ),
+        ):
+            result = json.loads(
+                await vision_analyze_tool(public_url, "describe this", "test/model")
+            )
+
+        assert result["success"] is True
+        assert result["analysis"] == "Public URL image"
+        assert "scale_note" not in result
+
+    @pytest.mark.asyncio
     async def test_public_url_region_uses_cropped_inline_image(self, tmp_path):
         public_url = "https://images.example.com/cat.png"
         inline_url = "data:image/png;base64,cropped"
