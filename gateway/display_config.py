@@ -1,7 +1,7 @@
-"""Per-platform display/verbosity configuration resolver.
+"""Per-chat-type and per-platform display configuration resolver.
 
 Provides ``resolve_display_setting()`` — the single entry-point for reading
-display settings with platform-specific overrides and sensible defaults.
+display settings with chat-type/platform overrides and sensible defaults.
 
 Resolution order (first non-None wins):
     1. ``display.platforms.<platform>.chat_types.<chat_type>.<key>``
@@ -185,6 +185,13 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 # Canonical set of per-platform overrideable keys (for validation).
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
+# Chat-type overrides are resolved per turn. Process-global formatter knobs
+# must stay at platform/global scope or concurrent turns can overwrite each
+# other's renderer state.
+CHAT_TYPE_OVERRIDEABLE_KEYS = (
+    OVERRIDEABLE_KEYS - {"tool_preview_length"}
+) | {"thinking_progress"}
+
 
 def resolve_display_setting(
     user_config: dict,
@@ -194,7 +201,7 @@ def resolve_display_setting(
     *,
     chat_type: str | None = None,
 ) -> Any:
-    """Resolve a display setting with per-platform override support.
+    """Resolve a display setting with chat-type and platform overrides.
 
     Parameters
     ----------
@@ -225,7 +232,11 @@ def resolve_display_setting(
     if isinstance(plat_overrides, dict):
         chat_type_key = _normalise_chat_type(chat_type)
         chat_types = plat_overrides.get("chat_types")
-        if chat_type_key and isinstance(chat_types, dict):
+        if (
+            setting in CHAT_TYPE_OVERRIDEABLE_KEYS
+            and chat_type_key
+            and isinstance(chat_types, dict)
+        ):
             chat_overrides = chat_types.get(chat_type_key)
             if isinstance(chat_overrides, dict):
                 val = chat_overrides.get(setting)
@@ -339,5 +350,9 @@ def _normalise_chat_type(value: str | None) -> str | None:
     aliases = {
         "direct": "dm",
         "private": "dm",
+        "forum": "group",
+        "supergroup": "group",
+        "channel": "group",
+        "thread": "group",
     }
     return aliases.get(key, key)
