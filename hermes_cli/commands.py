@@ -294,6 +294,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("wake", "Toggle the 'Hey Hermes' wake word listener", "Configuration",
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status")),
+    CommandDef("tokens", "Toggle a per-message token breakdown footer on replies", "Configuration",
+               args_hint="[on|off|always|status]", subcommands=("on", "off", "always", "status")),
     CommandDef("busy", "Control what Enter does while Hermes is working", "Configuration",
                cli_only=True, args_hint="[queue|steer|interrupt|status]",
                subcommands=("queue", "steer", "interrupt", "status")),
@@ -714,6 +716,7 @@ _TELEGRAM_MENU_PRIORITY = (
     # Lower-priority but still useful operational built-ins.
     "reasoning",
     "usage",
+    "tokens",
     "platforms",
     "platform",
     "profile",
@@ -1346,7 +1349,13 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform"})
+#   - tokens: the per-message token-footer display toggle — a set-once
+#     preference that persists per chat, not a recurring surface, so reaching
+#     it as /hermes tokens costs one interaction in total. Listed here because
+#     the registry was already AT the 50-cap when /tokens was added: a native
+#     slot would tip it past the cap and silently clamp an established slash,
+#     breaking Telegram parity. The new arrival yields rather than evicting one.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform", "tokens"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

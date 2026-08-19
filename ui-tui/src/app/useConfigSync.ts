@@ -288,6 +288,7 @@ export const applyDisplay = (
     pasteCollapseChars: _pasteCollapseCharsFromConfig(cfg),
     sections: resolveSections(d.sections),
     showReasoning: !!d.show_reasoning,
+    showTokens: !!d.show_message_tokens,
     statusBar: normalizeStatusBar(d.tui_statusbar),
     streaming: d.streaming !== false,
     // The SAME key that stamps [HH:MM] on classic-CLI labels (#41531) —
