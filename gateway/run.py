@@ -530,6 +530,15 @@ def _non_conversational_metadata(
     return merged
 
 
+def _transient_progress_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Mark non-final progress so transport adapters can preserve final quota."""
+    merged = dict(metadata or {})
+    merged["transient_progress"] = True
+    return merged
+
+
 def _seed_hygiene_system_prompt(
     agent: Any,
     session_row: Optional[Dict[str, Any]],
@@ -5320,6 +5329,9 @@ class TurnRunner:
                         chat_id=ctx.source.chat_id,
                         config=_consumer_cfg,
                         metadata=ctx._status_thread_metadata,
+                        commentary_metadata=_transient_progress_metadata(
+                            ctx._status_thread_metadata
+                        ),
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",)))
                             if ctx.progress_queue is not None
@@ -5364,7 +5376,9 @@ class TurnRunner:
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    metadata=_transient_progress_metadata(
+                        ctx._status_thread_metadata
+                    ),
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -5751,7 +5765,12 @@ class TurnRunner:
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     message,
-                    metadata=_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform),
+                    metadata=_transient_progress_metadata(
+                        _non_conversational_metadata(
+                            ctx._status_thread_metadata,
+                            platform=ctx.source.platform,
+                        )
+                    ),
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -27442,6 +27461,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=source.chat_id,
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
+                        commentary_metadata=_transient_progress_metadata(
+                            _thread_metadata
+                        ),
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
@@ -28182,6 +28204,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # reply anchor; carry it so progress joins that thread.
             _progress_metadata = {"reply_to_message_id": event_message_id}
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _progress_metadata = _transient_progress_metadata(_progress_metadata)
         if _native_slack_task_cards:
             # chat.startStream in channels requires the recipient team/user
             # pair; harmless extras elsewhere, so stamp them whenever known.
@@ -28601,7 +28624,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                            metadata=_transient_progress_metadata(
+                                _non_conversational_metadata(
+                                    _status_thread_metadata,
+                                    platform=source.platform,
+                                )
+                            ),
                         )
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
