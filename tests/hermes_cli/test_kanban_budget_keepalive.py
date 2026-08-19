@@ -414,6 +414,64 @@ def test_cli_lock_honors_kanban_env_ahead_of_config():
     ) is None
 
 
+def test_process_env_max_iterations_requires_dispatcher_identity(monkeypatch):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+    monkeypatch.setenv("HERMES_KANBAN_MAX_ITERATIONS", "180")
+    assert keepalive.effective_kanban_max_iterations() == 180
+    with non_dispatcher_owned_context():
+        assert keepalive.effective_kanban_max_iterations() is None
+        # Spawn-time / test callers still pass an explicit mapping.
+        assert keepalive.effective_kanban_max_iterations(
+            {
+                "HERMES_KANBAN_TASK": "t_abc",
+                "HERMES_KANBAN_MAX_ITERATIONS": "180",
+            }
+        ) == 180
+
+
+def test_budget_burn_inside_open_write_txn_records_zero_failures(kanban_home):
+    conn = kb.connect()
+    client = keepalive.RecordingRemokoClient()
+    try:
+        task = _running_task(conn)
+        before = _failures(conn, task.id)
+        with kb.write_txn(conn):
+            decision = keepalive.record_kanban_budget_exhausted(
+                conn, task.id, budget_used=90, budget_max=90, remoko_client=client
+            )
+        after = _failures(conn, task.id)
+        assert after["consecutive_failures"] == before["consecutive_failures"] == 0
+        assert after["status"] == "blocked"
+        assert after["block_kind"] == "needs_input"
+        assert decision.status == "pending"
+        assert len(client.ask_calls) == 1
+        assert _events(conn, task.id, "budget_exhausted") == ["budget_exhausted"]
+    finally:
+        conn.close()
+
+
+def test_env_fallback_keepalive_skips_non_dispatcher_identity(monkeypatch, kanban_home):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    client = keepalive.RecordingRemokoClient()
+    with non_dispatcher_owned_context():
+        decision = keepalive.record_iteration_budget_exhausted(
+            budget_used=90,
+            budget_max=90,
+            remoko_client=client,
+        )
+    assert decision is None
+    assert client.ask_calls == []
+    conn = kb.connect()
+    try:
+        assert keepalive.get_decision(conn, "t_parent") is None
+    finally:
+        conn.close()
+
+
 def test_sidecar_used_for_subagent_even_with_kanban_env(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
     client = keepalive.RecordingRemokoClient()

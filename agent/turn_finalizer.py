@@ -56,6 +56,21 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def _dispatcher_owned_kanban_task() -> str:
+    """Return ``HERMES_KANBAN_TASK`` only for the dispatcher-owned worker.
+
+    Cron / delegate_task children share the worker process env, so an
+    ungated read would park the parent card when the child burns turns.
+    """
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+    except Exception:
+        return ""
+    if not is_dispatcher_owned_worker_context():
+        return ""
+    return os.environ.get("HERMES_KANBAN_TASK") or ""
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str,
     api_call_count: int,
@@ -184,7 +199,7 @@ def finalize_turn(
         # objective and asks Remoko; regular CLI chats no-op. Wall-clock
         # ``max_runtime_seconds`` still uses ``_record_task_failure``.
         _record_kanban_budget_exhausted(
-            os.environ.get("HERMES_KANBAN_TASK") or "",
+            _dispatcher_owned_kanban_task(),
             api_call_count,
             agent.max_iterations,
             logger,
@@ -197,7 +212,7 @@ def finalize_turn(
         # ``budget_exhausted`` outcome so a live objective does not sit
         # ambiguous and does not count toward ``gave_up``.
         _record_kanban_budget_exhausted(
-            os.environ.get("HERMES_KANBAN_TASK") or "",
+            _dispatcher_owned_kanban_task(),
             api_call_count,
             agent.max_iterations,
             logger,

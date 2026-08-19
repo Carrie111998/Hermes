@@ -152,6 +152,7 @@ class TestDelegatedChildMarker:
                 "HERMES_KANBAN_RUN_ID": "123",
                 "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
                 "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+                "HERMES_KANBAN_MAX_ITERATIONS": "180",
             },
             clear=True,
         ):
@@ -163,6 +164,7 @@ class TestDelegatedChildMarker:
         assert "HERMES_KANBAN_RUN_ID" not in env
         assert "HERMES_KANBAN_DB" not in env
         assert "HERMES_KANBAN_WORKSPACE" not in env
+        assert "HERMES_KANBAN_MAX_ITERATIONS" not in env
         assert env["MY_APP_VAR"] == "keep-me"
 
 

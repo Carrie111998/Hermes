@@ -230,8 +230,19 @@ def effective_kanban_max_iterations(
     """Return HERMES_KANBAN_MAX_ITERATIONS when this process is a kanban worker.
 
     Honoured ahead of ``agent.max_turns`` so a granted +90 survives restart.
+    Process-env reads are identity-gated: cron / delegate_task children
+    inherit the worker's os.environ but must not take its iteration lock.
+    An explicit *env* mapping (dispatcher spawn, unit tests) is trusted
+    as-is because the caller is constructing a worker identity.
     """
-    source = env if env is not None else os.environ
+    if env is None:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if not is_dispatcher_owned_worker_context():
+            return None
+        source = os.environ
+    else:
+        source = env
     if not str(source.get("HERMES_KANBAN_TASK") or "").strip():
         return None
     raw = source.get("HERMES_KANBAN_MAX_ITERATIONS")
@@ -1082,10 +1093,12 @@ def record_iteration_budget_exhausted(
             session_id=str(getattr(agent, "session_id", "") or ""),
         )
 
-    live_task = (
-        str(task_id or "").strip()
-        or str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    )
+    live_task = str(task_id or "").strip()
+    if not live_task:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if is_dispatcher_owned_worker_context():
+            live_task = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not live_task:
         return None
 

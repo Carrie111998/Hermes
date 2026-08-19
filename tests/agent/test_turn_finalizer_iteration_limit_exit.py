@@ -165,6 +165,33 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
+def test_pending_response_skips_parent_task_outside_dispatcher_identity(monkeypatch):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-cron-leak")
+    record = MagicMock(name="record_iteration_budget_exhausted")
+    monkeypatch.setattr(
+        "hermes_cli.kanban_budget_keepalive.record_iteration_budget_exhausted",
+        record,
+    )
+    fail = MagicMock(name="record_task_failure")
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", fail)
+    agent = _LimitAgent()
+
+    with non_dispatcher_owned_context():
+        _finalize(
+            agent,
+            final_response=None,
+            exit_reason="unknown",
+            pending_verification_response="composed report",
+        )
+
+    record.assert_called_once()
+    assert record.call_args.kwargs["task_id"] == ""
+    fail.assert_not_called()
+
+
 def test_pending_response_records_kanban_keepalive(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")

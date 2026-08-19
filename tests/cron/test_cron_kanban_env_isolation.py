@@ -444,3 +444,19 @@ def test_every_dispatcher_kanban_var_is_identity_gated():
         f"dispatcher injects {sorted(uncovered)} which is neither in "
         "KANBAN_ENV_KEYS nor explicitly classified as behaviour-only"
     )
+
+
+def test_scrub_kanban_env_drops_max_iterations():
+    from agent.delegation_context import scrub_kanban_env
+
+    cleaned = scrub_kanban_env(
+        {
+            "HERMES_KANBAN_TASK": "t_abc",
+            "HERMES_KANBAN_MAX_ITERATIONS": "180",
+            "PATH": "/usr/bin",
+        }
+    )
+    assert "HERMES_KANBAN_TASK" not in cleaned
+    assert "HERMES_KANBAN_MAX_ITERATIONS" not in cleaned
+    assert cleaned["PATH"] == "/usr/bin"
+    assert cleaned.get("HERMES_DELEGATED_CHILD_CONTEXT") == "1"
