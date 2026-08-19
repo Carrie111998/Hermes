@@ -1995,24 +1995,34 @@ CREATE TABLE IF NOT EXISTS session_bridge_state (
     updated_at REAL NOT NULL
 );
 
--- ``list_sidebar_candidates`` computes each Claude row's ``last_active`` by
--- json_extract-ing this table over every candidate session, then sorts the
--- whole set before LIMIT can cut it.  Indexing the extracted value makes the
--- key lookup covering: SQLite reads a precomputed REAL instead of fetching the
--- row and parsing its JSON.  The ``json_valid`` guard keeps the expression
--- total -- without it, indexing json_extract would make ANY non-JSON write to
--- session_bridge_state fail with "malformed JSON", coupling ten unrelated
--- writers to this index.  The query must repeat this expression verbatim for
--- SQLite to substitute the indexed value.
-CREATE INDEX IF NOT EXISTS idx_session_bridge_state_activity
+-- ``list_sidebar_candidates`` orders Claude candidates by a ``last_active``
+-- that only exists inside this table's JSON, so without an index SQLite had to
+-- compute it for every candidate and sort the whole set before LIMIT could cut
+-- it.  Indexing the extracted value DESC, key lets the Claude arm read its page
+-- straight off the index in final order and stop at LIMIT: the key is
+-- ``<constant prefix> || session_id``, so ordering by key is ordering by
+-- session_id and the index satisfies ``last_active DESC, session_id`` outright.
+--
+-- The ``json_valid`` guard keeps the expression total.  Without it, indexing
+-- json_extract would make ANY non-JSON write to session_bridge_state fail with
+-- "malformed JSON", coupling ten unrelated writers to this index.  The query
+-- must repeat this expression verbatim for SQLite to substitute the indexed
+-- value.
+CREATE INDEX IF NOT EXISTS idx_session_bridge_state_activity_ordered
     ON session_bridge_state(
-        key,
         CASE
             WHEN json_valid(value_json) THEN CAST(json_extract(
                 value_json, '$.last_active'
             ) AS REAL)
-        END
+        END DESC,
+        key
     );
+
+-- Superseded by the ordered index above.  The first cut of this optimisation
+-- indexed (key, <expr>) to make the per-candidate key lookup covering; the
+-- query no longer looks activity rows up by key at all, so keeping it would
+-- cost every session_bridge_state write a second expression index for nothing.
+DROP INDEX IF EXISTS idx_session_bridge_state_activity;
 
 CREATE TABLE IF NOT EXISTS session_bridge_migrations (
     migration_name TEXT PRIMARY KEY,

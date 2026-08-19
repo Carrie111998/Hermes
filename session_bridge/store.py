@@ -133,6 +133,14 @@ _CLAUDE_LINEAGE_SOURCE_PROVENANCE_MISMATCH = "claude_lineage_source_provenance_m
 _CLAUDE_LINEAGE_INVALID_COMPLETION = "claude_lineage_invalid_completion"
 _CLAUDE_LINEAGE_CONFLICT = "claude_lineage_conflict"
 _PROFILE_SHADOW_SOURCE = "session_bridge_profile"
+_EXTERNAL_ACTIVITY_KEY_PREFIX = "session-bridge:external-activity:"
+# Repeated verbatim by idx_session_bridge_state_activity_ordered.  SQLite only
+# substitutes the indexed value -- and only satisfies the ORDER BY from the
+# index -- when the query's expression matches the index's exactly.
+_SIDEBAR_ACTIVITY_EXPR = (
+    "CASE WHEN json_valid(activity.value_json) "
+    "THEN CAST(json_extract(activity.value_json, '$.last_active') AS REAL) END"
+)
 _WORKTREE_SNAPSHOT_STATE_PREFIX = "session-bridge:worktree:"
 _WORKTREE_SNAPSHOT_FIELDS = frozenset({
     "version",
@@ -4521,26 +4529,39 @@ class SessionBridgeStore:
         ):
             raise ValueError("sidebar candidate limit must be between 1 and 1000")
         normalized_cursor = _validated_sidebar_candidate_cursor(cursor)
-        cursor_clause = ""
-        cutoff_clause = ""
+        claude_cursor_clause = ""
+        hermes_cursor_clause = ""
+        claude_cutoff_clause = ""
+        hermes_cutoff_clause = ""
         params: dict[str, Any] = {
             "claude": Provider.CLAUDE.value,
             "native": OriginKind.NATIVE.value,
-            "activity_prefix": "session-bridge:external-activity:",
+            "activity_prefix": _EXTERNAL_ACTIVITY_KEY_PREFIX,
+            "activity_prefix_len": len(_EXTERNAL_ACTIVITY_KEY_PREFIX),
             "profile_shadow_source": _PROFILE_SHADOW_SOURCE,
             "query_limit": limit + 1,
         }
         if cutoff is not None:
-            cutoff_clause = "AND last_active >= :after"
+            claude_cutoff_clause = f"AND {_SIDEBAR_ACTIVITY_EXPR} >= :after"
+            hermes_cutoff_clause = "AND last_active >= :after"
             params["after"] = cutoff
         if normalized_cursor is not None:
-            cursor_clause = """AND (
-                candidate.last_active < :cursor_activity
-                OR (
-                    candidate.last_active = :cursor_activity
-                    AND candidate.session_id > :cursor_session_id
-                )
-            )"""
+            claude_cursor_clause = f"""AND (
+                              {_SIDEBAR_ACTIVITY_EXPR} < :cursor_activity
+                              OR (
+                                  {_SIDEBAR_ACTIVITY_EXPR} = :cursor_activity
+                                  AND substr(
+                                      activity.key, :activity_prefix_len + 1
+                                  ) > :cursor_session_id
+                              )
+                          )"""
+            hermes_cursor_clause = """AND (
+                              last_active < :cursor_activity
+                              OR (
+                                  last_active = :cursor_activity
+                                  AND session_id > :cursor_session_id
+                              )
+                          )"""
             params["cursor_activity"] = normalized_cursor[0]
             params["cursor_session_id"] = normalized_cursor[1]
 
@@ -4548,8 +4569,11 @@ class SessionBridgeStore:
             conn = self.db._conn
             assert conn is not None
             rows = conn.execute(
-                f"""WITH source_metadata AS (
-                       SELECT s.id AS session_id, s.source, s.model_config,
+                f"""WITH claude_candidate AS (
+                       SELECT substr(
+                                  activity.key, :activity_prefix_len + 1
+                              ) AS session_id,
+                              s.source, s.model_config,
                               s.title, s.cwd, s.started_at, s.git_branch,
                               s.git_repo_root,
                               e.provider AS external_provider,
@@ -4558,25 +4582,68 @@ class SessionBridgeStore:
                               e.last_native_cursor, e.last_native_hash,
                               e.last_indexed_at, e.parser_version, e.origin_kind,
                               e.origin_bridge_id,
+                              {_SIDEBAR_ACTIVITY_EXPR} AS last_active,
+                              CASE WHEN s.source = 'cron' THEN 1 ELSE 0 END
+                                  AS automation_only,
                               CASE
-                                  WHEN e.provider = :claude THEN CASE
-                                      WHEN json_valid(activity.value_json) THEN CAST(
-                                          json_extract(
-                                              activity.value_json, '$.last_active'
-                                          ) AS REAL
-                                      )
-                                  END
-                                  ELSE COALESCE(
-                                      (SELECT MAX(message.timestamp)
-                                         FROM messages AS message
-                                        WHERE message.session_id = s.id
-                                          AND (
-                                              message.active = 1
-                                              OR message.compacted = 1
-                                          )),
-                                      s.started_at
-                                  )
-                              END AS last_active,
+                                  WHEN s.source IN ('subagent', 'tool') THEN 1
+                                  WHEN json_extract(
+                                      COALESCE(s.model_config, '{{}}'),
+                                      '$._delegate_from'
+                                  ) IS NOT NULL THEN 1
+                                  ELSE 0
+                              END AS subagent_only
+                         FROM session_bridge_state AS activity
+                         INDEXED BY idx_session_bridge_state_activity_ordered
+                         JOIN sessions AS s
+                           ON s.id = substr(
+                               activity.key, :activity_prefix_len + 1
+                           )
+                         JOIN external_sessions AS e
+                           ON e.session_id = s.id
+                        WHERE substr(
+                                  activity.key, 1, :activity_prefix_len
+                              ) = :activity_prefix
+                          AND {_SIDEBAR_ACTIVITY_EXPR} IS NOT NULL
+                          AND e.provider = :claude
+                          AND e.origin_kind = :native
+                          AND e.origin_bridge_id IS NULL
+                          AND s.source != :profile_shadow_source
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM session_sidebar_jobs AS sidebar_job
+                               WHERE sidebar_job.source_session_id = s.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM session_sidebar_exclusions AS exclusion
+                               WHERE exclusion.source_session_id = s.id
+                          )
+                          {claude_cutoff_clause}
+                          {claude_cursor_clause}
+                        ORDER BY {_SIDEBAR_ACTIVITY_EXPR} DESC, activity.key
+                        LIMIT :query_limit
+                   ), hermes_metadata AS (
+                       SELECT s.id AS session_id, s.source, s.model_config,
+                              s.title, s.cwd, s.started_at, s.git_branch,
+                              s.git_repo_root,
+                              NULL AS external_provider,
+                              NULL AS external_native_id,
+                              NULL AS native_path, NULL AS native_status,
+                              NULL AS last_native_cursor,
+                              NULL AS last_native_hash,
+                              NULL AS last_indexed_at, NULL AS parser_version,
+                              NULL AS origin_kind, NULL AS origin_bridge_id,
+                              COALESCE(
+                                  (SELECT MAX(message.timestamp)
+                                     FROM messages AS message
+                                    WHERE message.session_id = s.id
+                                      AND (
+                                          message.active = 1
+                                          OR message.compacted = 1
+                                      )),
+                                  s.started_at
+                              ) AS last_active,
                               CASE WHEN s.source = 'cron' THEN 1 ELSE 0 END
                                   AS automation_only,
                               CASE
@@ -4590,26 +4657,14 @@ class SessionBridgeStore:
                          FROM sessions AS s
                          LEFT JOIN external_sessions AS e
                            ON e.session_id = s.id
-                         LEFT JOIN session_bridge_state AS activity
-                           INDEXED BY idx_session_bridge_state_activity
-                           ON activity.key = :activity_prefix || s.id
-                        WHERE (
-                            (
-                                e.provider = :claude
-                                AND e.origin_kind = :native
-                                AND e.origin_bridge_id IS NULL
-                            )
-                            OR (
-                                e.session_id IS NULL
-                                AND s.id NOT LIKE 'claude:%'
-                                AND s.id NOT LIKE 'codex:%'
-                                AND NOT EXISTS (
-                                    SELECT 1
-                                      FROM session_links AS incoming_link
-                                     WHERE incoming_link.to_session_id = s.id
-                                )
-                            )
-                        )
+                        WHERE e.session_id IS NULL
+                          AND s.id NOT LIKE 'claude:%'
+                          AND s.id NOT LIKE 'codex:%'
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM session_links AS incoming_link
+                               WHERE incoming_link.to_session_id = s.id
+                          )
                           AND s.source != :profile_shadow_source
                           AND NOT EXISTS (
                               SELECT 1
@@ -4621,15 +4676,20 @@ class SessionBridgeStore:
                                 FROM session_sidebar_exclusions AS exclusion
                                WHERE exclusion.source_session_id = s.id
                           )
-                   ), candidate AS (
-                       SELECT * FROM source_metadata
+                   ), hermes_candidate AS (
+                       SELECT * FROM hermes_metadata
                         WHERE last_active IS NOT NULL
-                          {cutoff_clause}
+                          {hermes_cutoff_clause}
+                          {hermes_cursor_clause}
+                        ORDER BY last_active DESC, session_id
+                        LIMIT :query_limit
                    )
-                   SELECT * FROM candidate
-                    WHERE 1 = 1
-                      {cursor_clause}
-                    ORDER BY candidate.last_active DESC, candidate.session_id
+                   SELECT * FROM (
+                       SELECT * FROM claude_candidate
+                       UNION ALL
+                       SELECT * FROM hermes_candidate
+                   )
+                    ORDER BY last_active DESC, session_id
                     LIMIT :query_limit""",
                 params,
             ).fetchall()
@@ -12979,7 +13039,7 @@ def _existing_message_keys(
 
 
 def _external_activity_state_key(session_id: str) -> str:
-    return f"session-bridge:external-activity:{session_id}"
+    return f"{_EXTERNAL_ACTIVITY_KEY_PREFIX}{session_id}"
 
 
 def _decode_external_activity(value_json: str) -> float:

@@ -64,6 +64,7 @@ from session_bridge.store import (
     SIDEBAR_RETRYABLE_ERRORS,
     LocalSessionOwnsCanonicalId,
     SessionBridgeStore,
+    _EXTERNAL_ACTIVITY_KEY_PREFIX,
     _external_activity_state_key,
     sidebar_precreate_terminal_evidence_digest,
     sidebar_terminal_evidence_digest,
@@ -14245,22 +14246,78 @@ def test_claude_visibility_new_ambiguity_invalidates_prior_absence(
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 2
 
 
-def test_sidebar_candidate_query_uses_the_activity_expression_index(db) -> None:
+def test_sidebar_candidate_query_reads_its_page_from_the_ordered_index(db) -> None:
     """Pin the plan, not just the answer.
 
-    ``last_active`` for a Claude row is a json_extract over
-    ``session_bridge_state``.  Computing it per candidate -- and then sorting
-    the whole set before LIMIT can cut it -- made this query the scan loop's
-    largest remaining frame.  ``idx_session_bridge_state_activity`` indexes the
-    extracted value so the key lookup is covering, but SQLite only substitutes
-    the precomputed REAL when the query repeats the indexed expression
-    verbatim.  A reformat of either copy silently un-optimises the query while
-    every correctness test still passes, so assert the plan directly.
+    A Claude row's ``last_active`` lives only inside ``session_bridge_state``
+    JSON, so without an index SQLite computed it for every candidate and sorted
+    the whole set before LIMIT could cut it -- the scan loop's largest frame.
+    ``idx_session_bridge_state_activity_ordered`` stores that value DESC, key,
+    which lets the Claude arm read its page straight off the index in final
+    order and stop at LIMIT.
+
+    SQLite only satisfies the ORDER BY from an index when the query repeats the
+    indexed expression verbatim, so a reformat of either copy silently restores
+    the full sort while every correctness test still passes.  Capture the SQL
+    the method actually issues and assert the plan over it, rather than
+    re-deriving a query the production path might no longer use.
     """
     _sidebar_candidate(db, native_id="planned", eligible_at=100.0)
     store = SessionBridgeStore(db)
-    store.list_sidebar_candidates(after=0.0, limit=10)
 
+    conn = db._conn
+    assert conn is not None
+    issued: list[str] = []
+    conn.set_trace_callback(issued.append)
+    try:
+        store.list_sidebar_candidates(after=0.0, limit=10)
+    finally:
+        conn.set_trace_callback(None)
+
+    # The trace callback hands back the statement with its parameters already
+    # expanded, so it replays through EXPLAIN without rebinding.
+    candidate_sql = [sql for sql in issued if "claude_candidate" in sql]
+    assert len(candidate_sql) == 1, (
+        f"expected one candidate query, got {len(candidate_sql)}"
+    )
+    with db._lock:
+        plan = [
+            (row["id"], row["parent"], row["detail"])
+            for row in conn.execute("EXPLAIN QUERY PLAN " + candidate_sql[0])
+        ]
+
+    # Scope the assertion to the Claude arm's subtree.  The outer merge and the
+    # Hermes arm each sort legitimately -- they handle a page-sized set -- so a
+    # whole-plan "no sort" assertion would be false, and a whole-plan "uses the
+    # index" assertion is too weak: INDEXED BY keeps the index in the plan even
+    # when the expression stops matching, and SQLite just adds the sort back.
+    arm = [node for node, _, detail in plan if "CO-ROUTINE claude_candidate" in detail]
+    assert len(arm) == 1, f"could not locate the Claude arm: {plan}"
+    subtree = set(arm)
+    for node, parent, _ in plan:
+        if parent in subtree:
+            subtree.add(node)
+
+    arm_steps = [detail for node, _, detail in plan if node in subtree]
+    activity_steps = [step for step in arm_steps if "activity" in step]
+    assert activity_steps, f"no step reads the activity table: {arm_steps}"
+    assert all(
+        "idx_session_bridge_state_activity_ordered" in step
+        for step in activity_steps
+    ), f"Claude arm is not driven by the ordered index: {activity_steps}"
+    assert not [step for step in arm_steps if "TEMP B-TREE" in step], (
+        "the Claude arm sorts instead of reading its page in index order; the "
+        f"query expression no longer matches the index: {arm_steps}"
+    )
+
+
+def test_superseded_activity_key_index_is_dropped(db) -> None:
+    """The first cut of this optimisation indexed (key, <expr>).
+
+    The query no longer looks activity rows up by key, so leaving that index in
+    place would cost every ``session_bridge_state`` write a second expression
+    index maintained for nothing.  ``BRIDGE_SCHEMA_SQL`` drops it on open.
+    """
     with db._lock:
         conn = db._conn
         assert conn is not None
@@ -14272,7 +14329,34 @@ def test_sidebar_candidate_query_uses_the_activity_expression_index(db) -> None:
             )
         }
 
-    assert "idx_session_bridge_state_activity" in indexes
+    assert "idx_session_bridge_state_activity_ordered" in indexes
+    assert "idx_session_bridge_state_activity" not in indexes
+
+
+def test_activity_key_prefix_is_shared_by_writer_and_query(db) -> None:
+    """The query recovers ``session_id`` by slicing the prefix off the key.
+
+    That only works while the prefix the writer stamps on and the prefix the
+    query slices are the same string.  If they ever drift, every Claude row
+    silently stops matching and the sidebar goes empty with no error -- so
+    assert the writer is built from the same constant the query is.
+    """
+    assert _external_activity_state_key("claude:abc") == (
+        f"{_EXTERNAL_ACTIVITY_KEY_PREFIX}claude:abc"
+    )
+
+    candidate = _sidebar_candidate(db, native_id="prefixed", eligible_at=100.0)
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        stored = conn.execute(
+            "SELECT key FROM session_bridge_state WHERE key = ?",
+            (_external_activity_state_key(candidate.source_session_id),),
+        ).fetchone()
+    assert stored is not None
+
+    page = SessionBridgeStore(db).list_sidebar_candidates(after=0.0, limit=10)
+    assert [row.source_session_id for row in page] == [candidate.source_session_id]
 
 
 def test_session_bridge_state_still_accepts_non_json_values(db) -> None:
