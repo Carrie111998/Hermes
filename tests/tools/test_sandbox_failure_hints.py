@@ -16,12 +16,13 @@ class TestSandboxFailureHint:
         assert "read_file" in h and "terminal" in h
         assert "normal tool call" in h
 
-    def test_helper_import_failure_reports_runtime_schema_skew(self):
+    def test_helper_import_failure_reports_actionable_module_skew(self):
         err = "ImportError: cannot import name 'json_parse' from 'hermes_tools'"
         h = _sandbox_failure_hint(err)
         assert h is not None
-        assert "expected to be exported by hermes_tools" in h
-        assert "out of sync" in h
+        assert "from hermes_tools import json_parse" in h
+        assert "stale" in h
+        assert "sys.path" in h
 
     @pytest.mark.parametrize("helper", ["json_parse", "shell_quote", "retry"])
     def test_helper_name_error_recommends_explicit_import(self, helper):

@@ -136,6 +136,9 @@ print(json.dumps({
                 module_path = os.path.join(tmpdir, "hermes_tools.py")
                 with open(module_path, "w", encoding="utf-8") as handle:
                     handle.write(generate_hermes_tools_module([], transport=transport))
+                # The generated module lives in cwd, which intentionally makes
+                # it the first import candidate for `python -c`, matching the
+                # real sandbox's per-run temp-directory staging contract.
                 completed = subprocess.run(
                     [sys.executable, "-c", probe],
                     cwd=tmpdir,

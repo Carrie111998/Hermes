@@ -397,9 +397,11 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
             helpers = {"json_parse", "shell_quote", "retry"}
             if missing in helpers:
                 return (
-                    f"{missing} is expected to be exported by hermes_tools, but "
-                    "this sandbox did not expose it. The execute_code runtime and "
-                    "schema may be out of sync; retry in a fresh session."
+                    f"{missing} should be imported from the generated hermes_tools.py, "
+                    "but this module did not export it. Verify the import uses "
+                    f"`from hermes_tools import {missing}`; if it does, the generated "
+                    "module may be stale or a different hermes_tools may be first on "
+                    "sys.path. Retry in a fresh session and report it if the mismatch persists."
                 )
             return (
                 f"'{missing}' is not available inside the execute_code sandbox. "
