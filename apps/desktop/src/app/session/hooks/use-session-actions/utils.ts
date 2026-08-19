@@ -1316,10 +1316,15 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
   try {
     const session = await getSession(storedSessionId, activeKey)
 
-    // The Desktop profile we explicitly queried is authoritative. A pooled
-    // remote backend can answer with its own local alias (usually "default"),
-    // which is not the profile identity the renderer must route with.
-    session.profile = activeKey
+    // A non-default Desktop profile can point at a standalone backend that
+    // answers with its own local alias (usually "default") or omits ownership.
+    // Stamp the Desktop routing key in those compatibility cases, but preserve
+    // explicit non-default ownership and the legacy unowned default-profile row.
+    const reportedProfile = session.profile?.trim()
+
+    if (activeKey !== 'default' && (!reportedProfile || normalizeProfileKey(reportedProfile) === 'default')) {
+      session.profile = activeKey
+    }
 
     upsertResolvedSession(session, storedSessionId)
 

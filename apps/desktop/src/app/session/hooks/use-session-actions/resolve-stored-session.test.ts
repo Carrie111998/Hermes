@@ -109,6 +109,26 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).toHaveBeenCalledWith('s1', 'meta')
   })
 
+  it('preserves explicit non-default ownership returned by the scoped backend', async () => {
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'work' }))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('work')
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'meta')
+  })
+
+  it('preserves the legacy unowned row on the default-profile lookup', async () => {
+    $activeGatewayProfile.set('default')
+    $profiles.set(profiles('default'))
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1' }))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBeUndefined()
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'default')
+  })
+
   it('probed desktop profile overrides a remote backend answering as its own "default"', async () => {
     // Per-profile remote override: Electron strips the desktop alias before
     // forwarding, so the standalone backend stamps its backend-local root.
