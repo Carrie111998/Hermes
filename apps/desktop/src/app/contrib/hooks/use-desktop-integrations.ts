@@ -96,6 +96,7 @@ export function useDesktopIntegrations({
   // navigation exactly once. The same effect owns subsequent writes so the
   // initial `/` cannot overwrite remembered history before it is read.
   // This ref is a one-time lifecycle latch, not a mirror of reactive atom state.
+  // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
     if (!profileReady || isHudWindow()) {
       return
