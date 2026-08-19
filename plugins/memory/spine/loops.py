@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -290,21 +291,63 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
 
     # ── Pass 4: Demote stale hot-core ────────────────────────────────
     demoted = 0
-    # Check if MEMORY.md is over budget
-    mem_path = os.path.expanduser("~/.hermes/memories/MEMORY.md")
-    mem_size = 0
-    if os.path.exists(mem_path):
-        mem_size = os.path.getsize(mem_path)
+    mem_path = _hotcore_path()
+    mem_size = os.path.getsize(mem_path) if os.path.exists(mem_path) else 0
+    start_size = mem_size
+
     if mem_size > 20000:
-        # Find promoted entries with no recent evidence → demote
+        # Oldest-confirmed promoted rows first. Two things were wrong here
+        # before: the text was never removed from MEMORY.md (so the file only
+        # ever grew), and rows were flipped back to 'active', which made them
+        # eligible for promotion again on the very next run.
         stale = idx.conn.execute(
-            """SELECT id FROM observations WHERE status='promoted'
-               ORDER BY last_confirmed ASC LIMIT 5"""
+            """SELECT id, content, type FROM observations WHERE status='promoted'
+               ORDER BY last_confirmed ASC"""
         ).fetchall()
-        for (obs_id,) in stale:
-            idx.update_status(obs_id, "active")  # demote back to active
+
+        blocks = _read_hotcore_blocks(mem_path)
+        unmatched = 0
+        for obs_id, content, obs_type in stale:
+            if mem_size <= HOTCORE_TARGET_BYTES:
+                break
+            remaining = _excise_block(blocks, content)
+            if remaining is None:
+                # MEMORY.md has a second writer: the memory() tool and the
+                # LLM-assisted consolidation pass rewrite and merge blocks
+                # wholesale, so a promoted row's text may no longer appear
+                # verbatim. Leave the row promoted rather than demoting a row
+                # whose text we could not remove -- doing that empties the DB's
+                # view of the hot core while the file itself stays fat.
+                unmatched += 1
+                continue
+            blocks = remaining
+            mem_size = len("\n§\n".join(blocks)) + 1
+            # 'demoted' stays searchable (it is in SEARCHABLE_STATUSES) but is
+            # never re-promoted, because the promote pass only reads 'active'.
+            idx.update_status(obs_id, "demoted")
             demoted += 1
-    report["passes"]["demote"] = f"demoted {demoted} stale entries (MEMORY.md: {mem_size:,} bytes)"
+
+        if demoted:
+            _write_hotcore_blocks(mem_path, blocks)
+            mem_size = os.path.getsize(mem_path)
+
+        if mem_size > 20000 and unmatched:
+            # Say so loudly. A pass that runs nightly, removes nothing, and
+            # reports success is exactly how the embedder outage went unseen
+            # for eight days.
+            warning = (
+                f"MEMORY.md is {mem_size:,} bytes, over the {20000:,} budget, and "
+                f"{unmatched} promoted observation(s) could not be matched to a "
+                f"block -- spine cannot shrink the file on its own. Run the "
+                f"LLM-assisted consolidation pass."
+            )
+            report.setdefault("warnings", []).append(warning)
+            logger.warning(warning)
+
+    report["passes"]["demote"] = (
+        f"demoted {demoted} stale entries "
+        f"(MEMORY.md: {start_size:,} → {mem_size:,} bytes)"
+    )
 
     report["active_count"] = idx.count_active()
     idx.conn.commit()
@@ -313,31 +356,94 @@ def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
     return report
 
 
-def _promote_to_hotcore(obs_id: str, content: str, obs_type: str, config: SpineConfig) -> None:
-    """Write an observation to MEMORY.md hot core with appropriate tag.
+HOTCORE_PATH = "~/.hermes/memories/MEMORY.md"
+
+# Demote until the file is back under this. Kept below the 20,000 trigger so a
+# single pass actually clears the threshold instead of hovering on it and
+# re-firing every night.
+HOTCORE_TARGET_BYTES = 18000
+
+_TAG_MAP = {
+    "correction": "[C]",
+    "preference": "[W]",
+    "pattern": "[W]",
+    "fact": "[F]",
+    "identity": "[ID]",
+}
+
+
+def _hotcore_path() -> str:
+    return os.path.expanduser(HOTCORE_PATH)
+
+
+def _read_hotcore_blocks(path: str) -> List[str]:
+    """Split MEMORY.md into its §-delimited blocks."""
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [b.strip() for b in f.read().split("\n§\n") if b.strip()]
+
+
+def _write_hotcore_blocks(path: str, blocks: List[str]) -> None:
+    """Rewrite MEMORY.md from blocks, atomically via a temp file + replace."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n§\n".join(blocks) + "\n")
+    os.replace(tmp, path)
+
+
+def _hotcore_entry(content: str, obs_type: str) -> str:
+    return f"{_TAG_MAP.get(obs_type, '[F]')} {content}".strip()
+
+
+_TAG_PREFIX = re.compile(r"^\s*\[(C|R|W|F|ID)\]\s*")
+
+
+def _block_body(block: str) -> str:
+    """A block's text with its [X] tag removed, for tag-insensitive matching.
+
+    Legacy blocks carry an [R] tag that no observation type maps to, so
+    comparing the rendered '{tag} {content}' string misses them entirely.
+    """
+    return _TAG_PREFIX.sub("", block).strip()
+
+
+def _excise_block(blocks: List[str], content: str) -> Optional[List[str]]:
+    """Return blocks minus the one matching content, or None if absent.
+
+    Matching is exact on the tag-stripped body. Deliberately NOT a substring
+    match: the consolidation pass merges several facts into one block, and
+    removing a merged block to retire one of its facts would silently delete
+    the others.
+    """
+    target = content.strip()
+    remaining = [b for b in blocks if _block_body(b) != target]
+    return remaining if len(remaining) != len(blocks) else None
+
+
+def _promote_to_hotcore(obs_id: str, content: str, obs_type: str, config: SpineConfig) -> bool:
+    """Append an observation to the MEMORY.md hot core, skipping duplicates.
 
     Tags per spec: [R] rule, [C] correction, [F] fact, [W] workflow, [ID] identity.
+    Returns True if the entry was written, False if it was already present or
+    the write failed. Without the duplicate check this function was the growth
+    engine: the demote pass flipped rows back to 'active', which made them
+    eligible for promotion again, and each round appended another copy.
     """
-    import os as _os
-
-    tag_map = {
-        "correction": "[C]",
-        "preference": "[W]",
-        "pattern": "[W]",
-        "fact": "[F]",
-        "identity": "[ID]",
-    }
-    tag = tag_map.get(obs_type, "[F]")
-
-    mem_path = _os.path.expanduser("~/.hermes/memories/MEMORY.md")
-    entry = f"\n§\n{tag} {content}\n"
+    mem_path = _hotcore_path()
+    entry = _hotcore_entry(content, obs_type)
 
     try:
+        if entry in _read_hotcore_blocks(mem_path):
+            logger.debug("Skipped promoting %s — already in MEMORY.md", obs_id)
+            return False
         with open(mem_path, "a", encoding="utf-8") as f:
-            f.write(entry)
+            f.write(f"\n§\n{entry}\n")
         logger.info("Promoted %s to MEMORY.md: %s", obs_id, content[:80])
+        return True
     except Exception as e:
         logger.error("Failed to promote %s to MEMORY.md: %s", obs_id, e)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
