@@ -29,7 +29,15 @@ When you run `hermes update`, the following steps occur:
 3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the nine critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
 4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
 5. **Config migration** — detects new config options added since your version and prompts you to set them
-6. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
+6. **Gateway auto-restart**: running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile. Pass `--no-restart` to skip restarting running gateway profiles after update.
+
+### Skip gateway restart: `--no-restart`
+
+```bash
+hermes update --no-restart
+```
+
+Dependency install and post-install hooks still run. Restart later with `hermes gateway restart` when you want running profiles to load the new code.
 
 ### Updating against a non-default branch: `--branch`
 
