@@ -176,7 +176,7 @@ export const coreCommands: SlashCommand[] = [
       }
 
       patchUiState({ mouseTracking: next })
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'mouse', value: next }).catch(() => {})
+      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'mouse', value: next }).catch(ctx.guardedErr)
 
       queueMicrotask(() => ctx.transcript.sys(`mouse tracking ${next}`))
     }
@@ -293,7 +293,9 @@ export const coreCommands: SlashCommand[] = [
       }
 
       patchUiState({ compact: next })
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'density', value: next ? 'on' : 'off' }).catch(() => {})
+      ctx.gateway
+        .rpc<ConfigSetResponse>('config.set', { key: 'density', value: next ? 'on' : 'off' })
+        .catch(ctx.guardedErr)
 
       queueMicrotask(() => ctx.transcript.sys(`density ${next ? 'on' : 'off'}`))
     }
@@ -311,10 +313,10 @@ export const coreCommands: SlashCommand[] = [
       }
       // `always` persists to config (shows in every future session); `on` is
       // session-only; `off` disables and clears the persisted preference.
-      // Persistence is only CLAIMED once the gateway confirms the write
-      // (mirrors /theme): a rejected config.set must not be reported as
-      // saved, or the preference silently vanishes on restart. The session
-      // flip stays optimistic — it is local state and cannot fail.
+      // Persistence is only CLAIMED once the gateway confirms the write: a
+      // rejected config.set must not be reported as saved, or the preference
+      // silently vanishes on restart. The session flip stays optimistic — it
+      // is local state and cannot fail.
       if (a === 'always') {
         patchUiState({ showTokens: true })
         ctx.gateway
@@ -385,7 +387,7 @@ export const coreCommands: SlashCommand[] = [
         patchUiState({ sections: mode ? { ...rest, [first]: mode } : rest })
         gateway
           .rpc<ConfigSetResponse>('config.set', { key: `details_mode.${first}`, value: mode ?? '' })
-          .catch(() => {})
+          .catch(ctx.guardedErr)
         transcript.sys(`details ${first}: ${mode ?? 'reset'}`)
 
         return
@@ -400,7 +402,7 @@ export const coreCommands: SlashCommand[] = [
       const sections = Object.fromEntries(SECTION_NAMES.map(section => [section, next]))
 
       patchUiState({ detailsMode: next, detailsModeCommandOverride: true, sections })
-      gateway.rpc<ConfigSetResponse>('config.set', { key: 'details_mode', value: next }).catch(() => {})
+      gateway.rpc<ConfigSetResponse>('config.set', { key: 'details_mode', value: next }).catch(ctx.guardedErr)
       transcript.sys(`details: ${next}`)
     }
   },
@@ -633,7 +635,9 @@ export const coreCommands: SlashCommand[] = [
       // returns to whatever /verbose mode the user had. Optimistically patch the
       // badge so the status bar flips on the same frame.
       patchUiState({ focusView: next })
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'focus', value: next ? 'on' : 'off' }).catch(() => {})
+      ctx.gateway
+        .rpc<ConfigSetResponse>('config.set', { key: 'focus', value: next ? 'on' : 'off' })
+        .catch(ctx.guardedErr)
 
       queueMicrotask(() =>
         ctx.transcript.sys(
@@ -665,7 +669,7 @@ export const coreCommands: SlashCommand[] = [
       }
 
       patchUiState({ statusBar: next })
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'statusbar', value: next }).catch(() => {})
+      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'statusbar', value: next }).catch(ctx.guardedErr)
 
       queueMicrotask(() => ctx.transcript.sys(`status bar ${next}`))
     }
@@ -704,7 +708,9 @@ export const coreCommands: SlashCommand[] = [
       }
 
       patchUiState({ battery: next, ...(next ? {} : { batteryStatus: null }) })
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'battery', value: next ? 'on' : 'off' }).catch(() => {})
+      ctx.gateway
+        .rpc<ConfigSetResponse>('config.set', { key: 'battery', value: next ? 'on' : 'off' })
+        .catch(ctx.guardedErr)
 
       queueMicrotask(() => ctx.transcript.sys(`battery indicator ${next ? 'on' : 'off'}`))
     }
