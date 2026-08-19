@@ -107,21 +107,24 @@ def test_automatic_review_is_deferred_until_parent_cleanup_flush(monkeypatch):
             events.append("run")
 
     monkeypatch.setattr(run_agent_module, "AIAgent", RecordingReviewAgent)
-    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    CapturingThread.targets = []
+    monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
 
     agent = _bare_agent()
-    AIAgent._spawn_background_review(
+    assert AIAgent._spawn_background_review(
         agent,
         messages_snapshot=[{"role": "user", "content": "hello"}],
         review_memory=True,
         defer_until_turn_complete=True,
-    )
+    ) is True
 
     assert events == []
     assert agent._background_review_run is not None
     assert agent._deferred_background_review is not None
 
     AIAgent._flush_deferred_background_review(agent)
+    assert events == []
+    CapturingThread.targets[0]()
 
     assert events == ["init", "run"]
     assert agent._deferred_background_review is None
@@ -160,6 +163,93 @@ def test_prepared_review_is_cancelled_without_starting_worker(monkeypatch):
 
     AIAgent._flush_deferred_background_review(agent)
     assert provider_calls == []
+
+
+def test_live_turn_retires_deferred_reservation_during_thread_construction(monkeypatch):
+    import time
+    import agent.background_review as background_review_module
+
+    entered_construction = threading.Event()
+    allow_construction = threading.Event()
+    provider_calls = []
+    real_spawn = background_review_module.spawn_background_review_thread
+
+    def delayed_spawn(*args, **kwargs):
+        entered_construction.set()
+        assert allow_construction.wait(2.0)
+        return real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(
+        background_review_module,
+        "spawn_background_review_thread",
+        delayed_spawn,
+    )
+    CapturingThread.targets = []
+    monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
+
+    agent = _bare_agent()
+    spawn_result = {}
+
+    def build_review():
+        spawn_result["started"] = AIAgent._spawn_background_review(
+            agent,
+            messages_snapshot=[{"role": "user", "content": "hello"}],
+            review_memory=True,
+            defer_until_turn_complete=True,
+        )
+
+    builder = _REAL_THREAD(target=build_review, daemon=True)
+    builder.start()
+    assert entered_construction.wait(2.0)
+    run = agent._background_review_run
+    assert run is not None
+    assert agent._deferred_background_review == (None, run)
+
+    started = time.monotonic()
+    from agent.background_review import cancel_background_review_for_live_turn
+
+    assert cancel_background_review_for_live_turn(agent) is True
+    elapsed = time.monotonic() - started
+    allow_construction.set()
+    builder.join(timeout=2.0)
+
+    assert elapsed < 0.5
+    assert not builder.is_alive()
+    assert spawn_result == {"started": False}
+    assert run.request_done.is_set()
+    assert agent._background_review_run is None
+    assert agent._deferred_background_review is None
+    assert provider_calls == []
+
+
+def test_explicit_refine_supersedes_prepared_automatic_review(monkeypatch):
+    CapturingThread.targets = []
+    monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
+
+    agent = _bare_agent()
+    assert AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "automatic"}],
+        review_memory=True,
+        defer_until_turn_complete=True,
+    ) is True
+    automatic_run = agent._background_review_run
+
+    assert AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "manual"}],
+        review_memory=True,
+        explicit_request=True,
+    ) is True
+
+    assert automatic_run is not None
+    assert automatic_run.request_done.is_set()
+    assert agent._background_review_run is not automatic_run
+    assert agent._deferred_background_review is None
+    assert len(CapturingThread.targets) == 2
+
+    CapturingThread.targets[-1]()
+    assert agent._background_review_run is None
 
 
 def test_deferred_review_flushes_after_parent_relay_cleanup(monkeypatch):

@@ -1809,7 +1809,8 @@ class AIAgent:
         review_skills: bool = False,
         focus: Optional[str] = None,
         defer_until_turn_complete: bool = False,
-    ) -> None:
+        explicit_request: bool = False,
+    ) -> bool:
         """Spawn the background memory/skill review thread.
 
         Thin wrapper — the heavy lifting lives in
@@ -1820,7 +1821,8 @@ class AIAgent:
 
         ``focus`` is optional user-supplied steering (from ``/refine``)
         appended to the review prompt — e.g. "save the deploy workflow as a
-        skill". The automatic post-turn triggers never set it.
+        skill". ``explicit_request`` distinguishes a bare ``/refine`` from an
+        automatic trigger even when no focus text is supplied.
 
         Automatic reviews pass ``defer_until_turn_complete=True`` from the
         turn finalizer. They are started by the outer wrapper only after its
@@ -1833,31 +1835,64 @@ class AIAgent:
         # are spawned with ``skip_memory=True``, so a review here has little to
         # persist — yet it inherits the subagent's (often premium) delegation
         # model and replays the whole conversation at premium rates, silently
-        # inflating token cost (#85859). An explicit ``/refine`` (``focus`` set)
-        # is a deliberate user request and still runs.
-        if focus is None and getattr(self, "_delegate_depth", 0) > 0:
-            return
+        # inflating token cost (#85859). An explicit ``/refine`` is a deliberate
+        # user request and still runs, with or without focus text.
+        manual_request = explicit_request or focus is not None
+        if not manual_request and getattr(self, "_delegate_depth", 0) > 0:
+            return False
         # Explicit off-switch for automatic post-turn forks
         # (``auxiliary.background_review.enabled: false``). Manual ``/refine``
         # still works — same contract as zeroing the nudge intervals (#87250).
         # Load the task block once here and pass it into the spawn path so
         # aux routing does not re-read config.
         task_cfg = None
-        if focus is None:
+        if not manual_request:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
-                return
+                return False
         from agent.background_review import (
+            cancel_background_review_for_live_turn,
             finish_background_review_run,
             prepare_background_review_run,
             spawn_background_review_thread,
         )
         from tools.thread_context import propagate_context_to_thread
 
-        review_run = prepare_background_review_run(self)
+        review_run = prepare_background_review_run(
+            self,
+            deferred=defer_until_turn_complete,
+        )
+        if review_run is None and manual_request:
+            cancel_background_review_for_live_turn(
+                self,
+                reason="superseded by explicit /refine",
+            )
+            review_run = prepare_background_review_run(self)
         if review_run is None:
-            return
+            return False
+
+        def _clear_deferred_reservation() -> None:
+            if not defer_until_turn_complete:
+                return
+            lock = getattr(self, "_background_review_lock", None)
+            if lock is None:
+                prepared = getattr(self, "_deferred_background_review", None)
+                if (
+                    isinstance(prepared, tuple)
+                    and len(prepared) == 2
+                    and prepared[1] is review_run
+                ):
+                    self._deferred_background_review = None
+                return
+            with lock:
+                prepared = getattr(self, "_deferred_background_review", None)
+                if (
+                    isinstance(prepared, tuple)
+                    and len(prepared) == 2
+                    and prepared[1] is review_run
+                ):
+                    self._deferred_background_review = None
         try:
             target, _prompt = spawn_background_review_thread(
                 self,
@@ -1876,36 +1911,77 @@ class AIAgent:
                 name="bg-review",
             )
             if defer_until_turn_complete:
-                # The run token is already published, closing the gap between
-                # parent finalization and Thread.start(). A concurrent live turn
-                # can cancel this prepared review before it reaches a provider.
-                self._deferred_background_review = (t, review_run)
-                return
+                lock = getattr(self, "_background_review_lock", None)
+                installed = False
+                if lock is None:
+                    prepared = getattr(self, "_deferred_background_review", None)
+                    if (
+                        isinstance(prepared, tuple)
+                        and len(prepared) == 2
+                        and prepared[1] is review_run
+                        and not review_run.cancel_requested.is_set()
+                    ):
+                        self._deferred_background_review = (t, review_run)
+                        installed = True
+                else:
+                    with lock:
+                        prepared = getattr(self, "_deferred_background_review", None)
+                        if (
+                            getattr(self, "_background_review_run", None) is review_run
+                            and isinstance(prepared, tuple)
+                            and len(prepared) == 2
+                            and prepared[1] is review_run
+                            and not review_run.cancel_requested.is_set()
+                        ):
+                            self._deferred_background_review = (t, review_run)
+                            installed = True
+                if not installed:
+                    finish_background_review_run(self, review_run)
+                    return False
+                return True
             t.start()
+            return True
         except Exception:
+            _clear_deferred_reservation()
             finish_background_review_run(self, review_run)
             raise
 
     def _flush_deferred_background_review(self) -> None:
         """Start one queued automatic review after parent turn cleanup."""
         lock = getattr(self, "_background_review_lock", None)
+        start_error = None
+        review_run = None
         if lock is None:
             prepared = getattr(self, "_deferred_background_review", None)
             self._deferred_background_review = None
+            if isinstance(prepared, tuple) and len(prepared) == 2:
+                thread, review_run = prepared
+                if thread is not None:
+                    try:
+                        thread.start()
+                    except Exception as exc:
+                        start_error = exc
         else:
             with lock:
                 prepared = getattr(self, "_deferred_background_review", None)
-                self._deferred_background_review = None
-        if not isinstance(prepared, tuple) or len(prepared) != 2:
-            return
-        thread, review_run = prepared
-        try:
-            thread.start()
-        except Exception:
+                if isinstance(prepared, tuple) and len(prepared) == 2:
+                    thread, review_run = prepared
+                    if thread is not None:
+                        try:
+                            # Keep the synchronous-retire handle visible until
+                            # Thread.start() returns. The worker may block briefly
+                            # on this parent lock, but cannot enter a provider
+                            # before startup fencing has a concrete daemon.
+                            thread.start()
+                        except Exception as exc:
+                            start_error = exc
+                if getattr(self, "_deferred_background_review", None) is prepared:
+                    self._deferred_background_review = None
+        if start_error is not None:
             from agent.background_review import finish_background_review_run
 
             finish_background_review_run(self, review_run)
-            raise
+            raise start_error
 
     def _build_memory_write_metadata(
         self,

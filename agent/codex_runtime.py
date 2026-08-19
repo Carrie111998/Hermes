@@ -917,6 +917,7 @@ def run_codex_app_server_turn(
                 messages_snapshot=list(messages),
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
+                defer_until_turn_complete=True,
             )
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)

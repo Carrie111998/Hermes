@@ -2982,14 +2982,17 @@ class GatewaySlashCommandsMixin:
 
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
         try:
-            agent._spawn_background_review(
+            started = agent._spawn_background_review(
                 messages_snapshot=snapshot,
                 review_memory=True,
                 review_skills=review_skills,
                 focus=args or None,
+                explicit_request=True,
             )
         except Exception as exc:
             return f"/refine failed to start: {exc}"
+        if not started:
+            return "A background review is already running — retry /refine shortly."
         tail = f" (focus: {args})" if args else ""
         return (
             f"⚗ Reviewing this conversation in the background{tail} — "

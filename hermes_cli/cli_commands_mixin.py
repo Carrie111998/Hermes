@@ -2695,14 +2695,18 @@ class CLICommandsMixin:
 
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
         try:
-            agent._spawn_background_review(
+            started = agent._spawn_background_review(
                 messages_snapshot=snapshot,
                 review_memory=True,
                 review_skills=review_skills,
                 focus=focus or None,
+                explicit_request=True,
             )
         except Exception as exc:
             _cprint(f"  /refine failed to start: {exc}")
+            return
+        if not started:
+            _cprint("  A background review is already running — retry /refine shortly.")
             return
         tail = f" (focus: {focus})" if focus else ""
         _cprint(

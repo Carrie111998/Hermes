@@ -72,8 +72,17 @@ class _BackgroundReviewRun:
             return True
 
 
-def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
-    """Install a unique run token on the parent before ``Thread.start()``."""
+def prepare_background_review_run(
+    agent: Any,
+    *,
+    deferred: bool = False,
+) -> Optional[_BackgroundReviewRun]:
+    """Install a unique run token before ``Thread.start()``.
+
+    A deferred automatic review also publishes a placeholder tuple under the
+    same parent lock. A concurrent live turn can therefore retire the prepared
+    run even while its target/thread object is still being constructed.
+    """
     lock = getattr(agent, "_background_review_lock", None)
     if lock is None:
         try:
@@ -89,6 +98,8 @@ def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
             if current is not None and not current.request_done.is_set():
                 return None
             agent._background_review_run = run
+            if deferred:
+                agent._deferred_background_review = (None, run)
     except (AttributeError, TypeError):
         return None
     return run
@@ -112,12 +123,12 @@ def finish_background_review_run(
     run.request_done.set()
 
 
-def _interrupt_background_review(review_agent: Any) -> None:
+def _interrupt_background_review(review_agent: Any, reason: str) -> None:
     """Request abort off-thread so a broken abort hook cannot stall foreground."""
 
     def _interrupt() -> None:
         try:
-            review_agent.interrupt("superseded by a new live turn")
+            review_agent.interrupt(reason)
         except Exception:
             logger.debug(
                 "Failed to cancel in-flight background review for a new turn",
@@ -137,7 +148,11 @@ def _interrupt_background_review(review_agent: Any) -> None:
         )
 
 
-def cancel_background_review_for_live_turn(agent: Any) -> bool:
+def cancel_background_review_for_live_turn(
+    agent: Any,
+    *,
+    reason: str = "superseded by a new live turn",
+) -> bool:
     """Cancel the current review and await its request-phase acknowledgement.
 
     Returns ``False`` when acknowledgement is unavailable or misses the bounded
@@ -166,7 +181,7 @@ def cancel_background_review_for_live_turn(agent: Any) -> bool:
     if run is None:
         if legacy_agent is None:
             return True
-        _interrupt_background_review(legacy_agent)
+        _interrupt_background_review(legacy_agent, reason)
         return False
 
     review_agent = run.cancel()
@@ -176,7 +191,7 @@ def cancel_background_review_for_live_turn(agent: Any) -> bool:
         # parent cleanup has not launched yet.
         finish_background_review_run(agent, run)
     if review_agent is not None:
-        _interrupt_background_review(review_agent)
+        _interrupt_background_review(review_agent, reason)
 
     acknowledged = run.request_done.wait(
         timeout=_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS
