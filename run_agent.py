@@ -1862,6 +1862,7 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
         focus: Optional[str] = None,
+        snapshot_id: Optional[str] = None,
     ) -> None:
         """Spawn the background memory/skill review thread.
 
@@ -1905,6 +1906,7 @@ class AIAgent:
             review_skills=review_skills,
             focus=focus,
             task_cfg=task_cfg,
+            snapshot_id=snapshot_id,
         )
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).

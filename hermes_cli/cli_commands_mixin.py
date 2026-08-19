@@ -2745,10 +2745,19 @@ class CLICommandsMixin:
         optional focus instructions. Writes go to the memory + skill stores
         in a background fork; the live conversation and prompt cache are
         never touched.
+
+        ``/refine undo`` restores the most recent review snapshot for this
+        session (see ``skills/continual-harness`` + ``agent/refine_rollback``).
         """
         from cli import _DIM, _RST, _cprint
 
-        parts = (cmd or "").strip().split(None, 1)
+        arg = (cmd or "").strip()
+        # Undo the most recent /refine for this session.
+        if arg == "undo":
+            self._handle_refine_undo()
+            return
+
+        parts = arg.split(None, 1)
         focus = parts[1].strip() if len(parts) > 1 else ""
 
         agent = getattr(self, "agent", None)
@@ -2761,6 +2770,26 @@ class CLICommandsMixin:
             _cprint(f"  {_DIM}Nothing to refine yet — the conversation is empty.{_RST}")
             return
 
+        # Snapshot memory + skills BEFORE the fork writes, so the run can be
+        # undone with /refine undo. Best-effort: never block the review if
+        # the snapshot fails (issue #14944 class).
+        session_id = getattr(agent, "session_id", None) or "unknown"
+        snapshot_id = None
+        try:
+            from agent.refine_rollback import take_snapshot
+            from hermes_constants import get_hermes_home
+            from tools.memory_tool import get_memory_dir
+            from tools.skill_manager_tool import _skills_dir
+            snapshot_id = take_snapshot(
+                get_hermes_home(), session_id, [get_memory_dir(), _skills_dir()]
+            )
+        except Exception as exc:  # snapshot is best-effort
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Failed to snapshot before /refine (non-fatal): %s", exc
+            )
+            snapshot_id = None
+
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
         try:
             agent._spawn_background_review(
@@ -2768,14 +2797,52 @@ class CLICommandsMixin:
                 review_memory=True,
                 review_skills=review_skills,
                 focus=focus or None,
+                snapshot_id=snapshot_id,
             )
         except Exception as exc:
             _cprint(f"  /refine failed to start: {exc}")
             return
         tail = f" (focus: {focus})" if focus else ""
+        undo_hint = " · undo with /refine undo" if snapshot_id else ""
         _cprint(
             f"  ⚗ Reviewing this conversation in the background{tail} — "
-            f"any memory/skill updates will be reported when done."
+            f"any memory/skill updates will be reported when done.{undo_hint}"
+        )
+
+    def _handle_refine_undo(self) -> None:
+        """Restore the latest /refine snapshot for this session."""
+        from cli import _DIM, _RST, _cprint
+
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            _cprint(f"  {_DIM}Nothing to undo — no active session.{_RST}")
+            return
+        try:
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+        except Exception:
+            _cprint(f"  {_DIM}No HERMES_HOME resolved; cannot locate snapshots.{_RST}")
+            return
+        session_id = getattr(agent, "session_id", None) or "unknown"
+        from agent.refine_rollback import latest_snapshot_id, restore_snapshot
+        sid = latest_snapshot_id(home, session_id)
+        if not sid:
+            _cprint(f"  {_DIM}No /refine snapshot for this session to undo.{_RST}")
+            return
+        result = restore_snapshot(home, sid)
+        if not result["applied"]:
+            _cprint(f"  {_DIM}Snapshot {sid} no longer exists.{_RST}")
+            return
+        if result["skipped"]:
+            skipped = ", ".join(result["skipped"])
+            _cprint(
+                f"  ⚠ Restored most of the snapshot, but skipped {skipped}: "
+                f"its snapshot storage was empty while the manifest expected "
+                f"files, so it was NOT wiped (possible capture corruption)."
+            )
+        _cprint(
+            f"  ↩ Restored the pre-/refine snapshot for this session "
+            f"(id {sid[:24]}…)."
         )
 
     def _handle_goal_command(self, cmd: str) -> None:

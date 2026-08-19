@@ -862,12 +862,17 @@ def _run_review_in_thread(
     messages_snapshot: List[Dict],
     prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None,
+    snapshot_id: Optional[str] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
     Spawns a forked ``AIAgent`` inheriting the parent's runtime, runs the
     review prompt, and surfaces a compact action summary back to the user
     via ``agent._safe_print`` and ``agent.background_review_callback``.
+
+    ``snapshot_id`` (optional) is the reversible-rollback snapshot id taken
+    before this fork wrote anything; when set, the summary mentions that the
+    run can be undone with ``/refine undo``.
     """
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
@@ -1261,6 +1266,8 @@ def _run_review_in_thread(
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
+            if snapshot_id:
+                summary = f"{summary} · undo: /refine undo"
             agent._safe_print(
                 f"  💾 Self-improvement review: {summary}"
             )
@@ -1319,6 +1326,7 @@ def spawn_background_review_thread(
     review_skills: bool = False,
     focus: Optional[str] = None,
     task_cfg: Optional[Dict[str, Any]] = None,
+    snapshot_id: Optional[str] = None,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -1336,6 +1344,10 @@ def spawn_background_review_thread(
     from :func:`load_background_review_settings`. When omitted, config is
     read once here and shared with the worker (aux routing) so a single
     turn does not re-parse the config file.
+
+    ``snapshot_id`` (optional) is the reversible-rollback snapshot id taken
+    before this fork wrote anything (``agent.refine_rollback``); when set,
+    the completion summary notes the run can be undone with ``/refine undo``.
     """
     if task_cfg is None:
         task_cfg = _background_review_task_config()
@@ -1359,7 +1371,9 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt, task_cfg)
+        _run_review_in_thread(
+            agent, messages_snapshot, prompt, task_cfg, snapshot_id=snapshot_id
+        )
 
     return _target, prompt
 
