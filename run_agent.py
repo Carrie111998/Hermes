@@ -3512,6 +3512,17 @@ class AIAgent:
         with _redirect_lock:
             return bool(self._pending_redirect)
 
+    def queue_redirect(self, text: str) -> None:
+        """Queue a mid-turn redirect/steering instruction."""
+        if not text:
+            return
+        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        if _redirect_lock is None:
+            self._pending_redirect = str(text)
+            return
+        with _redirect_lock:
+            self._pending_redirect = str(text)
+
     def _drain_pending_redirect(self) -> Optional[str]:
         """Return and clear pending active-turn correction text."""
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)

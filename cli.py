@@ -15660,8 +15660,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Sync interaction mode before each turn.
                     if hasattr(self.agent, 'interaction_mode'):
                         self.agent.interaction_mode = self._interaction_mode
-                    # Only prepend mode note if user switched explicitly to plan mode
-                    # or if custom interaction mode instructions are needed
+                    # Always prepend mode note (PLAN vs BUILD) so agent is 100% aware
                     if getattr(self, '_interaction_mode', 'build') == 'plan':
                         _mode_note = (
                             "[System: Current interaction mode: PLAN.\n"
@@ -15674,7 +15673,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             "- Research and design architecture, workflows, and task roadmaps\n"
                             "- Do not attempt to write code, edit files, or execute mutating actions directly]"
                         )
-                        agent_message = _prepend_note_to_message(agent_message, _mode_note)
+                    else:
+                        _mode_note = (
+                            "[System: Current interaction mode: BUILD.\n"
+                            "Full tool execution is enabled for implementing changes.\n\n"
+                            "BUILD mode guidelines:\n"
+                            "- Explore first: read code, locate exact symbols/functions before editing\n"
+                            "- Implement minimal, robust changes matching project conventions\n"
+                            "- Run tests and verify changes before reporting completion\n"
+                            "- Use delegate_task to orchestrate subagent workstreams when appropriate]"
+                        )
+                    agent_message = _prepend_note_to_message(agent_message, _mode_note)
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -17580,16 +17589,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         @kb.add(_imode_key)
         def handle_interaction_mode_toggle(event):
-            """Toggle PLAN/BUILD interaction mode.
-
-            Session-scoped. PLAN disables write/execute tools; BUILD is the
-            normal default. No model turn spent. Default key: Shift+Tab.
-            Config: agent.interaction_mode_key
-            """
+            """Toggle PLAN/BUILD interaction mode."""
             self._interaction_mode = 'plan' if self._interaction_mode == 'build' else 'build'
             if self.agent is not None:
                 try:
                     self.agent.interaction_mode = self._interaction_mode
+                    # If the agent is currently running mid-response, inject live redirect notification
+                    if getattr(self, '_agent_running', False):
+                        if hasattr(self.agent, 'queue_redirect'):
+                            mode_desc = "PLAN mode (tools disabled, explore/plan only)" if self._interaction_mode == 'plan' else "BUILD mode (tools enabled, code execution active)"
+                            self.agent.queue_redirect(
+                                f"[System: User switched mode mid-response to {mode_desc}. Adjust behavior immediately.]"
+                            )
                 except Exception:
                     pass
             mode_label = 'plan — tools disabled' if self._interaction_mode == 'plan' else 'build — tools enabled'

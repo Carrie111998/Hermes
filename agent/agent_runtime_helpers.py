@@ -3059,11 +3059,32 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         "clarify", "browser_snapshot", "browser_get_images",
         "memory",
     })
-    if getattr(agent, "interaction_mode", "build") == "plan" and function_name not in _PLAN_READ_ONLY_TOOLS:
+
+    def _is_plan_allowed_write(fname: str, fargs: dict) -> bool:
+        if fname not in ("write_file", "patch"):
+            return False
+        path_str = str(fargs.get("path", "") or "").lower().replace("\\", "/")
+        if not path_str:
+            return False
+        if "/.hermes/" in path_str or path_str.startswith(".hermes/"):
+            if "/prd/" in path_str or "/roadmap/" in path_str or path_str.endswith("memory.md") or path_str.endswith(".md"):
+                return True
+        if "/.ares/" in path_str or path_str.startswith(".ares/") or "/.plans/" in path_str or path_str.startswith(".plans/"):
+            return True
+        allowed_exact_filenames = (
+            "plan.md", "prd.md", "roadmap.md", "requirements.md", "tasks.md", "technical.md"
+        )
+        if any(path_str.endswith(f) or path_str.endswith(f".{f}") for f in allowed_exact_filenames):
+            return True
+        if path_str.endswith(".plan.md") or path_str.endswith(".prd.md"):
+            return True
+        return False
+
+    if getattr(agent, "interaction_mode", "build") == "plan" and function_name not in _PLAN_READ_ONLY_TOOLS and not _is_plan_allowed_write(function_name, function_args):
         result = json.dumps(
             {
-                "error": "Tool execution is disabled in PLAN mode. "
-                "Switch to BUILD mode to run tools."
+                "error": "Tool execution is disabled in PLAN mode. Writing to source code is restricted. "
+                "Switch to BUILD mode (Shift+Tab) to implement and execute code changes."
             },
             ensure_ascii=False,
         )

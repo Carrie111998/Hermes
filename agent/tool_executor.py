@@ -562,10 +562,36 @@ def _run_agent_tool_execution_middleware(
         "clarify", "browser_snapshot", "browser_get_images",
         "memory",
     })
-    if getattr(agent, "interaction_mode", "build") == "plan" and function_name not in _PLAN_READ_ONLY_TOOLS:
+
+    def _is_plan_allowed_write(fname: str, fargs: dict) -> bool:
+        """Allow write_file and patch in PLAN mode ONLY for PRD, roadmap, and memory files."""
+        if fname not in ("write_file", "patch"):
+            return False
+        path_str = str(fargs.get("path", "") or "").lower().replace("\\", "/")
+        if not path_str:
+            return False
+        # 1. Feature workspace paths (.hermes/<feat>/prd/*, roadmap/*, memory.md)
+        if "/.hermes/" in path_str or path_str.startswith(".hermes/"):
+            if "/prd/" in path_str or "/roadmap/" in path_str or path_str.endswith("memory.md") or path_str.endswith(".md"):
+                return True
+        # 2. Local dot-plans or .ares workspace
+        if "/.ares/" in path_str or path_str.startswith(".ares/") or "/.plans/" in path_str or path_str.startswith(".plans/"):
+            return True
+        # 3. Root standard plan/roadmap markdown files
+        allowed_exact_filenames = (
+            "plan.md", "prd.md", "roadmap.md", "requirements.md", "tasks.md", "technical.md"
+        )
+        if any(path_str.endswith(f) or path_str.endswith(f".{f}") for f in allowed_exact_filenames):
+            return True
+        if path_str.endswith(".plan.md") or path_str.endswith(".prd.md"):
+            return True
+        return False
+
+    is_plan_mode = getattr(agent, "interaction_mode", "build") == "plan"
+    if is_plan_mode and function_name not in _PLAN_READ_ONLY_TOOLS and not _is_plan_allowed_write(function_name, function_args):
         block_msg = (
-            "Tool execution is disabled in PLAN mode. "
-            "Switch to BUILD mode to run tools."
+            "Tool execution is disabled in PLAN mode. Writing to source code is restricted. "
+            "Switch to BUILD mode (Shift+Tab) to implement and execute code changes."
         )
         _emit_terminal_post_tool_call(
             agent,
