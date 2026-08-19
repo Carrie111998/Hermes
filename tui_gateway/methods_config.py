@@ -8,6 +8,7 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
 from .method_ctx import HandlerRegistry
+from .json_safe import make_json_safe
 
 from hermes_constants import DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES
 
@@ -189,7 +190,7 @@ def _(rid, params: dict) -> dict:
         cwd = _completion_cwd({"cwd": raw} if raw else {})
         return _ok(rid, {"cwd": cwd, "branch": _git_branch_for_cwd(cwd)})
     if key == "full":
-        return _ok(rid, {"config": _load_cfg()})
+        return _ok(rid, {"config": make_json_safe(_load_cfg())})
     if key == "prompt":
         return _ok(rid, {"prompt": _load_cfg().get("custom_prompt", "")})
     if key == "skin":
